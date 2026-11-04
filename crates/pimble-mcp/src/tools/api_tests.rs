@@ -190,3 +190,53 @@ async fn metanodes_are_set_described_and_listed() {
     assert!(again.contains("two levels, shown with the calendar viewer"), "{again}");
     let _ = server.stop().await;
 }
+
+/// Smart lists (docs/QUERY_METANODES_CONTRACT.md section 7): `set_metanode`
+/// takes a query and makes the node a list, `get_metanode` lists its own
+/// children and then what it finds, each marked found with where it lives.
+#[tokio::test]
+async fn a_smart_list_is_set_and_lists_its_finds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        replicas_dir: Some(dir.path().join("replicas")),
+        ..Default::default()
+    });
+    server.start().await.expect("server starts");
+    let url = format!("http://{}", server.addr());
+    let service = PimbleClient::connect(&url).await.unwrap();
+    service.create_store(dir.path().join("work.pimble"), "Work").await.unwrap();
+    let pimble = Pimble::new(Arc::new(Connection::with_client(PimbleClient::connect(&url).await.unwrap())));
+    for (parent, title) in [("Work", "Projects"), ("Work/Projects", "Alpha"), ("Work/Projects", "Beta"), ("Work", "Waiting"), ("Work/Waiting", "Mine")] {
+        pimble.create_node(p(json!({ "parent": parent, "title": title }))).await.unwrap();
+    }
+    pimble.set_tags(p(json!({ "node": "Work/Projects/Alpha", "tags": ["waiting"] }))).await.unwrap();
+    pimble.set_tags(p(json!({ "node": "Work/Projects/Beta", "tags": ["waiting", "done"] }))).await.unwrap();
+    let alpha = pimble.api.resolve("Work/Projects/Alpha").await.unwrap();
+    service.edit_node(alpha.store, alpha.node, "test", |doc, at| doc.set_field("Due", Some("2026-11-06"), at)).await.unwrap();
+
+    let set = pimble
+        .set_metanode(p(json!({ "node": "Work/Waiting", "query": { "all": [{ "tag": "waiting" }, { "no_tag": "done" }], "order": "created", "descending": true } })))
+        .await
+        .unwrap();
+    assert!(set.contains("the nodes tagged waiting and not tagged done in Work, newest first, at most 50, shown with the list viewer"), "{set}");
+
+    let shown = pimble.get_metanode(p(json!({ "node": "Work/Waiting" }))).await.unwrap();
+    let lines: Vec<&str> = shown.lines().collect();
+    assert!(lines[1].starts_with("- Mine (pimble:") && !lines[1].contains("found"), "{shown}");
+    assert!(lines[2].starts_with("Found (1;"), "{shown}");
+    assert!(lines[3].starts_with("- Alpha (pimble:") && lines[3].ends_with("[found, in Work / Projects]"), "{shown}");
+    assert!(!shown.contains("Beta"), "{shown}");
+
+    // A field condition; a bad one is refused with a sentence.
+    pimble
+        .set_metanode(p(json!({ "node": "Work/Waiting", "query": { "all": [{ "field": "Due", "is": "<", "value": "2026-12-01" }] } })))
+        .await
+        .unwrap();
+    assert!(pimble.get_metanode(p(json!({ "node": "Work/Waiting" }))).await.unwrap().contains("- Alpha ("));
+    let refused = pimble.set_metanode(p(json!({ "node": "Work/Waiting", "query": { "all": [{ "field": "Due", "is": "<" }] } }))).await.unwrap_err();
+    assert!(refused.contains("needs a `value`"), "{refused}");
+    let refused = pimble.set_metanode(p(json!({ "node": "Work/Waiting", "depth": 2, "query": {} }))).await.unwrap_err();
+    assert!(refused.contains("not both"), "{refused}");
+    let _ = server.stop().await;
+}

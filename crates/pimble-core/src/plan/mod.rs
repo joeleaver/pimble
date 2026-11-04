@@ -13,11 +13,13 @@
 //! the API (wave 5), and so that the rules sit beside the types they judge.
 
 mod capabilities;
+mod found;
 mod moves;
 #[cfg(test)]
 mod tests;
 
 pub use capabilities::*;
+pub use found::*;
 pub use moves::*;
 
 use std::collections::HashSet;

@@ -26,6 +26,7 @@ pub mod router;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod metanode;
+mod matching;
 pub mod view;
 #[cfg(feature = "conformance")]
 pub mod conformance;

@@ -248,6 +248,15 @@ Write:
 `get_node` describes a metanode in one line ("a metanode: the children of Work, two levels,
 shown with the kanban viewer") and says when a newer Pimble wrote part of its source.
 
+Smart lists (docs/QUERY_METANODES_CONTRACT.md section 7, built 2026-11-04): `set_metanode`
+takes `query` instead of `depth` (`within`: omitted for the node's store, "everywhere", a
+store's name, or a node for everything under it; `all`: conditions, each one of `tag`,
+`no_tag`, `text`, `field` with `is` and `value`, `links_to`, `type`; `order`: "title",
+"modified", "created" or "field:<name>"; `descending`; `limit`, 1 to 500, default 50), and
+the viewer is "list" unless one is named. `get_metanode` lists the node's own children, then
+"Found (n; ...)" and each find as `- Title (link) [found, in Store / Parent]`: the real node,
+which `move_node` and `delete_node` act on where it lives.
+
 Sheets (docs/SHEETS_CONTRACT.md section 10, wave 1; built 2026-10-19 on branch `sheets`).
 `pimble-mcp` links `pimble-sheet` and computes what it reads exactly as the app does, over
 the node documents it fetches (`crates/pimble-mcp/src/sheets/`: a `Book` filled with the

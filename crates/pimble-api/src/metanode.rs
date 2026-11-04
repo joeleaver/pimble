@@ -8,14 +8,22 @@
 //! order is data (a parent's list is co-edited, and a card's place in its
 //! column is its priority), so nothing here sorts. Grouping and sorting are
 //! a viewer's, for display only.
+//!
+//! A query metanode (docs/QUERY_METANODES_CONTRACT.md) is the exception:
+//! after its own children come the nodes its match finds, in the match's
+//! order, each marked `found`. They are found afresh from the held
+//! documents every time and never stored anywhere.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use pimble_core::metanode::{leaves_metanode_warning, Metanode, Source};
-use pimble_core::plan::MovePlan;
-use pimble_core::{Node, NodeId, Place, StoreId};
+use pimble_core::metanode::{leaves_metanode_warning, parse_node_ref, Condition, Metanode, Named, Query, Source, Within};
+use pimble_core::plan::{found_refusal, lives_in, MovePlan};
+use pimble_core::{node_types, Node, NodeId, Place, StoreId};
+use pimble_crdt::{NodeDoc, NodeFields};
+use pimble_rpc::StoreChangeKind;
 
-use crate::{Addr, Affected, ApiError, Change, Pimble, View};
+use crate::matching::{compare, Key, Matcher};
+use crate::{label, Addr, Affected, ApiError, Change, Pimble, View};
 
 /// One node a source found.
 #[derive(Debug, Clone)]
@@ -27,8 +35,15 @@ pub struct ForestEntry {
     pub parent: Option<Addr>,
     /// Its children that are in the forest too, in the tree's order.
     pub children: Vec<Addr>,
-    /// How far below the metanode: 1 for its children.
+    /// How far below the metanode: 1 for its children, and for a found node.
     pub depth: u32,
+    /// Found by the metanode's match rather than one of its own children
+    /// (or theirs). A found entry is the real node, living elsewhere: it
+    /// changes itself but not its place from here
+    /// (`plan::FoundRowAction`, [`Pimble::found_refusal`]). It has no
+    /// parent and no children in the forest; a viewer that shows its
+    /// children lists them as any node's.
+    pub found: bool,
 }
 
 /// What a metanode's source found, as a forest in the tree's own order.
@@ -47,15 +62,35 @@ pub struct Forest {
     /// before its children, siblings in their list's order, so an outline
     /// is these in turn, indented by depth.
     pub entries: Vec<ForestEntry>,
+    /// Why a found entry is found, after "Shown here because" ("it is
+    /// tagged #waiting"); `None` for a source that finds nothing.
+    pub reason: Option<String>,
     /// The nodes whose list of children the source read: a node that lands
     /// in one of these lists is in the forest.
     lists: Vec<Addr>,
+    /// The stores a match looked in: any node changing there may change
+    /// what it finds.
+    scanned: Vec<StoreId>,
+    /// Whether what a match finds depends on node content (a text or links
+    /// condition, or the last-changed order), so a content edit counts.
+    reads_content: bool,
 }
 
 impl Forest {
-    /// The tops: the metanode's own children, in order.
+    /// The tops: the metanode's own children, in order, then what its match
+    /// found.
     pub fn tops(&self) -> impl Iterator<Item = &ForestEntry> {
         self.entries.iter().filter(|e| e.parent.is_none())
+    }
+
+    /// What the metanode's match found, in the match's order.
+    pub fn found(&self) -> impl Iterator<Item = &ForestEntry> {
+        self.entries.iter().filter(|e| e.found)
+    }
+
+    /// Whether `addr` is in the forest as a found entry.
+    pub fn is_found(&self, addr: Addr) -> bool {
+        self.get(addr).is_some_and(|e| e.found)
     }
 
     pub fn get(&self, addr: Addr) -> Option<&ForestEntry> {
@@ -80,7 +115,14 @@ impl Forest {
     /// nothing outside those can bring a node into it: a node arriving lands
     /// in a list read, one leaving leaves one, and a row changing is a node
     /// found.
+    ///
+    /// A match is not tree-shaped: any node of a store it looked in may
+    /// come to match or stop matching, so any document named there touches
+    /// it (still one membership test per change).
     pub fn touched(&self, store: StoreId, affected: &Affected) -> bool {
+        if self.scanned.contains(&store) && !affected.is_empty() {
+            return true;
+        }
         let watched = |id: &NodeId| {
             let addr = Addr::new(store, *id);
             addr == self.metanode || self.lists.contains(&addr) || self.contains(addr)
@@ -89,9 +131,19 @@ impl Forest {
     }
 
     /// [`Forest::touched`] for a change as [`Pimble::next_change`] gives it.
+    /// A content edit in a store a match looked in counts only when what it
+    /// finds reads content or the node is shown.
     pub fn touched_by(&self, change: &Change) -> bool {
         match change {
-            Change::Store(change) => self.touched(change.store, &Affected::of(&change.kind)),
+            Change::Store(change) => {
+                if let StoreChangeKind::ContentUpdated { node_id } = &change.kind {
+                    if !self.reads_content && self.scanned.contains(&change.store) {
+                        let addr = Addr::new(change.store, *node_id);
+                        return addr == self.metanode || self.contains(addr);
+                    }
+                }
+                self.touched(change.store, &Affected::of(&change.kind))
+            }
             Change::Resynced { store, changed } => self.touched(*store, &Affected::documents(changed.clone())),
             Change::Rejudged { store, nodes } => self.touched(*store, &Affected::rows(nodes.clone())),
         }
@@ -175,7 +227,7 @@ impl Pimble {
                 }
             }
             let mount = node.mount_ref().map(|m| Addr::new(m.source_store, m.source_node));
-            entries.push(ForestEntry { addr, node, parent, children: Vec::new(), depth: at });
+            entries.push(ForestEntry { addr, node, parent, children: Vec::new(), depth: at, found: false });
             if at >= depth {
                 continue;
             }
@@ -192,7 +244,190 @@ impl Pimble {
                 Err(e) => tracing::debug!("a metanode's source could not read the children of {}: {e}", addr.link()),
             }
         }
-        Ok(Forest { metanode, node, spec, source, entries, lists })
+        let mut scanned = Vec::new();
+        let mut reason = None;
+        let reads_content = match &source.query {
+            Query::Match { all, order, .. } => {
+                matches!(order, pimble_core::metanode::Order::Modified)
+                    || all.iter().any(|c| matches!(c, Condition::Text { .. } | Condition::LinksTo { .. }))
+            }
+            _ => false,
+        };
+        if let Some(matcher) = Matcher::of(&source.query, crate::book::SheetBook::local_today()) {
+            // Never the metanode, what is above it, or its own children.
+            let mut skip: HashSet<Addr> = entries.iter().map(|e| e.addr).collect();
+            skip.insert(metanode);
+            skip.extend(self.ancestors(metanode).await.unwrap_or_default());
+            let (found, stores) = self.find(metanode, &source, &matcher, &skip).await?;
+            scanned = stores;
+            entries.extend(found);
+            let names = self.names_in(metanode, &source).await;
+            reason = source.found_reason(&|n| names.get(&n.key()).cloned());
+        }
+        Ok(Forest { metanode, node, spec, source, entries, reason, lists, scanned, reads_content })
+    }
+
+    /// What a match finds (docs/QUERY_METANODES_CONTRACT.md section 3): the
+    /// live nodes below the tops of each store it looks in (or below the
+    /// node it names), as held, that every condition holds for and `skip`
+    /// does not name, sorted and cut to the limit. A store's own nodes
+    /// only: a mount in it is judged as a node, and not entered. Answers the
+    /// stores looked in too.
+    async fn find(&self, metanode: Addr, source: &Source, matcher: &Matcher, skip: &HashSet<Addr>) -> Result<(Vec<ForestEntry>, Vec<StoreId>), ApiError> {
+        let Query::Match { within, order, descending, .. } = &source.query else { return Ok((Vec::new(), Vec::new())) };
+        let places: Vec<(StoreId, Option<NodeId>)> = match within {
+            None => vec![(metanode.store, None)],
+            Some(Within::Store(store)) => vec![(*store, None)],
+            Some(Within::Under(node)) => parse_node_ref(node).map(|(s, n)| vec![(s, Some(n))]).unwrap_or_default(),
+            Some(Within::Everywhere) => self.stores().await?.iter().map(|s| (s.id, None)).collect(),
+        };
+        // (address, sort key, lowercased title, the node when already read)
+        let mut hits: Vec<(Addr, Key, String, Option<Node>)> = Vec::new();
+        let mut scanned = Vec::new();
+        for (store, under) in places {
+            let tops = match under {
+                Some(node) => vec![node],
+                None => match self.store_row(store).await {
+                    Some(row) => row.shown_roots(),
+                    None => continue,
+                },
+            };
+            scanned.push(store);
+            let judge = |addr: Addr, doc: &NodeDoc, fields: &NodeFields, node: Option<Node>, hits: &mut Vec<_>| {
+                if !skip.contains(&addr) && fields.deleted_at.is_none() && matcher.matches(doc, fields) {
+                    hits.push((addr, matcher.key(order, fields), fields.title.trim().to_lowercase(), node));
+                }
+            };
+            if self.passes_through(store) {
+                // The backend holds these documents: walk them through it.
+                let mut stack: Vec<Addr> = tops.iter().map(|n| Addr::new(store, *n)).collect();
+                let mut seen = HashSet::new();
+                while let Some(at) = stack.pop() {
+                    if !seen.insert(at) {
+                        continue;
+                    }
+                    let Ok(children) = self.children(at).await else { continue };
+                    for (addr, child) in children {
+                        if addr.store != store {
+                            continue;
+                        }
+                        let doc = if child.content.is_empty() { self.doc(addr).await.ok() } else { NodeDoc::load(&child.content).ok() };
+                        let Some(doc) = doc else { continue };
+                        let Ok(fields) = doc.fields() else { continue };
+                        if child.node_type != node_types::MOUNT {
+                            stack.push(addr);
+                        }
+                        judge(addr, &doc, &fields, Some(child), &mut hits);
+                    }
+                }
+                continue;
+            }
+            if let Err(e) = self.hold_store(store).await {
+                tracing::debug!("a match could not look in store {store}: {e}");
+                continue;
+            }
+            let held = self.held.lock().unwrap();
+            let Some(h) = held.store(store) else { continue };
+            let mut stack = tops;
+            let mut seen = HashSet::new();
+            while let Some(at) = stack.pop() {
+                if !seen.insert(at) {
+                    continue;
+                }
+                for id in h.tree.get_children(at).unwrap_or_default() {
+                    let Some(doc) = h.tree.doc(id) else { continue };
+                    let Ok(fields) = doc.fields() else { continue };
+                    if fields.node_type != node_types::MOUNT {
+                        stack.push(id);
+                    }
+                    judge(Addr::new(store, id), doc, &fields, None, &mut hits);
+                }
+            }
+        }
+        hits.sort_by(|a, b| compare((&a.1, &a.2, a.0.node), (&b.1, &b.2, b.0.node), *descending));
+        hits.dedup_by_key(|h| h.0);
+        hits.truncate(source.limit());
+        let mut found = Vec::with_capacity(hits.len());
+        for (addr, _, _, node) in hits {
+            let node = match node {
+                Some(node) => node,
+                None => match self.held_node(addr).await {
+                    Ok(node) => node,
+                    Err(_) => continue,
+                },
+            };
+            found.push(ForestEntry { addr, node, parent: None, children: Vec::new(), depth: 1, found: true });
+        }
+        Ok((found, scanned))
+    }
+
+    /// What the stores and nodes a match names are called, keyed as
+    /// [`Named::key`] keys them, for saying the source in words.
+    async fn names_in(&self, metanode: Addr, source: &Source) -> HashMap<String, String> {
+        let mut names = HashMap::new();
+        let Query::Match { within, all, .. } = &source.query else { return names };
+        if let Some(row) = self.store_row(metanode.store).await {
+            names.insert(Named::Here.key(), row.name);
+        }
+        if let Some(Within::Store(store)) = within {
+            if let Some(row) = self.store_row(*store).await {
+                names.insert(Named::Store(*store).key(), row.name);
+            }
+        }
+        let mut refs: Vec<&str> = all.iter().filter_map(|c| if let Condition::LinksTo { links_to } = c { Some(links_to.as_str()) } else { None }).collect();
+        if let Some(Within::Under(node)) = within {
+            refs.push(node);
+        }
+        for raw in refs {
+            if let Some((store, node)) = parse_node_ref(raw) {
+                if let Ok(n) = self.held_node(Addr::new(store, node)).await {
+                    names.insert(Named::Node(raw).key(), label(&n));
+                }
+            }
+        }
+        names
+    }
+
+    /// A metanode's source in words, with the stores and nodes it names
+    /// called by their names ("the nodes tagged waiting in Personal, ...").
+    pub async fn describe_source(&self, metanode: Addr, source: &Source) -> String {
+        let of = match self.held_node(metanode).await {
+            Ok(n) => label(&n),
+            Err(_) => "this node".to_string(),
+        };
+        let names = self.names_in(metanode, source).await;
+        source.describe_named(&of, &|n| names.get(&n.key()).cloned())
+    }
+
+    /// Where `addr` lives, as a found row's refusal says it: its store's
+    /// name and the titles above it, "Personal / Projects".
+    pub async fn lives_in(&self, addr: Addr) -> String {
+        let store = self.store_row(addr.store).await;
+        let mut titles: Vec<String> = Vec::new();
+        for above in self.ancestors(addr).await.unwrap_or_default() {
+            if store.as_ref().is_some_and(|s| s.root_node_id == above.node) {
+                break;
+            }
+            match self.held_node(above).await {
+                Ok(n) => titles.push(label(&n)),
+                Err(_) => break,
+            }
+        }
+        titles.push(store.map_or_else(|| addr.store.to_string(), |s| s.name));
+        titles.reverse();
+        lives_in(&titles)
+    }
+
+    /// Why a found entry's place cannot be changed from the metanode
+    /// (docs/QUERY_METANODES_CONTRACT.md section 4): "Shown here because it
+    /// is tagged #waiting. It lives in Personal / Projects." `None` for an
+    /// entry that is not found (an own child, or not in the forest).
+    pub async fn found_refusal(&self, forest: &Forest, addr: Addr) -> Option<String> {
+        if !forest.is_found(addr) {
+            return None;
+        }
+        let reason = forest.reason.clone().unwrap_or_else(|| "this list finds it".to_string());
+        Some(found_refusal(&reason, &self.lives_in(addr).await))
     }
 
     /// Make `addr` a metanode shown with `viewer`, or with `None` an
@@ -219,6 +454,17 @@ impl Pimble {
     /// Nothing is sent.
     pub async fn judge_in_metanode(&self, metanode: Addr, edit: MetanodeEdit) -> Result<Judged, ApiError> {
         let forest = self.metanode_source(metanode).await?;
+        // A found node's place is not changed from here, and nothing is put
+        // into or beside it (plan::FoundRowAction).
+        let named: Vec<Addr> = match &edit {
+            MetanodeEdit::Move { nodes, target, .. } => nodes.iter().copied().chain([*target]).collect(),
+            MetanodeEdit::Delete { nodes } => nodes.clone(),
+        };
+        for addr in named {
+            if let Some(sentence) = self.found_refusal(&forest, addr).await {
+                return Err(ApiError::refused(sentence));
+            }
+        }
         match edit {
             MetanodeEdit::Move { nodes, target, place } => {
                 let plan = self.plan_move(&nodes, target, place).await?;

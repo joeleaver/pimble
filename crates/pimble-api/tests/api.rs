@@ -699,3 +699,182 @@ async fn a_metanode_source_reads_through_mounts() {
     assert!(forest.lists_children_of(Addr::new(lib, lib_root)));
     let _ = { s }.server.stop().await;
 }
+
+/// A query metanode (docs/QUERY_METANODES_CONTRACT.md waves A and B): its own
+/// children first, then the nodes its match finds, each condition kind,
+/// orders, the limit, where it looks, what it never finds, the refusal a
+/// found node's place gives, and the changes that make it read again.
+#[tokio::test]
+async fn a_query_metanode_finds_nodes_after_its_own_children() {
+    use pimble_api::MetanodeEdit;
+    use pimble_core::metanode::{node_ref, Condition as C, FieldOp, Order, Query, Source, Within, NEWER_SOURCE};
+    let s = stack().await;
+    let (p, root) = s.service.create_store(s.dir.path().join("personal.pimble"), "Personal").await.unwrap();
+    let (o, o_root) = s.service.create_store(s.dir.path().join("other.pimble"), "Other").await.unwrap();
+    let mk = |parent, ty: &'static str, title: &'static str| s.service.create_node(p, Some(parent), ty, title);
+    let projects = mk(root, "folder", "Projects").await.unwrap();
+    let alpha = mk(projects, "document", "Alpha").await.unwrap();
+    let beta = mk(projects, "document", "Beta").await.unwrap();
+    let gamma = mk(projects, "document", "Gamma").await.unwrap();
+    let gone = mk(projects, "document", "Gone").await.unwrap();
+    let target = mk(root, "document", "Target").await.unwrap();
+    let sketch = mk(root, "board", "Sketch").await.unwrap();
+    let lists = mk(root, "folder", "Lists").await.unwrap();
+    let waiting = mk(lists, "folder", "Waiting").await.unwrap();
+    let own = mk(waiting, "document", "Own").await.unwrap();
+    let mine = mk(waiting, "document", "Mine").await.unwrap();
+    let kanban = mk(root, "folder", "Board").await.unwrap();
+    let elsewhere = s.service.create_node(o, Some(o_root), "document", "Elsewhere").await.unwrap();
+    let target_link = pimble_core::PimbleUrl::node(p, target).to_string();
+
+    // (node, tags, fields, text, created)
+    let setup: Vec<(StoreId, NodeId, Vec<&str>, Vec<(&str, &str)>, String, &str)> = vec![
+        (p, alpha, vec!["waiting"], vec![("Due", "2026-11-06"), ("Cost", "$1,200")], "Send the invoice to Bob".into(), "2026-01-01T00:00:00.000Z"),
+        (p, beta, vec!["waiting", "done"], vec![("Due", "2026-11-20")], "An invoice draft".into(), "2026-02-01T00:00:00.000Z"),
+        (p, gamma, vec!["#Waiting"], vec![], format!("See [the target]({target_link})"), "2026-03-01T00:00:00.000Z"),
+        (p, sketch, vec!["waiting"], vec![], String::new(), "2026-04-01T00:00:00.000Z"),
+        (p, gone, vec!["waiting"], vec![], String::new(), "2026-05-01T00:00:00.000Z"),
+        (p, lists, vec!["waiting"], vec![], String::new(), "2026-05-01T00:00:00.000Z"),
+        (p, waiting, vec!["waiting"], vec![], String::new(), "2026-05-01T00:00:00.000Z"),
+        (p, own, vec!["waiting"], vec![], String::new(), "2026-05-01T00:00:00.000Z"),
+        (o, elsewhere, vec!["waiting"], vec![], String::new(), "2026-05-01T00:00:00.000Z"),
+    ];
+    for (store, node, tags, fields, text, created) in setup {
+        s.service
+            .edit_node(store, node, "setup", |doc, at| {
+                doc.set_tags(&tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(), at)?;
+                for (name, value) in &fields {
+                    doc.set_field(name, Some(*value), at)?;
+                }
+                if !text.is_empty() {
+                    doc.append_markdown(&text)?;
+                }
+                doc.set_timestamps(created, created)
+            })
+            .await
+            .unwrap();
+    }
+    s.service.delete_node(p, gone).await.unwrap();
+
+    let (api, _) = api(&s).await;
+    api.set_metanode(Addr::new(p, kanban), Some("kanban"), None).await.unwrap();
+    let at = Addr::new(p, waiting);
+    let query = |all: Vec<C>, within: Option<Within>, order: Order, descending: bool, limit: u32| Source {
+        query: Query::Match { within, all, order, descending, limit },
+        later: Default::default(),
+    };
+    let tag = |t: &str| C::Tag { tag: t.into() };
+    let finds = |all: Vec<C>| query(all, None, Order::Title, false, 50);
+    let api = &api;
+    let found_with = |source: Source| async move {
+        api.set_metanode(at, Some("list"), Some(&source)).await.unwrap();
+        let forest = api.metanode_source(at).await.unwrap();
+        forest.found().map(|e| e.addr.node).collect::<Vec<_>>()
+    };
+
+    // Own children first, in order; then the finds by title. A node that is
+    // both shows once, as its own. Never the metanode, what is above it, a
+    // deleted node, or another store's node.
+    api.set_metanode(at, Some("list"), Some(&finds(vec![tag("waiting")]))).await.unwrap();
+    let forest = api.metanode_source(at).await.unwrap();
+    let rows: Vec<(NodeId, bool)> = forest.entries.iter().map(|e| (e.addr.node, e.found)).collect();
+    assert_eq!(rows, vec![(own, false), (mine, false), (alpha, true), (beta, true), (gamma, true), (sketch, true)]);
+    assert!(forest.entries.iter().all(|e| e.depth == 1 && e.parent.is_none() && e.children.is_empty()));
+    assert_eq!(forest.reason.as_deref(), Some("it is tagged #waiting"));
+    assert!(forest.lists_children_of(at), "a drop onto the metanode makes an own child");
+    assert_eq!(
+        api.describe_source(at, &forest.source).await,
+        "the nodes tagged waiting in Personal, by title, at most 50"
+    );
+
+    // Each condition kind.
+    assert_eq!(found_with(finds(vec![tag("waiting"), C::NoTag { no_tag: "done".into() }])).await, vec![alpha, gamma, sketch]);
+    assert_eq!(found_with(finds(vec![C::Text { text: "invoice".into() }])).await, vec![alpha, beta]);
+    assert_eq!(found_with(finds(vec![C::Text { text: "INVOICE bob".into() }])).await, vec![alpha]);
+    assert_eq!(found_with(finds(vec![C::Text { text: "target".into() }])).await, vec![gamma, target], "title and text");
+    let field = |f: &str, is, v: Option<&str>| C::Field { field: f.into(), is, value: v.map(Into::into) };
+    assert_eq!(found_with(finds(vec![field("Due", FieldOp::Less, Some("2026-11-10"))])).await, vec![alpha]);
+    assert_eq!(found_with(finds(vec![field("due", FieldOp::AtLeast, Some("2026-11-06"))])).await, vec![alpha, beta]);
+    assert_eq!(found_with(finds(vec![field("Due", FieldOp::Set, None)])).await, vec![alpha, beta]);
+    assert_eq!(found_with(finds(vec![tag("waiting"), field("Due", FieldOp::Empty, None)])).await, vec![gamma, sketch]);
+    assert_eq!(found_with(finds(vec![field("Cost", FieldOp::More, Some("1000"))])).await, vec![alpha]);
+    assert_eq!(found_with(finds(vec![field("Cost", FieldOp::Equal, Some("1200"))])).await, vec![alpha]);
+    assert_eq!(found_with(finds(vec![C::LinksTo { links_to: node_ref(p, target) }])).await, vec![gamma]);
+    assert_eq!(found_with(finds(vec![C::LinksTo { links_to: target_link.clone() }])).await, vec![gamma]);
+    assert_eq!(found_with(finds(vec![C::Type { node_type: "canvas".into() }])).await, vec![sketch]);
+    assert_eq!(found_with(finds(vec![C::Type { node_type: "kanban".into() }])).await, vec![kanban]);
+    assert_eq!(found_with(finds(vec![tag("waiting"), C::Type { node_type: "document".into() }])).await, vec![alpha, beta, gamma]);
+
+    // Orders, descending, and the limit.
+    assert_eq!(found_with(query(vec![tag("waiting")], None, Order::Created, true, 50)).await, vec![sketch, gamma, beta, alpha]);
+    assert_eq!(found_with(query(vec![tag("waiting")], None, Order::Created, true, 2)).await, vec![sketch, gamma]);
+    assert_eq!(found_with(query(vec![tag("waiting")], None, Order::Modified, false, 50)).await, vec![alpha, beta, gamma, sketch]);
+    assert_eq!(found_with(query(vec![tag("waiting")], None, Order::Title, true, 50)).await, vec![sketch, gamma, beta, alpha]);
+    // A field order: the values in order, then the nodes without one, by title.
+    assert_eq!(
+        found_with(query(vec![tag("waiting")], None, Order::Field("Due".into()), true, 50)).await,
+        vec![beta, alpha, gamma, sketch]
+    );
+
+    // Where it looks.
+    let under = Within::Under(node_ref(p, projects));
+    assert_eq!(found_with(query(vec![tag("waiting")], Some(under), Order::Title, false, 50)).await, vec![alpha, beta, gamma]);
+    assert_eq!(found_with(query(vec![tag("waiting")], Some(Within::Store(o)), Order::Title, false, 50)).await, vec![elsewhere]);
+    let everywhere = found_with(query(vec![tag("waiting")], Some(Within::Everywhere), Order::Title, false, 50)).await;
+    assert_eq!(everywhere, vec![alpha, beta, elsewhere, gamma, sketch]);
+
+    // A condition from a newer Pimble: own children only, and a sentence.
+    let mut newer = finds(vec![tag("waiting")]);
+    if let Query::Match { all, .. } = &mut newer.query {
+        all.push(C::Later(serde_json::json!({ "near": "home" })));
+    }
+    api.set_metanode(at, Some("list"), Some(&newer)).await.unwrap();
+    let forest = api.metanode_source(at).await.unwrap();
+    assert_eq!(forest.not_understood(), Some(NEWER_SOURCE));
+    assert_eq!(forest.entries.iter().map(|e| e.addr.node).collect::<Vec<_>>(), vec![own, mine]);
+
+    // A found node's place is not changed from here, and says why.
+    api.set_metanode(at, Some("list"), Some(&finds(vec![tag("waiting")]))).await.unwrap();
+    let forest = api.metanode_source(at).await.unwrap();
+    let sentence = "Shown here because it is tagged #waiting. It lives in Personal / Projects.";
+    assert_eq!(api.found_refusal(&forest, Addr::new(p, alpha)).await.as_deref(), Some(sentence));
+    assert_eq!(api.found_refusal(&forest, Addr::new(p, own)).await, None, "an own child is ordinary");
+    let refused = api.judge_in_metanode(at, MetanodeEdit::Delete { nodes: vec![Addr::new(p, alpha)] }).await.unwrap_err();
+    assert_eq!(refused.sentence(), sentence);
+    let into = MetanodeEdit::Move { nodes: vec![Addr::new(p, mine)], target: Addr::new(p, alpha), place: Place::Last };
+    assert_eq!(api.judge_in_metanode(at, into).await.unwrap_err().sentence(), sentence);
+    let own_move = MetanodeEdit::Move { nodes: vec![Addr::new(p, mine)], target: at, place: Place::First };
+    assert!(api.judge_in_metanode(at, own_move).await.is_ok());
+
+    // Live: a tag added anywhere in the store touches it; another store's
+    // change does not, and a content edit only when the match reads content.
+    api.listen();
+    s.service.edit_node(p, target, "elsewhere", |doc, at| doc.set_tags(&["waiting".to_string()], at)).await.unwrap();
+    let touched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match api.next_change().await {
+                Some(change @ Change::Store(_)) if forest.touched_by(&change) => return true,
+                Some(_) => continue,
+                None => panic!("nothing is subscribed"),
+            }
+        }
+    })
+    .await
+    .expect("the tag is heard");
+    assert!(touched);
+    assert!(api.metanode_source(at).await.unwrap().is_found(Addr::new(p, target)));
+    assert!(!forest.touched(o, &pimble_api::Affected::rows(vec![elsewhere])));
+    let content = |node| {
+        Change::Store(pimble_api::StoreChange {
+            store: p,
+            kind: pimble_rpc::StoreChangeKind::ContentUpdated { node_id: node },
+            source: None,
+            update: None,
+        })
+    };
+    assert!(!forest.touched_by(&content(projects)), "a tag match does not read content");
+    api.set_metanode(at, Some("list"), Some(&finds(vec![C::Text { text: "x".into() }]))).await.unwrap();
+    let by_text = api.metanode_source(at).await.unwrap();
+    assert!(by_text.touched_by(&content(projects)));
+    let _ = { s }.server.stop().await;
+}

@@ -144,3 +144,70 @@ E. **Checked** in the release desktop app and the browser: a plain store, an enc
    one meaning for a drop everywhere), or is changed to match (given the tag).
 4. **Do found rows expand** to show their own children: yes (recommended: they are the real
    nodes), or found rows are leaves.
+
+## Built: waves A and B (2026-11-04)
+
+What is built, on `master`:
+
+- **Core** (`crates/pimble-core/src/metanode.rs`): `Query::Match { within, all, order,
+  descending, limit }` beside `Children` and `Subtree`, in the section 3 JSON shape. `Within`
+  (`{"store"}`, `{"under"}`, `"everywhere"`; absent is the metanode's store), `Condition`
+  (untagged: `Tag`, `NoTag`, `Text`, `Field { field, is: FieldOp, value }`, `LinksTo`,
+  `Type`, and `Later(Value)` for a condition from a newer Pimble, kept as written), `FieldOp`
+  (`<`, `<=`, `=`, `>=`, `>`, `set`, `empty`), `Order` (`"title"`, `"modified"`,
+  `"created"`, `{"field"}`), `DEFAULT_LIMIT` 50, `MAX_LIMIT` 500. `Source::matching`,
+  `is_match`, `limit`, `describe_named` (names through a callback: "the nodes tagged waiting
+  in Personal, newest first, at most 50"), `found_reason` ("it is tagged #waiting and it
+  isn't tagged #done"), `parse_node_ref` (`<store>/<node>` or a `pimble:` link). `Query` is
+  no longer `Copy`/`Eq`. An older Pimble reads a match as `Query::Later`; a match holding an
+  unknown condition finds nothing here and says `NEWER_SOURCE`.
+- **Plan rule** (`crates/pimble-core/src/plan/found.rs`): `FoundRowAction` (`allowed()`:
+  open, edit, rename, appearance, discuss, copy, new inside; not delete, cut, drag, drop
+  into or beside, keyboard move, paste into), `lives_in(&[titles])` ("Personal /
+  Projects"), `found_refusal(reason, lives_in)` ("Shown here because it is tagged #waiting.
+  It lives in Personal / Projects.").
+- **Evaluation** (`crates/pimble-api/src/metanode.rs`, `matching.rs`): `Pimble::metanode_source`
+  answers the own children (depth 1, `found: false`) and then the finds (`found: true`, depth
+  1, no parent, no children in the forest). Finds are judged locally over held documents,
+  not through the search RPC: a store is held whole (`hold_store`) and walked from its
+  shown tops (or the `under` node) through each live list, a store's own nodes only (a mount
+  is judged as a node and not entered); in the browser an encrypted store is walked through
+  its backend. Text is every word of the condition, any case, in the title and plain text
+  (`NodeDoc::text`, substring, so "invoice" finds "invoices"; not stemmed); links are
+  `NodeDoc::links` (content and canvas cards); field values are read as a sheet reads typing
+  (`pimble_sheet::input::parse_input`: a number, else a date relative to today, else text
+  in any case), and values of different kinds never compare; tags compare without `#` in any
+  case; `canvas` is the `board` type (and the old `canvas`, `image`), `kanban` a metanode
+  with that viewer. Never found: tombstones, the metanode, its ancestors, its own children
+  (a node that is both shows once, as its own). Sorted by the order (a field order puts
+  nodes without the field last either way), then title, then id; cut to the limit.
+  `Forest::found()`, `is_found`, `reason`; `Pimble::describe_source`, `lives_in`,
+  `found_refusal(&forest, addr)`; `judge_in_metanode` refuses a found node as moved,
+  deleted or as a move's target with the refusal sentence.
+- **Liveness**: `Forest::touched` counts any document named in a store the match looked in;
+  `touched_by` skips a `ContentUpdated` there unless the match reads content (a text or
+  links condition, or the last-changed order) or the node is shown. A viewer debounces.
+- **MCP**: `set_metanode` takes `query` (viewer `list` unless named); `get_metanode` lists
+  own children, then finds marked `[found, in Store / Parent]` (docs/MCP_CONTRACT.md).
+- **Tests**: `pimble-core` `metanode::tests` (`a_match_round_trips_in_the_contracts_shape`,
+  `a_match_says_itself_in_words`, `an_older_reader_sees_a_match_as_a_newer_query`,
+  `a_newer_condition_is_kept_and_named`, `node_refs_read_both_ways`) and
+  `plan::found::tests::a_found_row_changes_itself_not_its_place`; `pimble-api`
+  `matching::tests::values_read_as_typed` and `tests/api.rs`
+  `a_query_metanode_finds_nodes_after_its_own_children` (every condition kind, the four
+  orders, descending, limit, under / another store / everywhere, the exclusions, own first
+  and once, a newer condition, the refusal sentence and `judge_in_metanode`, liveness);
+  `pimble-mcp` `a_smart_list_is_set_and_lists_its_finds`.
+
+Not done, or done differently from sections 3 and 8:
+
+- Section 3 says text, backlinks, tags and types come from the search index, and wave B
+  indexes fields in `pimble-search`. Evaluation reads the held documents instead: the index
+  is server-side, keyword-only through `search`, and absent for an encrypted store in the
+  browser, while every client already holds the documents, so one evaluation serves every
+  backend. The index is untouched. A very large store pays a walk per evaluation (the text
+  of a node is read only when its cheaper conditions hold).
+- Text matching is a case-insensitive substring per word, not stemmed.
+- A found node that is itself a query metanode is shown as a plain entry; the
+  "one level down" rule (section 2) is the explorer's, wave C.
+- Store roots and the `under` node itself are never found (the walk starts below them).

@@ -281,7 +281,7 @@ impl Pimble {
 
     /// Whether `store`'s backend holds its documents itself, so nothing of
     /// it is held here ([`crate::StoreCapabilities::local_documents`]).
-    fn passes_through(&self, store: StoreId) -> bool {
+    pub(crate) fn passes_through(&self, store: StoreId) -> bool {
         self.backend.capabilities(store).local_documents
     }
 
