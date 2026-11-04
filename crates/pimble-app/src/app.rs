@@ -467,11 +467,14 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     store.editor_dirty.set(false);
 }
 
-/// "Copy as Mount Source": record the canonical pair and display title of the
-/// node or store root identified by `value` into `store.mount_source`, for a
-/// subsequent "Paste Mount Here" elsewhere in the tree.
-fn copy_as_mount_source(store: AppStore, value: &str) {
+/// Remember the node of row `value` (a store row: its root) as copied, for a
+/// later Paste to mount (docs/MENUS_CONTRACT.md section 3.1). A row of an
+/// encrypted store is not remembered: no mount reaches into one.
+fn remember_copied(store: AppStore, value: &str) {
     let Some((s_id, node_id_opt)) = parse_tree_value(value) else { return };
+    if store.is_vault(s_id) {
+        return;
+    }
     match node_id_opt {
         Some(n_id) => {
             let title = store.display_label(s_id, n_id);
@@ -486,7 +489,17 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
             }
         }
     }
-    bump_tree_after_menu_closes(store);
+}
+
+/// Copy (docs/MENUS_CONTRACT.md section 3.1; Joe: "'copy' copies
+/// everything"): the rows' `pimble:` links on the system clipboard, and the
+/// first row remembered for a later Paste to mount. A row menu's Copy and the
+/// explorer's Ctrl+C.
+pub(crate) fn copy_rows(store: AppStore, values: &[String]) {
+    if let Some(first) = values.first() {
+        remember_copied(store, first);
+    }
+    copy_links(store, values);
 }
 
 /// Start renaming the row of tree value `value` in place: a double-click, F2,
@@ -607,52 +620,6 @@ pub(crate) fn copy_link(store: AppStore, value: &str) {
         Ok(()) => crate::events::show_notice(store, "Link copied.".to_string()),
         Err(e) => crate::events::show_notice(store, format!("The link could not be copied: {e}")),
     }
-}
-
-/// Re-render every row's context menu (so "Paste Mount Here" reads its fresh
-/// `disabled` value: every row's `TreeNodeData` carries that flag) **after**
-/// the menu item's click has finished, never inside it.
-///
-/// A rinch `DropdownMenuItem` closes its menu by writing the `ContextMenu`'s
-/// `opened` signal *after* the item's own callback returns. That signal is
-/// owned by the row's render scope, and bumping the tree disposes every row —
-/// so a bump inside the callback frees the signal the close is about to write,
-/// the write is dropped ("Signal::set() on a freed signal"), and the menu's
-/// portal is left on screen with nothing alive to hide it. It is parented to
-/// the body rather than to the row, so disposing the row does not take it
-/// away either: the menu stays up for good.
-///
-/// `run_on_main_thread` does not help here — called from the main thread it
-/// runs the closure straight through, which is exactly the case this has to
-/// avoid. A zero-length timeout is a real turn of the loop on both targets:
-/// the click handler returns, the item writes `opened = false`, the portal
-/// hides, and only then does the tree rebuild.
-fn bump_tree_after_menu_closes(store: AppStore) {
-    // Nothing cancels this; the tree must be rebuilt whatever happens next.
-    let _ = set_timeout(0, move || store.bump_tree_structure());
-}
-
-/// "Paste Mount Here": create a mount at the tree location identified by
-/// `target_value`, sourced from whatever "Copy as Mount Source" last recorded
-/// in `store.mount_source`. No-op if nothing was copied. Clears the copied
-/// source on success so the menu item disappears again.
-fn paste_mount_here(store: AppStore, target_value: &str) {
-    let Some(source) = untracked(|| store.mount_source.get()) else { return };
-    let (source_store, source_node, title) = source;
-    // Under a mount it goes into the mount's source, like anything made on
-    // a row, and only where this device may write.
-    let Some((target_store, parent_id)) = crate::tree_view::create_parent_of_row(store, target_value) else { return };
-    store.send(BackendCommand::CreateMount {
-        store_id: target_store,
-        parent_id,
-        source_store_id: source_store,
-        source_node_id: source_node,
-        title: Some(title),
-    });
-    store.mount_source.set(None);
-    // Re-render every row's context menu so "Paste Mount Here" reads as
-    // disabled again (see the `no_mount_source` note in `run`).
-    bump_tree_after_menu_closes(store);
 }
 
 /// Open the "Add Remote Store..." modal, resetting everything a previous run
@@ -1459,39 +1426,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
             // Context menu actions
             let nv_ctx = node_value.clone();
-            // Under this row's node, a store row's root, or a mount's source
-            // (`pimble_core::plan::create_parent`, as every creation is).
-            let on_new_child = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, pid)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        store.send(BackendCommand::CreateNode {
-                            store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
-                            place: Default::default(),
-                        });
-                    }
-                }
-            };
-            // Boards (docs/IMAGE_MARKUP_CONTRACT.md section 1, "Making one"):
-            // under this row's node, a store row's root, or a mount's source.
-            let on_new_whiteboard = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::boards::new_whiteboard(store, s_id, parent);
-                    }
-                }
-            };
-            // Discussions (docs/DISCUSSIONS_CONTRACT.md): a discussion node of
-            // its own under this row, or one on this row's node.
-            let on_new_discussion = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::discussions::new_discussion(store, s_id, parent);
-                    }
-                }
-            };
+            // "Discuss": a discussion on this row's node
+            // (docs/DISCUSSIONS_CONTRACT.md); a discussion node of its own is
+            // one of New's kinds.
             let on_start_discussion = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1500,47 +1437,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             };
-            let on_new_sheet = {
+            // Cut, Copy and Paste (docs/MENUS_CONTRACT.md section 3.1).
+            let on_cut = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::sheets::new_sheet(store, s_id, parent);
+                    let rows: Vec<String> = rows_for_menu(tree_state, &nv).into_iter().filter(|v| matches!(parse_tree_value(v), Some((_, Some(_))))).collect();
+                    if !rows.is_empty() {
+                        crate::tree_keys::set_cut(store, rows);
                     }
                 }
             };
-            // A plugin's recipe ("New Kanban"): made under the row, as
-            // "New Sheet" is.
-            let on_recipe = {
+            let on_copy = {
                 let nv = nv_ctx.clone();
-                move |recipe: pimble_plugin_abi::RecipeDecl| {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::plugins::make(store, s_id, parent, recipe);
-                    }
-                }
+                move || copy_rows(store, &rows_for_menu(tree_state, &nv))
             };
-            let on_new_image = {
+            let on_paste = {
                 let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::boards::pick_images(store, crate::boards::Dest::Under(s_id, parent));
-                    }
-                }
-            };
-            #[cfg(feature = "native")]
-            let on_paste_image = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        crate::boards::paste_image(store, crate::boards::Dest::Under(s_id, parent));
-                    }
-                }
-            };
-            // The browser takes a paste with the row selected instead
-            // (`boards::install_browser_handlers`): a page cannot read the
-            // clipboard from a menu without asking.
-            #[cfg(not(feature = "native"))]
-            let on_paste_image = move || {
-                crate::events::show_notice(store, "Select the row and press Ctrl+V to paste a picture as a canvas.".to_string());
+                move || crate::pasting::paste(store, &nv)
             };
             let on_close_store = {
                 let nv = nv_ctx.clone();
@@ -1705,35 +1618,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
-            // Mount-node-only "New Node": creates under the mount's source,
-            // never under the mount node itself (decision 2 — the server
-            // rejects a mount node as a create parent), as `on_new_child` does.
-            let on_new_child_mount = on_new_child.clone();
-
-            // "Copy as Mount Source" — store roots and ordinary nodes only
-            // (not mount nodes, which are placeholders). Not reactive, so a
-            // single `move` closure built once is fine (Rule 4/16).
-            let on_copy_as_mount_source = {
-                let nv = nv_ctx.clone();
-                move || copy_as_mount_source(store, &nv)
-            };
-            let on_copy_link = {
-                let nv = nv_ctx.clone();
-                move || copy_links(store, &rows_for_menu(tree_state, &nv))
-            };
-            // "Paste Mount Here" is always rendered, disabled while nothing is
-            // copied, because a `DropdownMenuItem`'s `disabled` is a value
-            // snapshotted at render time rather than a reactive one.
-            // `copy_as_mount_source`/`paste_mount_here` bump the tree structure
-            // afterwards (see `bump_tree_after_menu_closes` for why that has to
-            // wait a turn), so every row's menu re-renders with a fresh value.
-            //
-            // An item may sit inside an `if` in rsx: `show_dom` renders the
-            // branch synchronously the first time, while `ContextMenu`'s close
-            // signal is still published, so the item closes the menu like any
-            // other. Verified on the desktop with the rinch debug tools.
-            let no_mount_source = untracked(|| store.mount_source.get().is_none());
-
             // Mounts do not exist in an encrypted store: the server holds only
             // blobs there and has no tree to point a mount at. Hiding the two
             // items rather than disabling them keeps the menu honest — there is
@@ -1741,10 +1625,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let mounts_apply = parsed
                 .map(|(s_id, _)| !store.is_vault(s_id))
                 .unwrap_or(true);
-            let on_paste_mount = {
-                let nv = nv_ctx.clone();
-                move || paste_mount_here(store, &nv)
-            };
 
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
 
@@ -2045,7 +1925,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
             // Which of a store row's items are off: one rule, in one place
             // (`Capabilities::store_row_menu`), from what the row snapshots.
-            let store_menu = caps.store_row_menu(!no_mount_source);
+            let store_menu = caps.store_row_menu(false);
 
             // Remember this row for `reveal_row`, and scroll to it now if it
             // is the one a followed link revealed.
@@ -2056,66 +1936,92 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
 
             // Wrap in ContextMenu — different items for store roots vs nodes
+            // (docs/MENUS_CONTRACT.md section 3: grouped, what cannot apply
+            // left out; New is one list, `crate::creating`, until rinch's
+            // submenus make it "New ▸").
+            let nv_new = nv_ctx.clone();
             let context_menu = if is_store_root {
                 rsx! {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
                             {menu_note}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::FilePlus,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_child,
-                                "New Node"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Chalkboard,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_whiteboard.clone(),
-                                "New Canvas"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Table,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_sheet.clone(),
-                                "New Sheet"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Messages,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_discussion.clone(),
-                                "New Discussion"
-                            }
-                            for item in store.recipes.get() {
+                            for item in crate::creating::kinds(store) {
                                 DropdownMenuItem {
-                                    key: format!("{} {}", item.plugin, item.recipe.id),
-                                    left_section: item.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban),
+                                    key: item.label.clone(),
+                                    left_section: item.icon,
                                     disabled: store_menu.new_node,
                                     onclick: {
-                                        let (on_recipe, recipe) = (on_recipe.clone(), item.recipe.clone());
-                                        move || on_recipe(recipe.clone())
+                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                        move || crate::creating::make_in_row(store, &kind, &nv)
                                     },
-                                    {item.recipe.label.clone()}
+                                    {format!("New {}", item.label)}
                                 }
                             }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
-                                left_section: TablerIcon::Photo,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_image.clone(),
-                                "New Canvas from Picture..."
+                                left_section: TablerIcon::Copy,
+                                onclick: on_copy.clone(),
+                                "Copy"
                             }
                             DropdownMenuItem {
-                                left_section: TablerIcon::ClipboardCopy,
+                                left_section: TablerIcon::Clipboard,
                                 disabled: store_menu.new_node,
-                                onclick: on_paste_image.clone(),
-                                "Paste Picture"
+                                onclick: on_paste.clone(),
+                                "Paste"
+                            }
+                            DropdownMenuDivider {}
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Share,
+                                    disabled: store_menu.share,
+                                    onclick: on_share.clone(),
+                                    "Share..."
+                                }
+                            }
+                            // How the store reaches other places: only what
+                            // can apply to it now (principle 2).
+                            if CAN_ADMINISTER_STORES && !store_menu.link_to_remote {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Cloud,
+                                    onclick: on_link_to_remote.clone(),
+                                    "Link to Remote..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES && !store_menu.host {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudUpload,
+                                    onclick: on_host_on_cloud.clone(),
+                                    "Host on Pimble Cloud..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES && !store_menu.stop_relaying {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::ShareOff,
+                                    onclick: on_stop_relaying.clone(),
+                                    "Stop Sharing from This Computer..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES && !store_menu.unlink {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Unlink,
+                                    onclick: on_unlink_from_remote.clone(),
+                                    "Unlink from Remote"
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES && !store_menu.remove_replica {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Trash,
+                                    onclick: on_remove_replica.clone(),
+                                    "Remove Replica..."
+                                }
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
                                     disabled: store_menu.mount_store,
                                     onclick: on_mount_store.clone(),
-                                    "Mount Store..."
+                                    "Mount Store Here..."
                                 }
                             }
                             if CAN_ADMINISTER_STORES {
@@ -2126,74 +2032,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     "Mount Remote Store Here..."
                                 }
                             }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
-                                left_section: TablerIcon::Link,
-                                onclick: on_copy_link.clone(),
-                                "Copy Link"
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Copy,
-                                    disabled: store_menu.copy_as_mount_source,
-                                    onclick: on_copy_as_mount_source.clone(),
-                                    "Copy as Mount Source"
-                                }
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::ClipboardCopy,
-                                    disabled: store_menu.paste_mount,
-                                    onclick: on_paste_mount.clone(),
-                                    "Paste Mount Here"
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Cloud,
-                                    disabled: store_menu.link_to_remote,
-                                    onclick: on_link_to_remote.clone(),
-                                    "Link to Remote..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::CloudUpload,
-                                    disabled: store_menu.host,
-                                    onclick: on_host_on_cloud.clone(),
-                                    "Host on Pimble Cloud..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Share,
-                                    disabled: store_menu.share,
-                                    onclick: on_share.clone(),
-                                    "Share..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::ShareOff,
-                                    disabled: store_menu.stop_relaying,
-                                    onclick: on_stop_relaying.clone(),
-                                    "Stop Sharing from This Computer..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Unlink,
-                                    disabled: store_menu.unlink,
-                                    onclick: on_unlink_from_remote.clone(),
-                                    "Unlink from Remote"
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Trash,
-                                    disabled: store_menu.remove_replica,
-                                    onclick: on_remove_replica.clone(),
-                                    "Remove Replica..."
-                                }
+                                left_section: TablerIcon::Palette,
+                                disabled: store_menu.appearance,
+                                onclick: on_appearance,
+                                "Appearance..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::History,
@@ -2201,13 +2045,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_recently_deleted,
                                 "Recently Deleted..."
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Palette,
-                                disabled: store_menu.appearance,
-                                onclick: on_appearance,
-                                "Appearance..."
-                            }
                             if CAN_ADMINISTER_STORES {
+                                DropdownMenuDivider {}
                                 DropdownMenuItem {
                                     left_section: TablerIcon::X,
                                     onclick: on_close_store.clone(),
@@ -2218,30 +2057,33 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             } else if is_mount {
+                // New makes in the mount's source, never under the mount node
+                // itself (the server rejects a mount node as a parent).
                 rsx! {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
                             {mount_menu_note}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::FilePlus,
-                                disabled: !can_write_mount_source,
-                                onclick: on_new_child_mount,
-                                "New Node"
-                            }
-                            if CAN_ADMINISTER_STORES {
+                            for item in crate::creating::kinds(store) {
                                 DropdownMenuItem {
-                                    left_section: TablerIcon::Share,
-                                    disabled: true,
-                                    "Share..."
+                                    key: item.label.clone(),
+                                    left_section: item.icon,
+                                    disabled: !can_write_mount_source,
+                                    onclick: {
+                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                        move || crate::creating::make_in_row(store, &kind, &nv)
+                                    },
+                                    {format!("New {}", item.label)}
                                 }
                             }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
                                 disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
                                 disabled: !can_write_tree,
@@ -2263,7 +2105,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // document opens in the new half. Off with four panes open.
                 // With several rows selected and this one among them, the
                 // menu acts on all of them where that makes sense (Delete,
-                // Copy Link) and turns off what is for one row alone
+                // Cut, Copy) and turns off what is for one row alone
                 // (docs/TREE_CONTRACT.md "Multi-select").
                 let nv_count = nv_for_context_menu.clone();
                 let acts_on = Memo::new(move || tree_state.selected.with(|s| if s.contains(&nv_count) { s.len().max(1) } else { 1 }));
@@ -2287,40 +2129,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_open_in_split.clone(),
                                 "Open in Split View"
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::FilePlus,
-                                disabled: !can_write_tree,
-                                onclick: on_new_child,
-                                "New Node"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Chalkboard,
-                                disabled: !can_write_tree,
-                                onclick: on_new_whiteboard.clone(),
-                                "New Canvas"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Table,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_sheet.clone(),
-                                "New Sheet"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Messages,
-                                disabled: store_menu.new_node,
-                                onclick: on_new_discussion.clone(),
-                                "New Discussion"
-                            }
-                            for item in store.recipes.get() {
+                            for item in crate::creating::kinds(store) {
                                 DropdownMenuItem {
-                                    key: format!("{} {}", item.plugin, item.recipe.id),
-                                    left_section: item.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban),
-                                    disabled: store_menu.new_node,
+                                    key: item.label.clone(),
+                                    left_section: item.icon,
+                                    disabled: !can_write_tree,
                                     onclick: {
-                                        let (on_recipe, recipe) = (on_recipe.clone(), item.recipe.clone());
-                                        move || on_recipe(recipe.clone())
+                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                        move || crate::creating::make_in_row(store, &kind, &nv)
                                     },
-                                    {item.recipe.label.clone()}
+                                    {format!("New {}", item.label)}
                                 }
                             }
                             DropdownMenuItem {
@@ -2328,69 +2146,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 // A commenter's too (docs/DISCUSSIONS_CONTRACT.md section 7).
                                 disabled: !access_now.allows_comment(),
                                 onclick: on_start_discussion.clone(),
-                                "Start a Discussion"
+                                "Discuss"
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Photo,
-                                disabled: !can_write_tree,
-                                onclick: on_new_image.clone(),
-                                "New Canvas from Picture..."
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::ClipboardCopy,
-                                disabled: !can_write_tree,
-                                onclick: on_paste_image.clone(),
-                                "Paste Picture"
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Link,
-                                    disabled: !can_write_tree,
-                                    onclick: on_mount_store.clone(),
-                                    "Mount Store..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::CloudDownload,
-                                    disabled: !can_write_tree,
-                                    onclick: on_mount_remote_store.clone(),
-                                    "Mount Remote Store Here..."
-                                }
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Link,
-                                onclick: on_copy_link.clone(),
-                                "Copy Link"
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Copy,
-                                    onclick: on_copy_as_mount_source.clone(),
-                                    "Copy as Mount Source"
-                                }
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::ClipboardCopy,
-                                    disabled: no_mount_source || !can_write_tree,
-                                    onclick: on_paste_mount.clone(),
-                                    "Paste Mount Here"
-                                }
-                            }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,
                                 disabled: {move || !can_write_tree || several()},
                                 onclick: on_rename.clone(),
                                 "Rename"
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Share,
-                                    disabled: {move || share_disabled || several()},
-                                    onclick: on_share.clone(),
-                                    "Share..."
-                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
@@ -2406,6 +2169,49 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     "Show as Outline"
                                 }
                             }
+                            DropdownMenuDivider {}
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Scissors,
+                                disabled: !can_write_tree,
+                                onclick: on_cut.clone(),
+                                "Cut"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Copy,
+                                onclick: on_copy.clone(),
+                                "Copy"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Clipboard,
+                                disabled: {move || !can_write_tree || several()},
+                                onclick: on_paste.clone(),
+                                "Paste"
+                            }
+                            if mounts_apply {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Link,
+                                    disabled: !can_write_tree,
+                                    onclick: on_mount_store.clone(),
+                                    "Mount Store Here..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudDownload,
+                                    disabled: !can_write_tree,
+                                    onclick: on_mount_remote_store.clone(),
+                                    "Mount Remote Store Here..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Share,
+                                    disabled: {move || share_disabled || several()},
+                                    onclick: on_share.clone(),
+                                    "Share..."
+                                }
+                            }
+                            DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
                                 disabled: !can_write_tree,
@@ -2527,34 +2333,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
-        // Toolbar button handlers — new node (in selected store, or first store)
+        // The explorer's "+" (docs/MENUS_CONTRACT.md section 3.2): the list of
+        // what can be made (`crate::creating`), made beside the selected row.
+        // With no store open there is nowhere to make one: on the desktop
+        // "New Store..." is a menu item away; a browser has no menu bar, so
+        // "+" offers the store instead of an empty list.
         let on_new_node = move || {
-            // Try to use the currently selected store
-            let result = store.selected_id.get()
-                .and_then(|sel| parse_tree_value(&sel))
-                .map(|(s_id, _)| s_id)
-                .filter(|s_id| store.root_node_id(*s_id).is_some())
-                // Fall back to first store
-                .or_else(|| untracked(|| store.store_ids.with(|ids| ids.first().copied())))
-                // Under the store's root, as its row's "New Node" makes one,
-                // and not where this device may only read
-                // (docs/NODE_DOCUMENT_CONTRACT.md section 5): the row's "New
-                // Node" is disabled there, and so is this.
-                .and_then(|s_id| pimble_core::plan::create_parent(&store.view(), s_id, None).ok());
-            match result {
-                Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
-                    store_id: s_id,
-                    parent_id: Some(root_id),
-                    title: String::new(),
-                    init: None,
-                    place: Default::default(),
-                }),
-                // Nothing to create a node under. On the desktop "New
-                // Store..." is a menu item away; a browser has no menu bar, so
-                // "+" offers the store instead of doing nothing at all.
-                None if CAN_CREATE_HOSTED_STORES => open_new_store_modal(store),
-                None => {}
+            let no_store = untracked(|| store.store_ids.with(|ids| ids.is_empty()));
+            if no_store {
+                if CAN_CREATE_HOSTED_STORES {
+                    open_new_store_modal(store);
+                }
+                return;
             }
+            store.new_menu_open.update(|open| *open = !*open);
         };
 
         // The split view: one to four panes beside the explorer, each with
@@ -3061,6 +2853,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // backend makes the store, mints its key if it is encrypted, and asks
         // for a token that carries the new grant; the store then arrives
         // through `StoresListed` like any other.
+        // Paste with several things it could do (`crate::pasting`).
+        let paste_chooser = crate::pasting::render_chooser(__scope, store);
+
         let new_store_modal = rsx! {
             Modal {
                 opened_fn: move || store.new_store_modal_open.get(),
@@ -4336,14 +4131,39 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     }
                                 }
 
-                                div {
-                                    title: "New Node",
-                                    style: "display: inline-flex;",
-                                    ActionIcon {
-                                        icon: TablerIcon::Plus,
-                                        variant: "subtle",
-                                        size: "xs",
-                                        onclick: on_new_node,
+                                DropdownMenu {
+                                    opened_fn: move || store.new_menu_open.get(),
+                                    on_close: move || store.new_menu_open.set(false),
+                                    close_on_click_outside: true,
+                                    close_on_item_click: true,
+                                    position: "bottom-end",
+                                    DropdownMenuTarget {
+                                        div {
+                                            title: "New",
+                                            style: "display: inline-flex;",
+                                            ActionIcon {
+                                                icon: TablerIcon::Plus,
+                                                variant: "subtle",
+                                                size: "xs",
+                                                onclick: on_new_node,
+                                            }
+                                        }
+                                    }
+                                    DropdownMenuDropdown {
+                                        for item in crate::creating::kinds(store) {
+                                            DropdownMenuItem {
+                                                key: item.label.clone(),
+                                                left_section: item.icon,
+                                                onclick: {
+                                                    let kind = item.kind.clone();
+                                                    move || {
+                                                        store.new_menu_open.set(false);
+                                                        crate::creating::make_from_plus(store, &kind);
+                                                    }
+                                                },
+                                                {item.label.clone()}
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -4570,6 +4390,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {share_modal}
                 {shares_modal}
                 {share_name_question}
+                {paste_chooser}
                 {body}
             }
         };
@@ -4605,6 +4426,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {share_modal}
                 {shares_modal}
                 {share_name_question}
+                {paste_chooser}
                 {body}
             }
         };

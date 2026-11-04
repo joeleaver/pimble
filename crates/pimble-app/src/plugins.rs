@@ -158,8 +158,8 @@ fn recipes() -> Vec<crate::state::PluginRecipe> {
 
 /// A row's recipe item: make what `recipe` says under `parent`, through the
 /// app's own API, as the person's own edit (no plugin code runs).
-pub(crate) fn make(store: AppStore, store_id: pimble_core::StoreId, parent_id: pimble_core::NodeId, recipe: RecipeDecl) {
-    store.send(BackendCommand::MakeFromRecipe { store_id, parent_id, recipe });
+pub(crate) fn make(store: AppStore, store_id: pimble_core::StoreId, parent_id: pimble_core::NodeId, recipe: RecipeDecl, place: pimble_core::Place) {
+    store.send(BackendCommand::MakeFromRecipe { store_id, parent_id, recipe, place });
 }
 
 // ── What the host knows, for each plugin view ─────────────────────────────────

@@ -510,6 +510,13 @@ pub struct AppStore {
     // display title of the node last copied as a mount source, if any.
     pub mount_source: Signal<Option<(StoreId, NodeId, String)>>,
 
+    // "Paste" with more than one thing it could do: the row it was chosen on
+    // and the choices, while the chooser is open (`crate::pasting`).
+    pub paste_offer: Signal<Option<crate::pasting::Offer>>,
+    // The explorer's "+" list is open (`crate::creating`; File > New > More...
+    // opens it too).
+    pub new_menu_open: Signal<bool>,
+
     // Editor dirty flag — set when user edits content, cleared on save/load
     pub editor_dirty: Signal<bool>,
 
@@ -968,6 +975,8 @@ impl AppStore {
             drop_hint: Signal::new(None),
             pending_mount: Signal::new(None),
             mount_source: Signal::new(None),
+            paste_offer: Signal::new(None),
+            new_menu_open: Signal::new(false),
             editor_dirty: Signal::new(false),
             live_label: Signal::new(HashMap::new()),
             client_id: Signal::new(String::new()),

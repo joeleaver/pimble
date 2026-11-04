@@ -61,11 +61,11 @@ thread_local! {
     static CUT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn cut_rows() -> Vec<String> {
+pub(crate) fn cut_rows() -> Vec<String> {
     CUT.with(|c| c.borrow().clone())
 }
 
-fn set_cut(store: AppStore, values: Vec<String>) {
+pub(crate) fn set_cut(store: AppStore, values: Vec<String>) {
     let hint = match values.as_slice() {
         [] => None,
         [one] => Some(format!("Cut {}. Ctrl+V puts it after a row, Ctrl+Shift+V into one.", label_of(store, one))),
@@ -92,6 +92,24 @@ pub(crate) fn label_of(store: AppStore, value: &str) -> String {
 /// address), which a sibling at the same level shares.
 fn suffix(value: &str) -> String {
     value.find('/').map(|at| value[at..].to_string()).unwrap_or_default()
+}
+
+/// Paste the cut rows inside `row`, last: a row menu's Paste
+/// (docs/MENUS_CONTRACT.md section 3.1), judged as a drop is.
+pub(crate) fn move_cut_into(store: AppStore, row: &str) {
+    let cut = cut_rows();
+    if cut.is_empty() {
+        return;
+    }
+    let drop = TreeDrop {
+        dragged: cut,
+        parent: Some(row.to_string()),
+        slot: TreeSlot::Last,
+        over: row.to_string(),
+        zone: DropZone::Inside,
+    };
+    set_cut(store, Vec::new());
+    deliver(store, &drop);
 }
 
 /// Send what a drop-shaped move plans, or say why not. A key that would put
@@ -159,6 +177,8 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
         Action::Paste { into } => {
             let cut = cut_rows();
             if cut.is_empty() {
+                // Nothing cut: a straight paste into the cursor row.
+                crate::pasting::paste_straight(store, &cursor);
                 return true;
             }
             let drop = TreeDrop {
@@ -171,7 +191,7 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
             set_cut(store, Vec::new());
             deliver(store, &drop);
         }
-        Action::CopyLink => crate::app::copy_link(store, &cursor),
+        Action::CopyLink => crate::app::copy_rows(store, key.carried()),
         Action::Escape => {
             let several = untracked(|| tree_state.selected.with(|s| s.len() > 1));
             if !cut_rows().is_empty() {

@@ -1820,14 +1820,19 @@ pub(crate) fn build_board(board: &Board, author: Option<&Author>, picture: Optio
 /// creates it (two devices creating one board would keep only one).
 /// The node is `pimble_api::recipes::canvas`; `from_picture` picks its icon.
 pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, from_picture: bool, board: Vec<u8>, request: Option<u64>) {
-    let (title, init) = NodeInit::of(pimble_api::recipes::canvas(title, board, from_picture), request);
-    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place: Default::default() });
+    create_board_node_at(store, store_id, parent_id, title, from_picture, board, request, Default::default());
 }
 
-/// A row's "New Canvas": an empty board under `parent_id`.
-pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+#[allow(clippy::too_many_arguments)]
+fn create_board_node_at(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, from_picture: bool, board: Vec<u8>, request: Option<u64>, place: pimble_core::Place) {
+    let (title, init) = NodeInit::of(pimble_api::recipes::canvas(title, board, from_picture), request);
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place });
+}
+
+/// "New Canvas": an empty board under `parent_id`, at `place`.
+pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId, place: pimble_core::Place) {
     if let Some(board) = new_board(None) {
-        create_board_node(store, store_id, parent_id, "Canvas", false, board, None);
+        create_board_node_at(store, store_id, parent_id, "Canvas", false, board, None, place);
     }
 }
 

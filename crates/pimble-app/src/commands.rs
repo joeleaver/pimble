@@ -227,9 +227,9 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             }
         }
 
-        C::MakeFromRecipe { store_id, parent_id, recipe } => {
+        C::MakeFromRecipe { store_id, parent_id, recipe, place } => {
             let init = pimble_api::recipes::metanode(&recipe.title, recipe.icon.as_deref(), &recipe.viewer, recipe.depth);
-            let node_id = match api.backend().create_node(store_id, parent_id, init, pimble_core::Place::Last).await {
+            let node_id = match api.backend().create_node(store_id, parent_id, init, place).await {
                 Ok(node_id) => node_id,
                 Err(e) => return Ok(failed(e)),
             };

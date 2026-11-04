@@ -47,7 +47,7 @@ pub enum BackendCommand {
     /// (docs/KANBAN_CONTRACT.md "New Kanban"): a metanode with its viewer and
     /// source written in its create, then its first children in order.
     /// Answers with `NodeCreated` for the metanode.
-    MakeFromRecipe { store_id: StoreId, parent_id: NodeId, recipe: pimble_plugin_abi::RecipeDecl },
+    MakeFromRecipe { store_id: StoreId, parent_id: NodeId, recipe: pimble_plugin_abi::RecipeDecl, place: pimble_core::Place },
     /// Create an attachment of `host_id` (a discussion on it,
     /// docs/DISCUSSIONS_CONTRACT.md section 1): the host is not edited.
     /// Answers with `AttachmentCreated`.

@@ -840,10 +840,10 @@ fn init(request: u64) -> NodeInit {
 
 /// A row's "New Discussion": a discussion node of its own under `parent_id`,
 /// opened in the focused pane once it is made.
-pub(crate) fn new_discussion(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+pub(crate) fn new_discussion(store: AppStore, store_id: StoreId, parent_id: NodeId, place: pimble_core::Place) {
     let request = next_request();
     OPEN_AFTER.with(|o| o.borrow_mut().insert(request, store.focused()));
-    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title: String::new(), init: Some(init(request)), place: pimble_core::Place::Last });
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title: String::new(), init: Some(init(request)), place });
 }
 
 /// "Start a Discussion" on node `host_id`: an attachment of it, opened beside

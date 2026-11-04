@@ -713,7 +713,7 @@ fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, 
 // ── Making one ───────────────────────────────────────────────────────────
 
 /// A row's "New Sheet": a sheet node under `parent_id`.
-pub(crate) fn new_sheet(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+pub(crate) fn new_sheet(store: AppStore, store_id: StoreId, parent_id: NodeId, place: pimble_core::Place) {
     let recipe = match pimble_api::recipes::sheet("Sheet", None) {
         Ok(recipe) => recipe,
         Err(e) => {
@@ -722,7 +722,7 @@ pub(crate) fn new_sheet(store: AppStore, store_id: StoreId, parent_id: NodeId) {
         }
     };
     let (title, init) = NodeInit::of(recipe, None);
-    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place: pimble_core::Place::Last });
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place });
 }
 
 // ── What formulas see ────────────────────────────────────────────────────

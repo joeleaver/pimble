@@ -15,6 +15,8 @@
 
 use std::rc::Rc;
 
+use rinch::prelude::untracked;
+
 use crate::state::AppStore;
 
 /// One line in a menu.
@@ -27,6 +29,11 @@ pub enum MenuEntry {
         action: Rc<dyn Fn()>,
     },
     Separator,
+    /// A submenu.
+    Sub {
+        label: &'static str,
+        entries: Vec<MenuEntry>,
+    },
 }
 
 impl MenuEntry {
@@ -75,8 +82,29 @@ fn account_entries(store: AppStore) -> Vec<MenuEntry> {
     ]
 }
 
+/// File > New (docs/MENUS_CONTRACT.md section 3.2): the kinds `crate::creating`
+/// lists, made where the explorer's "+" makes them. A menu bar is built once,
+/// before the plugins load, so their kinds are behind "More...", which opens
+/// the "+" list.
+fn new_entries(store: AppStore) -> Vec<MenuEntry> {
+    use crate::creating::{make_from_plus, Kind};
+    let make = move |kind: Kind| move || {
+        make_from_plus(store, &kind);
+    };
+    vec![
+        MenuEntry::item("Text", "", make(Kind::Text)),
+        MenuEntry::item("Canvas", "", make(Kind::Canvas)),
+        MenuEntry::item("Sheet", "", make(Kind::Sheet)),
+        MenuEntry::item("Discussion", "", make(Kind::Discussion)),
+        MenuEntry::Separator,
+        MenuEntry::item("More...", "", move || store.new_menu_open.set(true)),
+        MenuEntry::Separator,
+        MenuEntry::item("Canvas from Picture...", "", make(Kind::CanvasFromPicture)),
+    ]
+}
+
 fn file_entries(store: AppStore) -> Vec<MenuEntry> {
-    let mut entries = Vec::new();
+    let mut entries = vec![MenuEntry::Sub { label: "New", entries: new_entries(store) }, MenuEntry::Separator];
 
     // "New Store..." exists on both, and means something different on each: a
     // directory the desktop picks a path for, a hosted store the browser asks
@@ -139,7 +167,27 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
 }
 
 fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
+    // The explorer's selected row, as its menu's Cut, Copy and Paste
+    // (docs/MENUS_CONTRACT.md section 3.1). No shortcuts: Ctrl+X, C and V are
+    // the text's in a note, and the explorer's own in the explorer.
+    let selected = move || untracked(|| store.selected_id.get());
     vec![
+        MenuEntry::item("Cut Node", "", move || {
+            if let Some(row) = selected().filter(|v| matches!(crate::state::parse_tree_value(v), Some((_, Some(_))))) {
+                crate::tree_keys::set_cut(store, vec![row]);
+            }
+        }),
+        MenuEntry::item("Copy Node", "", move || {
+            if let Some(row) = selected() {
+                crate::app::copy_rows(store, &[row]);
+            }
+        }),
+        MenuEntry::item("Paste into Node...", "", move || {
+            if let Some(row) = selected() {
+                crate::pasting::paste(store, &row);
+            }
+        }),
+        MenuEntry::Separator,
         // docs/IMAGES_CONTRACT.md "Showing and inserting images": into the
         // focused pane's note, at its caret. With no note there, or one this
         // device may only read, it says so.
@@ -156,7 +204,7 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
         // A discussion at the caret, drawn in the margin (commenters too).
         MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
-        MenuEntry::item("Start a Discussion", "", move || crate::discussions::start_on_focused(store)),
+        MenuEntry::item("Discuss", "", move || crate::discussions::start_on_focused(store)),
         MenuEntry::Separator,
         MenuEntry::item("Delete", "", move || {
         // A native menu item cannot be greyed out reactively, so the check a
@@ -219,25 +267,24 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
 pub fn build_menus(store: AppStore) -> Vec<(&'static str, rinch::menu::Menu)> {
     use rinch::menu::{Menu, MenuItem};
 
-    menu_spec(store)
-        .into_iter()
-        .map(|section| {
-            let mut menu = Menu::new();
-            for entry in section.entries {
-                menu = match entry {
-                    MenuEntry::Separator => menu.separator(),
-                    MenuEntry::Item { label, shortcut, action } => {
-                        let mut item = MenuItem::new(label);
-                        if !shortcut.is_empty() {
-                            item = item.shortcut(shortcut);
-                        }
-                        menu.item(item.on_click(move || action()))
+    fn build(entries: Vec<MenuEntry>) -> Menu {
+        let mut menu = Menu::new();
+        for entry in entries {
+            menu = match entry {
+                MenuEntry::Separator => menu.separator(),
+                MenuEntry::Sub { label, entries } => menu.submenu(label, build(entries)),
+                MenuEntry::Item { label, shortcut, action } => {
+                    let mut item = MenuItem::new(label);
+                    if !shortcut.is_empty() {
+                        item = item.shortcut(shortcut);
                     }
-                };
-            }
-            (section.title, menu)
-        })
-        .collect()
+                    menu.item(item.on_click(move || action()))
+                }
+            };
+        }
+        menu
+    }
+    menu_spec(store).into_iter().map(|section| (section.title, build(section.entries))).collect()
 }
 
 #[cfg(test)]

@@ -28,6 +28,8 @@ pub mod app;
 pub mod brand;
 pub mod appearance;
 pub mod boards;
+pub mod creating;
+pub mod pasting;
 pub mod commands;
 pub mod editor;
 pub mod events;
