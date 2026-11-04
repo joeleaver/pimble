@@ -1,7 +1,8 @@
-//! The kanban viewer (docs/KANBAN_CONTRACT.md wave 1): a metanode whose source
-//! is its subtree two levels deep, drawn as columns (the first level) of cards
-//! (the second), in the tree's own order, so a card's place in its column is
-//! its priority.
+//! The kanban viewer (docs/KANBAN_CONTRACT.md waves 1 and 2): a metanode whose
+//! source is its subtree two levels deep, drawn as columns (the first level)
+//! of cards (the second), in the tree's own order, so a card's place in its
+//! column is its priority. A child that is itself a kanban is a lane, drawn
+//! below from its own source (`board`'s module comment).
 //!
 //! Everything it changes is an ordinary edit of real nodes through the Pimble
 //! API, judged by core as the explorer's edits are: a rename is the one write
@@ -13,15 +14,15 @@
 //! change the API hears (`next_change`, `Forest::touched_by`), from this
 //! window, another device, the CLI or an agent.
 //!
-//! Moving is by dragging, by the card's "Move to" buttons and by the keyboard
-//! (Alt+Shift+arrows, as in the explorer; a column moves with
-//! Alt+Shift+Left/Right once its header is chosen). Drags are rinch's
+//! Moving is by dragging and by the keyboard (Alt+Shift+arrows, as in the
+//! explorer, Up and Down carrying a card into the lane above or below; a
+//! column moves with Alt+Shift+Left/Right once its header is chosen). Drags are rinch's
 //! sortable lists (joeleaver/rinch#2093): each column's cards are a vertical
 //! list of the group "cards", and the columns a horizontal list of the group
 //! "columns" dragged by their headers. While a drag is over a place, the list
 //! asks [`Kanban::judge_drop`], `plan`'s judgement over the documents held,
 //! and a refusal's sentence shows at the caret; a drop becomes the same
-//! `Target` the menu and the keys make (`board::drop_of`), and
+//! `Target` the keys make (`board::drop_of`), and
 //! `Kanban::move_to` is the one function every kind of move ends in.
 //!
 //! Presence is the app's (docs/PRESENCE_CONTRACT.md "Plugins"): choosing a
@@ -41,7 +42,7 @@ use pimble_plugin_sdk::pimble_ui::presence::{more_label, PersonChip};
 use pimble_plugin_sdk::prelude::*;
 use rinch::core::dom::NodeId as DomId;
 
-use board::{board_of, drop_of, key_of, step_card, step_column, to_column, Board, Step, Target};
+use board::{board_of, drop_of, key_of, step_card, step_column, Board, Lane, Step, Target};
 
 /// The sortable groups: a drag of one only ever lands in lists of its own,
 /// so a card never lands among the columns or a column among the cards.
@@ -61,34 +62,26 @@ fn describe() -> Manifest {
         .writes(StoreAsk::Chosen)
 }
 
-/// What is chosen on the board: a card, or a column by its header.
+/// What is chosen on the board: a card, a column by its header, or a lane by
+/// its header (its node on the board).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Chosen {
     Card(Addr),
     Column(Addr),
+    Lane(Addr),
 }
 
 impl Chosen {
     fn addr(self) -> Addr {
         match self {
-            Chosen::Card(a) | Chosen::Column(a) => a,
+            Chosen::Card(a) | Chosen::Column(a) | Chosen::Lane(a) => a,
         }
     }
 }
 
-/// A column a card's "Move to" offers.
-#[derive(Debug, Clone, PartialEq)]
-struct MoveTo {
-    to: Addr,
-    name: String,
-}
-
-/// The columns a card in column `home` may be moved to, tracked.
-fn move_targets(board: Signal<Board>, home: Addr, writable: bool) -> Vec<MoveTo> {
-    if !writable {
-        return Vec::new();
-    }
-    board.with(|b| b.columns.iter().filter(|c| c.addr != home).map(|c| MoveTo { to: c.addr, name: c.label.clone() }).collect())
+/// A kanban: a node shown with this viewer.
+fn is_kanban(node: &pimble_plugin_sdk::pimble_core::Node) -> bool {
+    node.metadata.metanode.as_ref().is_some_and(|m| m.viewer == VIEWER)
 }
 
 /// A move that `plan` or the metanode warned about, waiting for "Move anyway".
@@ -126,8 +119,9 @@ fn dom_id(addr: Addr) -> String {
 }
 
 impl Kanban {
-    /// Read the forest into the board.
-    async fn read(&self) -> Option<Forest> {
+    /// Read the forest into the board, and each lane's own forest: the
+    /// forests read, which say what a change must touch to be read again.
+    async fn read(&self) -> Option<Vec<Forest>> {
         // The stores listed again with every read: a drag is judged
         // synchronously over what is held (`judge_drop`), so a mounted
         // column's store closed since is refused at the caret, not after
@@ -135,7 +129,26 @@ impl Kanban {
         let _ = self.api.stores().await;
         match self.api.metanode_source(self.metanode).await {
             Ok(forest) => {
-                let board = board_of(&forest, display_label);
+                // The tops that are kanbans are lanes: a kanban itself, or a
+                // mount of one (read from its source).
+                let tops: Vec<(Addr, pimble_plugin_sdk::pimble_core::Node)> = forest.tops().map(|t| (t.addr, t.node.clone())).collect();
+                let mut lanes: Vec<(Addr, Forest)> = Vec::new();
+                for (top, node) in tops {
+                    let source = if is_kanban(&node) {
+                        Some(top)
+                    } else if let Some(m) = node.mount_ref() {
+                        let source = Addr::new(m.source_store, m.source_node);
+                        self.api.node(source).await.ok().filter(is_kanban).map(|_| source)
+                    } else {
+                        None
+                    };
+                    let Some(source) = source else { continue };
+                    match self.api.metanode_source(source).await {
+                        Ok(lane) => lanes.push((top, lane)),
+                        Err(e) => self.status.set(e.sentence()),
+                    }
+                }
+                let board = board_of(&forest, &lanes, display_label);
                 // Something chosen that is no longer on the board is let go,
                 // unless it is being named: a card just made is chosen before
                 // the board has read it.
@@ -143,7 +156,8 @@ impl Kanban {
                 if let Some(chosen) = untracked(|| self.chosen.get()).filter(|c| Some(c.addr()) != naming) {
                     let there = match chosen {
                         Chosen::Card(a) => board.find_card(a).is_some(),
-                        Chosen::Column(a) => board.column_index(a).is_some(),
+                        Chosen::Column(a) => board.find_column(a).is_some(),
+                        Chosen::Lane(a) => board.lane_of_node(a).is_some(),
                     };
                     if !there {
                         self.choose(None);
@@ -153,7 +167,9 @@ impl Kanban {
                     self.board.set(board);
                 }
                 self.loaded.set(true);
-                Some(forest)
+                let mut forests = vec![forest];
+                forests.extend(lanes.into_iter().map(|(_, lane)| lane));
+                Some(forests)
             }
             Err(e) => {
                 self.status.set(e.sentence());
@@ -187,17 +203,19 @@ impl Kanban {
     /// in one, a column along the board. Judged in the metanode first, so a
     /// refusal is the explorer's sentence and nothing is sent; a warning
     /// (another store, leaving a share, leaving this view) waits for "Move
-    /// anyway" unless `confirmed`. A drop (rinch #2091) will call this with
-    /// `board::drop_target`'s answer.
+    /// anyway" unless `confirmed`. It is judged in the lane it lands in (the
+    /// lane's own kanban), so a card carried into another lane is not taken
+    /// for one leaving the view.
     fn move_to(&self, node: Addr, target: Target, confirmed: bool) {
         let k = self.clone();
+        let judged_in = untracked(|| self.board.with(|b| b.lane_for_parent(target.parent).map(|l| l.metanode))).unwrap_or(self.metanode);
         self.waiting.set(None);
         spawn_local(async move {
             // Judged against the stores open now: a column mounted from a
             // store closed since the board was read is refused, not planned.
             let _ = k.api.stores().await;
             let edit = MetanodeEdit::Move { nodes: vec![node], target: target.parent, place: target.place };
-            let judged = match k.api.judge_in_metanode(k.metanode, edit).await {
+            let judged = match k.api.judge_in_metanode(judged_in, edit).await {
                 Ok(judged) => judged,
                 Err(e) => return k.say(e.sentence()),
             };
@@ -220,6 +238,7 @@ impl Kanban {
                             k.choose(chosen.map(|c| match c {
                                 Chosen::Card(_) => Chosen::Card(to.addr),
                                 Chosen::Column(_) => Chosen::Column(to.addr),
+                                Chosen::Lane(_) => Chosen::Lane(to.addr),
                             }));
                         }
                     }
@@ -266,7 +285,7 @@ impl Kanban {
         let (node, target) = match untracked(|| self.chosen.get()) {
             Some(Chosen::Card(card)) => (card, step_card(&board, card, step)),
             Some(Chosen::Column(column)) => (column, step_column(&board, column, step)),
-            None => return,
+            Some(Chosen::Lane(_)) | None => return,
         };
         if let Some(target) = target {
             self.move_to(node, target, false);
@@ -333,6 +352,36 @@ impl Kanban {
         });
     }
 
+    /// "+ Add lane": a kanban under the board, last, with the columns of the
+    /// lane above it (the first columns when there are none), then its name
+    /// typed in place.
+    fn add_lane(&self) {
+        let k = self.clone();
+        let mut names: Vec<String> = untracked(|| self.board.with(|b| b.lanes.last().map(|l| l.columns.iter().map(|c| c.label.clone()).collect()).unwrap_or_default()));
+        if names.is_empty() {
+            names = FIRST_COLUMNS.iter().map(|n| n.to_string()).collect();
+        }
+        spawn_local(async move {
+            let init = pimble_api::recipes::metanode("", Some("layout-kanban"), VIEWER, 2);
+            let lane = match k.api.create(k.metanode, Place::Last, init).await {
+                Ok(lane) => lane,
+                Err(e) => return k.say(e.sentence()),
+            };
+            for name in names {
+                let made = match pimble_api::recipes::document(&name, None) {
+                    Ok(init) => k.api.create(lane, Place::Last, init).await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = made {
+                    k.say(e.sentence());
+                    break;
+                }
+            }
+            k.choose(Some(Chosen::Lane(lane)));
+            k.start_rename(lane, String::new());
+        });
+    }
+
     /// Delete `card` (a tombstone, put back from Recently Deleted), asked of
     /// `plan` first as the explorer's Delete is.
     fn delete(&self, card: Addr) {
@@ -381,20 +430,22 @@ impl Kanban {
             self.choose(walk(&board, chosen, step).or(chosen));
             return true;
         }
-        let writable = |addr: Addr| match board.card(addr) {
-            Some(card) => card.writable,
-            None => board.columns.iter().find(|c| c.addr == addr).is_some_and(|c| c.writable),
+        let writable = |chosen: Chosen| match chosen {
+            Chosen::Card(a) => board.card(a).is_some_and(|c| c.writable),
+            Chosen::Column(a) => board.column(a).is_some_and(|c| c.writable),
+            Chosen::Lane(a) => board.lane_of_node(a).is_some_and(|l| l.writable),
         };
         match (key.key.as_str(), chosen) {
             ("Enter", Some(Chosen::Card(card))) => self.host.open(card),
-            ("F2", Some(c)) if writable(c.addr()) => {
+            ("F2", Some(c)) if writable(c) => {
                 let now = match c {
                     Chosen::Card(a) => board.card(a).map(|k| k.label.clone()),
-                    Chosen::Column(a) => board.columns.iter().find(|col| col.addr == a).map(|col| col.label.clone()),
+                    Chosen::Column(a) => board.column(a).map(|col| col.label.clone()),
+                    Chosen::Lane(a) => board.lane_of_node(a).and_then(|l| l.label.clone()),
                 };
                 self.start_rename(c.addr(), now.unwrap_or_default());
             }
-            ("Delete", Some(Chosen::Card(card))) if writable(card) => self.delete(card),
+            ("Delete", Some(c @ Chosen::Card(card))) if writable(c) => self.delete(card),
             ("Escape", Some(_)) => self.choose(None),
             _ => return false,
         }
@@ -403,40 +454,61 @@ impl Kanban {
 }
 
 /// Where a plain arrow takes the choice: along a column's cards, across to
-/// the neighbor column's card at the same height, or onto a column's header
-/// from above its first card.
+/// the neighbor column's card at the same height, onto a column's header from
+/// above its first card, and past a column's top or bottom into the lined-up
+/// column of the lane above or below.
 fn walk(board: &Board, chosen: Option<Chosen>, step: Step) -> Option<Chosen> {
-    let first = || board.columns.first().map(|c| c.cards.first().map_or(Chosen::Column(c.addr), |k| Chosen::Card(k.addr)));
+    let top_of = |l: usize, c: usize| {
+        let col = &board.lanes[l].columns[c];
+        col.cards.first().map_or(Chosen::Column(col.addr), |k| Chosen::Card(k.addr))
+    };
+    let first = || board.lanes.iter().position(|l| !l.columns.is_empty()).map(|l| top_of(l, 0));
     match chosen {
-        None => first(),
+        None | Some(Chosen::Lane(_)) => first(),
         Some(Chosen::Card(card)) => {
-            let (c, i) = board.find_card(card)?;
-            let column = &board.columns[c];
+            let (l, c, i) = board.find_card(card)?;
+            let column = &board.lanes[l].columns[c];
             match step {
                 Step::Up if i == 0 => Some(Chosen::Column(column.addr)),
                 Step::Up => Some(Chosen::Card(column.cards[i - 1].addr)),
-                Step::Down => column.cards.get(i + 1).map(|k| Chosen::Card(k.addr)),
+                Step::Down => match column.cards.get(i + 1) {
+                    Some(k) => Some(Chosen::Card(k.addr)),
+                    None => board.matching_column(l, c, l + 1).map(|to| Chosen::Column(board.lanes[l + 1].columns[to].addr)),
+                },
                 Step::Left | Step::Right => {
                     let to = if step == Step::Left { c.checked_sub(1)? } else { c + 1 };
-                    let next = board.columns.get(to)?;
+                    let next = board.lanes[l].columns.get(to)?;
                     Some(next.cards.get(i.min(next.cards.len().saturating_sub(1))).map_or(Chosen::Column(next.addr), |k| Chosen::Card(k.addr)))
                 }
             }
         }
         Some(Chosen::Column(column)) => {
-            let c = board.column_index(column)?;
+            let (l, c) = board.find_column(column)?;
+            let lane = &board.lanes[l];
             match step {
-                Step::Down => board.columns[c].cards.first().map(|k| Chosen::Card(k.addr)),
-                Step::Up => None,
-                Step::Left => c.checked_sub(1).map(|to| Chosen::Column(board.columns[to].addr)),
-                Step::Right => board.columns.get(c + 1).map(|col| Chosen::Column(col.addr)),
+                Step::Down => match lane.columns[c].cards.first() {
+                    Some(k) => Some(Chosen::Card(k.addr)),
+                    None => board.matching_column(l, c, l + 1).map(|to| Chosen::Column(board.lanes[l + 1].columns[to].addr)),
+                },
+                Step::Up => {
+                    let up = l.checked_sub(1)?;
+                    let col = &board.lanes[up].columns[board.matching_column(l, c, up)?];
+                    Some(col.cards.last().map_or(Chosen::Column(col.addr), |k| Chosen::Card(k.addr)))
+                }
+                Step::Left => c.checked_sub(1).map(|to| Chosen::Column(lane.columns[to].addr)),
+                Step::Right => lane.columns.get(c + 1).map(|col| Chosen::Column(col.addr)),
             }
         }
     }
 }
 
 const BOARD_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; height: 100%; box-sizing: border-box; outline: none;";
-const COLUMNS_STYLE: &str = "display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
+/// The lanes, top to bottom, scrolled together, so lined-up columns stay
+/// lined up.
+const COLUMNS_STYLE: &str = "display: flex; flex-direction: column; gap: 16px; overflow: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
+const LANE_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;";
+const LANE_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-start;";
+const LANE_HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 14px; padding: 2px 4px; border-radius: 4px; cursor: pointer; max-width: 600px;";
 // The sortable lists' layout is written here as well as in rinch's stylesheet,
 // which is the app's: an app on a rinch from before sortable lists still lays
 // the board out (only the caret and the refusal box need its stylesheet).
@@ -495,10 +567,10 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     {
         let k = k.clone();
         spawn_local(async move {
-            let mut forest = k.read().await;
+            let mut forests = k.read().await;
             while let Some(change) = k.api.next_change().await {
-                if forest.as_ref().map_or(true, |f| f.touched_by(&change)) {
-                    forest = k.read().await.or(forest);
+                if forests.as_ref().map_or(true, |fs| fs.iter().any(|f| f.touched_by(&change))) {
+                    forests = k.read().await.or(forests);
                 }
             }
         });
@@ -524,7 +596,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         let (k, doc) = (k.clone(), __scope.doc_weak());
         __scope.create_effect(move || {
             let Some(leader) = k.host.following() else { return };
-            let cards: Vec<Addr> = k.board.with(|b| b.columns.iter().flat_map(|c| c.cards.iter().map(|card| card.addr)).collect());
+            let cards: Vec<Addr> = k.board.with(|b| b.cards().map(|card| card.addr).collect());
             let Some(card) = cards.into_iter().find(|card| k.host.people_in(*card).iter().any(|p| p.key == leader)) else { return };
             let Some(doc) = doc.upgrade() else { return };
             let found = doc.borrow().query_selector(&format!("#{}", dom_id(card)));
@@ -537,9 +609,8 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         });
     }
 
-    let (kk, kw1, kw2, ka, kcol, kd) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kk, kw1, kw2, ka, kl) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let judge = drop_judge(&k);
-    let metanode_key = key_of(metanode);
     let (board, status, waiting, loaded, root) = (k.board, k.status, k.waiting, k.loaded, k.root);
     rsx! {
         div {
@@ -569,26 +640,88 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
                     Button { size: "xs", variant: "default", onclick: { let k = kw2.clone(); move || k.waiting.set(None) }, "Cancel" }
                 }
             }
-            if loaded.get() && board.with(|b| b.columns.is_empty()) {
+            if loaded.get() && board.with(|b| b.lanes.iter().all(|l| l.columns.is_empty()) && b.lanes.len() < 2) {
                 div { style: LINE_STYLE, "This kanban has no columns yet." }
             }
             div {
-                class: "kanban__columns",
+                class: "kanban__lanes",
                 style: COLUMNS_STYLE,
-                // The columns, dragged by their headers along the board. A
-                // list's props are read when it is drawn, so it is drawn again
-                // when the board's writability changes (the board reads as not
-                // writable until its first read).
-                if board.with(|b| b.writable) {
-                    {column_list(__scope, &kcol, &metanode_key, judge.clone(), true)}
-                } else {
-                    {column_list(__scope, &kd, &metanode_key, judge.clone(), false)}
+                // Each lane is drawn again when its name or what the person may
+                // do with it changes (a list's props are read when it is drawn);
+                // its columns follow the board on their own.
+                for lane in board.get().lanes {
+                    div {
+                        key: format!("{:?} {:?} {:?} {}", lane.metanode, lane.label, lane.color, lane.writable),
+                        class: "kanban__lane",
+                        style: LANE_STYLE,
+                        {render_lane(__scope, &kl, lane.clone(), judge.clone())}
+                    }
                 }
                 if board.with(|b| b.writable) {
                     div {
+                        class: "kanban__add-lane",
+                        style: "font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer; padding: 4px;",
+                        onclick: { let k = ka.clone(); move || k.add_lane() },
+                        "+ Add lane"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A lane's columns as the board has them now, tracked.
+fn lane_columns(board: Signal<Board>, lane: Addr) -> Vec<board::Column> {
+    board.with(|b| b.lanes.iter().find(|l| l.metanode == lane).map(|l| l.columns.clone()).unwrap_or_default())
+}
+
+/// One lane: its header (a named lane's: chosen, renamed in place, its
+/// people), its columns, a horizontal sortable list dragged by the headers,
+/// and "+ Add column". A lane the person may only read takes no drags.
+fn render_lane(__scope: &mut RenderScope, k: &Kanban, lane: Lane, judge: SortJudge) -> NodeHandle {
+    let (board, kd, kcol, ka) = (k.board, k.clone(), k.clone(), k.clone());
+    let writable = lane.writable;
+    let metanode = lane.metanode;
+    let header = match lane.node {
+        Some(node) => lane_header(__scope, k, &lane, node),
+        None => rsx! { span { style: "display: none;" } },
+    };
+    rsx! {
+        div {
+            style: "display: contents;",
+            {header}
+            div {
+                class: "kanban__lane-row",
+                style: LANE_ROW_STYLE,
+                SortableList {
+                    group: COLUMNS,
+                    id: key_of(metanode),
+                    axis: SortAxis::Horizontal,
+                    label: lane.label.clone().unwrap_or_else(|| "Columns".to_string()),
+                    class: "kanban__column-list",
+                    style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
+                    disabled: !writable,
+                    lift_keys: lift_keys(),
+                    judge: Some(judge.clone()),
+                    ondrop: move |m: SortMove| kd.drop_move(m),
+                    for column in lane_columns(board, metanode) {
+                        SortableItem {
+                            key: format!("{column:?}"),
+                            value: key_of(column.addr),
+                            handle: true,
+                            disabled: !(column.writable && writable),
+                            label: column.label.clone(),
+                            class: "kanban__column",
+                            style: COLUMN_STYLE,
+                            {render_column(__scope, &kcol, column.clone(), judge.clone(), writable)}
+                        }
+                    }
+                }
+                if writable {
+                    div {
                         class: "kanban__add-column",
                         style: "width: 200px; flex-shrink: 0; padding: 8px; font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer;",
-                        onclick: { let k = ka.clone(); move || k.add(k.metanode, false) },
+                        onclick: { let k = ka.clone(); move || k.add(metanode, false) },
                         "+ Add column"
                     }
                 }
@@ -597,33 +730,58 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
-/// The board's columns, a horizontal sortable list dragged by the headers;
-/// `writable` is the board's (a board the person may only read takes no
-/// drags at all).
-fn column_list(__scope: &mut RenderScope, k: &Kanban, metanode_key: &str, judge: SortJudge, writable: bool) -> NodeHandle {
-    let (board, kd, kcol) = (k.board, k.clone(), k.clone());
+/// A named lane's header: its name (renamed in place), its people, and while
+/// chosen, Rename.
+fn lane_header(__scope: &mut RenderScope, k: &Kanban, lane: &Lane, node: Addr) -> NodeHandle {
+    let seen = k.host.seen();
+    let (kc, kr, kh, kf, kf2) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (chosen, renaming) = (k.chosen, k.renaming);
+    let color = lane.color.clone();
+    let (label, label2) = (lane.label.clone().unwrap_or_default(), lane.label.clone().unwrap_or_default());
+    let writable = lane.writable;
     rsx! {
-        SortableList {
-            group: COLUMNS,
-            id: metanode_key.to_string(),
-            axis: SortAxis::Horizontal,
-            label: "Columns",
-            class: "kanban__column-list",
-            style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
-            disabled: !writable,
-            lift_keys: lift_keys(),
-            judge: Some(judge.clone()),
-            ondrop: move |m: SortMove| kd.drop_move(m),
-            for column in board.get().columns {
-                SortableItem {
-                    key: format!("{column:?}"),
-                    value: key_of(column.addr),
-                    handle: true,
-                    disabled: !(column.writable && writable),
-                    label: column.label.clone(),
-                    class: "kanban__column",
-                    style: COLUMN_STYLE,
-                    {render_column(__scope, &kcol, column.clone(), judge.clone(), writable)}
+        div {
+            class: "kanban__lane-header",
+            id: dom_id(node),
+            style: {|| format!(
+                "{LANE_HEADER_STYLE}{}{}",
+                color.as_deref().map(|c| format!(" color: {};", display_color(c, seen.dark()))).unwrap_or_default(),
+                if chosen.get() == Some(Chosen::Lane(node)) { " box-shadow: inset 0 0 0 2px var(--rinch-primary-color);" } else { "" },
+            )},
+            onclick: move || {
+                kc.choose(Some(Chosen::Lane(node)));
+                if untracked(|| kc.renaming.get()) != Some(node) {
+                    kc.take_keyboard();
+                }
+            },
+            span { style: "display: inline-flex; width: 16px; height: 16px; flex-shrink: 0;", IconGlyph { name: "layout-kanban".to_string() } }
+            if renaming.get() == Some(node) {
+                input {
+                    class: "kanban__field",
+                    style: FIELD_STYLE,
+                    ref: kf.field,
+                    placeholder: "Lane name",
+                    value: {move || kf.draft.get()},
+                    oninput: move |v: String| kf2.draft.set(v),
+                    onkeydown: {
+                        let k = kr.clone();
+                        move |key: &KeyEventData| match key.key.as_str() {
+                            "Enter" => { k.commit_rename(); true }
+                            "Escape" => { k.cancel_rename(); true }
+                            _ => false,
+                        }
+                    },
+                }
+            } else {
+                span { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", {label.clone()} }
+            }
+            {people(__scope, k, node)}
+            if writable && chosen.get() == Some(Chosen::Lane(node)) && renaming.get() != Some(node) {
+                Button {
+                    size: "xs",
+                    variant: "subtle",
+                    onclick: { let (k, label) = (kh.clone(), label2.clone()); move || k.start_rename(node, label.clone()) },
+                    "Rename"
                 }
             }
         }
@@ -702,7 +860,7 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, j
     // A column is dragged by its header, when the person may move it.
     let movable = board_writable && writable;
     let header = if movable { rsx! { SortableHandle { {header} } } } else { header };
-    let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, &column, card.clone())).collect();
+    let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, card.clone())).collect();
     let can_add = column.writable;
     let kd = k.clone();
     rsx! {
@@ -762,7 +920,7 @@ fn people(__scope: &mut RenderScope, k: &Kanban, addr: Addr) -> NodeHandle {
 
 /// One card: its icon, label and subtasks in its colors, who is on it, and
 /// while chosen, what can be done with it.
-fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, card: board::Card) -> NodeHandle {
+fn render_card(__scope: &mut RenderScope, k: &Kanban, card: board::Card) -> NodeHandle {
     let addr = card.addr;
     let seen = k.host.seen();
     let (kc, ko, kr, kd, kf, kf2, kn) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
@@ -772,11 +930,6 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, ca
     let (label, label2) = (card.label.clone(), card.label.clone());
     let writable = card.writable;
     let (icon, subtasks, label_color) = (card.icon.clone(), card.subtasks, card.color.clone());
-    // "Move to" the other columns, in their order, as the board has them now
-    // (a column added or renamed since this card was drawn included).
-    let (board, home) = (k.board, column.addr);
-
-    let km = k.clone();
     let item_label = card.label.clone();
     let card = rsx! {
         div {
@@ -847,18 +1000,6 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, ca
                     if writable {
                         Button { size: "xs", variant: "subtle", onclick: { let (k, l) = (kn.clone(), label2.clone()); move || k.start_rename(addr, l.clone()) }, "Rename" }
                         Button { size: "xs", variant: "subtle", color: "red", onclick: { let k = kd.clone(); move || k.delete(addr) }, "Delete" }
-                    }
-                    if !move_targets(board, home, writable).is_empty() {
-                        span { style: LINE_STYLE, "Move to \u{25b8}" }
-                    }
-                    for target in move_targets(board, home, writable) {
-                        Button {
-                            key: format!("{} {}", target.to.node, target.name),
-                            size: "xs",
-                            variant: "default",
-                            onclick: { let (k, to) = (km.clone(), target.to); move || k.move_to(addr, to_column(to), false) },
-                            {target.name.clone()}
-                        }
                     }
                 }
             }

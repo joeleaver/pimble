@@ -37,7 +37,7 @@ the interface.
   deep, and columns To do, Doing, Done (open decision 4), through a recipe the plugin
   registers.
 
-## 3. Lanes (wave 2)
+## 3. Lanes (wave 2, built 2026-11-04; see section 8)
 
 - With lanes the source is three levels deep. Kanban children of a kanban are lanes, top to bottom; their children are their columns.
 - Columns line up by name (case- and space-insensitive) when every lane agrees; otherwise
@@ -99,7 +99,8 @@ two levels deep, children To do, Doing, Done), asks to read and change the store
   as `plan`'s sentence with nothing sent, holds a warning (another store, leaving a share,
   leaving the view) for "Move anyway" / "Cancel", and sends the plan
   (`Pimble::move_nodes`), keeping the card chosen under a new id when the move gave it one.
-  The card's "Move to ▸ <column>" buttons go to the bottom of that column; the keyboard is
+  (The card's "Move to ▸ <column>" buttons were removed on 2026-11-04: Joe, dragging does
+  it.) The keyboard is
   the explorer's, Alt+Shift+arrows (Alt+Left and Alt+Right alone are the app's Back and
   Forward): up and down one within the column, left and right into the neighbor column at
   the same height; a column chosen by its header moves along the board with
@@ -251,3 +252,49 @@ here"; a card's menu is inline buttons under the chosen card, not a popup menu (
 into a plugin's body are untried, wave 4); the browser is checked under docs/PLUGINS_CONTRACT.md wave 3 (cards added, moved by key and by drag, in a plain and an encrypted store); a
 reader's board (no gestures) was not tried with a real share; plugin markup is styled
 inline (a plugin cannot add a stylesheet), so it has no hover states.
+
+## 8. Built: wave 2, lanes (2026-11-04, branch `master`)
+
+Joe, 2026-11-04: "sub-kanbans should show as lanes, not columns", and the card's "Move to"
+buttons go ("we can drag").
+
+- **What a lane is.** A top of the kanban's forest that is itself a kanban
+  (`metanode.viewer == "kanban"`), or a mount whose source is one, is a lane. The viewer
+  reads each lane's own forest (`Pimble::metanode_source` of the lane, or of the mount's
+  source) beside the board's, so a lane keeps its own source and the board's stays two
+  levels deep; a change touching any of the forests reads them all again. The other tops
+  form the unnamed lane at the top (open decision 3), which is the whole board when there
+  are no lanes and is not drawn when there are lanes and no other tops. Lanes nested in a
+  lane are not lanes of the board: inside a lane, a kanban child is a column.
+- **Model** (`board.rs`): `Board { lanes: Vec<Lane> }`, `Lane { metanode, node, label,
+  color, writable, columns }`; `find_card` answers (lane, column, index), `lane_for_parent`
+  the lane a move lands in, `matching_column` the column of another lane that lines up
+  (same name, case and spacing ignored, else the same place).
+- **Moves** are judged in the lane they land in (`judge_in_metanode` of the lane's
+  kanban), so a card carried into another lane is not warned about as leaving the view.
+  Drags work across lanes as they do across columns (one `cards` group; each lane's
+  columns are a `columns` list of their own, keyed by the lane's node). Alt+Shift+Up at a
+  column's top and Down at its bottom carry a card to the lined-up column of the lane
+  above (its bottom) or below (its top); the plain arrows walk the same way.
+- **Drawing.** Lanes stack top to bottom in one scrolled area, so columns of equal width
+  line up across lanes. A named lane has a header (the kanban icon, its name renamed in
+  place by Rename or F2, its people) and its own "+ Add column". "+ Add lane" under the
+  last lane makes a kanban (the "New Kanban" recipe's metanode, no title) whose columns
+  copy the lane above it (To do, Doing, Done when that has none), then its name is typed
+  in place.
+- **Not built:** one shared header row when every lane's columns agree (each lane draws
+  its own headers; equal widths keep them lined up); dragging a lane to reorder it (the
+  explorer moves it); "Rename in every lane"; the cross-store warning wording for a
+  mounted lane was not tried.
+- **Tests:** kanban-viewer 8: `a_card_steps_into_the_lined_up_column_of_the_lane_above_or_below`,
+  `a_move_is_judged_in_the_lane_it_lands_in`, `column_names_match_without_case_or_spacing`,
+  and the wave 1 tests over a one-lane board.
+- **Checked in the release desktop app** (port 7473, scratch dirs): "+ Add lane" made Work
+  with To do, Doing, Done under the top lane's; Bravo dragged from the top lane's Doing
+  into Work's Doing moved with no warning; Alt+Shift+Up carried it back to the bottom of
+  the top lane's Doing; the card's actions show Open, Rename, Delete only.
+- **Asked of rinch (Joe, 2026-11-04):** smooth drags with a ghost of the card following the
+  pointer and the list opening a gap where it lands. Today `SortableItem` hides the
+  window's ghost and dims the item in place with a caret; the request went to the Rinch
+  master session.
+
