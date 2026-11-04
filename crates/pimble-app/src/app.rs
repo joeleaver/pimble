@@ -347,6 +347,22 @@ fn step_history(store: AppStore, tree_state: UseTreeReturn, back: bool) {
 /// Open a tree value in pane `pane` without touching its history: what both
 /// an ordinary open and a step back or forward end in.
 fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+    // A mount row is a placeholder: the pane shows the node it mounts (a
+    // mounted kanban is the kanban), and the explorer keeps the mount's row
+    // chosen.
+    if let Some((s_id, Some(n_id))) = parse_tree_value(&value) {
+        if store.is_mount(s_id, n_id) {
+            let source = pimble_core::plan::TreeView::mount_source(&store.view(), s_id, n_id);
+            if let Some((source_store, source_node)) = source {
+                show_in_pane(store, tree_state, pane, format!("node_{source_store}_{source_node}"));
+                if pane == store.focused() {
+                    tree_state.controller.set_selection([value.clone()]);
+                    tree_state.controller.set_anchor(Some(&value));
+                }
+                return;
+            }
+        }
+    }
     let focused = pane == store.focused();
     let state = store.pane(pane);
     store.select_in_pane(pane, Some(value.clone()));
@@ -1599,6 +1615,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // (docs/METANODES_CONTRACT.md), its source kept for next time.
             // Snapshotted like the icon: the row's label carries the viewer.
             let is_metanode_row = node_sig.is_some_and(|sig| untracked(|| sig.with(crate::metanodes::is_metanode)));
+            // "Show as <viewer>" (Joe, 2026-11-04: "there seems to be no way to
+            // revert 'show as outline'"): a plugin viewer the node is not shown
+            // with, over the source its recipe makes ("Show as Kanban": its
+            // subtree two levels deep). Snapshotted like the icon.
+            let row_viewer: Option<String> = node_sig.and_then(|sig| untracked(|| sig.with(|n| n.metadata.metanode.as_ref().map(|m| m.viewer.clone()))));
+            let show_as_items: Vec<(String, TablerIcon, String, u32)> = {
+                let mut seen = std::collections::HashSet::new();
+                untracked(|| store.recipes.get())
+                    .into_iter()
+                    .filter(|r| Some(&r.recipe.viewer) != row_viewer.as_ref() && seen.insert(r.recipe.viewer.clone()))
+                    .map(|r| {
+                        let name = r.recipe.label.strip_prefix("New ").unwrap_or(&r.recipe.label).to_string();
+                        let icon = r.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban);
+                        (format!("Show as {name}"), icon, r.recipe.viewer.clone(), r.recipe.depth)
+                    })
+                    .collect()
+            };
             let on_show_as_outline = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1940,6 +1973,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // left out; New is one list, `crate::creating`, until rinch's
             // submenus make it "New ▸").
             let nv_new = nv_ctx.clone();
+            let nv_show_as = nv_ctx.clone();
             let context_menu = if is_store_root {
                 rsx! {
                     ContextMenu {
@@ -2167,6 +2201,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     disabled: {move || !can_write_tree || several()},
                                     onclick: on_show_as_outline.clone(),
                                     "Show as Outline"
+                                }
+                            }
+                            for (label, icon, viewer, depth) in show_as_items.clone() {
+                                DropdownMenuItem {
+                                    key: label.clone(),
+                                    left_section: icon,
+                                    disabled: !can_write_tree,
+                                    onclick: {
+                                        let (nv, viewer) = (nv_show_as.clone(), viewer.clone());
+                                        move || {
+                                            if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                                                let source = pimble_core::metanode::Source::subtree(depth);
+                                                crate::metanodes::set_metanode(store, s_id, n_id, Some(viewer.clone()), Some(source));
+                                            }
+                                        }
+                                    },
+                                    {label.clone()}
                                 }
                             }
                             DropdownMenuDivider {}

@@ -1076,6 +1076,12 @@ impl NodeDoc {
         Ok(())
     }
 
+    /// A text key of the `node` root, for a document being made: a field
+    /// (`field:<name>`) or a metanode's viewer or source.
+    pub(crate) fn put_node_text(&self, txn: &mut TransactionMut, key: &str, value: &str) {
+        self.node.insert(txn, key, value.to_string());
+    }
+
     /// One top-level key of the `data` root (see [`NodeDoc::set_data`]).
     pub(crate) fn put_data(&self, txn: &mut TransactionMut, key: &str, value: &serde_json::Value) {
         self.data.insert(txn, key.to_string(), json_to_in(value));

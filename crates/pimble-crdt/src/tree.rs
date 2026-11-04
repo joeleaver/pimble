@@ -36,7 +36,8 @@ use pimble_core::custom_keys::SHARE;
 use pimble_core::{NodeId, PimbleUrl, Place, StoreId};
 
 use crate::error::{CrdtError, Result};
-use crate::node_doc::{NodeDoc, NodeFields, NodeUpdateEffect};
+use crate::node_doc::{NodeDoc, NodeFields, NodeUpdateEffect, FIELD_PREFIX};
+use pimble_core::metanode::{SOURCE_KEY, VIEWER_KEY};
 pub use crate::store_document::{NodeInfo, TreeIssue};
 
 /// What a tree operation changed: per touched document, the v1 update its
@@ -90,6 +91,12 @@ pub struct CuttingNode {
     pub tags: Vec<String>,
     /// Every custom field but the share marker.
     pub custom: HashMap<String, serde_json::Value>,
+    /// The node's fields, name and value (`field:<name>` keys).
+    pub fields: Vec<(String, String)>,
+    /// A metanode's viewer and source as stored: a kanban stays a kanban
+    /// (until 2026-11-04 a move between stores dropped both).
+    pub metanode_viewer: Option<String>,
+    pub metanode_source: Option<String>,
     pub created_at: String,
     /// The plugin root as JSON (`NodeDoc::data_json`).
     pub data: serde_json::Value,
@@ -764,6 +771,9 @@ impl Tree {
                 title: fields.title,
                 tags: fields.tags,
                 custom,
+                fields: fields.fields,
+                metanode_viewer: fields.metanode_viewer,
+                metanode_source: fields.metanode_source,
                 created_at: fields.created_at,
                 data: doc.data_json(),
                 data_copy: doc.fresh_data(),
@@ -785,6 +795,9 @@ impl Tree {
                     title: fields.title,
                     tags: fields.tags,
                     custom,
+                    fields: fields.fields,
+                    metanode_viewer: fields.metanode_viewer,
+                    metanode_source: fields.metanode_source,
                     created_at: fields.created_at,
                     data: doc.data_json(),
                     data_copy: doc.fresh_data(),
@@ -849,6 +862,15 @@ impl Tree {
                 }
                 for (key, value) in node.custom.iter().filter(|(key, _)| key.as_str() != SHARE) {
                     d.put_custom(txn, key, value)?;
+                }
+                for (name, value) in &node.fields {
+                    d.put_node_text(txn, &format!("{FIELD_PREFIX}{name}"), value);
+                }
+                if let Some(viewer) = &node.metanode_viewer {
+                    d.put_node_text(txn, VIEWER_KEY, viewer);
+                }
+                if let Some(source) = &node.metanode_source {
+                    d.put_node_text(txn, SOURCE_KEY, source);
                 }
                 match &node.data_copy {
                     Some(bytes) => d.put_data_copy(txn, bytes)?,
@@ -2603,6 +2625,26 @@ mod tests {
         let Some(Out::YArray(points)) = board.get(&txn, "points") else { panic!("no points") };
         assert!(matches!(points.get(&txn, 0), Some(Out::Any(Any::Buffer(b))) if b.as_ref() == [1u8, 2, 3]));
         assert!(matches!(board.get(&txn, "text"), Some(Out::YText(_))));
+    }
+
+    /// A metanode stays one and fields stay (Joe, 2026-11-04: a kanban moved
+    /// to another store came out a plain node with the kanban's icon).
+    #[test]
+    fn transplant_keeps_a_metanode_and_its_fields() {
+        let mut s = shared();
+        {
+            let doc = s.tree.doc_mut(s.a).unwrap();
+            doc.set_metanode_viewer(Some("kanban"), T3).unwrap();
+            doc.set_metanode_source(Some(&pimble_core::metanode::Source::subtree(2)), T3).unwrap();
+            doc.set_field("Due", Some("Friday"), T3).unwrap();
+        }
+        let mut made = Vec::new();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, Place::Last, T3, &mut fresh_ids(&mut made)).unwrap();
+        let doc = s.tree.doc(new_a).unwrap();
+        let spec = doc.metanode().expect("still a metanode");
+        assert_eq!(spec.viewer, "kanban");
+        assert_eq!(spec.source.depth(), 2);
+        assert_eq!(doc.node_fields(), vec![("Due".to_string(), "Friday".to_string())]);
     }
 
     #[test]
