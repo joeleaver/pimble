@@ -348,3 +348,18 @@ three lane sizes and folded columns, Done no taller than its row, and "Add card"
   the mount is a lane. Checked in the release desktop app with a kanban in a second store
   pasted as a mount.
 
+## 10. Drags with a ghost and a gap (2026-11-04, rinch #2154 at `3930135e`)
+
+Joe: "dragging should be smooth, with a card ghost". Both card and column lists use
+`indicator: SortIndicator::Gap` (the list opens a gap where the drop lands) and
+`source: SortSource::Collapse` (the carried item leaves its list), and
+`preview: SortPreview::Snapshot`: the window's own picture of the card under the pointer.
+rinch's default `Clone` preview (a copy of the item's elements on the guest's body) does
+not keep a plugin's look or place across the host (checked in the app: a bare label away
+from the pointer), so the kanban asks for the runtime's picture; the browser runtime has
+none, so there a drag shows the gap and the collapse without a ghost. The gap needs the
+host's rinch stylesheet: the plugin and the app ship together. pimble-plugin-host's
+kanban tests check the collapse and the gap's shifted items in place of the old caret.
+Checked in the release desktop app: Charlie dragged from Doing over To do showed its
+picture at the pointer, To do opened a gap, Doing closed up, and the drop landed there.
+

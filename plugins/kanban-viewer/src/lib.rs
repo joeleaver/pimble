@@ -1035,6 +1035,11 @@ fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lane>, judge: 
                 style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
                 disabled: !writable,
                 lift_keys: lift_keys(),
+                indicator: SortIndicator::Gap,
+                source: SortSource::Collapse,
+                // The app's own picture of the item under the pointer: a copy of
+                // a plugin's elements does not keep its look across the host.
+                preview: SortPreview::Snapshot,
                 judge: Some(judge.clone()),
                 ondrop: move |m: SortMove| kd.drop_move(m),
                 for (column, count, folded) in header_columns(&kc, lane.as_ref().map(|l| l.metanode)) {
@@ -1377,6 +1382,13 @@ fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column, last: bool
                     // why not ("You can read this, not change it.").
                     disabled: !lane_writable,
                     lift_keys: lift_keys(),
+                    // Trello's feel (Joe, 2026-11-04): the card follows the
+                    // pointer, and the list opens a gap where it lands.
+                    indicator: SortIndicator::Gap,
+                    source: SortSource::Collapse,
+                    // The app's own picture of the item under the pointer: a copy of
+                    // a plugin's elements does not keep its look across the host.
+                    preview: SortPreview::Snapshot,
                     judge: Some(judge),
                     ondrop: move |m: SortMove| kd.drop_move(m),
                     {cards}

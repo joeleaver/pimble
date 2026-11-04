@@ -276,27 +276,28 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     let r = &running;
     r.pump_until(&f, "the board", |r| r.text().contains("Charlie"));
 
-    // Alpha dragged over the lower half of Charlie, in the other column: it
-    // lands after Charlie, one moveNode.
+    // Alpha dragged over the upper half of Charlie, in the other column: the
+    // list opens a gap before Charlie, and it lands there, one moveNode.
     let card = sortable(r, &key(store, alpha));
     rinch_core::events::reset_drag_ghost_visibility();
     fire(r, card, "data-ondragstart");
-    // The guest's drag start hid the window's ghost through the host.
-    assert!(!rinch_core::events::is_drag_ghost_visible());
+    // The kanban asks for the window's own picture of the card under the
+    // pointer (`SortPreview::Snapshot`): the host leaves the ghost shown.
+    assert!(rinch_core::events::is_drag_ghost_visible());
     rinch_core::events::reset_drag_ghost_visibility();
-    assert!(has_class(&r.doc.borrow(), card, "rinch-sortable__item--dragging"));
+    // The card collapses out of its column while it is carried.
+    assert!(has_class(&r.doc.borrow(), card, "rinch-sortable__item--collapsed"));
     let target = sortable(r, &key(store, charlie));
-    over(150.0, 135.0, 100.0, 100.0, 240.0, 40.0);
+    over(150.0, 110.0, 100.0, 100.0, 240.0, 40.0);
     fire(r, target, "data-ondragover");
-    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"), "the caret after Charlie");
+    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--shifted"), "the gap before Charlie");
     fire(r, card, "data-ondragmove");
     fire(r, target, "data-ondrop");
     fire(r, card, "data-ondragend");
-    r.pump_until(&f, "the card's drop", |_| children(&f, store, f.write) == ["Charlie", "Alpha"]);
+    r.pump_until(&f, "the card's drop", |_| children(&f, store, f.write) == ["Alpha", "Charlie"]);
     assert_eq!(children(&f, store, f.plan), ["Bravo"]);
     r.pump_until(&f, "the board after the drop", |r| {
-        let t = r.text();
-        t.find("Charlie").unwrap() < t.find("Alpha").unwrap()
+        r.doc.borrow().text_content(cell(r, &key(store, f.write))).unwrap_or_default().contains("Alpha")
     });
 
     // The "Write it" column dragged by its header over the left half of
@@ -307,7 +308,7 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     let plan_column = sortable(r, &key(store, f.plan));
     over(110.0, 50.0, 100.0, 40.0, 260.0, 400.0);
     fire(r, plan_column, "data-ondragover");
-    assert!(has_class(&r.doc.borrow(), plan_column, "rinch-sortable__item--drop-before"));
+    assert!(has_class(&r.doc.borrow(), plan_column, "rinch-sortable__item--shifted"), "the gap before Plan");
     fire(r, plan_column, "data-ondrop");
     fire(r, column, "data-ondragend");
     r.pump_until(&f, "the column's drop", |_| children(&f, store, f.board) == ["Write it", "Plan"]);
@@ -345,7 +346,7 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     // Nothing was asked of the server: no call waits, and the lists stand.
     assert!(r.calls.borrow().iter().all(|(_, c)| !format!("{c:?}").contains("Move")), "{:?}", r.calls.borrow());
     r.pump_until(&f, "the caret gone", |r| r.find(&|d, n| has_class(d, n, "rinch-sortable__reason--shown")).is_none());
-    assert_eq!(children(&f, store, f.write), ["Bravo", "Charlie", "Alpha"]);
+    assert_eq!(children(&f, store, f.write), ["Bravo", "Alpha", "Charlie"]);
     r.instance.unmount();
 }
 
@@ -407,13 +408,13 @@ fn a_drag_whose_card_a_remote_edit_redrew_ends_when_the_host_says() {
     let r = &running;
     r.pump_until(&f, "the board", |r| r.text().contains("Charlie"));
 
-    // Alpha is dragged over Charlie: the caret is after Charlie.
+    // Alpha is dragged over Charlie's upper half: the gap opens before Charlie.
     let card = sortable(r, &key(store, alpha));
     fire(r, card, "data-ondragstart");
     let target = sortable(r, &key(store, charlie));
-    over(150.0, 135.0, 100.0, 100.0, 240.0, 40.0);
+    over(150.0, 110.0, 100.0, 100.0, 240.0, 40.0);
     fire(r, target, "data-ondragover");
-    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"));
+    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--shifted"));
 
     // Someone renames Alpha meanwhile: its card is drawn again as a new node,
     // and the old one's `data-ondragend` has nowhere to go.
@@ -422,10 +423,10 @@ fn a_drag_whose_card_a_remote_edit_redrew_ends_when_the_host_says() {
     assert_ne!(sortable(r, &key(store, alpha)), card, "the card is a new node");
 
     // The drag is cancelled (Escape): the target hears it leave, and the host
-    // tells the plugin the drag ended. The caret is gone and nothing moved.
+    // tells the plugin the drag ended. The gap closes and nothing moved.
     fire(r, target, "data-ondragleave");
     assert!(r.instance.drag_ended());
-    assert!(!has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"));
+    assert!(!has_class(&r.doc.borrow(), target, "rinch-sortable__item--shifted"));
     assert_eq!(children(&f, store, f.plan), ["Alpha two"]);
 
     // A later drop over Charlie delivers only what that drag carries: a drag
