@@ -79,6 +79,12 @@ struct Shown {
     stopped: Option<String>,
     /// "Not now" was chosen for this metanode in this pane.
     declined: bool,
+    /// The stores the metanode's mounts reach that the plugin was not allowed,
+    /// asked for while it runs (a mounted kanban in another store is a lane
+    /// only once the plugin may read it).
+    wants: Vec<pimble_core::StoreId>,
+    /// "Not now" was chosen for `wants` in this pane.
+    declined_wants: bool,
 }
 
 thread_local! {
@@ -282,6 +288,10 @@ pub(crate) fn register_slot(pane: PaneId, doc: Weak<RefCell<dyn DomDocument>>, n
 pub(crate) enum Outcome {
     /// The plugin's view is in the pane.
     Shown,
+    /// It is, and the metanode shows mounts into stores it was not allowed:
+    /// the view, under this sentence asking for them with "Allow" and "Not
+    /// now".
+    ShownAsking(String),
     /// It is not: the outline, under this sentence.
     Outline(String),
     /// The plugin waits for the person to allow it: the outline, under this
@@ -302,6 +312,46 @@ fn store_name(store: AppStore, id: pimble_core::StoreId) -> String {
 /// Show `forest`'s metanode in pane `pane` with the plugin providing `viewer`:
 /// ask for approval, mount it, or hand the one already mounted its new props.
 pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Outcome {
+    let outcome = show_viewer(store, pane, viewer, forest);
+    if !matches!(outcome, Outcome::Shown) {
+        return outcome;
+    }
+    // Shown: ask for the stores its mounts reach that the plugin may not read,
+    // as it asked for the metanode's own.
+    let Some(plugin_id) = SHOWN.with(|s| s.borrow().get(&pane).map(|shown| shown.plugin_id.clone())) else { return outcome };
+    let Some(manifest) = manifest_of(&plugin_id) else { return outcome };
+    let approval = approval_of(&plugin_id);
+    let wants: Vec<pimble_core::StoreId> = mounted_stores(forest).into_iter().filter(|s| !approval.covers(&manifest.asks, *s)).collect();
+    let declined = SHOWN.with(|s| {
+        let mut s = s.borrow_mut();
+        let shown = s.get_mut(&pane)?;
+        shown.wants = wants.clone();
+        Some(shown.declined_wants)
+    });
+    if wants.is_empty() || declined != Some(false) {
+        return outcome;
+    }
+    let names: Vec<String> = wants.iter().map(|s| store_name(store, *s)).collect();
+    Outcome::ShownAsking(asking_sentence(&manifest.name, &manifest.asks, &names.join(" and ")))
+}
+
+/// The stores other than the metanode's that its forest reaches through
+/// mounts, in the forest's order.
+fn mounted_stores(forest: &Forest) -> Vec<pimble_core::StoreId> {
+    let mut stores = Vec::new();
+    for entry in &forest.entries {
+        let reached = entry.node.mount_ref().map(|m| m.source_store).into_iter().chain(Some(entry.addr.store));
+        for store in reached {
+            if store != forest.metanode.store && !stores.contains(&store) {
+                stores.push(store);
+            }
+        }
+    }
+    stores
+}
+
+/// [`show`] without asking for the mounts' stores.
+fn show_viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Outcome {
     let props = props(forest, viewer);
     let same = SHOWN.with(|s| s.borrow().get(&pane).is_some_and(|shown| shown.metanode == forest.metanode && shown.viewer == viewer));
     if same {
@@ -351,6 +401,8 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
         props: props.clone(),
         stopped,
         declined: false,
+        wants: Vec::new(),
+        declined_wants: false,
     };
     if manifest.asks.asks_anything() && !approval.covers(&manifest.asks, forest.metanode.store) {
         SHOWN.with(|s| s.borrow_mut().insert(pane, shown(None, None)));
@@ -433,7 +485,13 @@ pub(crate) fn allow(store: AppStore, pane: PaneId) {
     let Some(manifest) = manifest_of(&plugin_id) else {
         return;
     };
-    let grown = approval_of(&plugin_id).grown(&manifest.asks, metanode.store);
+    // The metanode's store, and while the plugin runs, the stores its mounts
+    // reach that it asked for.
+    let (wants, running) = SHOWN.with(|s| s.borrow().get(&pane).map(|shown| (shown.wants.clone(), shown.instance.is_some()))).unwrap_or_default();
+    let mut grown = approval_of(&plugin_id).grown(&manifest.asks, metanode.store);
+    for store in &wants {
+        grown = grown.grown(&manifest.asks, *store);
+    }
     APPROVALS.with(|a| a.borrow_mut().insert(plugin_id.clone(), grown.clone()));
     write_approvals();
     tracing::info!("plugins: {} allowed {:?}", plugin_id, grown);
@@ -446,6 +504,11 @@ pub(crate) fn allow(store: AppStore, pane: PaneId) {
             }
         }
     });
+    // A running plugin read its metanode without them: it starts again, so
+    // it reads what they let it (a mounted kanban becomes a lane).
+    if running && !wants.is_empty() {
+        hide(pane);
+    }
     crate::metanodes::refill(store, pane);
     refresh_window();
 }
@@ -454,7 +517,13 @@ pub(crate) fn allow(store: AppStore, pane: PaneId) {
 pub(crate) fn decline(store: AppStore, pane: PaneId) {
     SHOWN.with(|s| {
         if let Some(shown) = s.borrow_mut().get_mut(&pane) {
-            shown.declined = true;
+            // A running plugin asking for its mounts' stores keeps running
+            // without them; one waiting for its first approval is not shown.
+            if shown.instance.is_some() {
+                shown.declined_wants = true;
+            } else {
+                shown.declined = true;
+            }
         }
     });
     crate::metanodes::refill(store, pane);

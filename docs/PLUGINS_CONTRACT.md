@@ -482,6 +482,14 @@ first plugin.
    2026-10-23 rule that how things look is each device's own: never in a store, never
    synced, never in the personal document. The props kept for comparing are the
    settings alone, so remembering never sends new props.
+   **Mounts into stores not allowed** (2026-11-04, Joe's mounted kanban showed as a
+   column): while a plugin runs, the app lists the stores its metanode's mounts reach
+   that the plugin was not allowed (`mounted_stores`, `Shown::wants`) and asks for them
+   above the view with the same sentence and buttons as the first approval
+   (`Outcome::ShownAsking`): "The Kanban plugin wants to read and change the store
+   Apex." Allow grows the approval by those stores and starts the plugin again, so it
+   reads what they let it (the mount becomes a lane); Not now hides the question in
+   that pane and the plugin runs without them. Approvals stay per store.
 
 ## 5. How it is checked
 

@@ -342,4 +342,9 @@ three lane sizes and folded columns, Done no taller than its row, and "Add card"
   from the CLI stayed inside a cell as tall as its row and scrolled there.
 - **Not built:** the milestone party (petals every ten done; plugins cannot animate yet);
   assignee and tag filters; a folded column takes no drops; the browser was not tried.
+- **A mounted kanban from a store the plugin was not allowed** (Joe, 2026-11-04) showed as a
+  column: the plugin could not read the mount's source to see it is a kanban. The app now
+  asks for that store above the board (`docs/PLUGINS_CONTRACT.md`, ABI 5 note); allowed,
+  the mount is a lane. Checked in the release desktop app with a kanban in a second store
+  pasted as a mount.
 

@@ -221,6 +221,10 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     if let Some(spec) = &forest.spec {
         match viewer(store, pane, &spec.viewer, forest) {
             Viewer::Plugin => plugin = true,
+            Viewer::PluginAsking(sentence) => {
+                plugin = true;
+                asking = Some(sentence);
+            }
             Viewer::Outline(sentence) => lines.push(sentence),
             Viewer::Ask(sentence) => asking = Some(sentence),
             Viewer::Missing => lines.push(outline_line(&spec.viewer)),
@@ -252,6 +256,8 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
 enum Viewer {
     /// The plugin providing it, mounted in the pane.
     Plugin,
+    /// Mounted, under its request for the stores the metanode's mounts reach.
+    PluginAsking(String),
     /// The outline, under this sentence (its plugin was refused or stopped).
     Outline(String),
     /// The outline, under the plugin's request to be allowed what it needs.
@@ -263,6 +269,7 @@ enum Viewer {
 fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewer {
     match crate::plugins::show(store, pane, viewer, forest) {
         crate::plugins::Outcome::Shown => Viewer::Plugin,
+        crate::plugins::Outcome::ShownAsking(sentence) => Viewer::PluginAsking(sentence),
         crate::plugins::Outcome::Outline(sentence) => Viewer::Outline(sentence),
         crate::plugins::Outcome::Ask(sentence) => Viewer::Ask(sentence),
         crate::plugins::Outcome::Missing => Viewer::Missing,
