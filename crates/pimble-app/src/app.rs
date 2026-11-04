@@ -1286,6 +1286,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
             // Parse once for reuse
             let parsed = parse_tree_value(&node_value);
+            // A row a query metanode found (docs/QUERY_METANODES_CONTRACT.md
+            // section 4): the real node, shown where it does not live. Its
+            // place is not changed from here (`FoundRowAction`), and the
+            // menu's top line says why. A snapshot: the row's data carries
+            // it, so the row re-renders when it changes.
+            let found = crate::state::found_row(&node_value);
+            let found_on = found.is_some();
+            let level = payload.level;
 
             // Determine if this node is a mount point (static — mount status is structural)
             let is_mount = if !is_store_root {
@@ -1395,6 +1403,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             } else {
                 node_sig
             };
+            // A query metanode, a query metanode: violet, its own icon unless
+            // the person chose one (section 6).
+            let is_query = !is_store_root && node_sig.is_some_and(|sig| sig.with(crate::metanodes::is_query));
             let (custom_icon, node_color, row_color) = appearance_sig
                 .map(|sig| {
                     sig.with(|n| {
@@ -1412,6 +1423,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 TablerIcon::Database
             } else if is_mount {
                 TablerIcon::Link
+            } else if is_query {
+                TablerIcon::FilterSearch
             } else if is_folder {
                 TablerIcon::Folder
             } else {
@@ -1423,6 +1436,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let color_css = move |color: &Option<String>| -> String {
                 color.as_ref().map(|c| format!(" color: {};", display_color(c, store.dark_mode.get()))).unwrap_or_default()
             };
+            // A query metanode's icon is violet unless the person colored
+            // the node; then a small violet mark on the icon says it still
+            // gathers.
+            let query_mark = is_query && node_color.is_some();
+            let query_violet = is_query && node_color.is_none();
             let icon_color = node_color.clone();
             let label_color = node_color;
 
@@ -1649,6 +1667,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 None
             };
 
+            // A found row's arrow at its end: it lives elsewhere, and the
+            // tooltip says where (section 6).
+            let found_arrow: Option<NodeHandle> = match &found {
+                Some(f) => {
+                    let arrow = render_tabler_icon(__scope, TablerIcon::ArrowUpRight, TablerIconStyle::Outline);
+                    let title = if f.lives_in.is_empty() { "Lives elsewhere".to_string() } else { format!("Lives in {}", f.lives_in) };
+                    Some(rsx! {
+                        span {
+                            class: "pimble-tree__found",
+                            title: title,
+                            style: {move || format!("color: {};", crate::appearance::gathered_violet(store.dark_mode.get()))},
+                            {arrow}
+                        }
+                    })
+                }
+                None => None,
+            };
+
             // A store someone else shared with this account says so on its
             // row, and what it lets this device do. Reactive on the store's
             // own signal so it appears as soon as the store arrives.
@@ -1757,6 +1793,25 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         },
                     }
 
+                    // Beside a found row, its metanode's guide line drawn
+                        // violet: the finds read as one group after its own
+                        // children (section 6). Over the Tree's own guide,
+                        // which is one line for every child alike.
+                    span {
+                        class: "pimble-found-guide",
+                        style: {
+                            move || if found_on {
+                                format!(
+                                    "left: calc(var(--tree-level-offset) * {} + var(--tree-guide-offset)); background: {};",
+                                    level.saturating_sub(1),
+                                    crate::appearance::gathered_violet(store.dark_mode.get())
+                                )
+                            } else {
+                                "display: none;".to_string()
+                            }
+                        },
+                    }
+
                     span {
                         class: icon_class,
                         style: {
@@ -1766,7 +1821,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 let dimmed = mount_sig.map_or(false, |ms| {
                                     ms.with(|m| m.mount_state.as_ref().map_or(false, mount_is_dimmed))
                                 });
-                                let color = color_css(&icon_color);
+                                let color = if query_violet {
+                                    format!(" color: {};", crate::appearance::gathered_violet(store.dark_mode.get()))
+                                } else {
+                                    color_css(&icon_color)
+                                };
                                 if dimmed {
                                     format!("width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;{color}")
                                 } else {
@@ -1775,6 +1834,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                         },
                         {icon_el}
+                        span {
+                            class: "pimble-query-mark",
+                            style: {move || if query_mark { format!("background: {};", crate::appearance::gathered_violet(store.dark_mode.get())) } else { "display: none;".to_string() }},
+                        }
                     }
 
                     span {
@@ -1823,6 +1886,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                     {share_badge}
                     {shared_by_note}
+                    {found_arrow}
 
                     // Who else has the note open (docs/PRESENCE_CONTRACT.md
                     // section 6): a dot each, up to three, from the
@@ -1910,11 +1974,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // menu is otherwise a full menu (docs/NODE_DOCUMENT_CONTRACT.md
             // section 5).
             let access_note_text = crate::state::access_note(access_now);
+            let found_note = found.as_ref().map(|f| f.refusal.clone()).unwrap_or_default();
             let menu_note_text = if ended_now {
                 crate::state::ENDED_REPLICA_NOTE.to_string()
             } else {
-                crate::state::menu_note_text(&[access_note_text, share_note_text, relayed_note_text])
+                crate::state::menu_note_text(&[found_note.as_str(), access_note_text, share_note_text, relayed_note_text])
             };
+            // What a found row allows (`pimble_core::plan::FoundRowAction`,
+            // one rule for the explorer, plugins and the MCP).
+            let found_allows = {
+                let is_found = found.is_some();
+                move |action: pimble_core::plan::FoundRowAction| !is_found || action.allowed()
+            };
+            use pimble_core::plan::FoundRowAction as Fra;
             let menu_note: Option<NodeHandle> = if menu_note_text.is_empty() {
                 None
             } else {
@@ -2168,7 +2240,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Scissors,
-                                disabled: !can_write_tree,
+                                disabled: !can_write_tree || !found_allows(Fra::Cut),
                                 onclick: on_cut.clone(),
                                 "Cut"
                             }
@@ -2179,14 +2251,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Clipboard,
-                                disabled: {move || !can_write_tree || several()},
+                                disabled: {move || !can_write_tree || several() || !found_allows(Fra::PasteInto)},
                                 onclick: on_paste.clone(),
                                 "Paste"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
-                                    disabled: !can_write_tree,
+                                    disabled: !can_write_tree || !found_allows(Fra::PasteInto),
                                     onclick: on_mount_store.clone(),
                                     "Mount Store Here..."
                                 }
@@ -2194,7 +2266,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudDownload,
-                                    disabled: !can_write_tree,
+                                    disabled: !can_write_tree || !found_allows(Fra::PasteInto),
                                     onclick: on_mount_remote_store.clone(),
                                     "Mount Remote Store Here..."
                                 }
@@ -2210,7 +2282,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             DropdownMenuDivider {}
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
-                                disabled: !can_write_tree,
+                                disabled: !can_write_tree || !found_allows(Fra::Delete),
                                 onclick: on_delete,
                                 {move || match acts_on.get() {
                                     1 => "Delete".to_string(),

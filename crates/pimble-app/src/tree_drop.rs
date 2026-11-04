@@ -98,6 +98,9 @@ pub(crate) fn drag_values(value: &str) -> Vec<String> {
 /// Pimble's terms (the nodes, the row they go into, a `Place`), judged by
 /// `pimble_core::plan::plan_move`.
 pub(crate) fn plan_drop(store: AppStore, drop: &TreeDrop) -> DropPlan {
+    if let Some(sentence) = found_refusal(drop) {
+        return DropPlan::Refused(DropHint { line: sentence, warning: None, refused: true });
+    }
     let mut nodes = Vec::with_capacity(drop.dragged.len());
     for value in &drop.dragged {
         let Some((s, Some(n))) = parse_tree_value(value) else { return refused(Refusal::NotANode) };
@@ -120,6 +123,27 @@ pub(crate) fn plan_drop(store: AppStore, drop: &TreeDrop) -> DropPlan {
         Ok(plan) => plan_of(plan, drop.parent.clone().filter(|v| v.starts_with("node_"))),
         Err(refusal) => refused(refusal),
     }
+}
+
+/// Why a drop touches a found row's place, when it does
+/// (docs/QUERY_METANODES_CONTRACT.md section 4): a found row dragged away, a
+/// drop into one, or beside one (after it, or first among its metanode's
+/// finds). Said as the row's own sentence: "Shown here because it is tagged
+/// #waiting. It lives in Personal / Projects."
+pub(crate) fn found_refusal(drop: &TreeDrop) -> Option<String> {
+    use pimble_core::plan::FoundRowAction;
+    if let Some(found) = crate::state::first_found(&drop.dragged).filter(|_| !FoundRowAction::Drag.allowed()) {
+        return Some(found.refusal);
+    }
+    if FoundRowAction::Drop.allowed() {
+        return None;
+    }
+    let into = drop.parent.as_deref().and_then(crate::state::found_row);
+    let beside = match &drop.slot {
+        TreeSlot::After(value) => crate::state::found_row(value),
+        _ => None,
+    };
+    into.or(beside).map(|found| found.refusal)
 }
 
 /// Send what a plan says to send; `true` when it sent anything.
@@ -183,6 +207,50 @@ mod tests {
         assert_eq!(stays.verdict(), DropVerdict::Allowed);
         let no = refused(Refusal::IntoItself);
         assert_eq!((no.verdict(), no.hint().line.as_str()), (DropVerdict::Refused, pimble_core::plan::INTO_ITSELF));
+    }
+
+    /// docs/QUERY_METANODES_CONTRACT.md section 4: a found row is not
+    /// dragged away, and nothing is dropped into or beside it, each refused
+    /// with its own sentence; a drop onto the metanode itself is ordinary.
+    #[test]
+    fn a_found_rows_place_is_not_changed_by_a_drop() {
+        use crate::state::{AppStore, Found};
+        use pimble_core::metanode::{Condition, Metanode, Source};
+        use pimble_core::{Node, Store};
+        use rinch::prelude::{untracked, DropZone};
+        let app = AppStore::new();
+        let mut st = Store::new_local("Notes", "/tmp/notes.pimble".into());
+        let root = Node::folder("Notes");
+        st.root_node_id = root.id;
+        let s = st.id;
+        let mut list = Node::document("Waiting");
+        list.metadata.metanode = Some(Metanode { viewer: "list".into(), source: Source::matching(vec![Condition::Tag { tag: "x".into() }]) });
+        let (plain, own) = (Node::document("Plain"), Node::document("Own"));
+        let (root_id, list_id, plain_id, own_id) = (root.id, list.id, plain.id, own.id);
+        app.upsert_store(st);
+        for n in [root, list, plain, own] {
+            app.upsert_node(s, n);
+        }
+        app.set_children(s, root_id, vec![(s, plain_id), (s, list_id)]);
+        app.set_children(s, list_id, vec![(s, own_id)]);
+        let sentence = "Shown here because it is tagged #x. It lives in Notes.";
+        app.finds.set(std::collections::HashMap::from([((s, list_id), vec![Found { store_id: s, node_id: plain_id, lives_in: "Notes".into(), refusal: sentence.into() }])]));
+        untracked(|| app.build_tree_data_structural());
+        let (list_row, own_row, plain_row) = (format!("node_{s}_{list_id}"), format!("node_{s}_{own_id}"), format!("node_{s}_{plain_id}"));
+        let found_row = format!("node_{s}_{plain_id}/{s}_{list_id}");
+        let drop = |dragged: &str, parent: &str, slot: TreeSlot| TreeDrop {
+            dragged: vec![dragged.to_string()],
+            parent: Some(parent.to_string()),
+            slot,
+            over: parent.to_string(),
+            zone: DropZone::Inside,
+        };
+        let refused = |d: &TreeDrop| matches!(plan_drop(app, d), DropPlan::Refused(h) if h.line == sentence);
+        assert!(refused(&drop(&found_row, &format!("store_{s}"), TreeSlot::Last)), "dragged away");
+        assert!(refused(&drop(&own_row, &found_row, TreeSlot::Last)), "into it");
+        assert!(refused(&drop(&own_row, &list_row, TreeSlot::After(found_row.clone()))), "beside it");
+        assert!(!refused(&drop(&own_row, &list_row, TreeSlot::Last)), "onto the metanode: an own child");
+        assert!(found_refusal(&drop(&plain_row, &list_row, TreeSlot::First)).is_none(), "the node in its own place is ordinary");
     }
 
     #[test]

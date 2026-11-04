@@ -327,7 +327,15 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
 
         C::GetMetanode { store_id, node_id } => {
             let forest = api.metanode_source(Addr::new(store_id, node_id)).await.map_err(|e| error_message(&e));
-            Some(BackendEvent::MetanodeRead { store_id, node_id, forest })
+            // Where each found node lives, for its row's tooltip and the
+            // sentence a refused action on it says.
+            let mut lives = Vec::new();
+            if let Ok(forest) = &forest {
+                for entry in forest.found() {
+                    lives.push((entry.addr, api.lives_in(entry.addr).await));
+                }
+            }
+            Some(BackendEvent::MetanodeRead { store_id, node_id, forest, lives })
         }
 
         C::SetMetanode { store_id, node_id, viewer, source } => {

@@ -86,6 +86,23 @@ pub fn metanode(title: &str, icon_name: Option<&str>, viewer: &str, depth: u32) 
     }
 }
 
+/// A query metanode titled `title` (docs/QUERY_METANODES_CONTRACT.md sections 5
+/// and 9): a metanode with the app's `list` viewer and a match over its own
+/// store, its first condition a "tagged" line still to be filled in (a blank
+/// condition finds nothing, so a new list does not show its whole store).
+/// Its icon is the query metanode's own, drawn at render time; nothing is
+/// stored for it.
+pub fn query_metanode(title: &str) -> NodeInit {
+    use pimble_core::metanode::{Condition, Source, LIST_VIEWER};
+    let source = Source::matching(vec![Condition::Tag { tag: String::new() }]);
+    NodeInit {
+        node_type: node_types::DOCUMENT.to_string(),
+        title: title.to_string(),
+        content: Some(NodeDoc::metanode_seed(LIST_VIEWER, &source)),
+        custom: vec![explicit()],
+    }
+}
+
 /// The first message of a discussion: who wrote it, when, and its body.
 pub struct FirstMessage<'a> {
     pub author: Option<&'a Author>,

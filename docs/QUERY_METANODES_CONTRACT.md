@@ -1,7 +1,7 @@
 # Query metanodes contract: nodes that gather other nodes
 
 Status: drafted 2026-11-04 from Joe's design in conversation; Joe: "build it", the
-decisions of section 9 taken as recommended (Smart List; its own store; a drop makes an own
+decisions of section 9 taken as recommended (its own store; a drop makes an own
 child; found rows expand). This is `docs/METANODES_CONTRACT.md` wave 3 ("Query sources"),
 shaped by what Joe decided on 2026-11-04 (section 1).
 
@@ -137,8 +137,9 @@ E. **Checked** in the release desktop app and the browser: a plain store, an enc
 
 ## 9. Decisions (taken as recommended, 2026-11-04)
 
-1. **What New calls it**: "Smart List" (recommended: says it gathers, not a folder you put
-   things in), "Smart Folder", "Query", or "Collection".
+1. **What New calls it**: "Metanode" (Joe, 2026-11-04: "we agreed on terminology earlier,
+   it isn't 'smart list', it's just Metanode"). The options drafted were "Smart List",
+   "Smart Folder", "Query" and "Collection"; none of them is used.
 2. **Where it looks by default**: its own store (recommended), or everywhere.
 3. **A node dropped onto a query metanode**: becomes one of its own children (recommended:
    one meaning for a drop everywhere), or is changed to match (given the tag).
@@ -211,3 +212,104 @@ Not done, or done differently from sections 3 and 8:
 - A found node that is itself a query metanode is shown as a plain entry; the
   "one level down" rule (section 2) is the explorer's, wave C.
 - Store roots and the `under` node itself are never found (the walk starts below them).
+
+## Built: waves C and D (2026-11-04)
+
+What is built, on `master`. The person sees one word for it: **Metanode** (decision 1).
+
+- **Explorer** (`crates/pimble-app/src/state.rs` `structural_node`, `metanodes.rs`): a query
+  metanode's row has its own children, then its finds (`AppStore::finds`). A found row's tree
+  value is a path address through the metanode, as a mount child's is
+  (`node_{s}_{n}/{ms}_{mn}`); its own children carry the found row too
+  (`.../{ms}_{mn}/{s}_{n}`), so a node can sit in its own place, in several metanodes, and
+  below a found row without two rows sharing a value. Each build registers its found rows
+  (`state::found_row(value)`, `first_found`: the metanode, its row, where the node lives and
+  the refusal), and the row's `TreeNodeData` label carries `found: <sentence>` so it
+  re-renders when that changes. Found rows expand to their own children (decision 4); a
+  found query metanode shows its own finds one level down, and a metanode found two finds
+  down shows none (`finds_crossed`). The forest is asked when a query metanode's row loads
+  its children (`metanodes::children_loaded`), kept with the panes' forests, and read again
+  when `Forest::touched_by_view` says so, debounced 300 ms (`REREAD_MS`); a node whose source
+  becomes a match starts showing finds. `BackendEvent::MetanodeRead` carries `lives`, where
+  each found node lives (`Pimble::lives_in`), so the sentence is the API's
+  `found_refusal`'s.
+- **Rules on found rows** (all through `pimble_core::plan::FoundRowAction`): the row menu's
+  top line (`pimble-menu-note`) is the sentence ("Shown here because it is tagged #waiting
+  and it isn't tagged #done. It lives in Desk test / Kanban / Done."), and Cut, Paste, Mount
+  Store Here..., Mount Remote Store Here... and Delete are greyed. `tree_drop::found_refusal`
+  (inside `plan_drop`, the one judgement of a drop) refuses a found row dragged, a drop into
+  one and a drop beside one (`TreeSlot::After(found)`), with its sentence in the strip; a
+  drop onto the metanode is an ordinary move to an own child. Keyboard: Alt+Shift moves go
+  through `plan_drop`; Delete (`tree_view::deletable`), Ctrl+X and Edit > Cut Node
+  (`tree_keys::set_cut`), and Paste / Ctrl+V into one (`pasting::paste`, `paste_straight`)
+  say the sentence as a notice. "+", File > New and Ctrl+Shift+Enter beside a found row make
+  an own child of its metanode, last (nothing is put at a found row's place); New inside a
+  found row makes a real child of the real node.
+- **Look** (section 6): a query metanode's icon is Tabler `filter-search` (also
+  `pimble_ui::appearance::node_icon`) in violet (`gathered_violet`: `--rinch-color-violet-6`
+  light, `--rinch-color-violet-4` dark), unless the person chose an icon; a color the person
+  sets wins, and then a small violet dot sits on the icon (`pimble-query-mark`). A found row
+  keeps its icon and color and gets a violet `arrow-up-right` at its end, titled "Lives in
+  Desk test / Kanban / Done". rinch's Tree draws one guide line per subtree for every child
+  alike and cannot style it per row, so the violet line beside the finds is the app's own:
+  a 2px span in each found row at the parent's guide column
+  (`calc(var(--tree-level-offset) * (level - 1) + var(--tree-guide-offset))`), drawn over the
+  Tree's guide. rinch is unchanged. Nothing is stored.
+- **Setup pane** (`crates/pimble-app/src/metanode_setup.rs`, both targets): a metanode
+  with the `list` viewer shows its setup in place of the outline (`MetanodeUi::setup`). Show
+  nodes: one line per condition ("tagged [ ]", "not tagged [ ]", "containing [ ]", "with
+  [field] [op] [value]" (the value hidden for set / empty), "linking to <node> [Pick a
+  node...]", "that are [kind]"), each with a remove button, and "+ Add a condition" (a menu
+  of the six kinds). From: this store, under a node (with the picker), everywhere (and
+  "In <store>" when the source names another store). Order: title, last changed, created,
+  a field (named in a field); ascending or descending; at most N (1 to 500). Then "It finds
+  N nodes now." and the first ten finds, each opening its node in the pane. The node
+  picker is the setup's own: a field searching through `Search` (`SearchPurpose::MetanodeSetup(pane)`)
+  and a list of hits; the editor's link picker is tied to an editor's caret. Every change
+  writes the source through `BackendCommand::SetMetanode` (`Pimble::set_metanode`, an edit
+  of `metanode:source`); typing is written once it rests 400 ms, choices at once, and a
+  source arriving while this pane's own write is on its way does not overwrite what is
+  being typed (taken once it matches, or after 3 s: someone else's write won).
+- **A blank condition finds nothing** (`Condition::is_blank`, `Prepared::Nothing` in
+  `pimble-api` `matching.rs`): a line still being filled in, so a new metanode does not
+  list its whole store. The setup says "Fill in each condition to find nodes." A match with
+  no conditions at all still finds every node (a "recently changed" list by order and limit).
+- **New ▸ "Metanode"** (`creating::Kind::Metanode`, so "+", the row menus' New and File >
+  New): `pimble_api::recipes::query_metanode`, a metanode with viewer `list` and a match
+  over its own store (`within` absent, which section 3 defines as its own store, so it keeps
+  meaning that if the node moves to another store) whose one condition is a blank "tagged"
+  line; named "Metanode", renamed in place wherever it is made (the row menus' New too),
+  and opened in the focused pane (`state::open_when_created`), which shows its setup.
+- **Tests**: `pimble-app` `state::tests::a_query_metanode_shows_its_finds_after_its_own_children`,
+  `a_found_rows_children_are_ordinary`; `tree_drop::tests::a_found_rows_place_is_not_changed_by_a_drop`;
+  `metanode_setup::tests` (`a_setup_edits_its_source_as_a_match`,
+  `from_order_and_limit_read_as_chosen`, `the_count_line`); `pimble-api` `tests/api.rs`
+  `a_query_metanode_finds_nodes_after_its_own_children` gains blank conditions.
+  `pimble-app --lib`: 212 pass; `pimble-core --lib` and `pimble-api` pass; the web build
+  compiles.
+- **Checked in the release desktop app** (port 7473, scratch dirs, four nodes tagged
+  `waiting` through a scratch agent's `pimble-mcp`): "+" listed Metanode; it made a violet
+  `filter-search` row "Metanode" under the store row and renamed it in place ("Waiting");
+  the setup showed "tagged [a tag]" and "Fill in each condition to find nodes."; typing
+  "waiting" found Bravo, Delta, Echo and Sheet; adding "not tagged done" dropped Echo; the
+  expanded row showed Bravo, Delta and Sheet with violet arrows and a violet guide line; the
+  found row's menu had the sentence on top and Cut, Paste, both Mounts and Delete greyed; a
+  drag of Delta onto Doing showed the sentence in red in the strip and moved nothing; Delete
+  on the selected found row said the sentence as a notice and deleted nothing; tagging
+  Charlie through MCP brought it into the row and the setup within about a second; the
+  light theme drew the same violet; "Linking to a node...", "Pick a node...", typing
+  "Bravo" and picking it named Bravo on the line and the count said "It finds nothing now."
+
+Not done, or done differently:
+
+- A new metanode starts with one blank "tagged" line, not with no conditions (a match with
+  none finds everything, which for a new node would be its whole store).
+- The arrow's "why" is in the menu's top line and the refusals; the tooltip says where it
+  lives only.
+- Not tried in the app: the corner mark on a colored metanode, a found metanode's own finds
+  and the one-level rule (unit-tested), Alt+Shift moves and Ctrl+X on a found row (they go
+  through `plan_drop` and `set_cut`, unit-tested for drops only), the browser (wave E), an
+  encrypted or shared store.
+- The pane's title bar still draws the node's type icon (a document) for a metanode.
+- A query metanode with no own children whose conditions are blank has nothing to show,
+  so its row has no expander until it finds something.

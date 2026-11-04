@@ -24,6 +24,9 @@ pub enum SearchPurpose {
     Panel,
     /// The link picker (`[[` and Ctrl+L, docs/LINKS_CONTRACT.md).
     LinkPicker,
+    /// The node picker of a query metanode's setup in this pane
+    /// (docs/QUERY_METANODES_CONTRACT.md section 5).
+    MetanodeSetup(crate::panes::PaneId),
 }
 
 /// Commands sent from UI to backend
@@ -481,7 +484,9 @@ pub enum BackendEvent {
     Shown { view: pimble_api::View },
     /// A metanode's forest as its source found it, or why it could not be
     /// read.
-    MetanodeRead { store_id: StoreId, node_id: NodeId, forest: Result<pimble_api::Forest, String> },
+    /// `lives` says where each found node lives ("Personal / Projects"), for
+    /// a found row's tooltip and refusals (docs/QUERY_METANODES_CONTRACT.md).
+    MetanodeRead { store_id: StoreId, node_id: NodeId, forest: Result<pimble_api::Forest, String>, lives: Vec<(pimble_api::Addr, String)> },
     /// The answer to a plugin's call (`PluginCall`), for the instance that
     /// made it.
     PluginReply { instance: u64, call_id: u64, reply: pimble_plugin_host::abi::api::ApiReply },

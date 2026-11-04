@@ -422,6 +422,42 @@ pub(crate) const APP_CSS: &str = "
     cursor: default;
 }
 
+/* Query metanodes and what they find (docs/QUERY_METANODES_CONTRACT.md
+   section 6): violet, drawn at render time. A found row's arrow at its end,
+   its metanode's guide line beside it, and a mark on a metanode's icon when
+   the person colored it. */
+.pimble-tree__found {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    margin-left: 6px;
+    cursor: default;
+}
+.pimble-tree__found svg {
+    width: 0.8rem;
+    height: 0.8rem;
+}
+.rinch-tree__label > .pimble-found-guide {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    margin-left: -0.5px;
+    pointer-events: none;
+}
+.rinch-tree__label .rinch-tree__icon {
+    position: relative;
+}
+.pimble-query-mark {
+    position: absolute;
+    right: -2px;
+    bottom: -1px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    pointer-events: none;
+}
+
 /* Mount point icon gets a distinct color */
 .rinch-tree__icon--mount {
     color: var(--rinch-primary-color-6) !important;
@@ -2406,6 +2442,69 @@ pub(crate) const APP_CSS: &str = "
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+}
+
+/* ── A query metanode's setup (metanode_setup.rs) ───────────────────── */
+
+.pimble-setup {
+    padding: 4px 16px 16px 16px;
+    max-width: 760px;
+}
+.pimble-setup__heading {
+    margin: 14px 0 6px 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--rinch-color-dimmed);
+}
+.pimble-setup__line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-height: 30px;
+    font-size: 13px;
+}
+.pimble-setup__words {
+    color: var(--rinch-color-text);
+    white-space: nowrap;
+}
+.pimble-setup__field {
+    width: 160px;
+}
+.pimble-setup__field--wide {
+    flex: 1;
+    min-width: 200px;
+    width: auto;
+}
+.pimble-setup__field--narrow {
+    width: 64px;
+}
+.pimble-setup__node {
+    font-weight: 500;
+}
+.pimble-setup__remove {
+    display: inline-flex;
+    margin-left: 2px;
+}
+.pimble-setup__add {
+    margin-top: 4px;
+}
+.pimble-setup__picker {
+    margin: 6px 0;
+    padding: 6px 8px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+}
+.pimble-setup__dim {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+.pimble-setup__more {
+    margin: 4px 0 0 12px;
+}
+.pimble-setup .pimble-metanode__row {
+    padding-left: 12px;
 }
 
 /* ── Empty state ────────────────────────────────────────────── */

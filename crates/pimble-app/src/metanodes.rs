@@ -11,6 +11,11 @@
 //! tree is shown (`BackendEvent::Shown`) may have touched it
 //! (`Forest::touched_by_view`): the change's own ids against the metanode,
 //! the nodes found and the lists read, so a change elsewhere asks nothing.
+//! A query metanode's forest is read for the explorer too, once its row has
+//! loaded its children (docs/QUERY_METANODES_CONTRACT.md section 4): its
+//! finds are rows after its own children (`AppStore::finds`), kept live the
+//! same way. Every re-read walks the store, so the re-reads a change asks for
+//! wait until changes rest ([`REREAD_MS`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,7 +28,11 @@ use rinch::prelude::*;
 use crate::appearance::{display_color, IconGlyph};
 use crate::panes::PaneId;
 use crate::protocol::BackendCommand;
-use crate::state::{display_label_from_node, ActiveEdit, AppStore, LinkOpen};
+use crate::state::{display_label_from_node, ActiveEdit, AppStore, Found, LinkOpen};
+
+/// How long changes rest before the forests they touched are read again: a
+/// match walks its whole store each time, and typing is a change a keystroke.
+const REREAD_MS: u32 = 300;
 
 /// One row of a metanode's outline, as drawn.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +63,10 @@ pub struct MetanodeUi {
     /// over the outline, with "Allow" and "Not now" (docs/PLUGINS_CONTRACT.md
     /// decision 2).
     pub asking: Signal<Option<String>>,
+    /// The metanode is a query metanode (the `list` viewer): the pane shows its
+    /// setup (`crate::metanode_setup`) in place of the outline.
+    pub setup: Signal<bool>,
+    pub setup_ui: crate::metanode_setup::SetupUi,
 }
 
 impl MetanodeUi {
@@ -64,6 +77,8 @@ impl MetanodeUi {
             loaded: Signal::new(false),
             plugin: Signal::new(false),
             asking: Signal::new(None),
+            setup: Signal::new(false),
+            setup_ui: crate::metanode_setup::SetupUi::new(),
         }
     }
 }
@@ -82,6 +97,29 @@ thread_local! {
     /// one meanwhile, so it is asked once more when the answer comes (the
     /// answer may be from before the change).
     static ASKED: RefCell<HashMap<(StoreId, NodeId), bool>> = RefCell::new(HashMap::new());
+    /// Forests a change touched, waiting for changes to rest.
+    static TOUCHED: RefCell<Vec<(StoreId, NodeId)>> = const { RefCell::new(Vec::new()) };
+    static REREAD: RefCell<Option<rinch::prelude::TimeoutHandle>> = const { RefCell::new(None) };
+}
+
+/// Whether `node` is a query metanode, whose row shows what it finds.
+pub(crate) fn is_query(node: &Node) -> bool {
+    node.metadata.metanode.as_ref().is_some_and(|m| m.is_query())
+}
+
+/// Whether the explorer shows what metanode `key` finds: its row has loaded
+/// its children, and it is a query metanode.
+fn in_explorer(store: AppStore, key: (StoreId, NodeId)) -> bool {
+    store.has_children_loaded(key.0, key.1)
+        && store.get_node_signal(key.0, key.1).is_some_and(|sig| untracked(|| sig.with(is_query)))
+}
+
+/// The children of row `(store_id, node_id)` were loaded: a query
+/// metanode's row asks what it finds, to show them after its own.
+pub(crate) fn children_loaded(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    if in_explorer(store, (store_id, node_id)) {
+        ask(store, (store_id, node_id));
+    }
 }
 
 /// Whether `node` is a metanode, so a pane shows its outline.
@@ -128,9 +166,11 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.metanode_ui.lines.set(Vec::new());
     state.metanode_ui.plugin.set(false);
     state.metanode_ui.asking.set(None);
+    state.metanode_ui.setup.set(false);
+    crate::metanode_setup::stop(store, pane);
     crate::plugins::hide(pane);
     let key = (held.store_id, held.node_id);
-    if showing(store, key).is_empty() {
+    if showing(store, key).is_empty() && !in_explorer(store, key) {
         FORESTS.with(|f| f.borrow_mut().remove(&key));
     }
 }
@@ -166,16 +206,34 @@ fn ask(store: AppStore, key: (StoreId, NodeId)) {
 }
 
 /// The forest of metanode `(store_id, node_id)` arrived (or could not be
-/// read): every pane showing it shows it.
-pub(crate) fn forest_read(store: AppStore, store_id: StoreId, node_id: NodeId, forest: Result<Forest, String>) {
+/// read): every pane showing it shows it, and its row in the explorer shows
+/// what it finds. `lives` says where each found node lives.
+pub(crate) fn forest_read(
+    store: AppStore,
+    store_id: StoreId,
+    node_id: NodeId,
+    forest: Result<Forest, String>,
+    lives: &[(pimble_api::Addr, String)],
+) {
     let key = (store_id, node_id);
     let again = ASKED.with(|asked| asked.borrow_mut().remove(&key)).unwrap_or(false);
     let panes = showing(store, key);
-    if panes.is_empty() {
+    let explorer = in_explorer(store, key);
+    if panes.is_empty() && !explorer {
+        // Nothing shows it now: its finds go with it.
+        if untracked(|| store.finds.with(|f| f.contains_key(&key))) {
+            store.finds.update(|f| {
+                f.remove(&key);
+            });
+            store.bump_tree_structure();
+        }
         return;
     }
     if let Ok(forest) = &forest {
         FORESTS.with(|f| f.borrow_mut().insert(key, forest.clone()));
+        if explorer {
+            show_finds(store, key, forest, lives);
+        }
     }
     for pane in panes {
         fill(store, pane, forest.as_ref().map_err(String::as_str));
@@ -185,14 +243,71 @@ pub(crate) fn forest_read(store: AppStore, store_id: StoreId, node_id: NodeId, f
     }
 }
 
+/// What `forest` finds, as the explorer's rows under metanode `key`: each
+/// found node held for its row, with where it lives and what a refused
+/// action on it says. The tree is rebuilt only when the rows changed.
+fn show_finds(store: AppStore, key: (StoreId, NodeId), forest: &Forest, lives: &[(pimble_api::Addr, String)]) {
+    let reason = forest.reason.clone().unwrap_or_else(|| "this metanode finds it".to_string());
+    let mut found = Vec::new();
+    for entry in forest.found() {
+        let lives_in = lives.iter().find(|(a, _)| *a == entry.addr).map(|(_, l)| l.clone()).unwrap_or_default();
+        let refusal = pimble_core::plan::found_refusal(&reason, &lives_in);
+        // Its row reads the node from the cache, as every row does.
+        store.track_mount_info(entry.addr.store, &entry.node);
+        store.upsert_node(entry.addr.store, entry.node.clone());
+        found.push(Found { store_id: entry.addr.store, node_id: entry.addr.node, lives_in, refusal });
+    }
+    let changed = untracked(|| store.finds.with(|f| f.get(&key) != Some(&found)));
+    if changed {
+        store.finds.update(|f| {
+            if found.is_empty() && !forest.source.is_match() {
+                f.remove(&key);
+            } else {
+                f.insert(key, found);
+            }
+        });
+        store.bump_tree_structure();
+    }
+}
+
 /// A change was shown to the tree: every forest it may have touched is
-/// asked for again.
+/// asked for again once changes rest ([`REREAD_MS`]).
 pub(crate) fn view_shown(store: AppStore, view: &pimble_api::View) {
     let touched: Vec<(StoreId, NodeId)> =
         FORESTS.with(|f| f.borrow().iter().filter(|(_, forest)| forest.touched_by_view(view)).map(|(key, _)| *key).collect());
-    for key in touched {
-        ask(store, key);
+    // A metanode whose source changed to a match (a query metanode's setup)
+    // starts showing its finds in the explorer.
+    let became: Vec<(StoreId, NodeId)> = view
+        .nodes
+        .iter()
+        .map(|n| (view.store, n.id))
+        .filter(|key| !FORESTS.with(|f| f.borrow().contains_key(key)) && in_explorer(store, *key))
+        .collect();
+    if touched.is_empty() && became.is_empty() {
+        return;
     }
+    TOUCHED.with(|t| {
+        let mut t = t.borrow_mut();
+        for key in touched.into_iter().chain(became) {
+            if !t.contains(&key) {
+                t.push(key);
+            }
+        }
+    });
+    if let Some(pending) = REREAD.with(|r| r.borrow_mut().take()) {
+        rinch::prelude::clear_timeout(pending);
+    }
+    let handle = rinch::prelude::set_timeout(REREAD_MS, move || {
+        REREAD.with(|r| r.borrow_mut().take());
+        for key in TOUCHED.with(|t| std::mem::take(&mut *t.borrow_mut())) {
+            if !showing(store, key).is_empty() || in_explorer(store, key) {
+                ask(store, key);
+            } else {
+                FORESTS.with(|f| f.borrow_mut().remove(&key));
+            }
+        }
+    });
+    REREAD.with(|r| *r.borrow_mut() = Some(handle));
 }
 
 /// Pane `pane`'s outline and lines from `forest`.
@@ -210,7 +325,9 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     let mut lines = Vec::new();
     let mut plugin = false;
     let mut asking = None;
-    if let Some(spec) = &forest.spec {
+    // A query metanode shows its setup, built into the app.
+    let setup = forest.spec.as_ref().is_some_and(|spec| spec.shows_setup());
+    if let Some(spec) = forest.spec.as_ref().filter(|_| !setup) {
         match viewer(store, pane, &spec.viewer, forest) {
             Viewer::Plugin => plugin = true,
             Viewer::PluginAsking(sentence) => {
@@ -237,6 +354,15 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             color: entry.node.metadata.color().map(str::to_string),
         })
         .collect();
+    if setup {
+        if untracked(|| ui.plugin.get()) {
+            crate::plugins::hide(pane);
+        }
+        crate::metanode_setup::forest_arrived(store, pane, forest, &rows);
+    } else if untracked(|| ui.setup.get()) {
+        crate::metanode_setup::stop(store, pane);
+    }
+    ui.setup.set(setup);
     ui.lines.set(lines);
     ui.rows.set(rows);
     ui.loaded.set(true);
@@ -335,7 +461,9 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
     // A plugin's view goes here (`crate::plugins`); the outline is hidden while it
     // shows.
     let plugin_slot = Some(crate::plugins::render_slot(__scope, pane, ui.plugin));
-    let drawn = move || if ui.plugin.get() { Vec::new() } else { drawn() };
+    let drawn = move || if ui.plugin.get() || ui.setup.get() { Vec::new() } else { drawn() };
+    // A query metanode's setup goes here (`crate::metanode_setup`).
+    let setup_slot = crate::metanode_setup::render_setup(__scope, store, pane);
     rsx! {
         div {
             class: "pimble-metanode",
@@ -360,9 +488,10 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
                 }
             }
             {plugin_slot}
+            {setup_slot}
             div {
                 class: "pimble-metanode__empty",
-                style: {move || if ui.loaded.get() && !ui.plugin.get() && ui.rows.with(|r| r.is_empty()) { "" } else { "display: none;" }},
+                style: {move || if ui.loaded.get() && !ui.plugin.get() && !ui.setup.get() && ui.rows.with(|r| r.is_empty()) { "" } else { "display: none;" }},
                 "Nothing to show here yet."
             }
             for item in drawn() {

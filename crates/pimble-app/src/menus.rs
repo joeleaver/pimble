@@ -96,6 +96,7 @@ fn new_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Canvas", "", make(Kind::Canvas)),
         MenuEntry::item("Sheet", "", make(Kind::Sheet)),
         MenuEntry::item("Discussion", "", make(Kind::Discussion)),
+        MenuEntry::item(crate::creating::METANODE, "", make(Kind::Metanode)),
         MenuEntry::Separator,
         MenuEntry::item("More...", "", move || store.new_menu_open.set(true)),
         MenuEntry::Separator,

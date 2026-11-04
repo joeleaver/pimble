@@ -70,7 +70,22 @@ fn choices(store: AppStore, row: &str) -> Vec<Choice> {
 }
 
 /// A row menu's Paste on `row`.
+/// Whether `row` is a found row, after saying why nothing is pasted into it
+/// (docs/QUERY_METANODES_CONTRACT.md section 4).
+fn into_found(store: AppStore, row: &str) -> bool {
+    match crate::state::found_row(row).filter(|_| !pimble_core::plan::FoundRowAction::PasteInto.allowed()) {
+        Some(found) => {
+            crate::events::show_notice(store, found.refusal);
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn paste(store: AppStore, row: &str) {
+    if into_found(store, row) {
+        return;
+    }
     let choices = choices(store, row);
     match choices.as_slice() {
         [] => {
@@ -91,6 +106,9 @@ pub(crate) fn paste(store: AppStore, row: &str) {
 /// could always just be a straight paste"): no chooser; the picture on the
 /// clipboard if there is one, else a mount of the copied node.
 pub(crate) fn paste_straight(store: AppStore, row: &str) {
+    if into_found(store, row) {
+        return;
+    }
     let choices = choices(store, row);
     let pick = choices
         .iter()

@@ -858,6 +858,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // store (the mount's source store when `parent_id` is a
                 // mount point, `store_id` otherwise, decision 1).
                 take_children(store, *store_id, *parent_id, *children_store_id, children);
+                // A query metanode's row shows what it finds after these.
+                crate::metanodes::children_loaded(store, *store_id, *parent_id);
                 store.bump_tree_structure();
             }
 
@@ -875,8 +877,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::metanodes::view_shown(store, view);
             }
 
-            BackendEvent::MetanodeRead { store_id, node_id, forest } => {
-                crate::metanodes::forest_read(store, *store_id, *node_id, forest.clone());
+            BackendEvent::MetanodeRead { store_id, node_id, forest, lives } => {
+                crate::metanodes::forest_read(store, *store_id, *node_id, forest.clone(), lives);
             }
 
             BackendEvent::PluginReply { instance, call_id, reply } => {
@@ -925,6 +927,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Some(value) = crate::state::take_pending_create(*store_id, parent, *node_id) {
                     tree_state.controller.set_cursor(&value);
                     tree_state.controller.set_selection([value.clone()]);
+                    // A new query metanode opens its setup in the pane.
+                    if crate::state::take_open_when_created() {
+                        crate::app::open_node(store, tree_state, value);
+                    }
                 }
                 // The list it went into was shown just before this answer
                 // (`Shown`) when it is loaded; one never loaded is loaded
@@ -1242,6 +1248,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::BlobLoaded { url, result } => {
                 crate::pictures::loaded(*url, result);
                 crate::boards::blob_loaded(url, result);
+            }
+
+            BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::MetanodeSetup(pane), results } => {
+                crate::metanode_setup::search_answered(store, *pane, results);
             }
 
             BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::LinkPicker, results } => {

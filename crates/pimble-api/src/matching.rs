@@ -70,12 +70,16 @@ enum Prepared {
     Field { name: String, is: FieldOp, value: Option<Value> },
     Text(Vec<String>),
     LinksTo(Option<(StoreId, NodeId)>),
+    /// A condition still being filled in ([`Condition::is_blank`]): it holds
+    /// for nothing.
+    Nothing,
 }
 
 impl Prepared {
     /// Cheap ones first: the content is read only for a node the fields let through.
     fn cost(&self) -> u8 {
         match self {
+            Prepared::Nothing => 0,
             Prepared::Tag(_) | Prepared::NoTag(_) | Prepared::Type(_) | Prepared::Field { .. } => 0,
             Prepared::Text(_) => 1,
             Prepared::LinksTo(_) => 2,
@@ -97,6 +101,10 @@ impl Matcher {
         let Query::Match { all, .. } = query else { return None };
         let mut conditions = Vec::new();
         for c in all {
+            if c.is_blank() {
+                conditions.push(Prepared::Nothing);
+                continue;
+            }
             conditions.push(match c {
                 Condition::Tag { tag } => Prepared::Tag(tag_key(tag)),
                 Condition::NoTag { no_tag } => Prepared::NoTag(tag_key(no_tag)),
@@ -119,6 +127,7 @@ impl Matcher {
     pub fn matches(&self, doc: &NodeDoc, fields: &NodeFields) -> bool {
         let mut text: Option<String> = None;
         self.conditions.iter().all(|c| match c {
+            Prepared::Nothing => false,
             Prepared::Tag(tag) => fields.tags.iter().any(|t| tag_key(t) == *tag),
             Prepared::NoTag(tag) => !fields.tags.iter().any(|t| tag_key(t) == *tag),
             Prepared::Type(t) => is_type(fields, t),

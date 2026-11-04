@@ -22,6 +22,9 @@ pub(crate) enum Kind {
     Recipe(pimble_plugin_abi::RecipeDecl),
     /// A canvas per picture chosen from files.
     CanvasFromPicture,
+    /// A query metanode: a query metanode, its setup in the pane
+    /// (docs/QUERY_METANODES_CONTRACT.md sections 5 and 9).
+    Metanode,
 }
 
 /// One entry of the list: what it makes, what it is called, its icon.
@@ -34,6 +37,9 @@ pub(crate) struct NewItem {
     pub divided: bool,
 }
 
+/// What a query metanode is called in New, and what a new one is named.
+pub(crate) const METANODE: &str = "Metanode";
+
 /// What can be made, in order, tracked on the plugins' recipes: Text, Canvas,
 /// Sheet, Discussion, each plugin recipe, Canvas from Picture...
 pub(crate) fn kinds(store: AppStore) -> Vec<NewItem> {
@@ -43,6 +49,7 @@ pub(crate) fn kinds(store: AppStore) -> Vec<NewItem> {
         item(Kind::Canvas, "Canvas", TablerIcon::Chalkboard, false),
         item(Kind::Sheet, "Sheet", TablerIcon::Table, false),
         item(Kind::Discussion, "Discussion", TablerIcon::Messages, false),
+        item(Kind::Metanode, METANODE, TablerIcon::FilterSearch, false),
     ];
     for (i, r) in store.recipes.get().into_iter().enumerate() {
         let icon = r.recipe.icon.as_deref().and_then(crate::appearance::icon_by_name).unwrap_or(TablerIcon::LayoutKanban);
@@ -69,6 +76,14 @@ pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: Node
         Kind::Discussion => crate::discussions::new_discussion(store, store_id, parent, place),
         Kind::Recipe(recipe) => crate::plugins::make(store, store_id, parent, recipe.clone(), place),
         Kind::CanvasFromPicture => crate::boards::pick_images(store, crate::boards::Dest::Under(store_id, parent)),
+        Kind::Metanode => {
+            // Named in place as a new text is, and opened: the cursor goes to
+            // it, which opens its setup in the pane.
+            crate::state::set_pending_create(store_id, parent, rename_suffix.unwrap_or_default());
+            crate::state::open_when_created();
+            let (title, init) = crate::protocol::NodeInit::of(pimble_api::recipes::query_metanode(METANODE), None);
+            store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent), title, init: Some(init), place });
+        }
     }
 }
 
@@ -76,7 +91,18 @@ pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: Node
 /// in the node it mounts), last: a row menu's New.
 pub(crate) fn make_in_row(store: AppStore, kind: &Kind, row: &str) {
     if let Some((s, parent)) = crate::tree_view::create_parent_of_row(store, row) {
-        make(store, kind, s, parent, Place::Last, None);
+        // A query metanode is named in place wherever it is made; its row sits
+        // one level below `row` (under a mount or a found row: through it).
+        let suffix = (*kind == Kind::Metanode).then(|| children_suffix(store, row));
+        make(store, kind, s, parent, Place::Last, suffix);
+    }
+}
+
+/// The mount-path suffix the children of row `row` carry.
+fn children_suffix(store: AppStore, row: &str) -> String {
+    match parse_tree_value(row) {
+        Some((s, Some(n))) if store.is_mount(s, n) || crate::state::found_row(row).is_some() => format!("{}/{s}_{n}", suffix(row)),
+        _ => suffix(row),
     }
 }
 
@@ -88,6 +114,12 @@ pub(crate) fn where_plus(store: AppStore) -> Option<(StoreId, NodeId, Place, Str
     let selected = untracked(|| store.selected_id.get());
     let view = store.view();
     if let Some(value) = selected {
+        // Beside a found row: one of its metanode's own children, after
+        // them (nothing is put at a found row's place).
+        if let Some(found) = crate::state::found_row(&value) {
+            return crate::tree_view::create_parent_of_row(store, &found.metanode_row)
+                .map(|(s, parent)| (s, parent, Place::Last, children_suffix(store, &found.metanode_row)));
+        }
         match parse_tree_value(&value) {
             // A node: its parent (a node seen through a mount: its parent in the
             // mounted store), after it.

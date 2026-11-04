@@ -197,3 +197,11 @@ metanode's viewer is still data (`metanode:viewer`), which an agent sets through
 (`set_metanode`); the outline shows only when a viewer's plugin is missing. "View as ▸"
 is dropped from wave 2.
 
+
+## 9. Metanode in New (2026-11-04)
+
+New gains **Metanode** after Discussion (`creating::Kind::Metanode`; docs/QUERY_METANODES_CONTRACT.md
+"Built: waves C and D"), so "+", the row menus' New and File > New ▸ all list it. A new one
+is named "Metanode" in place and opens its setup in the pane. On a row a query metanode
+found, the menu's top line says why it is shown there and where it lives, and Cut, Paste,
+Mount Store Here..., Mount Remote Store Here... and Delete are greyed.

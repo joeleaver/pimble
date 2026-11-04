@@ -91,6 +91,12 @@ pub(crate) fn create_parent_of_row(store: AppStore, row: &str) -> Option<(StoreI
 /// ([`plan::can_delete`]), answered with their canonical pairs; `None` after
 /// saying why not, and quietly when no row is a node.
 pub(crate) fn deletable(store: AppStore, values: &[String]) -> Option<Vec<(StoreId, NodeId)>> {
+    // A found row is not deleted from where it was found
+    // (docs/QUERY_METANODES_CONTRACT.md section 4).
+    if let Some(found) = crate::state::first_found(values).filter(|_| !plan::FoundRowAction::Delete.allowed()) {
+        crate::events::show_notice(store, found.refusal);
+        return None;
+    }
     let nodes: Vec<(StoreId, NodeId)> = values
         .iter()
         .filter_map(|v| match parse_tree_value(v) {

@@ -20,6 +20,11 @@ pub fn node_icon(node: &Node) -> String {
     if let Some(icon) = node.metadata.icon() {
         return icon.to_string();
     }
+    // A query metanode, a query metanode (docs/QUERY_METANODES_CONTRACT.md
+    // section 6), whatever its type.
+    if node.metadata.metanode.as_ref().is_some_and(|m| m.is_query()) {
+        return TablerIcon::FilterSearch.name().to_string();
+    }
     let icon = match node.node_type.as_str() {
         node_types::FOLDER => TablerIcon::Folder,
         node_types::MOUNT => TablerIcon::Link,
@@ -29,6 +34,19 @@ pub fn node_icon(node: &Node) -> String {
         _ => TablerIcon::File,
     };
     icon.name().to_string()
+}
+
+/// The violet a query metanode and the rows it finds are drawn with
+/// (docs/QUERY_METANODES_CONTRACT.md section 6: purple means "gathered
+/// here", as blue means "mounted here"): the theme's violet on the light
+/// theme, a lifted one on the dark. Render-time only; nothing purple is
+/// stored on a node.
+pub fn gathered_violet(dark_mode: bool) -> &'static str {
+    if dark_mode {
+        "var(--rinch-color-violet-4)"
+    } else {
+        "var(--rinch-color-violet-6)"
+    }
 }
 
 /// One Tabler icon by name, as a component so a reactive `for` can render it

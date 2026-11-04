@@ -66,6 +66,12 @@ pub(crate) fn cut_rows() -> Vec<String> {
 }
 
 pub(crate) fn set_cut(store: AppStore, values: Vec<String>) {
+    // A found row's place is not changed from where it was found
+    // (docs/QUERY_METANODES_CONTRACT.md section 4).
+    if let Some(found) = crate::state::first_found(&values).filter(|_| !pimble_core::plan::FoundRowAction::Cut.allowed()) {
+        crate::events::show_notice(store, found.refusal);
+        return;
+    }
     let hint = match values.as_slice() {
         [] => None,
         [one] => Some(format!("Cut {}. Ctrl+V puts it after a row, Ctrl+Shift+V into one.", label_of(store, one))),
@@ -226,6 +232,14 @@ fn keyboard_to_document(store: AppStore, pane: crate::panes::PaneId, value: Stri
 
 /// A new node after the cursor row (or inside it, last), named at once.
 fn new_node(store: AppStore, key: &TreeKey, child: bool) {
+    // Beside a found row: one of its metanode's own children, after them
+    // (nothing is put at a found row's place, section 4).
+    if let (false, Some(found)) = (child, crate::state::found_row(&key.cursor)) {
+        let Some((s, parent)) = crate::tree_view::create_parent_of_row(store, &found.metanode_row) else { return };
+        crate::state::set_pending_create(s, parent, suffix(&found.metanode_row));
+        store.send(BackendCommand::CreateNode { store_id: s, parent_id: Some(parent), title: String::new(), init: None, place: Place::Last });
+        return;
+    }
     let target = if child { Some(key.cursor.clone()) } else { key.parent.clone() };
     let Some(parent_value) = target else { return };
     // Under a store row: its root. Under a mount: the node it mounts, as a

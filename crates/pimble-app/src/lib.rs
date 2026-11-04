@@ -39,6 +39,7 @@ pub mod link_picker;
 pub mod links;
 pub mod menus;
 pub mod metanodes;
+pub mod metanode_setup;
 pub mod nav;
 pub mod pane_view;
 pub mod panes;

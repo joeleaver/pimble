@@ -39,6 +39,53 @@ pub fn take_last_drop_target_value() -> Option<String> {
     LAST_DROP_TARGET_VALUE.with(|cell| cell.borrow_mut().take())
 }
 
+/// One node a query metanode found, as the explorer shows it
+/// (docs/QUERY_METANODES_CONTRACT.md section 4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    /// Where it lives: "Personal / Projects".
+    pub lives_in: String,
+    /// What a refused action on its row says: "Shown here because it is
+    /// tagged #waiting. It lives in Personal / Projects."
+    pub refusal: String,
+}
+
+/// A row of the explorer that a query metanode found: the real node, shown
+/// where it does not live. Its place cannot be changed from there
+/// (`pimble_core::plan::FoundRowAction`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundRow {
+    /// The metanode that found it.
+    pub metanode: (StoreId, NodeId),
+    /// The metanode's own row (where a node made beside the found row goes).
+    pub metanode_row: String,
+    pub lives_in: String,
+    pub refusal: String,
+}
+
+thread_local! {
+    /// The found rows of the explorer as last built, by tree value: what the
+    /// row menus, drops and keys ask whether a row is found
+    /// ([`found_row`]). Rebuilt with the tree's data.
+    static FOUND_ROWS: RefCell<HashMap<String, FoundRow>> = RefCell::new(HashMap::new());
+}
+
+/// The found row `value` is, or `None` for every other row: one a query
+/// metanode found (docs/QUERY_METANODES_CONTRACT.md section 4). A found
+/// row's own children are ordinary rows.
+pub fn found_row(value: &str) -> Option<FoundRow> {
+    FOUND_ROWS.with(|rows| rows.borrow().get(value).cloned())
+}
+
+/// The first of `values` that is a found row, with what it says when its
+/// place would change: what refuses a drag, a drop, a cut or a delete of
+/// several rows at once.
+pub fn first_found(values: &[String]) -> Option<FoundRow> {
+    values.iter().find_map(|v| found_row(v))
+}
+
 thread_local! {
     /// A node the explorer's keyboard asked for (docs/TREE_CONTRACT.md "The
     /// keyboard": a new sibling or child, renamed at once): its store, its
@@ -47,11 +94,26 @@ thread_local! {
     /// The tree value of that node once it exists, renamed when its row is
     /// drawn.
     static PENDING_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The pending node opens in the focused pane once made (a query metanode
+    /// opens its setup, docs/QUERY_METANODES_CONTRACT.md section 7).
+    static OPEN_CREATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The node [`set_pending_create`] asks for opens in the focused pane once
+/// it is made.
+pub fn open_when_created() {
+    OPEN_CREATED.with(|o| o.set(true));
+}
+
+/// Whether the node just made opens ([`open_when_created`]), once.
+pub fn take_open_when_created() -> bool {
+    OPEN_CREATED.with(|o| o.replace(false))
 }
 
 /// The keyboard is making a node under `parent`; its row, when it comes,
 /// starts renaming.
 pub fn set_pending_create(store_id: StoreId, parent: NodeId, suffix: String) {
+    OPEN_CREATED.with(|o| o.set(false));
     PENDING_CREATE.with(|cell| *cell.borrow_mut() = Some((store_id, parent, suffix)));
 }
 
@@ -458,6 +520,10 @@ pub struct AppStore {
     /// mount's source store when the parent is a mount node (decision 1).
     pub children_of: Signal<HashMap<(StoreId, NodeId), Signal<Vec<(StoreId, NodeId)>>>>,
     pub mount_data: Signal<HashMap<(StoreId, NodeId), Signal<MountInfo>>>,
+    /// What each query metanode the explorer has opened finds, shown under
+    /// its own children (docs/QUERY_METANODES_CONTRACT.md section 4); kept
+    /// live by `crate::metanodes`.
+    pub finds: Signal<HashMap<(StoreId, NodeId), Vec<Found>>>,
 
     /// Each registered store's remote endpoint (`None` when unlinked) and
     /// current sync state (docs/SYNC_CONTRACT.md "B: app side"). An entry
@@ -958,6 +1024,7 @@ impl AppStore {
             node_data: Signal::new(HashMap::new()),
             children_of: Signal::new(HashMap::new()),
             mount_data: Signal::new(HashMap::new()),
+            finds: Signal::new(HashMap::new()),
             sync_data: Signal::new(HashMap::new()),
             tree_structure_version: Signal::new(0),
             expanded: Signal::new(HashSet::new()),
@@ -1970,8 +2037,9 @@ impl AppStore {
                             n.metadata.color().unwrap_or(""),
                             n.metadata.background().unwrap_or(""),
                             if n.metadata.share().is_some() { "shared" } else { "" },
-                            // The row's menu offers "Show as Outline" on a metanode.
-                            n.metadata.metanode.as_ref().map_or("", |m| m.viewer.as_str()),
+                            // A query metanode looks like one (its icon and
+                            // violet), and stops when its source changes.
+                            n.metadata.metanode.as_ref().map_or(String::new(), |m| format!("{}{}", m.viewer, if m.is_query() { " query" } else { "" })),
                         )
                     })
                 })
@@ -1991,6 +2059,7 @@ impl AppStore {
         // every row's data must change when that flips, or no row re-renders
         // and the item never enables.
         let paste = self.mount_source.with(|s| s.is_some());
+        FOUND_ROWS.with(|rows| rows.borrow_mut().clear());
         let mut result = Vec::new();
         for &sid in &store_ids {
             let store_info = self.store_data.with(|map| {
@@ -2054,12 +2123,12 @@ impl AppStore {
             // the replica's, and is no row (`Store::shown_roots`). When every
             // share has ended the row has nothing under it.
             let children = if roots.is_empty() {
-                self.build_children_structural(sid, root_id, paste, &[])
+                self.build_children_structural(sid, root_id, paste, &[], 0)
             } else {
                 roots
                     .iter()
                     .filter(|root| !ended_roots.contains(root))
-                    .map(|&root| self.structural_node(sid, root, paste, &[]))
+                    .map(|&root| self.structural_node(sid, root, paste, &[], 0, None))
                     .collect()
             };
             if children.is_empty() {
@@ -2078,12 +2147,17 @@ impl AppStore {
     /// (decision 7) — empty for a node reached directly from its own store's
     /// root. It disambiguates the same canonical node appearing in several
     /// places, since rinch's Tree keys expansion and selection by value string.
+    /// A query metanode's finds are reached through it the same way
+    /// (docs/QUERY_METANODES_CONTRACT.md section 4), and `finds_crossed`
+    /// counts the finds crossed to get here: a found metanode shows its own
+    /// finds, one level down only.
     fn build_children_structural(
         &self,
         store_id: StoreId,
         parent_id: NodeId,
         paste: bool,
         mount_path: &[(StoreId, NodeId)],
+        finds_crossed: u8,
     ) -> Vec<TreeNodeData> {
         let children = self.children_of.with(|map| {
             map.get(&(store_id, parent_id)).map(|sig| sig.get())
@@ -2092,22 +2166,27 @@ impl AppStore {
 
         children
             .iter()
-            .map(|&(child_store, child_id)| self.structural_node(child_store, child_id, paste, mount_path))
+            .map(|&(child_store, child_id)| self.structural_node(child_store, child_id, paste, mount_path, finds_crossed, None))
             .collect()
     }
 
     /// One row: the node itself plus whatever hangs below it. Used for every
     /// child of a loaded parent, and for each scope root of a partial replica,
     /// which is a row under the store row rather than a child of anything
-    /// (see `build_tree_data_structural`).
+    /// (see `build_tree_data_structural`), and for each node a query metanode
+    /// found (`found_in`: the metanode and its row's value), whose own path
+    /// already ends with the metanode.
     fn structural_node(
         &self,
         child_store: StoreId,
         child_id: NodeId,
         paste: bool,
         mount_path: &[(StoreId, NodeId)],
+        finds_crossed: u8,
+        found_in: Option<(&Found, (StoreId, NodeId), &str)>,
     ) -> TreeNodeData {
         let suffix = mount_path_suffix(mount_path);
+        let value = format!("node_{}_{}{}", child_store, child_id, suffix);
         let is_mount = self.mount_data.with(|map| {
             map.get(&(child_store, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
         });
@@ -2124,7 +2203,8 @@ impl AppStore {
         // rides along too. "Share..." also snapshots whether the node's store
         // reached this device as someone else's share (`share_item_disabled`),
         // which the access does not say: an editor of a share and an owner
-        // both read as `Full`.
+        // both read as `Full`. A found row's menu and look snapshot that it
+        // is found, and the sentence its refused items say.
         let appearance = self.row_snapshot(child_store, child_id);
         let access = format!("{:?}", self.node_access(child_store, child_id));
         let held_as_share = self
@@ -2135,26 +2215,60 @@ impl AppStore {
             .with(|map| map.get(&(child_store, child_id)).and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
             .map(|(source_store, source_node)| format!("{:?}", self.node_access(source_store, source_node)))
             .unwrap_or_default();
+        let found_note = found_in.map(|(found, _, _)| format!("|found: {}", found.refusal)).unwrap_or_default();
+        if let Some((found, metanode, metanode_row)) = found_in {
+            FOUND_ROWS.with(|rows| {
+                rows.borrow_mut().insert(
+                    value.clone(),
+                    FoundRow { metanode, metanode_row: metanode_row.to_string(), lives_in: found.lives_in.clone(), refusal: found.refusal.clone() },
+                )
+            });
+        }
         let tree_node = TreeNodeData::new(
-            format!("node_{}_{}{}", child_store, child_id, suffix),
+            value.clone(),
             format!(
-                "{}|{}{}|{}|{}",
+                "{}|{}{}|{}|{}{}",
                 if paste { "paste" } else { "" },
                 access,
                 source_access,
                 if held_as_share { "theirs" } else { "" },
-                appearance
+                appearance,
+                found_note
             ),
         );
 
-        // Crossing a mount node adds it to the path for everything below it.
-        let children_data = if is_mount {
+        // Crossing a mount node adds it to the path for everything below it;
+        // so does a found row, whose own children are its, not the
+        // metanode's (and a node a metanode finds can be its own child
+        // elsewhere).
+        let below_path = if is_mount || found_in.is_some() {
             let mut next_path = mount_path.to_vec();
             next_path.push((child_store, child_id));
-            self.build_children_structural(child_store, child_id, paste, &next_path)
+            next_path
         } else {
-            self.build_children_structural(child_store, child_id, paste, mount_path)
+            mount_path.to_vec()
         };
+        let mut children_data = self.build_children_structural(child_store, child_id, paste, &below_path, finds_crossed);
+        // A query metanode's finds, after its own children: reached through
+        // the metanode, so each is its own row wherever else it shows. A
+        // found metanode shows its own finds, and no deeper.
+        let finds = if finds_crossed <= 1 { self.finds.with(|f| f.get(&(child_store, child_id)).cloned()) } else { None };
+        if let Some(finds) = finds {
+            let mut through = below_path.clone();
+            if through.last() != Some(&(child_store, child_id)) {
+                through.push((child_store, child_id));
+            }
+            for found in &finds {
+                children_data.push(self.structural_node(
+                    found.store_id,
+                    found.node_id,
+                    paste,
+                    &through,
+                    finds_crossed + 1,
+                    Some((found, (child_store, child_id), &value)),
+                ));
+            }
+        }
         let has_children = !children_data.is_empty();
         let has_loaded_children = self.children_of.with(|map| {
             map.contains_key(&(child_store, child_id))
@@ -2162,10 +2276,11 @@ impl AppStore {
 
         // Check if the node itself reports having children (from its
         // children list) even if we haven't fetched them yet. This
-        // lets the tree show an expand chevron for unfetched subtrees.
+        // lets the tree show an expand chevron for unfetched subtrees. A
+        // query metanode has finds to show whether or not it has children.
         let node_reports_children = !has_loaded_children && self.node_data.with(|map| {
             map.get(&(child_store, child_id))
-                .map_or(false, |sig| sig.with(|n| !n.children.is_empty()))
+                .map_or(false, |sig| sig.with(|n| !n.children.is_empty() || n.metadata.metanode.as_ref().is_some_and(|m| m.is_query())))
         });
 
         if has_children {
@@ -2900,6 +3015,88 @@ mod tests {
         assert!(!app.is_partial_replica(store_id));
         assert_eq!(app.shown_roots(store_id), vec![app.root_node_id(store_id).unwrap()]);
         assert_eq!(app.store_row_node(store_id), app.root_node_id(store_id));
+    }
+
+    /// A query metanode with one own child, finding `Recipes` (which lives under
+    /// the root) and `Smart` (a query metanode itself, finding `Deep`).
+    fn a_query_metanode() -> (AppStore, StoreId, NodeId, NodeId, NodeId, NodeId, NodeId) {
+        use pimble_core::metanode::{Condition, Metanode, Source};
+        let (app, s, recipes) = store_with_a_child();
+        let root = app.root_node_id(s).unwrap();
+        let query = || Some(Metanode { viewer: "list".into(), source: Source::matching(vec![Condition::Tag { tag: "x".into() }]) });
+        let mut list = Node::document("Waiting");
+        list.metadata.metanode = query();
+        let own = Node::document("Own");
+        let mut smart = Node::document("Smart");
+        smart.metadata.metanode = query();
+        let deep = Node::document("Deep");
+        let (list_id, own_id, smart_id, deep_id) = (list.id, own.id, smart.id, deep.id);
+        for n in [list, own, smart, deep] {
+            app.upsert_node(s, n);
+        }
+        app.set_children(s, root, vec![(s, recipes), (s, list_id)]);
+        app.set_children(s, list_id, vec![(s, own_id)]);
+        app.set_children(s, smart_id, Vec::new());
+        let found = |n: NodeId| Found { store_id: s, node_id: n, lives_in: "Notes".into(), refusal: format!("Shown here because it is tagged #x. It lives in Notes ({n}).") };
+        app.finds.set(HashMap::from([((s, list_id), vec![found(recipes), found(smart_id)]), ((s, smart_id), vec![found(deep_id)])]));
+        (app, s, recipes, list_id, own_id, smart_id, deep_id)
+    }
+
+    /// docs/QUERY_METANODES_CONTRACT.md section 4: a query metanode's row
+    /// has its own children, then its finds, each a row of its own reached
+    /// through the metanode (so the same node also sits in its own place);
+    /// a found row knows it is one and what it says; a found metanode shows
+    /// its own finds, and no deeper.
+    #[test]
+    fn a_query_metanode_shows_its_finds_after_its_own_children() {
+        let (app, s, recipes, list, own, smart, deep) = a_query_metanode();
+        let data = untracked(|| app.build_tree_data_structural());
+        let top = &data[0].children;
+        assert_eq!(top[0].value, format!("node_{s}_{recipes}"), "in its own place");
+        let list_row = &top[1];
+        let values: Vec<&str> = list_row.children.iter().map(|c| c.value.as_str()).collect();
+        let found_recipes = format!("node_{s}_{recipes}/{s}_{list}");
+        let found_smart = format!("node_{s}_{smart}/{s}_{list}");
+        assert_eq!(values, vec![format!("node_{s}_{own}").as_str(), found_recipes.as_str(), found_smart.as_str()]);
+        assert_eq!(parse_tree_value(&found_recipes), Some((s, Some(recipes))), "the real node");
+
+        assert!(found_row(&format!("node_{s}_{own}")).is_none(), "an own child is ordinary");
+        assert!(found_row(&top[0].value).is_none(), "its own place is ordinary");
+        let row = found_row(&found_recipes).expect("found");
+        assert_eq!(row.metanode, (s, list));
+        assert_eq!(row.metanode_row, list_row.value);
+        assert!(list_row.children[1].label.contains("found: Shown here because it is tagged #x."), "the row's data carries it");
+
+        // The found metanode shows its finds one level down, through itself.
+        let smart_row = &list_row.children[2];
+        let deep_value = format!("node_{s}_{deep}/{s}_{list}/{s}_{smart}");
+        assert_eq!(smart_row.children.iter().map(|c| c.value.clone()).collect::<Vec<_>>(), vec![deep_value.clone()]);
+        assert_eq!(found_row(&deep_value).map(|f| f.metanode), Some((s, smart)));
+        // ...and a metanode found two finds down shows none of its own.
+        app.finds.update(|f| {
+            f.insert((s, deep), vec![Found { store_id: s, node_id: own, lives_in: String::new(), refusal: String::new() }]);
+        });
+        let data = untracked(|| app.build_tree_data_structural());
+        let deep_row = &data[0].children[1].children[2].children[0];
+        assert!(deep_row.children.is_empty(), "no recursion through finds");
+        assert_eq!(first_found(&[format!("node_{s}_{own}"), found_recipes.clone()]).map(|f| f.metanode), Some((s, list)));
+    }
+
+    /// A found row's own children are its, reached through it: ordinary rows.
+    #[test]
+    fn a_found_rows_children_are_ordinary() {
+        let (app, s, recipes, list, ..) = a_query_metanode();
+        let leaf = Node::document("Leaf");
+        let leaf_id = leaf.id;
+        app.upsert_node(s, leaf);
+        app.set_children(s, recipes, vec![(s, leaf_id)]);
+        let data = untracked(|| app.build_tree_data_structural());
+        let found = &data[0].children[1].children[1];
+        let child = &found.children[0].value;
+        assert_eq!(*child, format!("node_{s}_{leaf_id}/{s}_{list}/{s}_{recipes}"));
+        assert!(found_row(child).is_none());
+        // In its own place the same child is its plain value.
+        assert_eq!(data[0].children[0].children[0].value, format!("node_{s}_{leaf_id}"));
     }
 }
 

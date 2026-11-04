@@ -26,6 +26,10 @@ pub const SOURCE_KEY: &str = "metanode:source";
 /// this is not one a person reads, and every walk of a forest stays bounded.
 pub const MAX_SUBTREE_DEPTH: u32 = 16;
 
+/// The viewer built into the app for a query metanode, a query metanode
+/// (docs/QUERY_METANODES_CONTRACT.md section 5): its pane shows the setup.
+pub const LIST_VIEWER: &str = "list";
+
 /// What a metanode stores: the viewer and the source. A node
 /// carries one only when it has a viewer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +52,18 @@ impl Metanode {
     /// viewer". `of` is the metanode's own label.
     pub fn describe(&self, of: &str) -> String {
         format!("a metanode: {}, shown with the {} viewer", self.source.describe(of), self.viewer)
+    }
+
+    /// Whether it finds nodes beyond its own children (a query metanode,
+    /// docs/QUERY_METANODES_CONTRACT.md): the explorer shows its finds, and
+    /// it looks like one.
+    pub fn is_query(&self) -> bool {
+        self.source.is_match()
+    }
+
+    /// Whether its pane shows the query metanode setup ([`LIST_VIEWER`]).
+    pub fn shows_setup(&self) -> bool {
+        self.viewer.trim() == LIST_VIEWER
     }
 }
 
@@ -236,6 +252,23 @@ pub fn tag_key(tag: &str) -> String {
 }
 
 impl Condition {
+    /// Whether the condition is still being filled in (its value is empty):
+    /// it holds for nothing, so a query metanode finds nothing until it is
+    /// written out.
+    pub fn is_blank(&self) -> bool {
+        match self {
+            Condition::Tag { tag } => tag.trim().trim_start_matches('#').trim().is_empty(),
+            Condition::NoTag { no_tag } => no_tag.trim().trim_start_matches('#').trim().is_empty(),
+            Condition::Text { text } => text.trim().is_empty(),
+            Condition::LinksTo { links_to } => links_to.trim().is_empty(),
+            Condition::Type { node_type } => node_type.trim().is_empty(),
+            Condition::Field { field, is, value } => {
+                field.trim().is_empty() || (!matches!(is, FieldOp::Set | FieldOp::Empty) && value.as_deref().unwrap_or("").trim().is_empty())
+            }
+            Condition::Later(_) => false,
+        }
+    }
+
     /// The condition as a source says it: "tagged waiting".
     fn describe(&self, name: &dyn Fn(Named) -> Option<String>) -> String {
         match self {

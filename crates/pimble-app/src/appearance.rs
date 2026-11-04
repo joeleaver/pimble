@@ -159,7 +159,7 @@ pub fn icons_matching(query: &str) -> Vec<TablerIcon> {
 
 // The glyph and the colors as drawn on the current theme are pimble-ui's,
 // shared with plugins so a card in a plugin's view looks as the tree draws it.
-pub use pimble_ui::appearance::{display_color, row_background, IconGlyph};
+pub use pimble_ui::appearance::{display_color, gathered_violet, row_background, IconGlyph};
 
 #[cfg(test)]
 mod tests {

@@ -804,6 +804,11 @@ async fn a_query_metanode_finds_nodes_after_its_own_children() {
     assert_eq!(found_with(finds(vec![C::Type { node_type: "canvas".into() }])).await, vec![sketch]);
     assert_eq!(found_with(finds(vec![C::Type { node_type: "kanban".into() }])).await, vec![kanban]);
     assert_eq!(found_with(finds(vec![tag("waiting"), C::Type { node_type: "document".into() }])).await, vec![alpha, beta, gamma]);
+    // A condition still being filled in finds nothing (a new query metanode's
+    // first line), with or beside others.
+    assert_eq!(found_with(finds(vec![tag(" ")])).await, Vec::<NodeId>::new());
+    assert_eq!(found_with(finds(vec![tag("waiting"), C::Text { text: String::new() }])).await, Vec::<NodeId>::new());
+    assert_eq!(found_with(finds(vec![field("Due", FieldOp::Less, None)])).await, Vec::<NodeId>::new());
 
     // Orders, descending, and the limit.
     assert_eq!(found_with(query(vec![tag("waiting")], None, Order::Created, true, 50)).await, vec![sketch, gamma, beta, alpha]);
