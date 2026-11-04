@@ -55,6 +55,7 @@ pub mod discussions;
 pub mod doc_session;
 pub mod personal;
 pub mod places;
+pub mod properties;
 pub mod views;
 pub mod presence;
 pub mod text_boards;

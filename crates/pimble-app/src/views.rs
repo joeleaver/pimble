@@ -1,8 +1,9 @@
 //! What this device remembers of how things looked, so they look the same
 //! next time (Joe, 2026-10-23: every client keeps its own): the explorer's
 //! expanded rows, the place in every text node (the selection and the first
-//! line in view) and the camera of every board. None of it is in a store or
-//! in the personal document, and none of it leaves the device:
+//! line in view), the camera of every board, and the Properties panel. None
+//! of it is in a store or in the personal document, and none of it leaves
+//! the device:
 //! `<data dir>/pimble/views.json` on the desktop, `localStorage`
 //! `pimble.views` in the browser, saved a moment after it changes.
 
@@ -85,6 +86,10 @@ pub(crate) struct Views {
     /// id>"`, as each handed it over.
     #[serde(default)]
     plugins: HashMap<String, PluginView>,
+    /// The Properties panel (docs/PROPERTIES_CONTRACT.md section 3):
+    /// whether it is open and its width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    properties: Option<PanelView>,
     /// The last `at` handed out.
     #[serde(default)]
     clock: u64,
@@ -92,6 +97,13 @@ pub(crate) struct Views {
     /// they were left, rather than revealing what a pane shows.
     #[serde(skip)]
     seen_at_start: Vec<String>,
+}
+
+/// A side panel as it was left.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PanelView {
+    pub open: bool,
+    pub width: f32,
 }
 
 /// A plugin viewer's remembered look on one metanode: its own text.
@@ -258,6 +270,27 @@ pub(crate) fn rows_remembered(store_id: StoreId) -> bool {
     with(|v| v.seen_at_start.contains(&id))
 }
 
+// ── The Properties panel ────────────────────────────────────────────────────
+
+/// The Properties panel as this device left it, if it has been touched.
+pub(crate) fn properties() -> Option<PanelView> {
+    with(|v| v.properties)
+}
+
+/// The Properties panel is now `panel`.
+pub(crate) fn set_properties(panel: PanelView) {
+    let changed_now = with(|v| {
+        if v.properties == Some(panel) {
+            return false;
+        }
+        v.properties = Some(panel);
+        true
+    });
+    if changed_now {
+        changed();
+    }
+}
+
 // ── Text ────────────────────────────────────────────────────────────────────
 
 pub(crate) fn place(store_id: StoreId, node_id: NodeId) -> Option<TextPlace> {
@@ -376,6 +409,7 @@ mod tests {
         v.set_place("s/n".into(), TextPlace::new(vec![1, 2], vec![3], Some(vec![4])));
         v.set_place("s/m".into(), TextPlace::new(vec![5], vec![5], None));
         v.set_camera("s/b".into(), Camera::new(1.5, -2.0, 0.5));
+        v.properties = Some(PanelView { open: true, width: 320.0 });
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<Views>(&json).unwrap(), v);
         assert_eq!(serde_json::from_str::<Views>("{}").unwrap(), Views::default());

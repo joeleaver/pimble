@@ -715,8 +715,10 @@ In layers (Joe, 2026-10-19: "would be nice"):
   `field_update`, an update made on a blank document so a client that does not hold the
   node can write one), read into `NodeMetadata::fields` and so into every `Node`; a field
   change is `MetadataUpdated`. Formulas read them (`'Packing'!rate`, `[@where].rate`) in
-  the app and the MCP. The app shows them in a band under the pane's title strip
-  (`fields.rs`: edit in place, Enter writes; ×; "+ Field"; Edit > "Add Field"). A node
+  the app and the MCP. The app showed them in a band under the pane's title strip
+  until 2026-11-04; they now live in the Properties panel (docs/PROPERTIES_CONTRACT.md:
+  edit in place, Enter or leaving the box writes through `fields::write`; ×; "+ Add
+  field"; Edit > "Add Field" opens the panel with a new field's name box). A node
   made from a link cell gets its new siblings' field names, empty. Search indexes them
   (`name: value`). MCP `get_fields`, `set_fields`, and `get_node` lists them. Checked on
   the desktop (the band, a rate changed there recomputing `[@where].rate` in another

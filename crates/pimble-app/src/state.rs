@@ -650,12 +650,20 @@ pub struct AppStore {
     pub link_modal_pending: Signal<bool>,
 
     // "Appearance..." modal (node context menu): the node whose icon and
-    // colour are being picked; `None` means closed. `appearance_icon_query`
-    // filters the icon grid over the whole Tabler set; `appearance_tags_text`
-    // is the tags field's text (comma separated), seeded when the modal opens.
+    // colors are being picked; `None` means closed. `appearance_icon_query`
+    // filters the icon grid over the whole Tabler set. Tags are the
+    // Properties panel's (docs/PROPERTIES_CONTRACT.md).
     pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
     pub appearance_icon_query: Signal<String>,
-    pub appearance_tags_text: Signal<String>,
+
+    /// The Properties panel (docs/PROPERTIES_CONTRACT.md): whether it is
+    /// open (View > "Properties", `Alt+Enter`) and its width, both remembered
+    /// on this device (`views.rs`); a new field's row is showing (Edit >
+    /// "Add Field"); and what the backend last said of the node it shows.
+    pub properties_open: Signal<bool>,
+    pub properties_width: Signal<f32>,
+    pub properties_adding_field: Signal<bool>,
+    pub properties_context: Signal<Option<crate::properties::Context>>,
 
     /// The theme in use (View > "Toggle Dark Mode"), persisted in `state.json`.
     /// Read reactively wherever a colour depends on the scheme.
@@ -961,8 +969,6 @@ pub struct PaneState {
     /// Whether the pane shows a sheet node's tables (docs/SHEETS_CONTRACT.md
     /// section 1) instead of its editor, which stays mounted, hidden.
     pub show_sheet: Signal<bool>,
-    /// A field is being added to the node (Edit > "Add Field", `fields.rs`).
-    pub adding_field: Signal<bool>,
     /// The sheet node the pane holds, like `board` for a board node.
     pub sheet: Signal<Option<ActiveEdit>>,
     /// What the sheet view shows: the computed tables, the cell being typed
@@ -1000,7 +1006,6 @@ impl PaneState {
             markup: Signal::new(false),
             picture: Signal::new(None),
             show_sheet: Signal::new(false),
-            adding_field: Signal::new(false),
             sheet: Signal::new(None),
             sheet_ui: crate::sheets::SheetUi::new(),
             show_discussion: Signal::new(false),
@@ -1067,7 +1072,10 @@ impl AppStore {
             link_modal_pending: Signal::new(false),
             appearance_modal_node: Signal::new(None),
             appearance_icon_query: Signal::new(String::new()),
-            appearance_tags_text: Signal::new(String::new()),
+            properties_open: Signal::new(false),
+            properties_width: Signal::new(crate::properties::DEFAULT_WIDTH),
+            properties_adding_field: Signal::new(false),
+            properties_context: Signal::new(None),
             dark_mode: Signal::new(true),
             board_tool: Signal::new(crate::boards::Tool::default()),
             board_style: crate::boards::StyleUi::new(),

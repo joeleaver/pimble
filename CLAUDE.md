@@ -370,7 +370,7 @@ render time, so the row's `TreeNodeData` label carries them (with the paste flag
 `NodeLoaded` bumps the tree when they change. `display_color` lifts a dark stored colour
 on the dark theme and caps a light one on the light theme, at render time and reactively
 on `AppStore::dark_mode`; the stored value is never altered. "Appearance..." opens the
-picker (every click applies at once; the tags field applies on Enter or Done). A background color
+picker (every click applies at once; tags left it for the Properties panel, docs/PROPERTIES_CONTRACT.md). A background color
 (`custom_keys::BACKGROUND`, "Background" in the picker beside "Text", docs/IMPORT_CONTRACT.md "Background colors")
 tints the whole row behind its text, a band the label draws over the
 `position: relative` row. Tags are
@@ -648,6 +648,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
+- `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties.rs` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter)
 
 ## Build & Run
 

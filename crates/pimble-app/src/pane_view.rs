@@ -129,7 +129,7 @@ fn pane_people(store: AppStore, pane: PaneId) -> (Vec<crate::presence::Person>, 
 
 /// The title in pane `pane`'s strip, tracked: the label its tree row shows,
 /// typing included.
-fn pane_title(store: AppStore, pane: PaneId) -> String {
+pub(crate) fn pane_title(store: AppStore, pane: PaneId) -> String {
     let Some((store_id, node_id)) = pane_document(store, pane) else { return String::new() };
     if let Some(live) = store.live_label_signal((store_id, node_id)).get() {
         return live;
@@ -143,7 +143,7 @@ fn pane_title(store: AppStore, pane: PaneId) -> String {
 /// The icon in pane `pane`'s strip and its colour, tracked: the node's own
 /// when it has them (docs "Tree appearance"), a document's otherwise. Empty
 /// for a pane with no document.
-fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
+pub(crate) fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
     let Some((store_id, node_id)) = pane_document(store, pane) else { return Vec::new() };
     let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
     // The icon and color the node's explorer row shows: a metanode with a
@@ -274,7 +274,6 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // The note's tables no atom shows any more (docs/SHEETS_CONTRACT.md
     // section 1), under its text.
     let lost_tables = crate::sheets::in_text::render_lost(__scope, store, pane);
-    let fields_band = crate::fields::render_fields(__scope, store, pane);
     let content_wrap = rsx! {
         div {
             class: "pimble-editor__content-wrap",
@@ -477,8 +476,6 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 }
             }
 
-            // The node's own fields (docs/SHEETS_CONTRACT.md section 8).
-            {fields_band}
             // The same sentence a refused write comes back with, so a
             // reader meets one wording everywhere.
             div {
@@ -635,6 +632,10 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     });
     let slots: Vec<NodeHandle> = PaneId::ALL.into_iter().map(|pane| render_pane(__scope, store, pane, hints)).collect();
     let dividers: Vec<NodeHandle> = (0..MAX_PANES - 1).map(|index| render_divider(__scope, store, index)).collect();
+    // The Properties panel (docs/PROPERTIES_CONTRACT.md), right of the
+    // panes under the toolbar: it takes its width from the area, and the
+    // panes keep theirs in percent of what is left.
+    let properties = crate::properties::render_panel(__scope, store);
     rsx! {
         div {
             class: "pimble-panes-area",
@@ -654,9 +655,13 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
                 }
             }
             div {
-                class: "pimble-panes",
-                {slots}
-                {dividers}
+                class: "pimble-panes-row",
+                div {
+                    class: "pimble-panes",
+                    {slots}
+                    {dividers}
+                }
+                {properties}
             }
         }
     }

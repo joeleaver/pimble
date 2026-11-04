@@ -316,8 +316,14 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                             }
                         }
                     }
-                    if let Some(tags) = tags {
-                        doc.set_tags(&tags, now)?;
+                    // Made on the tags as the document has them now, so a
+                    // tag someone else added meanwhile stays.
+                    if let Some(change) = tags {
+                        let before = doc.fields()?.tags;
+                        let after = change.apply(&before);
+                        if after != before {
+                            doc.set_tags(&after, now)?;
+                        }
                     }
                     Ok(())
                 })
@@ -473,6 +479,19 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             }
             ancestors.reverse();
             Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
+        }
+
+        C::GetProperties { store_id, node_id } => {
+            // Where it lives: parent by parent, as `GetAncestors` reads them.
+            let mut lives_in = Vec::new();
+            if let Ok(above) = api.ancestors(Addr::new(store_id, node_id)).await {
+                for addr in above.into_iter().rev() {
+                    let Ok(node) = api.node(addr).await else { break };
+                    lives_in.push((addr.node, crate::state::display_label_from_node(&node)));
+                }
+            }
+            let store_tags = api.tags_in(store_id).await.unwrap_or_default();
+            Some(BackendEvent::PropertiesLoaded { store_id, node_id, lives_in, store_tags })
         }
 
         C::ResolveLink { url, hops } => match api.backend().resolve_link(url.store, url.node).await {

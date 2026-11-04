@@ -1031,6 +1031,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::AncestorsLoaded { store_id, node_id, ancestors } => {
                 reveal_in_tree(store, tree_state, *store_id, *node_id, ancestors);
             }
+            BackendEvent::PropertiesLoaded { store_id, node_id, lives_in, store_tags } => {
+                store.properties_context.set(Some(crate::properties::Context {
+                    store_id: *store_id,
+                    node_id: *node_id,
+                    lives_in: lives_in.clone(),
+                    store_tags: store_tags.clone(),
+                }));
+            }
             BackendEvent::DeletedListed { store_id, nodes } => {
                 tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());
                 // A late answer for a store the modal has moved on from (or

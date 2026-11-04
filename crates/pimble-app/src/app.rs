@@ -889,14 +889,9 @@ fn member_role_text(role: pimble_rpc::MemberRole) -> &'static str {
     }
 }
 
-/// Open the "Appearance..." picker for `(store_id, node_id)`: seed the tags field
-/// from the node and clear the icon search.
+/// Open the "Appearance..." picker for `(store_id, node_id)`, its icon
+/// search cleared. Tags are the Properties panel's.
 fn open_appearance_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
-    let tags = store
-        .get_node_signal(store_id, node_id)
-        .map(|sig| untracked(|| sig.with(|n| n.metadata.tags.join(", "))))
-        .unwrap_or_default();
-    store.appearance_tags_text.set(tags);
     store.appearance_icon_query.set(String::new());
     store.appearance_modal_node.set(Some((store_id, node_id)));
 }
@@ -1100,6 +1095,21 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     if let Some(width) = load_sidebar_width() {
         store.sidebar_width.set(width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
     }
+    // The Properties panel as this device left it (closed the first time,
+    // docs/PROPERTIES_CONTRACT.md decision 2), remembered whenever it opens,
+    // closes or is resized.
+    if let Some(panel) = crate::views::properties() {
+        store.properties_open.set(panel.open);
+        store.properties_width.set(panel.width.clamp(crate::properties::MIN_WIDTH, crate::properties::MAX_WIDTH));
+    }
+    // The first run only subscribes (no timer before the window exists).
+    let panel_subscribed = Cell::new(false);
+    let _ = rinch::Effect::new(move || {
+        let panel = crate::views::PanelView { open: store.properties_open.get(), width: store.properties_width.get() };
+        if panel_subscribed.replace(true) {
+            untracked(|| crate::views::set_properties(panel));
+        }
+    });
 
     // The split view as it was left (docs/SPLIT_VIEW_CONTRACT.md
     // "Persistence"): the tiling at once, each pane's document when its
@@ -2797,16 +2807,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None });
             }
         };
-        let send_tags = move || {
-            if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-                let tags: Vec<String> = untracked(|| store.appearance_tags_text.get())
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, background: None, tags: Some(tags) });
-            }
-        };
         let swatches: Vec<NodeHandle> = COLOR_CHOICES
             .iter()
             .map(|&(name, hex)| {
@@ -2901,21 +2901,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                         }
                     }
-                    div { class: "pimble-appearance__label", "Tags (comma separated)" }
-                    TextInput {
-                        placeholder: "e.g. Important, Tax",
-                        value_fn: move || store.appearance_tags_text.get(),
-                        oninput: move |val: String| store.appearance_tags_text.set(val),
-                        onsubmit: move || send_tags(),
-                    }
                     div {
                         style: "margin-top: 14px; display: flex; justify-content: flex-end;",
                         Button {
                             variant: "filled",
-                            onclick: move || {
-                                send_tags();
-                                store.appearance_modal_node.set(None);
-                            },
+                            onclick: move || store.appearance_modal_node.set(None),
                             "Done"
                         }
                     }

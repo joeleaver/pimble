@@ -305,7 +305,7 @@ fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
                 Insert::Board => crate::text_boards::insert_board(store),
                 Insert::Sheet => crate::sheets::in_text::insert_sheet(store),
                 Insert::SheetNode => crate::sheets::in_text::insert_sheet_node(store),
-                Insert::Field => crate::fields::add_field(store),
+                Insert::Field => crate::properties::add_field(store),
                 Insert::Discussion => crate::discussions::start_here(store),
             }
             return;

@@ -548,6 +548,33 @@ impl Pimble {
         Ok(())
     }
 
+    /// The tags used anywhere in `store` (its nodes not deleted), each once
+    /// whatever its case (the spelling met first), sorted case-insensitively:
+    /// what the Properties panel suggests as a tag is typed
+    /// (docs/PROPERTIES_CONTRACT.md section 4). Read from the documents held,
+    /// the store held whole first.
+    pub async fn tags_in(&self, store: StoreId) -> Result<Vec<String>, ApiError> {
+        self.hold_store(store).await?;
+        let held = self.held.lock().unwrap();
+        let Some(h) = held.store(store) else { return Ok(Vec::new()) };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for id in h.tree.ids() {
+            let Some(fields) = h.tree.doc(id).and_then(|d| d.fields().ok()) else { continue };
+            if fields.deleted_at.is_some() {
+                continue;
+            }
+            for tag in fields.tags {
+                let tag = tag.trim().to_string();
+                if !tag.is_empty() && seen.insert(tag.to_lowercase()) {
+                    out.push(tag);
+                }
+            }
+        }
+        out.sort_by_key(|t| t.to_lowercase());
+        Ok(out)
+    }
+
     /// Every node of `store` as the person sees its tree: its top (the root,
     /// or a partial replica's shared roots) and everything under it, through
     /// mounts, each with its path of titles from the store's name.

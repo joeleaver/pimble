@@ -29,6 +29,32 @@ pub enum SearchPurpose {
     MetanodeSetup(crate::panes::PaneId),
 }
 
+/// One change of a node's tags (`BackendCommand::SetNodeAppearance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagEdit {
+    /// Add this tag, unless the node has it in any case.
+    Add(String),
+    /// Take this tag off, in whatever case the node has it.
+    Remove(String),
+}
+
+impl TagEdit {
+    /// `tags` with this change made.
+    pub fn apply(&self, tags: &[String]) -> Vec<String> {
+        let mut out = tags.to_vec();
+        match self {
+            TagEdit::Add(tag) => {
+                let tag = tag.trim();
+                if !tag.is_empty() && !out.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                    out.push(tag.to_string());
+                }
+            }
+            TagEdit::Remove(tag) => out.retain(|t| !t.eq_ignore_ascii_case(tag.trim())),
+        }
+        out
+    }
+}
+
 /// Commands sent from UI to backend
 #[derive(Debug)]
 pub enum BackendCommand {
@@ -114,8 +140,10 @@ pub enum BackendCommand {
         color: Option<Option<String>>,
         /// The row colour (`custom_keys::BACKGROUND`), the same way.
         background: Option<Option<String>>,
-        /// `Some(tags)` replaces the node's tags.
-        tags: Option<Vec<String>>,
+        /// A tag added or taken off (the Properties panel,
+        /// docs/PROPERTIES_CONTRACT.md section 4), made on the node's tags as
+        /// the edit finds them.
+        tags: Option<TagEdit>,
     },
     DeleteNode { store_id: StoreId, node_id: NodeId },
     /// Answers `NodeMoved`, or `NodeTransplanted` when the move would have
@@ -144,6 +172,10 @@ pub enum BackendCommand {
     /// The nodes above `node_id`, so the tree can open down to it (a followed
     /// link's target, docs/LINKS_CONTRACT.md). Answers `AncestorsLoaded`.
     GetAncestors { store_id: StoreId, node_id: NodeId },
+    /// What the Properties panel shows of a node besides its own signal
+    /// (docs/PROPERTIES_CONTRACT.md sections 4 and 5): where it lives and the
+    /// tags its store uses. Answers `PropertiesLoaded`.
+    GetProperties { store_id: StoreId, node_id: NodeId },
 
     /// Parse picked files and write what they hold under `parent_id` (the
     /// store's root when `None`) as new nodes, through the same commands the
@@ -518,6 +550,10 @@ pub enum BackendEvent {
     /// Answer to `GetAncestors`: the store's root first, down to `node_id`'s
     /// parent. Empty for the root, or when the chain could not be read.
     AncestorsLoaded { store_id: StoreId, node_id: NodeId, ancestors: Vec<NodeId> },
+    /// Answer to `GetProperties`: the nodes above `node_id`, the store's top
+    /// first, each with the label its row shows (empty for a store's root,
+    /// or when the chain could not be read), and the tags used in the store.
+    PropertiesLoaded { store_id: StoreId, node_id: NodeId, lives_in: Vec<(NodeId, String)>, store_tags: Vec<String> },
 
     // Mount events
     MountCreated {

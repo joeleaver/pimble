@@ -615,11 +615,235 @@ pub(crate) const APP_CSS: &str = "
     flex-direction: column;
 }
 
+/* The panes, then the Properties panel on their right. */
+.pimble-panes-row {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+}
+
 /* The tiled area: every pane and divider slot is positioned inside it. */
 .pimble-panes {
     flex: 1;
+    min-width: 0;
     position: relative;
     overflow: hidden;
+}
+
+/* ── The Properties panel (docs/PROPERTIES_CONTRACT.md) ─────── */
+
+.pimble-properties-wrap {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+}
+
+.pimble-properties__resizer {
+    flex-shrink: 0;
+    width: 5px;
+    margin-left: -2px;
+    z-index: 1;
+    cursor: col-resize;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-properties__resizer:hover {
+    border-right-color: var(--rinch-primary-color);
+}
+
+.pimble-properties {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    background: var(--rinch-color-body);
+    font-size: 13px;
+    color: var(--rinch-color-text);
+}
+
+.pimble-properties__head {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 6px 0 12px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-properties__icon {
+    display: inline-flex;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-properties__name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-weight: 600;
+}
+
+.pimble-properties__close,
+.pimble-properties__remove,
+.pimble-properties__chip-remove {
+    cursor: pointer;
+    color: var(--rinch-color-dimmed);
+    padding: 0 4px;
+}
+
+.pimble-properties__close:hover,
+.pimble-properties__remove:hover,
+.pimble-properties__chip-remove:hover {
+    color: var(--rinch-color-text);
+}
+
+.pimble-properties__none {
+    padding: 16px 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-properties__note {
+    padding: 8px 12px 0;
+    color: var(--rinch-color-dimmed);
+    font-style: italic;
+}
+
+.pimble-properties__section {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-properties__heading {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--rinch-color-dimmed);
+    margin-bottom: 6px;
+}
+
+.pimble-properties__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+
+.pimble-properties__chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 2px 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--rinch-color-border);
+    background: var(--rinch-color-surface);
+}
+
+.pimble-properties__empty {
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-properties__input {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    padding: 3px 6px;
+    font-size: 13px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+}
+
+.pimble-properties__suggestions {
+    display: flex;
+    flex-direction: column;
+    margin-top: 2px;
+}
+
+.pimble-properties__suggestion {
+    padding: 3px 6px;
+    cursor: pointer;
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-properties__suggestion:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-properties__field {
+    margin-bottom: 4px;
+}
+
+.pimble-properties__field-edit,
+.pimble-properties__field--new {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pimble-properties__field-edit .pimble-properties__input,
+.pimble-properties__field--new .pimble-properties__input {
+    flex: 1;
+}
+
+.pimble-properties__field-name {
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-properties__field-read {
+    display: flex;
+    gap: 8px;
+}
+
+.pimble-properties__field-name-text {
+    color: var(--rinch-color-dimmed);
+    min-width: 6em;
+}
+
+.pimble-properties__add {
+    margin-top: 4px;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+}
+
+.pimble-properties__add:hover {
+    color: var(--rinch-primary-color);
+}
+
+/* Flex items, so each step is a box a click can land on. */
+.pimble-properties__path {
+    display: flex;
+    flex-wrap: wrap;
+    line-height: 1.6;
+}
+
+.pimble-properties__step {
+    display: inline-flex;
+    white-space: pre;
+}
+
+.pimble-properties__sep {
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-properties__link {
+    color: var(--rinch-primary-color);
+    cursor: pointer;
+}
+
+.pimble-properties__link:hover {
+    text-decoration: underline;
+}
+
+.pimble-properties__through,
+.pimble-properties__times {
+    margin-top: 6px;
+    color: var(--rinch-color-dimmed);
 }
 
 .pimble-pane {
@@ -1157,40 +1381,6 @@ pub(crate) const APP_CSS: &str = "
     padding: 0;
     gap: 6px;
     font-size: 14px;
-}
-
-/* A node's fields, under the pane's title strip. */
-.pimble-fields {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px 14px;
-    padding: 6px 16px;
-    border-bottom: 1px solid var(--rinch-color-border);
-    font-size: 13px;
-}
-
-.pimble-fields__item {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-}
-
-.pimble-fields__name {
-    color: var(--rinch-color-dimmed);
-}
-
-.pimble-fields__item .rinch-text-input {
-    width: 11em;
-}
-
-.pimble-fields__remove,
-.pimble-fields__add {
-    border: none;
-    background: transparent;
-    color: var(--rinch-color-dimmed);
-    cursor: pointer;
-    font-size: 12px;
 }
 
 /* A sheet node shown in the text: its title, a link to it. */

@@ -2,7 +2,8 @@
 
 Status: drafted 2026-11-04 from Joe's request ("should we have a dedicated pane, maybe a
 side panel, for editing key/value pairs and tags?"), with his decisions (section 1).
-Nothing built. The decisions of section 7 taken as recommended ("looks good", 2026-11-04).
+The decisions of section 7 taken as recommended ("looks good", 2026-11-04). Waves 1 and 2
+built 2026-11-04 (section 8); waves 3 and 4 not started.
 
 ## 1. What Joe decided (2026-11-04)
 
@@ -90,3 +91,76 @@ Read-only sections under the fields, each collapsed to one line when empty:
 1. **The shortcut**: `Alt+Enter` (recommended: the "properties" key on Windows, and free in
    the editor), or none.
 2. **Open at first**: closed until opened (recommended: the panes keep their width), or open.
+
+## 8. Built: waves 1 and 2 (2026-11-04)
+
+**What and where.**
+
+- `crates/pimble-app/src/properties.rs`: the panel, rendered once by `pane_view::render_panes`
+  in a `pimble-panes-row` beside `.pimble-panes` (under the toolbar; the panes keep their
+  percent layout inside what is left). It shows `pane_view::pane_document` of the focused
+  pane, with the pane strip's own icon and title (`pane_icon`, `pane_title`, now
+  `pub(crate)`). Width dragged by its left edge (200 to 560 px), open/closed and width in
+  `views.rs` (`Views::properties`, `PanelView`; `views.json` / `localStorage`), restored at
+  start in `app::build_view`; closed until first opened.
+- **Opening**: View > "Properties", a checked item (`MenuEntry::Check` over
+  `AppStore::properties_open`, rinch's `MenuItem::checkbox`) with the shortcut `Alt+Enter`.
+  rinch tries menu chords before the app hears the key and swallows a chord with Alt even
+  in a text target, so neither the editor nor the explorer sees it. Edit > "Add Field" (and
+  the toolbar's) is `properties::add_field`: opens the panel with the new field's name box
+  focused (`request_focus` on the desktop, the element's `focus()` in the browser).
+- **Tags**: chips with ×, a box that takes a tag on Enter or comma (`split_typed`), with up
+  to six suggestions as you type from the tags used in the store (`suggestions`: starts-with
+  first, then contains, case-insensitive, the node's own left out; a typed tag takes the
+  store's spelling). Each change is one `SetNodeAppearance` whose `tags` is now a
+  `TagEdit::{Add, Remove}`, applied inside `Pimble::edit` to the tags the document has, so a
+  tag someone else added meanwhile stays. The Appearance dialog's tags box, its
+  `appearance_tags_text` and the replace-all tags path are gone.
+- **Fields**: a row per field, name and value each a box written on Enter or leaving it
+  (`onchange`) through `fields::write`, unchanged; a rename is the new name written with the
+  value, then the old removed (a change of case only is ignored, as `fields::write` treats it
+  as the same field); × removes; "+ Add field" (Escape cancels). `fields::render_fields`, its
+  slot under the pane title, `PaneState::adding_field` and `fields::add_field` are removed.
+- **Read-only**: on a node this device may only read, the access note
+  (`state::access_note`) at the top, chips without ×, fields as text, no boxes.
+- **Context (wave 2)**: "Lives in" is the store's name then the ancestors under the top,
+  each opening that node in the focused pane (`AppStore::link_open`); "Found by <Metanode>."
+  when the pane's row is a found row, "Shown through the mount <name>." (or "Shown by the
+  Metanode <name>.") when its tree value crossed one. "Created ... · Changed ..." in local
+  time (`chrono::Local`, `wasmbind` in the browser).
+- **Backend**: `BackendCommand::GetProperties` answers `PropertiesLoaded { lives_in,
+  store_tags }` from `Pimble::ancestors` and the new `Pimble::tags_in(store)` (holds the
+  store, reads every held document's tags, not deleted, once per case). The panel asks when
+  it opens, when the node it shows changes, and when that node's parent or tags change
+  (deduplicated, so typing in the note asks nothing). Routed in the browser by
+  `vault::store_id_of`; a read, so not gated.
+- **Live**: tags, fields, icon, title and times read the node's signal, so edits from
+  anywhere show as they land.
+
+**Tests**: `properties::tests` (suggestions, comma splitting, `TagEdit` keeps one of each
+case, local time), `views` round trip with the panel; `pimble-app --lib` 216 pass; the web
+build compiles (`wasm32`, only the pre-existing warnings).
+
+**Checked in the release desktop app** (scratch environment, port 7473): Alt+Enter opened
+the panel from the editor and closed it again without a line break in the note; View >
+"Properties" opens it and shows the check while open; typing "d" offered "done", a click
+added it, "urgent," added on the comma, "home" on Enter, × removed one; a found node went
+out of and back into the "Waiting" Metanode as its tags changed. "+ Add field" put the
+keyboard in the name box; "rate"/"25" added, the value edited to 250 on leaving the box,
+the name renamed to "rates" on Enter, × removed a field. An agent's `set_tags` and
+`set_fields` (pimble-mcp) showed in the open panel at once. Splitting, the empty pane shows
+"Choose a node to see its properties."; focusing either pane switched the panel; a node
+opened under a mount said "Shown through the mount Kanban." and lives in "Other / Kanban";
+a found node said "Found by Waiting."; Edit > "Add Field" with the panel closed opened it
+with the name box focused; Appearance... has no tags and an icon chosen there showed in
+the panel's head; light and dark themes both read; the width drag and open state survived
+a restart. A first cut of "Lives in" laid its steps out inline and a click on one did
+nothing (rinch hit-tests boxes, not inline text runs); they are flex items now, and a click
+opened the step.
+
+**Not done / not checked**: the read-only face was not seen in the app (no shared store in
+the scratch environment); the browser was compiled but not driven. "Found by" is read from
+the explorer's found rows, so it is missing after a restart (the restored pane has no row
+yet) and stays after the node stops being found until the pane opens something else.
+Ancestors renamed elsewhere show their new name only when the panel asks again. Waves 3
+(Shown in, Links here, Rows pointing here) and 4 (the full check matrix) remain.
