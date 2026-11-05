@@ -63,6 +63,26 @@ pub use pimble_plugin_abi::{HostState, Manifest, NodeAddr, Permissions, PresentP
 pub use pimble_ui;
 pub use runtime::{log_line, person, Guest, Host, Mount, Seen, ViewFn};
 
+/// How soon a second click on the same thing makes a double-click.
+pub const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+thread_local! {
+    static LAST_CLICK: std::cell::Cell<Option<(std::time::Instant, pimble_api::Addr)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether this click on `addr` (a card, a row, a header) is the second of a
+/// double-click: what renames each of them in a viewer, as a double-click
+/// does a row of the explorer. rinch hands a click no count, so a guest times
+/// its clicks itself (WASI's clock answers on both hosts).
+pub fn clicked_again(addr: pimble_api::Addr) -> bool {
+    LAST_CLICK.with(|last| {
+        let now = std::time::Instant::now();
+        let again = last.get().is_some_and(|(at, on)| on == addr && now.duration_since(at) < DOUBLE_CLICK);
+        last.set(if again { None } else { Some((now, addr)) });
+        again
+    })
+}
+
 /// The rinch git revision this SDK was built against (from the plugin's
 /// `Cargo.lock`, `unknown` when there was none to read). The manifest carries it.
 pub const RINCH_REVISION: &str = env!("PIMBLE_RINCH_REVISION");
@@ -76,7 +96,7 @@ pub use rinch;
 /// `rinch` it brings into scope.
 pub mod prelude {
     pub use crate::{pimble_api, rinch};
-    pub use crate::{display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
+    pub use crate::{clicked_again, display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
     pub use crate::pimble_ui;
     pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Judged, MetanodeEdit, Pimble};
     pub use pimble_core::Place;

@@ -2,7 +2,7 @@
 # Build Pimble plugins and install them into this device's plugins folder
 # (docs/PLUGINS_CONTRACT.md decision 3: a per-device folder, installed by hand).
 #
-#   scripts/plugins/install.sh                 # the kanban viewer
+#   scripts/plugins/install.sh                 # the kanban and todo list viewers
 #   scripts/plugins/install.sh kanban-viewer hello-viewer
 #
 # The folder is <data dir>/pimble/plugins/: ~/.local/share/pimble/plugins on
@@ -18,7 +18,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 plugins=("$@")
 if [ ${#plugins[@]} -eq 0 ]; then
-  plugins=(kanban-viewer)
+  plugins=(kanban-viewer todo-viewer)
 fi
 
 if [ -n "${PIMBLE_DATA_DIR:-}" ]; then

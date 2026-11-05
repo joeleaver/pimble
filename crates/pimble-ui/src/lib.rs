@@ -7,6 +7,7 @@
 //!   words a hover says.
 //! - [`appearance`]: a node's icon by name and the colors it is drawn with on
 //!   the current theme.
+//! - [`viewer`]: how a metanode viewer plugin looks (the kanban's look, shared).
 //!
 //! The classes these components carry are styled by [`STYLES`], which the app
 //! puts in its stylesheet. A plugin's markup is applied under the app's
@@ -14,6 +15,7 @@
 
 pub mod appearance;
 pub mod presence;
+pub mod viewer;
 
 /// The stylesheet for this crate's components; the app includes it in its own.
 pub const STYLES: &str = presence::STYLES;

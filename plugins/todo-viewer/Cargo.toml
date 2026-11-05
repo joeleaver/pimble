@@ -1,0 +1,18 @@
+[package]
+name = "todo-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The todo list metanode viewer: a subtree as a checklist, done as a timestamp in the node field `done` (docs/TODO_CONTRACT.md)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }
+# An item's `due` read as a sheet's date column reads what is typed into it.
+pimble-sheet = { path = "../../crates/pimble-sheet" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The look remembered on this device, and the value a rename's `explicit_title` flag is written as.
+serde_json = "1"
