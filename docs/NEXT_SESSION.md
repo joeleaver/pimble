@@ -1,5 +1,89 @@
 # Next session: start here
 
+**2026-11-04 (session b7ec70bd): v0.18.1 released (release commit 7fc903a), deployed (jkbase
+v47) and installed here, with the kanban plugin; rinch `main` c69c65ec in all three locks
+(root, `web/`, `plugins/`).** `master` = `origin/master`, clean. Eleven releases in two days
+(v0.16.0 to v0.18.1, jkbase v40 to v47); no accounts-DB backup was taken before these
+deploys (none changed the accounts schema). The branch `api` was merged into `master`
+(fast-forward) at v0.16.0 and is no longer worked on.
+
+What was built, in order (each has its contract; "Built" sections at their ends say what,
+where, tests, and what was checked in the app):
+
+1. **The internal API refactor** (docs/API_CONTRACT.md waves 0-5): `pimble-api` (one
+   `Pimble` used by the desktop, the web app, the MCP and plugins), `pimble_core::plan`,
+   one write path, held documents. Shipped in v0.16.0.
+2. **Metanodes** (docs/METANODES_CONTRACT.md): a node with `metanode:viewer` and
+   `metanode:source` keys. **The user-facing word is "Metanode"** (Joe, 2026-11-04: never
+   "Smart List"); memory has it.
+3. **Plugins** (docs/PLUGINS_CONTRACT.md): wasm32-wasip1 guests, wasmtime on the desktop,
+   the page's WebAssembly in the browser, ABI **5** (`Props::remembered` and
+   `HostRequest::Remember`: a viewer's look kept per device in `views.rs`). Approvals are
+   per store; the app asks for the stores a metanode's mounts reach.
+4. **Kanban** (docs/KANBAN_CONTRACT.md, plugin in `plugins/kanban-viewer`): columns are
+   children, cards grandchildren, order is priority; sub-kanbans (and mounted kanbans)
+   are **lanes**; one shared header row when lanes agree; lanes collapse, minimize,
+   expand; columns fold by name; Done never taller than its row; "Add card" on hover;
+   drags with the card's picture under the pointer and a gap (rinch #2154,
+   `SortPreview::Snapshot` because rinch's element copy loses a plugin's look across the
+   host; the browser has no snapshot so it shows only the gap). Install the plugin with
+   `scripts/plugins/install.sh` after a release (it is not in the packages).
+5. **Menus** (docs/MENUS_CONTRACT.md): one New list (`crate::creating`) for "+", the row
+   menus (New ▸) and File > New ▸; "+" makes beside the selected row; Copy (link + node for
+   mounting), Cut, one Paste that chooses (`crate::pasting`); Ctrl+V a straight paste;
+   submenus New ▸, Mount ▸, Sync ▸ (rinch #2214); no "Show as Outline"/"Show as Kanban"
+   (Joe: a metanode is made by a recipe; the MCP's `set_metanode` changes one).
+6. **Query metanodes** (docs/QUERY_METANODES_CONTRACT.md): New ▸ Metanode; own children
+   plus found nodes (tag, no tag, text, field, links to, type; within; order; limit),
+   evaluated over held documents, never stored; found rows violet with an arrow, their
+   place unchangeable (greyed with a sentence); the pane shows the setup. MCP
+   `set_metanode`/`get_metanode` take and show queries.
+7. **Properties panel** (docs/PROPERTIES_CONTRACT.md): right of the panes, follows the
+   focused pane, View > Properties / Alt+Enter, closed at first; tags (chips with
+   suggestions), fields (replaces the fields band), Lives in, Shown in, Links here (new
+   `backlinks` RPC), Rows pointing here (shared with the MCP), Created/Changed. Tags left
+   the Appearance dialog.
+8. **Fixes**: a move between stores now keeps a node's fields and metanode keys
+   (`CuttingNode`), a mount row opens the node it mounts, a draggable's child gets its own
+   click in the browser (rinch #2134), a new node's rename starts empty.
+
+**Open, in Joe's priority as far as known:**
+- **Wave 4 checks of Properties and query metanodes** were never run: the browser, an
+  encrypted store, a read-only share, a node through a mount (Properties), a colored
+  metanode's violet dot, Alt+Shift moves and Ctrl+X on a found row.
+- **Known limits** (in the contracts): text matching is a per-word substring, not stemmed;
+  every query re-read walks the store (fine at Joe's sizes; index it if a store grows);
+  "Links here" misses links from other stores (each store's index knows its own); "Found
+  by ..." in Lives in comes from the explorer and is missing after a restart; a kanban's
+  card ghost is absent in the browser.
+- **Kanban not built**: one shared header row's "Rename in every lane" is built, but
+  dragging a lane to reorder it, the milestone party (plugins cannot animate), tag filters,
+  drops onto a folded column.
+- **Joe's real data**: Personal/Kanban has the mounted Apex Kanban as a lane; Apex/Apex
+  Kanban was restored to a kanban through the MCP after the move-between-stores bug.
+
+**How to work here** (all in memory and CLAUDE.md; the ones that bit this session):
+- ONE heavy cargo job at a time on this machine (other projects build too; load 40-60 is
+  normal): every cargo command through `scripts/guarded.sh -j 6 --release`; never the whole
+  workspace suite except before a big release.
+- Check UI in the release desktop app isolated from Joe's: the scratch environment of this
+  session was `/tmp/claude-1000/-home-joe-dev-pimble/b7ec70bd-7c99-4bc0-bd8c-ff39695a2ced/scratchpad/desk`
+  (`start-app.sh` on port 7473 with scratch XDG dirs, `drive.py` over rinch's debug port via
+  `scripts/perf/rd.py`; `key_press` needs `shift`, `ctrl` and `alt`; menus open on hover
+  after 400 ms, so move the pointer in steps; the first click after a menu closes is
+  swallowed). Recreate it from `scripts/perf/README.md` if /tmp was cleared.
+- Releases: Windows check (`cargo xwin check -p pimble-app -p pimble-mcp --release
+  --target x86_64-pc-windows-msvc`), bump `Cargo.toml` and `web/Cargo.toml`,
+  `cargo update -w` in `plugins/`, tag, push, `git push jkbase`, then
+  `tools/install-release.sh` and `scripts/plugins/install.sh`.
+- rinch work goes to the peer session "Rinch master session" (SendMessage by that name; the
+  socket address changes when it restarts). It merges through batches and tells this
+  session when a PR is on main; then move all three locks to the same revision
+  (`cargo update rinch rinch-tabler-icons rinch-editor-core`; `--precise <sha>` in `web/`
+  and `plugins/`) and keep root and `web/` on the same wasm-bindgen.
+- Joe's words for things are decisions: "Metanode", "Properties", "canvas" (code: board).
+
+
 **2026-11-02: v0.15.1 released (release commit 490cbaa), deployed (jkbase v39; backup
 `bkp_1793634527332_f7581ddf58f5fea8`) and installed here: rinch `main` 2d1f11a0.** A
 rinch-only release: 332 rinch commits past v0.15.0's 6c2bedc0 (element ids are u64,
