@@ -80,6 +80,12 @@ pub(crate) fn split_pane(store: AppStore, pane: PaneId, direction: Direction) ->
 /// split from takes its space. The last pane is emptied instead.
 pub(crate) fn close_pane(store: AppStore, pane: PaneId) {
     crate::presence::follow::stop(pane);
+    store.pane(pane).beside.set(None);
+    for other in PaneId::ALL {
+        if untracked(|| store.pane(other).beside.get()) == Some(pane) {
+            store.pane(other).beside.set(None);
+        }
+    }
     stop_editing(store, pane);
     store.clear_pane(pane);
     let mut tiling = untracked(|| store.tiling.get());
@@ -93,6 +99,38 @@ pub(crate) fn close_pane(store: AppStore, pane: PaneId) {
             crate::editor::editor(neighbour).focus();
         }
     }
+}
+
+/// Open node `node_id` of `store_id` beside pane `from`, which keeps the
+/// focus (a kanban's card clicked: plugin ABI 6, `HostRequest::OpenBeside`).
+/// It goes to the pane `from` already opens things beside while that is still
+/// shown, so one card after another replaces the last; otherwise `from` is
+/// split to the right; with four panes, another pane shown takes it, and with
+/// `from` the only one it opens there.
+pub(crate) fn open_beside(store: AppStore, from: PaneId, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
+    let shown = untracked(|| store.tiling.with(|tiling| tiling.panes()));
+    let kept = untracked(|| store.pane(from).beside.get()).filter(|p| *p != from && shown.contains(p));
+    let target = kept
+        .or_else(|| {
+            if !untracked(|| store.tiling.with(|tiling| tiling.can_split())) {
+                return None;
+            }
+            let new = split_pane(store, from, Direction::Right)?;
+            // The split focused the new pane; the focus stays where the person is.
+            focus_pane(store, from);
+            Some(new)
+        })
+        .or_else(|| shown.iter().copied().find(|p| *p != from));
+    if let Some(target) = target {
+        store.pane(from).beside.set(Some(target));
+    }
+    store.link_open.set(Some(crate::state::LinkOpen {
+        value: format!("node_{store_id}_{node_id}"),
+        store_id,
+        node_id,
+        anchor: None,
+        pane: Some(target.unwrap_or(from)),
+    }));
 }
 
 /// View > "Split Right" / "Split Down": the focused pane.

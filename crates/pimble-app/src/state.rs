@@ -991,6 +991,11 @@ pub struct PaneState {
     pub metanode: Signal<Option<ActiveEdit>>,
     /// What the metanode's outline shows (`crate::metanodes`).
     pub metanode_ui: crate::metanodes::MetanodeUi,
+    /// The pane this one opens things beside (`pane_view::open_beside`: a
+    /// kanban's card clicked), kept so that opening one after another shows
+    /// each in the same place instead of splitting again. Forgotten when
+    /// either pane closes.
+    pub beside: Signal<Option<PaneId>>,
 }
 
 impl PaneState {
@@ -1017,6 +1022,7 @@ impl PaneState {
             show_metanode: Signal::new(false),
             metanode: Signal::new(None),
             metanode_ui: crate::metanodes::MetanodeUi::new(),
+            beside: Signal::new(None),
         }
     }
 }
@@ -1695,7 +1701,8 @@ impl AppStore {
                 documents.push(crate::panes::SavedDocument { pane, store_id, node_id });
             }
         }
-        crate::panes::SavedPanes { tiling, focused, documents }
+        let beside = tiling.panes().into_iter().filter_map(|pane| Some((pane, self.pane(pane).beside.get()?))).collect();
+        crate::panes::SavedPanes { tiling, focused, documents, beside }
     }
 
     /// Put back a remembered layout at start: the tiling and the focus at
@@ -1705,6 +1712,9 @@ impl AppStore {
         let saved = saved.sanitized();
         for document in &saved.documents {
             self.pane(document.pane).restore.set(Some((document.store_id, document.node_id)));
+        }
+        for (pane, other) in &saved.beside {
+            self.pane(*pane).beside.set(Some(*other));
         }
         self.tiling.set(saved.tiling);
         self.focused_pane.set(saved.focused);

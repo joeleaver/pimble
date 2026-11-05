@@ -118,6 +118,8 @@ struct Kanban {
     look: Signal<Look>,
     /// The column cell the pointer is over: it offers "Add card".
     hovered: Signal<Option<Addr>>,
+    /// The card the pointer is over: it offers its trash can.
+    hovered_card: Signal<Option<Addr>>,
 }
 
 /// How big a lane is drawn (kobayban's three): one bar with its name and
@@ -249,6 +251,32 @@ impl Kanban {
                 None
             }
         }
+    }
+
+    /// A click on `card`: it opens beside the board, or with Ctrl (Cmd)
+    /// held in the board's place; a second click on it within
+    /// [`DOUBLE_CLICK`] renames it instead, as a double-click does a row of the
+    /// explorer. The board keeps the keyboard.
+    fn click_card(&self, card: Addr, modifiers: rinch::core::ModifierState) {
+        let again = clicked_again(card);
+        self.choose(Some(Chosen::Card(card)));
+        if untracked(|| self.renaming.get()) == Some(card) {
+            return;
+        }
+        let board = untracked(|| self.board.get());
+        let Some(shown) = board.card(card) else { return };
+        if again {
+            if shown.writable {
+                self.start_rename(card, shown.label.clone());
+            }
+            return;
+        }
+        if modifiers.ctrl || modifiers.meta {
+            self.host.open(card);
+        } else {
+            self.host.open_beside(card);
+        }
+        self.take_keyboard();
     }
 
     /// Choose `chosen`, and tell the host the person is on it, so everyone
@@ -597,7 +625,7 @@ impl Kanban {
     }
 
     /// The board's keys: arrows choose, Alt+Shift+arrows move, Enter opens the chosen
-    /// card, F2 renames, Delete deletes, Escape lets go. Answers whether it
+    /// card beside the board (Ctrl+Enter in its place), F2 renames, Delete deletes, Escape lets go. Answers whether it
     /// took the key.
     fn key(&self, key: &KeyEventData) -> bool {
         if untracked(|| self.renaming.get()).is_some() {
@@ -630,7 +658,9 @@ impl Kanban {
             Chosen::Lane(a) => board.lane_of_node(a).is_some_and(|l| l.writable),
         };
         match (key.key.as_str(), chosen) {
-            ("Enter", Some(Chosen::Card(card))) => self.host.open(card),
+            // Enter opens beside, as a click does; Ctrl (Cmd) opens in the board's place.
+            ("Enter", Some(Chosen::Card(card))) if key.ctrl || key.meta => self.host.open(card),
+            ("Enter", Some(Chosen::Card(card))) => self.host.open_beside(card),
             ("F2", Some(c)) if writable(c) => {
                 let now = match c {
                     Chosen::Card(a) => board.card(a).map(|k| k.label.clone()),
@@ -738,7 +768,7 @@ const BOARD_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; padd
 /// so columns stay lined up.
 const GRID_STYLE: &str = "display: flex; flex-direction: column; gap: 10px; overflow: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
 /// A column's width, a folded column's, and the lane names' column.
-const COLUMN_W: u32 = 260;
+const COLUMN_W: u32 = 280;
 const FOLDED_W: u32 = 44;
 const LABEL_W: u32 = 168;
 /// A minimized lane shows about three cards a column (kobayban's cap).
@@ -749,8 +779,19 @@ const HEADER_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-end;
 // which is the app's: an app on a rinch from before sortable lists still lays
 // the board out (only the caret and the refusal box need its stylesheet).
 const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-end; flex-shrink: 0; position: relative;";
-const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; min-height: 28px; position: relative;";
-const CELL_BG: &str = "background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); border: 1px solid var(--rinch-color-default-border, rgba(127,127,127,0.25)); border-radius: 8px;";
+const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; min-height: 28px; position: relative;";
+const CELL_BG: &str = "background: var(--kanban-cell); border: 1px solid var(--kanban-cell-border); border-radius: 8px;";
+
+/// The board's surfaces, set on its root and inherited: a column's cell a
+/// step off the pane and each card a step further, lighter in the dark
+/// theme and white in the light one, so cards stand on their cells.
+fn surfaces(dark: bool) -> &'static str {
+    if dark {
+        " --kanban-cell: var(--rinch-color-dark-6); --kanban-cell-border: var(--rinch-color-dark-5); --kanban-card: var(--rinch-color-dark-5); --kanban-card-border: var(--rinch-color-dark-4);"
+    } else {
+        " --kanban-cell: var(--rinch-color-gray-1); --kanban-cell-border: var(--rinch-color-gray-3); --kanban-card: var(--rinch-color-white); --kanban-card-border: var(--rinch-color-gray-3);"
+    }
+}
 const LANE_LABEL_STYLE: &str = "display: flex; flex-direction: column; gap: 4px; padding: 6px 4px; flex-shrink: 0; box-sizing: border-box; min-width: 0;";
 const ICON_BUTTON: &str = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; color: var(--rinch-color-dimmed);";
 /// The caret and the refusal box in the app's own theme colors, through the
@@ -765,19 +806,43 @@ fn lift_keys() -> Vec<String> {
     vec![" ".to_string()]
 }
 const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
-const FIELD_STYLE: &str = "width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
+const FIELD_STYLE: &str = "flex: 1 1 0; min-width: 0; width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
+/// The icon a plain note has (`node_icon`), which a card leaves out.
+const DEFAULT_CARD_ICON: &str = "file";
+
+/// How soon a second click on a card renames it rather than opening it again.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether this click on `addr` (a card, a column's header, a lane's name)
+/// is the second of a double-click: what renames each of them.
+fn clicked_again(addr: Addr) -> bool {
+    LAST_CLICK.with(|last| {
+        let now = std::time::Instant::now();
+        let again = last.get().is_some_and(|(at, on)| on == addr && now.duration_since(at) < DOUBLE_CLICK);
+        last.set(if again { None } else { Some((now, addr)) });
+        again
+    })
+}
+
+thread_local! {
+    /// The last click on a card, a header or a lane's name, for [`DOUBLE_CLICK`].
+    static LAST_CLICK: std::cell::Cell<Option<(std::time::Instant, Addr)>> = const { std::cell::Cell::new(None) };
+}
+
 const LINE_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed);";
 
 /// A card's style: chosen or not, its row color, and the color of the person
 /// the pane follows when they are on it.
 fn card_style(chosen: bool, background: Option<String>, leader: Option<String>) -> String {
-    let border = match (leader, chosen) {
-        (Some(color), _) => format!("2px solid {color}"),
-        (None, true) => "2px solid var(--rinch-primary-color)".to_string(),
-        (None, false) => "1px solid var(--rinch-color-default-border, rgba(127,127,127,0.3))".to_string(),
+    // A wider border takes its width from the padding, so choosing a card
+    // never moves or rewraps what is in it.
+    let (border, padding) = match (leader, chosen) {
+        (Some(color), _) => (format!("2px solid {color}"), "9px 11px"),
+        (None, true) => ("2px solid var(--rinch-primary-color)".to_string(), "9px 11px"),
+        (None, false) => ("1px solid var(--kanban-card-border)".to_string(), "10px 12px"),
     };
-    let background = background.unwrap_or_else(|| "var(--rinch-color-body)".to_string());
-    format!("display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border-radius: 6px; cursor: pointer; border: {border}; background: {background};")
+    let background = background.unwrap_or_else(|| "var(--kanban-card)".to_string());
+    format!("display: flex; flex-direction: column; gap: 4px; padding: {padding}; border-radius: 6px; cursor: pointer; border: {border}; background: {background};")
 }
 
 /// The viewer.
@@ -800,6 +865,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         field: Signal::new(None),
         look: Signal::new(mount.remembered().map(|r| Look::parse(&r)).unwrap_or_default()),
         hovered: Signal::new(None),
+        hovered_card: Signal::new(None),
     };
 
     // Read the forest, then keep it live from every change the API hears.
@@ -848,14 +914,14 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         });
     }
 
-    let (kk, kw1, kw2, ka, kl, kt, kx, kh) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kk, kw1, kw2, ka, kl, kt, kh) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let judge = drop_judge(&k);
     let (judge_h, judge_l) = (judge.clone(), judge.clone());
     let (board, status, waiting, loaded, root, look) = (k.board, k.status, k.waiting, k.loaded, k.root, k.look);
     rsx! {
         div {
             class: "kanban",
-            style: BOARD_STYLE,
+            style: {let seen = k.host.seen(); move || format!("{BOARD_STYLE}{}", surfaces(seen.dark()))},
             tabindex: "0",
             ref: root,
             onkeydown: move |key: &KeyEventData| kk.key(key),
@@ -880,33 +946,14 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
                     Button { size: "xs", variant: "default", onclick: { let k = kw2.clone(); move || k.waiting.set(None) }, "Cancel" }
                 }
             }
-            // With lanes: every lane shown whole, or each back to its own size.
-            if board.with(|b| b.lanes.len() > 1) {
+            // With lanes whose columns differ there is no shared header row,
+            // and so no corner above the lane names: the lane tools go above
+            // the board instead.
+            if board.with(|b| b.lanes.len() > 1 && !b.aligned()) {
                 div {
                     class: "kanban__toolbar",
-                    style: "display: flex; gap: 4px; align-items: center;",
-                    Button {
-                        size: "xs",
-                        variant: "subtle",
-                        onclick: {
-                            let k = kt.clone();
-                            move || {
-                                let lanes = untracked(|| k.board.get()).lanes;
-                                k.relook(|l| {
-                                    for lane in &lanes {
-                                        l.lanes.insert(lane_key(lane), Size::Expanded);
-                                    }
-                                });
-                            }
-                        },
-                        "Expand all"
-                    }
-                    Button {
-                        size: "xs",
-                        variant: "subtle",
-                        onclick: { let k = kx.clone(); move || k.relook(|l| l.lanes.clear()) },
-                        "Reset lanes"
-                    }
+                    style: "display: flex; gap: 2px; align-items: center;",
+                    {lane_tools(__scope, &kt)}
                 }
             }
             if loaded.get() && board.with(|b| b.lanes.len() < 2 && b.lanes.iter().all(|l| l.columns.is_empty())) {
@@ -1011,7 +1058,7 @@ fn header_columns(k: &Kanban, lane: Option<Addr>) -> Vec<(board::Column, usize, 
 /// own. A horizontal sortable list dragged by the headers, then "+ Add
 /// column".
 fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lane>, judge: SortJudge) -> NodeHandle {
-    let (kd, kc, ka) = (k.clone(), k.clone(), k.clone());
+    let (kd, kc, ka, kt) = (k.clone(), k.clone(), k.clone(), k.clone());
     let board = untracked(|| k.board.get());
     let first = board.lanes.first().cloned();
     let Some(owner) = lane.clone().or(first) else { return rsx! { span { style: "display: none;" } } };
@@ -1023,8 +1070,15 @@ fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lane>, judge: 
         div {
             class: "kanban__header-row",
             style: HEADER_ROW_STYLE,
+            // The corner above the lane names holds the lane tools.
             if spacer {
-                div { style: format!("width: {LABEL_W}px; flex-shrink: 0;") }
+                div {
+                    class: "kanban__corner",
+                    style: format!("width: {LABEL_W}px; flex-shrink: 0; display: flex; gap: 2px; align-items: center; padding: 2px 0;"),
+                    if shared {
+                        {lane_tools(__scope, &kt)}
+                    }
+                }
             }
             SortableList {
                 group: COLUMNS,
@@ -1095,7 +1149,7 @@ fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board::Column, c
     }
     let seen = k.host.seen();
     let color = column.color.clone();
-    let (kc, kr, kh, kf, kf2, kfold) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kc, kr, kf, kf2, kfold) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let (label, label2) = (column.label.clone(), column.label.clone());
     let writable = column.writable;
     let (chosen, renaming) = (k.chosen, k.renaming);
@@ -1109,8 +1163,16 @@ fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board::Column, c
                 if chosen.get() == Some(Chosen::Column(addr)) { " box-shadow: inset 0 0 0 2px var(--rinch-primary-color);" } else { "" },
             )},
             onclick: move || {
+                let again = clicked_again(addr);
                 kc.choose(Some(Chosen::Column(addr)));
-                kc.take_keyboard();
+                if untracked(|| kc.renaming.get()) == Some(addr) {
+                    return;
+                }
+                if again && writable {
+                    kc.start_rename(addr, label2.clone());
+                } else {
+                    kc.take_keyboard();
+                }
             },
             if renaming.get() == Some(addr) {
                 input {
@@ -1132,20 +1194,12 @@ fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board::Column, c
             } else {
                 span {
                     style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                    title: if writable { "Click to choose; F2 or Rename to rename" } else { "" },
+                    title: if writable { "Double-click or F2 to rename" } else { "" },
                     {label.clone()}
                 }
                 span { style: LINE_STYLE, {count.to_string()} }
             }
             {people(__scope, k, addr)}
-            if writable && chosen.get() == Some(Chosen::Column(addr)) && renaming.get() != Some(addr) {
-                Button {
-                    size: "xs",
-                    variant: "subtle",
-                    onclick: { let (k, label) = (kh.clone(), label2.clone()); move || k.start_rename(addr, label.clone()) },
-                    "Rename"
-                }
-            }
             span {
                 style: ICON_BUTTON,
                 title: "Fold this column",
@@ -1156,6 +1210,38 @@ fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board::Column, c
     };
     // A column is dragged by its header, when the person may move it.
     if board_writable && writable { rsx! { SortableHandle { {header} } } } else { header }
+}
+
+/// What a board with lanes offers for all of them, as icons: every lane shown
+/// whole, and each back to its own size.
+fn lane_tools(__scope: &mut RenderScope, k: &Kanban) -> NodeHandle {
+    let (ke, kr) = (k.clone(), k.clone());
+    rsx! {
+        span {
+            style: "display: inline-flex; gap: 2px; align-items: center;",
+            span {
+                class: "kanban__expand-all",
+                style: ICON_BUTTON,
+                title: "Show every lane whole",
+                onclick: move || {
+                    let lanes = untracked(|| ke.board.get()).lanes;
+                    ke.relook(|l| {
+                        for lane in &lanes {
+                            l.lanes.insert(lane_key(lane), Size::Expanded);
+                        }
+                    });
+                },
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "chevrons-down".to_string() } }
+            }
+            span {
+                class: "kanban__reset-lanes",
+                style: ICON_BUTTON,
+                title: "Put every lane back to its own size",
+                onclick: move || kr.relook(|l| l.lanes.clear()),
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "restore".to_string() } }
+            }
+        }
+    }
 }
 
 /// One lane: a bar with its name and count when collapsed; otherwise its
@@ -1209,7 +1295,7 @@ fn lane_label(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown) -> NodeH
     let lane = shown.lane.clone();
     let (board, metanode) = (k.board, lane.metanode);
     let seen = k.host.seen();
-    let (kc, kr, kh, kf, kf2, ks, kz) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kc, kr, kf, kf2, ks, kz) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let (chosen, renaming) = (k.chosen, k.renaming);
     let node = lane.node;
     let color = lane.color.clone();
@@ -1238,8 +1324,14 @@ fn lane_label(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown) -> NodeH
                 )},
                 onclick: move || {
                     if let Some(node) = node {
+                        let again = clicked_again(node);
                         kc.choose(Some(Chosen::Lane(node)));
-                        if untracked(|| kc.renaming.get()) != Some(node) {
+                        if untracked(|| kc.renaming.get()) == Some(node) {
+                            return;
+                        }
+                        if again && writable {
+                            kc.start_rename(node, name2.clone());
+                        } else {
                             kc.take_keyboard();
                         }
                     }
@@ -1287,16 +1379,6 @@ fn lane_label(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown) -> NodeH
             }
             if let Some(people_here) = people_here.clone() {
                 {people_here}
-            }
-            if writable && node.is_some() && chosen.get() == node.map(Chosen::Lane) && renaming.get() != node {
-                div {
-                    Button {
-                        size: "xs",
-                        variant: "subtle",
-                        onclick: { let (k, label) = (kh.clone(), name2.clone()); move || if let Some(node) = node { k.start_rename(node, label.clone()) } },
-                        "Rename"
-                    }
-                }
             }
         }
     }
@@ -1442,14 +1524,16 @@ fn people(__scope: &mut RenderScope, k: &Kanban, addr: Addr) -> NodeHandle {
 fn render_card(__scope: &mut RenderScope, k: &Kanban, card: board::Card) -> NodeHandle {
     let addr = card.addr;
     let seen = k.host.seen();
-    let (kc, ko, kr, kd, kf, kf2, kn) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kc, kr, kd, kf, kf2, kenter, kleave) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let chosen = k.chosen;
     let renaming = k.renaming;
+    let hovered = k.hovered_card;
     let (color, background) = (card.color.clone(), card.background.clone());
-    let (label, label2) = (card.label.clone(), card.label.clone());
+    let label = card.label.clone();
     let writable = card.writable;
     let (icon, subtasks, label_color) = (card.icon.clone(), card.subtasks, card.color.clone());
     let item_label = card.label.clone();
+    let show_icon = icon != DEFAULT_CARD_ICON;
     let card = rsx! {
         div {
             class: "kanban__card",
@@ -1458,17 +1542,29 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, card: board::Card) -> Node
                 let leader = seen.following().and_then(|key| seen.people_in(addr).into_iter().find(|p| p.key == key).map(|p| p.color));
                 card_style(chosen.get() == Some(Chosen::Card(addr)), background.as_deref().map(|b| row_background(b, seen.dark())), leader)
             }},
-            onclick: move || {
-                kc.choose(Some(Chosen::Card(addr)));
-                if untracked(|| kc.renaming.get()) != Some(addr) {
-                    kc.take_keyboard();
+            onclick: move || kc.click_card(addr, rinch::core::get_modifier_state()),
+            onmouseenter: move || kenter.hovered_card.set(Some(addr)),
+            onmouseleave: move || {
+                if untracked(|| kleave.hovered_card.get()) == Some(addr) {
+                    kleave.hovered_card.set(None);
                 }
             },
             div {
-                style: "display: flex; align-items: center; gap: 6px; font-size: 13px;",
-                span {
-                    style: {|| format!("display: inline-flex; width: 14px; height: 14px; flex-shrink: 0;{}", color.as_deref().map(|c| format!(" color: {};", display_color(c, seen.dark()))).unwrap_or_default())},
-                    IconGlyph { name: icon.clone() }
+                style: "display: flex; align-items: flex-start; gap: 8px; font-size: 14px; line-height: 1.45;",
+                // A grip says the card drags (the whole card does).
+                if writable {
+                    span {
+                        class: "kanban__grip",
+                        style: "display: inline-flex; width: 14px; height: 14px; margin-top: 3px; margin-left: -4px; flex-shrink: 0; color: var(--rinch-color-dimmed); opacity: 0.6;",
+                        IconGlyph { name: "grip-vertical".to_string() }
+                    }
+                }
+                // A plain note's icon says nothing on a card; any other does.
+                if show_icon {
+                    span {
+                        style: {let color = color.clone(); move || format!("display: inline-flex; width: 14px; height: 14px; margin-top: 3px; flex-shrink: 0;{}", color.as_deref().map(|c| format!(" color: {};", display_color(c, seen.dark()))).unwrap_or_default())},
+                        IconGlyph { name: icon.clone() }
+                    }
                 }
                 if renaming.get() == Some(addr) {
                     input {
@@ -1506,21 +1602,27 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, card: board::Card) -> Node
                         {subtasks.to_string()}
                     }
                 }
+                // The trash can, while the pointer is on the card or it is
+                // chosen; its slot is always there so the label never reflows.
+                if writable {
+                    span {
+                        class: "kanban__trash-slot",
+                        style: "display: inline-flex; width: 16px; height: 16px; margin-top: 2px; flex-shrink: 0;",
+                        if (hovered.get() == Some(addr) || chosen.get() == Some(Chosen::Card(addr))) && renaming.get() != Some(addr) {
+                            span {
+                                class: "kanban__trash",
+                                title: "Delete (View > Recently Deleted puts it back)",
+                                style: "display: inline-flex; width: 16px; height: 16px; cursor: pointer; color: var(--rinch-color-dimmed);",
+                                onclick: { let k = kd.clone(); move || k.delete(addr) },
+                                IconGlyph { name: "trash".to_string() }
+                            }
+                        }
+                    }
+                }
             }
             div {
                 style: "display: flex; align-items: center; min-height: 0;",
                 {people(__scope, k, addr)}
-            }
-            if chosen.get() == Some(Chosen::Card(addr)) && renaming.get() != Some(addr) {
-                div {
-                    class: "kanban__actions",
-                    style: "display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding-top: 4px; border-top: 1px solid var(--rinch-color-default-border, rgba(127,127,127,0.3));",
-                    Button { size: "xs", variant: "subtle", onclick: { let k = ko.clone(); move || k.host.open(addr) }, "Open" }
-                    if writable {
-                        Button { size: "xs", variant: "subtle", onclick: { let (k, l) = (kn.clone(), label2.clone()); move || k.start_rename(addr, l.clone()) }, "Rename" }
-                        Button { size: "xs", variant: "subtle", color: "red", onclick: { let k = kd.clone(); move || k.delete(addr) }, "Delete" }
-                    }
-                }
             }
         }
     };

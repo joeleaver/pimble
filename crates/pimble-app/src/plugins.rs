@@ -234,6 +234,13 @@ fn request(store: AppStore, pane: PaneId, plugin_id: &str, request: HostRequest)
                 }));
             }
         }
+        HostRequest::OpenBeside { node } => {
+            if let Some(addr) = readable(&node) {
+                // Out of the plugin's call: splitting writes the layout, which
+                // other effects read.
+                let _ = rinch::prelude::set_timeout(0, move || crate::pane_view::open_beside(store, pane, addr.store, addr.node));
+            }
+        }
         HostRequest::Focus { node } => {
             let on = match node {
                 None => None,

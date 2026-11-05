@@ -72,9 +72,12 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
     assert!(!text.contains("Step one"), "a subtask is a count on its card, not a card: {text}");
     assert!(r.find(&|d, n| has_class(d, n, "kanban__subtasks") && d.text_content(n).unwrap_or_default().trim() == "1").is_some(), "{text}");
 
-    // Choosing a card tells the host the person is on it.
+    // A click on a card tells the host the person is on it, and opens it
+    // beside the board.
     choose(r, "kanban__card", "Alpha");
     r.pump_until(&f, "the focus", |r| r.requests.borrow().contains(&HostRequest::Focus { node: Some(NodeAddr::from(Addr::new(store, alpha))) }));
+    r.pump_until(&f, "the open beside", |r| r.requests.borrow().contains(&HostRequest::OpenBeside { node: NodeAddr::from(Addr::new(store, alpha)) }));
+    assert!(!r.requests.borrow().iter().any(|q| matches!(q, HostRequest::Open { .. })), "a plain click does not open in the board's place");
 
     // Alt+Shift+Right: into Write it at the same height (its top); then
     // Alt+Shift+Down below Charlie.
@@ -101,14 +104,17 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
     assert!(key_on(r, "kanban", alt("ArrowLeft")));
     r.pump_until(&f, "the move left", |_| children(&f, store, f.plan) == ["Alpha", "Bravo"]);
 
-    // Open: the host opens it in the pane.
-    r.pump_until(&f, "the actions", |r| r.text().contains("Open"));
-    r.click("button", "Open");
+    // Ctrl+Enter opens the chosen card in the board's place; a card has no
+    // buttons of its own.
+    assert!(!r.text().contains("Open"), "{}", r.text());
+    assert!(key_on(r, "kanban", KeyEventData::new("Enter", "Enter").with_modifiers(true, false, false, false)));
     r.pump_until(&f, "the open", |r| r.requests.borrow().contains(&HostRequest::Open { node: NodeAddr::from(Addr::new(store, alpha)) }));
 
-    // Rename the column in place: the one write, with the explicit title.
+    // Rename the column in place, by a double-click on its header (it has no
+    // Rename button): the one write, with the explicit title.
+    assert!(!r.text().contains("Rename"), "{}", r.text());
     choose(r, "kanban__header", "Plan");
-    r.click("button", "Rename");
+    choose(r, "kanban__header", "Plan");
     r.pump_until(&f, "the name field", |r| r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).is_some());
     r.type_text("Planning");
     assert!(key_on(r, "kanban__field", KeyEventData::new("Enter", "Enter")));
@@ -132,8 +138,9 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
     // Delete it: asked of `plan`, then a tombstone.
     r.pump_until(&f, "Delta on the board", |r| r.text().contains("Delta"));
     choose(r, "kanban__card", "Delta");
-    r.pump_until(&f, "its actions", |r| r.text().contains("Delete"));
-    r.click("button", "Delete");
+    r.pump_until(&f, "its trash can", |r| r.find(&|d, n| has_class(d, n, "kanban__trash")).is_some());
+    let trash = r.find(&|d, n| has_class(d, n, "kanban__trash")).unwrap();
+    assert!(dispatch_event(EventHandlerId(r.handler(trash, "data-rid"))));
     r.pump_until(&f, "the delete", |_| children(&f, store, f.plan) == ["Alpha", "Bravo"]);
     r.pump_until(&f, "the line", |r| r.text().contains("Deleted \u{201c}Delta\u{201d}."));
 
@@ -380,9 +387,9 @@ fn space_lifts_a_focused_card_but_not_from_a_field_and_enter_opens() {
 
     // A Space typed in the card's name field is the field's: the host names
     // the field as the key's target, and the card is not lifted.
+    // A double-click on a card renames it.
     choose(r, "kanban__card", "Alpha");
-    r.pump_until(&f, "the actions", |r| r.text().contains("Rename"));
-    r.click("button", "Rename");
+    choose(r, "kanban__card", "Alpha");
     r.pump_until(&f, "the name field", |r| r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).is_some());
     let field = r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).unwrap();
     r.doc.borrow_mut().focus_element(field);
