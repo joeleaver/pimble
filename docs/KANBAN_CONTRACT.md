@@ -105,18 +105,32 @@ two levels deep, children To do, Doing, Done), asks to read and change the store
   Forward): up and down one within the column, left and right into the neighbor column at
   the same height; a column chosen by its header moves along the board with
   Alt+Shift+Left/Right. Plain arrows choose (cards, and a column's header above its first
-  card), Enter opens, F2 renames, Delete deletes, Escape lets go.
+  card), Enter opens beside (Ctrl+Enter in the board's place), F2 renames, Delete deletes,
+  Escape lets go.
 - **Drags** are rinch's sortable lists (see "Drags" below): a card drags whole, a
   column by its header; a drop is judged and sent by `move_to` like a menu item or a key.
-- **Renaming** in place (a column by its header's "Rename" or F2, a card by its own): the
+- **Renaming** in place (a card, a column by its header or a lane by its name, each by a
+  double-click or F2; nothing on the board has a Rename button, Joe 2026-11-05): the
   one write, `Pimble::edit` with the title and `explicit_title`; Enter keeps it, Escape
   cancels; the field takes the keyboard when it is drawn.
 - **Adding:** "+ Add card" creates under the column, last; "+ Add column" under the
   metanode, last; each with no title (`recipes::document("")`), then its name typed in
   place. **Deleting** a card asks `can_delete` first, then deletes (a tombstone) and says
   "Deleted “X”. View > Recently Deleted puts it back."
-- **Opening** a card: Open or Enter asks the host (`Host::open`), which opens it in the
-  plugin's pane as an outline row does.
+- **Opening** a card (2026-11-05, Joe: "we wouldn't even need open and rename buttons"):
+  a click opens it beside the board (`Host::open_beside`, plugin ABI 6), in the pane the
+  app keeps beside the board's (`PaneState::beside`, split off to the right the first
+  time, so card after card shows in the same place) while the board keeps the focus and
+  the keyboard; Ctrl (Cmd) + click or Ctrl+Enter opens it in the board's place
+  (`Host::open`). A second click within 500 ms renames instead. A card has no buttons:
+  a trash can shows on it while the pointer is over it or it is chosen (its slot is
+  always there, so the label never reflows), and deletes as Delete does.
+- **The look** (2026-11-05, after Joe's kobayban screenshot): cards stand on their
+  cells, a step lighter in the dark theme and white in the light one (`surfaces`: custom
+  properties on the board's root, `--kanban-cell`, `--kanban-card` and their borders); a
+  dim grip on every card that drags, where a plain note's icon used to be (any other icon
+  still shows); 14 px text, 10 x 12 px padding, 8 px between cards, 280 px columns; a
+  chosen card's 2 px border takes its width from the padding, so nothing moves.
 - **Live:** the forest is read again whenever a change touches it
   (`next_change`, `Forest::touched_by`): another window, the CLI, the MCP.
 - **Presence** (docs/PRESENCE_CONTRACT.md "Plugins"): choosing a card or column says the
@@ -320,7 +334,10 @@ three lane sizes and folded columns, Done no taller than its row, and "Add card"
   collapsed (one bar with its name and count; a click shows it), minimized (about three
   cards a column, 220 px, the rest scrolled) or expanded; a board with lanes starts
   minimized, a board without them is shown whole. The name cell has show all / show
-  about three and collapse; "Expand all" and "Reset lanes" sit above a board with lanes.
+  about three and collapse. Showing every lane whole and putting each back to its own
+  size are two icons in the corner above the lane names (`lane_tools`; above the board
+  when the lanes' columns differ and there is no shared header row), never words that
+  hang above the board (Joe, 2026-11-05).
   A column folds by its name (in every lane) to a 44 px strip with its name turned on
   its side and its count; a click unfolds it.
 - **Done no taller than its row.** The last column's cell (where finished cards pile up,

@@ -490,6 +490,13 @@ first plugin.
    Apex." Allow grows the approval by those stores and starts the plugin again, so it
    reads what they let it (the mount becomes a lane); Not now hides the question in
    that pane and the plugin runs without them. Approvals stay per store.
+   **ABI 6** (2026-11-05, for opening kanban cards beside the board):
+   `HostRequest::OpenBeside { node }` (`Host::open_beside`) opens a node beside the
+   plugin's pane, which keeps the focus: the app keeps one pane beside each pane for it
+   (`PaneState::beside`, `pane_view::open_beside`, remembered in `state.json`'s `panes`),
+   splits the plugin's pane to the right when there is none, uses another pane shown when
+   four are open, and the plugin's own pane when it is the only one. A guest that wants a
+   double-click times its clicks itself: WASI's clock answers on both hosts.
 
 ## 5. How it is checked
 

@@ -33,7 +33,7 @@ pub mod api;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -402,6 +402,11 @@ pub enum HostRequest {
     /// bytes) as how the viewer looks on its metanode on this device; the
     /// next mount's [`Props::remembered`]. Not document data.
     Remember { value: String },
+    /// Open `node` beside the plugin's pane (ABI 6): in the pane the app keeps
+    /// beside it, split off to the right the first time, while the plugin's pane
+    /// keeps the focus. Where there is no room for another pane it opens in
+    /// another pane shown, or in the plugin's own when that is the only one.
+    OpenBeside { node: NodeAddr },
 }
 
 // ── The DOM op log ────────────────────────────────────────────────────────────

@@ -118,6 +118,10 @@ focus is remembered too. "The node is known" is asked with `resolveLink`, which 
 live, deleted or missing in one go; a pane whose store has not opened keeps its document
 in what is saved.
 
+`beside` (2026-11-05): `[[pane, other], ...]`, the pane each pane opens things beside
+(`PaneState::beside`: a kanban card clicked, plugin ABI 6). Kept only while both panes
+are shown, forgotten when either closes; with nothing beside, the field is left out.
+
 ## Out of scope
 
 Dragging a tree row onto a pane; Ctrl+click to open in a split; moving a pane; tabs inside

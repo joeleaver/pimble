@@ -70,6 +70,13 @@ impl Host {
         self.link.request(&HostRequest::Open { node: node.into() });
     }
 
+    /// Open `node` beside the plugin's pane, which keeps the focus: the app
+    /// keeps one pane beside it for this, so opening one node after another
+    /// shows each in the same place.
+    pub fn open_beside(&self, node: Addr) {
+        self.link.request(&HostRequest::OpenBeside { node: node.into() });
+    }
+
     /// The person is on `node` in the view (a card they chose), or on nothing
     /// in it.
     pub fn focus(&self, node: Option<Addr>) {

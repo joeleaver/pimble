@@ -100,6 +100,10 @@ pub struct SavedPanes {
     /// lives, however it was reached.
     #[serde(default)]
     pub documents: Vec<SavedDocument>,
+    /// The pane each pane opens things beside (`PaneState::beside`), as
+    /// `(pane, beside)` pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beside: Vec<(PaneId, PaneId)>,
 }
 
 /// One pane's document in a [`SavedPanes`].
@@ -124,7 +128,13 @@ impl SavedPanes {
                 documents.push(document);
             }
         }
-        SavedPanes { tiling, focused, documents }
+        let mut beside: Vec<(PaneId, PaneId)> = Vec::new();
+        for (pane, other) in self.beside {
+            if pane != other && shown.contains(&pane) && shown.contains(&other) && !beside.iter().any(|(held, _)| *held == pane) {
+                beside.push((pane, other));
+            }
+        }
+        SavedPanes { tiling, focused, documents, beside }
     }
 }
 
@@ -638,6 +648,7 @@ mod tests {
                 SavedDocument { pane: P[0], store_id, node_id },
                 SavedDocument { pane: P[1], store_id, node_id },
             ],
+            beside: vec![(P[0], P[1])],
         };
         let json = serde_json::to_string(&saved).unwrap();
         let back: SavedPanes = serde_json::from_str(&json).unwrap();
@@ -650,9 +661,12 @@ mod tests {
         odd.focused = P[3];
         odd.documents.push(SavedDocument { pane: P[2], store_id, node_id: other });
         odd.documents.push(SavedDocument { pane: P[0], store_id, node_id: other });
+        odd.beside.push((P[1], P[3]));
+        odd.beside.push((P[0], P[0]));
         let safe = odd.sanitized();
         assert_eq!(safe.focused, P[0]);
         assert_eq!(safe.documents, saved.documents);
+        assert_eq!(safe.beside, saved.beside, "beside names two panes shown, once each");
 
         // A file from before the split view has no `panes`; one with only a
         // tiling is the tiling with nothing in it.

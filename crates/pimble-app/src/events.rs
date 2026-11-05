@@ -2953,6 +2953,7 @@ mod tests {
                 SavedDocument { pane: PaneId::ALL[1], store_id, node_id: kept },
                 SavedDocument { pane: PaneId::ALL[2], store_id, node_id: gone },
             ],
+            beside: Vec::new(),
         });
         assert_eq!(store.tiling.get(), tiling, "the tiling is back at once");
         assert_eq!(store.focused(), PaneId::ALL[1]);
