@@ -65,7 +65,7 @@ the hosted server to this version together.
 | `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server, canvases included (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
 | `pimble-import` | Scrivener + RTF import | Complete |
 | `pimble-ui` | rinch components with no app state, drawn alike by the app and plugins: presence chips and dots, icons, theme colors | Complete |
-| `pimble-plugin-abi` / `-host` / `-sdk` | plugins: the ABI (5), the host (wasmtime on the desktop, the page's WebAssembly in the browser), the guest SDK in the `plugins/` workspace (with `hello-viewer`, `stuck-viewer`, `kanban-viewer`; `scripts/plugins/install.sh`) | Desktop and browser hosts built (docs/PLUGINS_CONTRACT.md) |
+| `pimble-plugin-abi` / `-host` / `-sdk` | plugins: the ABI (6), the host (wasmtime on the desktop, the page's WebAssembly in the browser), the guest SDK in the `plugins/` workspace (with `hello-viewer`, `stuck-viewer`, `kanban-viewer`, `todo-viewer`; `scripts/plugins/install.sh`; viewers share `pimble_ui::viewer`, the kanban's look) | Desktop and browser hosts built (docs/PLUGINS_CONTRACT.md) |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
 | `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace; account pages and the vault client | Complete (phases 1 and 2a) |

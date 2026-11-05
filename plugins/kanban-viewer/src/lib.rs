@@ -39,6 +39,7 @@ use std::sync::Arc;
 use pimble_plugin_sdk::pimble_core::{custom_keys, plan};
 use pimble_plugin_sdk::pimble_ui::appearance::{display_color, row_background, IconGlyph};
 use pimble_plugin_sdk::pimble_ui::presence::{more_label, PersonChip};
+use pimble_plugin_sdk::pimble_ui::viewer as viewer_look;
 use pimble_plugin_sdk::prelude::*;
 use rinch::core::dom::NodeId as DomId;
 
@@ -255,7 +256,7 @@ impl Kanban {
 
     /// A click on `card`: it opens beside the board, or with Ctrl (Cmd)
     /// held in the board's place; a second click on it within
-    /// [`DOUBLE_CLICK`] renames it instead, as a double-click does a row of the
+    /// [`pimble_plugin_sdk::DOUBLE_CLICK`] renames it instead, as a double-click does a row of the
     /// explorer. The board keeps the keyboard.
     fn click_card(&self, card: Addr, modifiers: rinch::core::ModifierState) {
         let again = clicked_again(card);
@@ -780,25 +781,10 @@ const HEADER_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-end;
 // the board out (only the caret and the refusal box need its stylesheet).
 const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-end; flex-shrink: 0; position: relative;";
 const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; min-height: 28px; position: relative;";
-const CELL_BG: &str = "background: var(--kanban-cell); border: 1px solid var(--kanban-cell-border); border-radius: 8px;";
-
-/// The board's surfaces, set on its root and inherited: a column's cell a
-/// step off the pane and each card a step further, lighter in the dark
-/// theme and white in the light one, so cards stand on their cells.
-fn surfaces(dark: bool) -> &'static str {
-    if dark {
-        " --kanban-cell: var(--rinch-color-dark-6); --kanban-cell-border: var(--rinch-color-dark-5); --kanban-card: var(--rinch-color-dark-5); --kanban-card-border: var(--rinch-color-dark-4);"
-    } else {
-        " --kanban-cell: var(--rinch-color-gray-1); --kanban-cell-border: var(--rinch-color-gray-3); --kanban-card: var(--rinch-color-white); --kanban-card-border: var(--rinch-color-gray-3);"
-    }
-}
+const CELL_BG: &str = viewer_look::PANEL;
 const LANE_LABEL_STYLE: &str = "display: flex; flex-direction: column; gap: 4px; padding: 6px 4px; flex-shrink: 0; box-sizing: border-box; min-width: 0;";
-const ICON_BUTTON: &str = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; color: var(--rinch-color-dimmed);";
-/// The caret and the refusal box in the app's own theme colors, through the
-/// properties rinch's sortable stylesheet reads (a plugin cannot add a
-/// stylesheet; custom properties set inline here are inherited by the boxes
-/// the lists draw).
-const SORT_THEME: &str = " --rinch-sortable-caret-color: var(--rinch-primary-color); --rinch-sortable-refused-color: var(--rinch-color-red-6); --rinch-sortable-reason-bg: var(--rinch-color-red-6); --rinch-sortable-reason-color: var(--rinch-color-white, #ffffff); --rinch-sortable-reason-font-size: 12px; --rinch-sortable-reason-radius: 4px; --rinch-sortable-reason-white-space: normal; --rinch-sortable-reason-max-width: 220px; --rinch-sortable-dragging-opacity: 0.45;";
+use viewer_look::ICON_BUTTON;
+use viewer_look::SORT_THEME;
 
 /// The keys that lift a focused card or column for a keyboard move: Space
 /// only, so Enter stays "open the card", as everywhere else in Pimble.
@@ -806,43 +792,14 @@ fn lift_keys() -> Vec<String> {
     vec![" ".to_string()]
 }
 const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
-const FIELD_STYLE: &str = "flex: 1 1 0; min-width: 0; width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
-/// The icon a plain note has (`node_icon`), which a card leaves out.
-const DEFAULT_CARD_ICON: &str = "file";
-
-/// How soon a second click on a card renames it rather than opening it again.
-const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Whether this click on `addr` (a card, a column's header, a lane's name)
-/// is the second of a double-click: what renames each of them.
-fn clicked_again(addr: Addr) -> bool {
-    LAST_CLICK.with(|last| {
-        let now = std::time::Instant::now();
-        let again = last.get().is_some_and(|(at, on)| on == addr && now.duration_since(at) < DOUBLE_CLICK);
-        last.set(if again { None } else { Some((now, addr)) });
-        again
-    })
-}
-
-thread_local! {
-    /// The last click on a card, a header or a lane's name, for [`DOUBLE_CLICK`].
-    static LAST_CLICK: std::cell::Cell<Option<(std::time::Instant, Addr)>> = const { std::cell::Cell::new(None) };
-}
-
-const LINE_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed);";
+use viewer_look::FIELD_STYLE;
+const DEFAULT_CARD_ICON: &str = viewer_look::PLAIN_ICON;
+use viewer_look::LINE_STYLE;
 
 /// A card's style: chosen or not, its row color, and the color of the person
 /// the pane follows when they are on it.
 fn card_style(chosen: bool, background: Option<String>, leader: Option<String>) -> String {
-    // A wider border takes its width from the padding, so choosing a card
-    // never moves or rewraps what is in it.
-    let (border, padding) = match (leader, chosen) {
-        (Some(color), _) => (format!("2px solid {color}"), "9px 11px"),
-        (None, true) => ("2px solid var(--rinch-primary-color)".to_string(), "9px 11px"),
-        (None, false) => ("1px solid var(--kanban-card-border)".to_string(), "10px 12px"),
-    };
-    let background = background.unwrap_or_else(|| "var(--kanban-card)".to_string());
-    format!("display: flex; flex-direction: column; gap: 4px; padding: {padding}; border-radius: 6px; cursor: pointer; border: {border}; background: {background};")
+    format!("display: flex; flex-direction: column; gap: 4px; {}", viewer_look::item_style(chosen, background, leader, (10, 12)))
 }
 
 /// The viewer.
@@ -921,7 +878,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     rsx! {
         div {
             class: "kanban",
-            style: {let seen = k.host.seen(); move || format!("{BOARD_STYLE}{}", surfaces(seen.dark()))},
+            style: {let seen = k.host.seen(); move || format!("{BOARD_STYLE}{}", viewer_look::surfaces(seen.dark()))},
             tabindex: "0",
             ref: root,
             onkeydown: move |key: &KeyEventData| kk.key(key),
