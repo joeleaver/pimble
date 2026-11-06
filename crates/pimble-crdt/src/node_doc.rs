@@ -892,6 +892,59 @@ impl NodeDoc {
         .map(|_| ())
     }
 
+    /// Change one place inside the `data` root, named by `path` from a
+    /// top-level key down through nested maps (by key) and arrays (by index):
+    /// set a map's key or replace an array's item, insert an item into an
+    /// array, or remove either. Everything else under `data` is left as it
+    /// is, so two people changing different parts of a plugin's JSON (a
+    /// calendar's month names, its eras) both keep what they wrote, where
+    /// [`NodeDoc::set_data`] would put a whole new value in place. Answers
+    /// whether anything changed (setting what is already there writes
+    /// nothing); a path that names nothing, or an edit its place cannot take,
+    /// is refused and nothing is written.
+    pub fn edit_data(&mut self, path: &[DataStep<'_>], edit: DataEdit<'_>) -> Result<bool> {
+        let (last, within) = path.split_last().ok_or_else(|| CrdtError::Refused("An edit of a plugin's data names no place.".into()))?;
+        let (_, update) = self.edit(|d, txn| {
+            let mut at = Out::YMap(d.data.clone());
+            for step in within {
+                at = match (&at, step) {
+                    (Out::YMap(map), DataStep::Key(key)) => map.get(txn, key),
+                    (Out::YArray(array), DataStep::Index(i)) => array.get(txn, *i),
+                    _ => None,
+                }
+                .ok_or_else(|| CrdtError::Refused(format!("Nothing in this node's data is at {}.", describe_path(path))))?;
+            }
+            let wrong = || CrdtError::Refused(format!("{} is not a place that edit can change.", describe_path(path)));
+            match (at, *last, edit) {
+                (Out::YMap(map), DataStep::Key(key), DataEdit::Set(value)) => {
+                    if map.get(txn, key).is_some_and(|now| out_to_json(txn, now) == *value) {
+                        return Ok(());
+                    }
+                    map.insert(txn, key.to_string(), json_to_in(value));
+                }
+                (Out::YMap(map), DataStep::Key(key), DataEdit::Remove) => {
+                    map.remove(txn, key);
+                }
+                (Out::YArray(array), DataStep::Index(i), DataEdit::Set(value)) if i < array.len(txn) => {
+                    if array.get(txn, i).is_some_and(|now| out_to_json(txn, now) == *value) {
+                        return Ok(());
+                    }
+                    array.remove(txn, i);
+                    array.insert(txn, i, json_to_in(value));
+                }
+                (Out::YArray(array), DataStep::Index(i), DataEdit::Insert(value)) if i <= array.len(txn) => {
+                    array.insert(txn, i, json_to_in(value));
+                }
+                (Out::YArray(array), DataStep::Index(i), DataEdit::Remove) if i < array.len(txn) => {
+                    array.remove(txn, i);
+                }
+                _ => return Err(wrong()),
+            }
+            Ok(())
+        })?;
+        Ok(update.is_some())
+    }
+
     /// The yrs document and its `data` root, for code that keeps a finer
     /// schema under `data` than JSON (a board, docs/IMAGE_MARKUP_CONTRACT.md
     /// section 3: `pimble_board::Board::of_node`). What it writes is an
@@ -1483,6 +1536,42 @@ fn board_cards<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, out: &mut Vec<
 
 // ── JSON in and out of the `data` root ──────────────────────────────────
 
+/// A step into the `data` root ([`NodeDoc::edit_data`]): a map's key or an
+/// array's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataStep<'a> {
+    Key(&'a str),
+    Index(u32),
+}
+
+/// What [`NodeDoc::edit_data`] does at the place its path names.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataEdit<'a> {
+    /// Set a map's key, or replace an array's item, with this JSON.
+    Set(&'a serde_json::Value),
+    /// Insert this JSON into an array before the index named (its length:
+    /// at the end).
+    Insert(&'a serde_json::Value),
+    /// Remove a map's key or an array's item.
+    Remove,
+}
+
+/// A data path as a person reads it: `calendar.year[3].days`.
+fn describe_path(path: &[DataStep<'_>]) -> String {
+    let mut out = String::new();
+    for step in path {
+        match step {
+            DataStep::Key(key) if out.is_empty() => out.push_str(key),
+            DataStep::Key(key) => {
+                out.push('.');
+                out.push_str(key);
+            }
+            DataStep::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
+}
+
 /// A JSON value as something to insert: objects and arrays as nested shared
 /// types, strings as shared text, scalars as values.
 fn json_to_in(value: &serde_json::Value) -> In {
@@ -1952,6 +2041,35 @@ mod tests {
         let merged = json!({"left": {"x": 1}, "right": ["y"]});
         assert_eq!(a.data_json(), merged);
         assert_eq!(b.data_json(), merged);
+    }
+
+    #[test]
+    fn edits_inside_data_touch_only_the_place_they_name_and_merge() {
+        use super::{DataEdit::*, DataStep::*};
+        let mut a = NodeDoc::new();
+        a.init("plugin", "P", None, T0).unwrap();
+        a.set_data("cal", &json!({"name": "Shire", "year": [{"month": "Afteryule", "days": 30}, {"day": "Lithe"}]})).unwrap();
+        let mut b = NodeDoc::load(&a.save()).unwrap();
+        // Two people change different parts at once: a name, and a month's length.
+        assert!(a.edit_data(&[Key("cal"), Key("name")], Set(&json!("Shire Reckoning"))).unwrap());
+        assert!(b.edit_data(&[Key("cal"), Key("year"), Index(0), Key("days")], Set(&json!(31))).unwrap());
+        // Another inserts a month while one removes the day of no month.
+        assert!(a.edit_data(&[Key("cal"), Key("year"), Index(1)], Insert(&json!({"month": "Solmath", "days": 30}))).unwrap());
+        assert!(b.edit_data(&[Key("cal"), Key("year"), Index(1)], Remove).unwrap());
+        let (a_sv, b_sv) = (a.state_vector(), b.state_vector());
+        let (to_b, to_a) = (a.diff_since(&b_sv).unwrap(), b.diff_since(&a_sv).unwrap());
+        b.apply_update(&to_b).unwrap();
+        a.apply_update(&to_a).unwrap();
+        let merged = json!({"cal": {"name": "Shire Reckoning", "year": [{"month": "Afteryule", "days": 31}, {"month": "Solmath", "days": 30}]}});
+        assert_eq!(a.data_json(), merged);
+        assert_eq!(b.data_json(), merged);
+        // Setting what is there writes nothing; a place that is not there is refused.
+        assert!(!a.edit_data(&[Key("cal"), Key("name")], Set(&json!("Shire Reckoning"))).unwrap());
+        let refused = a.edit_data(&[Key("cal"), Key("eras"), Index(0), Key("name")], Set(&json!("x"))).unwrap_err();
+        assert_eq!(refused.to_string(), "Nothing in this node's data is at cal.eras[0].name.");
+        assert!(a.edit_data(&[Key("cal"), Key("year"), Index(9)], Remove).is_err());
+        assert!(a.edit_data(&[Key("cal"), Key("name")], Remove).unwrap());
+        assert_eq!(a.data_json()["cal"].get("name"), None);
     }
 
     #[test]

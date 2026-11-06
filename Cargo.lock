@@ -5238,11 +5238,13 @@ dependencies = [
 name = "pimble-plugin-host"
 version = "0.18.1"
 dependencies = [
+ "chrono",
  "futures",
  "js-sys",
  "pimble-api",
  "pimble-client",
  "pimble-core",
+ "pimble-crdt",
  "pimble-plugin-abi",
  "pimble-rpc",
  "pimble-server",

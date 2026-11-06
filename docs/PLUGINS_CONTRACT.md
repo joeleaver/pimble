@@ -261,7 +261,11 @@ first plugin.
    `Pimble` subscribes like any client, through the bridge, to stores its approval
    covers only, so its held documents stay live and `next_change` works as in the
    app. **Props** are the metanode's address and the viewer's settings (its `data`
-   under the viewer's id); the forest is no longer sent: the plugin reads it with
+   under the viewer's id; a viewer writes its settings with `api.edit` and
+   `NodeDoc::edit_data`, which sets, inserts or removes one place inside `data` by a path
+   of keys and indexes and leaves the rest alone, so two people changing different
+   settings both keep theirs: docs/TIMELINE_CONTRACT.md section 8); the forest is no
+   longer sent: the plugin reads it with
    `Pimble::metanode_source` and keeps it live itself. **What an author writes:** in
    `describe`, `.writes(StoreAsk::Chosen)` (or `.reads(..)`, `StoreAsk::All`); in the
    view, `mount.api` (an `Arc<Pimble>`) and `mount.metanode()`, with calls run in

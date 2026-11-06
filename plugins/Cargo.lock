@@ -2336,6 +2336,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "timeline-viewer"
+version = "0.1.0"
+dependencies = [
+ "pimble-plugin-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tiny-skia"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

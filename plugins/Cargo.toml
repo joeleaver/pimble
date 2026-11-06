@@ -11,7 +11,7 @@
 # install them into this device's plugins folder: scripts/plugins/install.sh.
 [workspace]
 resolver = "2"
-members = ["../crates/pimble-plugin-sdk", "hello-viewer", "stuck-viewer", "kanban-viewer", "todo-viewer"]
+members = ["../crates/pimble-plugin-sdk", "hello-viewer", "stuck-viewer", "kanban-viewer", "todo-viewer", "timeline-viewer"]
 
 [profile.release]
 # Plugins are loaded and compiled by the app at start: small modules load faster.
