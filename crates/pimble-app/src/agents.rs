@@ -9,6 +9,10 @@
 //! browser's server keeps no local agents (remote agents, wave 4, are where the
 //! browser gets a view).
 
+// The browser keeps no agents (Settings has no AI Agents section there), so
+// most of this is the desktop's alone.
+#![cfg_attr(not(feature = "native"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 
 use pimble_core::{NodeId, StoreId};
@@ -74,7 +78,6 @@ pub struct Editing {
 /// The window's state, one per window.
 #[derive(Clone, Copy)]
 pub struct AgentsUi {
-    pub open: Signal<bool>,
     pub agents: Signal<Vec<AgentInfo>>,
     pub editing: Signal<Option<Editing>>,
     /// A just-made agent and its key, shown once, with the app it is for.
@@ -90,7 +93,6 @@ pub struct AgentsUi {
 impl AgentsUi {
     pub fn new() -> Self {
         Self {
-            open: Signal::new(false),
             agents: Signal::new(Vec::new()),
             editing: Signal::new(None),
             created: Signal::new(None),
@@ -108,16 +110,27 @@ impl Default for AgentsUi {
     }
 }
 
-/// Account > "AI Agents...".
+/// Account > "AI Agents...": Settings at AI Agents.
 pub fn open(store: AppStore) {
+    crate::settings::open_at(store, crate::settings::Section::Agents);
+}
+
+/// Settings > AI Agents is shown: the list, asked for again.
+pub(crate) fn shown(store: AppStore) {
     let ui = store.agents_ui;
     ui.editing.set(None);
     ui.created.set(None);
     ui.error.set(String::new());
     ui.setup.set(String::new());
     ui.busy.set(true);
-    ui.open.set(true);
     store.send(BackendCommand::ListAgents);
+}
+
+/// Settings closed: a key shown once is not shown again.
+pub(crate) fn hidden(store: AppStore) {
+    let ui = store.agents_ui;
+    ui.created.set(None);
+    ui.editing.set(None);
 }
 
 // ── Events ───────────────────────────────────────────────────────────────
@@ -493,7 +506,7 @@ fn chevron(row: Row) -> &'static str {
 
 const ROLE_BTN: &str = "padding: 2px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; border: 1px solid var(--rinch-color-border);";
 
-pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let ui = store.agents_ui;
     let listing = move || ui.editing.get().is_none() && ui.created.get().is_none();
     let save = move || {
@@ -516,16 +529,6 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
     };
 
     rsx! {
-        Modal {
-            opened_fn: move || ui.open.get(),
-            onclose: move || {
-                ui.open.set(false);
-                ui.created.set(None);
-                ui.editing.set(None);
-            },
-            title: "AI Agents",
-            size: "lg",
-
             div {
                 class: "pimble-agents",
 
@@ -745,7 +748,6 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     {move || ui.error.get()}
                 }
             }
-        }
     }
 }
 

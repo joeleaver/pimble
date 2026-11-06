@@ -46,6 +46,7 @@ pub(crate) fn remember(store: AppStore, pane: PaneId, store_id: StoreId, node_id
 }
 
 /// Remember the place of every pane holding a note (the window is closing).
+#[cfg(feature = "native")]
 pub(crate) fn remember_all(store: AppStore) {
     for pane in PaneId::ALL {
         if let Some(active) = untracked(|| store.pane(pane).active_edit.get()) {

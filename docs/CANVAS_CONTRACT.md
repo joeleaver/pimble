@@ -41,7 +41,7 @@ MCP, the CLI, the site and the docs a person reads:
 | Row menu "New Whiteboard" | "New Canvas" (title "Canvas", the chalkboard icon) |
 | Row menu "New Image..." (dialog "New Image") | "New Canvas from Picture..." (dialog "New Canvas from Picture") |
 | Edit / toolbar "Insert Board..." (embedded an existing board node) | "Insert Canvas": an empty canvas in the text (decision 4) |
-| Edit / toolbar "Insert Image..." | "Insert Image...", unchanged: a canvas holding the picture (decision 4) |
+| Edit / toolbar "Insert Image..." | "Insert Image...", unchanged: a canvas holding the picture (decision 4) . Since 2026-11-06 Edit > Insert > "Canvas from Picture...", New's name for it (Joe: the two lists match) |
 | Picture menu "Convert to Image Node" | "Convert to Node" (decision 3) |
 | Picture menu "Open Board", "Open Board in Split View" | "Open Canvas", "Open Canvas in Split View" |
 | Canvas menu "Flatten into New Image" | "Flatten into New Canvas" |

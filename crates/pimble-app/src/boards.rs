@@ -1464,6 +1464,7 @@ fn remember_camera(pane: PaneId, scale: f32) {
 }
 
 /// Remember the camera of every pane's board (the window is closing).
+#[cfg(feature = "native")]
 pub(crate) fn remember_all() {
     for pane in PaneId::ALL {
         remember_camera(pane, scale_of(pane));

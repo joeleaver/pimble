@@ -44,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/relay", get(crate::relay::owner_tunnel))
         .route("/api/v1/relay/:store_id", get(crate::relay::member_connection))
         .route("/api/v1/releases", get(misc::releases))
+        .route("/api/v1/plugins", get(misc::plugins))
+        .route("/api/v1/plugins/:file", get(misc::plugin_file))
         .route("/api/v1/.well-known/jwks.json", get(misc::jwks))
         .route("/api/v1/health", get(misc::health))
         .with_state(state)

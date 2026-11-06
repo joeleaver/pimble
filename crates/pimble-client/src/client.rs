@@ -1033,6 +1033,32 @@ impl PimbleClient {
         Ok(sub)
     }
 
+    /// Hand a `pimble:` link to a Pimble window on this server; `false` when
+    /// no window listens.
+    pub async fn open_in_app(&self, url: &str) -> Result<bool> {
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string() }).await.map_err(rpc_error)?;
+        Ok(response.delivered)
+    }
+
+    /// As a Pimble window: hear the links `openInApp` hands this one.
+    pub async fn subscribe_app_links(&self) -> Result<jsonrpsee::core::client::Subscription<String>> {
+        self.client
+            .subscribe::<String, _>("pimble_subscribeAppLinks", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeAppLinks")
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Hear how this computer's connections to Pimble Cloud are doing, the
+    /// first at once and then each change; `None` while signed out.
+    pub async fn subscribe_cloud_connection(&self) -> Result<jsonrpsee::core::client::Subscription<Option<pimble_rpc::CloudConnection>>> {
+        let sub = self
+            .client
+            .subscribe::<Option<pimble_rpc::CloudConnection>, _>("pimble_subscribeCloudConnection", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeCloudConnection")
+            .await
+            .map_err(rpc_error)?;
+        Ok(sub)
+    }
+
     /// Hear other sessions' presence frames in `store_id`
     /// (docs/PRESENCE_CONTRACT.md); `client_id` is this client's own, whose
     /// frames are not sent back and whose sessions end when this closes.

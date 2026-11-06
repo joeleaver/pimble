@@ -80,6 +80,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ed25519-dalek = { version = "2.2", optional = true }
 semver = { version = "1", optional = true }
 dirs = { version = "6", optional = true }
+# The plugins folder is watched, so a plugin added, replaced or removed there
+# takes effect at once (docs/SETTINGS_CONTRACT.md section 3).
+notify = { workspace = true, optional = true }
 # Runs plugins (docs/PLUGINS_CONTRACT.md): the op log applier, the bridge and,
 # per target, an engine: wasmtime (`wasm-host`) on the desktop, the page's own
 # WebAssembly (`js-host`) in the browser.
@@ -135,6 +138,7 @@ native = [
     "dep:ed25519-dalek",
     "dep:semver",
     "dep:dirs",
+    "dep:notify",
     "pimble-plugin-host/wasm-host",
     "rinch/desktop",
     # GPU rendering (vello over wgpu). The CPU renderer repaints the whole window

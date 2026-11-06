@@ -50,6 +50,9 @@ pub mod rinch_editor;
 pub mod state;
 pub mod styles;
 pub mod sheets;
+pub mod settings;
+pub mod shortcuts;
+pub mod splitting;
 pub mod shares;
 pub mod discussions;
 pub mod doc_session;
@@ -62,6 +65,10 @@ pub mod text_boards;
 pub mod toolbar;
 #[cfg(feature = "native")]
 pub mod update;
+/// The Ed25519 key releases are signed with, the raw 32 bytes in base64
+/// (`tools/update-key.sh` writes it): desktop updates and the plugin library's
+/// plugins verify against it. Anything that is not such a key refuses both.
+pub(crate) const RELEASE_KEY: &str = include_str!("../update-key.pub");
 /// Plugins (docs/PLUGINS_CONTRACT.md): where they live on this device, what
 /// each was allowed, and the metanode viewers they provide, on the desktop and
 /// in the browser alike; only the engine differs.

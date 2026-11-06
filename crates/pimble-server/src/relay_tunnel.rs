@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::handler::RpcHandler;
+use crate::relay_face::TunnelState;
 use crate::vault_link::{INITIAL_BACKOFF, MAX_BACKOFF};
 
 const KIND_OPEN: u8 = 1;
@@ -122,9 +123,15 @@ pub(crate) async fn run(handler: RpcHandler, mut serve: watch::Receiver<HashSet<
     let mut told_down = false;
     loop {
         while serve.borrow_and_update().is_empty() {
+            handler.relay().set_tunnel_state(TunnelState::Idle);
             if serve.changed().await.is_err() {
                 return;
             }
+        }
+        // Down stays said while it is tried again: a laptop with no network
+        // is not "connecting" every thirty seconds.
+        if !matches!(handler.relay().tunnel_state(), TunnelState::Down { .. } | TunnelState::Replaced) {
+            handler.relay().set_tunnel_state(TunnelState::Connecting);
         }
         let mut served = false;
         let result = serve_once(&handler, &mut serve, &mut served).await;
@@ -136,6 +143,7 @@ pub(crate) async fn run(handler: RpcHandler, mut serve: watch::Receiver<HashSet<
             // Nothing left to announce: no tunnel until there is.
             Ok(()) => {
                 info!("Relay tunnel closed: nothing is shared from this computer right now");
+                handler.relay().set_tunnel_state(TunnelState::Idle);
                 continue;
             }
             // Two computers that both share the same store (its directory
@@ -144,13 +152,18 @@ pub(crate) async fn run(handler: RpcHandler, mut serve: watch::Receiver<HashSet<
             // only now and then.
             Err(e) if e.is::<Replaced>() => {
                 warn!("Relay tunnel closed: {}. If another computer shares the same stores, only one of them can at a time", e);
+                handler.relay().set_tunnel_state(TunnelState::Replaced);
                 backoff = MAX_BACKOFF;
             }
             Err(e) if !told_down => {
                 info!("Relay tunnel is down ({}); trying again, quietly, until it is back", e);
+                handler.relay().set_tunnel_state(TunnelState::Down { reason: e.to_string() });
                 told_down = true;
             }
-            Err(e) => debug!("Relay tunnel still down: {}", e),
+            Err(e) => {
+                debug!("Relay tunnel still down: {}", e);
+                handler.relay().set_tunnel_state(TunnelState::Down { reason: e.to_string() });
+            }
         }
         // The wait, cut short when what is served changes: a store relayed
         // a moment ago should not sit out the rest of a thirty-second wait.
@@ -232,6 +245,7 @@ async fn serve_once(handler: &RpcHandler, serve: &mut watch::Receiver<HashSet<St
                                 }
                                 *served = true;
                                 let asked = serve.borrow().len();
+                                handler.relay().set_tunnel_state(TunnelState::Up { serving: count, asked });
                                 if count < asked {
                                     warn!("Relay tunnel: the relay serves {} of the {} stores announced; the others are not recorded as shared from this account", count, asked);
                                 }

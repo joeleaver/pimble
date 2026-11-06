@@ -9,8 +9,12 @@
 use rinch::prelude::Renderer;
 
 const USAGE: &str = "\
-Usage: pimble [--cpu | --renderer <auto|gpu|cpu>]
+Usage: pimble [--cpu | --renderer <auto|gpu|cpu>] [<pimble: link>]
        pimble --install
+
+  <pimble: link>    open a link in Pimble: a note's (Copy Link), or
+                    pimble:settings/plugins?install=<id>; a Pimble already open
+                    takes it, else this one opens with it
 
   --install         put this copy in your home folder (on the menu and the PATH),
                     where it keeps itself up to date
@@ -60,7 +64,18 @@ fn main() {
     }
     pimble_app::update::at_start();
 
-    let renderer = match parse_args(std::env::args().skip(1)) {
+    // A `pimble:` link (the operating system starts `pimble <link>` for a
+    // click in a browser or a mail app) goes to the Pimble already open, if
+    // one is, and this process stops there.
+    let (links, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.starts_with("pimble:"));
+    if let Some(link) = links.into_iter().next() {
+        if hand_to_open_window(&link) {
+            return;
+        }
+        pimble_app::links::set_launch_link(link);
+    }
+
+    let renderer = match parse_args(args) {
         Ok(renderer) => renderer,
         Err(message) => {
             if message.is_empty() {
@@ -84,6 +99,19 @@ fn main() {
 
     // Run the application
     pimble_app::app::run(renderer);
+}
+
+/// Hand `link` to a Pimble window on this computer's server; whether one took
+/// it. No server, an older one, or no window listening: `false`.
+fn hand_to_open_window(link: &str) -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return false };
+    runtime.block_on(async {
+        let asked = async {
+            let client = pimble_client::PimbleClient::connect(pimble_server::local::server_url()).await.ok()?;
+            client.open_in_app(link).await.ok()
+        };
+        matches!(tokio::time::timeout(std::time::Duration::from_secs(3), asked).await, Ok(Some(true)))
+    })
 }
 
 #[cfg(test)]

@@ -6,6 +6,11 @@ license = "MIT"
 publish = false
 description = "The kanban metanode viewer: columns and cards over a tree two levels deep (docs/KANBAN_CONTRACT.md)"
 
+# In the plugin library (docs/SETTINGS_CONTRACT.md section 4).
+[package.metadata.pimble]
+library = true
+summary = "Columns of cards from a node's children; drag a card to move it."
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

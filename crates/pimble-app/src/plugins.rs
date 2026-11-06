@@ -46,6 +46,7 @@ use pimble_crdt::NodeDoc;
 use pimble_plugin_host::abi::api::{ApiReply, Reach};
 use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl, StoreAsk};
 use pimble_plugin_host::bridge::asking_sentence;
+use pimble_plugin_host::library::{self, Entry, Index, Offer, Provenance};
 #[cfg(not(feature = "native"))]
 use pimble_plugin_host::js_engine::{Plugin, Registry, ViewerLookup};
 #[cfg(feature = "native")]
@@ -85,6 +86,10 @@ struct Shown {
     wants: Vec<pimble_core::StoreId>,
     /// "Not now" was chosen for `wants` in this pane.
     declined_wants: bool,
+    /// A newer version of the plugin was installed on its own while this
+    /// pane showed it: the pane keeps this one until "Restart Plugin" or the
+    /// next time it mounts (docs/SETTINGS_CONTRACT.md section 3).
+    newer: bool,
 }
 
 thread_local! {
@@ -99,6 +104,21 @@ thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
     /// Host state is pushed from one effect, made once.
     static WATCHING: Cell<bool> = const { Cell::new(false) };
+    /// The plugin library's index, once it was read.
+    static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
+    /// Which installed plugins came from the library: `library.json`.
+    static PROVENANCE: RefCell<Provenance> = RefCell::new(Provenance::default());
+    /// What a library row says about its plugin now (downloading, what came
+    /// of an install), by plugin id.
+    static ROW_LINES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Plugins being updated on their own (wave 3): a pane showing one keeps
+    /// the version it runs when the new one is swapped in.
+    static QUIET: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+    /// The plugin a `pimble:settings/plugins?install=<id>` link asked about:
+    /// its library row is marked and says what to press.
+    static ASKED: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The library is checked for updates on a timer, started once.
+    static CHECKING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Read the registry, if it has loaded.
@@ -116,6 +136,7 @@ fn manifest_of(id: &str) -> Option<Manifest> {
 pub(crate) fn load(store: AppStore) {
     STORE.with(|s| s.set(Some(store)));
     APPROVALS.with(|a| *a.borrow_mut() = place::read_approvals());
+    PROVENANCE.with(|p| *p.borrow_mut() = place::read_provenance());
     place::load();
 }
 
@@ -127,6 +148,9 @@ fn loaded(registry: Registry) {
         // What the explorer's new-node menu offers from them.
         store.recipes.set(recipes());
         crate::metanodes::plugins_ready(store);
+        if !CHECKING.with(|c| c.replace(true)) {
+            schedule_update_check(FIRST_UPDATE_CHECK_MS);
+        }
         if !WATCHING.with(|w| w.replace(true)) {
             watch_host_state(store);
             // A drag in this window ended: every running plugin hears it, so a
@@ -141,6 +165,45 @@ fn loaded(registry: Registry) {
         }
     }
     refresh_window();
+    refresh_library();
+}
+
+/// The plugins changed: one was added, replaced or removed (`changed` names
+/// them by id). Every pane showing one of them stops it, the registry is
+/// swapped, and each pane holding a metanode mounts again with what is loaded
+/// now, so a new version takes over in place (docs/SETTINGS_CONTRACT.md
+/// section 3).
+///
+/// A plugin updated on its own (`QUIET`) is not stopped: each pane showing it
+/// keeps the version it runs and says a newer one is ready.
+fn swapped(registry: Registry, changed: &[String]) {
+    for id in changed {
+        if QUIET.with(|q| q.borrow().contains(id)) {
+            SHOWN.with(|s| {
+                for shown in s.borrow_mut().values_mut().filter(|shown| &shown.plugin_id == id && shown.instance.is_some()) {
+                    shown.newer = true;
+                }
+            });
+        } else {
+            stop_everywhere(id);
+        }
+    }
+    loaded(registry);
+}
+
+/// "Restart Plugin": the pane stops the version it runs and mounts the one
+/// installed now.
+pub(crate) fn restart(store: AppStore, pane: PaneId) {
+    hide(pane);
+    crate::metanodes::refill(store, pane);
+}
+
+/// Every pane showing plugin `id` stops it.
+fn stop_everywhere(id: &str) {
+    let panes: Vec<PaneId> = SHOWN.with(|s| s.borrow().iter().filter(|(_, shown)| shown.plugin_id == id).map(|(p, _)| *p).collect());
+    for pane in panes {
+        hide(pane);
+    }
 }
 
 /// The recipes every loaded plugin registers ("New Kanban"), in the folder's
@@ -299,6 +362,9 @@ pub(crate) enum Outcome {
     /// the view, under this sentence asking for them with "Allow" and "Not
     /// now".
     ShownAsking(String),
+    /// It is, and a newer version was installed since it mounted: the view,
+    /// under this sentence with "Restart Plugin".
+    ShownNewer(String),
     /// It is not: the outline, under this sentence.
     Outline(String),
     /// The plugin waits for the person to allow it: the outline, under this
@@ -336,6 +402,10 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
         Some(shown.declined_wants)
     });
     if wants.is_empty() || declined != Some(false) {
+        let newer = SHOWN.with(|s| s.borrow().get(&pane).is_some_and(|shown| shown.newer));
+        if newer {
+            return Outcome::ShownNewer(format!("A newer version of {} is ready.", manifest.name));
+        }
         return outcome;
     }
     let names: Vec<String> = wants.iter().map(|s| store_name(store, *s)).collect();
@@ -410,6 +480,7 @@ fn show_viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> 
         declined: false,
         wants: Vec::new(),
         declined_wants: false,
+        newer: false,
     };
     if manifest.asks.asks_anything() && !approval.covers(&manifest.asks, forest.metanode.store) {
         SHOWN.with(|s| s.borrow_mut().insert(pane, shown(None, None)));
@@ -622,21 +693,74 @@ struct PluginRow {
     removable: bool,
 }
 
+/// What a plugin asks for, as a row says it: "asks to read the stores you
+/// choose".
+fn asks_sentence(asks: &pimble_plugin_host::abi::Permissions) -> &'static str {
+    match (asks.stores, asks.write) {
+        (StoreAsk::None, _) => "asks for nothing",
+        (StoreAsk::All, true) => "asks to read and change all your stores",
+        (StoreAsk::All, false) => "asks to read all your stores",
+        (StoreAsk::Chosen, true) => "asks to read and change the stores you choose",
+        (StoreAsk::Chosen, false) => "asks to read the stores you choose",
+    }
+}
+
+/// One plugin the library offers, as Settings > Plugins lists it.
+#[derive(Clone, PartialEq)]
+struct LibraryRow {
+    id: String,
+    /// "Kanban 0.1.0".
+    title: String,
+    summary: String,
+    /// "Asks to read and change the stores you choose."
+    asks: String,
+    offer: Offer,
+    /// "Install" or "Update", when the row has a button.
+    button: Option<&'static str>,
+    /// Downloading, or what came of the last install.
+    line: String,
+    /// A link asked about this plugin.
+    asked: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PluginsUi {
-    open: Signal<bool>,
     rows: Signal<Vec<PluginRow>>,
     /// What came of the last "Add plugin..." or "Remove".
     status: Signal<String>,
+    library: Signal<Vec<LibraryRow>>,
+    /// Reading the library, or why it could not be read.
+    library_line: Signal<String>,
 }
 
-/// Open Account > "Plugins...".
+/// Account > "Plugins...": Settings at Plugins.
 pub(crate) fn open(store: AppStore) {
+    crate::settings::open_at(store, crate::settings::Section::Plugins);
+}
+
+/// Settings > Plugins is shown: the list as it is now, and no line left from
+/// last time.
+pub(crate) fn shown(store: AppStore) {
     if let Some(ui) = UI.with(Cell::get) {
         ui.status.set(String::new());
         ui.rows.set(rows(store));
-        ui.open.set(true);
     }
+    read_library();
+}
+
+/// Settings closes: what the rows said (an install, an update made on its
+/// own) is said until then.
+pub(crate) fn hidden() {
+    ROW_LINES.with(|l| l.borrow_mut().clear());
+    ASKED.with(|a| *a.borrow_mut() = None);
+}
+
+/// A link asked to install plugin `id` (the website's "Install in Pimble"):
+/// its row in the library is marked and says what to press. Nothing is
+/// installed until the person presses it.
+pub(crate) fn offer_install(id: &str) {
+    ASKED.with(|a| *a.borrow_mut() = Some(id.to_string()));
+    refresh_library();
 }
 
 fn refresh_window() {
@@ -656,14 +780,9 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
         .map(|p| {
             let m = &p.manifest;
             let viewers: Vec<String> = m.viewers().map(|v| v.name.clone()).collect();
-            let asks = match (m.asks.stores, m.asks.write) {
-                (StoreAsk::None, _) => "asks for nothing".to_string(),
-                (StoreAsk::All, true) => "asks to read and change all your stores".to_string(),
-                (StoreAsk::All, false) => "asks to read all your stores".to_string(),
-                (StoreAsk::Chosen, true) => "asks to read and change the stores you choose".to_string(),
-                (StoreAsk::Chosen, false) => "asks to read the stores you choose".to_string(),
-            };
+            let asks = asks_sentence(&m.asks);
             let line = format!("{} {}: the {} viewer; {asks}.", m.name, m.version, viewers.join(", "));
+            let came = if PROVENANCE.with(|p| p.borrow().from_library(&m.id)) { "From the library." } else { "Added from a file." };
             let approval = approval_of(&m.id);
             let verb = if approval.write { "read and change" } else { "read" };
             let (note, revocable) = match &approval.stores {
@@ -675,6 +794,7 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
                 Approved::Nothing if m.asks.asks_anything() => ("Not allowed anything yet.".to_string(), false),
                 Approved::Nothing => ("It needs nothing allowed.".to_string(), false),
             };
+            let note = format!("{came} {note}");
             PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable, removable: place::REMOVABLE }
         })
         .collect();
@@ -684,17 +804,17 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
     rows
 }
 
-/// The Plugins window: each plugin in the folder, what it asks for, what it was
-/// allowed here, and "Revoke".
-pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let ui = PluginsUi { open: Signal::new(false), rows: Signal::new(Vec::new()), status: Signal::new(String::new()) };
+/// Settings > Plugins: each plugin installed, what it asks for, what it was
+/// allowed here, "Revoke" and "Remove"; and "Add from a file...".
+pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    let ui = PluginsUi {
+        rows: Signal::new(Vec::new()),
+        status: Signal::new(String::new()),
+        library: Signal::new(Vec::new()),
+        library_line: Signal::new(String::new()),
+    };
     UI.with(|u| u.set(Some(ui)));
     rsx! {
-        Modal {
-            opened_fn: move || ui.open.get(),
-            onclose: move || ui.open.set(false),
-            title: "Plugins",
-            size: "md",
             div {
                 class: "pimble-plugins",
                 style: "display: flex; flex-direction: column; gap: 12px;",
@@ -746,19 +866,280 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     div { style: "font-size: 12px;", {move || ui.status.get()} }
                 }
                 div {
-                    style: "display: flex; justify-content: flex-end; gap: 8px;",
+                    style: "display: flex; justify-content: flex-start; gap: 8px;",
                     if place::CAN_ADD {
-                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add plugin..." }
+                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add from a File..." }
                     }
-                    Button { variant: "default", size: "xs", onclick: move || ui.open.set(false), "Close" }
+                }
+                div { class: "pimble-settings__heading", style: "margin-top: 8px;", "Library" }
+                div {
+                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                    "Plugins from pimble.app, signed by Pimble and checked before they are installed."
+                }
+                if !ui.library_line.get().is_empty() {
+                    div { style: "font-size: 13px;", {move || ui.library_line.get()} }
+                }
+                for row in ui.library.get() {
+                    div {
+                        key: format!("{} {} {:?} {} {}", row.id, row.title, row.offer, row.line, row.asked),
+                        class: if row.asked { "pimble-plugins__row pimble-plugins__row--asked" } else { "pimble-plugins__row" },
+                        style: "display: flex; gap: 12px; align-items: center;",
+                        div {
+                            style: "flex: 1; display: flex; flex-direction: column; gap: 2px;",
+                            div { style: "font-size: 13px; font-weight: 600;", {row.title.clone()} }
+                            div { style: "font-size: 13px;", {row.summary.clone()} }
+                            div { style: "font-size: 12px; color: var(--rinch-color-dimmed);", {row.asks.clone()} }
+                            if !row.line.is_empty() {
+                                div { style: "font-size: 12px;", {row.line.clone()} }
+                            }
+                        }
+                        if row.button.is_some() {
+                            Button {
+                                variant: "filled",
+                                size: "xs",
+                                onclick: {
+                                    let id = row.id.clone();
+                                    move || install_from_library(&id)
+                                },
+                                {row.button.unwrap_or_default()}
+                            }
+                        }
+                        if row.button.is_none() {
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed); white-space: nowrap;",
+                                {offer_label(&row.offer)}
+                            }
+                        }
+                    }
                 }
             }
+    }
+}
+
+/// What a library row says instead of a button.
+fn offer_label(offer: &Offer) -> &'static str {
+    match offer {
+        Offer::Installed => "Installed",
+        Offer::FromFile => "Added from a file",
+        Offer::NeedsNewer => "Needs a newer Pimble",
+        Offer::Install | Offer::Update { .. } => "",
+    }
+}
+
+// ── The library (docs/SETTINGS_CONTRACT.md section 4) ─────────────────────────
+
+/// Where the library's index (`None`) or one of its files is.
+fn library_url(file: Option<&str>) -> String {
+    let base = place::library_base();
+    match file {
+        Some(file) => format!("{}/{file}", base.trim_end_matches('/')),
+        None => base,
+    }
+}
+
+/// Read the index again, as Settings > Plugins is shown.
+fn read_library() {
+    if INDEX.with(|i| i.borrow().is_none()) {
+        library_said("Looking at the library...".to_string());
+    }
+    place::fetch(library_url(None), |fetched| {
+        let read = fetched.and_then(|bytes| Index::parse(&bytes));
+        match read {
+            Ok(index) => {
+                let empty = index.plugins.is_empty();
+                INDEX.with(|i| *i.borrow_mut() = Some(index));
+                library_said(if empty { "The library has no plugins yet.".to_string() } else { String::new() });
+            }
+            Err(e) => {
+                tracing::warn!("plugins: the library could not be read: {e}");
+                let known = INDEX.with(|i| i.borrow().is_some());
+                library_said(if known { String::new() } else { format!("The library could not be reached ({e}).") });
+            }
+        }
+        refresh_library();
+    });
+}
+
+fn library_said(line: String) {
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.library_line.set(line);
+    }
+}
+
+fn library_rows() -> Vec<LibraryRow> {
+    let Some(index) = INDEX.with(|i| i.borrow().clone()) else { return Vec::new() };
+    index
+        .plugins
+        .iter()
+        .map(|entry| {
+            let installed = manifest_of(&entry.id).map(|m| m.version);
+            let from_library = PROVENANCE.with(|p| p.borrow().from_library(&entry.id));
+            let offer = library::offer(entry, installed.as_deref(), from_library);
+            let mut asks = asks_sentence(&entry.asks).to_string();
+            if let Some(first) = asks.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            let asked = ASKED.with(|a| a.borrow().as_deref() == Some(entry.id.as_str()));
+            let line = ROW_LINES.with(|l| l.borrow().get(&entry.id).cloned()).unwrap_or_else(|| match (&offer, asked) {
+                (Offer::Install, true) => format!("Press Install to add {}.", entry.name),
+                (Offer::Update { from }, true) => format!("You have {from}. Press Update to get {}.", entry.version),
+                (Offer::Update { from }, false) => format!("You have {from}."),
+                (Offer::Installed, true) => format!("{} is installed already.", entry.name),
+                (Offer::FromFile, true) => format!("{} was added from a file. Remove it above to install the library's.", entry.name),
+                (Offer::NeedsNewer, true) => format!("{} needs a newer Pimble. Update Pimble first.", entry.name),
+                _ => String::new(),
+            });
+            let button = match offer {
+                Offer::Install => Some("Install"),
+                Offer::Update { .. } => Some("Update"),
+                _ => None,
+            };
+            LibraryRow { asked, button, id: entry.id.clone(), title: format!("{} {}", entry.name, entry.version), summary: entry.summary.clone(), asks: format!("{asks}."), offer, line }
+        })
+        .collect()
+}
+
+fn refresh_library() {
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.library.set(library_rows());
+    }
+}
+
+fn row_said(id: &str, line: String) {
+    ROW_LINES.with(|l| l.borrow_mut().insert(id.to_string(), line));
+    refresh_library();
+}
+
+/// "Install" or "Update".
+fn install_from_library(id: &str) {
+    let Some(entry) = INDEX.with(|i| i.borrow().as_ref().and_then(|index| index.plugins.iter().find(|e| e.id == id).cloned())) else {
+        return;
+    };
+    row_said(&entry.id, format!("Downloading {}...", entry.name));
+    fetch_and_install(entry);
+}
+
+/// The plugin and its signature are downloaded, checked against what the
+/// index lists and the key this build carries, and only then installed. A
+/// plugin that does not verify is never written anywhere.
+fn fetch_and_install(entry: Entry) {
+    place::fetch(library_url(Some(&entry.wasm)), move |wasm| {
+        let sig_url = library_url(Some(&entry.sig));
+        place::fetch(sig_url, move |sig| {
+            let (wasm, sig) = match (wasm, sig) {
+                (Ok(wasm), Ok(sig)) => (wasm, sig),
+                (Err(e), _) | (_, Err(e)) => return install_failed(&entry, format!("The download did not finish ({e}).")),
+            };
+            if let Err(e) = library::verify_download(&entry, crate::RELEASE_KEY, &wasm, &sig) {
+                tracing::warn!("plugins: {} from the library refused: {e}", entry.id);
+                return install_failed(&entry, library::NOT_VERIFIED.to_string());
+            }
+            if !QUIET.with(|q| q.borrow().contains(&entry.id)) {
+                row_said(&entry.id, format!("Installing {}...", entry.name));
+            }
+            place::install(entry, wasm);
+        });
+    });
+}
+
+/// A plugin from the library is installed: remember where it came from.
+fn installed_from_library(entry: &Entry) {
+    let quiet = QUIET.with(|q| q.borrow_mut().remove(&entry.id));
+    PROVENANCE.with(|p| p.borrow_mut().plugins.insert(entry.id.clone(), entry.version.clone()));
+    write_provenance();
+    let line = if quiet { format!("{} updated to {}.", entry.name, entry.version) } else { format!("Installed {} {}.", entry.name, entry.version) };
+    tracing::info!("plugins: {line}");
+    row_said(&entry.id, line);
+    refresh_window();
+    if quiet {
+        // Panes showing it say a newer version is ready.
+        if let Some(store) = STORE.with(Cell::get) {
+            crate::metanodes::plugins_ready(store);
         }
     }
 }
 
+/// An install from the library did not happen: the row says why. One made on
+/// its own is tried again at the next check.
+fn install_failed(entry: &Entry, line: String) {
+    let quiet = QUIET.with(|q| q.borrow_mut().remove(&entry.id));
+    if quiet {
+        tracing::warn!("plugins: updating {} to {} did not happen: {line}", entry.id, entry.version);
+    }
+    row_said(&entry.id, line);
+}
+
+// ── Updates on their own (docs/SETTINGS_CONTRACT.md section 5) ───────────────
+
+/// The first look at the library after the app starts, then one every six
+/// hours.
+const FIRST_UPDATE_CHECK_MS: u32 = 20_000;
+const UPDATE_CHECK_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
+
+fn schedule_update_check(after_ms: u32) {
+    rinch::core::reactive::unowned(|| {
+        let _ = rinch::core::set_timeout(after_ms, || {
+            check_for_updates();
+            schedule_update_check(UPDATE_CHECK_EVERY_MS);
+        });
+    });
+}
+
+/// Read the index, and install every newer version of a plugin that came from
+/// the library and that this Pimble can load, without asking. A plugin added
+/// from a file is never touched; what each was allowed carries over, and a
+/// new version that asks for more asks the way a first use does.
+fn check_for_updates() {
+    place::fetch(library_url(None), |fetched| {
+        let index = match fetched.and_then(|bytes| Index::parse(&bytes)) {
+            Ok(index) => index,
+            Err(e) => return tracing::info!("plugins: no update check this time: {e}"),
+        };
+        INDEX.with(|i| *i.borrow_mut() = Some(index.clone()));
+        let due = updates_due(&index, |id| manifest_of(id).map(|m| m.version), |id| PROVENANCE.with(|p| p.borrow().from_library(id)));
+        refresh_library();
+        for entry in due {
+            if !QUIET.with(|q| q.borrow_mut().insert(entry.id.clone())) {
+                continue;
+            }
+            tracing::info!("plugins: updating {} to {}", entry.id, entry.version);
+            fetch_and_install(entry);
+        }
+    });
+}
+
+/// The entries of `index` that are updates to install on their own: newer
+/// than the version installed, of a plugin installed from the library, for
+/// this Pimble's plugin ABI.
+fn updates_due(index: &Index, installed: impl Fn(&str) -> Option<String>, from_library: impl Fn(&str) -> bool) -> Vec<Entry> {
+    index
+        .plugins
+        .iter()
+        .filter(|entry| {
+            let have = installed(&entry.id);
+            matches!(library::offer(entry, have.as_deref(), from_library(&entry.id)), Offer::Update { .. })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Plugin `id` was removed, or added from a file over the library's: the
+/// library no longer looks after it.
+fn forget_library(id: &str) {
+    let had = PROVENANCE.with(|p| p.borrow_mut().plugins.remove(id).is_some());
+    if had {
+        write_provenance();
+    }
+    ROW_LINES.with(|l| l.borrow_mut().remove(id));
+    refresh_library();
+}
+
+fn write_provenance() {
+    let json = PROVENANCE.with(|p| p.borrow().to_json());
+    place::write_provenance(&json);
+}
+
 /// Say what came of an add or a remove, in the Plugins window.
-#[cfg_attr(feature = "native", allow(dead_code))]
 fn say(line: String) {
     if let Some(ui) = UI.with(Cell::get) {
         ui.status.set(line);
@@ -767,22 +1148,122 @@ fn say(line: String) {
 
 // ── Where plugins live, per target ────────────────────────────────────────────
 
-/// The desktop: a folder of `.wasm` files put there by hand, compiled under
-/// wasmtime off the UI thread; approvals in a file beside them.
+/// The desktop: a folder of `.wasm` files, compiled under wasmtime off the UI
+/// thread and watched, so a plugin added, replaced or removed there (by
+/// Settings, `scripts/plugins/install.sh` or by hand) takes effect at once;
+/// approvals in a file beside them.
 #[cfg(feature = "native")]
 mod place {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
-    use pimble_plugin_host::wasmtime_engine::{load_dir, DEFAULT_BUDGET};
+    use pimble_plugin_host::wasmtime_engine::{load_bytes, load_file, DEFAULT_BUDGET};
 
-    /// The folder is the person's: the window lists it and does not change it.
-    pub const CAN_ADD: bool = false;
-    pub const REMOVABLE: bool = false;
+    pub const CAN_ADD: bool = true;
+    pub const REMOVABLE: bool = true;
 
     pub static WHERE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        format!("Plugins are .wasm files in {}. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
+        format!("Plugins are .wasm files in {}. One added there, replaced or removed takes effect at once. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
     });
+
+    type Loaded = Result<Plugin, (Option<Manifest>, String)>;
+
+    /// What a file was when it was loaded: its length and modified time.
+    type Stamp = (u64, Option<SystemTime>);
+
+    /// What each file in the folder loaded as, and the file as it was then: a
+    /// file unchanged since is not compiled again.
+    static CACHE: Mutex<Option<HashMap<PathBuf, (Stamp, Loaded)>>> = Mutex::new(None);
+
+    fn stamp(path: &Path) -> Option<Stamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    }
+
+    fn id_of(loaded: &Loaded) -> Option<String> {
+        match loaded {
+            Ok(plugin) => Some(plugin.manifest.id.clone()),
+            Err((Some(manifest), _)) => Some(manifest.id.clone()),
+            Err((None, _)) => None,
+        }
+    }
+
+    /// Every `.wasm` file in `dir`, each compiled again only when its file
+    /// changed, and the ids whose plugin changed: new, replaced or gone.
+    fn scan(dir: &Path) -> (Registry, Vec<String>) {
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = guard.get_or_insert_with(HashMap::new);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "wasm")).collect())
+            .unwrap_or_default();
+        paths.sort();
+        let mut changed: Vec<String> = Vec::new();
+        let mut note = |id: Option<String>| {
+            if let Some(id) = id {
+                if !changed.contains(&id) {
+                    changed.push(id);
+                }
+            }
+        };
+        let mut registry = Registry::default();
+        for path in &paths {
+            let now = stamp(path);
+            let same = now.is_some() && cache.get(path).is_some_and(|(was, _)| Some(*was) == now);
+            if !same {
+                if let Some((_, old)) = cache.get(path) {
+                    note(id_of(old));
+                }
+                let loaded = load_file(path, DEFAULT_BUDGET);
+                note(id_of(&loaded));
+                cache.insert(path.clone(), (now.unwrap_or((0, None)), loaded));
+            }
+            let (_, loaded) = &cache[path];
+            registry.take(path.clone(), loaded.clone());
+        }
+        let gone: Vec<PathBuf> = cache.keys().filter(|p| !paths.contains(p)).cloned().collect();
+        for path in gone {
+            if let Some((_, old)) = cache.remove(&path) {
+                note(id_of(&old));
+            }
+        }
+        (registry, changed)
+    }
+
+    /// Look at the folder again and hand what changed to the window.
+    fn rescan(dir: &Path) {
+        let (registry, changed) = scan(dir);
+        if changed.is_empty() {
+            return;
+        }
+        tracing::info!("plugins: {} changed in {}", changed.join(", "), dir.display());
+        rinch::core::reactive::run_on_main_thread(move || swapped(registry, &changed));
+    }
+
+    /// Watch the folder for as long as the app runs: a burst of events (a copy
+    /// writes in several steps) is one rescan once it has been quiet for half
+    /// a second.
+    fn watch(dir: PathBuf) {
+        use notify::Watcher;
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut watcher = match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok_and(|e| e.paths.iter().any(|p| p.extension().is_some_and(|x| x == "wasm"))) {
+                let _ = tx.send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => return tracing::warn!("plugins: the folder cannot be watched ({e}); a change there shows at the next start"),
+        };
+        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+            return tracing::warn!("plugins: {} cannot be watched ({e}); a change there shows at the next start", dir.display());
+        }
+        while rx.recv().is_ok() {
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+            rescan(&dir);
+        }
+    }
 
     /// Where plugins are installed on this device.
     pub fn plugins_dir() -> PathBuf {
@@ -791,6 +1272,68 @@ mod place {
 
     fn approvals_path() -> PathBuf {
         plugins_dir().join("approvals.json")
+    }
+
+    fn provenance_path() -> PathBuf {
+        plugins_dir().join("library.json")
+    }
+
+    pub fn read_provenance() -> Provenance {
+        std::fs::read(provenance_path()).map(|bytes| Provenance::parse(&bytes)).unwrap_or_default()
+    }
+
+    pub fn write_provenance(json: &[u8]) {
+        let path = provenance_path();
+        let written = std::fs::create_dir_all(plugins_dir()).and_then(|_| std::fs::write(&path, json));
+        if let Err(e) = written {
+            tracing::warn!("plugins: {} could not be saved: {e}", path.display());
+        }
+    }
+
+    /// pimble.app's library, or another service's (`PIMBLE_LIBRARY_URL`, for
+    /// the local stack).
+    pub fn library_base() -> String {
+        std::env::var("PIMBLE_LIBRARY_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "https://pimble.app/api/v1/plugins".to_string())
+    }
+
+    /// Fetch `url` off the UI thread; `done` hears the bytes on it.
+    pub fn fetch(url: String, done: impl FnOnce(Result<Vec<u8>, String>) + Send + 'static) {
+        let spawned = std::thread::Builder::new().name("pimble-library".into()).spawn(move || {
+            let fetched = (|| {
+                let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+                let resp = client.get(&url).send().map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status().as_u16()));
+                }
+                resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+            })();
+            rinch::core::reactive::run_on_main_thread(move || done(fetched));
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start a download: {e}");
+        }
+    }
+
+    /// A verified download from the library: loaded (it must be the plugin
+    /// the index listed) and put in the folder as "Add from a file..." puts one.
+    pub fn install(entry: Entry, bytes: Vec<u8>) {
+        let dir = plugins_dir();
+        let spawned = std::thread::Builder::new().name("pimble-plugin-install".into()).spawn(move || {
+            let put = load_bytes(Path::new(&entry.wasm), &bytes, DEFAULT_BUDGET)
+                .map_err(|(_, sentence)| sentence)
+                .and_then(|plugin| library::matches(&entry, &plugin.manifest).map(|_| plugin))
+                .and_then(|plugin| put(&dir, &bytes, &plugin.manifest));
+            match put {
+                Ok(()) => {
+                    rescan(&dir);
+                    rinch::core::reactive::run_on_main_thread(move || installed_from_library(&entry));
+                }
+                Err(e) => rinch::core::reactive::run_on_main_thread(move || install_failed(&entry, e)),
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start installing: {e}");
+        }
     }
 
     pub fn read_approvals() -> HashMap<String, Approval> {
@@ -808,9 +1351,10 @@ mod place {
     pub fn load() {
         let dir = plugins_dir();
         let spawned = std::thread::Builder::new().name("pimble-plugins".into()).spawn(move || {
-            let registry = load_dir(&dir, DEFAULT_BUDGET);
+            let (registry, changed) = scan(&dir);
             tracing::info!("plugins: {} loaded and {} refused from {}", registry.plugins.len(), registry.refused.len(), dir.display());
-            rinch::core::reactive::run_on_main_thread(move || loaded(registry));
+            rinch::core::reactive::run_on_main_thread(move || swapped(registry, &changed));
+            watch(dir);
         });
         if let Err(e) = spawned {
             tracing::warn!("plugins: could not start loading: {e}");
@@ -826,9 +1370,82 @@ mod place {
         plugin.instantiate(key, DEFAULT_BUDGET)
     }
 
-    pub fn pick() {}
+    /// "Add from a file...": a `.wasm` the person picks, checked (it must
+    /// load), then copied into the folder: over the file that holds the same
+    /// plugin now, so a new version replaces the old, else as `<id>.wasm`.
+    pub fn pick() {
+        let Some(picked) = rinch::dialogs::open_file().set_title("Add Plugin").add_filter("Pimble plugins", &["wasm"]).pick_file() else {
+            return;
+        };
+        let dir = plugins_dir();
+        let spawned = std::thread::Builder::new().name("pimble-plugin-add".into()).spawn(move || {
+            let (id, line) = add(&dir, &picked);
+            rinch::core::reactive::run_on_main_thread(move || {
+                if let Some(id) = id {
+                    forget_library(&id);
+                }
+                say(line);
+            });
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start adding: {e}");
+        }
+    }
 
-    pub fn remove(_id: &str) {}
+    /// The plugin added (by id, when one was) and the sentence saying so.
+    fn add(dir: &Path, picked: &Path) -> (Option<String>, String) {
+        let file = picked.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = match std::fs::read(picked) {
+            Ok(bytes) => bytes,
+            Err(e) => return (None, format!("{file} could not be read: {e}.")),
+        };
+        let plugin = match load_bytes(picked, &bytes, DEFAULT_BUDGET) {
+            Ok(plugin) => plugin,
+            Err((_, sentence)) => return (None, sentence),
+        };
+        let m = &plugin.manifest;
+        if let Err(e) = put(dir, &bytes, m) {
+            return (None, e);
+        }
+        rescan(dir);
+        (Some(m.id.clone()), format!("Added the {} plugin {}.", m.name, m.version))
+    }
+
+    /// Write `bytes`, a plugin that loaded as `manifest`, into the folder:
+    /// over the file that holds the same plugin now, so a new version replaces
+    /// the old, else as `<id>.wasm`; beside it and renamed over it, so the
+    /// watcher never reads half a plugin.
+    fn put(dir: &Path, bytes: &[u8], manifest: &Manifest) -> Result<(), String> {
+        let id = &manifest.id;
+        let holding = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| {
+            cache.iter().find(|(_, (_, loaded))| id_of(loaded).as_deref() == Some(id.as_str())).map(|(path, _)| path.clone())
+        });
+        let dest = holding.unwrap_or_else(|| dir.join(format!("{id}.wasm")));
+        if std::fs::read(&dest).is_ok_and(|have| have == bytes) {
+            return Ok(());
+        }
+        let partial = dest.with_extension("wasm.partial");
+        let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, bytes)).and_then(|_| std::fs::rename(&partial, &dest));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("The {} plugin could not be put in {}: {e}.", manifest.name, dir.display())
+        })
+    }
+
+    /// "Remove": the plugin's file leaves the folder, with what it was allowed.
+    pub fn remove(id: &str) {
+        let Some(path) = with_registry(|r| r.plugin(id).map(|p| p.path.clone())).flatten() else { return };
+        let name = manifest_of(id).map_or(id.to_string(), |m| m.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            return say(format!("The {name} plugin could not be removed from {}: {e}.", path.display()));
+        }
+        APPROVALS.with(|a| a.borrow_mut().remove(id));
+        super::write_approvals();
+        forget_library(id);
+        let dir = plugins_dir();
+        let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
+        say(format!("Removed the {name} plugin."));
+    }
 }
 
 /// The browser: plugins the person added, kept in this page's IndexedDB (per
@@ -888,6 +1505,12 @@ export async function pluginsPut(id, bytes) {
   await done(tx);
   db.close();
 }
+export async function libraryFetch(url) {
+  let r;
+  try { r = await fetch(url, { credentials: 'omit' }); } catch (e) { throw String(e); }
+  if (!r.ok) throw 'HTTP ' + r.status;
+  return new Uint8Array(await r.arrayBuffer());
+}
 export async function pluginsDelete(id) {
   const db = await open();
   const tx = db.transaction(STORE, 'readwrite');
@@ -903,6 +1526,47 @@ export async function pluginsDelete(id) {
         async fn plugins_put(id: &str, bytes: &[u8]) -> Result<JsValue, JsValue>;
         #[wasm_bindgen(js_name = pluginsDelete, catch)]
         async fn plugins_delete(id: &str) -> Result<JsValue, JsValue>;
+        #[wasm_bindgen(js_name = libraryFetch, catch)]
+        async fn library_fetch(url: &str) -> Result<JsValue, JsValue>;
+    }
+
+    const PROVENANCE_KEY: &str = "pimble.plugins.library";
+
+    pub fn read_provenance() -> Provenance {
+        storage().and_then(|s| s.get_item(PROVENANCE_KEY).ok().flatten()).map(|json| Provenance::parse(json.as_bytes())).unwrap_or_default()
+    }
+
+    pub fn write_provenance(json: &[u8]) {
+        let saved = storage().map(|s| s.set_item(PROVENANCE_KEY, &String::from_utf8_lossy(json)));
+        if !matches!(saved, Some(Ok(()))) {
+            tracing::warn!("plugins: where the plugins came from could not be saved in this browser");
+        }
+    }
+
+    /// The library of the service this page came from.
+    pub fn library_base() -> String {
+        "/api/v1/plugins".to_string()
+    }
+
+    pub fn fetch(url: String, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = match library_fetch(&url).await {
+                Ok(bytes) => Ok(js_sys::Uint8Array::new(&bytes).to_vec()),
+                Err(e) => Err(e.as_string().unwrap_or_else(|| format!("{e:?}"))),
+            };
+            done(fetched);
+        });
+    }
+
+    /// A verified download from the library, kept as "Add from a file..."
+    /// keeps one, once it loads as the plugin the index listed.
+    pub fn install(entry: Entry, bytes: Vec<u8>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            match put(&entry.wasm, &bytes, Some(&entry)).await {
+                Ok(_) => installed_from_library(&entry),
+                Err(e) => install_failed(&entry, e),
+            }
+        });
     }
 
     fn storage() -> Option<web_sys::Storage> {
@@ -999,24 +1663,36 @@ export async function pluginsDelete(id) {
     }
 
     async fn add(name: &str, bytes: &[u8]) {
-        let plugin = match load_bytes(name, bytes, DEFAULT_BUDGET).await {
-            Ok(plugin) => plugin,
-            Err((_, sentence)) => return say(sentence),
-        };
+        match put(name, bytes, None).await {
+            Ok((id, line)) => {
+                forget_library(&id);
+                say(line);
+            }
+            Err(e) => say(e),
+        }
+    }
+
+    /// Compile and describe `bytes`; one this app runs (and, from the
+    /// library, the one `entry` lists) is kept in this browser, replacing an
+    /// earlier version of the same plugin, and swapped in.
+    async fn put(name: &str, bytes: &[u8], entry: Option<&Entry>) -> Result<(String, String), String> {
+        let plugin = load_bytes(name, bytes, DEFAULT_BUDGET).await.map_err(|(_, sentence)| sentence)?;
+        if let Some(entry) = entry {
+            library::matches(entry, &plugin.manifest)?;
+        }
         let id = plugin.manifest.id.clone();
         if let Err(e) = plugins_put(&id, bytes).await {
             tracing::warn!("plugins: {id} could not be kept: {e:?}");
-            return say(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
+            return Err(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
         }
         // An earlier version of the same plugin goes, with any pane showing it.
-        stop_everywhere(&id);
         let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
         registry.plugins.retain(|p| p.manifest.id != id);
         registry.refused.retain(|r| r.file() != format!("{id}.wasm"));
         let line = format!("Added the {} plugin {}.", plugin.manifest.name, plugin.manifest.version);
         registry.take(format!("{id}.wasm").into(), Ok(plugin));
-        loaded(registry);
-        say(line);
+        swapped(registry, std::slice::from_ref(&id));
+        Ok((id, line))
     }
 
     /// "Remove": the plugin leaves this browser, with what it was allowed.
@@ -1028,12 +1704,12 @@ export async function pluginsDelete(id) {
                 return say("The plugin could not be removed from this browser.".to_string());
             }
             let name = manifest_of(&id).map_or(id.clone(), |m| m.name);
-            stop_everywhere(&id);
             APPROVALS.with(|a| a.borrow_mut().remove(&id));
             write_approvals_now();
+            forget_library(&id);
             let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
             registry.plugins.retain(|p| p.manifest.id != id);
-            loaded(registry);
+            swapped(registry, std::slice::from_ref(&id));
             say(format!("Removed the {name} plugin from this browser."));
         });
     }
@@ -1041,12 +1717,51 @@ export async function pluginsDelete(id) {
     fn write_approvals_now() {
         super::write_approvals();
     }
+}
 
-    /// Take plugin `id` out of every pane showing it; they look again.
-    fn stop_everywhere(id: &str) {
-        let panes: Vec<PaneId> = SHOWN.with(|s| s.borrow().iter().filter(|(_, shown)| shown.plugin_id == id).map(|(p, _)| *p).collect());
-        for pane in panes {
-            hide(pane);
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use pimble_plugin_host::abi::{Permissions, ABI_VERSION};
+
+    fn entry(id: &str, version: &str, abi: u32) -> Entry {
+        Entry {
+            id: id.into(),
+            name: id.into(),
+            version: version.into(),
+            abi,
+            author: "Pimble".into(),
+            summary: String::new(),
+            asks: Permissions::default(),
+            wasm: format!("{id}-{version}.wasm"),
+            sig: format!("{id}-{version}.wasm.sig"),
+            shot: None,
+            bytes: 1,
+            sha256: String::new(),
         }
+    }
+
+    #[test]
+    fn only_newer_library_plugins_this_pimble_runs_update_on_their_own() {
+        let index = Index {
+            v: 1,
+            plugins: vec![
+                entry("kanban-viewer", "0.2.0", ABI_VERSION),
+                entry("todo-viewer", "0.2.0", ABI_VERSION),
+                entry("timeline-viewer", "0.2.0", ABI_VERSION + 1),
+                entry("calendar-viewer", "0.2.0", ABI_VERSION),
+                entry("stuck-viewer", "0.1.0", ABI_VERSION),
+            ],
+        };
+        let installed = |id: &str| match id {
+            "kanban-viewer" | "todo-viewer" | "timeline-viewer" => Some("0.1.0".to_string()),
+            "stuck-viewer" => Some("0.1.0".to_string()),
+            _ => None,
+        };
+        // todo was added from a file; calendar is not installed; timeline's new
+        // version needs a newer Pimble; stuck is current.
+        let from_library = |id: &str| id != "todo-viewer";
+        let due: Vec<String> = updates_due(&index, installed, from_library).into_iter().map(|e| e.id).collect();
+        assert_eq!(due, vec!["kanban-viewer".to_string()]);
     }
 }

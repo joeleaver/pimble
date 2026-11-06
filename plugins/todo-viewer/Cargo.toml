@@ -6,6 +6,11 @@ license = "MIT"
 publish = false
 description = "The todo list metanode viewer: a subtree as a checklist, done as a timestamp in the node field `done` (docs/TODO_CONTRACT.md)"
 
+# In the plugin library (docs/SETTINGS_CONTRACT.md section 4).
+[package.metadata.pimble]
+library = true
+summary = "A subtree as a checklist: check a node off and it is marked done."
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

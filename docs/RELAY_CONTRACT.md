@@ -146,8 +146,9 @@ twin to documents under a share is a later optimisation.
   an encrypted copy is kept there, so it works while this computer is off." Choosing the
   first calls `cloudRelayStore`, then continues into the share as today. Nothing is ever
   chosen for the person.
-- The store row of a relayed store says `shared from here` with the link's state, not
-  `encrypted · synced`.
+- The store row of a relayed store has no badge (Joe, 2026-11-06): its link is to its own
+  twin on this computer, so its state says nothing about whether members can reach it, and
+  each shared node carries the share icon. (Until 0.19 it read `shared from here · synced`.)
 - A member sees no difference except when the owner is offline: the badge reads
   `owner offline` and the store is read and edited from the local replica as any offline
   store is.

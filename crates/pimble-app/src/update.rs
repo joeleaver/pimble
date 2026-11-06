@@ -18,10 +18,8 @@ use crate::state::{AppStore, UpdateStatus};
 
 /// The release feed: the accounts service's view of the latest GitHub release.
 const FEED: &str = "https://pimble.app/api/v1/releases";
-/// The Ed25519 key release packages are signed with, the raw 32 bytes in base64
-/// (`tools/update-key.sh` writes it). Anything that is not such a key refuses
-/// every update.
-const PUBLIC_KEY: &str = include_str!("../update-key.pub");
+/// The key release packages are signed with (`crate::RELEASE_KEY`).
+const PUBLIC_KEY: &str = crate::RELEASE_KEY;
 /// The file that makes a folder a managed install.
 const MARKER: &str = "pimble-install.json";
 /// Where an update waits for "Restart to update", inside the install folder.
@@ -144,12 +142,81 @@ fn desktop_integration(dir: &Path, binaries: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("writing an icon: {e}"))?;
     let apps = data.join("applications");
     std::fs::create_dir_all(&apps).map_err(|e| format!("creating {}: {e}", apps.display()))?;
-    let entry = format!(
+    std::fs::write(apps.join(DESKTOP_FILE), desktop_entry(dir)).map_err(|e| format!("writing the menu entry: {e}"))?;
+    claim_links(&apps);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const DESKTOP_FILE: &str = "pimble.desktop";
+
+/// The menu entry, which also says Pimble opens `pimble:` links
+/// (docs/SETTINGS_CONTRACT.md section 12): the link arrives as `%u`.
+#[cfg(target_os = "linux")]
+fn desktop_entry(dir: &Path) -> String {
+    format!(
         "[Desktop Entry]\nType=Application\nName=Pimble\nComment=Your notes, on your disk, shared when you choose\n\
-         Exec={}\nIcon=pimble\nTerminal=false\nCategories=Office;Utility;\nStartupWMClass=pimble\n",
+         Exec={} %u\nIcon=pimble\nTerminal=false\nCategories=Office;Utility;\nStartupWMClass=pimble\n\
+         MimeType=x-scheme-handler/pimble;\n",
         dir.join(EXE).display()
-    );
-    std::fs::write(apps.join("pimble.desktop"), entry).map_err(|e| format!("writing the menu entry: {e}"))
+    )
+}
+
+/// Make Pimble the program that opens `pimble:` links, as far as the desktop
+/// lets a user say so. Best effort: a desktop without `xdg-mime` reads the
+/// entry's `MimeType` line itself.
+#[cfg(target_os = "linux")]
+fn claim_links(apps: &Path) {
+    let quiet = |cmd: &mut std::process::Command| cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = quiet(std::process::Command::new("update-desktop-database").arg(apps));
+    let _ = quiet(std::process::Command::new("xdg-mime").args(["default", DESKTOP_FILE, "x-scheme-handler/pimble"]));
+}
+
+/// An installed copy says it opens `pimble:` links, once: copies installed
+/// before 0.20 got a menu entry without it, and an update never rewrites the
+/// entry. On Windows, the same in the user's own registry (the installer
+/// writes it for a new install; this covers one updated in place).
+fn register_links(dir: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(apps) = dirs::data_local_dir().map(|d| d.join("applications")) else { return };
+        let path = apps.join(DESKTOP_FILE);
+        let want = desktop_entry(dir);
+        if std::fs::read_to_string(&path).is_ok_and(|have| have == want) {
+            return;
+        }
+        if std::fs::create_dir_all(&apps).and_then(|_| std::fs::write(&path, want)).is_ok() {
+            claim_links(&apps);
+            tracing::info!("pimble: links now open in this copy ({})", path.display());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let exe = dir.join(EXE);
+        let command = format!("\"{}\" \"%1\"", exe.display());
+        let key = r"HKCU\Software\Classes\pimble";
+        let reg = |args: &[&str]| {
+            std::process::Command::new("reg")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let open = format!(r"{key}\shell\open\command");
+        let current = std::process::Command::new("reg").args(["query", &open, "/ve"]).output().ok();
+        if current.is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains(&command)) {
+            return;
+        }
+        let done = reg(&["add", key, "/ve", "/d", "URL:Pimble", "/f"])
+            && reg(&["add", key, "/v", "URL Protocol", "/d", "", "/f"])
+            && reg(&["add", &open, "/ve", "/d", &command, "/f"]);
+        if done {
+            tracing::info!("pimble: links now open in this copy ({})", exe.display());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = dir;
 }
 
 // ── At start ────────────────────────────────────────────────────────────────
@@ -284,16 +351,7 @@ fn verify(package: &[u8], signature: &[u8]) -> Result<(), String> {
 }
 
 fn verify_with(public_key: &str, package: &[u8], signature: &[u8]) -> Result<(), String> {
-    use base64::Engine as _;
-    use ed25519_dalek::{Signature, VerifyingKey};
-    let key: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(public_key.trim())
-        .ok()
-        .and_then(|k| k.try_into().ok())
-        .ok_or("this build has no update key (tools/update-key.sh)")?;
-    let key = VerifyingKey::from_bytes(&key).map_err(|e| format!("the update key: {e}"))?;
-    let signature = Signature::from_slice(signature).map_err(|e| format!("the signature: {e}"))?;
-    key.verify_strict(package, &signature).map_err(|_| "the package's signature does not verify".to_string())
+    pimble_plugin_host::library::verify_signature(public_key, package, signature).map_err(|e| format!("the package: {e}"))
 }
 
 // ── The app's side ──────────────────────────────────────────────────────────
@@ -337,6 +395,7 @@ pub fn start(store: AppStore) {
         return;
     };
     STORE.with(|s| s.set(Some(store)));
+    register_links(&dir);
     store.update_status.set(UpdateStatus::Waiting);
     if let Some(version) = staged_version(&dir).filter(|v| newer_than_current(v)) {
         store.update_ready.set(Some(version.clone()));
@@ -447,7 +506,7 @@ mod tests {
         let (signing, _) = key_pair();
         let signature = signing.sign(b"x").to_bytes();
         let refused = verify_with("not a key", b"x", &signature).unwrap_err();
-        assert!(refused.contains("no update key"), "{refused}");
+        assert!(refused.contains("no signing key"), "{refused}");
     }
 
     #[test]

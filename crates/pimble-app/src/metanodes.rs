@@ -63,6 +63,9 @@ pub struct MetanodeUi {
     /// over the outline, with "Allow" and "Not now" (docs/PLUGINS_CONTRACT.md
     /// decision 2).
     pub asking: Signal<Option<String>>,
+    /// The plugin shown was updated on its own since it mounted: this
+    /// sentence, over its view, with "Restart Plugin".
+    pub newer: Signal<Option<String>>,
     /// The metanode is a query metanode (the `list` viewer): the pane shows its
     /// setup (`crate::metanode_setup`) in place of the outline.
     pub setup: Signal<bool>,
@@ -77,6 +80,7 @@ impl MetanodeUi {
             loaded: Signal::new(false),
             plugin: Signal::new(false),
             asking: Signal::new(None),
+            newer: Signal::new(None),
             setup: Signal::new(false),
             setup_ui: crate::metanode_setup::SetupUi::new(),
         }
@@ -166,6 +170,7 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.metanode_ui.lines.set(Vec::new());
     state.metanode_ui.plugin.set(false);
     state.metanode_ui.asking.set(None);
+    state.metanode_ui.newer.set(None);
     state.metanode_ui.setup.set(false);
     crate::metanode_setup::stop(store, pane);
     crate::plugins::hide(pane);
@@ -325,6 +330,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     let mut lines = Vec::new();
     let mut plugin = false;
     let mut asking = None;
+    let mut newer = None;
     // A query metanode shows its setup, built into the app.
     let setup = forest.spec.as_ref().is_some_and(|spec| spec.shows_setup());
     if let Some(spec) = forest.spec.as_ref().filter(|_| !setup) {
@@ -333,6 +339,10 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             Viewer::PluginAsking(sentence) => {
                 plugin = true;
                 asking = Some(sentence);
+            }
+            Viewer::PluginNewer(sentence) => {
+                plugin = true;
+                newer = Some(sentence);
             }
             Viewer::Outline(sentence) => lines.push(sentence),
             Viewer::Ask(sentence) => asking = Some(sentence),
@@ -368,6 +378,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     ui.loaded.set(true);
     ui.plugin.set(plugin);
     ui.asking.set(asking);
+    ui.newer.set(newer);
 }
 
 /// What a pane shows for a metanode's viewer.
@@ -376,6 +387,8 @@ enum Viewer {
     Plugin,
     /// Mounted, under its request for the stores the metanode's mounts reach.
     PluginAsking(String),
+    /// Mounted, under the line saying a newer version is ready.
+    PluginNewer(String),
     /// The outline, under this sentence (its plugin was refused or stopped).
     Outline(String),
     /// The outline, under the plugin's request to be allowed what it needs.
@@ -388,6 +401,7 @@ fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewe
     match crate::plugins::show(store, pane, viewer, forest) {
         crate::plugins::Outcome::Shown => Viewer::Plugin,
         crate::plugins::Outcome::ShownAsking(sentence) => Viewer::PluginAsking(sentence),
+        crate::plugins::Outcome::ShownNewer(sentence) => Viewer::PluginNewer(sentence),
         crate::plugins::Outcome::Outline(sentence) => Viewer::Outline(sentence),
         crate::plugins::Outcome::Ask(sentence) => Viewer::Ask(sentence),
         crate::plugins::Outcome::Missing => Viewer::Missing,
@@ -485,6 +499,17 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
                     }
                     Button { variant: "filled", size: "xs", onclick: move || allow_plugin(store, pane), "Allow" }
                     Button { variant: "default", size: "xs", onclick: move || decline_plugin(store, pane), "Not now" }
+                }
+            }
+            if ui.newer.with(|n| n.is_some()) {
+                div {
+                    class: "pimble-metanode__ask",
+                    style: "display: flex; align-items: center; gap: 8px; flex-wrap: wrap;",
+                    span {
+                        class: "pimble-metanode__line",
+                        {move || ui.newer.get().unwrap_or_default()}
+                    }
+                    Button { variant: "default", size: "xs", onclick: move || crate::plugins::restart(store, pane), "Restart Plugin" }
                 }
             }
             {plugin_slot}

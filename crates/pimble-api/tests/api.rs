@@ -968,3 +968,41 @@ async fn what_points_at_a_node() {
     assert!(api.backlinks(Addr::new(p, plain)).await.unwrap().is_empty());
     assert!(api.rows_pointing_here(t).await.unwrap().is_empty(), "no table links to it");
 }
+
+/// Splitting a note at a place in its text, then joining it back
+/// (docs/SPLIT_CONTRACT.md): the new note lands right below with the text
+/// from there on, the first note keeps its children, and a join puts the
+/// text, the children and the links of the note below into this one.
+#[tokio::test]
+async fn a_note_splits_in_two_and_joins_back() {
+    let s = stack().await;
+    let (store, root) = s.service.create_store(s.dir.path().join("book.pimble"), "Book").await.unwrap();
+    let (api, _) = api(&s).await;
+    let chapter = api.create(Addr::new(store, root), Place::Last, recipes::document("Chapter", Some("First part.\n\nSecond part.\n\nThird part.")).unwrap()).await.unwrap();
+    let after = api.create(Addr::new(store, root), Place::Last, recipes::document("After", None).unwrap()).await.unwrap();
+    let child = api.create(chapter, Place::Last, recipes::document("A child", None).unwrap()).await.unwrap();
+
+    let at = api.doc(chapter).await.unwrap().sticky_at_quote("Second").unwrap();
+    let split = api.split_node(chapter, at, Some("Part two".into())).await.unwrap();
+    assert!(split.kept_delta.is_some());
+    assert_eq!(api.doc(chapter).await.unwrap().markdown().unwrap().trim(), "First part.");
+    assert_eq!(api.doc(split.new).await.unwrap().markdown().unwrap().trim(), "Second part.\n\nThird part.");
+    assert_eq!(api.node(split.new).await.unwrap().metadata.title, "Part two");
+    assert_eq!(api.node(split.new).await.unwrap().metadata.custom.get(pimble_core::custom_keys::EXPLICIT_TITLE), Some(&serde_json::json!(true)), "named, not titled from its text");
+    let order: Vec<NodeId> = api.children(Addr::new(store, root)).await.unwrap().into_iter().map(|(a, _)| a.node).collect();
+    assert_eq!(order, vec![chapter.node, split.new.node, after.node], "right below it");
+    assert_eq!(api.children(chapter).await.unwrap().len(), 1, "its children stay");
+
+    // A grandchild under the new note goes with it when it is joined back.
+    let under = api.create(split.new, Place::Last, recipes::document("Under part two", None).unwrap()).await.unwrap();
+    let joined = api.join_next(chapter).await.unwrap();
+    assert_eq!(joined.gone, split.new);
+    assert_eq!(api.doc(chapter).await.unwrap().markdown().unwrap().trim(), "First part.\n\nSecond part.\n\nThird part.");
+    let kids: Vec<NodeId> = api.children(chapter).await.unwrap().into_iter().map(|(a, _)| a.node).collect();
+    assert_eq!(kids, vec![child.node, under.node]);
+    assert_eq!(api.resolve(&split.new.link()).await.unwrap(), chapter, "a link to the note joined in leads here");
+
+    // Nothing below the last note.
+    assert!(api.join_next(after).await.unwrap_err().to_string().contains("no note below"));
+    let _ = { s }.server.stop().await;
+}

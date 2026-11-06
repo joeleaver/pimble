@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pimble Plugins</title>
+  <meta name="description" content="Plugins for Pimble: new ways to see your notes, signed by Pimble and installed from the app.">
+  <link rel="icon" href="brand/pimble-icon.svg" type="image/svg+xml">
+  <link rel="icon" href="brand/pimble-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html"><picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="111" height="26"></picture></a>
+    <nav class="nav__links">
+      <a href="download.html">Download</a>
+      <a href="plugins.html" aria-current="page" class="nav__hide-sm">Plugins</a>
+      <a href="/app/" class="nav__hide-sm">Web app</a>
+      <a href="/app/login">Log in</a>
+      <a href="/app/signup" class="nav__cta">Sign up</a>
+    </nav>
+  </header>
+
+    <main class="wrap">
+    <div class="page-head">
+      <h1>Plugins</h1>
+      <p>Plugins show a node's notes in new ways: a board of cards, a checklist, a line of time. Pimble signs every one and checks it before it is installed. You install them in the app, under Settings &gt; Plugins, and they keep themselves up to date.</p>
+    </div>
+
+    <p class="dim">Install in Pimble opens the desktop app at that plugin, ready to install; it needs Pimble on this computer, so <a href="download.html">download it</a> first if you have not. Open in the web app does the same in the browser.</p>
+
+    <p id="plugins-loading" class="dim">Looking up the plugins…</p>
+    <p id="plugins-empty" class="dim" hidden>No plugins are published yet.</p>
+    <p id="plugins-error" class="dim" hidden></p>
+
+    <div id="plugins" class="assets"></div>
+  </main>
+  <footer class="site">
+    <div class="wrap footer__inner">
+      <div class="footer__brand">
+        <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="86" height="20"></picture>
+        <span>Open source, MIT license.</span>
+      </div>
+      <nav class="footer__links">
+        <a href="download.html">Download</a>
+        <a href="plugins.html">Plugins</a>
+        <a href="/app/">Web app</a>
+        <a href="/app/login">Log in</a>
+        <a href="https://github.com/joeleaver/pimble">GitHub</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="site.js"></script>
+  <script>
+    (async function () {
+      const list = document.getElementById("plugins");
+      const loading = document.getElementById("plugins-loading");
+      // What a plugin asks to be allowed, as Settings > Plugins says it.
+      function asks(a) {
+        const stores = a && a.stores;
+        const write = a && a.write;
+        if (stores === "All") return write ? "Asks to read and change all your stores." : "Asks to read all your stores.";
+        if (stores === "Chosen") return write ? "Asks to read and change the stores you choose." : "Asks to read the stores you choose.";
+        return "Asks for nothing.";
+      }
+      function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined) e.textContent = text;
+        return e;
+      }
+      try {
+        const index = await apiFetch("/plugins");
+        const plugins = (index && index.plugins) || [];
+        loading.hidden = true;
+        if (plugins.length === 0) {
+          document.getElementById("plugins-empty").hidden = false;
+          return;
+        }
+        for (const p of plugins) {
+          const row = el("div", "asset plugin");
+          const main = el("div", "asset__main");
+          if (p.shot) {
+            const img = el("img", "plugin__shot");
+            img.src = PIMBLE_API_BASE + "/plugins/" + encodeURIComponent(p.shot);
+            img.alt = p.name + " in Pimble";
+            img.loading = "lazy";
+            main.appendChild(img);
+          }
+          const text = el("div");
+          const title = el("div", "asset__os", p.name);
+          title.appendChild(el("span", "asset__tag", p.version));
+          text.appendChild(title);
+          text.appendChild(el("div", "asset__note", p.summary || ""));
+          text.appendChild(el("div", "plugin__asks", asks(p.asks) + " By " + (p.author || "Pimble") + "."));
+          main.appendChild(text);
+          row.appendChild(main);
+          const buttons = el("div", "plugin__buttons");
+          const link = "pimble:settings/plugins?install=" + encodeURIComponent(p.id);
+          const desktop = el("a", "btn small", "Install in Pimble");
+          desktop.href = link;
+          const web = el("a", "btn small secondary", "Open in the web app");
+          web.href = "/app/?open=" + encodeURIComponent(link);
+          buttons.appendChild(desktop);
+          buttons.appendChild(web);
+          row.appendChild(buttons);
+          list.appendChild(row);
+        }
+      } catch (err) {
+        loading.hidden = true;
+        const error = document.getElementById("plugins-error");
+        error.hidden = false;
+        error.textContent = "The plugins could not be listed: " + (err && err.message ? err.message : "the server did not answer") + ".";
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -9,6 +9,8 @@
 //! - [`instance`]: one running plugin over any [`GuestEngine`]: mount, props,
 //!   events, timers, and stopping it (with a sentence) when it runs too long, is
 //!   refused or traps.
+//! - [`library`]: the plugin library's index, what it offers this device, and
+//!   the check every downloaded plugin passes.
 //! - [`registry`]: the plugins loaded and the ones refused, whatever engine
 //!   compiled them.
 //! - `wasmtime_engine` (feature `wasm-host`, the desktop): loading `.wasm` files from
@@ -27,6 +29,7 @@ pub mod bridge;
 pub mod instance;
 #[cfg(feature = "js-host")]
 pub mod js_engine;
+pub mod library;
 pub mod registry;
 #[cfg(feature = "wasm-host")]
 pub mod wasmtime_engine;

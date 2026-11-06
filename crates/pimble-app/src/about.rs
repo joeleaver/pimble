@@ -40,7 +40,7 @@ fn pimble_server_older(theirs: &str) -> bool {
 }
 
 /// What the update part says.
-fn update_line(s: &UpdateStatus) -> String {
+pub(crate) fn update_line(s: &UpdateStatus) -> String {
     if !cfg!(feature = "native") {
         return "This is the web app: each visit loads the version pimble.app serves.".to_string();
     }

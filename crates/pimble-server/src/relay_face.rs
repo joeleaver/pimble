@@ -102,6 +102,22 @@ struct Face {
     issuer: String,
 }
 
+/// How the tunnel to Pimble Cloud's relay is doing: whether the people
+/// something is shared with can reach this computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TunnelState {
+    /// Nothing is shared from this computer, so there is no tunnel.
+    Idle,
+    /// Opening, or open and waiting for the relay's answer.
+    Connecting,
+    /// The relay serves `serving` of the `asked` stores announced.
+    Up { serving: usize, asked: usize },
+    /// It could not be opened, or it broke; tried again with backoff.
+    Down { reason: String },
+    /// Another computer serves the same stores now.
+    Replaced,
+}
+
 #[derive(Default)]
 struct Inner {
     face: Option<Face>,
@@ -117,6 +133,9 @@ pub(crate) struct RelayHost {
     inner: Mutex<Inner>,
     /// What the tunnel announces. Written under `inner`'s lock.
     serve: watch::Sender<HashSet<StoreId>>,
+    /// How the tunnel is doing (`crate::relay_tunnel` writes it), for the
+    /// status bar's Pimble Cloud state (`RpcHandler::cloud_connection`).
+    tunnel: watch::Sender<TunnelState>,
     /// The running face's URL, written under `inner`'s lock and read without
     /// it: the tunnel asks for every member's connection, and must not wait
     /// behind a face that is starting or a twin that is being opened.
@@ -125,7 +144,28 @@ pub(crate) struct RelayHost {
 
 impl RelayHost {
     pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, url: std::sync::Mutex::new(None) }
+        Self { dir, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, tunnel: watch::channel(TunnelState::Idle).0, url: std::sync::Mutex::new(None) }
+    }
+
+    /// How the tunnel is doing now.
+    pub(crate) fn tunnel_state(&self) -> TunnelState {
+        self.tunnel.borrow().clone()
+    }
+
+    /// Hear the tunnel's state change.
+    pub(crate) fn watch_tunnel(&self) -> watch::Receiver<TunnelState> {
+        self.tunnel.subscribe()
+    }
+
+    /// The tunnel's own task says how it is doing.
+    pub(crate) fn set_tunnel_state(&self, state: TunnelState) {
+        self.tunnel.send_if_modified(|now| {
+            if *now == state {
+                return false;
+            }
+            *now = state;
+            true
+        });
     }
 
     /// Everything a relayed store's link needs before it connects: the face
@@ -300,6 +340,7 @@ impl RelayHost {
         if let Some(task) = inner.tunnel.take() {
             task.abort();
         }
+        self.set_tunnel_state(TunnelState::Idle);
         if !inner.stores.is_empty() {
             inner.tunnel = Some(tokio::spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
         }
@@ -315,6 +356,7 @@ impl RelayHost {
         if let Some(task) = inner.tunnel.take() {
             task.abort();
         }
+        self.set_tunnel_state(TunnelState::Idle);
         inner.stores.clear();
         self.publish(inner);
         *self.url.lock().unwrap() = None;

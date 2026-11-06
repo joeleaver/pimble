@@ -2613,7 +2613,7 @@ pub(crate) const APP_CSS: &str = "
     padding: 6px 10px;
     font-size: 12px;
     color: var(--rinch-color-dimmed);
-    background: var(--rinch-color-default-hover);
+    background: var(--rinch-color-option-hover);
     border-radius: 4px;
 }
 
@@ -2642,7 +2642,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-metanode__row:hover {
-    background: var(--rinch-color-default-hover);
+    background: var(--rinch-color-option-hover);
 }
 
 .pimble-metanode__icon {
@@ -2861,13 +2861,132 @@ pub(crate) const APP_CSS: &str = "
     margin-top: 2px;
 }
 
+/* ── Settings (docs/SETTINGS_CONTRACT.md section 2) ─────────────── */
+
+.pimble-settings {
+    display: flex;
+    gap: 20px;
+    min-height: 420px;
+}
+
+.pimble-settings__nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 150px;
+    flex-shrink: 0;
+    padding-right: 12px;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-settings__tab {
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--rinch-color-text);
+    opacity: 0.8;
+}
+
+.pimble-settings__tab:hover {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+}
+
+.pimble-settings__tab--on {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+    font-weight: 600;
+}
+
+/* A library row a link asked about (pimble:settings/plugins?install=<id>). */
+.pimble-plugins__row--asked {
+    border-left: 3px solid var(--rinch-primary-color);
+    padding-left: 10px;
+}
+
+.pimble-settings__page {
+    flex: 1;
+    min-width: 0;
+    max-height: 70vh;
+    overflow-y: auto;
+    /* Room for the scrollbar, which is drawn over the content. */
+    padding-right: 16px;
+}
+
+.pimble-settings__section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pimble-settings__heading {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.pimble-settings__line {
+    font-size: 13px;
+}
+
+.pimble-settings__note {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-settings__choices {
+    display: flex;
+    gap: 6px;
+}
+
+.pimble-settings__choice {
+    padding: 4px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--rinch-color-border);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.pimble-settings__choice:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-settings__choice--on {
+    border-color: var(--rinch-primary-color-6);
+    color: var(--rinch-primary-color-6);
+}
+
+.pimble-settings__key {
+    display: grid;
+    grid-template-columns: 180px 180px auto;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 2px;
+}
+
+.pimble-settings__key-name {
+    font-size: 13px;
+}
+
+.pimble-settings__key-problem {
+    grid-column: 2 / 4;
+    font-size: 12px;
+    color: var(--rinch-color-orange-6);
+}
+
+.pimble-settings__buttons {
+    display: flex;
+    gap: 8px;
+}
+
 /* ── Status bar ─────────────────────────────────────────────── */
 
 .pimble-status-bar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 3px 12px;
+    gap: 4px;
+    height: 24px;
+    padding: 0 8px;
     border-top: 1px solid var(--rinch-color-border);
     background: var(--rinch-color-body);
     font-size: 11px;
@@ -2875,15 +2994,70 @@ pub(crate) const APP_CSS: &str = "
     flex-shrink: 0;
 }
 
-.pimble-status-bar__addr {
-    opacity: 0.5;
-    font-size: 11px;
+/* One part of the bar (this computer, Pimble Cloud): a dot, a name and a
+   dimmer detail, every part alike, with a thin rule between them. */
+.pimble-status-bar__part {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: 4px;
+    min-width: 0;
 }
 
-/* The signed-in account; a click opens the Account modal. */
-.pimble-status-bar__account {
-    font-size: 11px;
-    opacity: 0.7;
+.pimble-status-bar__rule {
+    width: 1px;
+    height: 12px;
+    margin: 0 2px;
+    flex-shrink: 0;
+    background: var(--rinch-color-border);
+}
+
+.pimble-status-bar__part--button {
+    cursor: pointer;
+}
+
+.pimble-status-bar__part--button:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-status-bar__dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--rinch-color-dimmed);
+    opacity: 0.6;
+}
+
+.pimble-status-bar__dot--good {
+    background: var(--rinch-color-green-6);
+    opacity: 1;
+}
+
+.pimble-status-bar__dot--waiting {
+    background: var(--rinch-color-yellow-6);
+    opacity: 1;
+}
+
+.pimble-status-bar__dot--bad {
+    background: var(--rinch-color-red-6);
+    opacity: 1;
+}
+
+.pimble-status-bar__name {
+    color: var(--rinch-color-text);
+    opacity: 0.8;
+    white-space: nowrap;
+}
+
+.pimble-status-bar__detail {
+    opacity: 0.75;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
 }
 
 /* Restart to update (docs/UPDATE_CONTRACT.md): the one thing on the bar that
@@ -2898,15 +3072,11 @@ pub(crate) const APP_CSS: &str = "
     text-decoration: underline;
 }
 
-.pimble-status-bar__account:hover {
-    opacity: 1;
-    text-decoration: underline;
-}
-
 /* A refusal the server sent back: not a broken connection, so it reads as a
    plain sentence rather than as the error badge. */
 .pimble-status-bar__notice {
     font-size: 11px;
+    margin-left: 8px;
     color: var(--rinch-color-yellow-6);
 }
 

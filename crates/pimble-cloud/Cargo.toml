@@ -75,6 +75,7 @@ hmac = "0.12"
 # the GitHub Releases API for /releases. rustls (no system OpenSSL) matches
 # the rest of this workspace's TLS story.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+bytes = "1"
 
 [dev-dependencies]
 pimble-server = { workspace = true }

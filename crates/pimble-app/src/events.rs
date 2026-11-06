@@ -649,6 +649,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // A picture that could not be fetched while there was no
                 // connection is asked for again.
                 crate::pictures::retry_missing();
+                // The link this process was started with, once the stores
+                // it names have had a moment to open.
+                if let Some(link) = crate::links::take_launch_link() {
+                    rinch::core::reactive::unowned(|| {
+                        let _ = rinch::prelude::set_timeout(1500, move || crate::links::open_app_link(store, &link));
+                    });
+                }
 
                 // Auto-open previously loaded stores. On a reconnect this is
                 // the same list (every open store is persisted there), so
@@ -752,8 +759,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let root_id = opened_store.root_node_id;
 
                 register_opened_store(store, tree_state, opened_store);
-                // "Add Here" in the Shares dialog: the row becomes "Open".
-                if untracked(|| store.shares_ui.open.get()) {
+                // "Add Here" in Settings > Shares: the row becomes "Open".
+                if untracked(|| crate::settings::showing(store, crate::settings::Section::Shares)) {
                     store.send(BackendCommand::CloudListShares);
                 }
 
@@ -1050,6 +1057,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.deleted_modal_nodes.set(nodes.iter().map(crate::state::deleted_row).collect());
                     store.deleted_modal_pending.set(false);
                 }
+            }
+            // The new note opens where the split was made, as Scrivener's does.
+            BackendEvent::NodeSplit { store_id, new_id, .. } => {
+                store.send(BackendCommand::ResolveLink { url: pimble_core::PimbleUrl::node(*store_id, *new_id), hops: 0 });
             }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
                 // The list it left and the subtree that went with it were
@@ -1423,6 +1434,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     None => crate::state::ServerVersion::Unknown,
                 }));
             }
+            BackendEvent::CloudConnectionChanged { connection } => {
+                store.cloud_connection.set(connection.clone());
+            }
+            BackendEvent::AppLink { url } => {
+                #[cfg(feature = "native")]
+                crate::app::bring_to_front();
+                crate::links::open_app_link(store, url);
+            }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
                 // section 6): the account, or nobody when signed out.
@@ -1440,6 +1459,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
                 store.cloud_signed_in.set(*signed_in);
+                if !*signed_in {
+                    store.cloud_connection.set(None);
+                }
                 store.cloud_email.set(email.clone().unwrap_or_default());
                 store.cloud_url.set(url.clone().unwrap_or_default());
                 // Seed the sign-in form with the account this server knows,
@@ -1472,7 +1494,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     CloudOp::Status => {
                         // Asked on every connect; only worth a line in the
                         // modal when the modal is there to show it.
-                        if untracked(|| store.account_modal_open.get()) {
+                        if untracked(|| crate::app::account_showing(store)) {
                             store.account_modal_busy.set(false);
                             store.account_modal_error.set(message.clone());
                         }

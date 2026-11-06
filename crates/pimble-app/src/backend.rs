@@ -127,6 +127,8 @@ impl Local {
         inner.ever = true;
         inner.client = Some(client.clone());
         self.watch(client.clone());
+        self.hear_cloud(client.clone());
+        self.hear_links(client.clone());
         self.emit(BackendEvent::Connected { server_addr: server_addr(), client_id: self.client_id.clone() });
         Ok(client)
     }
@@ -139,6 +141,48 @@ impl Local {
             let Some(me) = me.upgrade() else { return };
             if !me.closing.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = me.client().await;
+            }
+        });
+    }
+
+    /// How this computer's connections to Pimble Cloud are doing, for the
+    /// status bar, for as long as `client`'s connection lasts. A server from
+    /// before 0.19.1 has no such subscription and the bar shows the account
+    /// alone.
+    fn hear_cloud(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut sub = match client.subscribe_cloud_connection().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::debug!("No Pimble Cloud state from this server: {e}");
+                    return;
+                }
+            };
+            while let Some(Ok(connection)) = sub.next().await {
+                let Some(me) = me.upgrade() else { return };
+                me.emit(BackendEvent::CloudConnectionChanged { connection });
+            }
+        });
+    }
+
+    /// The `pimble:` links this computer is asked to open (`openInApp`), handed
+    /// to this window for as long as `client`'s connection lasts. A server from
+    /// before 0.20 has no such subscription, and a link then opens a window of
+    /// its own.
+    fn hear_links(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut sub = match client.subscribe_app_links().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::debug!("No app links from this server: {e}");
+                    return;
+                }
+            };
+            while let Some(Ok(url)) = sub.next().await {
+                let Some(me) = me.upgrade() else { return };
+                me.emit(BackendEvent::AppLink { url });
             }
         });
     }

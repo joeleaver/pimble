@@ -349,6 +349,51 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             renamed(ctx, store_id, node_id, edited).await
         }
 
+        // docs/SPLIT_CONTRACT.md: the views of this window holding the node
+        // take the update the API sent (the server relays it to everyone
+        // else), and the tree shows the new node, or the one joined in gone.
+        C::SplitNode { store_id, node_id, at, title } => {
+            let addr = Addr::new(store_id, node_id);
+            let parent = match api.node(addr).await {
+                Ok(node) => node.parent_id,
+                Err(e) => return Ok(failed(e)),
+            };
+            match api.split_node(addr, at, title).await {
+                Ok(split) => {
+                    if let Some(update) = split.kept_delta {
+                        ctx.emit(BackendEvent::RemoteChanges { store_id, node_id, update });
+                    }
+                    let lists: Vec<NodeId> = parent.into_iter().collect();
+                    let mut nodes = vec![node_id, split.new.node];
+                    nodes.extend(lists.iter().copied());
+                    show_after(ctx, store_id, pimble_api::Affected { nodes, lists, ..Default::default() }).await;
+                    Some(BackendEvent::NodeSplit { store_id, node_id, new_id: split.new.node })
+                }
+                Err(e) => failed(e),
+            }
+        }
+
+        C::JoinBelow { store_id, node_id } => {
+            let addr = Addr::new(store_id, node_id);
+            let parent = match api.node(addr).await {
+                Ok(node) => node.parent_id,
+                Err(e) => return Ok(failed(e)),
+            };
+            match api.join_next(addr).await {
+                Ok(joined) => {
+                    if let Some(update) = joined.delta {
+                        ctx.emit(BackendEvent::RemoteChanges { store_id, node_id, update });
+                    }
+                    let mut lists = vec![node_id];
+                    lists.extend(parent);
+                    let nodes = lists.clone();
+                    show_after(ctx, store_id, pimble_api::Affected { nodes, lists, gone: vec![joined.gone.node], ..Default::default() }).await;
+                    None
+                }
+                Err(e) => failed(e),
+            }
+        }
+
         C::DeleteNode { store_id, node_id } => {
             let addr = Addr::new(store_id, node_id);
             let parent_id = match api.node(addr).await {

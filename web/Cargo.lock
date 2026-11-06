@@ -1998,12 +1998,17 @@ dependencies = [
 name = "pimble-plugin-host"
 version = "0.19.0"
 dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
  "js-sys",
  "pimble-api",
  "pimble-core",
  "pimble-plugin-abi",
  "rinch-core",
+ "semver",
  "serde",
+ "serde_json",
+ "sha2",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",

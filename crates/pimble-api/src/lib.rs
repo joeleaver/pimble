@@ -23,6 +23,7 @@ pub mod names;
 pub mod presence;
 pub mod recipes;
 pub mod router;
+pub mod split;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod metanode;

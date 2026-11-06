@@ -132,8 +132,45 @@ jobs:
             dist/*-setup.exe
           if-no-files-found: error
 
+  # The plugin library (docs/SETTINGS_CONTRACT.md section 4): the plugins whose
+  # Cargo.toml puts them in it, as <id>-<version>.wasm, and plugins.json read
+  # from their own manifests. The release job signs the modules.
+  build-plugins:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins -> target
+
+      - name: Build the plugins
+        working-directory: plugins
+        run: cargo build --release --target wasm32-wasip1
+
+      - name: Write the library
+        run: |
+          cargo metadata --manifest-path plugins/Cargo.toml --no-deps --format-version 1 > plugins-metadata.json
+          cargo run --release -p pimble-plugin-host --features index-tool --bin pimble-plugin-index -- \
+            plugins-metadata.json plugins/target/wasm32-wasip1/release dist/plugins
+          cat dist/plugins/plugins.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-library
+          path: dist/plugins/*
+          if-no-files-found: error
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-plugins]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
@@ -146,6 +183,7 @@ jobs:
         run: |
           mkdir -p release
           find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*-setup.exe' \) -exec cp {} release/ \;
+          cp dist/plugin-library/* release/
           ls -la release
 
       # Every package gets a detached Ed25519 signature beside it, which the
@@ -163,7 +201,9 @@ jobs:
           key="$(mktemp)"
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$SIGNING_KEY" > "$key"
-          for package in release/*.tar.gz release/*.zip release/*-setup.exe; do
+          # The library's plugins too, which the app verifies before it
+          # installs one (docs/SETTINGS_CONTRACT.md section 4).
+          for package in release/*.tar.gz release/*.zip release/*-setup.exe release/*.wasm; do
             openssl pkeyutl -sign -rawin -inkey "$key" -in "$package" -out "$package.sig"
           done
           ls -la release
