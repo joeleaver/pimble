@@ -139,6 +139,7 @@ impl Pimble {
     /// Ok is what the checks said about the fields their viewers read.
     pub(super) async fn field_checks(&self, addr: Addr, fields: &std::collections::BTreeMap<String, Option<String>>) -> Result<Vec<String>, String> {
         let mut said = Vec::new();
+        let written = self.api.node(addr).await.map(|n| label(&n)).unwrap_or_default();
         let mut at = addr;
         for distance in 1..=pimble_core::metanode::MAX_SUBTREE_DEPTH {
             let Ok(node) = self.api.node(at).await else { break };
@@ -159,7 +160,7 @@ impl Pimble {
                 let args = serde_json::json!({ "viewer": metanode.viewer, "metanode": at.link(), "node": addr.link(), "field": field, "value": value });
                 let answer = self.run_tool(path.clone(), guide::CHECK_FIELD, args).await?;
                 if !answer.ok {
-                    return Err(format!("Nothing was written: {field} on {} is shown by the {} viewer of {}, which says: {}", label(&node), metanode.viewer, label(&shower), answer.said));
+                    return Err(format!("Nothing was written: {field} on {written} is shown by the {} viewer of {}, which says: {}", metanode.viewer, label(&shower), answer.said));
                 }
                 if listed.contains(&field.as_str()) {
                     said.push(answer.said);

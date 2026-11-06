@@ -41,6 +41,8 @@ fn the_timeline_reads_dates_and_checks_settings_for_an_agent() {
         node
     });
     let cal_link = PimbleUrl::node(f.store, cal_node).to_string();
+    // A node of the timeline with a start, for its end to be checked against.
+    f.rt.block_on(f.app.edit(Addr::new(f.store, f.plan), |doc, now| -> Result<(), pimble_api::ApiError> { Ok(doc.set_field("start", Some("Mar 1, 50 BC"), now)?) })).unwrap();
     let url = f.url.clone();
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -60,6 +62,10 @@ fn the_timeline_reads_dates_and_checks_settings_for_an_agent() {
         ask("read_date", json!({ "calendar": cal_link, "text": "Fir 3, 1300 YF" })),
         ask("read_date", json!({ "calendar": cal_link, "text": "Year's Gate, 12 BF" })),
         ask("read_date", json!({ "text": "c. 1066" })),
+        ask("check_field", json!({ "viewer": "timeline", "metanode": timeline, "node": plain, "field": "end", "value": "44 BC" })),
+        ask("check_field", json!({ "viewer": "timeline", "metanode": timeline, "node": plain, "field": "end", "value": "60 BC" })),
+        ask("read_date", json!({ "text": "264-241 BC" })),
+        ask("outline", json!({ "timeline": timeline })),
     ];
     let answers: Vec<ToolAnswer> = local.block_on(&rt, async {
         let backend: Arc<dyn pimble_api::Backend> = Arc::new(RpcBackend::over(PimbleClient::connect(&url).await.unwrap()));
@@ -84,4 +90,9 @@ fn the_timeline_reads_dates_and_checks_settings_for_an_agent() {
     assert!(a(8).0 && a(8).1.contains("reads as Fir 3, 1300") && a(8).1.contains("in the Gregorian calendar"), "{:?}", a(8));
     assert!(a(9).0 && a(9).1.contains("Year's Gate"), "{:?}", a(9));
     assert!(a(10).0 && a(10).1.contains("1066"), "{:?}", a(10));
+    assert!(a(11).0 && a(11).1.ends_with("As an end it runs through Dec 31, 44 BC."), "{:?}", a(11));
+    assert_eq!(a(12), (false, "the span would end before it starts: its start is \u{201c}Mar 1, 50 BC\u{201d} and its end \u{201c}60 BC\u{201d}"));
+    // Plan starts Mar 1, 50 BC; the rest have no dates and are labels.
+    assert!(a(14).0 && a(14).1.contains("Mar 1, 50 BC (point): Plan") && a(14).1.contains("Group labels"), "{:?}", a(14));
+    assert!(a(13).0 && a(13).1.contains("reads as 264\u{2013}241 BC"), "{:?}", a(13));
 }

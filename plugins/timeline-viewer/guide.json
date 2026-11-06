@@ -8,17 +8,17 @@
       "fields": [
         {
           "name": "date",
-          "about": "One moment, written as the timeline's calendar writes dates: in an invented calendar its months' short names and its eras' short names (\"Fir 3, 1300 YF\"), and a day of no month by its name (\"Year's Gate, 1300 YF\"). An era left out means the calendar's quiet era. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\" (a season the calendar names), and a span in one field, \"1215-1217\". Nothing checks a date when it is written: one that does not read leaves its node off the line, so copy the forms here.",
+          "about": "One moment, written as the timeline's calendar writes dates: in an invented calendar its months' short names and its eras' short names (\"Fir 3, 1300 YF\"), and a day of no month by its name (\"Year's Gate, 1300 YF\"). An era left out means the calendar's quiet era. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\" (a season the calendar names), and a span in one field, \"1215-1217\". set_fields asks the timeline first: a date it cannot read is refused with forms that do, and a good one is said back with its Gregorian date. Try a form with call_plugin_tool read_date before writing many. The Gregorian calendar is proleptic: dates before 1582 are counted as if it had always been in use, not as the Julian dates many histories give.",
           "example": "Oct 14, 1066"
         },
         {
           "name": "start",
-          "about": "Where a span begins (read before date when both are there).",
+          "about": "Where a span begins (read before date when both are there). A start after its end is refused.",
           "example": "Mar 15, 44 BC"
         },
         {
           "name": "end",
-          "about": "Where a span ends; with start, the node is a bar.",
+          "about": "Where a span ends, through the end of what it names: an end of \"241 BC\" runs through Dec 31, 241 BC. With start, the node is a bar.",
           "example": "Aug 19, 14"
         }
       ],
@@ -67,7 +67,7 @@
       "about": "A calendar node: its settings are a calendar's whole definition, which timelines name to count in it. The person edits it as a form; an agent writes the definition with set_viewer_settings. Make one with set_metanode (viewer \"calendar\", depth 1) on a new node. Years are numbered absolutely (any whole number, year 0 starting at epoch); eras say how a person numbers them.",
       "source": "none needed (depth 1)",
       "settings": {
-        "about": "The definition. Months and days of no month come in the year's order; a date on a day of no month is written with its name (\"Year's Gate, 1300 YF\"). Years are numbered absolutely: year 0 is the first year after epoch, -1 the one before. An era counting up names the absolute year that is its year 1 in from; one counting down names the absolute year that is its year 1 in to (as 1 BC is). With the example's eras, absolute year 0 is 1 YF and -1 is 1 BF. The leap rule is tested on the absolute year plus offset. epoch is the start of year 0 in seconds from the Gregorian 1 January AD 1: whole days times 86400 (0 lines year 0 up with AD 1; 1 January 1200 is 437925 days later, 37836720000; negative is earlier). One era should be quiet: it is left out when dates are written, and a year typed without an era is in it. Only the shape is checked when this is written: a season naming a month the year does not have, or an era without its from or to, is written as it is, and the calendar may then read dates wrongly.",
+        "about": "The definition. Months and days of no month come in the year's order; a date on a day of no month is written with its name (\"Year's Gate, 1300 YF\"). Years are numbered absolutely: year 0 is the first year after epoch, -1 the one before. An era counting up names the absolute year that is its year 1 in from; one counting down names the absolute year that is its year 1 in to (as 1 BC is). With the example's eras, absolute year 0 is 1 YF and -1 is 1 BF. The leap rule is tested on the absolute year plus offset. epoch is the start of year 0 in seconds from the Gregorian 1 January AD 1: whole days times 86400 (0 lines year 0 up with AD 1; 1 January 1200 is 437925 days later, 37836720000; negative is earlier). One era should be quiet: it is left out when dates are written, and a year typed without an era is in it. set_viewer_settings asks the timeline first: a calendar it cannot use is refused with the reason, and a good one is described back (days a year, how years 0 and -1 are written, where year 0 begins in the Gregorian calendar, how today reads); check those against your own sums.",
         "schema": {
           "type": "object",
           "required": [
@@ -425,7 +425,8 @@
             "type": "string"
           },
           "metanode": {
-            "type": "string"
+            "type": "string",
+            "description": "the timeline's pimble: link (find_node or get_node gives it)"
           },
           "node": {
             "type": "string"
@@ -455,6 +456,23 @@
           },
           "text": {
             "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "outline",
+      "about": "What a person opening a timeline sees, as text: every node on the line in time order, each with its first and last day, whether it is a point, a span or a bar, and (in an invented calendar) its Gregorian days; the group labels; and anything not shown as meant (a date that does not read, an end before its start).",
+      "params": {
+        "type": "object",
+        "required": [
+          "timeline"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "timeline": {
+            "type": "string",
+            "description": "the timeline's pimble: link"
           }
         }
       }

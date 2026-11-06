@@ -500,6 +500,9 @@ impl Calendar {
         let mut time_has_seconds = false;
         let mut pm: Option<bool> = None;
         let mut iso_date: Option<(i64, usize, u32)> = None;
+        // How many numbers came before the month's name: none means the
+        // calendar's own order, "Mon D, Y".
+        let mut before_month: Option<usize> = None;
         let mut i = 0;
         while i < tokens.len() {
             let t = tokens[i].clone();
@@ -555,6 +558,7 @@ impl Calendar {
             }
             if let Some(m) = self.month_named(&bare) {
                 month = Some(m);
+                before_month = Some(numbers.len());
                 continue;
             }
             // A day of the week before the date says nothing more.
@@ -597,16 +601,24 @@ impl Calendar {
             };
             (absolute, m, d, Precision::Day)
         } else {
+            // The days a month can have (in a leap year): a number that fits
+            // is read as a day before it is read as a year.
+            let fits_day = |m: usize, n: i64| (1..=self.year.get(m).map_or(31, |e| e.days(true))).contains(&n);
             match (month, &numbers[..]) {
                 (None, [y]) => (to_absolute(*y), 0, 1, Precision::Year),
                 (Some(m), [y]) if !self.is_month(m) => (to_absolute(*y), m, 1, Precision::Day),
                 // "Oct 14" is a day with no year more often than October of
                 // AD 14: a small number beside a month needs its era.
-                (Some(_), [n]) if era.is_none() && (1..=31).contains(n) => return None,
+                (Some(m), [n]) if era.is_none() && fits_day(m, *n) => return None,
                 (Some(m), [y]) => (to_absolute(*y), m, 1, Precision::Month),
                 (Some(m), [a, b]) => {
                     // A day is the small number written next to the month.
-                    let (d, y) = if (1..=31).contains(a) && !(1..=31).contains(b) { (*a, *b) } else if (1..=31).contains(b) && !(1..=31).contains(a) { (*b, *a) } else { (*a, *b) };
+                    // After the month's name they are in the order the
+                    // calendar writes them, the day then the year, and a day
+                    // the month does not have does not read. With one before
+                    // the name ("14 Oct 1066", "1066 Oct 14") the day is
+                    // whichever fits, the first when both do.
+                    let (d, y) = if before_month == Some(0) || fits_day(m, *a) || !fits_day(m, *b) { (*a, *b) } else { (*b, *a) };
                     (to_absolute(y), m, d as u32, Precision::Day)
                 }
                 _ => return None,
@@ -684,10 +696,9 @@ impl Calendar {
                 if a.is_empty() || !a.chars().all(|c| c.is_ascii_digit()) || !b.chars().all(|c| c.is_ascii_digit()) || b.is_empty() {
                     return None;
                 }
-                let (na, nb): (i64, i64) = (a.parse().ok()?, b.parse().ok()?);
-                if nb < na {
-                    return None;
-                }
+                // Either way round: years count down in an era like BC
+                // ("264-241 BC"); the moments read decide the order below.
+                let _: (i64, i64) = (a.parse().ok()?, b.parse().ok()?);
                 let tail = rest.join(" ");
                 (format!("{a} {tail}"), format!("{b} {tail}"))
             }
@@ -701,6 +712,10 @@ impl Calendar {
         } else {
             self.read(&left).or_else(|| self.read(&borrowed))
         }?;
+        // A span runs forward on the line, whichever way its years count.
+        if to.at < from.at {
+            return None;
+        }
         Some((from, to))
     }
 
@@ -1000,6 +1015,36 @@ mod tests {
 
     fn g() -> Calendar {
         Calendar::gregorian()
+    }
+
+    /// Found by an agent writing dates through the MCP (docs/AGENT_GUIDES_CONTRACT.md
+    /// section 10): a day past 31 in a month that has it, beside a small year,
+    /// was read the other way round; a falling pair of years counting down
+    /// did not read as a span.
+    #[test]
+    fn a_day_is_whatever_its_month_holds_and_spans_count_down_too() {
+        let mut c = Calendar::invented();
+        if let Entry::Month { days, .. } = &mut c.year[0] {
+            *days = 37;
+        }
+        let m = c.read("Fir 36, 1").unwrap();
+        assert_eq!(c.write(m), "Fir 36, 1 YF");
+        let m = c.read("Fir 37, 3").unwrap();
+        assert_eq!(c.write(m), "Fir 37, 3 YF");
+        assert_eq!(c.write(c.read("3 Fir 12").unwrap()), "Fir 3, 12 YF", "both fit: the day comes first");
+        assert!(c.read("Sec 36, 1").is_none(), "the second month has 30 days");
+        let g = g();
+        assert_eq!(g.write(g.read("Oct 14, 1066").unwrap()), "Oct 14, 1066");
+        assert_eq!(g.write(g.read("1066 Oct 14").unwrap()), "Oct 14, 1066");
+        match g.read_said("264-241 BC") {
+            Some(Said::Between { from, to, .. }) => assert_eq!((g.write(from), g.write(to)), ("264 BC".to_string(), "241 BC".to_string())),
+            other => panic!("{other:?}"),
+        }
+        match g.read_said("1215-1217") {
+            Some(Said::Between { from, to, .. }) => assert_eq!((g.write(from), g.write(to)), ("1215".to_string(), "1217".to_string())),
+            other => panic!("{other:?}"),
+        }
+        assert!(g.read_said("1217-1215").is_none(), "a span that runs backwards on the line is not one");
     }
 
     #[test]

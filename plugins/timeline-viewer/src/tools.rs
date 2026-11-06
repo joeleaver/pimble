@@ -35,6 +35,7 @@ async fn answer(r: &ToolRequest, api: &Pimble) -> ToolAnswer {
             }
         }
         "check_field" => check_field(api, a).await,
+        "outline" => outline(api, a).await,
         "read_date" => {
             let named = text(a, "calendar");
             let cal = match CalRef::parse(if named.is_empty() { "gregorian" } else { &named }) {
@@ -126,7 +127,7 @@ fn describe(cal: &Calendar) -> String {
     if let Some(y) = leap_year {
         let leap_days = cal.year_days(y);
         if leap_days != days {
-            out.push_str(&format!(" ({leap_days} in a leap year, such as {})", cal.year_label(y)));
+            out.push_str(&format!(" ({leap_days} in a leap year, such as the year written {}, absolute {y})", cal.year_label(y)));
         }
     }
     let start = cal.year_start(0);
@@ -169,7 +170,52 @@ async fn check_field(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
             cals.push(c);
         }
     }
-    read_in(&cals, &text(a, "value"))
+    let value = text(a, "value");
+    let mut answer = read_in(&cals, &value);
+    if !answer.ok || value.is_empty() {
+        return answer;
+    }
+    let fields = &settings.fields;
+    // An end said with a year or a month runs to its end, as the line draws it.
+    if field == fields.end {
+        if let Some((cal, (_, end))) = span_of(&cals, &value) {
+            let last = Moment { at: end - cal.seconds_in_day(), precision: Precision::Day };
+            answer.said.push_str(&format!(" As an end it runs through {}.", cal.write(last)));
+        }
+    }
+    // A start and an end the wrong way round would draw no bar.
+    let other = if field == fields.end { Some(&fields.start) } else if field == fields.start { Some(&fields.end) } else { None };
+    if let (Some(other), Some(node)) = (other, addr_of(&text(a, "node"))) {
+        let theirs = api.node(node).await.ok().and_then(|n| n.metadata.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(other)).map(|(_, v)| v.trim().to_string()));
+        if let (Some(theirs), Some((_, mine))) = (theirs.filter(|t| !t.is_empty()), span_of(&cals, &value)) {
+            if let Some((_, theirs_span)) = span_of(&cals, &theirs) {
+                let (start, end) = if field == fields.end { (theirs_span.0, mine.1) } else { (mine.0, theirs_span.1) };
+                if end <= start {
+                    return ToolAnswer::no(format!(
+                        "the span would end before it starts: its {} is \u{201c}{}\u{201d} and its {} \u{201c}{}\u{201d}",
+                        fields.start,
+                        if field == fields.start { value.as_str() } else { theirs.as_str() },
+                        fields.end,
+                        if field == fields.end { value.as_str() } else { theirs.as_str() },
+                    ));
+                }
+            }
+        }
+    }
+    answer
+}
+
+/// Where `value` begins and ends on the line, in the first of `cals` that
+/// reads it, as the line draws it.
+fn span_of<'a>(cals: &'a [Calendar], value: &str) -> Option<(&'a Calendar, (i64, i64))> {
+    cals.iter().find_map(|cal| {
+        let span = match cal.read_said(value)? {
+            Said::At { moment, .. } => (moment.at, cal.end_of(moment)),
+            Said::Between { from, to, .. } => (from.at, cal.end_of(to)),
+            Said::Rough { from, to, .. } => (from, to),
+        };
+        Some((cal, span))
+    })
 }
 
 /// `value` read in the first of `cals` that reads it, said back in that
@@ -204,3 +250,87 @@ fn read_in(cals: &[Calendar], value: &str) -> ToolAnswer {
         examples[1]
     ))
 }
+
+/// What a person opening the timeline sees, as text: every node on the line in
+/// time order, with how its dates read and where they fall in the Gregorian
+/// calendar, then the groups, then what is not on the line and why.
+async fn outline(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
+    let Some(metanode) = addr_of(&text(a, "timeline")) else { return ToolAnswer::no("timeline must be the timeline's pimble: link") };
+    let forest = match api.metanode_source(metanode).await {
+        Ok(f) => f,
+        Err(e) => return ToolAnswer::no(format!("the timeline cannot be read: {}", e.sentence())),
+    };
+    let settings = parse_settings(api.doc(metanode).await.ok().and_then(|d| d.data_json().get(VIEWER).map(|v| v.to_string())).as_deref());
+    let mut cals = Vec::new();
+    match calendar_of(api, CalRef::of(settings.calendar)).await {
+        Ok(c) => cals.push(c),
+        Err(why) => return ToolAnswer::no(format!("the timeline's calendar: {why}")),
+    }
+    for named in settings.also {
+        if let Ok(c) = calendar_of(api, named).await {
+            cals.push(c);
+        }
+    }
+    let gregorian = Calendar::gregorian();
+    let day = |at: i64| Moment { at, precision: Precision::Day };
+    let f = &settings.fields;
+    let get = |node: &pimble_plugin_sdk::pimble_core::Node, name: &str| {
+        node.metadata.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let mut on_line: Vec<(i64, String)> = Vec::new();
+    let mut groups = Vec::new();
+    let mut off = Vec::new();
+    for entry in &forest.entries {
+        let title = pimble_plugin_sdk::display_label(&entry.node);
+        let (start, date, end) = (get(&entry.node, &f.start), get(&entry.node, &f.date), get(&entry.node, &f.end));
+        let Some(first) = start.clone().or(date.clone()) else {
+            if end.is_some() {
+                off.push(format!("{title}: an {} with no {} or {}", f.end, f.start, f.date));
+            } else {
+                groups.push(title);
+            }
+            continue;
+        };
+        let Some((cal, (from, mut to))) = span_of(&cals, &first) else {
+            off.push(format!("{title}: \u{201c}{first}\u{201d} does not read"));
+            continue;
+        };
+        if let Some(end) = &end {
+            match span_of(&cals, end) {
+                Some((_, (_, e))) if e > from => to = e,
+                Some(_) => off.push(format!("{title}: its {} \u{201c}{end}\u{201d} is before it starts, so it shows as a point", f.end)),
+                None => off.push(format!("{title}: its {} \u{201c}{end}\u{201d} does not read, so it shows as a point", f.end)),
+            }
+        }
+        let shape = if end.is_some() && to > from { "bar" } else if to - from > cal.seconds_in_day() { "span" } else { "point" };
+        let mut line = if shape == "point" {
+            format!("{} (point): {title}", cal.write(day(from)))
+        } else {
+            format!("{} to {} ({shape}): {title}", cal.write(day(from)), cal.write(day(to - cal.seconds_in_day())))
+        };
+        if cal.name != gregorian.name {
+            line.push_str(&if shape == "point" {
+                format!(" [Gregorian {}]", gregorian.write(day(from)))
+            } else {
+                format!(" [Gregorian {} to {}]", gregorian.write(day(from)), gregorian.write(day(to - 1)))
+            });
+        }
+        on_line.push((from, line));
+    }
+    on_line.sort_by_key(|(at, _)| *at);
+    let mut out = format!("{} on the line, in {}:\n", on_line.len(), cals[0].called());
+    for (_, line) in &on_line {
+        out.push_str(&format!("- {line}\n"));
+    }
+    if !groups.is_empty() {
+        out.push_str(&format!("Group labels (no dates of their own): {}.\n", groups.join(", ")));
+    }
+    if !off.is_empty() {
+        out.push_str("Not as meant:\n");
+        for o in &off {
+            out.push_str(&format!("- {o}\n"));
+        }
+    }
+    ToolAnswer::ok(out.trim_end().to_string())
+}
+

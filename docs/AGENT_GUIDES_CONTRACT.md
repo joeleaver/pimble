@@ -1,7 +1,8 @@
 # What plugins tell agents: viewer guides
 
 Status: waves 1 and 2 built 2026-11-06 on branch `agent-guides` (sections 6 and 7); wave 3,
-plugin tools, decided by Joe and built the same day (sections 8 and 9). Joe asked for it the same
+plugin tools, decided by Joe and built the same day (sections 8 and 9); a second blind
+trial and its fixes (section 10). Joe asked for it the same
 day ("We should probably build that"), after a look at what an agent could do with the
 plugins through the MCP: it could guess its way to a Gregorian timeline but could not make
 a calendar, set a timeline's calendar, or learn an invented calendar's month names.
@@ -287,3 +288,63 @@ Checked:
 - **Whole suites:** `pimble-mcp` 35 tests, `pimble-plugin-host` (every suite, with the
   built plugins) and the plugins' own tests all pass; the workspace and the browser build
   cleanly.
+
+## 10. The second blind trial (2026-11-06)
+
+A fresh agent got the same task, in a fresh store "Atlas" and a world "Veyra", with the
+plugin tools in place. It tried every form with `read_date` before writing, wrote every
+date through the checks, and checked the Gregorian date each answer gave against its own
+sums. It made:
+- a Roman Republic timeline of 14 events;
+- "Veyran Reckoning": ten months of 36 or 37 days, three days of no month (one only in
+  leap years), a six-day week, eras BV and AV, and year 0 on Mar 21, 1000;
+- "Chronicle of Veyra": 10 events in three periods.
+
+Opened in the app, the chronicle drew all 10, where `outline` said they would be.
+
+What it found, and what came of it:
+- **A real bug in the timeline's date reading, which no person had hit.**
+  - "Dee 36, 1 BV" read as day 1 of 36 BV. The day-or-year guess allowed days only up
+    to 31, whatever the month held.
+  - "Sec 36, 1", in a 30-day month, read as day 1 of year 36 instead of not reading.
+
+  `Calendar::read` now:
+  - allows a day whatever the month holds in a leap year;
+  - reads two numbers after the month's name in the calendar's order, the day then the
+    year, so a day the month lacks does not read;
+  - still guesses only when a number comes before the month ("14 Oct 1066", "1066 Oct
+    14").
+
+  Test: `a_day_is_whatever_its_month_holds_and_spans_count_down_too`.
+- **"264-241 BC" did not read,** while the refusal suggested "-". The two-number
+  shorthand now takes a falling pair, since years count down in BC, and a span that runs
+  backwards on the line does not read.
+- **A refusal named the parent** ("date on The Founding") instead of the node written.
+  It now names the node.
+- **The guides still said "nothing checks a date".** They now say:
+  - what the checks do;
+  - that `read_date` tries a form;
+  - that the Gregorian calendar is proleptic, so dates before 1582 are not the Julian
+    dates many histories give;
+  - that an end runs through the end of what it names ("241 BC" through Dec 31, 241 BC).
+- **The leap year was given as "such as 5"** without saying it was the written year. It
+  now reads "such as the year written 5, absolute 4".
+- **Ends:**
+  - `check_field` on an end says what it runs through: "As an end it runs through Dec 31,
+    44 BC.";
+  - a start or an end that would put the end before the start is refused, as the line
+    would draw no bar.
+- **No way to see a timeline.** The timeline now has an `outline` tool: every node on the
+  line in time order, with its first and last day, whether it is a point, a span or a bar,
+  and its Gregorian days in an invented calendar; then the group labels, and what is not
+  shown as meant. Run on the agent's own two timelines, it listed every event as the app
+  then drew it.
+- **Left as they are:**
+  - a Gregorian date is accepted on a timeline that shows the Gregorian beside its own
+    calendar, as documented, and the answer names the calendar it read in;
+  - `check_field` through `call_plugin_tool` takes links, not paths, as its parameter
+    says;
+  - the trial client's missing `$defs` (section 7).
+
+Checked: the timeline's 22 tests; `timeline_tools` with the end, an end before its start,
+"264-241 BC" and `outline`; the MCP's end-to-end test.
