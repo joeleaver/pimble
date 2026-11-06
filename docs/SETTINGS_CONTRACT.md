@@ -1,6 +1,6 @@
 # Settings, and the plugin library
 
-Status: waves 1 and 2 built 2026-11-06 on branch `settings` (sections 9 and 10). The
+Status: waves 1 to 3 built 2026-11-06 on branch `settings` (sections 9 to 11). The
 shape was agreed with Joe in conversation ("Seems right"), including the four
 recommendations in section 1, and he answered section 7 the same day.
 
@@ -278,6 +278,59 @@ release app on the scratch copy, with the browser checked on the local stack.
     - the same three rows, all with Install;
     - Install on Kanban was refused with the same sentence;
     - IndexedDB held nothing and `pimble.plugins.library` was unset.
-  - **Not yet checked: a real install.** Only the Release workflow holds the signing key,
-    so the first verified install can only happen against the first release that
-    publishes the library. Check it then, on the installed desktop and on pimble.app.
+  - **A real install** was checked with wave 3 (section 11), in a local build trusting a
+    throwaway key. Only the Release workflow holds the real key, so the first install
+    under it comes with the first release that publishes the library. Check it then, on
+    the installed desktop and on pimble.app.
+
+## 11. Wave 3 as built (2026-11-06)
+
+- **When:** 20 seconds after the plugins first load, then every 6 hours
+  (`schedule_update_check`, rinch's `set_timeout` on both targets).
+- **What updates** (`updates_due`): an index entry whose `offer` is Update, which means:
+  - the installed plugin came from the library;
+  - the entry is newer than the installed version;
+  - it is built for this Pimble's plugin ABI.
+
+  A plugin added from a file, one not installed, and one needing a newer Pimble are left
+  alone.
+- **How:** through the same download, verification and install as the Update button
+  (`fetch_and_install`). Nothing is asked.
+- **What it is allowed carries over:** approvals are kept by plugin id. When a new
+  version asks for more, `Approval::covers` fails on its manifest, so the pane asks the
+  way a first use does.
+- **A pane showing the plugin keeps the version it runs.**
+  - While the update installs, its id is in `QUIET`. `swapped` then marks the panes
+    showing it (`Shown.newer`) instead of stopping them.
+  - The pane says "A newer version of Kanban is ready." with "Restart Plugin"
+    (`Outcome::ShownNewer`, `MetanodeUi::newer`). Restart Plugin stops the old version and
+    mounts the new one.
+  - A pane that mounts the plugin afresh gets the new version.
+  - An Update pressed by the person still stops and remounts every pane at once
+    (section 3).
+- **What is said:**
+  - The row says "Kanban updated to 0.1.1." until Settings is next closed (row lines are
+    now cleared on close, not on every show). The log says it too.
+  - A failed update is logged and tried again at the next check.
+- **Checked:**
+  - `pimble-app` 222 tests, among them `only_newer_library_plugins_this_pimble_runs_update_on_their_own`:
+    - from-file, not installed, newer ABI and current plugins are left alone;
+    - the one library plugin with a newer version updates.
+  - The browser builds without warnings.
+  - In a release build on the scratch copy, built to trust a throwaway key for this check
+    only. The real `update-key.pub` was restored at once, and `target/release` was built
+    again with it. Against a stub library signed with that key:
+    1. Removing the Kanban added from a file and pressing Install put
+       `kanban-viewer.wasm` in the folder. `library.json` recorded `0.1.0`, and the row
+       said "From the library."
+    2. Apex Kanban then asked to be allowed, and after Allow it showed its board.
+    3. The app restarted with Kanban 0.1.1 in the library. After 20 s the log said
+       "updating kanban-viewer to 0.1.1" and then "Kanban updated to 0.1.1.", and
+       `library.json` said `0.1.1`.
+    4. The open board kept running under "A newer version of Kanban is ready." and
+       Restart Plugin brought the board back on 0.1.1.
+    5. Settings showed Kanban 0.1.1 "From the library." with its approval kept, and the
+       row line "Kanban updated to 0.1.1."; Timeline and Todo List, added from a file,
+       were untouched. The line was gone once Settings closed and opened again.
+  - Not run in the browser: its download and refusal were checked in wave 2, and the
+    update path is the shared code above.

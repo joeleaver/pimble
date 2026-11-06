@@ -86,6 +86,10 @@ struct Shown {
     wants: Vec<pimble_core::StoreId>,
     /// "Not now" was chosen for `wants` in this pane.
     declined_wants: bool,
+    /// A newer version of the plugin was installed on its own while this
+    /// pane showed it: the pane keeps this one until "Restart Plugin" or the
+    /// next time it mounts (docs/SETTINGS_CONTRACT.md section 3).
+    newer: bool,
 }
 
 thread_local! {
@@ -107,6 +111,11 @@ thread_local! {
     /// What a library row says about its plugin now (downloading, what came
     /// of an install), by plugin id.
     static ROW_LINES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Plugins being updated on their own (wave 3): a pane showing one keeps
+    /// the version it runs when the new one is swapped in.
+    static QUIET: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+    /// The library is checked for updates on a timer, started once.
+    static CHECKING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Read the registry, if it has loaded.
@@ -136,6 +145,9 @@ fn loaded(registry: Registry) {
         // What the explorer's new-node menu offers from them.
         store.recipes.set(recipes());
         crate::metanodes::plugins_ready(store);
+        if !CHECKING.with(|c| c.replace(true)) {
+            schedule_update_check(FIRST_UPDATE_CHECK_MS);
+        }
         if !WATCHING.with(|w| w.replace(true)) {
             watch_host_state(store);
             // A drag in this window ended: every running plugin hears it, so a
@@ -158,11 +170,29 @@ fn loaded(registry: Registry) {
 /// swapped, and each pane holding a metanode mounts again with what is loaded
 /// now, so a new version takes over in place (docs/SETTINGS_CONTRACT.md
 /// section 3).
+///
+/// A plugin updated on its own (`QUIET`) is not stopped: each pane showing it
+/// keeps the version it runs and says a newer one is ready.
 fn swapped(registry: Registry, changed: &[String]) {
     for id in changed {
-        stop_everywhere(id);
+        if QUIET.with(|q| q.borrow().contains(id)) {
+            SHOWN.with(|s| {
+                for shown in s.borrow_mut().values_mut().filter(|shown| &shown.plugin_id == id && shown.instance.is_some()) {
+                    shown.newer = true;
+                }
+            });
+        } else {
+            stop_everywhere(id);
+        }
     }
     loaded(registry);
+}
+
+/// "Restart Plugin": the pane stops the version it runs and mounts the one
+/// installed now.
+pub(crate) fn restart(store: AppStore, pane: PaneId) {
+    hide(pane);
+    crate::metanodes::refill(store, pane);
 }
 
 /// Every pane showing plugin `id` stops it.
@@ -329,6 +359,9 @@ pub(crate) enum Outcome {
     /// the view, under this sentence asking for them with "Allow" and "Not
     /// now".
     ShownAsking(String),
+    /// It is, and a newer version was installed since it mounted: the view,
+    /// under this sentence with "Restart Plugin".
+    ShownNewer(String),
     /// It is not: the outline, under this sentence.
     Outline(String),
     /// The plugin waits for the person to allow it: the outline, under this
@@ -366,6 +399,10 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
         Some(shown.declined_wants)
     });
     if wants.is_empty() || declined != Some(false) {
+        let newer = SHOWN.with(|s| s.borrow().get(&pane).is_some_and(|shown| shown.newer));
+        if newer {
+            return Outcome::ShownNewer(format!("A newer version of {} is ready.", manifest.name));
+        }
         return outcome;
     }
     let names: Vec<String> = wants.iter().map(|s| store_name(store, *s)).collect();
@@ -440,6 +477,7 @@ fn show_viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> 
         declined: false,
         wants: Vec::new(),
         declined_wants: false,
+        newer: false,
     };
     if manifest.asks.asks_anything() && !approval.covers(&manifest.asks, forest.metanode.store) {
         SHOWN.with(|s| s.borrow_mut().insert(pane, shown(None, None)));
@@ -702,8 +740,13 @@ pub(crate) fn shown(store: AppStore) {
         ui.status.set(String::new());
         ui.rows.set(rows(store));
     }
-    ROW_LINES.with(|l| l.borrow_mut().clear());
     read_library();
+}
+
+/// Settings closes: what the rows said (an install, an update made on its
+/// own) is said until then.
+pub(crate) fn hidden() {
+    ROW_LINES.with(|l| l.borrow_mut().clear());
 }
 
 fn refresh_window() {
@@ -947,26 +990,33 @@ fn row_said(id: &str, line: String) {
     refresh_library();
 }
 
-/// "Install" or "Update": the plugin and its signature are downloaded, checked
-/// against what the index lists and the key this build carries, and only then
-/// installed. A plugin that does not verify is never written anywhere.
+/// "Install" or "Update".
 fn install_from_library(id: &str) {
     let Some(entry) = INDEX.with(|i| i.borrow().as_ref().and_then(|index| index.plugins.iter().find(|e| e.id == id).cloned())) else {
         return;
     };
     row_said(&entry.id, format!("Downloading {}...", entry.name));
+    fetch_and_install(entry);
+}
+
+/// The plugin and its signature are downloaded, checked against what the
+/// index lists and the key this build carries, and only then installed. A
+/// plugin that does not verify is never written anywhere.
+fn fetch_and_install(entry: Entry) {
     place::fetch(library_url(Some(&entry.wasm)), move |wasm| {
         let sig_url = library_url(Some(&entry.sig));
         place::fetch(sig_url, move |sig| {
             let (wasm, sig) = match (wasm, sig) {
                 (Ok(wasm), Ok(sig)) => (wasm, sig),
-                (Err(e), _) | (_, Err(e)) => return row_said(&entry.id, format!("The download did not finish ({e}).")),
+                (Err(e), _) | (_, Err(e)) => return install_failed(&entry, format!("The download did not finish ({e}).")),
             };
             if let Err(e) = library::verify_download(&entry, crate::RELEASE_KEY, &wasm, &sig) {
                 tracing::warn!("plugins: {} from the library refused: {e}", entry.id);
-                return row_said(&entry.id, library::NOT_VERIFIED.to_string());
+                return install_failed(&entry, library::NOT_VERIFIED.to_string());
             }
-            row_said(&entry.id, format!("Installing {}...", entry.name));
+            if !QUIET.with(|q| q.borrow().contains(&entry.id)) {
+                row_said(&entry.id, format!("Installing {}...", entry.name));
+            }
             place::install(entry, wasm);
         });
     });
@@ -974,10 +1024,83 @@ fn install_from_library(id: &str) {
 
 /// A plugin from the library is installed: remember where it came from.
 fn installed_from_library(entry: &Entry) {
+    let quiet = QUIET.with(|q| q.borrow_mut().remove(&entry.id));
     PROVENANCE.with(|p| p.borrow_mut().plugins.insert(entry.id.clone(), entry.version.clone()));
     write_provenance();
-    row_said(&entry.id, format!("Installed {} {}.", entry.name, entry.version));
+    let line = if quiet { format!("{} updated to {}.", entry.name, entry.version) } else { format!("Installed {} {}.", entry.name, entry.version) };
+    tracing::info!("plugins: {line}");
+    row_said(&entry.id, line);
     refresh_window();
+    if quiet {
+        // Panes showing it say a newer version is ready.
+        if let Some(store) = STORE.with(Cell::get) {
+            crate::metanodes::plugins_ready(store);
+        }
+    }
+}
+
+/// An install from the library did not happen: the row says why. One made on
+/// its own is tried again at the next check.
+fn install_failed(entry: &Entry, line: String) {
+    let quiet = QUIET.with(|q| q.borrow_mut().remove(&entry.id));
+    if quiet {
+        tracing::warn!("plugins: updating {} to {} did not happen: {line}", entry.id, entry.version);
+    }
+    row_said(&entry.id, line);
+}
+
+// ── Updates on their own (docs/SETTINGS_CONTRACT.md section 5) ───────────────
+
+/// The first look at the library after the app starts, then one every six
+/// hours.
+const FIRST_UPDATE_CHECK_MS: u32 = 20_000;
+const UPDATE_CHECK_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
+
+fn schedule_update_check(after_ms: u32) {
+    rinch::core::reactive::unowned(|| {
+        let _ = rinch::core::set_timeout(after_ms, || {
+            check_for_updates();
+            schedule_update_check(UPDATE_CHECK_EVERY_MS);
+        });
+    });
+}
+
+/// Read the index, and install every newer version of a plugin that came from
+/// the library and that this Pimble can load, without asking. A plugin added
+/// from a file is never touched; what each was allowed carries over, and a
+/// new version that asks for more asks the way a first use does.
+fn check_for_updates() {
+    place::fetch(library_url(None), |fetched| {
+        let index = match fetched.and_then(|bytes| Index::parse(&bytes)) {
+            Ok(index) => index,
+            Err(e) => return tracing::info!("plugins: no update check this time: {e}"),
+        };
+        INDEX.with(|i| *i.borrow_mut() = Some(index.clone()));
+        let due = updates_due(&index, |id| manifest_of(id).map(|m| m.version), |id| PROVENANCE.with(|p| p.borrow().from_library(id)));
+        refresh_library();
+        for entry in due {
+            if !QUIET.with(|q| q.borrow_mut().insert(entry.id.clone())) {
+                continue;
+            }
+            tracing::info!("plugins: updating {} to {}", entry.id, entry.version);
+            fetch_and_install(entry);
+        }
+    });
+}
+
+/// The entries of `index` that are updates to install on their own: newer
+/// than the version installed, of a plugin installed from the library, for
+/// this Pimble's plugin ABI.
+fn updates_due(index: &Index, installed: impl Fn(&str) -> Option<String>, from_library: impl Fn(&str) -> bool) -> Vec<Entry> {
+    index
+        .plugins
+        .iter()
+        .filter(|entry| {
+            let have = installed(&entry.id);
+            matches!(library::offer(entry, have.as_deref(), from_library(&entry.id)), Offer::Update { .. })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Plugin `id` was removed, or added from a file over the library's: the
@@ -1185,7 +1308,7 @@ mod place {
                     rescan(&dir);
                     rinch::core::reactive::run_on_main_thread(move || installed_from_library(&entry));
                 }
-                Err(e) => rinch::core::reactive::run_on_main_thread(move || row_said(&entry.id, e)),
+                Err(e) => rinch::core::reactive::run_on_main_thread(move || install_failed(&entry, e)),
             }
         });
         if let Err(e) = spawned {
@@ -1421,7 +1544,7 @@ export async function pluginsDelete(id) {
         wasm_bindgen_futures::spawn_local(async move {
             match put(&entry.wasm, &bytes, Some(&entry)).await {
                 Ok(_) => installed_from_library(&entry),
-                Err(e) => row_said(&entry.id, e),
+                Err(e) => install_failed(&entry, e),
             }
         });
     }
@@ -1573,5 +1696,52 @@ export async function pluginsDelete(id) {
 
     fn write_approvals_now() {
         super::write_approvals();
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use pimble_plugin_host::abi::{Permissions, ABI_VERSION};
+
+    fn entry(id: &str, version: &str, abi: u32) -> Entry {
+        Entry {
+            id: id.into(),
+            name: id.into(),
+            version: version.into(),
+            abi,
+            author: "Pimble".into(),
+            summary: String::new(),
+            asks: Permissions::default(),
+            wasm: format!("{id}-{version}.wasm"),
+            sig: format!("{id}-{version}.wasm.sig"),
+            shot: None,
+            bytes: 1,
+            sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_newer_library_plugins_this_pimble_runs_update_on_their_own() {
+        let index = Index {
+            v: 1,
+            plugins: vec![
+                entry("kanban-viewer", "0.2.0", ABI_VERSION),
+                entry("todo-viewer", "0.2.0", ABI_VERSION),
+                entry("timeline-viewer", "0.2.0", ABI_VERSION + 1),
+                entry("calendar-viewer", "0.2.0", ABI_VERSION),
+                entry("stuck-viewer", "0.1.0", ABI_VERSION),
+            ],
+        };
+        let installed = |id: &str| match id {
+            "kanban-viewer" | "todo-viewer" | "timeline-viewer" => Some("0.1.0".to_string()),
+            "stuck-viewer" => Some("0.1.0".to_string()),
+            _ => None,
+        };
+        // todo was added from a file; calendar is not installed; timeline's new
+        // version needs a newer Pimble; stuck is current.
+        let from_library = |id: &str| id != "todo-viewer";
+        let due: Vec<String> = updates_due(&index, installed, from_library).into_iter().map(|e| e.id).collect();
+        assert_eq!(due, vec!["kanban-viewer".to_string()]);
     }
 }

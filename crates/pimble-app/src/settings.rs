@@ -93,6 +93,7 @@ fn choose(store: AppStore, section: Section) {
 fn close(store: AppStore) {
     store.settings.set(None);
     crate::app::account_hidden(store);
+    crate::plugins::hidden();
     #[cfg(feature = "native")]
     crate::agents::hidden(store);
 }
