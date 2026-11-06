@@ -1009,6 +1009,79 @@ fn kind_label(kind: &str) -> &'static str {
     }
 }
 
+/// How one part of the status bar is doing: its dot's color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Light {
+    Good,
+    Waiting,
+    Bad,
+    Quiet,
+}
+
+/// One part of the status bar: a dot, a name, a dimmer detail beside it and
+/// a sentence on hover. Every part reads the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusPart {
+    light: Light,
+    detail: String,
+    tooltip: String,
+}
+
+impl StatusPart {
+    fn dot_class(&self) -> &'static str {
+        match self.light {
+            Light::Good => "pimble-status-bar__dot pimble-status-bar__dot--good",
+            Light::Waiting => "pimble-status-bar__dot pimble-status-bar__dot--waiting",
+            Light::Bad => "pimble-status-bar__dot pimble-status-bar__dot--bad",
+            Light::Quiet => "pimble-status-bar__dot",
+        }
+    }
+}
+
+/// What the first part is: Pimble's server on this computer, or in the
+/// browser Pimble Cloud itself.
+fn server_part_name() -> &'static str {
+    if CAN_ADMINISTER_STORES { "This computer" } else { "Pimble Cloud" }
+}
+
+/// The first part, from `AppStore::connection_status` ("Connected",
+/// "Disconnected", "Error: ...") and the address connected to.
+fn server_part(status: &str, addr: &str) -> StatusPart {
+    let place = if CAN_ADMINISTER_STORES { "Pimble's server on this computer" } else { "Pimble Cloud" };
+    let shown = url::Url::parse(addr).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| addr.to_string());
+    if status == "Connected" {
+        let at = if addr.is_empty() { String::new() } else { format!(" at {addr}") };
+        StatusPart { light: Light::Good, detail: shown, tooltip: format!("Connected to {place}{at}.") }
+    } else if let Some(message) = status.strip_prefix("Error: ") {
+        StatusPart { light: Light::Bad, detail: message.to_string(), tooltip: format!("{place}: {message}") }
+    } else {
+        StatusPart { light: Light::Waiting, detail: "connecting".to_string(), tooltip: format!("Connecting to {place}.") }
+    }
+}
+
+/// The Pimble Cloud part: who is signed in and how this computer's
+/// connections to Pimble Cloud are doing (`pimble_rpc::CloudConnection`).
+fn cloud_part(signed_in: bool, email: &str, connection: Option<&pimble_rpc::CloudConnection>) -> StatusPart {
+    use pimble_rpc::CloudReach;
+    if !signed_in {
+        return StatusPart { light: Light::Quiet, detail: "sign in".to_string(), tooltip: "Not signed in. Sign in to host stores on Pimble Cloud and to share.".to_string() };
+    }
+    let Some(c) = connection else {
+        return StatusPart { light: Light::Quiet, detail: email.to_string(), tooltip: format!("Signed in as {email}.") };
+    };
+    let (light, word) = match c.reach {
+        CloudReach::Idle => (Light::Quiet, None),
+        CloudReach::Connected => (Light::Good, None),
+        CloudReach::Connecting => (Light::Waiting, Some("connecting")),
+        CloudReach::Offline => (Light::Bad, Some("offline")),
+    };
+    let detail = match word {
+        Some(word) => format!("{email} · {word}"),
+        None => email.to_string(),
+    };
+    StatusPart { light, detail, tooltip: format!("Signed in as {email}. {}", c.sentence) }
+}
+
 /// Text for a linked store's status badge (docs/SYNC_CONTRACT.md "B: app
 /// side"). `Conflict` is out of scope for this contract (there are no
 /// conflicts to show yet) but still needs a label rather than a match gap.
@@ -1016,9 +1089,10 @@ fn kind_label(kind: &str) -> &'static str {
 /// decision 4): `encrypted · synced`.
 ///
 /// A store shared from this computer (`relay` is `Owner`,
-/// docs/RELAY_CONTRACT.md) says that instead, in the same style: its link is
-/// to its own twin on this machine, and `shared from here · offline` is the
-/// people it is shared with being unable to reach it. A member's row reads as
+/// docs/RELAY_CONTRACT.md) has no badge: its link is to its own twin on this
+/// machine, so its state says nothing about whether the people it is shared
+/// with can reach it, and the nodes shared carry the share icon (Joe,
+/// 2026-11-06). A member's row reads as
 /// any encrypted store's does ("a member sees no difference"), except that a
 /// backend that knows the owner's computer to be off says `owner offline`.
 /// Only the browser's knows: a Pimble server reports a member's link as
@@ -1035,10 +1109,7 @@ fn sync_badge_text(
         return "owner offline";
     }
     match (relay, mode, state) {
-        (RelaySide::Owner, _, SyncState::Offline) => "shared from here · offline",
-        (RelaySide::Owner, _, SyncState::Syncing) => "shared from here · syncing",
-        (RelaySide::Owner, _, SyncState::Synced { .. }) => "shared from here · synced",
-        (RelaySide::Owner, _, SyncState::Conflict { .. }) => "shared from here · conflict",
+        (RelaySide::Owner, _, _) => "",
         (_, StoreKind::Plain, SyncState::Offline) => "offline",
         (_, StoreKind::Plain, SyncState::Syncing) => "syncing",
         (_, StoreKind::Plain, SyncState::Synced { .. }) => "synced",
@@ -1968,7 +2039,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 // shared" is said once, beside the name, and
                                 // how that link is doing is not.
                                 let ended = store_sig.map_or(false, |sig| sig.with(|s| s.every_share_ended()));
-                                if (linked || owner_offline) && !ended {
+                                // A store shared from this computer has no
+                                // badge: its link is to its own twin here, so
+                                // it says nothing about the people it is
+                                // shared with, and the shared nodes carry the
+                                // share icon (Joe, 2026-11-06).
+                                let owner = store_sig.map_or(false, |sig| sig.with(|s| s.relay == pimble_core::RelaySide::Owner));
+                                if (linked || owner_offline) && !ended && !owner {
                                     "margin-left: 6px; cursor: default; font-size: 10px; font-weight: 400; \
                                      text-transform: none; letter-spacing: normal; opacity: 0.6;"
                                 } else {
@@ -2502,18 +2579,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
                 None => tree_state.controller.clear_selected(),
             });
-        });
-
-        // Connection status color (pure derivation → Memo)
-        let status_color = Memo::new(move || {
-            let status = store.connection_status.get();
-            if status == "Connected" {
-                "green".to_string()
-            } else if status.starts_with("Error") {
-                "red".to_string()
-            } else {
-                "yellow".to_string()
-            }
         });
 
         // ── Search box + results panel ────────────────────────────────
@@ -4333,19 +4398,33 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     div {
                         class: "pimble-status-bar",
 
-                        Badge {
-                            variant: "dot",
-                            color: {|| status_color.get()},
-                            size: "xs",
-                            {|| store.connection_status.get()}
+                        // Pimble's server on this computer (in the browser,
+                        // Pimble Cloud itself, which is what it connects to).
+                        div {
+                            class: "pimble-status-bar__part",
+                            title: {move || server_part(&store.connection_status.get(), &store.server_addr.get()).tooltip},
+                            span { class: {move || server_part(&store.connection_status.get(), &store.server_addr.get()).dot_class()} }
+                            span { class: "pimble-status-bar__name", {server_part_name()} }
+                            span { class: "pimble-status-bar__detail", {move || server_part(&store.connection_status.get(), &store.server_addr.get()).detail} }
                         }
 
-                        span {
-                            class: "pimble-status-bar__addr",
-                            {|| {
-                                let addr = store.server_addr.get();
-                                if addr.is_empty() { String::new() } else { addr }
-                            }}
+                        // The signed-in account and how this computer's
+                        // connections to Pimble Cloud are doing; a click opens
+                        // the Account modal (docs/DESKTOP_ACCOUNT_CONTRACT.md
+                        // decision 7). Only a build whose server keeps an
+                        // account: the browser signs in through its own pages.
+                        if CAN_ADMINISTER_STORES {
+                            span { class: "pimble-status-bar__rule" }
+                        }
+                        if CAN_ADMINISTER_STORES {
+                            div {
+                                class: "pimble-status-bar__part pimble-status-bar__part--button",
+                                title: {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).tooltip},
+                                onclick: move || open_account_modal(store, ""),
+                                span { class: {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).dot_class()} }
+                                span { class: "pimble-status-bar__name", "Pimble Cloud" }
+                                span { class: "pimble-status-bar__detail", {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).detail} }
+                            }
                         }
 
                         // A refusal the server sent back, in its own words
@@ -4356,19 +4435,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             class: "pimble-status-bar__notice",
                             style: {|| if store.notice.get().is_empty() { "display: none;" } else { "" }},
                             {|| store.notice.get()}
-                        }
-
-                        // The signed-in account, when there is one; a click
-                        // opens the Account modal (docs/DESKTOP_ACCOUNT_CONTRACT.md
-                        // decision 7). Only a build whose server keeps an
-                        // account: the browser signs in through its own pages.
-                        if CAN_ADMINISTER_STORES {
-                            span {
-                                class: "pimble-status-bar__account",
-                                style: {|| if store.cloud_signed_in.get() { "cursor: pointer;" } else { "display: none;" }},
-                                onclick: move || open_account_modal(store, ""),
-                                {|| format!("Signed in as {}", store.cloud_email.get())}
-                            }
                         }
 
                         div { style: "flex: 1;", }
@@ -4626,7 +4692,7 @@ pub fn run(renderer: Renderer) {
 mod tests {
     use super::{
         hosted_store_label, host_to_share, member_role_text, member_status_text, open_share_modal, open_stop_relay_modal,
-        share_from_this_computer, sync_badge_text, MOUNT_NOTE,
+        cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
     };
     use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
     use crate::state::{AppStore, ShareFace};
@@ -4939,8 +5005,31 @@ mod tests {
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, none, false), "encrypted · synced");
     }
 
-    /// A store shared from this computer says so, with the link's state in the
-    /// vault badge's style (docs/RELAY_CONTRACT.md, "The apps"). A member's
+    #[test]
+    fn the_cloud_part_says_who_and_how_it_is_doing() {
+        use pimble_rpc::{CloudConnection, CloudReach};
+        assert_eq!(cloud_part(false, "", None).detail, "sign in");
+        let connected = CloudConnection { reach: CloudReach::Connected, sentence: "Connected to pimble.app.".into() };
+        let part = cloud_part(true, "joe@example.com", Some(&connected));
+        assert_eq!((part.light, part.detail.as_str()), (Light::Good, "joe@example.com"));
+        assert_eq!(part.tooltip, "Signed in as joe@example.com. Connected to pimble.app.");
+        let offline = CloudConnection { reach: CloudReach::Offline, sentence: "Not everything here can reach pimble.app.".into() };
+        let part = cloud_part(true, "joe@example.com", Some(&offline));
+        assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "joe@example.com · offline"));
+        // A server too old to say: the account alone.
+        assert_eq!(cloud_part(true, "joe@example.com", None).light, Light::Quiet);
+    }
+
+    #[test]
+    fn the_server_part_reads_the_connection_status() {
+        assert_eq!(server_part("Connected", "127.0.0.1:7462").light, Light::Good);
+        assert_eq!(server_part("Disconnected", "127.0.0.1:7462").detail, "connecting");
+        let part = server_part("Error: refused", "127.0.0.1:7462");
+        assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "refused"));
+    }
+
+    /// A store shared from this computer says nothing: its link is to its own
+    /// twin here (docs/RELAY_CONTRACT.md, "The apps"). A member's
     /// row reads as any encrypted store's does, and says `owner offline` only
     /// when the backend knows that is why: a Pimble server reports a member's
     /// link as `Offline` and no more, which no network looks like too.
@@ -4948,9 +5037,8 @@ mod tests {
     fn badge_text_says_which_end_of_the_relay_this_is() {
         let synced: SyncState =
             serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-21T00:00:00Z"}"#).unwrap();
-        assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Owner, false), "shared from here · synced");
-        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault, RelaySide::Owner, false), "shared from here · syncing");
-        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Owner, false), "shared from here · offline");
+        assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Owner, false), "");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Owner, false), "");
 
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Member, false), "encrypted · synced");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");

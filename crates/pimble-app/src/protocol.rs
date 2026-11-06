@@ -690,6 +690,10 @@ pub enum BackendEvent {
     /// from before 0.12.2, which has no `serverInfo`.
     ServerInfo { version: Option<String> },
     CloudStatusChanged { signed_in: bool, email: Option<String>, user_id: Option<String>, url: Option<String> },
+    /// How this computer's connections to Pimble Cloud are doing, heard from
+    /// the server whenever it changes; `None` while signed out (desktop only:
+    /// the browser's connection is to Pimble Cloud itself).
+    CloudConnectionChanged { connection: Option<pimble_rpc::CloudConnection> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.
     CloudError { op: CloudOp, message: String },

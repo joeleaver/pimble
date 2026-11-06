@@ -1077,6 +1077,10 @@ pub struct RpcHandler {
     /// Who is in which document, in memory only (docs/PRESENCE_CONTRACT.md;
     /// `crate::presence`).
     presence: Arc<crate::presence::PresenceHub>,
+    /// Bumped whenever something Pimble Cloud's state is made of may have
+    /// changed (a link's state, a sign-in or out); the tunnel has its own
+    /// watch (`RelayHost::watch_tunnel`). `subscribeCloudConnection` hears both.
+    cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1172,6 +1176,7 @@ impl RpcHandler {
             hands_over: false,
             version: Arc::from(env!("CARGO_PKG_VERSION")),
             presence: Arc::new(crate::presence::PresenceHub::new()),
+            cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
         }
     }
 
@@ -1531,6 +1536,32 @@ impl RpcHandler {
     pub(crate) async fn notify_sync_state_changed(&self, store_id: StoreId, state: SyncState) {
         self.notify_store_change(store_id, StoreChangeKind::SyncStateChanged { state }, None).await;
         self.notify_mount_states_for_source(store_id).await;
+        self.cloud_changed();
+    }
+
+    /// Something Pimble Cloud's state is made of may have changed.
+    pub(crate) fn cloud_changed(&self) {
+        self.cloud_changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// How this computer's connections to Pimble Cloud are doing, all of them
+    /// together (`CloudConnection`); `None` while signed out. The tunnel is
+    /// what lets people reach what is shared from here; every other vault
+    /// link (a hosted store, or a share someone gave this account) is one
+    /// connection to Pimble Cloud. A relayed store's own link is to its twin
+    /// on this computer and is not one, and a member's link whose owner is
+    /// off reaches Pimble Cloud fine.
+    pub(crate) async fn cloud_connection(&self) -> Option<pimble_rpc::CloudConnection> {
+        let account = self.keystore.account().await?;
+        let host = url::Url::parse(&account.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| account.url.clone());
+        let links: Vec<(StoreId, SyncState, bool)> = self.vault_links.read().await.iter().map(|(id, h)| (*id, h.state(), h.owner_offline())).collect();
+        let mut stores = Vec::new();
+        for (id, state, owner_offline) in links {
+            if self.link_kind_of(id).await.1 != RelaySide::Owner {
+                stores.push((state, owner_offline));
+            }
+        }
+        Some(describe_cloud(&host, &self.relay.tunnel_state(), &stores))
     }
 
     /// A store's sync link state, `Offline` if it has neither a sync link
@@ -3027,6 +3058,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
         // A tunnel to the relay is opened with the account's session.
         self.relay.account_changed(self).await;
+        self.cloud_changed();
 
         Ok(EmptyResponse {})
     }
@@ -3037,6 +3069,7 @@ impl PimbleApiServer for RpcHandler {
         self.keystore.sign_out().await.map_err(to_rpc_error)?;
         // Nothing is served to anyone on a session that was given up.
         self.relay.account_changed(self).await;
+        self.cloud_changed();
         Ok(EmptyResponse {})
     }
 
@@ -3118,9 +3151,41 @@ impl PimbleApiServer for RpcHandler {
                 email: Some(account.email),
                 user_id: Some(account.user_id),
                 url: Some(account.url),
+                connection: self.cloud_connection().await,
             }),
-            None => Ok(CloudStatusResponse { signed_in: false, email: None, user_id: None, url: None }),
+            None => Ok(CloudStatusResponse { signed_in: false, email: None, user_id: None, url: None, connection: None }),
         }
+    }
+
+    async fn subscribe_cloud_connection(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeCloudConnection") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let handler = self.clone();
+        let mut changes = self.cloud_changes.subscribe();
+        let mut tunnel = self.relay.watch_tunnel();
+        tokio::spawn(async move {
+            // The first at once, then each that differs from the last sent.
+            let mut sent: Option<Option<pimble_rpc::CloudConnection>> = None;
+            loop {
+                let now = handler.cloud_connection().await;
+                if sent.as_ref() != Some(&now) {
+                    let Ok(msg) = SubscriptionMessage::from_json(&now) else { break };
+                    if sink.send(msg).await.is_err() {
+                        break;
+                    }
+                    sent = Some(now);
+                }
+                tokio::select! {
+                    changed = changes.changed() => if changed.is_err() { break },
+                    changed = tunnel.changed() => if changed.is_err() { break },
+                    _ = sink.closed() => break,
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn cloud_host_store(&self, ext: &Extensions, request: CloudHostStoreRequest) -> Result<CloudHostStoreResponse, ErrorObjectOwned> {
@@ -5416,5 +5481,116 @@ mod tests {
         assert!(is_link_client("vault-link:1234"));
         assert!(!is_link_client("pimble-cli"));
         assert!(!is_link_client("app-7f3a"));
+    }
+}
+
+/// [`RpcHandler::cloud_connection`] from what it is made of: the tunnel, and
+/// each other vault link's state with whether its owner is known to be off.
+/// One that cannot reach Pimble Cloud makes the whole of it `Offline`, and
+/// the sentence says what that stops.
+fn describe_cloud(host: &str, tunnel: &crate::relay_face::TunnelState, stores: &[(SyncState, bool)]) -> pimble_rpc::CloudConnection {
+    use crate::relay_face::TunnelState;
+    use pimble_rpc::{CloudConnection, CloudReach};
+    let offline = stores.iter().filter(|(s, owner_off)| matches!(s, SyncState::Offline) && !owner_off).count();
+    let connecting = stores.iter().filter(|(s, _)| matches!(s, SyncState::Syncing)).count();
+    let synced = stores.len() - offline - connecting;
+    let n = |k: usize| if k == 1 { "1 store".to_string() } else { format!("{k} stores") };
+
+    let mut said = Vec::new();
+    let mut reach = CloudReach::Idle;
+    let worse = |r: CloudReach, reach: &mut CloudReach| {
+        let rank = |r: CloudReach| match r {
+            CloudReach::Idle => 0,
+            CloudReach::Connected => 1,
+            CloudReach::Connecting => 2,
+            CloudReach::Offline => 3,
+        };
+        if rank(r) > rank(*reach) {
+            *reach = r;
+        }
+    };
+    match tunnel {
+        TunnelState::Idle => {}
+        TunnelState::Connecting => {
+            worse(CloudReach::Connecting, &mut reach);
+            said.push("Opening the way for the people you share with to reach this computer.".to_string());
+        }
+        TunnelState::Up { serving, asked } if serving < asked => {
+            worse(CloudReach::Offline, &mut reach);
+            said.push(format!("Pimble Cloud serves {serving} of the {asked} stores shared from this computer; the others are not recorded as shared from this account."));
+        }
+        TunnelState::Up { .. } => {
+            worse(CloudReach::Connected, &mut reach);
+            said.push("The people you share with can reach this computer.".to_string());
+        }
+        TunnelState::Down { reason } => {
+            worse(CloudReach::Offline, &mut reach);
+            said.push(format!("The people you share with cannot reach this computer until it can reach {host} ({reason})."));
+        }
+        TunnelState::Replaced => {
+            worse(CloudReach::Offline, &mut reach);
+            said.push("Another computer is sharing these stores now, so this one is not: only one can at a time.".to_string());
+        }
+    }
+    if offline > 0 {
+        worse(CloudReach::Offline, &mut reach);
+        said.push(format!("{} cannot reach {host}: edits wait here and go when it is back.", n(offline)));
+    }
+    if connecting > 0 {
+        worse(CloudReach::Connecting, &mut reach);
+        said.push(format!("{} connecting.", n(connecting)));
+    }
+    if synced > 0 {
+        worse(CloudReach::Connected, &mut reach);
+        said.push(format!("{} in sync with {host}.", n(synced)));
+    }
+    let lead = match reach {
+        CloudReach::Idle => format!("Signed in to {host}. Nothing here needs a connection to it right now."),
+        CloudReach::Connected => format!("Connected to {host}."),
+        CloudReach::Connecting => format!("Connecting to {host}."),
+        CloudReach::Offline => format!("Not everything here can reach {host}."),
+    };
+    said.insert(0, lead);
+    CloudConnection { reach, sentence: said.join(" ") }
+}
+
+#[cfg(test)]
+mod cloud_connection_tests {
+    use super::describe_cloud;
+    use crate::relay_face::TunnelState;
+    use pimble_core::SyncState;
+    use pimble_rpc::CloudReach;
+
+    fn synced() -> SyncState {
+        serde_json::from_str(r#"{"state":"synced","last_sync":"2026-11-06T00:00:00Z"}"#).unwrap()
+    }
+
+    #[test]
+    fn nothing_that_needs_a_connection_is_idle() {
+        let c = describe_cloud("pimble.app", &TunnelState::Idle, &[]);
+        assert_eq!(c.reach, CloudReach::Idle);
+        assert!(c.sentence.contains("Nothing here needs"), "{}", c.sentence);
+    }
+
+    #[test]
+    fn the_worst_part_is_the_whole() {
+        let up = TunnelState::Up { serving: 1, asked: 1 };
+        assert_eq!(describe_cloud("pimble.app", &up, &[(synced(), false)]).reach, CloudReach::Connected);
+        assert_eq!(describe_cloud("pimble.app", &up, &[(SyncState::Syncing, false)]).reach, CloudReach::Connecting);
+        let down = TunnelState::Down { reason: "connecting to wss://pimble.app/api/v1/relay failed".into() };
+        let c = describe_cloud("pimble.app", &down, &[(synced(), false)]);
+        assert_eq!(c.reach, CloudReach::Offline);
+        assert!(c.sentence.contains("cannot reach this computer"), "{}", c.sentence);
+        assert_eq!(describe_cloud("pimble.app", &TunnelState::Replaced, &[]).reach, CloudReach::Offline);
+        assert_eq!(describe_cloud("pimble.app", &TunnelState::Up { serving: 0, asked: 1 }, &[]).reach, CloudReach::Offline);
+    }
+
+    #[test]
+    fn a_share_whose_owner_is_off_still_reaches_pimble_cloud() {
+        let c = describe_cloud("pimble.app", &TunnelState::Idle, &[(SyncState::Offline, true)]);
+        assert_eq!(c.reach, CloudReach::Connected);
+        let c = describe_cloud("pimble.app", &TunnelState::Idle, &[(SyncState::Offline, false), (synced(), false)]);
+        assert_eq!(c.reach, CloudReach::Offline);
+        assert!(c.sentence.contains("1 store cannot reach pimble.app") && c.sentence.contains("1 store in sync"), "{}", c.sentence);
     }
 }

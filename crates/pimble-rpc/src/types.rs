@@ -1045,6 +1045,34 @@ pub struct CloudStatusResponse {
     pub user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// How this computer's connections to Pimble Cloud are doing, while an
+    /// account is signed in (`cloudConnectionChanged` says when it changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<CloudConnection>,
+}
+
+/// How this computer's connections to Pimble Cloud are doing, all of them
+/// together: the tunnel that lets people reach what is shared from here
+/// (docs/RELAY_CONTRACT.md) and the encrypted links of hosted and shared
+/// stores (docs/CRYPTO_CONTRACT.md). The status bar shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudConnection {
+    pub reach: CloudReach,
+    /// What it means, in a sentence or two: what is connected, or what
+    /// cannot be reached and what that stops.
+    pub sentence: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudReach {
+    /// Signed in, and nothing here needs a connection right now.
+    Idle,
+    Connecting,
+    Connected,
+    /// Something here cannot reach Pimble Cloud (or, for what is shared from
+    /// here, cannot be served by it).
+    Offline,
 }
 
 /// Host a local store's encrypted twin on Pimble Cloud: create a hosted

@@ -731,6 +731,10 @@ pub struct AppStore {
     pub cloud_signed_in: Signal<bool>,
     pub cloud_email: Signal<String>,
     pub cloud_url: Signal<String>,
+    /// How this computer's connections to Pimble Cloud are doing, while signed
+    /// in (`BackendEvent::CloudConnectionChanged`); `None` until the server
+    /// says, and from a server too old to.
+    pub cloud_connection: Signal<Option<pimble_rpc::CloudConnection>>,
 
     // "Account..." modal (Account menu, the status bar, and "Host on Pimble
     // Cloud..." with nothing signed in). One modal, two faces: the sign-in
@@ -1108,6 +1112,7 @@ impl AppStore {
             remove_replica_modal_pending: Signal::new(false),
             cloud_signed_in: Signal::new(false),
             cloud_email: Signal::new(String::new()),
+            cloud_connection: Signal::new(None),
             cloud_url: Signal::new(String::new()),
             account_modal_open: Signal::new(false),
             account_modal_url: Signal::new(String::new()),

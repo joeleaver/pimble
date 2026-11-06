@@ -1423,6 +1423,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     None => crate::state::ServerVersion::Unknown,
                 }));
             }
+            BackendEvent::CloudConnectionChanged { connection } => {
+                store.cloud_connection.set(connection.clone());
+            }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
                 // section 6): the account, or nobody when signed out.
@@ -1440,6 +1443,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
                 store.cloud_signed_in.set(*signed_in);
+                if !*signed_in {
+                    store.cloud_connection.set(None);
+                }
                 store.cloud_email.set(email.clone().unwrap_or_default());
                 store.cloud_url.set(url.clone().unwrap_or_default());
                 // Seed the sign-in form with the account this server knows,
