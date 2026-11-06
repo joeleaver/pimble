@@ -128,7 +128,7 @@ pub fn check(schema: &Value, value: &Value) -> Result<(), String> {
 }
 
 fn place(path: &str) -> String {
-    if path.is_empty() { "the settings".to_string() } else { path.to_string() }
+    if path.is_empty() { "the settings object".to_string() } else { path.to_string() }
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -283,14 +283,14 @@ mod tests {
     fn what_fits_and_what_does_not_says_where() {
         let s = schema();
         assert!(check(&s, &json!({ "name": "Shire", "year": [{ "month": "Afteryule", "days": 30 }, { "day": "Yule" }], "counts": "up" })).is_ok());
-        assert_eq!(check(&s, &json!({ "year": [] })).unwrap_err(), "the settings needs name");
+        assert_eq!(check(&s, &json!({ "year": [] })).unwrap_err(), "the settings object needs name");
         assert_eq!(check(&s, &json!({ "name": "S", "year": [] })).unwrap_err(), "year must have at least 1 entries");
         let e = check(&s, &json!({ "name": "S", "year": [{ "month": "A", "days": "thirty" }] })).unwrap_err();
         assert!(e.starts_with("year[0] must be one of: a month"), "{e}");
         assert_eq!(check(&s, &json!({ "name": 3, "year": [{ "day": "Y" }] })).unwrap_err(), "name must be text, not a whole number");
         assert_eq!(check(&s, &json!({ "name": "S", "year": [{ "day": "Y" }], "counts": "sideways" })).unwrap_err(), "counts must be one of \"up\", \"down\"");
         let e = check(&s, &json!({ "name": "S", "year": [{ "day": "Y" }], "colour": "red" })).unwrap_err();
-        assert!(e.starts_with("the settings has no colour; it takes"), "{e}");
+        assert!(e.starts_with("the settings object has no colour; it takes"), "{e}");
     }
 
     #[test]

@@ -6,9 +6,21 @@
       "about": "Shows the nodes of its source on a line of time, each placed by its own date fields and read in the timeline's calendar (the Gregorian unless its settings name a calendar node). A node with a date or a start is a point or a bar; a node with neither is a group label for the dated nodes under it. Make one with set_metanode (viewer \"timeline\", depth 2 is usual: groups, then events), then give each event a date with set_fields.",
       "source": "its subtree, usually two levels deep (groups, then events); any source works",
       "fields": [
-        { "name": "date", "about": "One moment, written as the timeline's calendar writes dates. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\", and a span in one field, \"1215-1217\".", "example": "Oct 14, 1066" },
-        { "name": "start", "about": "Where a span begins (read before date when both are there).", "example": "Mar 15, 44 BC" },
-        { "name": "end", "about": "Where a span ends; with start, the node is a bar.", "example": "Aug 19, 14" }
+        {
+          "name": "date",
+          "about": "One moment, written as the timeline's calendar writes dates: in an invented calendar its months' short names and its eras' short names (\"Fir 3, 1300 YF\"), and a day of no month by its name (\"Year's Gate, 1300 YF\"). An era left out means the calendar's quiet era. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\" (a season the calendar names), and a span in one field, \"1215-1217\". Nothing checks a date when it is written: one that does not read leaves its node off the line, so copy the forms here.",
+          "example": "Oct 14, 1066"
+        },
+        {
+          "name": "start",
+          "about": "Where a span begins (read before date when both are there).",
+          "example": "Mar 15, 44 BC"
+        },
+        {
+          "name": "end",
+          "about": "Where a span ends; with start, the node is a bar.",
+          "example": "Aug 19, 14"
+        }
       ],
       "settings": {
         "about": "The timeline's own settings. Leave calendar out for the Gregorian calendar; to count in an invented calendar, make a calendar node first (set_metanode with viewer \"calendar\", then set_viewer_settings with its definition) and name it here by its pimble: link. Dates in fields are then written the way that calendar writes them: its month names, its era's short name (\"Fir 3, 1300 YF\").",
@@ -16,14 +28,38 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "calendar": { "type": "string", "description": "a calendar node's pimble: link; absent for the Gregorian calendar" },
-            "also": { "type": "array", "description": "calendars shown under the timeline's own, lined up", "items": { "type": "string", "description": "\"gregorian\", or a calendar node's pimble: link" } },
-            "start": { "type": "string", "description": "the field read as where a span begins, instead of start" },
-            "date": { "type": "string", "description": "the field read as one moment, instead of date" },
-            "end": { "type": "string", "description": "the field read as where a span ends, instead of end" }
+            "calendar": {
+              "type": "string",
+              "description": "a calendar node's pimble: link; absent for the Gregorian calendar"
+            },
+            "also": {
+              "type": "array",
+              "description": "calendars shown under the timeline's own, lined up",
+              "items": {
+                "type": "string",
+                "description": "\"gregorian\", or a calendar node's pimble: link"
+              }
+            },
+            "start": {
+              "type": "string",
+              "description": "the field read as where a span begins, instead of start"
+            },
+            "date": {
+              "type": "string",
+              "description": "the field read as one moment, instead of date"
+            },
+            "end": {
+              "type": "string",
+              "description": "the field read as where a span ends, instead of end"
+            }
           }
         },
-        "example": { "calendar": "pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f", "also": ["gregorian"] }
+        "example": {
+          "calendar": "pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f",
+          "also": [
+            "gregorian"
+          ]
+        }
       }
     },
     {
@@ -31,25 +67,55 @@
       "about": "A calendar node: its settings are a calendar's whole definition, which timelines name to count in it. The person edits it as a form; an agent writes the definition with set_viewer_settings. Make one with set_metanode (viewer \"calendar\", depth 1) on a new node. Years are numbered absolutely (any whole number, year 0 starting at epoch); eras say how a person numbers them.",
       "source": "none needed (depth 1)",
       "settings": {
-        "about": "The definition. Months and days of no month come in the year's order. epoch is in seconds from the Gregorian 1 January AD 1 to the start of this calendar's year 0 (0 lines year 0 up with AD 1; one Gregorian year is about 31556952 seconds; negative is earlier). An era counting up starts at year from (its year 1 is the absolute year from); one counting down ends at year to (its year 1 is the absolute year to, as 1 BC is). One era should be quiet: it is left out when dates are written, and a year typed without an era is in it.",
+        "about": "The definition. Months and days of no month come in the year's order; a date on a day of no month is written with its name (\"Year's Gate, 1300 YF\"). Years are numbered absolutely: year 0 is the first year after epoch, -1 the one before. An era counting up names the absolute year that is its year 1 in from; one counting down names the absolute year that is its year 1 in to (as 1 BC is). With the example's eras, absolute year 0 is 1 YF and -1 is 1 BF. The leap rule is tested on the absolute year plus offset. epoch is the start of year 0 in seconds from the Gregorian 1 January AD 1: whole days times 86400 (0 lines year 0 up with AD 1; 1 January 1200 is 437925 days later, 37836720000; negative is earlier). One era should be quiet: it is left out when dates are written, and a year typed without an era is in it. Only the shape is checked when this is written: a season naming a month the year does not have, or an era without its from or to, is written as it is, and the calendar may then read dates wrongly.",
         "schema": {
           "type": "object",
-          "required": ["name", "day", "year", "eras"],
+          "required": [
+            "name",
+            "day",
+            "year",
+            "eras"
+          ],
           "additionalProperties": false,
           "properties": {
-            "name": { "type": "string" },
+            "name": {
+              "type": "string"
+            },
             "day": {
               "type": "object",
-              "required": ["hours", "minutes", "seconds"],
+              "required": [
+                "hours",
+                "minutes",
+                "seconds"
+              ],
               "additionalProperties": false,
               "properties": {
-                "hours": { "type": "integer", "minimum": 1 },
-                "minutes": { "type": "integer", "minimum": 1 },
-                "seconds": { "type": "integer", "minimum": 1 }
+                "hours": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "minutes": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
               }
             },
-            "week": { "type": "array", "description": "the day names in order; empty for no weeks", "items": { "type": "string" } },
-            "week_starts": { "type": "integer", "minimum": 0, "description": "which of week the first day of year 0 is" },
+            "week": {
+              "type": "array",
+              "description": "the day names in order; empty for no weeks",
+              "items": {
+                "type": "string"
+              }
+            },
+            "week_starts": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "which of week the first day of year 0 is"
+            },
             "year": {
               "type": "array",
               "minItems": 1,
@@ -58,23 +124,45 @@
                   {
                     "description": "a month: {\"month\": name, \"short\": short name, \"days\": count, \"leap_days\": days more in a leap year}",
                     "type": "object",
-                    "required": ["month", "days"],
+                    "required": [
+                      "month",
+                      "days"
+                    ],
                     "additionalProperties": false,
                     "properties": {
-                      "month": { "type": "string" },
-                      "short": { "type": ["string", "null"] },
-                      "days": { "type": "integer", "minimum": 0 },
-                      "leap_days": { "type": "integer", "minimum": 0 }
+                      "month": {
+                        "type": "string"
+                      },
+                      "short": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "days": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "leap_days": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
                     }
                   },
                   {
                     "description": "a day of no month: {\"day\": name, \"leap\": true when it is there only in leap years}",
                     "type": "object",
-                    "required": ["day"],
+                    "required": [
+                      "day"
+                    ],
                     "additionalProperties": false,
                     "properties": {
-                      "day": { "type": "string" },
-                      "leap": { "type": "boolean" }
+                      "day": {
+                        "type": "string"
+                      },
+                      "leap": {
+                        "type": "boolean"
+                      }
                     }
                   }
                 ]
@@ -85,28 +173,76 @@
               "description": "a leap year every N years (0: never), except every M, except every K after all; tested on the year plus offset",
               "additionalProperties": false,
               "properties": {
-                "every": { "type": "integer", "minimum": 0 },
-                "except_every": { "type": "integer", "minimum": 0 },
-                "except_except_every": { "type": "integer", "minimum": 0 },
-                "offset": { "type": "integer" }
+                "every": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "except_every": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "except_except_every": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "offset": {
+                  "type": "integer"
+                }
               }
             },
-            "epoch": { "type": "integer" },
+            "epoch": {
+              "type": "integer"
+            },
             "eras": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
-                "required": ["name", "short", "counts"],
+                "required": [
+                  "name",
+                  "short",
+                  "counts"
+                ],
                 "additionalProperties": false,
                 "properties": {
-                  "name": { "type": "string" },
-                  "short": { "type": "string", "description": "how dates write it: \"YF\"" },
-                  "also": { "type": "array", "items": { "type": "string" }, "description": "other ways of writing it" },
-                  "from": { "type": ["integer", "null"], "description": "counting up: the absolute year that is its year 1" },
-                  "to": { "type": ["integer", "null"], "description": "counting down: the absolute year that is its year 1" },
-                  "counts": { "enum": ["up", "down"] },
-                  "quiet": { "type": "boolean", "description": "left out when writing; a year typed without an era is in it" }
+                  "name": {
+                    "type": "string"
+                  },
+                  "short": {
+                    "type": "string",
+                    "description": "how dates write it: \"YF\""
+                  },
+                  "also": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "other ways of writing it"
+                  },
+                  "from": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "description": "counting up: the absolute year that is its year 1"
+                  },
+                  "to": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "description": "counting down: the absolute year that is its year 1"
+                  },
+                  "counts": {
+                    "enum": [
+                      "up",
+                      "down"
+                    ]
+                  },
+                  "quiet": {
+                    "type": "boolean",
+                    "description": "left out when writing; a year typed without an era is in it"
+                  }
                 }
               }
             },
@@ -115,13 +251,30 @@
               "description": "named parts of the year, \"spring of 412\"",
               "items": {
                 "type": "object",
-                "required": ["name", "from", "to"],
+                "required": [
+                  "name",
+                  "from",
+                  "to"
+                ],
                 "additionalProperties": false,
                 "properties": {
-                  "name": { "type": "string" },
-                  "also": { "type": "array", "items": { "type": "string" } },
-                  "from": { "type": "string", "description": "the month it starts with, by name" },
-                  "to": { "type": "string", "description": "the month it ends with, by name" }
+                  "name": {
+                    "type": "string"
+                  },
+                  "also": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "from": {
+                    "type": "string",
+                    "description": "the month it starts with, by name"
+                  },
+                  "to": {
+                    "type": "string",
+                    "description": "the month it ends with, by name"
+                  }
                 }
               }
             },
@@ -130,34 +283,103 @@
               "description": "how a date is written: \"Fir 3, 1300 YF\" by default",
               "additionalProperties": false,
               "properties": {
-                "day_first": { "type": "boolean", "description": "\"3 Fir 1300 YF\"" },
-                "full_months": { "type": "boolean", "description": "month names in full" },
-                "weekday": { "type": "boolean", "description": "the day of the week before the date" }
+                "day_first": {
+                  "type": "boolean",
+                  "description": "\"3 Fir 1300 YF\""
+                },
+                "full_months": {
+                  "type": "boolean",
+                  "description": "month names in full"
+                },
+                "weekday": {
+                  "type": "boolean",
+                  "description": "the day of the week before the date"
+                }
               }
             }
           }
         },
         "example": {
           "name": "Reckoning of the Founding",
-          "day": { "hours": 24, "minutes": 60, "seconds": 60 },
-          "week": ["Firstday", "Seconday", "Thirdday", "Fourthday", "Fifthday", "Restday"],
-          "year": [
-            { "day": "Year's Gate" },
-            { "month": "Firstmonth", "short": "Fir", "days": 30 },
-            { "month": "Seedmonth", "short": "See", "days": 30 },
-            { "month": "Rainmonth", "short": "Rai", "days": 30 },
-            { "month": "Sunmonth", "short": "Sun", "days": 30, "leap_days": 1 },
-            { "month": "Harvestmonth", "short": "Har", "days": 30 },
-            { "month": "Frostmonth", "short": "Fro", "days": 30 },
-            { "day": "Midwinter", "leap": true }
+          "day": {
+            "hours": 24,
+            "minutes": 60,
+            "seconds": 60
+          },
+          "week": [
+            "Firstday",
+            "Seconday",
+            "Thirdday",
+            "Fourthday",
+            "Fifthday",
+            "Restday"
           ],
-          "leap": { "every": 4 },
+          "year": [
+            {
+              "day": "Year's Gate"
+            },
+            {
+              "month": "Firstmonth",
+              "short": "Fir",
+              "days": 30
+            },
+            {
+              "month": "Seedmonth",
+              "short": "See",
+              "days": 30
+            },
+            {
+              "month": "Rainmonth",
+              "short": "Rai",
+              "days": 30
+            },
+            {
+              "month": "Sunmonth",
+              "short": "Sun",
+              "days": 30,
+              "leap_days": 1
+            },
+            {
+              "month": "Harvestmonth",
+              "short": "Har",
+              "days": 30
+            },
+            {
+              "month": "Frostmonth",
+              "short": "Fro",
+              "days": 30
+            },
+            {
+              "day": "Midwinter",
+              "leap": true
+            }
+          ],
+          "leap": {
+            "every": 4
+          },
           "epoch": -31556952000,
           "eras": [
-            { "name": "Before the Founding", "short": "BF", "to": -1, "counts": "down" },
-            { "name": "Year of the Founding", "short": "YF", "from": 0, "counts": "up", "quiet": true }
+            {
+              "name": "Before the Founding",
+              "short": "BF",
+              "to": -1,
+              "counts": "down"
+            },
+            {
+              "name": "Year of the Founding",
+              "short": "YF",
+              "from": 0,
+              "counts": "up",
+              "quiet": true
+            }
           ],
-          "seasons": [{ "name": "Growing", "from": "Seedmonth", "to": "Sunmonth" }]
+          "seasons": [
+            {
+              "name": "Growing",
+              "from": "Seedmonth",
+              "to": "Sunmonth"
+            }
+          ]
         }
       }
     }

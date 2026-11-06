@@ -1,6 +1,7 @@
 # What plugins tell agents: viewer guides
 
-Status: designed and built 2026-11-06 on branch `agent-guides`. Joe asked for it the same
+Status: waves 1 and 2 built 2026-11-06 on branch `agent-guides` (sections 6 and 7); one
+open question for Joe (section 8). Joe asked for it the same
 day ("We should probably build that"), after a look at what an agent could do with the
 plugins through the MCP: it could guess its way to a Gregorian timeline but could not make
 a calendar, set a timeline's calendar, or learn an invented calendar's month names.
@@ -105,3 +106,78 @@ loads, read again on every call (a few file reads; nothing cached that could go 
 2. **A blind agent's trial.** A fresh agent with only the MCP, on a scratch server, is
    asked to make a timeline of the Roman Republic and a second one in an invented
    calendar of its own. Where it stumbles goes into the guides or the tools.
+
+## 6. Wave 1 as built (2026-11-06)
+
+As sections 2 to 4 say:
+- `pimble_plugin_abi::guide` holds the types, `read`, `custom_section` and `check`;
+- `plugin!`'s `guide:` arm adds a `#[used]` static in the `pimble-guide` link section;
+- `crates/pimble-mcp/src/tools/viewer_tools.rs` holds the three tools.
+
+Checked:
+- **`guide` tests (3).** A refusal names the place: "year[0] must be one of: a month...",
+  "the settings object has no colour; it takes ...". An example that does not fit its
+  own schema fails the guide. The section is read out of a module.
+- **Each plugin's `the_guide_reads_and_names_its_viewers`,** and the timeline's
+  `the_calendar_schema_fits_the_calendars_the_code_writes`:
+  - the Gregorian and invented calendars, as serde writes them, fit the schema;
+  - the example reads as a `Calendar`;
+  - the timeline's example names a calendar.
+- **The MCP's `an_agent_reads_a_guide_and_writes_settings_that_fit_it`,** on a real
+  server with a module carrying the timeline's own `guide.json`:
+  - listing the viewers;
+  - a node that is not a metanode is refused;
+  - a misshapen calendar is refused and nothing is written;
+  - a good one is written and read back;
+  - another viewer's settings are refused;
+  - `get_node`'s pointer, and `set_metanode`'s note for a viewer nothing provides.
+- **The built modules** carry the section: `pimble-guide`, `name`, `producers`,
+  `target_features`.
+
+## 7. Wave 2: the blind trial (2026-11-06)
+
+A fresh agent got only a stdio MCP client (the server's instructions and the tools'
+descriptions, as a real client shows them) and an empty scratch store. Its task: a Roman
+Republic timeline, then a calendar for an invented world and a timeline counting in it. It
+made three things without a failed call:
+- **"Roman Republic":** 16 events in three groups, BC days and spans;
+- **"Reckoning of the Kindling":** eight months of 45 or 46 days, three days of no month
+  (one only in leap years), a six-day week, a leap rule with an exception, four seasons,
+  eras BK and AK, and year 0 at 1 January 1200;
+- **"Chronicle of Aerth":** 9 events in it, with the Gregorian shown beside.
+
+**Opened in the app afterwards, both drew right.** Every event of both was on the line:
+BC spans as bars, "Yearsdawn, 1 AK" and "Midsummer Feast, 310 AK" as points, "spring of
+40 BK" as a soft span, and the Gregorian axis lined up with 1 AK at 1200.
+
+What it stumbled on, and what came of it:
+- **Days of no month, eras and absolute years, and the epoch** were guessed and worked
+  out. The calendar's guide now gives:
+  - the form "Year's Gate, 1300 YF";
+  - which absolute year is which era's year 1;
+  - what the leap rule tests;
+  - the epoch as whole days times 86400, with a worked example.
+- **Refusals read "the settings has no ..."**: now "the settings object".
+- **Nothing checks a date, a calendar link or a calendar's meaning when written.**
+  "Blorpuary 99, banana" was taken as a date, "not a link" as a calendar, and a season
+  naming a month the year lacks as a season. The guides now say so (copy the forms shown;
+  only the shape is checked). Closing it is section 8.
+- **A viewer made with `set_metanode` keeps the plain node icon**, where New Timeline
+  gives its recipe's icon. The MCP sets no icons. Left as it is.
+- **`$defs` referenced by tool schemas** were missing from the trial client's listing.
+  That is the client's printing, not the server's; real MCP clients resolve them.
+
+## 8. Open: checking what only the plugin understands (Joe's call)
+
+How a date reads, whether a calendar link names a calendar, and whether a calendar makes
+sense are known only to the plugin's own code. Decision 1 keeps plugin code out of the
+agent's path, and the timeline contract's decision 4 keeps calendars inside the plugin.
+So the MCP can check only the shape. The ways to close it:
+
+1. **A pure check the plugin exports**, run by the MCP under wasmtime: settings or a
+   field value in, sentences out. Nothing is mounted, and the API is not reachable from
+   it. It needs wasmtime in `pimble-mcp`, which is the size of the app's plugin host, and
+   about a second to compile the timeline the first time (cacheable).
+2. **Leave it**, as now: the guides teach the forms, and the trial showed an agent
+   following them gets it right. A wrong date shows to the person as an event missing
+   from the line.
