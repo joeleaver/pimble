@@ -106,23 +106,83 @@ enum Cmd {
     SetBlock(&'static str),
     /// One of rinch's editor commands, by name.
     Run(&'static str),
-    HorizontalRule,
     Undo,
     Redo,
     ClearFormatting,
-    /// One of the Edit menu's inserts, into the focused pane's note.
+    /// One of the inserts (`inserts`), into the focused pane's note.
     Insert(Insert),
+    /// A discussion at the caret, drawn in the margin.
+    Discuss,
 }
 
-/// The Edit menu's inserts, the same functions its items call (`menus.rs`).
-#[derive(Clone, Copy)]
-enum Insert {
-    Image,
-    Board,
+/// What goes into a note's text at the caret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Insert {
+    Canvas,
     Sheet,
     SheetNode,
-    Field,
     Discussion,
+    Table,
+    Rule,
+    Field,
+    Picture,
+}
+
+/// One insert: its icon, its name in Edit > Insert, and its button's tooltip.
+pub(crate) struct InsertItem {
+    pub icon: TablerIcon,
+    pub label: &'static str,
+    pub tip: &'static str,
+    pub what: Insert,
+    /// A rule goes before it in the menu.
+    pub divided: bool,
+}
+
+/// Edit > Insert and the toolbar's Insert group are this one list, in this
+/// order, so they cannot drift apart. What New also makes (a canvas, a sheet,
+/// a discussion, a canvas from a picture) has New's name, icon and place in the order
+/// (`crate::creating::kinds`; Joe, 2026-11-06).
+pub(crate) fn inserts() -> Vec<InsertItem> {
+    let item = |icon, label, tip, what, divided| InsertItem { icon, label, tip, what, divided };
+    vec![
+        item(TablerIcon::Chalkboard, "Canvas", "Insert Canvas", Insert::Canvas, false),
+        item(TablerIcon::Table, "Sheet", "Insert Sheet", Insert::Sheet, false),
+        item(TablerIcon::TableShare, "Sheet from a Node...", "Insert Sheet from a Node...", Insert::SheetNode, false),
+        item(TablerIcon::Messages, "Discussion", "Insert Discussion", Insert::Discussion, false),
+        item(TablerIcon::TablePlus, "Table", "Insert Table", Insert::Table, true),
+        item(TablerIcon::SeparatorHorizontal, "Horizontal Rule", "Insert Horizontal Rule", Insert::Rule, false),
+        item(TablerIcon::Forms, "Field", "Add Field", Insert::Field, false),
+        item(TablerIcon::Photo, "Canvas from Picture...", "Insert Canvas from Picture...", Insert::Picture, true),
+    ]
+}
+
+/// Put `what` into the focused pane's note at its caret: Edit > Insert and
+/// the toolbar both run this. With no note there, or one this device may only
+/// read, it says so.
+pub(crate) fn insert(store: AppStore, what: Insert) {
+    match what {
+        Insert::Canvas => crate::text_boards::insert_board(store),
+        Insert::Sheet => crate::sheets::in_text::insert_sheet(store),
+        Insert::SheetNode => crate::sheets::in_text::insert_sheet_node(store),
+        Insert::Discussion => crate::discussions::insert_inline(store),
+        Insert::Field => crate::properties::add_field(store),
+        Insert::Picture => crate::pictures::insert_image(store),
+        Insert::Table | Insert::Rule => {
+            let pane = store.focused();
+            let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
+                crate::events::show_notice(store, "Open a note to put it in.".to_string());
+                return;
+            };
+            if !store.node_access(active.store_id, active.node_id).allows_write() {
+                crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+                return;
+            }
+            let h = editor(pane);
+            h.command(if what == Insert::Table { "insertTable" } else { "insertHorizontalRule" });
+            h.focus();
+            bump_toolbar(pane);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,15 +246,7 @@ fn button_groups() -> Vec<Group> {
         // The Edit menu's inserts, at the caret, plus the text's own table and rule.
         Group {
             label: "Insert",
-            buttons: vec![
-                b(TablerIcon::Photo, "Insert Image...", Cmd::Insert(Insert::Image), ActiveCheck::None),
-                b(TablerIcon::Chalkboard, "Insert Canvas", Cmd::Insert(Insert::Board), ActiveCheck::None),
-                b(TablerIcon::Table, "Insert Sheet", Cmd::Insert(Insert::Sheet), ActiveCheck::None),
-                b(TablerIcon::TableShare, "Insert Sheet from a Node...", Cmd::Insert(Insert::SheetNode), ActiveCheck::None),
-                b(TablerIcon::TablePlus, "Insert Table", Cmd::Run("insertTable"), ActiveCheck::None),
-                b(TablerIcon::SeparatorHorizontal, "Horizontal Rule", Cmd::HorizontalRule, ActiveCheck::None),
-                b(TablerIcon::Forms, "Add Field", Cmd::Insert(Insert::Field), ActiveCheck::None),
-            ],
+            buttons: inserts().into_iter().map(|i| b(i.icon, i.tip, Cmd::Insert(i.what), ActiveCheck::None)).collect(),
             in_table_only: false,
             for_commenters: false,
         },
@@ -214,7 +266,7 @@ fn button_groups() -> Vec<Group> {
         // in the margin.
         Group {
             label: "Discuss",
-            buttons: vec![b(TablerIcon::MessagePlus, "Start a Discussion Here", Cmd::Insert(Insert::Discussion), ActiveCheck::None)],
+            buttons: vec![b(TablerIcon::MessagePlus, "Start a Discussion Here", Cmd::Discuss, ActiveCheck::None)],
             in_table_only: false,
             for_commenters: true,
         },
@@ -300,14 +352,11 @@ fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
     match cmd {
         // These act on the focused pane, which is the one the toolbar follows.
         Cmd::Insert(what) => {
-            match what {
-                Insert::Image => crate::pictures::insert_image(store),
-                Insert::Board => crate::text_boards::insert_board(store),
-                Insert::Sheet => crate::sheets::in_text::insert_sheet(store),
-                Insert::SheetNode => crate::sheets::in_text::insert_sheet_node(store),
-                Insert::Field => crate::properties::add_field(store),
-                Insert::Discussion => crate::discussions::start_here(store),
-            }
+            insert(store, *what);
+            return;
+        }
+        Cmd::Discuss => {
+            crate::discussions::start_here(store);
             return;
         }
         Cmd::ToggleWrap(tag) => {
@@ -353,9 +402,6 @@ fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
         }
         Cmd::Run(name) => {
             h.command(name);
-        }
-        Cmd::HorizontalRule => {
-            h.command("insertHorizontalRule");
         }
         Cmd::Undo => {
             h.command("undo");

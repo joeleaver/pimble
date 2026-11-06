@@ -14,6 +14,7 @@ use crate::state::AppStore;
 pub enum Section {
     General,
     Account,
+    Shares,
     Plugins,
     Agents,
     Updates,
@@ -24,9 +25,9 @@ impl Section {
     /// is always the version pimble.app serves.
     pub fn all() -> &'static [Section] {
         if cfg!(feature = "native") {
-            &[Section::General, Section::Account, Section::Plugins, Section::Agents, Section::Updates]
+            &[Section::General, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates]
         } else {
-            &[Section::General, Section::Account, Section::Plugins]
+            &[Section::General, Section::Account, Section::Shares, Section::Plugins]
         }
     }
 
@@ -34,6 +35,7 @@ impl Section {
         match self {
             Section::General => "General",
             Section::Account => "Account",
+            Section::Shares => "Shares",
             Section::Plugins => "Plugins",
             Section::Agents => "AI Agents",
             Section::Updates => "Updates",
@@ -44,6 +46,7 @@ impl Section {
         match self {
             Section::General => "general",
             Section::Account => "account",
+            Section::Shares => "shares",
             Section::Plugins => "plugins",
             Section::Agents => "agents",
             Section::Updates => "updates",
@@ -72,6 +75,7 @@ pub fn open_at(store: AppStore, section: Section) {
 fn choose(store: AppStore, section: Section) {
     match section {
         Section::Plugins => crate::plugins::shown(store),
+        Section::Shares => crate::shares::shown(store),
         #[cfg(feature = "native")]
         Section::Agents => crate::agents::shown(store),
         Section::Account => crate::app::account_shown(store),
@@ -100,6 +104,7 @@ pub fn showing(store: AppStore, section: Section) -> bool {
 pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -> NodeHandle {
     let general = render_general(__scope, store);
     let plugins = crate::plugins::render_page(__scope, store);
+    let shares = crate::shares::render_page(__scope, store);
     let nav = rsx! {
         div {
             class: "pimble-settings__nav",
@@ -122,6 +127,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
                 class: "pimble-settings__page",
                 div { style: {move || page_style(store, Section::General)}, {general} }
                 div { style: {move || page_style(store, Section::Account)}, {account} }
+                div { style: {move || page_style(store, Section::Shares)}, {shares} }
                 div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
                 div { style: {move || page_style(store, Section::Agents)}, {agents} }
                 div { style: {move || page_style(store, Section::Updates)}, {updates} }
@@ -134,6 +140,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
             class: "pimble-settings__page",
             div { style: {move || page_style(store, Section::General)}, {general} }
             div { style: {move || page_style(store, Section::Account)}, {account} }
+            div { style: {move || page_style(store, Section::Shares)}, {shares} }
             div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
         }
     };

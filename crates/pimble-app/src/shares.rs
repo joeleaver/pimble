@@ -24,7 +24,6 @@ pub type ShareKey = (StoreId, Option<NodeId>);
 /// first-open question. One per window.
 #[derive(Clone, Copy)]
 pub struct SharesUi {
-    pub open: Signal<bool>,
     pub listing: Signal<Option<CloudListSharesResponse>>,
     pub error: Signal<String>,
     pub busy: Signal<bool>,
@@ -45,7 +44,6 @@ pub struct SharesUi {
 impl SharesUi {
     pub fn new() -> Self {
         Self {
-            open: Signal::new(false),
             listing: Signal::new(None),
             error: Signal::new(String::new()),
             busy: Signal::new(false),
@@ -65,12 +63,17 @@ impl Default for SharesUi {
     }
 }
 
-/// Account > "Shares...".
+/// Account > "Shares...": Settings at Shares.
 pub fn open(store: AppStore) {
+    crate::settings::open_at(store, crate::settings::Section::Shares);
+}
+
+/// Settings > Shares is shown: the list, asked for again. Making a share stays
+/// on the node ("Share..."); this is the shares you are in and your name in them.
+pub(crate) fn shown(store: AppStore) {
     let ui = store.shares_ui;
     ui.error.set(String::new());
     ui.busy.set(true);
-    ui.open.set(true);
     store.send(BackendCommand::CloudListShares);
 }
 
@@ -251,7 +254,7 @@ fn apply_share(store: AppStore, key: ShareKey) {
 fn open_share(store: AppStore, row: &CloudShareRow) {
     let node = row.root.or_else(|| store.root_node_id(row.store_id));
     if let Some(node) = node {
-        store.shares_ui.open.set(false);
+        store.settings.set(None);
         store.send(BackendCommand::ResolveLink { url: PimbleUrl::node(row.store_id, node), hops: 0 });
     }
 }
@@ -261,16 +264,10 @@ fn add_here(store: AppStore, row: &CloudShareRow) {
     store.send(BackendCommand::CloudAddHostedStore { store_id: row.store_id });
 }
 
-pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let ui = store.shares_ui;
     let rows = move || ui.listing.get().map(|l| l.shares).unwrap_or_default();
     rsx! {
-        Modal {
-            opened_fn: move || ui.open.get(),
-            onclose: move || ui.open.set(false),
-            title: "Shares",
-            size: "lg",
-
             div {
                 class: "pimble-shares",
                 div {
@@ -343,7 +340,6 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     {move || ui.error.get()}
                 }
             }
-        }
     }
 }
 

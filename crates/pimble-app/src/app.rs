@@ -162,7 +162,7 @@ thread_local! {
     /// Registered by the browser entry point, like [`ACCOUNT_ACTION`].
     static SIGN_OUT_ACTION: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The search box's `NodeHandle`, captured once when the toolbar is built
-    /// so the View menu's "Focus Search" (Ctrl+K) action — constructed earlier,
+    /// so the View menu's "Focus Search" (Ctrl+Shift+F) action — constructed earlier,
     /// before the box exists — can reach it later. Same reach-across-closures
     /// need as `EVENT_PROCESSOR`/`CLOSE_HANDLER` below.
     static SEARCH_INPUT: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
@@ -2607,7 +2607,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             input {
                 r#type: "text",
                 class: "pimble-search-bar__input",
-                placeholder: "Search... (Ctrl+K)",
+                placeholder: "Search... (Ctrl+Shift+F)",
                 // Raw elements have no special "value_fn" prop — that's a
                 // `TextInput`-component-only field. On a raw `<input>` any
                 // closure-valued prop just becomes a reactively-set attribute
@@ -4544,9 +4544,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         #[cfg(feature = "native")]
         let brand: rinch::components::SectionRenderer =
             Rc::new(move |__scope| crate::brand::titlebar_lockup(__scope, store));
-        // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
-        // section 3), both targets.
-        let shares_modal = crate::shares::render_modal(__scope, store);
+        // The first-open question (docs/PRESENCE_CONTRACT.md section 3), both
+        // targets; "Shares..." is a page of Settings.
         // This window's panes, said to everyone else (docs/PRESENCE_CONTRACT.md).
         crate::presence::start(store);
         let share_name_question = crate::shares::render_question(__scope, store);
@@ -4588,7 +4587,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {stop_relay_modal}
                 {hosted_modal}
                 {share_modal}
-                {shares_modal}
                 {share_name_question}
                 {paste_chooser}
                 {body}
@@ -4623,7 +4621,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {stop_relay_modal}
                 {hosted_modal}
                 {share_modal}
-                {shares_modal}
                 {share_name_question}
                 {paste_chooser}
                 {body}

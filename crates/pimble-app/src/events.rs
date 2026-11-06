@@ -752,8 +752,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let root_id = opened_store.root_node_id;
 
                 register_opened_store(store, tree_state, opened_store);
-                // "Add Here" in the Shares dialog: the row becomes "Open".
-                if untracked(|| store.shares_ui.open.get()) {
+                // "Add Here" in Settings > Shares: the row becomes "Open".
+                if untracked(|| crate::settings::showing(store, crate::settings::Section::Shares)) {
                     store.send(BackendCommand::CloudListShares);
                 }
 

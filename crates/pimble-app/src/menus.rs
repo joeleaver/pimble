@@ -95,20 +95,42 @@ fn account_entries(store: AppStore) -> Vec<MenuEntry> {
 /// the "+" list.
 fn new_entries(store: AppStore) -> Vec<MenuEntry> {
     use crate::creating::{make_from_plus, Kind};
-    let make = move |kind: Kind| move || {
-        make_from_plus(store, &kind);
-    };
-    vec![
-        MenuEntry::item("Text", "", make(Kind::Text)),
-        MenuEntry::item("Canvas", "", make(Kind::Canvas)),
-        MenuEntry::item("Sheet", "", make(Kind::Sheet)),
-        MenuEntry::item("Discussion", "", make(Kind::Discussion)),
-        MenuEntry::item(crate::creating::METANODE, "", make(Kind::Metanode)),
-        MenuEntry::Separator,
-        MenuEntry::item("More...", "", move || store.new_menu_open.set(true)),
-        MenuEntry::Separator,
-        MenuEntry::item("Canvas from Picture...", "", make(Kind::CanvasFromPicture)),
-    ]
+    // The row menu's list (`creating::kinds`), so the two cannot drift; the
+    // plugins' kinds, which load later, are behind "More...".
+    let mut entries = Vec::new();
+    let mut more = false;
+    for item in crate::creating::kinds(store) {
+        if matches!(item.kind, Kind::Recipe(_)) {
+            continue;
+        }
+        if item.divided && !more {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::item("More...", "", move || store.new_menu_open.set(true)));
+            more = true;
+        }
+        if item.divided {
+            entries.push(MenuEntry::Separator);
+        }
+        let kind = item.kind.clone();
+        let label: &'static str = Box::leak(item.label.into_boxed_str());
+        entries.push(MenuEntry::item(label, "", move || {
+            make_from_plus(store, &kind);
+        }));
+    }
+    entries
+}
+
+/// Edit > Insert: `toolbar::inserts`, in its order.
+fn insert_entries(store: AppStore) -> Vec<MenuEntry> {
+    let mut entries = Vec::new();
+    for item in crate::toolbar::inserts() {
+        if item.divided {
+            entries.push(MenuEntry::Separator);
+        }
+        let what = item.what;
+        entries.push(MenuEntry::item(item.label, "", move || crate::toolbar::insert(store, what)));
+    }
+    entries
 }
 
 fn file_entries(store: AppStore) -> Vec<MenuEntry> {
@@ -201,20 +223,12 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
             }
         }),
         MenuEntry::Separator,
-        // docs/IMAGES_CONTRACT.md "Showing and inserting images": into the
-        // focused pane's note, at its caret. With no note there, or one this
-        // device may only read, it says so.
-        MenuEntry::item("Insert Image...", "", move || crate::pictures::insert_image(store)),
-        MenuEntry::item("Insert Canvas", "", move || crate::text_boards::insert_board(store)),
-        // docs/SHEETS_CONTRACT.md section 1: a new table at the caret.
-        MenuEntry::item("Insert Sheet", "", move || crate::sheets::in_text::insert_sheet(store)),
-        // A sheet node of its own, shown live in the text.
-        MenuEntry::item("Insert Sheet from a Node...", "", move || crate::sheets::in_text::insert_sheet_node(store)),
-        // docs/DISCUSSIONS_CONTRACT.md section 6: a discussion at the caret, shown there.
-        MenuEntry::item("Insert Discussion", "", move || crate::discussions::insert_inline(store)),
-        // docs/SHEETS_CONTRACT.md section 8: a named value on the node, in
-        // the Properties panel (docs/PROPERTIES_CONTRACT.md).
-        MenuEntry::item("Add Field", "", move || crate::properties::add_field(store)),
+        // Into the focused pane's note, at its caret: the toolbar's Insert
+        // group, the same list (`toolbar::inserts`). With no note there, or
+        // one this device may only read, it says so.
+        MenuEntry::Sub { label: "Insert", entries: insert_entries(store) },
+        // Nodes, where the explorer's "+" makes them: File > New's list.
+        MenuEntry::Sub { label: "New", entries: new_entries(store) },
         // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
         // A discussion at the caret, drawn in the margin (commenters too).
         MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
@@ -262,7 +276,7 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Forward", "Alt+Right", move || store.nav_step.set(Some(false))),
         MenuEntry::Separator,
         MenuEntry::item("Focus Explorer", "Ctrl+Shift+E", crate::app::focus_explorer),
-        MenuEntry::item("Focus Search", "Ctrl+K", crate::app::focus_search),
+        MenuEntry::item("Focus Search", "Ctrl+Shift+F", crate::app::focus_search),
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)
         }),
