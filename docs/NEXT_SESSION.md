@@ -1,5 +1,21 @@
 # Next session: start here
 
+**2026-11-05 (session 78e7f30f): v0.19.0 released with three plugin pieces since v0.18.1,
+each merged into `master` from its own branch:**
+- **Kanban open beside** (`open-beside`, plugin ABI 6): a card opens in a pane beside the
+  board, which keeps the focus; no buttons on the board.
+- **Todo list** (`todo-list`, `plugins/todo-viewer`, docs/TODO_CONTRACT.md): a subtree as
+  a checklist.
+- **Timeline** (`timeline`, `plugins/timeline-viewer`, docs/TIMELINE_CONTRACT.md, all
+  four waves): nodes on a line of time by their fields; calendars as data, invented ones
+  made up in a calendar node's form; drags; several calendars lined up; rough dates;
+  presence on bars. One change outside the plugin: `NodeDoc::edit_data` (pimble-crdt),
+  a general edit of one place inside a node's data.
+
+Joe has not judged the timeline's calendar shape (contract section 3, built as proposed)
+and has not seen the timeline in the browser; both are open. Plugins are not in the
+packages: `scripts/plugins/install.sh` installs all three.
+
 **2026-11-04 (session b7ec70bd): v0.18.1 released (release commit 7fc903a), deployed (jkbase
 v47) and installed here, with the kanban plugin; rinch `main` c69c65ec in all three locks
 (root, `web/`, `plugins/`).** `master` = `origin/master`, clean. Eleven releases in two days
