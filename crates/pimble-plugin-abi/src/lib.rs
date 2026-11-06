@@ -28,6 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod guide;
 
 /// The version of this ABI. A host runs only plugins built for the same version;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on

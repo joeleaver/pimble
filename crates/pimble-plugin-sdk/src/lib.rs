@@ -184,8 +184,23 @@ impl ManifestExt for Manifest {
 /// (a function written like a rinch component, whose first parameter is named
 /// `__scope` so `rsx!` can use it). The exports exist only in the wasm build, so the
 /// same crate also builds natively for its own tests.
+///
+/// With `guide: include_bytes!("../guide.json")`, the plugin also carries what it
+/// tells agents about its viewers (docs/AGENT_GUIDES_CONTRACT.md) as the module's
+/// `pimble-guide` custom section, which the MCP reads from the file without
+/// running anything. Check it in the crate's tests with
+/// `pimble_plugin_sdk::abi::guide::Guide::parse`.
 #[macro_export]
 macro_rules! plugin {
+    (describe: $describe:path, view: $view:path, guide: $guide:expr $(,)?) => {
+        $crate::plugin!(describe: $describe, view: $view);
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            #[used]
+            #[unsafe(link_section = "pimble-guide")]
+            static GUIDE: [u8; $guide.len()] = *$guide;
+        };
+    };
     (describe: $describe:path, view: $view:path $(,)?) => {
         #[cfg(target_arch = "wasm32")]
         const _: () = {

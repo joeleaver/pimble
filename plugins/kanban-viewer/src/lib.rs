@@ -1597,10 +1597,23 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, card: board::Card) -> Node
     }
 }
 
-pimble_plugin_sdk::plugin!(describe: describe, view: view);
+pimble_plugin_sdk::plugin!(describe: describe, view: view, guide: include_bytes!("../guide.json"));
 
 #[cfg(test)]
 mod tests {
+    /// What it tells agents (docs/AGENT_GUIDES_CONTRACT.md) reads, names
+    /// every viewer the manifest provides, and nothing else.
+    #[test]
+    fn the_guide_reads_and_names_its_viewers() {
+        let guide = pimble_plugin_sdk::abi::guide::Guide::parse(include_bytes!("../guide.json")).unwrap();
+        let mut guided: Vec<&str> = guide.viewers.iter().map(|v| v.viewer.as_str()).collect();
+        let manifest = super::describe();
+        let mut provided: Vec<&str> = manifest.viewers().map(|v| v.id.as_str()).collect();
+        guided.sort();
+        provided.sort();
+        assert_eq!(guided, provided);
+    }
+
     use super::*;
 
     #[test]

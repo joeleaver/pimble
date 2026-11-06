@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "viewers": [
+    {
+      "viewer": "kanban",
+      "about": "Shows the metanode's children as a board: the first level is columns and the second level is cards, both in the tree's order, which is their priority (first is highest). A card moves between columns by moving its node (move_node); a new card is a new node under its column. A column that is itself a metanode shown with the kanban viewer is a lane: a row of the board with its own columns. Nothing is kept anywhere but the tree, so a card's text, tags and fields are the node's own.",
+      "source": "the metanode's children, two levels deep (set_metanode depth 2)"
+    }
+  ]
+}

@@ -538,3 +538,11 @@ the pane shows the outline with the request and "Allow"); 6, no network in these
    for wave 3 (2026-11-03): stopped when a turn that ran past its budget returns.
 6. **Network access:** none in the first waves (recommended), or a host-mediated `fetch`
    gated by the install permission.
+
+## What a plugin tells agents (2026-11-06)
+
+A plugin may carry a guide for agents: what each of its viewers shows, the node fields it
+reads, and its settings with a schema. The plugin's crate holds it as `guide.json`, and it
+is embedded with `plugin!(describe: ..., view: ..., guide: include_bytes!("../guide.json"))`
+as the module's `pimble-guide` custom section. The MCP reads it from the file; nothing
+runs. No ABI change. docs/AGENT_GUIDES_CONTRACT.md.

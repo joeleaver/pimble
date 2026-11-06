@@ -20,6 +20,10 @@ pimble-crdt = { workspace = true }
 # exactly as the app does.
 pimble-sheet = { workspace = true }
 pimble-discussion = { workspace = true }
+# What each installed plugin tells agents about its viewers
+# (docs/AGENT_GUIDES_CONTRACT.md): read from its module, never run.
+pimble-plugin-abi = { workspace = true }
+dirs = "6"
 # Canvases (docs/CANVAS_CONTRACT.md, docs/MCP_CONTRACT.md "Canvases"): read,
 # written and rendered as the app does.
 pimble-board = { workspace = true }

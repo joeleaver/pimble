@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "viewers": [
+    {
+      "viewer": "todo",
+      "about": "Shows the metanode's subtree as a checklist: every node is an item, an item's children are its sub-todos, and the tree's order is the list's order. Checking an item off is setting its done field; a parent shows its children's progress and is never checked by them.",
+      "source": "the metanode's whole subtree (set_metanode depth 16, as New Todo List makes it)",
+      "fields": [
+        { "name": "done", "about": "The moment the item was checked off, RFC 3339 in UTC; absent while it is not done. Remove the field to uncheck it.", "example": "2026-11-06T18:30:00Z" },
+        { "name": "due", "about": "When it is due, as a person types a date; shown as \"Today\", \"Tomorrow\" or the date, red once past and not done.", "example": "Nov 12, 2026" }
+      ]
+    }
+  ]
+}

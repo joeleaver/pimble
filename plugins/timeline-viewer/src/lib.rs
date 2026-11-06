@@ -1458,10 +1458,42 @@ fn grip_style(side: &str, v: View, start: i64, end: Option<i64>) -> String {
     }
 }
 
-pimble_plugin_sdk::plugin!(describe: describe, view: view);
+pimble_plugin_sdk::plugin!(describe: describe, view: view, guide: include_bytes!("../guide.json"));
 
 #[cfg(test)]
 mod tests {
+    /// What it tells agents (docs/AGENT_GUIDES_CONTRACT.md) reads, names
+    /// every viewer the manifest provides, and nothing else.
+    #[test]
+    fn the_guide_reads_and_names_its_viewers() {
+        let guide = pimble_plugin_sdk::abi::guide::Guide::parse(include_bytes!("../guide.json")).unwrap();
+        let mut guided: Vec<&str> = guide.viewers.iter().map(|v| v.viewer.as_str()).collect();
+        let manifest = super::describe();
+        let mut provided: Vec<&str> = manifest.viewers().map(|v| v.id.as_str()).collect();
+        guided.sort();
+        provided.sort();
+        assert_eq!(guided, provided);
+    }
+
+    /// The calendar's schema takes every calendar the plugin itself writes,
+    /// and its example is a calendar the plugin reads.
+    #[test]
+    fn the_calendar_schema_fits_the_calendars_the_code_writes() {
+        use pimble_plugin_sdk::abi::guide::{check, Guide};
+        let guide = Guide::parse(include_bytes!("../guide.json")).unwrap();
+        let settings = guide.viewer(super::CALENDAR_VIEWER).unwrap().settings.as_ref().unwrap();
+        for cal in [crate::calendar::Calendar::gregorian(), crate::calendar::Calendar::invented()] {
+            let written = serde_json::to_value(&cal).unwrap();
+            check(&settings.schema, &written).unwrap_or_else(|e| panic!("{}: {e}", cal.name));
+        }
+        let example: crate::calendar::Calendar = serde_json::from_value(settings.example.clone().unwrap()).unwrap();
+        assert_eq!(example.name, "Reckoning of the Founding");
+        // The timeline's example names a calendar the way its settings do.
+        let timeline = guide.viewer(super::VIEWER).unwrap().settings.as_ref().unwrap();
+        let s = super::parse_settings(Some(&timeline.example.clone().unwrap().to_string()));
+        assert!(s.calendar.is_some());
+    }
+
     use super::*;
 
     #[test]

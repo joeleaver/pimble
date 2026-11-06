@@ -31,6 +31,7 @@ mod api_tests;
 #[cfg(test)]
 mod presence_tests;
 mod sheet_tools;
+mod viewer_tools;
 
 const INSTRUCTIONS: &str = "\
 Pimble is the person's personal information manager: stores hold trees of nodes, each node \
@@ -87,7 +88,11 @@ its children two levels deep) and the viewer that shows them (such as a kanban, 
 the first level and cards the second, in the tree's order). get_node says when a node is one, \
 get_metanode lists what it shows, set_metanode sets or clears its viewer and source. A metanode can also have a query \
 (set_metanode with query): it shows its own children and then the nodes its query finds, which live \
-elsewhere. Moving, creating and editing the nodes it shows is done with the ordinary tools.
+elsewhere. Moving, creating and editing the nodes it shows is done with the ordinary tools. \
+list_viewers says, for every installed viewer, how it reads the tree, which node fields it reads (a \
+timeline's date, a todo list's done) and what settings it takes, with their schema and an example; \
+get_viewer_settings and set_viewer_settings read and write a metanode's settings (which calendar a \
+timeline counts in, a calendar node's whole definition), checked against that schema.
 
 Canvases are infinite whiteboards (a canvas node) and the marks on pictures in a note's text (a \
 picture's canvas, named by the note and the id after #canvas= in its URL). get_canvas lists a canvas's \
@@ -139,7 +144,7 @@ impl Pimble {
     pub fn with_api(api: Api) -> Self {
         Self {
             api: Arc::new(api),
-            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router(),
+            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router() + Self::viewer_router(),
         }
     }
 
@@ -632,7 +637,10 @@ impl Pimble {
         }
         if let Some(metanode) = &node.metadata.metanode {
             // docs/METANODES_CONTRACT.md section 3: what it shows, and how.
-            out.push_str(&format!("({}; get_metanode lists what it shows)\n", metanode.describe(&label(&node))));
+            out.push_str(&format!(
+                "({}; get_metanode lists what it shows; list_viewers says what its viewer reads and takes; get_viewer_settings shows its settings)\n",
+                metanode.describe(&label(&node))
+            ));
             if let Some(why) = metanode.source.not_understood() {
                 out.push_str(&format!("({why})\n"));
             }
@@ -895,12 +903,22 @@ impl Pimble {
         }
         let node = self.api.node(addr).await?;
         Ok(match &node.metadata.metanode {
-            Some(metanode) => format!(
-                "{} is now a metanode: {}, shown with the {} viewer.",
-                addr.link(),
-                self.api.describe_source(addr, &metanode.source).await,
-                metanode.viewer
-            ),
+            Some(metanode) => {
+                let mut said = format!(
+                    "{} is now a metanode: {}, shown with the {} viewer.",
+                    addr.link(),
+                    self.api.describe_source(addr, &metanode.source).await,
+                    metanode.viewer
+                );
+                let known = viewer_tools::known_viewers();
+                if !known.contains(&metanode.viewer) {
+                    said.push_str(&format!(
+                        " No plugin installed here says it provides that viewer, so Pimble shows the outline until one does; the viewers here: {}.",
+                        known.join(", ")
+                    ));
+                }
+                said
+            }
             None => format!("{} is an ordinary node again, shown as its outline.", addr.link()),
         })
     }

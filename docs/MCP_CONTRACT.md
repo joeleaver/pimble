@@ -244,6 +244,9 @@ Write:
 | `move_node` | within a store, or between stores (`transplantNode`); planned first with `pimble_core::plan::plan_move` through `pimble-api`, so it refuses what the explorer refuses with the same sentences (into itself, read only, a mount whose store is not open, beside a store) before sending, says the cross-store and share-leaving warnings in its answer, and takes several nodes with `nodes` (one `moveNodes`, all or none) |
 | `delete_node`, `undelete_node` | tombstone, put back |
 | `set_metanode` | make a node a metanode shown with `viewer` and, with `depth`, a source of its subtree to that depth (1 its children); no viewer makes it an ordinary node again, its source kept. One `applyEdit` of the `metanode:*` keys |
+| `list_viewers` | every viewer installed on this computer, from each plugin's guide (docs/AGENT_GUIDES_CONTRACT.md, read from the `pimble-guide` section of its `.wasm` in the plugins folder): what it shows and how it reads the tree, the node fields it reads, its settings with their schema and an example; Pimble's own `list`; plugins installed without a guide |
+| `get_viewer_settings` | a metanode's settings for its viewer (`data.<viewer>`) as JSON, `{}` when none; a viewer other than the one it is shown with is refused, naming that one |
+| `set_viewer_settings` | write a metanode's settings whole, after checking them against the viewer's schema; a refusal names the place and what was wanted, and nothing is written. One `applyEdit` of `data.<viewer>` |
 
 `get_node` describes a metanode in one line ("a metanode: the children of Work, two levels,
 shown with the kanban viewer") and says when a newer Pimble wrote part of its source.
