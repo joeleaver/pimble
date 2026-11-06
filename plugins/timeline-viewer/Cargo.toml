@@ -1,0 +1,16 @@
+[package]
+name = "timeline-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The timeline metanode viewer: nodes on a line of time by their own fields, in any calendar (docs/TIMELINE_CONTRACT.md)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }
+# Calendars are data (docs/TIMELINE_CONTRACT.md section 3); the view remembered on this device.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

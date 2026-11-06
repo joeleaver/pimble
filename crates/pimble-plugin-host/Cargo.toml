@@ -45,6 +45,8 @@ pimble-rpc = { workspace = true }
 tokio = { workspace = true }
 tempfile = "3"
 futures = { workspace = true }
+chrono = { workspace = true }
+pimble-crdt = { workspace = true }
 serde_json = { workspace = true }
 
 # The browser engine against hand-written guests, under wasm-bindgen-test

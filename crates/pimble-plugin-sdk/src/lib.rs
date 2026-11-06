@@ -57,6 +57,9 @@ pub use pimble_plugin_abi as abi;
 pub use api::{ApiLink, Bridge, GuestBackend};
 pub use pimble_api;
 pub use pimble_core;
+/// Node documents, for an `edit` that writes a plugin's own data finely
+/// (`NodeDoc::edit_data`).
+pub use pimble_crdt;
 pub use pimble_plugin_abi::{HostState, Manifest, NodeAddr, Permissions, PresentPerson, Props, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
 /// Pimble's own components (presence, icons, colors), drawn alike by the app
 /// and by plugins.
