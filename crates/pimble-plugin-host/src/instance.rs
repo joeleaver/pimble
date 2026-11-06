@@ -37,6 +37,12 @@ pub enum Call<'a> {
     HostState(&'a [u8]),
     /// An element drag in the window ended (`exports::DRAG_ENDED`).
     DragEnded,
+    /// Start a tool (`exports::TOOL`, a JSON `ToolRequest`): answers its run
+    /// id as a number.
+    Tool(&'a [u8]),
+    /// The tool run's answer (`exports::TOOL_RESULT`): bytes once done,
+    /// `Done` while it runs.
+    ToolResult(u64),
 }
 
 /// What an export call answered.
@@ -128,6 +134,23 @@ pub type HostKey = u64;
 thread_local! {
     static HOSTS: RefCell<HashMap<HostKey, Weak<dyn HostCalls>>> = RefCell::new(HashMap::new());
     static NEXT_KEY: Cell<HostKey> = const { Cell::new(1) };
+}
+
+/// Make `host` what an engine made with the returned key reaches, for as long
+/// as the caller holds `host` (a headless tool run, `crate::tools`, has no
+/// [`Instance`]). [`forget_host`] takes the key back.
+pub fn register_host(host: &Rc<dyn HostCalls>) -> HostKey {
+    let key = NEXT_KEY.with(|k| {
+        let key = k.get();
+        k.set(key + 1);
+        key
+    });
+    HOSTS.with(|h| h.borrow_mut().insert(key, Rc::downgrade(host)));
+    key
+}
+
+pub fn forget_host(key: HostKey) {
+    HOSTS.with(|h| h.borrow_mut().remove(&key));
 }
 
 /// The instance an engine's imports reach, if it is still alive. Key 0 is no

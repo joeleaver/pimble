@@ -20,6 +20,50 @@ pub const FORMAT: u32 = 1;
 pub struct Guide {
     pub v: u32,
     pub viewers: Vec<ViewerGuide>,
+    /// What the plugin's code can be asked to do for an agent (section 8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolGuide>,
+}
+
+/// The tool the MCP runs before it writes a viewer's settings:
+/// `{ viewer, metanode, settings }`.
+pub const CHECK_SETTINGS: &str = "check_settings";
+/// The tool the MCP runs before it writes a field a viewer reads:
+/// `{ viewer, metanode, node, field, value }`.
+pub const CHECK_FIELD: &str = "check_field";
+
+/// One tool a plugin offers agents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolGuide {
+    pub name: String,
+    pub about: String,
+    /// Its arguments, as a schema [`check`] reads.
+    pub params: Value,
+}
+
+/// What the host asks a plugin's `pimble_tool` export to do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolRequest {
+    pub tool: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+/// What a tool answered: whether all was well, and what it said.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolAnswer {
+    pub ok: bool,
+    pub said: String,
+}
+
+impl ToolAnswer {
+    pub fn ok(said: impl Into<String>) -> Self {
+        ToolAnswer { ok: true, said: said.into() }
+    }
+
+    pub fn no(said: impl Into<String>) -> Self {
+        ToolAnswer { ok: false, said: said.into() }
+    }
 }
 
 /// What an agent needs to use one viewer.
@@ -74,6 +118,10 @@ impl Guide {
 
     pub fn viewer(&self, id: &str) -> Option<&ViewerGuide> {
         self.viewers.iter().find(|v| v.viewer == id)
+    }
+
+    pub fn tool(&self, name: &str) -> Option<&ToolGuide> {
+        self.tools.iter().find(|t| t.name == name)
     }
 }
 

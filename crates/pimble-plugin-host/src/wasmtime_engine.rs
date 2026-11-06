@@ -217,6 +217,9 @@ pub struct WasmGuest {
     resolve: TypedFunc<(u32, u32), ()>,
     host_state: TypedFunc<(u32, u32), ()>,
     drag_ended: TypedFunc<(), ()>,
+    /// The tool exports, which a plugin without tools does not have.
+    tool: Option<TypedFunc<(u32, u32), u64>>,
+    tool_result: Option<TypedFunc<u64, u64>>,
     budget_ticks: u64,
 }
 
@@ -263,6 +266,8 @@ impl WasmGuest {
             resolve: export(&mut store, &instance, exports::RESOLVE)?,
             host_state: export(&mut store, &instance, exports::HOST_STATE)?,
             drag_ended: export(&mut store, &instance, exports::DRAG_ENDED)?,
+            tool: instance.get_typed_func::<(u32, u32), u64>(&mut store, exports::TOOL).ok(),
+            tool_result: instance.get_typed_func::<u64, u64>(&mut store, exports::TOOL_RESULT).ok(),
             memory,
             store,
             budget_ticks,
@@ -339,6 +344,18 @@ impl WasmGuest {
             Call::DragEnded => {
                 self.drag_ended.call(&mut self.store, ())?;
                 Answered::Done
+            }
+            Call::Tool(bytes) => {
+                let tool = self.tool.clone().ok_or_else(|| wasmtime::Error::new(Refusal("it has no tools".into())))?;
+                let id = self.with_input(bytes, |g, p, l| tool.call(&mut g.store, (p, l)))?;
+                Answered::Number(id as i64)
+            }
+            Call::ToolResult(id) => {
+                let result = self.tool_result.clone().ok_or_else(|| wasmtime::Error::new(Refusal("it has no tools".into())))?;
+                match result.call(&mut self.store, id)? {
+                    0 => Answered::Done,
+                    packed => Answered::Bytes(self.take_bytes(packed)?),
+                }
             }
         })
     }

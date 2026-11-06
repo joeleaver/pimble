@@ -92,6 +92,15 @@ pub mod exports {
     /// is in which node, whom the pane follows, the theme. Sent after
     /// `MOUNT` and again whenever any of it changes (ABI 3).
     pub const HOST_STATE: &str = "pimble_host_state";
+    /// `(ptr: u32, len: u32) -> u64`: start a tool (docs/AGENT_GUIDES_CONTRACT.md
+    /// section 8), a JSON [`guide::ToolRequest`](crate::guide::ToolRequest), as a
+    /// task in the guest; answers the tool run's id. Optional: a plugin without
+    /// it has no tools, and its absence changes nothing else.
+    pub const TOOL: &str = "pimble_tool";
+    /// `(id: u64) -> u64`: the finished tool run's JSON
+    /// [`guide::ToolAnswer`](crate::guide::ToolAnswer), packed, or 0 while it
+    /// runs. Optional, with `TOOL`.
+    pub const TOOL_RESULT: &str = "pimble_tool_result";
     /// The guest's linear memory.
     pub const MEMORY: &str = "memory";
 }

@@ -24,6 +24,7 @@
 
 mod calendar;
 mod calendar_view;
+mod tools;
 mod layout;
 
 use std::collections::HashMap;
@@ -1458,7 +1459,7 @@ fn grip_style(side: &str, v: View, start: i64, end: Option<i64>) -> String {
     }
 }
 
-pimble_plugin_sdk::plugin!(describe: describe, view: view, guide: include_bytes!("../guide.json"));
+pimble_plugin_sdk::plugin!(describe: describe, view: view, guide: include_bytes!("../guide.json"), tools: tools::tools);
 
 #[cfg(test)]
 mod tests {

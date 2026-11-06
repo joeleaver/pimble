@@ -504,6 +504,8 @@ impl JsGuest {
                 self.invoke(&self.drag_ended, &[])?;
                 Answered::Done
             }
+            // Tools run for agents, in the MCP, never in a page.
+            Call::Tool(_) | Call::ToolResult(_) => return Err(Failure::Refused("tools do not run in the browser".into())),
         })
     }
 }

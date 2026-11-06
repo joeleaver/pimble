@@ -92,7 +92,11 @@ elsewhere. Moving, creating and editing the nodes it shows is done with the ordi
 list_viewers says, for every installed viewer, how it reads the tree, which node fields it reads (a \
 timeline's date, a todo list's done) and what settings it takes, with their schema and an example; \
 get_viewer_settings and set_viewer_settings read and write a metanode's settings (which calendar a \
-timeline counts in, a calendar node's whole definition), checked against that schema.
+timeline counts in, a calendar node's whole definition), checked against that schema. A plugin \
+may also check what it alone understands: set_viewer_settings and set_fields ask it first, refuse a \
+value it cannot use (a date its timeline cannot read) with its sentence, and say how a good one reads; \
+call_plugin_tool runs its other tools (list_viewers lists them), such as trying a date in a calendar \
+before writing many.
 
 Canvases are infinite whiteboards (a canvas node) and the marks on pictures in a note's text (a \
 picture's canvas, named by the note and the id after #canvas= in its URL). get_canvas lists a canvas's \
@@ -113,6 +117,10 @@ pub struct Pimble {
     /// The one API (docs/API_CONTRACT.md): what the tools read and write
     /// through, as this agent, holding the documents it has read.
     api: Arc<Api>,
+    /// What a plugin's tools reach the stores through: this agent's own
+    /// connection, so the server judges them by its grant. None for an API
+    /// handed in (the presence tests), whose plugins then run no tools.
+    tool_backend: Option<Arc<dyn pimble_api::Backend>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -138,12 +146,15 @@ impl Pimble {
             Some(id) => format!("agent:{id}"),
             None => format!("mcp:{}", uuid::Uuid::new_v4()),
         };
-        Self::with_api(Api::new(RpcBackend::new(Shared(conn)), client_id))
+        let tool_backend: Arc<dyn pimble_api::Backend> = Arc::new(RpcBackend::new(Shared(conn.clone())));
+        viewer_tools::warm();
+        Self { tool_backend: Some(tool_backend), ..Self::with_api(Api::new(RpcBackend::new(Shared(conn)), client_id)) }
     }
 
     pub fn with_api(api: Api) -> Self {
         Self {
             api: Arc::new(api),
+            tool_backend: None,
             tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router() + Self::viewer_router(),
         }
     }

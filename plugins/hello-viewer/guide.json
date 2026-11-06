@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "viewers": [
+    { "viewer": "hello", "about": "A toy viewer that lists the metanode's source.", "fields": [{ "name": "mood", "about": "Anything but \"bad\"." }] }
+  ],
+  "tools": [
+    { "name": "echo", "about": "Says back what it is given.", "params": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } } },
+    { "name": "count_children", "about": "Says how many children a node has.", "params": { "type": "object", "required": ["node"], "properties": { "node": { "type": "string", "description": "a pimble: link" } } } },
+    { "name": "rename", "about": "Renames a node.", "params": { "type": "object", "required": ["node", "title"], "properties": { "node": { "type": "string" }, "title": { "type": "string" } } } },
+    { "name": "check_field", "about": "Refuses a mood of \"bad\".", "params": { "type": "object" } }
+  ]
+}

@@ -1,7 +1,7 @@
 # What plugins tell agents: viewer guides
 
-Status: waves 1 and 2 built 2026-11-06 on branch `agent-guides` (sections 6 and 7); one
-open question for Joe (section 8). Joe asked for it the same
+Status: waves 1 and 2 built 2026-11-06 on branch `agent-guides` (sections 6 and 7); wave 3,
+plugin tools, decided by Joe and built the same day (sections 8 and 9). Joe asked for it the same
 day ("We should probably build that"), after a look at what an agent could do with the
 plugins through the MCP: it could guess its way to a Gregorian timeline but could not make
 a calendar, set a timeline's calendar, or learn an invented calendar's month names.
@@ -167,17 +167,123 @@ What it stumbled on, and what came of it:
 - **`$defs` referenced by tool schemas** were missing from the trial client's listing.
   That is the client's printing, not the server's; real MCP clients resolve them.
 
-## 8. Open: checking what only the plugin understands (Joe's call)
+## 8. Plugin tools (decided by Joe 2026-11-06; wave 3)
 
-How a date reads, whether a calendar link names a calendar, and whether a calendar makes
-sense are known only to the plugin's own code. Decision 1 keeps plugin code out of the
-agent's path, and the timeline contract's decision 4 keeps calendars inside the plugin.
-So the MCP can check only the shape. The ways to close it:
+Joe chose the first way, and made it general: "This has to be a generic solution for many
+types of plugins, not just what already exists." His answers:
 
-1. **A pure check the plugin exports**, run by the MCP under wasmtime: settings or a
-   field value in, sentences out. Nothing is mounted, and the API is not reachable from
-   it. It needs wasmtime in `pimble-mcp`, which is the size of the app's plugin host, and
-   about a second to compile the timeline the first time (cacheable).
-2. **Leave it**, as now: the guides teach the forms, and the trial showed an agent
-   following them gets it right. A wrong date shows to the person as an event missing
-   from the line.
+1. **A plugin tool may read and write.** Every edit is an ordinary `applyEdit`, judged by
+   the agent's grant and attributed to the agent.
+2. **It is bounded by the agent's grant and by the plugin's own manifest asks.** The
+   approval it runs under is built from what the manifest asks: stores `none`, `all`, or
+   `chosen` (read as every store the agent's grant reaches), and `write` only when the
+   manifest asks to write. There is no second approval prompt.
+3. **A failed check refuses the write.** Nothing is written, and the answer carries the
+   plugin's sentence. A check that passes adds what it said to the write's answer
+   ("reads as Mar 15, 44 BC").
+
+**The shape:**
+- **Declared in the guide.** `tools` is a list of `{ name, about, params }`, where
+  `params` is a JSON Schema checked with `guide::check` before the plugin runs.
+- **Two names are conventions the MCP runs by itself:**
+  - `check_settings { viewer, metanode, settings }`, before `set_viewer_settings`
+    writes;
+  - `check_field { viewer, metanode, node, field, value }`, before `set_fields` writes
+    a field that a viewer showing the node names in its guide's `fields`.
+- **Every other tool** is called by name with `call_plugin_tool`.
+- **The answer** is `{ "ok": bool, "said": "..." }`.
+- **Optional exports, so no ABI change:**
+  - `pimble_tool(ptr, len) -> u64` starts the tool as a task in the plugin (the request
+    is the JSON `{ tool, args }`) and answers its task id;
+  - `pimble_tool_result(id) -> u64` answers the packed result bytes, or 0 while it runs.
+
+  The SDK's `plugin!` takes `tools: <fn(ToolCall, Arc<Pimble>) -> ToolFuture>`. A plugin
+  without the exports has no tools.
+- **The headless runner** (`pimble_plugin_host::tools`, feature `wasm-host`) instantiates
+  the module with no document. It drives the tool's task through the same exports a
+  mounted view uses: `poll_task`, `fire_timeout`, `drain_polls` and `resolve`.
+  - API calls go through `bridge::execute` with the approval above, through the MCP's
+    own connection, so the server judges them by the agent's grant.
+  - A tool that draws (`flush`) is refused.
+  - Each export call keeps the 2 s budget, and a whole tool gets 30 s.
+- **The MCP** keeps compiled plugins for as long as it runs, keyed by file and modified
+  time, and compiles those with tools in the background when it starts.
+
+**The timeline's tools** (wave 3):
+- `check_field`: a date read in the timeline's calendar, answering "reads as Oct 14,
+  1066" or why it does not read and the forms that do;
+- `check_settings`:
+  - for a timeline, that its calendar link names a calendar node;
+  - for a calendar, that it reads and makes sense: seasons name months the year has, an
+    era counting up has `from` and one counting down has `to`, and there is a quiet era;
+- `read_date { calendar, text }`: what a text reads as in a calendar (a calendar node's
+  link, or "gregorian"), and that moment in the Gregorian calendar.
+
+## 9. Wave 3 as built (2026-11-06)
+
+- **ABI**, with no version change:
+  - the optional exports `pimble_tool` and `pimble_tool_result` (`exports::TOOL`,
+    `exports::TOOL_RESULT`);
+  - in `guide`: `ToolGuide`, `ToolRequest`, `ToolAnswer`, `CHECK_SETTINGS` and
+    `CHECK_FIELD`;
+  - `Guide.tools`.
+- **SDK:**
+  - `plugin!(describe, view, guide, tools: <ToolFn>)`;
+  - `wasm::tool` starts the tool as a `spawn_local` task, and `wasm::tool_result` hands
+    its answer over once;
+  - `ToolAnswer`, `ToolFuture` and `ToolRequest` in the prelude.
+- **Host:**
+  - `Call::Tool` and `Call::ToolResult` in both engines; the browser engine refuses them,
+    since tools run for agents and never in a page;
+  - `instance::register_host` and `forget_host`, for a host with no `Instance`;
+  - `tools::run`, the headless driver;
+  - `tools::agent_approval`, which builds the approval from the manifest's asks.
+- **MCP:**
+  - `call_plugin_tool` checks the arguments against the tool's `params`, then runs it;
+  - `list_viewers` lists each plugin's tools and says which two run by themselves;
+  - `set_viewer_settings` runs `check_settings` after the schema check;
+  - `set_fields` runs `check_field` for every metanode showing the node (a parent within
+    its source's depth) whose plugin has it. A refusal names the field, the node, the
+    viewer and the metanode. A passing check is said only for the fields the viewer's
+    guide lists.
+  - Tools run on a blocking thread with a current-thread runtime and a `LocalSet`, over
+    the agent's own connection.
+  - Plugins are compiled once per file version, and those with tools are compiled in the
+    background when the MCP starts.
+- **The timeline** (`plugins/timeline-viewer/src/tools.rs`):
+  - `check_settings` for both of its viewers: a calendar goes through `Calendar::from_json`
+    (the calendar form's own `problem()`), and its seasons must name its months;
+  - `check_field`, read with the viewer's own `read_said` in its calendar, then in the
+    ones beside it;
+  - `read_date`.
+
+  A good calendar is described back: its days a year, how the absolute years 0 and -1
+  are written, where year 0 begins in the Gregorian calendar, and how today reads.
+- **hello-viewer** carries four test tools: an echo, a read, a write and a field check.
+
+Checked:
+- **`pimble-plugin-host` `tools`:** hello's tools answer, read (two children), write (a
+  rename the server then holds), check (a bad mood refused, a fine one passed), and
+  refuse an unknown tool in words.
+- **`timeline_tools`,** on the built timeline:
+  - "Mar 15, 44 BC" reads as itself;
+  - "Blorpuary 99, banana" does not read, with forms that do;
+  - a field it does not read passes;
+  - the example calendar is described;
+  - a season naming a missing month is refused;
+  - a non-link and a node that is no calendar are refused;
+  - a real calendar node is accepted with the Gregorian beside it;
+  - "Fir 3, 1300 YF" and "Year's Gate, 12 BF" read with their Gregorian dates, and
+    "c. 1066" reads.
+- **The MCP's end-to-end test,** with the real built plugin in the plugins folder, adds:
+  - the tools listed;
+  - a timeline's bad calendar link refused with the plugin's sentence, and a good one
+    written with "It counts in the Founding calendar.";
+  - "Blorpuary 99, banana" refused by `set_fields`, with nothing written;
+  - "Fir 3, 1 YF" written and said back, with a field the viewer does not read left
+    unmentioned;
+  - `call_plugin_tool` reading "Year's Gate, 3 YF", and refusing missing arguments and
+    an unknown tool.
+- **Whole suites:** `pimble-mcp` 35 tests, `pimble-plugin-host` (every suite, with the
+  built plugins) and the plugins' own tests all pass; the workspace and the browser build
+  cleanly.

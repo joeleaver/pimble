@@ -32,6 +32,8 @@ pub mod js_engine;
 pub mod library;
 pub mod registry;
 #[cfg(feature = "wasm-host")]
+pub mod tools;
+#[cfg(feature = "wasm-host")]
 pub mod wasmtime_engine;
 
 pub use applier::{Applier, ApplierOptions, Refusal};

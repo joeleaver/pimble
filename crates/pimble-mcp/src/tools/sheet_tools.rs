@@ -820,7 +820,7 @@ impl Pimble {
     /// phone), which formulas read as `'Note'!rate` and, through a
     /// link-to-a-node column, `[@project].rate`.
     #[tool(name = "get_fields")]
-    async fn get_fields(&self, Parameters(p): Parameters<super::NodeParam>) -> Result<String, String> {
+    pub(super) async fn get_fields(&self, Parameters(p): Parameters<super::NodeParam>) -> Result<String, String> {
         let addr = self.api.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         self.present(addr).await;
@@ -834,11 +834,14 @@ impl Pimble {
     /// Set (or with null, remove) a node's fields; each field is its own
     /// co-edited value, so only the fields named are written.
     #[tool(name = "set_fields")]
-    async fn set_fields(&self, Parameters(p): Parameters<SetFieldsParams>) -> Result<String, String> {
+    pub(super) async fn set_fields(&self, Parameters(p): Parameters<SetFieldsParams>) -> Result<String, String> {
         let addr = self.api.resolve(&p.node).await?;
         if p.fields.keys().any(|n| n.trim().is_empty()) {
             return Err("A field needs a name.".into());
         }
+        // A viewer showing the node may read these fields: its plugin checks
+        // them first (docs/AGENT_GUIDES_CONTRACT.md section 8).
+        let checked = self.field_checks(addr, &p.fields).await?;
         let now = chrono::Utc::now().to_rfc3339();
         let fields = p.fields.clone();
         self.edit(addr, move |doc| {
@@ -850,7 +853,11 @@ impl Pimble {
         .await?;
         let node = self.api.node(addr).await?;
         let lines: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("- {n}: {v}")).collect();
-        Ok(format!("Fields of {} now:\n{}", label(&node), if lines.is_empty() { "(none)".to_string() } else { lines.join("\n") }))
+        let mut out = format!("Fields of {} now:\n{}", label(&node), if lines.is_empty() { "(none)".to_string() } else { lines.join("\n") });
+        for said in checked {
+            out.push_str(&format!("\n{said}"));
+        }
+        Ok(out)
     }
 
     /// Every row of every table, in every open store, whose link-to-a-node

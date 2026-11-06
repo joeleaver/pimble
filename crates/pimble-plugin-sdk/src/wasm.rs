@@ -201,6 +201,42 @@ pub fn poll_task(id: u64) {
     with_guest(None, |g| g.flush());
 }
 
+thread_local! {
+    /// Tool runs (docs/AGENT_GUIDES_CONTRACT.md section 8): their answers once
+    /// done, by run id, until the host takes them.
+    static TOOL_RUNS: RefCell<(u64, std::collections::HashMap<u64, Vec<u8>>)> = RefCell::new((0, std::collections::HashMap::new()));
+}
+
+/// Start the tool the host asked for as a task, and answer its run's id. A
+/// request that does not read is answered at once, as a refusal.
+pub fn tool(describe: fn() -> Manifest, tools: crate::ToolFn, ptr: u32, len: u32) -> u64 {
+    let id = TOOL_RUNS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.0 += 1;
+        r.0
+    });
+    let done = move |answer: pimble_plugin_abi::guide::ToolAnswer| {
+        let bytes = serde_json::to_vec(&answer).unwrap_or_default();
+        TOOL_RUNS.with(|r| r.borrow_mut().1.insert(id, bytes));
+    };
+    match serde_json::from_slice::<pimble_plugin_abi::guide::ToolRequest>(input(ptr, len)) {
+        Err(e) => done(pimble_plugin_abi::guide::ToolAnswer::no(format!("the tool request does not read: {e}"))),
+        Ok(request) => {
+            let api = with_guest(Some(describe), |g| g.api());
+            rinch::core::task::spawn_local(async move { done(tools(request, api).await) });
+        }
+    }
+    id
+}
+
+/// The finished run's answer, handed over once; 0 while it runs.
+pub fn tool_result(id: u64) -> u64 {
+    match TOOL_RUNS.with(|r| r.borrow_mut().1.remove(&id)) {
+        Some(bytes) => answer(&bytes),
+        None => 0,
+    }
+}
+
 pub fn drain_polls() -> i64 {
     rinch::core::batch(rinch::core::reactive::drain_polls);
     with_guest(None, |g| g.flush());

@@ -40,6 +40,7 @@ fn plugins_dir() -> PathBuf {
 /// One `.wasm` file in the plugins folder and the guide it carries.
 struct Installed {
     file: String,
+    path: PathBuf,
     guide: Option<Result<guide::Guide, String>>,
 }
 
@@ -54,7 +55,7 @@ fn installed() -> Vec<Installed> {
                 .filter_map(|path| {
                     let bytes = std::fs::read(&path).ok()?;
                     let file = path.file_name()?.to_string_lossy().into_owned();
-                    Some(Installed { file, guide: guide::read(&bytes) })
+                    Some(Installed { file, guide: guide::read(&bytes), path })
                 })
                 .collect()
         })
@@ -65,7 +66,108 @@ fn installed() -> Vec<Installed> {
 
 /// The guide for viewer `id`, from whichever installed plugin provides it.
 fn viewer_guide(id: &str) -> Option<ViewerGuide> {
-    installed().into_iter().find_map(|p| p.guide?.ok()?.viewer(id).cloned())
+    provider(id).and_then(|(_, g)| g.viewer(id).cloned())
+}
+
+/// The installed plugin that provides viewer `id`, or whose file is `id`
+/// (`timeline_viewer`, `timeline-viewer`), with its guide.
+fn provider(id: &str) -> Option<(PathBuf, guide::Guide)> {
+    let stem = id.trim().trim_end_matches(".wasm").replace('-', "_");
+    let all: Vec<(PathBuf, String, guide::Guide)> =
+        installed().into_iter().filter_map(|p| Some((p.path, p.file.trim_end_matches(".wasm").to_string(), p.guide?.ok()?))).collect();
+    all.iter()
+        .find(|(_, _, g)| g.viewer(id).is_some())
+        .or_else(|| all.iter().find(|(_, file, _)| *file == stem))
+        .map(|(path, _, g)| (path.clone(), g.clone()))
+}
+
+// ── Running a plugin's tools (docs/AGENT_GUIDES_CONTRACT.md section 8) ─────
+
+/// What a file was when it was compiled: its length and modified time.
+type Stamp = (u64, Option<std::time::SystemTime>);
+
+/// Plugins compiled so far, for as long as this process runs.
+static COMPILED: Mutex<Option<std::collections::HashMap<PathBuf, (Stamp, pimble_plugin_host::wasmtime_engine::Plugin)>>> = Mutex::new(None);
+
+/// The plugin at `path`, compiled once for each version of the file.
+fn compiled(path: &std::path::Path) -> Result<pimble_plugin_host::wasmtime_engine::Plugin, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let stamp: Stamp = (meta.len(), meta.modified().ok());
+    if let Some((was, plugin)) = COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(path) {
+        if *was == stamp {
+            return Ok(plugin.clone());
+        }
+    }
+    let plugin = pimble_plugin_host::wasmtime_engine::load_file(path, pimble_plugin_host::wasmtime_engine::DEFAULT_BUDGET).map_err(|(_, sentence)| sentence)?;
+    COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.to_path_buf(), (stamp, plugin.clone()));
+    Ok(plugin)
+}
+
+/// Compile the installed plugins that have tools in the background, so the
+/// first check an agent's write makes does not wait for the compiler.
+pub(super) fn warm() {
+    let _ = std::thread::Builder::new().name("pimble-mcp-plugins".into()).spawn(|| {
+        for plugin in installed() {
+            if plugin.guide.as_ref().is_some_and(|g| g.as_ref().is_ok_and(|g| !g.tools.is_empty())) {
+                if let Err(e) = compiled(&plugin.path) {
+                    tracing::warn!("plugin {} cannot run its tools: {e}", plugin.file);
+                }
+            }
+        }
+    });
+}
+
+impl Pimble {
+    /// Run `tool` of the plugin at `path` with `args`, on a thread of its own
+    /// (a plugin runs on one thread), through this agent's connection.
+    async fn run_tool(&self, path: PathBuf, tool: &str, args: serde_json::Value) -> Result<guide::ToolAnswer, String> {
+        let backend = self.tool_backend.clone().ok_or("This MCP server runs no plugin tools.")?;
+        let request = guide::ToolRequest { tool: tool.to_string(), args };
+        tokio::task::spawn_blocking(move || {
+            let plugin = compiled(&path)?;
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, pimble_plugin_host::tools::run(&plugin, backend, &request))
+        })
+        .await
+        .map_err(|e| format!("the plugin's tool did not finish: {e}"))?
+    }
+
+    /// The checks a viewer's plugin makes before `fields` are written on
+    /// `addr`: for every metanode showing it (a parent within its source's
+    /// depth) whose viewer's plugin has `check_field`. Err is the refusal;
+    /// Ok is what the checks said about the fields their viewers read.
+    pub(super) async fn field_checks(&self, addr: Addr, fields: &std::collections::BTreeMap<String, Option<String>>) -> Result<Vec<String>, String> {
+        let mut said = Vec::new();
+        let mut at = addr;
+        for distance in 1..=pimble_core::metanode::MAX_SUBTREE_DEPTH {
+            let Ok(node) = self.api.node(at).await else { break };
+            let Some(parent) = node.parent_id else { break };
+            at = Addr { store: at.store, node: parent };
+            let Ok(shower) = self.api.node(at).await else { break };
+            let Some(metanode) = &shower.metadata.metanode else { continue };
+            if metanode.source.depth() < distance {
+                continue;
+            }
+            let Some((path, g)) = provider(&metanode.viewer) else { continue };
+            if g.tool(guide::CHECK_FIELD).is_none() {
+                continue;
+            }
+            let listed: Vec<&str> = g.viewer(&metanode.viewer).map(|v| v.fields.iter().map(|f| f.name.as_str()).collect()).unwrap_or_default();
+            for (field, value) in fields {
+                let Some(value) = value else { continue };
+                let args = serde_json::json!({ "viewer": metanode.viewer, "metanode": at.link(), "node": addr.link(), "field": field, "value": value });
+                let answer = self.run_tool(path.clone(), guide::CHECK_FIELD, args).await?;
+                if !answer.ok {
+                    return Err(format!("Nothing was written: {field} on {} is shown by the {} viewer of {}, which says: {}", label(&node), metanode.viewer, label(&shower), answer.said));
+                }
+                if listed.contains(&field.as_str()) {
+                    said.push(answer.said);
+                }
+            }
+        }
+        Ok(said)
+    }
 }
 
 /// The ids of every viewer a guide names here, and Pimble's own.
@@ -109,6 +211,17 @@ pub struct ViewerSettingsParam {
     /// Which viewer's settings; leave it out for the viewer the node is shown with.
     #[serde(default)]
     pub viewer: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CallPluginToolParams {
+    /// A viewer the plugin provides ("timeline"), or its file ("timeline_viewer").
+    pub plugin: String,
+    /// The tool's name, as list_viewers lists it.
+    pub tool: String,
+    /// The tool's arguments, as list_viewers says.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -162,6 +275,18 @@ impl Pimble {
                         out.push_str(&describe_viewer(v, &plugin.file));
                         out.push('\n');
                     }
+                    if !g.tools.is_empty() {
+                        out.push_str(&format!("### Tools of {} (call_plugin_tool)\n\n", plugin.file));
+                        for t in &g.tools {
+                            let auto = match t.name.as_str() {
+                                guide::CHECK_SETTINGS => " (run by set_viewer_settings before it writes)",
+                                guide::CHECK_FIELD => " (run by set_fields before it writes a field this plugin's viewers read)",
+                                _ => "",
+                            };
+                            out.push_str(&format!("- {}{auto}: {} Arguments: {}\n", t.name, t.about, serde_json::to_string(&t.params).unwrap_or_default()));
+                        }
+                        out.push('\n');
+                    }
                 }
                 Some(Err(e)) => without.push(format!("{} (its guide does not read: {e})", plugin.file)),
                 None => without.push(plugin.file),
@@ -175,6 +300,27 @@ impl Pimble {
             out.push_str(&format!("\nInstalled without a guide (their viewers work in Pimble, but say nothing here): {}.\n", without.join(", ")));
         }
         Ok(out)
+    }
+
+    /// Run one of a plugin's tools (list_viewers lists them with their
+    /// arguments): `plugin` is a viewer it provides ("timeline") or its file
+    /// ("timeline_viewer"). Its reads and writes are bounded by your grant and
+    /// by what the plugin asks for.
+    #[tool(name = "call_plugin_tool")]
+    async fn call_plugin_tool(&self, Parameters(p): Parameters<CallPluginToolParams>) -> Result<String, String> {
+        let Some((path, g)) = provider(&p.plugin) else {
+            return Err(format!("No plugin installed here provides {} or is called that. list_viewers lists them.", p.plugin));
+        };
+        let Some(tool) = g.tool(&p.tool) else {
+            let names: Vec<&str> = g.tools.iter().map(|t| t.name.as_str()).collect();
+            return Err(format!("{} has no tool {}; its tools: {}.", p.plugin, p.tool, if names.is_empty() { "none".to_string() } else { names.join(", ") }));
+        };
+        let args = if p.arguments.is_null() { serde_json::json!({}) } else { p.arguments.clone() };
+        if let Err(e) = guide::check(&tool.params, &args) {
+            return Err(format!("Nothing was run: {}. Its arguments: {}", e.replace("the settings object", "the arguments"), serde_json::to_string(&tool.params).unwrap_or_default()));
+        }
+        let answer = self.run_tool(path, &p.tool, args).await?;
+        if answer.ok { Ok(answer.said) } else { Err(answer.said) }
     }
 
     /// A metanode's viewer settings, as JSON: `{}` when none are set.
@@ -209,10 +355,21 @@ impl Pimble {
         if let Err(e) = guide::check(&settings.schema, &p.settings) {
             return Err(format!("Nothing was written: {e}. list_viewers shows the {viewer} viewer's schema and an example."));
         }
+        // The plugin's own check, which knows what the settings mean.
+        let mut said = String::new();
+        if let Some((path, g)) = provider(&viewer).filter(|(_, g)| g.tool(guide::CHECK_SETTINGS).is_some()) {
+            let _ = g;
+            let args = serde_json::json!({ "viewer": viewer, "metanode": addr.link(), "settings": p.settings });
+            let answer = self.run_tool(path, guide::CHECK_SETTINGS, args).await?;
+            if !answer.ok {
+                return Err(format!("Nothing was written: the {viewer} viewer says {}", answer.said));
+            }
+            said = format!(" {}", answer.said);
+        }
         let value = p.settings.clone();
         let key = viewer.clone();
         self.edit(addr, move |doc| doc.set_data(&key, &value).map_err(crdt)).await?;
-        Ok(format!("Wrote the {viewer} viewer's settings on {name} ({}).", addr.link()))
+        Ok(format!("Wrote the {viewer} viewer's settings on {name} ({}).{said}", addr.link()))
     }
 }
 
@@ -278,8 +435,14 @@ mod against_a_server {
         let dir = tempfile::tempdir().unwrap();
         let plugins = dir.path().join("plugins");
         std::fs::create_dir_all(&plugins).unwrap();
-        let guide = include_bytes!("../../../../plugins/timeline-viewer/guide.json");
-        std::fs::write(plugins.join("timeline_viewer.wasm"), module_with(guide)).unwrap();
+        // The real plugin, whose checks run: built by `cd plugins && cargo
+        // build --release --target wasm32-wasip1`.
+        let built = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/wasm32-wasip1/release/timeline_viewer.wasm");
+        if !built.is_file() {
+            eprintln!("skipped: build the plugins first; no {}", built.display());
+            return;
+        }
+        std::fs::copy(&built, plugins.join("timeline_viewer.wasm")).unwrap();
         std::fs::write(plugins.join("hello_viewer.wasm"), module_with(b"")[..12].to_vec()).unwrap();
         super::set_plugins_dir(plugins);
 
@@ -327,6 +490,35 @@ mod against_a_server {
         pimble.create_node(p(json!({ "parent": "World", "title": "Map" }))).await.unwrap();
         let made = pimble.set_metanode(p(json!({ "node": "World/Map", "viewer": "atlas" }))).await.unwrap();
         assert!(made.contains("No plugin installed here says it provides that viewer") && made.contains("timeline, calendar, list"), "{made}");
+
+        // The plugin's own checks (docs/AGENT_GUIDES_CONTRACT.md section 8).
+        let listed = pimble.list_viewers().await.unwrap();
+        assert!(listed.contains("### Tools of timeline_viewer.wasm") && listed.contains("- read_date: "), "{listed}");
+        let calendar = pimble.get_node(p(json!({ "node": "World/Founding Reckoning" }))).await.unwrap();
+        let cal_link = calendar.lines().find_map(|l| l.strip_prefix("link: ")).unwrap().to_string();
+        pimble.create_node(p(json!({ "parent": "World", "title": "Chronicle" }))).await.unwrap();
+        pimble.set_metanode(p(json!({ "node": "World/Chronicle", "viewer": "timeline", "depth": 2 }))).await.unwrap();
+        let refused = pimble.set_viewer_settings(p(json!({ "node": "World/Chronicle", "settings": { "calendar": "not a link" } }))).await.unwrap_err();
+        assert!(refused.starts_with("Nothing was written: the timeline viewer says calendar must be a calendar node's pimble: link"), "{refused}");
+        let wrote = pimble.set_viewer_settings(p(json!({ "node": "World/Chronicle", "settings": { "calendar": cal_link } }))).await.unwrap();
+        assert!(wrote.contains("It counts in the Founding calendar."), "{wrote}");
+
+        pimble.create_node(p(json!({ "parent": "World/Chronicle", "title": "The Founding" }))).await.unwrap();
+        let refused = pimble.set_fields(p(json!({ "node": "World/Chronicle/The Founding", "fields": { "date": "Blorpuary 99, banana" } }))).await.unwrap_err();
+        assert!(refused.starts_with("Nothing was written: date on The Founding is shown by the timeline viewer of Chronicle"), "{refused}");
+        assert!(refused.contains("does not read as a date in the Founding calendar"), "{refused}");
+        let fields = pimble.get_fields(p(json!({ "node": "World/Chronicle/The Founding" }))).await.unwrap();
+        assert!(!fields.contains("Blorpuary"), "nothing was written: {fields}");
+        let wrote = pimble.set_fields(p(json!({ "node": "World/Chronicle/The Founding", "fields": { "date": "Fir 3, 1 YF", "mood": "grand" } }))).await.unwrap();
+        assert!(wrote.contains("\u{201c}Fir 3, 1 YF\u{201d} reads as Fir 3, 1 in the Founding calendar"), "{wrote}");
+        assert!(!wrote.contains("does not read mood"), "a field the viewer does not read is not talked about: {wrote}");
+
+        let tried = pimble.call_plugin_tool(p(json!({ "plugin": "timeline", "tool": "read_date", "arguments": { "calendar": cal_link, "text": "Year's Gate, 3 YF" } }))).await.unwrap();
+        assert!(tried.contains("reads as Year's Gate, 3"), "{tried}");
+        let refused = pimble.call_plugin_tool(p(json!({ "plugin": "timeline", "tool": "read_date", "arguments": {} }))).await.unwrap_err();
+        assert!(refused.starts_with("Nothing was run: the arguments needs text"), "{refused}");
+        let refused = pimble.call_plugin_tool(p(json!({ "plugin": "timeline", "tool": "fly", "arguments": {} }))).await.unwrap_err();
+        assert!(refused.contains("has no tool fly; its tools: check_settings, check_field, read_date"), "{refused}");
         let _ = server.stop().await;
     }
 }

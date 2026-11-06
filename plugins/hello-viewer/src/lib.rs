@@ -194,4 +194,34 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
-pimble_plugin_sdk::plugin!(describe: describe, view: view);
+/// Its tools, for the host's tests of tools run for agents
+/// (docs/AGENT_GUIDES_CONTRACT.md section 8): one that answers, one that reads,
+/// one that writes, and a field check.
+fn tools(request: ToolRequest, api: Arc<Pimble>) -> ToolFuture {
+    Box::pin(async move {
+        let arg = |k: &str| request.args.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let addr = |k: &str| pimble_plugin_sdk::pimble_core::PimbleUrl::parse(&arg(k)).map(|u| Addr::new(u.store, u.node));
+        match request.tool.as_str() {
+            "echo" => ToolAnswer::ok(arg("text")),
+            "count_children" => match addr("node") {
+                None => ToolAnswer::no("node is not a pimble: link"),
+                Some(a) => match api.children(a).await {
+                    Ok(children) => ToolAnswer::ok(format!("{} children", children.len())),
+                    Err(e) => ToolAnswer::no(e.sentence()),
+                },
+            },
+            "rename" => match addr("node") {
+                None => ToolAnswer::no("node is not a pimble: link"),
+                Some(a) => match rename(&api, a, arg("title")).await {
+                    Ok(()) => ToolAnswer::ok(format!("renamed to {}", arg("title"))),
+                    Err(e) => ToolAnswer::no(e.sentence()),
+                },
+            },
+            "check_field" if arg("value") == "bad" => ToolAnswer::no("a mood cannot be bad"),
+            "check_field" => ToolAnswer::ok(format!("{} is a fine mood", arg("value"))),
+            other => ToolAnswer::no(format!("hello has no tool {other}")),
+        }
+    })
+}
+
+pimble_plugin_sdk::plugin!(describe: describe, view: view, guide: include_bytes!("../guide.json"), tools: tools);

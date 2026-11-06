@@ -24,6 +24,7 @@ pimble-rpc = { path = "../pimble-rpc" }
 pimble-ui = { path = "../pimble-ui" }
 futures = "0.3"
 async-trait = "0.1"
+serde_json = "1"
 # Components and theme only, nothing browser-specific: a wasm32-wasip1 guest runs
 # inside a host that is not a browser. rinch gates its browser halves on
 # `target_os = "unknown"` (joeleaver/rinch#2088, merged 2026-11-02), so main

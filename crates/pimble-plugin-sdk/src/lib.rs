@@ -54,6 +54,13 @@ pub mod wasm;
 
 pub use document::{HostLink, RemoteDocument};
 pub use pimble_plugin_abi as abi;
+pub use pimble_plugin_abi::guide::{ToolAnswer, ToolRequest};
+
+/// What a tool run comes to (docs/AGENT_GUIDES_CONTRACT.md section 8).
+pub type ToolFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ToolAnswer>>>;
+/// A plugin's tools: the request, and the API it reads and writes through
+/// (bounded by the agent's grant and the plugin's manifest asks).
+pub type ToolFn = fn(ToolRequest, std::sync::Arc<pimble_api::Pimble>) -> ToolFuture;
 pub use api::{ApiLink, Bridge, GuestBackend};
 pub use pimble_api;
 pub use pimble_core;
@@ -99,6 +106,7 @@ pub use rinch;
 /// `rinch` it brings into scope.
 pub mod prelude {
     pub use crate::{pimble_api, rinch};
+    pub use crate::{ToolAnswer, ToolFuture, ToolRequest};
     pub use crate::{clicked_again, display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
     pub use crate::pimble_ui;
     pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Judged, MetanodeEdit, Pimble};
@@ -192,6 +200,20 @@ impl ManifestExt for Manifest {
 /// `pimble_plugin_sdk::abi::guide::Guide::parse`.
 #[macro_export]
 macro_rules! plugin {
+    (describe: $describe:path, view: $view:path, guide: $guide:expr, tools: $tools:path $(,)?) => {
+        $crate::plugin!(describe: $describe, view: $view, guide: $guide);
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            #[unsafe(no_mangle)]
+            pub extern "C" fn pimble_tool(ptr: u32, len: u32) -> u64 {
+                $crate::wasm::tool($describe, $tools, ptr, len)
+            }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn pimble_tool_result(id: u64) -> u64 {
+                $crate::wasm::tool_result(id)
+            }
+        };
+    };
     (describe: $describe:path, view: $view:path, guide: $guide:expr $(,)?) => {
         $crate::plugin!(describe: $describe, view: $view);
         #[cfg(target_arch = "wasm32")]

@@ -383,5 +383,81 @@
         }
       }
     }
+  ],
+  "tools": [
+    {
+      "name": "check_settings",
+      "about": "Run by set_viewer_settings before it writes: a timeline's calendar and the calendars beside it must be calendar nodes the timeline can use; a calendar's definition must be one the timeline can read and write dates in, and its seasons must name its own months. A good calendar is described back: its days a year, where year 0 begins in the Gregorian calendar, how today reads.",
+      "params": {
+        "type": "object",
+        "required": [
+          "viewer",
+          "settings"
+        ],
+        "properties": {
+          "viewer": {
+            "enum": [
+              "timeline",
+              "calendar"
+            ]
+          },
+          "metanode": {
+            "type": "string"
+          },
+          "settings": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "check_field",
+      "about": "Run by set_fields before it writes a date field of a node a timeline shows: the value must read as a date in the timeline's calendar (or one shown beside it). The answer says how it reads, and where that falls in the Gregorian calendar.",
+      "params": {
+        "type": "object",
+        "required": [
+          "metanode",
+          "field",
+          "value"
+        ],
+        "properties": {
+          "viewer": {
+            "type": "string"
+          },
+          "metanode": {
+            "type": "string"
+          },
+          "node": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "read_date",
+      "about": "What a text reads as in a calendar, without writing anything: give calendar (a calendar node's pimble: link, or \"gregorian\") and text. Use it to try a form before writing many dates in it.",
+      "params": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "calendar": {
+            "type": "string",
+            "description": "a calendar node's pimble: link, or \"gregorian\" (the default)"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    }
   ]
 }

@@ -23,6 +23,9 @@ pimble-discussion = { workspace = true }
 # What each installed plugin tells agents about its viewers
 # (docs/AGENT_GUIDES_CONTRACT.md): read from its module, never run.
 pimble-plugin-abi = { workspace = true }
+# A plugin's tools, run for the agent with no window (docs/AGENT_GUIDES_CONTRACT.md
+# section 8): wasmtime, as the desktop app runs plugins.
+pimble-plugin-host = { workspace = true, features = ["wasm-host"] }
 dirs = "6"
 # Canvases (docs/CANVAS_CONTRACT.md, docs/MCP_CONTRACT.md "Canvases"): read,
 # written and rendered as the app does.

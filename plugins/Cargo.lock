@@ -1559,6 +1559,7 @@ dependencies = [
  "pimble-ui",
  "rinch",
  "rinch-core",
+ "serde_json",
 ]
 
 [[package]]
