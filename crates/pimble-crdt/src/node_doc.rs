@@ -1404,6 +1404,147 @@ impl NodeDoc {
     }
 }
 
+/// What splitting a node's text leaves for the new node: its content, a fresh
+/// projection with a history of its own, and the `data` keys (`board:<id>`,
+/// `sheet:<id>`) its canvases and sheets live under (docs/SPLIT_CONTRACT.md).
+#[derive(Debug, Clone)]
+pub struct SplitOff {
+    pub rest: Vec<u8>,
+    pub keys: Vec<String>,
+}
+
+impl NodeDoc {
+    /// Cut the text from `sticky` (a sticky index the editor made at its caret)
+    /// to the end out of this node, with the `data` of the canvases and sheets in
+    /// what was cut, and answer what the new node is made of. Where the split
+    /// falls: at the caret in a paragraph or heading (at a block's edge, between
+    /// blocks, so neither half begins or ends with an empty one); inside a
+    /// table, before the whole table, which never splits. Refused when either
+    /// half would be empty.
+    pub fn split_off(&mut self, sticky: &[u8]) -> Result<SplitOff> {
+        use rinch_editor_collab::CollabSession;
+        let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
+        if !self.has_projection() {
+            return Err(CrdtError::Refused("This note has no text to split.".into()));
+        }
+        let schema = std::rc::Rc::new(rinch_editor_core::Schema::starter_kit());
+        let mut session = CollabSession::from_bytes(&self.save()).map_err(collab)?;
+        let model = session.projected_doc(&schema).map_err(collab)?;
+        let at = session
+            .resolve_sticky(&model, sticky)
+            .ok_or_else(|| CrdtError::Refused("That place in the text is gone, so nothing was split.".into()))?;
+        let at = split_point(&model, at.0)?;
+        let end = model.content_size();
+        let (before, after) = (model.cut(0, at), model.cut(at, end));
+        let empty = |half: &rinch_editor_core::Node| half.child_count() == 0 || markdown::is_blank(half);
+        if empty(&before) {
+            return Err(CrdtError::Refused("Nothing comes before the caret, so there is nothing to split off.".into()));
+        }
+        if empty(&after) {
+            return Err(CrdtError::Refused("Nothing comes after the caret, so there is nothing to split off.".into()));
+        }
+        let rest = {
+            let state = rinch_editor_core::EditorState::create(schema.clone(), after.clone(), rinch_editor_core::default_plugins());
+            CollabSession::new(&state).map_err(collab)?.snapshot()
+        };
+        let keys: Vec<String> = data_keys_named(&after).into_iter().filter(|k| !data_keys_named(&before).contains(k)).collect();
+        session.record_local(&schema, &model, &before).map_err(collab)?;
+        let delta = session.save_incremental().map_err(collab)?;
+        self.apply_update(&delta)?;
+        let mut txn = self.doc.transact_mut();
+        for key in &keys {
+            self.data.remove(&mut txn, key);
+        }
+        Ok(SplitOff { rest, keys })
+    }
+
+    /// Put `other`'s text after this node's (instead of it, while this one is
+    /// blank), as an edit of this node's own text: what joining the node below
+    /// into this one writes. The `data` of `other`'s canvases and sheets comes
+    /// too.
+    pub fn append_content_of(&mut self, other: &NodeDoc) -> Result<()> {
+        if !other.has_projection() {
+            return Ok(());
+        }
+        let theirs = model_of(&other.save(), false)?;
+        if markdown::is_blank(&theirs) {
+            return Ok(());
+        }
+        let seed = !self.has_projection();
+        let delta = model_edit_delta(&self.save(), seed, |_schema, mine| {
+            if markdown::is_blank(mine) {
+                return Ok(theirs.clone());
+            }
+            Ok(mine.copy_with_content(mine.content().append(theirs.content())))
+        })?;
+        self.apply_update(&delta)?;
+        let keys = data_keys_named(&theirs);
+        self.copy_data_keys(other, &keys);
+        Ok(())
+    }
+
+    /// The `data` entries `keys` of `from`, copied into this node with their
+    /// yrs types (a canvas's elements, a sheet's rows). A key `from` lacks is
+    /// left out.
+    pub fn copy_data_keys(&mut self, from: &NodeDoc, keys: &[String]) {
+        let theirs = from.doc.transact();
+        let mut txn = self.doc.transact_mut();
+        for key in keys {
+            if let Some(value) = from.data.get(&theirs, key) {
+                self.data.insert(&mut txn, key.clone(), out_to_in(&theirs, value));
+            }
+        }
+    }
+
+    /// On a node joined into another, the node it became: links to it lead
+    /// there (docs/LINKS_CONTRACT.md "`became`").
+    pub fn set_became(&mut self, url: &PimbleUrl) {
+        let mut txn = self.doc.transact_mut();
+        self.write_became(&mut txn, url);
+    }
+}
+
+/// Where a split at `at` falls (see [`NodeDoc::split_off`]).
+fn split_point(model: &rinch_editor_core::Node, at: usize) -> Result<usize> {
+    let resolved = model.resolve(rinch_editor_core::Pos(at)).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    // A table never splits: the split goes before it.
+    if (1..=resolved.depth()).any(|d| resolved.node(d).type_name() == "table") {
+        return Ok(resolved.before(1).unwrap_or(at));
+    }
+    let depth = resolved.depth();
+    let parent = resolved.parent();
+    if depth >= 1 && parent.is_textblock() {
+        if resolved.parent_offset() == 0 {
+            return Ok(resolved.before(depth).unwrap_or(at));
+        }
+        if resolved.parent_offset() == parent.content_size() {
+            return Ok(resolved.after(depth).unwrap_or(at));
+        }
+    }
+    Ok(at)
+}
+
+/// The `data` keys the canvases and sheets in `model` live under, in the
+/// order they appear, each once.
+fn data_keys_named(model: &rinch_editor_core::Node) -> Vec<String> {
+    fn walk(node: &rinch_editor_core::Node, out: &mut Vec<String>) {
+        for (attr, prefix) in [("data-board", "board:"), (markdown::embed_attrs::SHEET, "sheet:")] {
+            if let Some(id) = node.attrs().get_str(attr).filter(|id| !id.is_empty()) {
+                let key = format!("{prefix}{id}");
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+        for child in node.content().iter() {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(model, &mut out);
+    out
+}
+
 impl Default for NodeDoc {
     fn default() -> Self {
         Self::new()
@@ -2149,5 +2290,131 @@ mod tests {
         // Typing before the appended words leaves the caret after them.
         doc.replace_text("three", "now three").unwrap();
         assert_eq!(at(&doc, appended), (2, 14));
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    //! Splitting a node's text in two and joining two nodes' text
+    //! (docs/SPLIT_CONTRACT.md).
+    use super::*;
+
+    const T0: &str = "2026-11-06T00:00:00Z";
+
+    fn note(md: &str) -> NodeDoc {
+        let mut doc = NodeDoc::new();
+        doc.init("document", "Note", None, T0).unwrap();
+        doc.write_markdown(md).unwrap();
+        doc
+    }
+
+    fn rest_markdown(off: &SplitOff) -> String {
+        let mut doc = NodeDoc::new();
+        doc.apply_update(&off.rest).unwrap();
+        doc.markdown().unwrap()
+    }
+
+    #[test]
+    fn a_split_inside_a_paragraph_leaves_each_half_its_part() {
+        let mut doc = note("One two.\n\nThree four.\n\nFive.");
+        let at = doc.sticky_at_quote("four.").unwrap();
+        let off = doc.split_off(&at).unwrap();
+        assert_eq!(doc.markdown().unwrap().trim(), "One two.\n\nThree");
+        assert_eq!(rest_markdown(&off).trim(), "four.\n\nFive.");
+    }
+
+    #[test]
+    fn a_split_at_the_start_of_a_paragraph_leaves_no_empty_one() {
+        let mut doc = note("One two.\n\nThree four.\n\nFive.");
+        let at = doc.sticky_at_quote("Three").unwrap();
+        let off = doc.split_off(&at).unwrap();
+        assert_eq!(doc.markdown().unwrap().trim(), "One two.");
+        assert_eq!(rest_markdown(&off).trim(), "Three four.\n\nFive.");
+    }
+
+    #[test]
+    fn a_split_with_nothing_before_the_caret_is_refused() {
+        let mut doc = note("One two.\n\nThree.");
+        let at = doc.sticky_at_quote("One").unwrap();
+        let err = doc.split_off(&at).unwrap_err();
+        assert!(err.to_string().contains("Nothing comes before the caret"), "{err}");
+        assert_eq!(doc.markdown().unwrap().trim(), "One two.\n\nThree.", "nothing changed");
+    }
+
+    #[test]
+    fn a_canvas_goes_with_the_text_it_is_in() {
+        let mut doc = NodeDoc::new();
+        doc.init("document", "Note", None, T0).unwrap();
+        {
+            let mut txn = doc.ydoc().transact_mut();
+            let board = doc.data_root().insert(&mut txn, "board:c1", yrs::MapPrelim::default());
+            board.insert(&mut txn, "markup_visible", true);
+        }
+        doc.write_markdown("Intro\n\nMiddle\n\n![shot](pimble-blob:a/b#canvas=c1)\n\nEnd").unwrap();
+        let before = NodeDoc::load(&doc.save()).unwrap();
+        let at = doc.sticky_at_quote("Middle").unwrap();
+        let off = doc.split_off(&at).unwrap();
+        assert_eq!(off.keys, vec!["board:c1".to_string()]);
+        assert!(doc.data_json().get("board:c1").is_none(), "the first half no longer holds it");
+        let mut rest = NodeDoc::new();
+        rest.init("document", "", None, T0).unwrap();
+        rest.apply_update(&off.rest).unwrap();
+        rest.copy_data_keys(&before, &off.keys);
+        assert_eq!(rest.data_json()["board:c1"]["markup_visible"], true);
+        assert!(rest.markdown().unwrap().contains("#canvas=c1"));
+    }
+
+    #[test]
+    fn a_split_inside_a_table_goes_before_the_table() {
+        let mut doc = note("Intro\n\n| a | b |\n| --- | --- |\n| c | dee |\n\nEnd");
+        // A sticky index inside the cell "dee", as the editor would make one
+        // at a caret there.
+        let at = {
+            let schema = rinch_editor_core::Schema::starter_kit();
+            let session = rinch_editor_collab::CollabSession::from_bytes(&doc.save()).unwrap();
+            let model = session.projected_doc(&schema).unwrap();
+            let mut inside = None;
+            model.nodes_between(0, model.content_size(), &mut |node, pos, _| {
+                if node.is_text() && node.text().map_or(false, |t| t == "dee") {
+                    inside = Some(pos + 1);
+                }
+                true
+            });
+            session.sticky_index(&model, rinch_editor_core::Pos(inside.expect("the cell"))).unwrap()
+        };
+        let off = doc.split_off(&at).unwrap();
+        assert_eq!(doc.markdown().unwrap().trim(), "Intro");
+        let rest = rest_markdown(&off);
+        assert!(rest.trim_start().starts_with("| a"), "{rest}");
+        assert!(rest.contains("dee") && rest.trim_end().ends_with("End"), "{rest}");
+    }
+
+    #[test]
+    fn joining_puts_the_other_text_after_this_one() {
+        let mut a = note("One.\n\nTwo.");
+        let b = note("Three.\n\nFour.");
+        a.append_content_of(&b).unwrap();
+        assert_eq!(a.markdown().unwrap().trim(), "One.\n\nTwo.\n\nThree.\n\nFour.");
+        // Into a blank note, the other text alone.
+        let mut empty = NodeDoc::new();
+        empty.init("document", "", None, T0).unwrap();
+        empty.append_content_of(&b).unwrap();
+        assert_eq!(empty.markdown().unwrap().trim(), "Three.\n\nFour.");
+    }
+
+    #[test]
+    fn a_split_then_a_join_gives_the_text_back() {
+        let md = "# Heading\n\nOne two three.\n\n- a\n- b\n\nLast.";
+        let mut doc = note(md);
+        let at = doc.sticky_at_quote("three.").unwrap();
+        let off = doc.split_off(&at).unwrap();
+        let mut rest = NodeDoc::new();
+        rest.init("document", "", None, T0).unwrap();
+        rest.apply_update(&off.rest).unwrap();
+        doc.append_content_of(&rest).unwrap();
+        // The paragraph the caret split stays two paragraphs (the space
+        // before the caret kept where it was): joining puts blocks after
+        // blocks.
+        assert_eq!(doc.markdown().unwrap().trim(), "# Heading\n\nOne two \n\nthree.\n\n- a\n- b\n\nLast.");
     }
 }

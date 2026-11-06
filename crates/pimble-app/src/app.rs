@@ -2607,7 +2607,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             input {
                 r#type: "text",
                 class: "pimble-search-bar__input",
-                placeholder: "Search... (Ctrl+Shift+F)",
+                placeholder: format!("Search... ({})", crate::shortcuts::chord(crate::shortcuts::SEARCH)),
                 // Raw elements have no special "value_fn" prop — that's a
                 // `TextInput`-component-only field. On a raw `<input>` any
                 // closure-valued prop just becomes a reactively-set attribute

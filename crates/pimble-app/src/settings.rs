@@ -13,6 +13,7 @@ use crate::state::AppStore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     General,
+    Keyboard,
     Account,
     Shares,
     Plugins,
@@ -25,15 +26,16 @@ impl Section {
     /// is always the version pimble.app serves.
     pub fn all() -> &'static [Section] {
         if cfg!(feature = "native") {
-            &[Section::General, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates]
+            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates]
         } else {
-            &[Section::General, Section::Account, Section::Shares, Section::Plugins]
+            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins]
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Section::General => "General",
+            Section::Keyboard => "Keyboard",
             Section::Account => "Account",
             Section::Shares => "Shares",
             Section::Plugins => "Plugins",
@@ -45,6 +47,7 @@ impl Section {
     fn key(self) -> &'static str {
         match self {
             Section::General => "general",
+            Section::Keyboard => "keyboard",
             Section::Account => "account",
             Section::Shares => "shares",
             Section::Plugins => "plugins",
@@ -103,6 +106,7 @@ pub fn showing(store: AppStore, section: Section) -> bool {
 /// `app.rs`, beside the sign-in it sends).
 pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -> NodeHandle {
     let general = render_general(__scope, store);
+    let keyboard = render_keyboard(__scope);
     let plugins = crate::plugins::render_page(__scope, store);
     let shares = crate::shares::render_page(__scope, store);
     let nav = rsx! {
@@ -126,6 +130,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
             div {
                 class: "pimble-settings__page",
                 div { style: {move || page_style(store, Section::General)}, {general} }
+                div { style: {move || page_style(store, Section::Keyboard)}, {keyboard} }
                 div { style: {move || page_style(store, Section::Account)}, {account} }
                 div { style: {move || page_style(store, Section::Shares)}, {shares} }
                 div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
@@ -139,6 +144,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
         div {
             class: "pimble-settings__page",
             div { style: {move || page_style(store, Section::General)}, {general} }
+                div { style: {move || page_style(store, Section::Keyboard)}, {keyboard} }
             div { style: {move || page_style(store, Section::Account)}, {account} }
             div { style: {move || page_style(store, Section::Shares)}, {shares} }
             div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
@@ -187,6 +193,56 @@ fn render_general(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                 div { class: {move || choice_class(!store.dark_mode.get())}, onclick: pick(false), "Light" }
             }
             div { class: "pimble-settings__note", "View > Toggle Dark Mode switches it too." }
+        }
+    }
+}
+
+/// Keyboard: every shortcut that can be changed (`crate::shortcuts`), typed
+/// as Ctrl+Shift+K; each one is saved as soon as it reads as a key no other
+/// shortcut has.
+fn render_keyboard(__scope: &mut RenderScope) -> NodeHandle {
+    use std::collections::HashMap;
+    let current = || -> HashMap<String, String> {
+        let saved = crate::shortcuts::saved();
+        crate::shortcuts::BINDINGS.iter().map(|b| (b.id.to_string(), saved.get(b.id).cloned().unwrap_or_else(|| b.default.to_string()))).collect()
+    };
+    let typed: Signal<HashMap<String, String>> = Signal::new(current());
+    let problems: Signal<HashMap<String, String>> = Signal::new(HashMap::new());
+    let when = if cfg!(feature = "native") { "the next time Pimble starts" } else { "the next time this page loads" };
+    rsx! {
+        div {
+            class: "pimble-settings__section",
+            div { class: "pimble-settings__heading", "Keyboard shortcuts" }
+            div { class: "pimble-settings__note", {format!("Type a shortcut as Ctrl+Shift+K. The menus use a changed one {when}.")} }
+            for b in crate::shortcuts::BINDINGS.iter() {
+                div {
+                    key: b.id,
+                    class: "pimble-settings__key",
+                    div { class: "pimble-settings__key-name", {b.label} }
+                    TextInput {
+                        value_fn: move || typed.with(|t| t.get(b.id).cloned().unwrap_or_default()),
+                        oninput: move |val: String| {
+                            typed.update(|t| { t.insert(b.id.to_string(), val.clone()); });
+                            let said = crate::shortcuts::choose(b.id, Some(&val)).err().unwrap_or_default();
+                            problems.update(|p| { p.insert(b.id.to_string(), said); });
+                        },
+                    }
+                    Button {
+                        variant: "default",
+                        size: "xs",
+                        onclick: move || {
+                            let _ = crate::shortcuts::choose(b.id, None);
+                            typed.update(|t| { t.insert(b.id.to_string(), b.default.to_string()); });
+                            problems.update(|p| { p.remove(b.id); });
+                        },
+                        {format!("Reset to {}", b.default)}
+                    }
+                    div {
+                        class: "pimble-settings__key-problem",
+                        {move || problems.with(|p| p.get(b.id).cloned().unwrap_or_default())}
+                    }
+                }
+            }
         }
     }
 }

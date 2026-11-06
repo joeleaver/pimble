@@ -1051,6 +1051,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.deleted_modal_pending.set(false);
                 }
             }
+            // The new note opens where the split was made, as Scrivener's does.
+            BackendEvent::NodeSplit { store_id, new_id, .. } => {
+                store.send(BackendCommand::ResolveLink { url: pimble_core::PimbleUrl::node(*store_id, *new_id), hops: 0 });
+            }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
                 // The list it left and the subtree that went with it were
                 // shown just before this answer (`Shown`).

@@ -51,6 +51,8 @@ pub mod state;
 pub mod styles;
 pub mod sheets;
 pub mod settings;
+pub mod shortcuts;
+pub mod splitting;
 pub mod shares;
 pub mod discussions;
 pub mod doc_session;

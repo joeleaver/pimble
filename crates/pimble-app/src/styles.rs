@@ -2948,6 +2948,24 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-primary-color-6);
 }
 
+.pimble-settings__key {
+    display: grid;
+    grid-template-columns: 180px 180px auto;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 2px;
+}
+
+.pimble-settings__key-name {
+    font-size: 13px;
+}
+
+.pimble-settings__key-problem {
+    grid-column: 2 / 4;
+    font-size: 12px;
+    color: var(--rinch-color-orange-6);
+}
+
 .pimble-settings__buttons {
     display: flex;
     gap: 8px;

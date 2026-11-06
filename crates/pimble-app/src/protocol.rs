@@ -146,6 +146,12 @@ pub enum BackendCommand {
         tags: Option<TagEdit>,
     },
     DeleteNode { store_id: StoreId, node_id: NodeId },
+    /// Split a text node at `at`, a sticky index made at the editor's caret:
+    /// the text from there on becomes a new node right below it, titled
+    /// `title` when given (docs/SPLIT_CONTRACT.md). Answers `NodeSplit`.
+    SplitNode { store_id: StoreId, node_id: NodeId, at: Vec<u8>, title: Option<String> },
+    /// Join the text node below this one into it (docs/SPLIT_CONTRACT.md).
+    JoinBelow { store_id: StoreId, node_id: NodeId },
     /// Answers `NodeMoved`, or `NodeTransplanted` when the move would have
     /// taken the node out of a share (docs/MOVE_CONTRACT.md).
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, place: Place },
@@ -528,6 +534,8 @@ pub enum BackendEvent {
     /// made it.
     PluginReply { instance: u64, call_id: u64, reply: pimble_plugin_host::abi::api::ApiReply },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
+    /// A split made `new_id` below `node_id` (`SplitNode`).
+    NodeSplit { store_id: StoreId, node_id: NodeId, new_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     /// A move that crossed a share's or a store's boundary
     /// (docs/MOVE_CONTRACT.md): `old_node_id` is now a tombstone under

@@ -140,17 +140,17 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
     // directory the desktop picks a path for, a hosted store the browser asks
     // the accounts service for and mints a key for.
     #[cfg(feature = "native")]
-    entries.push(MenuEntry::item("New Store...", "Ctrl+N", move || {
+    entries.push(MenuEntry::item("New Store...", crate::shortcuts::chord(crate::shortcuts::NEW_STORE), move || {
         crate::app::pick_and_create_store(store)
     }));
     #[cfg(not(feature = "native"))]
-    entries.push(MenuEntry::item("New Store...", "Ctrl+N", move || {
+    entries.push(MenuEntry::item("New Store...", crate::shortcuts::chord(crate::shortcuts::NEW_STORE), move || {
         crate::app::open_new_store_modal(store)
     }));
 
     #[cfg(feature = "native")]
     {
-        entries.push(MenuEntry::item("Open Store...", "Ctrl+O", move || {
+        entries.push(MenuEntry::item("Open Store...", crate::shortcuts::chord(crate::shortcuts::OPEN_STORE), move || {
             crate::app::pick_and_open_store(store)
         }));
         entries.push(MenuEntry::item("Add Remote Store...", "", move || {
@@ -178,7 +178,7 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
         entries.push(MenuEntry::Separator);
         // docs/SETTINGS_CONTRACT.md section 2: the theme, the account, plugins,
         // agents and updates in one window.
-        entries.push(MenuEntry::item("Settings...", "Ctrl+,", move || crate::settings::open(store)));
+        entries.push(MenuEntry::item("Settings...", crate::shortcuts::chord(crate::shortcuts::SETTINGS), move || crate::settings::open(store)));
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Exit", "Alt+F4", || {
             crate::app::close_window()
@@ -189,7 +189,7 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
     #[cfg(not(feature = "native"))]
     {
         entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::item("Settings...", "Ctrl+,", move || crate::settings::open(store)));
+        entries.push(MenuEntry::item("Settings...", crate::shortcuts::chord(crate::shortcuts::SETTINGS), move || crate::settings::open(store)));
         entries.push(MenuEntry::item("Account", "", crate::app::run_account_action));
         entries.push(MenuEntry::item("Shares...", "", move || crate::shares::open(store)));
         // docs/PLUGINS_CONTRACT.md wave 3: the plugins added in this browser,
@@ -229,6 +229,9 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::Sub { label: "Insert", entries: insert_entries(store) },
         // Nodes, where the explorer's "+" makes them: File > New's list.
         MenuEntry::Sub { label: "New", entries: new_entries(store) },
+        // docs/SPLIT_CONTRACT.md: Scrivener's keys (Ctrl+K, Ctrl+M).
+        MenuEntry::item("Split Note at Caret", crate::shortcuts::chord(crate::shortcuts::SPLIT), move || crate::splitting::split_here(store)),
+        MenuEntry::item("Join Note Below", crate::shortcuts::chord(crate::shortcuts::JOIN), move || crate::splitting::join_below(store)),
         // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
         // A discussion at the caret, drawn in the margin (commenters too).
         MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
@@ -276,7 +279,7 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Forward", "Alt+Right", move || store.nav_step.set(Some(false))),
         MenuEntry::Separator,
         MenuEntry::item("Focus Explorer", "Ctrl+Shift+E", crate::app::focus_explorer),
-        MenuEntry::item("Focus Search", "Ctrl+Shift+F", crate::app::focus_search),
+        MenuEntry::item("Focus Search", crate::shortcuts::chord(crate::shortcuts::SEARCH), crate::app::focus_search),
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)
         }),
