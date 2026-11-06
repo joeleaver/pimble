@@ -1,6 +1,6 @@
 # Settings, and the plugin library
 
-Status: waves 1 to 3 built 2026-11-06 on branch `settings` (sections 9 to 11). The
+Status: all four waves built 2026-11-06 on branch `settings` (sections 9 to 12). The
 shape was agreed with Joe in conversation ("Seems right"), including the four
 recommendations in section 1, and he answered section 7 the same day.
 
@@ -139,7 +139,8 @@ next closed.
 
 `site/plugins.html` lists the same index from `/api/v1/plugins`: screenshot, name, summary,
 what it asks for. Each plugin's "Install in Pimble" is `pimble:settings/plugins?install=<id>`.
-Pimble already opens its own links (docs/LINKS_CONTRACT.md), so this needs one new link kind.
+Pimble opened its own links only from inside itself, so wave 4 also made the operating
+system hand `pimble:` links to it (section 12).
 It opens Settings at that plugin's row with Install ready. Nothing is installed until the
 person presses it. With no Pimble installed, the page says to download it first.
 
@@ -334,3 +335,90 @@ release app on the scratch copy, with the browser checked on the local stack.
        were untouched. The line was gone once Settings closed and opened again.
   - Not run in the browser: its download and refusal were checked in wave 2, and the
     update path is the shared code above.
+
+## 12. Wave 4 as built (2026-11-06)
+
+**The link.** `crates/pimble-app/src/links.rs` `AppLink` reads:
+- a note's link, which follows it as a click does;
+- `pimble:settings`, which opens Settings at the section chosen last;
+- `pimble:settings/<section>`;
+- `pimble:settings/plugins?install=<id>`.
+
+An install link opens Settings at Plugins and marks the plugin's library row with a bar.
+The row says what to press: "Press Install to add Todo List.", "Press Update to get
+0.2.0.", or that it is installed already, added from a file, or needs a newer Pimble.
+**Nothing is installed until the person presses the button.** An `install` names only a
+plain id, and only at Plugins. Anything else is "Pimble does not know how to open ...".
+
+**From the operating system to the window.**
+- **Registration.**
+  - Linux: the menu entry says `Exec=... %u` and
+    `MimeType=x-scheme-handler/pimble;`, and the app runs `update-desktop-database` and
+    `xdg-mime default pimble.desktop x-scheme-handler/pimble`, both best effort.
+  - Windows: `HKCU\Software\Classes\pimble`, with `URL Protocol` and
+    `"<app>\pimble.exe" "%1"`.
+  - The installer writes the Windows keys for a new install (`[Registry]`, removed on
+    uninstall).
+  - An installed copy writes its own registration at start when it differs
+    (`update::register_links`). That covers copies installed before 0.20 and copies
+    updated in place, which never ran `--install` again. A copy that is not an installed
+    one registers nothing.
+- **The handoff.** `pimble <link>` (`main.rs`) asks this computer's server, with a 3 s
+  limit, to hand the link to a window: `openInApp`, Service-only, answers `delivered`.
+  - Windows listen through `subscribeAppLinks`. The one open longest takes the link, and
+    the second process exits.
+  - With no server, an older one, or no window listening (a server `pimble-mcp` started),
+    the process opens a window itself. It opens the link 1.5 s after it connects, so the
+    stores it names are open.
+- **Raising the window** needs rinch's `focus_current_window()`
+  ([joeleaver/rinch#2310](https://github.com/joeleaver/rinch/pull/2310), open). Until it
+  merges, `app::bring_to_front` calls `show_current_window()`, which does nothing for a
+  window already open, so the link's change happens wherever the window is. Switch to the
+  new call when the pin moves to a rinch that has it.
+
+**The web app.** `/app/?open=<pimble: link>` keeps the link in the tab's
+`sessionStorage` (`pimble.open`), so it survives a trip through sign-in or unlock. Once
+the app is up, it is opened the way the desktop opens a launch link.
+
+**The website.** `site/plugins.html` lists `/api/v1/plugins`:
+- each plugin's screenshot when the index names one, its name, version and summary, what
+  it asks for, and its author;
+- "Install in Pimble", which is the `pimble:` link;
+- "Open in the web app", which is `/app/?open=...`;
+- a line saying Install in Pimble needs Pimble on this computer, with a link to the
+  download page. A browser cannot tell whether a scheme has a handler, so the line is
+  always there.
+
+"Plugins" is in the header (hidden on a phone, like "Web app") and the footer of the home,
+download and plugins pages.
+
+**Checked:**
+- `pimble-server` `app_links`, all passing:
+  - no window means `delivered: false`;
+  - of two windows only the oldest hears the link;
+  - when it closes, the next one does;
+  - when both are gone, `false` again.
+- `pimble-app` 223 tests, among them `settings_links_read_and_nothing_else_does`.
+- The workspace with tests, the browser build, and
+  `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc` (the
+  registry code) build cleanly.
+- In the release app on the scratch copy (its own port, its own XDG dirs):
+  - **Handoff.** With the app running, `pimble "pimble:settings/plugins?install=todo-viewer"`
+    exited in 15 ms. The window opened Settings > Plugins with Todo List saying "Press
+    Install to add Todo List.", and nothing was written to the folder.
+  - **Cold start.** Started with the same link and no Pimble running, it opened with the
+    row marked.
+  - **A note link** handed over opened Ides of March and selected it in the tree.
+  - **Registration.** As a managed install in the scratch folder, with scratch
+    `XDG_DATA_HOME` and `XDG_CONFIG_HOME`, it rewrote `pimble.desktop` with `%u` and the
+    scheme, and `xdg-mime query default x-scheme-handler/pimble` answered `pimble.desktop`.
+    Then `xdg-open "pimble:settings/keyboard"` reached the running window, which opened
+    Settings at Keyboard. The real `~/.local/share/applications/pimble.desktop` and
+    `mimeapps.list` were untouched.
+- **The plugins page,** served beside a stub library: three rows with the right links, at
+  1200 px and at 375 px, with no sideways scroll.
+- **The web app** on the local stack: `/app/?open=pimble%3Asettings%2Fplugins%3Finstall%3Dtodo-viewer`
+  in a locked tab went to sign-in. After signing in as the fixture account, it opened
+  Settings > Plugins with Todo List marked and "Press Install to add Todo List.".
+- **Not checked:** the window coming to the front (rinch#2310), and the registration on a
+  real Windows machine.

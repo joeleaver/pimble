@@ -56,7 +56,7 @@ impl Section {
         }
     }
 
-    fn from_key(key: &str) -> Option<Section> {
+    pub(crate) fn from_key(key: &str) -> Option<Section> {
         Section::all().iter().copied().find(|s| s.key() == key)
     }
 }

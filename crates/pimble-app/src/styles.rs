@@ -2899,6 +2899,12 @@ pub(crate) const APP_CSS: &str = "
     font-weight: 600;
 }
 
+/* A library row a link asked about (pimble:settings/plugins?install=<id>). */
+.pimble-plugins__row--asked {
+    border-left: 3px solid var(--rinch-primary-color);
+    padding-left: 10px;
+}
+
 .pimble-settings__page {
     flex: 1;
     min-width: 0;

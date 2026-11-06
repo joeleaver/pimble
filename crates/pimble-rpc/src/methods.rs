@@ -351,6 +351,18 @@ pub trait PimbleApi {
     #[subscription(name = "subscribeCloudConnection" => "cloudConnectionChanged", unsubscribe = "unsubscribeCloudConnection", item = Option<CloudConnection>, with_extensions)]
     async fn subscribe_cloud_connection(&self) -> SubscriptionResult;
 
+    /// A `pimble:` link this computer was asked to open (a click in a browser
+    /// or a mail app starts `pimble <link>`): handed to one Pimble window
+    /// listening through `subscribeAppLinks`, the one open longest.
+    /// `delivered` is false when none is, and the caller opens a window of its
+    /// own. `Service`-only.
+    #[method(name = "openInApp", with_extensions)]
+    async fn open_in_app(&self, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned>;
+
+    /// A Pimble window hears the links `openInApp` hands it. `Service`-only.
+    #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = String, with_extensions)]
+    async fn subscribe_app_links(&self) -> SubscriptionResult;
+
     /// Host a local store's encrypted twin on Pimble Cloud. `Service`-only.
     #[method(name = "cloudHostStore", with_extensions)]
     async fn cloud_host_store(&self, request: CloudHostStoreRequest) -> Result<CloudHostStoreResponse, ErrorObjectOwned>;

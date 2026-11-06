@@ -53,6 +53,7 @@ use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
+    OpenInAppRequest, OpenInAppResponse,
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
@@ -1081,6 +1082,8 @@ pub struct RpcHandler {
     /// changed (a link's state, a sign-in or out); the tunnel has its own
     /// watch (`RelayHost::watch_tunnel`). `subscribeCloudConnection` hears both.
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The Pimble windows hearing `openInApp`, oldest first.
+    app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1177,6 +1180,7 @@ impl RpcHandler {
             version: Arc::from(env!("CARGO_PKG_VERSION")),
             presence: Arc::new(crate::presence::PresenceHub::new()),
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
+            app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -3184,6 +3188,42 @@ impl PimbleApiServer for RpcHandler {
                     _ = sink.closed() => break,
                 }
             }
+        });
+        Ok(())
+    }
+
+    async fn open_in_app(&self, ext: &Extensions, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "openInApp")?;
+        let mut windows = self.app_links.lock().unwrap_or_else(|e| e.into_inner());
+        // The oldest window still listening takes it; gone ones are dropped.
+        windows.retain(|w| !w.is_closed());
+        let delivered = windows.iter().any(|w| w.send(request.url.clone()).is_ok());
+        info!("openInApp: {}", if delivered { "handed to a window" } else { "no window is listening" });
+        Ok(OpenInAppResponse { delivered })
+    }
+
+    async fn subscribe_app_links(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeAppLinks") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        self.app_links.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    url = rx.recv() => {
+                        let Some(url) = url else { break };
+                        let Ok(msg) = SubscriptionMessage::from_json(&url) else { break };
+                        if sink.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = sink.closed() => break,
+                }
+            }
+            // Dropping `rx` closes the sender, which `openInApp` then skips.
         });
         Ok(())
     }

@@ -1780,3 +1780,15 @@ pub struct UpdateAgentRequest {
 pub struct RemoveAgentRequest {
     pub id: String,
 }
+
+/// `openInApp`: a `pimble:` link to hand to a Pimble window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenInAppRequest {
+    pub url: String,
+}
+
+/// Whether a window took the link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenInAppResponse {
+    pub delivered: bool,
+}

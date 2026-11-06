@@ -114,6 +114,9 @@ thread_local! {
     /// Plugins being updated on their own (wave 3): a pane showing one keeps
     /// the version it runs when the new one is swapped in.
     static QUIET: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+    /// The plugin a `pimble:settings/plugins?install=<id>` link asked about:
+    /// its library row is marked and says what to press.
+    static ASKED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The library is checked for updates on a timer, started once.
     static CHECKING: Cell<bool> = const { Cell::new(false) };
 }
@@ -716,6 +719,8 @@ struct LibraryRow {
     button: Option<&'static str>,
     /// Downloading, or what came of the last install.
     line: String,
+    /// A link asked about this plugin.
+    asked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -747,6 +752,15 @@ pub(crate) fn shown(store: AppStore) {
 /// own) is said until then.
 pub(crate) fn hidden() {
     ROW_LINES.with(|l| l.borrow_mut().clear());
+    ASKED.with(|a| *a.borrow_mut() = None);
+}
+
+/// A link asked to install plugin `id` (the website's "Install in Pimble"):
+/// its row in the library is marked and says what to press. Nothing is
+/// installed until the person presses it.
+pub(crate) fn offer_install(id: &str) {
+    ASKED.with(|a| *a.borrow_mut() = Some(id.to_string()));
+    refresh_library();
 }
 
 fn refresh_window() {
@@ -867,8 +881,8 @@ pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHan
                 }
                 for row in ui.library.get() {
                     div {
-                        key: format!("{} {} {:?} {}", row.id, row.title, row.offer, row.line),
-                        class: "pimble-plugins__row",
+                        key: format!("{} {} {:?} {} {}", row.id, row.title, row.offer, row.line, row.asked),
+                        class: if row.asked { "pimble-plugins__row pimble-plugins__row--asked" } else { "pimble-plugins__row" },
                         style: "display: flex; gap: 12px; align-items: center;",
                         div {
                             style: "flex: 1; display: flex; flex-direction: column; gap: 2px;",
@@ -965,8 +979,14 @@ fn library_rows() -> Vec<LibraryRow> {
             if let Some(first) = asks.get_mut(..1) {
                 first.make_ascii_uppercase();
             }
-            let line = ROW_LINES.with(|l| l.borrow().get(&entry.id).cloned()).unwrap_or_else(|| match &offer {
-                Offer::Update { from } => format!("You have {from}."),
+            let asked = ASKED.with(|a| a.borrow().as_deref() == Some(entry.id.as_str()));
+            let line = ROW_LINES.with(|l| l.borrow().get(&entry.id).cloned()).unwrap_or_else(|| match (&offer, asked) {
+                (Offer::Install, true) => format!("Press Install to add {}.", entry.name),
+                (Offer::Update { from }, true) => format!("You have {from}. Press Update to get {}.", entry.version),
+                (Offer::Update { from }, false) => format!("You have {from}."),
+                (Offer::Installed, true) => format!("{} is installed already.", entry.name),
+                (Offer::FromFile, true) => format!("{} was added from a file. Remove it above to install the library's.", entry.name),
+                (Offer::NeedsNewer, true) => format!("{} needs a newer Pimble. Update Pimble first.", entry.name),
                 _ => String::new(),
             });
             let button = match offer {
@@ -974,7 +994,7 @@ fn library_rows() -> Vec<LibraryRow> {
                 Offer::Update { .. } => Some("Update"),
                 _ => None,
             };
-            LibraryRow { button, id: entry.id.clone(), title: format!("{} {}", entry.name, entry.version), summary: entry.summary.clone(), asks: format!("{asks}."), offer, line }
+            LibraryRow { asked, button, id: entry.id.clone(), title: format!("{} {}", entry.name, entry.version), summary: entry.summary.clone(), asks: format!("{asks}."), offer, line }
         })
         .collect()
 }

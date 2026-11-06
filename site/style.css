@@ -619,6 +619,11 @@ footer.site {
 
 .assets { display: grid; gap: 12px; }
 
+/* plugins.html: a plugin is an .asset row with a screenshot and two buttons. */
+.plugin__shot { width: 160px; height: auto; border-radius: 10px; border: 1px solid var(--border); flex: none; }
+.plugin__asks { font-size: 0.85rem; color: var(--text-dim); margin-top: 6px; }
+.plugin__buttons { display: flex; flex-direction: column; gap: 8px; flex: none; }
+
 .asset {
   display: flex;
   justify-content: space-between;
@@ -728,6 +733,8 @@ form.stack { max-width: 360px; }
   .feature, .way, .platform { padding: 22px; }
   .asset { flex-direction: column; align-items: stretch; }
   .asset .btn { width: 100%; }
+  .plugin__shot { width: 100%; }
+  .asset__main:has(.plugin__shot) { flex-direction: column; }
   .closing { padding: 44px 20px; border-radius: 22px; }
   .diagram { flex-direction: column; }
   .diagram .node { width: 100%; }

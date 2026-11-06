@@ -142,12 +142,81 @@ fn desktop_integration(dir: &Path, binaries: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("writing an icon: {e}"))?;
     let apps = data.join("applications");
     std::fs::create_dir_all(&apps).map_err(|e| format!("creating {}: {e}", apps.display()))?;
-    let entry = format!(
+    std::fs::write(apps.join(DESKTOP_FILE), desktop_entry(dir)).map_err(|e| format!("writing the menu entry: {e}"))?;
+    claim_links(&apps);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const DESKTOP_FILE: &str = "pimble.desktop";
+
+/// The menu entry, which also says Pimble opens `pimble:` links
+/// (docs/SETTINGS_CONTRACT.md section 12): the link arrives as `%u`.
+#[cfg(target_os = "linux")]
+fn desktop_entry(dir: &Path) -> String {
+    format!(
         "[Desktop Entry]\nType=Application\nName=Pimble\nComment=Your notes, on your disk, shared when you choose\n\
-         Exec={}\nIcon=pimble\nTerminal=false\nCategories=Office;Utility;\nStartupWMClass=pimble\n",
+         Exec={} %u\nIcon=pimble\nTerminal=false\nCategories=Office;Utility;\nStartupWMClass=pimble\n\
+         MimeType=x-scheme-handler/pimble;\n",
         dir.join(EXE).display()
-    );
-    std::fs::write(apps.join("pimble.desktop"), entry).map_err(|e| format!("writing the menu entry: {e}"))
+    )
+}
+
+/// Make Pimble the program that opens `pimble:` links, as far as the desktop
+/// lets a user say so. Best effort: a desktop without `xdg-mime` reads the
+/// entry's `MimeType` line itself.
+#[cfg(target_os = "linux")]
+fn claim_links(apps: &Path) {
+    let quiet = |cmd: &mut std::process::Command| cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let _ = quiet(std::process::Command::new("update-desktop-database").arg(apps));
+    let _ = quiet(std::process::Command::new("xdg-mime").args(["default", DESKTOP_FILE, "x-scheme-handler/pimble"]));
+}
+
+/// An installed copy says it opens `pimble:` links, once: copies installed
+/// before 0.20 got a menu entry without it, and an update never rewrites the
+/// entry. On Windows, the same in the user's own registry (the installer
+/// writes it for a new install; this covers one updated in place).
+fn register_links(dir: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(apps) = dirs::data_local_dir().map(|d| d.join("applications")) else { return };
+        let path = apps.join(DESKTOP_FILE);
+        let want = desktop_entry(dir);
+        if std::fs::read_to_string(&path).is_ok_and(|have| have == want) {
+            return;
+        }
+        if std::fs::create_dir_all(&apps).and_then(|_| std::fs::write(&path, want)).is_ok() {
+            claim_links(&apps);
+            tracing::info!("pimble: links now open in this copy ({})", path.display());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let exe = dir.join(EXE);
+        let command = format!("\"{}\" \"%1\"", exe.display());
+        let key = r"HKCU\Software\Classes\pimble";
+        let reg = |args: &[&str]| {
+            std::process::Command::new("reg")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let open = format!(r"{key}\shell\open\command");
+        let current = std::process::Command::new("reg").args(["query", &open, "/ve"]).output().ok();
+        if current.is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains(&command)) {
+            return;
+        }
+        let done = reg(&["add", key, "/ve", "/d", "URL:Pimble", "/f"])
+            && reg(&["add", key, "/v", "URL Protocol", "/d", "", "/f"])
+            && reg(&["add", &open, "/ve", "/d", &command, "/f"]);
+        if done {
+            tracing::info!("pimble: links now open in this copy ({})", exe.display());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = dir;
 }
 
 // ── At start ────────────────────────────────────────────────────────────────
@@ -326,6 +395,7 @@ pub fn start(store: AppStore) {
         return;
     };
     STORE.with(|s| s.set(Some(store)));
+    register_links(&dir);
     store.update_status.set(UpdateStatus::Waiting);
     if let Some(version) = staged_version(&dir).filter(|v| newer_than_current(v)) {
         store.update_ready.set(Some(version.clone()));

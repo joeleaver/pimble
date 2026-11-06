@@ -282,11 +282,17 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    and the status bar showed "Node not found" (`GetAncestors` on both backends stops at
    the first parent this device cannot read); Copy Link to Here with a selection.
 
+## Opened from outside the app (built 2026-11-06)
+
+A `pimble:` link in an email or on a web page opens in Pimble: the operating system starts
+`pimble <link>`, which hands it to the window already open (`openInApp`), or opens one.
+The registration, the handoff and the `pimble:settings` links are
+docs/SETTINGS_CONTRACT.md section 12.
+
 ## Later
 
 - The backlinks view, with the metadata section (decision 4). Cross-store backlinks need
   either each store's index to keep incoming links from other stores, or a query across
   every open store's index; decided with that view.
-- Registering `pimble:` with the operating system, so a link in an email opens the app.
 - Link titles that follow a renamed target (today the words are what the writer typed or
   picked, and stay so).

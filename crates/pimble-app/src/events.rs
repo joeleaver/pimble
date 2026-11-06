@@ -649,6 +649,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // A picture that could not be fetched while there was no
                 // connection is asked for again.
                 crate::pictures::retry_missing();
+                // The link this process was started with, once the stores
+                // it names have had a moment to open.
+                if let Some(link) = crate::links::take_launch_link() {
+                    rinch::core::reactive::unowned(|| {
+                        let _ = rinch::prelude::set_timeout(1500, move || crate::links::open_app_link(store, &link));
+                    });
+                }
 
                 // Auto-open previously loaded stores. On a reconnect this is
                 // the same list (every open store is persisted there), so
@@ -1429,6 +1436,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
             BackendEvent::CloudConnectionChanged { connection } => {
                 store.cloud_connection.set(connection.clone());
+            }
+            BackendEvent::AppLink { url } => {
+                #[cfg(feature = "native")]
+                crate::app::bring_to_front();
+                crate::links::open_app_link(store, url);
             }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md

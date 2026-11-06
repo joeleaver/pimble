@@ -4633,6 +4633,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     (store, app_component)
 }
 
+/// A link from outside reached this window: show it. (rinch has no way yet
+/// to raise and focus a window; until it does, the window is made visible
+/// where it is.)
+#[cfg(feature = "native")]
+pub(crate) fn bring_to_front() {
+    show_current_window();
+}
+
 /// Open the desktop window: the same UI [`build_view`] builds, wrapped in a
 /// native menu bar, the borderless window and the saved theme. `renderer` is
 /// the GPU with a fall back to software unless the command line chose

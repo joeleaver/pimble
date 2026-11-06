@@ -61,6 +61,13 @@ Source: "{#Stage}\pimble-install.json"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{userprograms}\Pimble"; Filename: "{app}\pimble.exe"
 Name: "{userdesktop}\Pimble"; Filename: "{app}\pimble.exe"; Tasks: desktopicon
 
+[Registry]
+; Pimble opens pimble: links (docs/SETTINGS_CONTRACT.md section 12): a note's,
+; or the website's "Install in Pimble". Per user, gone with the uninstall.
+Root: HKCU; Subkey: "Software\Classes\pimble"; ValueType: string; ValueName: ""; ValueData: "URL:Pimble"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\pimble"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\pimble\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\pimble.exe"" ""%1"""
+
 [Run]
 Filename: "{app}\pimble.exe"; Description: "Open Pimble"; Flags: nowait postinstall skipifsilent
 
