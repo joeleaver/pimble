@@ -66,6 +66,17 @@ mod imp {
         write_state(&state);
     }
 
+    /// The Settings section chosen last (docs/SETTINGS_CONTRACT.md section 2).
+    pub(crate) fn load_settings_section() -> Option<String> {
+        read_state()["settings_section"].as_str().map(str::to_string)
+    }
+
+    pub(crate) fn save_settings_section(section: &str) {
+        let mut state = read_state();
+        state["settings_section"] = serde_json::json!(section);
+        write_state(&state);
+    }
+
     /// The explorer's width in pixels, when the person has dragged it.
     pub(crate) fn load_sidebar_width() -> Option<f32> {
         read_state()["sidebar_width"].as_f64().map(|w| w as f32)
@@ -232,6 +243,18 @@ mod imp {
         }
     }
 
+    const SETTINGS_SECTION_KEY: &str = "pimble.settings_section";
+
+    pub(crate) fn load_settings_section() -> Option<String> {
+        storage().and_then(|s| s.get_item(SETTINGS_SECTION_KEY).ok().flatten())
+    }
+
+    pub(crate) fn save_settings_section(section: &str) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(SETTINGS_SECTION_KEY, section);
+        }
+    }
+
     const PERSONAL_SYNC_KEY: &str = "pimble.personal_sync";
 
     pub(crate) fn load_personal_sync() -> bool {
@@ -338,8 +361,8 @@ pub(crate) fn save_panes(panes: &crate::panes::SavedPanes) {
 }
 
 pub(crate) use imp::{
-    load_app_state_file, load_dark_mode, load_personal, load_personal_sync, load_sidebar_width, save_app_state_file, save_dark_mode,
-    save_personal, save_personal_sync, save_sidebar_width,
+    load_app_state_file, load_dark_mode, load_personal, load_personal_sync, load_settings_section, load_sidebar_width, save_app_state_file,
+    save_dark_mode, save_personal, save_personal_sync, save_settings_section, save_sidebar_width,
 };
 pub(crate) use imp::{load_views_json, save_views_json};
 #[cfg(feature = "native")]

@@ -154,6 +154,10 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
             }
         }));
         entries.push(MenuEntry::Separator);
+        // docs/SETTINGS_CONTRACT.md section 2: the theme, the account, plugins,
+        // agents and updates in one window.
+        entries.push(MenuEntry::item("Settings...", "Ctrl+,", move || crate::settings::open(store)));
+        entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Exit", "Alt+F4", || {
             crate::app::close_window()
         }));
@@ -163,6 +167,7 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
     #[cfg(not(feature = "native"))]
     {
         entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item("Settings...", "Ctrl+,", move || crate::settings::open(store)));
         entries.push(MenuEntry::item("Account", "", crate::app::run_account_action));
         entries.push(MenuEntry::item("Shares...", "", move || crate::shares::open(store)));
         // docs/PLUGINS_CONTRACT.md wave 3: the plugins added in this browser,

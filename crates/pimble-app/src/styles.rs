@@ -2861,6 +2861,98 @@ pub(crate) const APP_CSS: &str = "
     margin-top: 2px;
 }
 
+/* ── Settings (docs/SETTINGS_CONTRACT.md section 2) ─────────────── */
+
+.pimble-settings {
+    display: flex;
+    gap: 20px;
+    min-height: 420px;
+}
+
+.pimble-settings__nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 150px;
+    flex-shrink: 0;
+    padding-right: 12px;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-settings__tab {
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--rinch-color-text);
+    opacity: 0.8;
+}
+
+.pimble-settings__tab:hover {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+}
+
+.pimble-settings__tab--on {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+    font-weight: 600;
+}
+
+.pimble-settings__page {
+    flex: 1;
+    min-width: 0;
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.pimble-settings__section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pimble-settings__heading {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.pimble-settings__line {
+    font-size: 13px;
+}
+
+.pimble-settings__note {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-settings__choices {
+    display: flex;
+    gap: 6px;
+}
+
+.pimble-settings__choice {
+    padding: 4px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--rinch-color-border);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.pimble-settings__choice:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-settings__choice--on {
+    border-color: var(--rinch-primary-color-6);
+    color: var(--rinch-primary-color-6);
+}
+
+.pimble-settings__buttons {
+    display: flex;
+    gap: 8px;
+}
+
 /* ── Status bar ─────────────────────────────────────────────── */
 
 .pimble-status-bar {

@@ -4977,6 +4977,7 @@ dependencies = [
  "futures",
  "image",
  "js-sys",
+ "notify",
  "open",
  "pimble-api",
  "pimble-board",

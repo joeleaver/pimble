@@ -678,15 +678,33 @@ pub fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId,
 /// host a store"), or empty. The URL field starts at `https://pimble.app` and
 /// then keeps whatever was last typed in this run.
 pub fn open_account_modal(store: AppStore, hint: &str) {
+    crate::settings::open_at(store, crate::settings::Section::Account);
+    store.account_modal_hint.set(hint.to_string());
+}
+
+/// The Account page is shown (Settings, docs/SETTINGS_CONTRACT.md section 2):
+/// it starts clean, with no hint unless whoever opened it gives one.
+pub(crate) fn account_shown(store: AppStore) {
     store.account_modal_error.set(String::new());
     store.account_modal_busy.set(false);
     store.account_modal_password.set(String::new());
     store.account_modal_password_visible.set(false);
-    store.account_modal_hint.set(hint.to_string());
+    store.account_modal_hint.set(String::new());
     if untracked(|| store.account_modal_url.get()).is_empty() {
         store.account_modal_url.set("https://pimble.app".to_string());
     }
-    store.account_modal_open.set(true);
+}
+
+/// Settings closed: a typed password does not outlive it.
+pub(crate) fn account_hidden(store: AppStore) {
+    store.account_modal_error.set(String::new());
+    store.account_modal_password.set(String::new());
+    store.account_modal_hint.set(String::new());
+}
+
+/// Whether the Account page is showing.
+pub(crate) fn account_showing(store: AppStore) -> bool {
+    crate::settings::showing(store, crate::settings::Section::Account)
 }
 
 /// "Host on Pimble Cloud..." for `store_id`: the confirmation when an account
@@ -3426,6 +3444,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // "Sign Out" button once something is. Both outcomes arrive as
         // `CloudStatusChanged`, which flips the face and leaves the modal
         // open so the person sees it worked.
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         let sign_in = move || {
             let url = untracked(|| store.account_modal_url.get()).trim().to_string();
             let email = untracked(|| store.account_modal_email.get()).trim().to_string();
@@ -3439,20 +3458,36 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.send(BackendCommand::CloudSignIn { url, email, password });
         };
         let about_modal = crate::about::render_about(__scope, store);
-        let account_modal = rsx! {
-            Modal {
-                opened_fn: move || store.account_modal_open.get(),
-                onclose: move || {
-                    store.account_modal_open.set(false);
-                    store.account_modal_error.set(String::new());
-                    store.account_modal_password.set(String::new());
-                    store.account_modal_hint.set(String::new());
-                },
-                title: "Account",
-                size: "sm",
-
+        // Settings > Account (docs/SETTINGS_CONTRACT.md section 2): the
+        // sign-in form, or who is signed in. The browser signs in through its
+        // own pages, so there it is a way to them.
+        #[cfg(not(feature = "native"))]
+        let account_page = rsx! {
+            div {
+                class: "pimble-settings__section",
+                style: "display: flex; flex-direction: column; gap: 10px; max-width: 420px;",
+                div { {|| format!("Signed in as {}", store.cloud_email.get())} }
+                Checkbox {
+                    label: "Keep what I've read in step",
+                    checked_fn: move || store.personal_sync.get(),
+                    onchange: move || crate::personal::set_sync_enabled(store, !untracked(|| store.personal_sync.get())),
+                }
                 div {
-                    style: "display: flex; flex-direction: column; gap: 10px;",
+                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                    "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
+                }
+                div {
+                    style: "display: flex; gap: 8px;",
+                    Button { variant: "default", size: "xs", onclick: run_account_action, "Your Account Page" }
+                    Button { variant: "light", size: "xs", onclick: run_sign_out_action, "Sign Out" }
+                }
+            }
+        };
+        #[cfg(feature = "native")]
+        let account_page = rsx! {
+                div {
+                    class: "pimble-settings__section",
+                    style: "display: flex; flex-direction: column; gap: 10px; max-width: 420px;",
 
                     if !store.account_modal_hint.get().is_empty() {
                         div {
@@ -3546,8 +3581,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
                     }
                 }
-            }
         };
+        let settings_modal = crate::settings::render(__scope, store, account_page);
 
         // ── "Host on Pimble Cloud..." confirmation (store root context
         // menu) ─────────────────────────────────────────────────────────
@@ -4509,12 +4544,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         #[cfg(feature = "native")]
         let brand: rinch::components::SectionRenderer =
             Rc::new(move |__scope| crate::brand::titlebar_lockup(__scope, store));
-        // Account > "AI Agents..." (docs/AGENTS_CONTRACT.md), the desktop only.
-        #[cfg(feature = "native")]
-        let agents_modal = crate::agents::render_modal(__scope, store);
-        // Account > "Plugins..." (docs/PLUGINS_CONTRACT.md decision 2) on the
-        // desktop, File > "Plugins..." in the browser.
-        let plugins_modal = crate::plugins::render_modal(__scope, store);
         // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
         // section 3), both targets.
         let shares_modal = crate::shares::render_modal(__scope, store);
@@ -4553,13 +4582,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
-                {account_modal}
+                {settings_modal}
                 {about_modal}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
-                {agents_modal}
-                {plugins_modal}
                 {share_modal}
                 {shares_modal}
                 {share_name_question}
@@ -4590,12 +4617,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
-                {account_modal}
+                {settings_modal}
                 {about_modal}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
-                {plugins_modal}
                 {share_modal}
                 {shares_modal}
                 {share_name_question}
@@ -4692,7 +4718,7 @@ pub fn run(renderer: Renderer) {
 mod tests {
     use super::{
         hosted_store_label, host_to_share, member_role_text, member_status_text, open_share_modal, open_stop_relay_modal,
-        cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
+        account_showing, cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
     };
     use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
     use crate::state::{AppStore, ShareFace};
@@ -4767,7 +4793,7 @@ mod tests {
         app.cloud_signed_in.set(false);
         open_share_modal(app, store_id, plain_id);
         assert_eq!(app.share_modal_node.get(), None);
-        assert!(app.account_modal_open.get());
+        assert!(account_showing(app));
         assert_eq!(app.account_modal_hint.get(), "Sign in to share a node");
     }
 
@@ -4795,7 +4821,7 @@ mod tests {
         app.cloud_signed_in.set(false);
         open_share_modal(app, store_id, shared_id);
         assert_eq!(app.share_modal_node.get(), Some((store_id, shared_id)));
-        assert!(!app.account_modal_open.get(), "a member is asked to sign in to read who shared it");
+        assert!(!account_showing(app), "a member is asked to sign in to read who shared it");
         assert_eq!(app.share_modal_pending.get(), None);
         assert!(!asked_for_members(&commands, shared_id));
     }
@@ -4809,7 +4835,7 @@ mod tests {
 
         open_share_modal(app, store_id, plain_id);
         assert_eq!(app.share_modal_node.get(), None);
-        assert!(!app.account_modal_open.get());
+        assert!(!account_showing(app));
         assert_eq!(app.notice.get(), "Only an owner of this store can share from it.");
         assert!(commands.try_iter().next().is_none());
     }

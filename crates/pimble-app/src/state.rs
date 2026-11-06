@@ -740,7 +740,10 @@ pub struct AppStore {
     // Cloud..." with nothing signed in). One modal, two faces: the sign-in
     // form while nothing is signed in, the signed-in view otherwise
     // (decision 1).
-    pub account_modal_open: Signal<bool>,
+    /// The Settings window's chosen section, `None` while it is closed
+    /// (docs/SETTINGS_CONTRACT.md section 2). The Account page is the
+    /// Account section.
+    pub settings: Signal<Option<crate::settings::Section>>,
     /// The service URL field; `"https://pimble.app"` when first opened, then
     /// whatever was last typed in this run (not persisted).
     pub account_modal_url: Signal<String>,
@@ -1114,7 +1117,7 @@ impl AppStore {
             cloud_email: Signal::new(String::new()),
             cloud_connection: Signal::new(None),
             cloud_url: Signal::new(String::new()),
-            account_modal_open: Signal::new(false),
+            settings: Signal::new(None),
             account_modal_url: Signal::new(String::new()),
             account_modal_email: Signal::new(String::new()),
             account_modal_password: Signal::new(String::new()),

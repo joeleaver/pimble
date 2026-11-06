@@ -50,6 +50,7 @@ pub mod rinch_editor;
 pub mod state;
 pub mod styles;
 pub mod sheets;
+pub mod settings;
 pub mod shares;
 pub mod discussions;
 pub mod doc_session;

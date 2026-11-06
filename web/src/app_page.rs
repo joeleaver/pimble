@@ -59,6 +59,7 @@ pub fn start() {
         // An unlocked page is a signed-in account: its personal document
         // follows it (docs/DISCUSSIONS_CONTRACT.md section 8).
         store.cloud_signed_in.set(true);
+        store.cloud_email.set(session::email().unwrap_or_default());
         pimble_app::personal::sync_now(store);
         // The name it goes by (docs/PRESENCE_CONTRACT.md section 3), which
         // stamps carry instead of the email's local part.

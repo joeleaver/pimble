@@ -143,6 +143,26 @@ fn loaded(registry: Registry) {
     refresh_window();
 }
 
+/// The plugins changed: one was added, replaced or removed (`changed` names
+/// them by id). Every pane showing one of them stops it, the registry is
+/// swapped, and each pane holding a metanode mounts again with what is loaded
+/// now, so a new version takes over in place (docs/SETTINGS_CONTRACT.md
+/// section 3).
+fn swapped(registry: Registry, changed: &[String]) {
+    for id in changed {
+        stop_everywhere(id);
+    }
+    loaded(registry);
+}
+
+/// Every pane showing plugin `id` stops it.
+fn stop_everywhere(id: &str) {
+    let panes: Vec<PaneId> = SHOWN.with(|s| s.borrow().iter().filter(|(_, shown)| shown.plugin_id == id).map(|(p, _)| *p).collect());
+    for pane in panes {
+        hide(pane);
+    }
+}
+
 /// The recipes every loaded plugin registers ("New Kanban"), in the folder's
 /// order, each with the plugin that registered it.
 fn recipes() -> Vec<crate::state::PluginRecipe> {
@@ -624,18 +644,22 @@ struct PluginRow {
 
 #[derive(Clone, Copy)]
 struct PluginsUi {
-    open: Signal<bool>,
     rows: Signal<Vec<PluginRow>>,
     /// What came of the last "Add plugin..." or "Remove".
     status: Signal<String>,
 }
 
-/// Open Account > "Plugins...".
+/// Account > "Plugins...": Settings at Plugins.
 pub(crate) fn open(store: AppStore) {
+    crate::settings::open_at(store, crate::settings::Section::Plugins);
+}
+
+/// Settings > Plugins is shown: the list as it is now, and no line left from
+/// last time.
+pub(crate) fn shown(store: AppStore) {
     if let Some(ui) = UI.with(Cell::get) {
         ui.status.set(String::new());
         ui.rows.set(rows(store));
-        ui.open.set(true);
     }
 }
 
@@ -684,17 +708,12 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
     rows
 }
 
-/// The Plugins window: each plugin in the folder, what it asks for, what it was
-/// allowed here, and "Revoke".
-pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let ui = PluginsUi { open: Signal::new(false), rows: Signal::new(Vec::new()), status: Signal::new(String::new()) };
+/// Settings > Plugins: each plugin installed, what it asks for, what it was
+/// allowed here, "Revoke" and "Remove"; and "Add from a file...".
+pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    let ui = PluginsUi { rows: Signal::new(Vec::new()), status: Signal::new(String::new()) };
     UI.with(|u| u.set(Some(ui)));
     rsx! {
-        Modal {
-            opened_fn: move || ui.open.get(),
-            onclose: move || ui.open.set(false),
-            title: "Plugins",
-            size: "md",
             div {
                 class: "pimble-plugins",
                 style: "display: flex; flex-direction: column; gap: 12px;",
@@ -746,19 +765,16 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     div { style: "font-size: 12px;", {move || ui.status.get()} }
                 }
                 div {
-                    style: "display: flex; justify-content: flex-end; gap: 8px;",
+                    style: "display: flex; justify-content: flex-start; gap: 8px;",
                     if place::CAN_ADD {
-                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add plugin..." }
+                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add from a File..." }
                     }
-                    Button { variant: "default", size: "xs", onclick: move || ui.open.set(false), "Close" }
                 }
             }
-        }
     }
 }
 
 /// Say what came of an add or a remove, in the Plugins window.
-#[cfg_attr(feature = "native", allow(dead_code))]
 fn say(line: String) {
     if let Some(ui) = UI.with(Cell::get) {
         ui.status.set(line);
@@ -767,22 +783,122 @@ fn say(line: String) {
 
 // ── Where plugins live, per target ────────────────────────────────────────────
 
-/// The desktop: a folder of `.wasm` files put there by hand, compiled under
-/// wasmtime off the UI thread; approvals in a file beside them.
+/// The desktop: a folder of `.wasm` files, compiled under wasmtime off the UI
+/// thread and watched, so a plugin added, replaced or removed there (by
+/// Settings, `scripts/plugins/install.sh` or by hand) takes effect at once;
+/// approvals in a file beside them.
 #[cfg(feature = "native")]
 mod place {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
-    use pimble_plugin_host::wasmtime_engine::{load_dir, DEFAULT_BUDGET};
+    use pimble_plugin_host::wasmtime_engine::{load_bytes, load_file, DEFAULT_BUDGET};
 
-    /// The folder is the person's: the window lists it and does not change it.
-    pub const CAN_ADD: bool = false;
-    pub const REMOVABLE: bool = false;
+    pub const CAN_ADD: bool = true;
+    pub const REMOVABLE: bool = true;
 
     pub static WHERE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        format!("Plugins are .wasm files in {}. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
+        format!("Plugins are .wasm files in {}. One added there, replaced or removed takes effect at once. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
     });
+
+    type Loaded = Result<Plugin, (Option<Manifest>, String)>;
+
+    /// What a file was when it was loaded: its length and modified time.
+    type Stamp = (u64, Option<SystemTime>);
+
+    /// What each file in the folder loaded as, and the file as it was then: a
+    /// file unchanged since is not compiled again.
+    static CACHE: Mutex<Option<HashMap<PathBuf, (Stamp, Loaded)>>> = Mutex::new(None);
+
+    fn stamp(path: &Path) -> Option<Stamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    }
+
+    fn id_of(loaded: &Loaded) -> Option<String> {
+        match loaded {
+            Ok(plugin) => Some(plugin.manifest.id.clone()),
+            Err((Some(manifest), _)) => Some(manifest.id.clone()),
+            Err((None, _)) => None,
+        }
+    }
+
+    /// Every `.wasm` file in `dir`, each compiled again only when its file
+    /// changed, and the ids whose plugin changed: new, replaced or gone.
+    fn scan(dir: &Path) -> (Registry, Vec<String>) {
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = guard.get_or_insert_with(HashMap::new);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "wasm")).collect())
+            .unwrap_or_default();
+        paths.sort();
+        let mut changed: Vec<String> = Vec::new();
+        let mut note = |id: Option<String>| {
+            if let Some(id) = id {
+                if !changed.contains(&id) {
+                    changed.push(id);
+                }
+            }
+        };
+        let mut registry = Registry::default();
+        for path in &paths {
+            let now = stamp(path);
+            let same = now.is_some() && cache.get(path).is_some_and(|(was, _)| Some(*was) == now);
+            if !same {
+                if let Some((_, old)) = cache.get(path) {
+                    note(id_of(old));
+                }
+                let loaded = load_file(path, DEFAULT_BUDGET);
+                note(id_of(&loaded));
+                cache.insert(path.clone(), (now.unwrap_or((0, None)), loaded));
+            }
+            let (_, loaded) = &cache[path];
+            registry.take(path.clone(), loaded.clone());
+        }
+        let gone: Vec<PathBuf> = cache.keys().filter(|p| !paths.contains(p)).cloned().collect();
+        for path in gone {
+            if let Some((_, old)) = cache.remove(&path) {
+                note(id_of(&old));
+            }
+        }
+        (registry, changed)
+    }
+
+    /// Look at the folder again and hand what changed to the window.
+    fn rescan(dir: &Path) {
+        let (registry, changed) = scan(dir);
+        if changed.is_empty() {
+            return;
+        }
+        tracing::info!("plugins: {} changed in {}", changed.join(", "), dir.display());
+        rinch::core::reactive::run_on_main_thread(move || swapped(registry, &changed));
+    }
+
+    /// Watch the folder for as long as the app runs: a burst of events (a copy
+    /// writes in several steps) is one rescan once it has been quiet for half
+    /// a second.
+    fn watch(dir: PathBuf) {
+        use notify::Watcher;
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut watcher = match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok_and(|e| e.paths.iter().any(|p| p.extension().is_some_and(|x| x == "wasm"))) {
+                let _ = tx.send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => return tracing::warn!("plugins: the folder cannot be watched ({e}); a change there shows at the next start"),
+        };
+        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+            return tracing::warn!("plugins: {} cannot be watched ({e}); a change there shows at the next start", dir.display());
+        }
+        while rx.recv().is_ok() {
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+            rescan(&dir);
+        }
+    }
 
     /// Where plugins are installed on this device.
     pub fn plugins_dir() -> PathBuf {
@@ -808,9 +924,10 @@ mod place {
     pub fn load() {
         let dir = plugins_dir();
         let spawned = std::thread::Builder::new().name("pimble-plugins".into()).spawn(move || {
-            let registry = load_dir(&dir, DEFAULT_BUDGET);
+            let (registry, changed) = scan(&dir);
             tracing::info!("plugins: {} loaded and {} refused from {}", registry.plugins.len(), registry.refused.len(), dir.display());
-            rinch::core::reactive::run_on_main_thread(move || loaded(registry));
+            rinch::core::reactive::run_on_main_thread(move || swapped(registry, &changed));
+            watch(dir);
         });
         if let Err(e) = spawned {
             tracing::warn!("plugins: could not start loading: {e}");
@@ -826,9 +943,65 @@ mod place {
         plugin.instantiate(key, DEFAULT_BUDGET)
     }
 
-    pub fn pick() {}
+    /// "Add from a file...": a `.wasm` the person picks, checked (it must
+    /// load), then copied into the folder: over the file that holds the same
+    /// plugin now, so a new version replaces the old, else as `<id>.wasm`.
+    pub fn pick() {
+        let Some(picked) = rinch::dialogs::open_file().set_title("Add Plugin").add_filter("Pimble plugins", &["wasm"]).pick_file() else {
+            return;
+        };
+        let dir = plugins_dir();
+        let spawned = std::thread::Builder::new().name("pimble-plugin-add".into()).spawn(move || {
+            let line = add(&dir, &picked);
+            rinch::core::reactive::run_on_main_thread(move || say(line));
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start adding: {e}");
+        }
+    }
 
-    pub fn remove(_id: &str) {}
+    fn add(dir: &Path, picked: &Path) -> String {
+        let file = picked.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = match std::fs::read(picked) {
+            Ok(bytes) => bytes,
+            Err(e) => return format!("{file} could not be read: {e}."),
+        };
+        let plugin = match load_bytes(picked, &bytes, DEFAULT_BUDGET) {
+            Ok(plugin) => plugin,
+            Err((_, sentence)) => return sentence,
+        };
+        let (id, name, version) = (plugin.manifest.id.clone(), plugin.manifest.name.clone(), plugin.manifest.version.clone());
+        let holding = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| {
+            cache.iter().find(|(_, (_, loaded))| id_of(loaded).as_deref() == Some(id.as_str())).map(|(path, _)| path.clone())
+        });
+        let dest = holding.unwrap_or_else(|| dir.join(format!("{id}.wasm")));
+        if dest != picked {
+            // Written beside it and renamed over it, so the watcher never
+            // reads half a plugin.
+            let partial = dest.with_extension("wasm.partial");
+            let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, &bytes)).and_then(|_| std::fs::rename(&partial, &dest));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&partial);
+                return format!("The {name} plugin could not be put in {}: {e}.", dir.display());
+            }
+        }
+        rescan(dir);
+        format!("Added the {name} plugin {version}.")
+    }
+
+    /// "Remove": the plugin's file leaves the folder, with what it was allowed.
+    pub fn remove(id: &str) {
+        let Some(path) = with_registry(|r| r.plugin(id).map(|p| p.path.clone())).flatten() else { return };
+        let name = manifest_of(id).map_or(id.to_string(), |m| m.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            return say(format!("The {name} plugin could not be removed from {}: {e}.", path.display()));
+        }
+        APPROVALS.with(|a| a.borrow_mut().remove(id));
+        super::write_approvals();
+        let dir = plugins_dir();
+        let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
+        say(format!("Removed the {name} plugin."));
+    }
 }
 
 /// The browser: plugins the person added, kept in this page's IndexedDB (per
@@ -1009,13 +1182,12 @@ export async function pluginsDelete(id) {
             return say(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
         }
         // An earlier version of the same plugin goes, with any pane showing it.
-        stop_everywhere(&id);
         let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
         registry.plugins.retain(|p| p.manifest.id != id);
         registry.refused.retain(|r| r.file() != format!("{id}.wasm"));
         let line = format!("Added the {} plugin {}.", plugin.manifest.name, plugin.manifest.version);
         registry.take(format!("{id}.wasm").into(), Ok(plugin));
-        loaded(registry);
+        swapped(registry, std::slice::from_ref(&id));
         say(line);
     }
 
@@ -1028,25 +1200,16 @@ export async function pluginsDelete(id) {
                 return say("The plugin could not be removed from this browser.".to_string());
             }
             let name = manifest_of(&id).map_or(id.clone(), |m| m.name);
-            stop_everywhere(&id);
             APPROVALS.with(|a| a.borrow_mut().remove(&id));
             write_approvals_now();
             let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
             registry.plugins.retain(|p| p.manifest.id != id);
-            loaded(registry);
+            swapped(registry, std::slice::from_ref(&id));
             say(format!("Removed the {name} plugin from this browser."));
         });
     }
 
     fn write_approvals_now() {
         super::write_approvals();
-    }
-
-    /// Take plugin `id` out of every pane showing it; they look again.
-    fn stop_everywhere(id: &str) {
-        let panes: Vec<PaneId> = SHOWN.with(|s| s.borrow().iter().filter(|(_, shown)| shown.plugin_id == id).map(|(p, _)| *p).collect());
-        for pane in panes {
-            hide(pane);
-        }
     }
 }

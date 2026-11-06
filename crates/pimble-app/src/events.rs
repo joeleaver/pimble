@@ -1478,7 +1478,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     CloudOp::Status => {
                         // Asked on every connect; only worth a line in the
                         // modal when the modal is there to show it.
-                        if untracked(|| store.account_modal_open.get()) {
+                        if untracked(|| crate::app::account_showing(store)) {
                             store.account_modal_busy.set(false);
                             store.account_modal_error.set(message.clone());
                         }
