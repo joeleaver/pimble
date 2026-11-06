@@ -1,8 +1,8 @@
 # Settings, and the plugin library
 
-Status: wave 1 built 2026-11-06 on branch `settings` (section 9). The shape was agreed
-with Joe in conversation ("Seems right"), including the four recommendations in section 1.
-The open questions in section 7 are still his.
+Status: waves 1 and 2 built 2026-11-06 on branch `settings` (sections 9 and 10). The
+shape was agreed with Joe in conversation ("Seems right"), including the four
+recommendations in section 1, and he answered section 7 the same day.
 
 Pimble's preferences and account matters are spread over separate modals today: Account...,
 Shares..., AI Agents..., Plugins..., plus View > "Toggle Dark Mode". Plugins arrive by hand:
@@ -105,8 +105,8 @@ its file name, so the app sees nothing new to update.
 (`/api/v1/releases`, cached from GitHub):
 
 - `GET /api/v1/plugins` is the latest release's `plugins.json`.
-- `GET /api/v1/plugins/<file>` streams one of that release's plugin files, cached on the
-  service's disk.
+- `GET /api/v1/plugins/<file>` serves one of that release's plugin files, fetched once and
+  kept by the service.
 
 Both run on the same origin as the web app, so the browser needs no cross-origin fetch, and
 neither needs an account: plugins are public code, not anyone's data.
@@ -118,7 +118,7 @@ neither needs an account: plugins are public code, not anyone's data.
    both targets).
 3. It is loaded (ABI checked) and added as in section 3.
 
-`<plugins dir>/library.json` (IndexedDB in the browser) records which installed plugins came
+`<plugins dir>/library.json` (`localStorage` in the browser) records which installed plugins came
 from the library, at which version. A failure is said in a sentence on the plugin's row:
 "The download did not verify, so nothing was installed."
 
@@ -143,15 +143,15 @@ Pimble already opens its own links (docs/LINKS_CONTRACT.md), so this needs one n
 It opens Settings at that plugin's row with Install ready. Nothing is installed until the
 person presses it. With no Pimble installed, the page says to download it first.
 
-## 7. Open questions for Joe
+## 7. Joe's answers (2026-11-06)
 
-1. **The General section.** Theme and the personal-state switch are what exist today. Should
-   anything else go in now? For example: the renderer (GPU or CPU, which takes effect at the
-   next start), whether semantic search is on, or the default for new stores.
-2. **Shares... in Settings or apart.** I've kept it a modal of its own, because it is about
-   stores rather than about this device. It could be a sixth section instead.
-3. **The library on the website without the app.** Is a listing page wanted at all before
-   wave 4, or does the library live only in the app until then?
+1. **The General section:** "yes, your recommendations". It holds the theme for now. The
+   renderer, semantic search and new-store defaults can join it when someone asks.
+2. **Shares:** "I think shares needs to be in settings also, maybe? But not adding a
+   share". Shares is a section of Settings that lists them; a share is still made from the
+   node's Share....
+3. **The library on the website:** "in-app only is fine for the first waves". Nothing on
+   the site until wave 4.
 
 ## 8. Waves
 
@@ -197,3 +197,87 @@ release app on the scratch copy, with the browser checked on the local stack.
   form back in place (about 7 s, most of it wasmtime compiling the timeline). `Ctrl+,`
   was not tried by hand: the debug driver's key presses do not reach menu chords (neither
   did `Ctrl+N`); rinch parses `Ctrl+,` (`"Comma"`).
+
+## 10. Wave 2 as built (2026-11-06)
+
+- **The index and the check** (`crates/pimble-plugin-host/src/library.rs`, both targets):
+  - `Index` and `Entry` are `plugins.json` as section 4 shows it. An index in another
+    format is refused with "The library is in a newer format than this Pimble reads."
+  - `offer` says what a row offers: Install, Installed, Update, "Added from a file" (the
+    library leaves it alone) or "Needs a newer Pimble" (another plugin ABI).
+  - `verify_download` checks the length, the SHA-256 and the Ed25519 signature.
+    `verify_signature` is now the one check for everything Pimble installs: desktop
+    updates call it too. The key is `crate::RELEASE_KEY` (`update-key.pub`).
+  - `matches` makes sure the plugin that loaded is the id and version the index listed.
+  - `Provenance` is what `library.json` holds: which installed plugins came from the
+    library, and at which version.
+- **Publishing.**
+  - A plugin is in the library when its Cargo.toml says `[package.metadata.pimble]
+    library = true` with a `summary`. Today that is the kanban, todo list and timeline
+    viewers; hello and stuck are not.
+  - `pimble-plugin-index` (a binary of `pimble-plugin-host`, feature `index-tool`) reads
+    `cargo metadata` and the built modules. It writes `<id>-<version>.wasm`, the
+    screenshot when there is one, and `plugins.json`, each entry from the plugin's own
+    manifest.
+  - The Release workflow's `build-plugins` job runs it, and the release job signs every
+    `.wasm` with the update key, beside the packages.
+- **A plugin's version is its crate's version** (all `0.1.0` today). A release that does
+  not bump it publishes the same file name, so nobody is offered an update. Bump a
+  plugin's version when it changes.
+- **The accounts service** (`crates/pimble-cloud/src/releases.rs`):
+  - `GET /api/v1/plugins` is the latest release's `plugins.json`, or
+    `{"v":1,"plugins":[]}` when the release has none.
+  - `GET /api/v1/plugins/<file>` serves only the files that index names. It fetches each
+    once and keeps it in memory, not on disk: the three plugins are about 24 MB, and a
+    name never changes its bytes.
+  - `GET /releases` no longer lists the library's files, so the download page shows
+    packages only.
+- **The app** (`crates/pimble-app/src/plugins.rs`):
+  - Settings > Plugins has a Library below the installed plugins. Each row shows the name
+    and version, the summary, what the plugin asks for, and its button or label.
+  - Installed plugins say "From the library." or "Added from a file.".
+  - Install and Update download the module and its signature, verify both, then load the
+    plugin and check it is the one listed. Only then is it installed, the way "Add from a
+    File..." installs one: on the desktop the folder write, the rescan and the swap; in
+    the browser IndexedDB and the swap. Then `library.json` records it.
+  - Add from a File and Remove clear the plugin's provenance.
+  - Where the record is kept:
+    - desktop: `<plugins dir>/library.json`;
+    - browser: `localStorage` `pimble.plugins.library`, not IndexedDB, since it is a few
+      bytes, like the approvals.
+  - Where the library is read from:
+    - desktop: `https://pimble.app/api/v1/plugins`, or `PIMBLE_LIBRARY_URL` (for the
+      local stack and a stub);
+    - browser: the page's own origin.
+  - Screenshots are published but not shown yet.
+- **Checked:**
+  - `pimble-plugin-host` `library` tests (6), all passing:
+    - the index reads back and names only its files;
+    - a newer format is refused;
+    - what each row offers;
+    - only a download signed by the key, with the listed hash, verifies;
+    - the plugin must be the one listed;
+    - provenance.
+  - `pimble-cloud` (80, with the real rhypedb-server):
+    - `the_plugin_library_is_the_latest_releases` serves the index, the module with its
+      type and the signature, 404s for a file the index does not name (another `.wasm`
+      in the release, a package, `plugins.json` itself), and `/releases` lists only the
+      package;
+    - `a_release_without_a_library_offers_no_plugins`.
+  - `pimble-app` 221 tests. The workspace and the browser build without warnings.
+  - `pimble-plugin-index` run here on the three plugins built for `wasm32-wasip1`: about
+    7.6 to 8.2 MB each, `plugins.json` as section 4 shows it.
+  - In the release app on the scratch copy, against a stub library whose files were
+    signed with a throwaway key:
+    - the Library listed Kanban and Timeline as "Added from a file" and Todo List
+      (moved out of the folder) with Install;
+    - Install said "The download did not verify, so nothing was installed.", the log said
+      why ("the signature does not verify"), and nothing reached the folder.
+  - In the browser on the local stack, with the accounts service pointed at a stub GitHub
+    release (`PIMBLE_CLOUD_RELEASES_BASE_URL`), signed in as a fixture account:
+    - the same three rows, all with Install;
+    - Install on Kanban was refused with the same sentence;
+    - IndexedDB held nothing and `pimble.plugins.library` was unset.
+  - **Not yet checked: a real install.** Only the Release workflow holds the signing key,
+    so the first verified install can only happen against the first release that
+    publishes the library. Check it then, on the installed desktop and on pimble.app.

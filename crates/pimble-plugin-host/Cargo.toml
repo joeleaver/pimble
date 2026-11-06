@@ -17,6 +17,13 @@ serde = { workspace = true }
 # registers its proxy handlers in the app's handler registries.
 rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 tracing = { workspace = true }
+# The plugin library (`library`): its index, and the check every downloaded
+# plugin passes (the same key and check as desktop updates).
+serde_json = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = "2"
+sha2 = "0.10"
+semver = "1"
 # The desktop engine. Off by default so that a build without it (the browser
 # app's, wave 3) compiles none of wasmtime; the desktop app turns it on.
 wasmtime = { workspace = true, optional = true }
@@ -30,7 +37,15 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 [features]
 default = []
 wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# `pimble-plugin-index`, which the Release workflow runs to write the library's
+# index from the built plugins.
+index-tool = ["wasm-host"]
 js-host = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
+
+[[bin]]
+name = "pimble-plugin-index"
+path = "src/bin/pimble-plugin-index.rs"
+required-features = ["index-tool"]
 
 [dev-dependencies]
 rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }

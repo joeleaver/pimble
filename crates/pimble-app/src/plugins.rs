@@ -46,6 +46,7 @@ use pimble_crdt::NodeDoc;
 use pimble_plugin_host::abi::api::{ApiReply, Reach};
 use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl, StoreAsk};
 use pimble_plugin_host::bridge::asking_sentence;
+use pimble_plugin_host::library::{self, Entry, Index, Offer, Provenance};
 #[cfg(not(feature = "native"))]
 use pimble_plugin_host::js_engine::{Plugin, Registry, ViewerLookup};
 #[cfg(feature = "native")]
@@ -99,6 +100,13 @@ thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
     /// Host state is pushed from one effect, made once.
     static WATCHING: Cell<bool> = const { Cell::new(false) };
+    /// The plugin library's index, once it was read.
+    static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
+    /// Which installed plugins came from the library: `library.json`.
+    static PROVENANCE: RefCell<Provenance> = RefCell::new(Provenance::default());
+    /// What a library row says about its plugin now (downloading, what came
+    /// of an install), by plugin id.
+    static ROW_LINES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 /// Read the registry, if it has loaded.
@@ -116,6 +124,7 @@ fn manifest_of(id: &str) -> Option<Manifest> {
 pub(crate) fn load(store: AppStore) {
     STORE.with(|s| s.set(Some(store)));
     APPROVALS.with(|a| *a.borrow_mut() = place::read_approvals());
+    PROVENANCE.with(|p| *p.borrow_mut() = place::read_provenance());
     place::load();
 }
 
@@ -141,6 +150,7 @@ fn loaded(registry: Registry) {
         }
     }
     refresh_window();
+    refresh_library();
 }
 
 /// The plugins changed: one was added, replaced or removed (`changed` names
@@ -642,11 +652,42 @@ struct PluginRow {
     removable: bool,
 }
 
+/// What a plugin asks for, as a row says it: "asks to read the stores you
+/// choose".
+fn asks_sentence(asks: &pimble_plugin_host::abi::Permissions) -> &'static str {
+    match (asks.stores, asks.write) {
+        (StoreAsk::None, _) => "asks for nothing",
+        (StoreAsk::All, true) => "asks to read and change all your stores",
+        (StoreAsk::All, false) => "asks to read all your stores",
+        (StoreAsk::Chosen, true) => "asks to read and change the stores you choose",
+        (StoreAsk::Chosen, false) => "asks to read the stores you choose",
+    }
+}
+
+/// One plugin the library offers, as Settings > Plugins lists it.
+#[derive(Clone, PartialEq)]
+struct LibraryRow {
+    id: String,
+    /// "Kanban 0.1.0".
+    title: String,
+    summary: String,
+    /// "Asks to read and change the stores you choose."
+    asks: String,
+    offer: Offer,
+    /// "Install" or "Update", when the row has a button.
+    button: Option<&'static str>,
+    /// Downloading, or what came of the last install.
+    line: String,
+}
+
 #[derive(Clone, Copy)]
 struct PluginsUi {
     rows: Signal<Vec<PluginRow>>,
     /// What came of the last "Add plugin..." or "Remove".
     status: Signal<String>,
+    library: Signal<Vec<LibraryRow>>,
+    /// Reading the library, or why it could not be read.
+    library_line: Signal<String>,
 }
 
 /// Account > "Plugins...": Settings at Plugins.
@@ -661,6 +702,8 @@ pub(crate) fn shown(store: AppStore) {
         ui.status.set(String::new());
         ui.rows.set(rows(store));
     }
+    ROW_LINES.with(|l| l.borrow_mut().clear());
+    read_library();
 }
 
 fn refresh_window() {
@@ -680,14 +723,9 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
         .map(|p| {
             let m = &p.manifest;
             let viewers: Vec<String> = m.viewers().map(|v| v.name.clone()).collect();
-            let asks = match (m.asks.stores, m.asks.write) {
-                (StoreAsk::None, _) => "asks for nothing".to_string(),
-                (StoreAsk::All, true) => "asks to read and change all your stores".to_string(),
-                (StoreAsk::All, false) => "asks to read all your stores".to_string(),
-                (StoreAsk::Chosen, true) => "asks to read and change the stores you choose".to_string(),
-                (StoreAsk::Chosen, false) => "asks to read the stores you choose".to_string(),
-            };
+            let asks = asks_sentence(&m.asks);
             let line = format!("{} {}: the {} viewer; {asks}.", m.name, m.version, viewers.join(", "));
+            let came = if PROVENANCE.with(|p| p.borrow().from_library(&m.id)) { "From the library." } else { "Added from a file." };
             let approval = approval_of(&m.id);
             let verb = if approval.write { "read and change" } else { "read" };
             let (note, revocable) = match &approval.stores {
@@ -699,6 +737,7 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
                 Approved::Nothing if m.asks.asks_anything() => ("Not allowed anything yet.".to_string(), false),
                 Approved::Nothing => ("It needs nothing allowed.".to_string(), false),
             };
+            let note = format!("{came} {note}");
             PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable, removable: place::REMOVABLE }
         })
         .collect();
@@ -711,7 +750,12 @@ fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
 /// Settings > Plugins: each plugin installed, what it asks for, what it was
 /// allowed here, "Revoke" and "Remove"; and "Add from a file...".
 pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let ui = PluginsUi { rows: Signal::new(Vec::new()), status: Signal::new(String::new()) };
+    let ui = PluginsUi {
+        rows: Signal::new(Vec::new()),
+        status: Signal::new(String::new()),
+        library: Signal::new(Vec::new()),
+        library_line: Signal::new(String::new()),
+    };
     UI.with(|u| u.set(Some(ui)));
     rsx! {
             div {
@@ -770,8 +814,186 @@ pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHan
                         Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add from a File..." }
                     }
                 }
+                div { class: "pimble-settings__heading", style: "margin-top: 8px;", "Library" }
+                div {
+                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                    "Plugins from pimble.app, signed by Pimble and checked before they are installed."
+                }
+                if !ui.library_line.get().is_empty() {
+                    div { style: "font-size: 13px;", {move || ui.library_line.get()} }
+                }
+                for row in ui.library.get() {
+                    div {
+                        key: format!("{} {} {:?} {}", row.id, row.title, row.offer, row.line),
+                        class: "pimble-plugins__row",
+                        style: "display: flex; gap: 12px; align-items: center;",
+                        div {
+                            style: "flex: 1; display: flex; flex-direction: column; gap: 2px;",
+                            div { style: "font-size: 13px; font-weight: 600;", {row.title.clone()} }
+                            div { style: "font-size: 13px;", {row.summary.clone()} }
+                            div { style: "font-size: 12px; color: var(--rinch-color-dimmed);", {row.asks.clone()} }
+                            if !row.line.is_empty() {
+                                div { style: "font-size: 12px;", {row.line.clone()} }
+                            }
+                        }
+                        if row.button.is_some() {
+                            Button {
+                                variant: "filled",
+                                size: "xs",
+                                onclick: {
+                                    let id = row.id.clone();
+                                    move || install_from_library(&id)
+                                },
+                                {row.button.unwrap_or_default()}
+                            }
+                        }
+                        if row.button.is_none() {
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed); white-space: nowrap;",
+                                {offer_label(&row.offer)}
+                            }
+                        }
+                    }
+                }
             }
     }
+}
+
+/// What a library row says instead of a button.
+fn offer_label(offer: &Offer) -> &'static str {
+    match offer {
+        Offer::Installed => "Installed",
+        Offer::FromFile => "Added from a file",
+        Offer::NeedsNewer => "Needs a newer Pimble",
+        Offer::Install | Offer::Update { .. } => "",
+    }
+}
+
+// ── The library (docs/SETTINGS_CONTRACT.md section 4) ─────────────────────────
+
+/// Where the library's index (`None`) or one of its files is.
+fn library_url(file: Option<&str>) -> String {
+    let base = place::library_base();
+    match file {
+        Some(file) => format!("{}/{file}", base.trim_end_matches('/')),
+        None => base,
+    }
+}
+
+/// Read the index again, as Settings > Plugins is shown.
+fn read_library() {
+    if INDEX.with(|i| i.borrow().is_none()) {
+        library_said("Looking at the library...".to_string());
+    }
+    place::fetch(library_url(None), |fetched| {
+        let read = fetched.and_then(|bytes| Index::parse(&bytes));
+        match read {
+            Ok(index) => {
+                let empty = index.plugins.is_empty();
+                INDEX.with(|i| *i.borrow_mut() = Some(index));
+                library_said(if empty { "The library has no plugins yet.".to_string() } else { String::new() });
+            }
+            Err(e) => {
+                tracing::warn!("plugins: the library could not be read: {e}");
+                let known = INDEX.with(|i| i.borrow().is_some());
+                library_said(if known { String::new() } else { format!("The library could not be reached ({e}).") });
+            }
+        }
+        refresh_library();
+    });
+}
+
+fn library_said(line: String) {
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.library_line.set(line);
+    }
+}
+
+fn library_rows() -> Vec<LibraryRow> {
+    let Some(index) = INDEX.with(|i| i.borrow().clone()) else { return Vec::new() };
+    index
+        .plugins
+        .iter()
+        .map(|entry| {
+            let installed = manifest_of(&entry.id).map(|m| m.version);
+            let from_library = PROVENANCE.with(|p| p.borrow().from_library(&entry.id));
+            let offer = library::offer(entry, installed.as_deref(), from_library);
+            let mut asks = asks_sentence(&entry.asks).to_string();
+            if let Some(first) = asks.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            let line = ROW_LINES.with(|l| l.borrow().get(&entry.id).cloned()).unwrap_or_else(|| match &offer {
+                Offer::Update { from } => format!("You have {from}."),
+                _ => String::new(),
+            });
+            let button = match offer {
+                Offer::Install => Some("Install"),
+                Offer::Update { .. } => Some("Update"),
+                _ => None,
+            };
+            LibraryRow { button, id: entry.id.clone(), title: format!("{} {}", entry.name, entry.version), summary: entry.summary.clone(), asks: format!("{asks}."), offer, line }
+        })
+        .collect()
+}
+
+fn refresh_library() {
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.library.set(library_rows());
+    }
+}
+
+fn row_said(id: &str, line: String) {
+    ROW_LINES.with(|l| l.borrow_mut().insert(id.to_string(), line));
+    refresh_library();
+}
+
+/// "Install" or "Update": the plugin and its signature are downloaded, checked
+/// against what the index lists and the key this build carries, and only then
+/// installed. A plugin that does not verify is never written anywhere.
+fn install_from_library(id: &str) {
+    let Some(entry) = INDEX.with(|i| i.borrow().as_ref().and_then(|index| index.plugins.iter().find(|e| e.id == id).cloned())) else {
+        return;
+    };
+    row_said(&entry.id, format!("Downloading {}...", entry.name));
+    place::fetch(library_url(Some(&entry.wasm)), move |wasm| {
+        let sig_url = library_url(Some(&entry.sig));
+        place::fetch(sig_url, move |sig| {
+            let (wasm, sig) = match (wasm, sig) {
+                (Ok(wasm), Ok(sig)) => (wasm, sig),
+                (Err(e), _) | (_, Err(e)) => return row_said(&entry.id, format!("The download did not finish ({e}).")),
+            };
+            if let Err(e) = library::verify_download(&entry, crate::RELEASE_KEY, &wasm, &sig) {
+                tracing::warn!("plugins: {} from the library refused: {e}", entry.id);
+                return row_said(&entry.id, library::NOT_VERIFIED.to_string());
+            }
+            row_said(&entry.id, format!("Installing {}...", entry.name));
+            place::install(entry, wasm);
+        });
+    });
+}
+
+/// A plugin from the library is installed: remember where it came from.
+fn installed_from_library(entry: &Entry) {
+    PROVENANCE.with(|p| p.borrow_mut().plugins.insert(entry.id.clone(), entry.version.clone()));
+    write_provenance();
+    row_said(&entry.id, format!("Installed {} {}.", entry.name, entry.version));
+    refresh_window();
+}
+
+/// Plugin `id` was removed, or added from a file over the library's: the
+/// library no longer looks after it.
+fn forget_library(id: &str) {
+    let had = PROVENANCE.with(|p| p.borrow_mut().plugins.remove(id).is_some());
+    if had {
+        write_provenance();
+    }
+    ROW_LINES.with(|l| l.borrow_mut().remove(id));
+    refresh_library();
+}
+
+fn write_provenance() {
+    let json = PROVENANCE.with(|p| p.borrow().to_json());
+    place::write_provenance(&json);
 }
 
 /// Say what came of an add or a remove, in the Plugins window.
@@ -909,6 +1131,68 @@ mod place {
         plugins_dir().join("approvals.json")
     }
 
+    fn provenance_path() -> PathBuf {
+        plugins_dir().join("library.json")
+    }
+
+    pub fn read_provenance() -> Provenance {
+        std::fs::read(provenance_path()).map(|bytes| Provenance::parse(&bytes)).unwrap_or_default()
+    }
+
+    pub fn write_provenance(json: &[u8]) {
+        let path = provenance_path();
+        let written = std::fs::create_dir_all(plugins_dir()).and_then(|_| std::fs::write(&path, json));
+        if let Err(e) = written {
+            tracing::warn!("plugins: {} could not be saved: {e}", path.display());
+        }
+    }
+
+    /// pimble.app's library, or another service's (`PIMBLE_LIBRARY_URL`, for
+    /// the local stack).
+    pub fn library_base() -> String {
+        std::env::var("PIMBLE_LIBRARY_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "https://pimble.app/api/v1/plugins".to_string())
+    }
+
+    /// Fetch `url` off the UI thread; `done` hears the bytes on it.
+    pub fn fetch(url: String, done: impl FnOnce(Result<Vec<u8>, String>) + Send + 'static) {
+        let spawned = std::thread::Builder::new().name("pimble-library".into()).spawn(move || {
+            let fetched = (|| {
+                let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+                let resp = client.get(&url).send().map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status().as_u16()));
+                }
+                resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+            })();
+            rinch::core::reactive::run_on_main_thread(move || done(fetched));
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start a download: {e}");
+        }
+    }
+
+    /// A verified download from the library: loaded (it must be the plugin
+    /// the index listed) and put in the folder as "Add from a file..." puts one.
+    pub fn install(entry: Entry, bytes: Vec<u8>) {
+        let dir = plugins_dir();
+        let spawned = std::thread::Builder::new().name("pimble-plugin-install".into()).spawn(move || {
+            let put = load_bytes(Path::new(&entry.wasm), &bytes, DEFAULT_BUDGET)
+                .map_err(|(_, sentence)| sentence)
+                .and_then(|plugin| library::matches(&entry, &plugin.manifest).map(|_| plugin))
+                .and_then(|plugin| put(&dir, &bytes, &plugin.manifest));
+            match put {
+                Ok(()) => {
+                    rescan(&dir);
+                    rinch::core::reactive::run_on_main_thread(move || installed_from_library(&entry));
+                }
+                Err(e) => rinch::core::reactive::run_on_main_thread(move || row_said(&entry.id, e)),
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start installing: {e}");
+        }
+    }
+
     pub fn read_approvals() -> HashMap<String, Approval> {
         std::fs::read(approvals_path()).map(|bytes| parse_approvals(&bytes)).unwrap_or_default()
     }
@@ -952,41 +1236,57 @@ mod place {
         };
         let dir = plugins_dir();
         let spawned = std::thread::Builder::new().name("pimble-plugin-add".into()).spawn(move || {
-            let line = add(&dir, &picked);
-            rinch::core::reactive::run_on_main_thread(move || say(line));
+            let (id, line) = add(&dir, &picked);
+            rinch::core::reactive::run_on_main_thread(move || {
+                if let Some(id) = id {
+                    forget_library(&id);
+                }
+                say(line);
+            });
         });
         if let Err(e) = spawned {
             tracing::warn!("plugins: could not start adding: {e}");
         }
     }
 
-    fn add(dir: &Path, picked: &Path) -> String {
+    /// The plugin added (by id, when one was) and the sentence saying so.
+    fn add(dir: &Path, picked: &Path) -> (Option<String>, String) {
         let file = picked.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
         let bytes = match std::fs::read(picked) {
             Ok(bytes) => bytes,
-            Err(e) => return format!("{file} could not be read: {e}."),
+            Err(e) => return (None, format!("{file} could not be read: {e}.")),
         };
         let plugin = match load_bytes(picked, &bytes, DEFAULT_BUDGET) {
             Ok(plugin) => plugin,
-            Err((_, sentence)) => return sentence,
+            Err((_, sentence)) => return (None, sentence),
         };
-        let (id, name, version) = (plugin.manifest.id.clone(), plugin.manifest.name.clone(), plugin.manifest.version.clone());
+        let m = &plugin.manifest;
+        if let Err(e) = put(dir, &bytes, m) {
+            return (None, e);
+        }
+        rescan(dir);
+        (Some(m.id.clone()), format!("Added the {} plugin {}.", m.name, m.version))
+    }
+
+    /// Write `bytes`, a plugin that loaded as `manifest`, into the folder:
+    /// over the file that holds the same plugin now, so a new version replaces
+    /// the old, else as `<id>.wasm`; beside it and renamed over it, so the
+    /// watcher never reads half a plugin.
+    fn put(dir: &Path, bytes: &[u8], manifest: &Manifest) -> Result<(), String> {
+        let id = &manifest.id;
         let holding = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| {
             cache.iter().find(|(_, (_, loaded))| id_of(loaded).as_deref() == Some(id.as_str())).map(|(path, _)| path.clone())
         });
         let dest = holding.unwrap_or_else(|| dir.join(format!("{id}.wasm")));
-        if dest != picked {
-            // Written beside it and renamed over it, so the watcher never
-            // reads half a plugin.
-            let partial = dest.with_extension("wasm.partial");
-            let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, &bytes)).and_then(|_| std::fs::rename(&partial, &dest));
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&partial);
-                return format!("The {name} plugin could not be put in {}: {e}.", dir.display());
-            }
+        if std::fs::read(&dest).is_ok_and(|have| have == bytes) {
+            return Ok(());
         }
-        rescan(dir);
-        format!("Added the {name} plugin {version}.")
+        let partial = dest.with_extension("wasm.partial");
+        let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, bytes)).and_then(|_| std::fs::rename(&partial, &dest));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("The {} plugin could not be put in {}: {e}.", manifest.name, dir.display())
+        })
     }
 
     /// "Remove": the plugin's file leaves the folder, with what it was allowed.
@@ -998,6 +1298,7 @@ mod place {
         }
         APPROVALS.with(|a| a.borrow_mut().remove(id));
         super::write_approvals();
+        forget_library(id);
         let dir = plugins_dir();
         let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
         say(format!("Removed the {name} plugin."));
@@ -1061,6 +1362,12 @@ export async function pluginsPut(id, bytes) {
   await done(tx);
   db.close();
 }
+export async function libraryFetch(url) {
+  let r;
+  try { r = await fetch(url, { credentials: 'omit' }); } catch (e) { throw String(e); }
+  if (!r.ok) throw 'HTTP ' + r.status;
+  return new Uint8Array(await r.arrayBuffer());
+}
 export async function pluginsDelete(id) {
   const db = await open();
   const tx = db.transaction(STORE, 'readwrite');
@@ -1076,6 +1383,47 @@ export async function pluginsDelete(id) {
         async fn plugins_put(id: &str, bytes: &[u8]) -> Result<JsValue, JsValue>;
         #[wasm_bindgen(js_name = pluginsDelete, catch)]
         async fn plugins_delete(id: &str) -> Result<JsValue, JsValue>;
+        #[wasm_bindgen(js_name = libraryFetch, catch)]
+        async fn library_fetch(url: &str) -> Result<JsValue, JsValue>;
+    }
+
+    const PROVENANCE_KEY: &str = "pimble.plugins.library";
+
+    pub fn read_provenance() -> Provenance {
+        storage().and_then(|s| s.get_item(PROVENANCE_KEY).ok().flatten()).map(|json| Provenance::parse(json.as_bytes())).unwrap_or_default()
+    }
+
+    pub fn write_provenance(json: &[u8]) {
+        let saved = storage().map(|s| s.set_item(PROVENANCE_KEY, &String::from_utf8_lossy(json)));
+        if !matches!(saved, Some(Ok(()))) {
+            tracing::warn!("plugins: where the plugins came from could not be saved in this browser");
+        }
+    }
+
+    /// The library of the service this page came from.
+    pub fn library_base() -> String {
+        "/api/v1/plugins".to_string()
+    }
+
+    pub fn fetch(url: String, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = match library_fetch(&url).await {
+                Ok(bytes) => Ok(js_sys::Uint8Array::new(&bytes).to_vec()),
+                Err(e) => Err(e.as_string().unwrap_or_else(|| format!("{e:?}"))),
+            };
+            done(fetched);
+        });
+    }
+
+    /// A verified download from the library, kept as "Add from a file..."
+    /// keeps one, once it loads as the plugin the index listed.
+    pub fn install(entry: Entry, bytes: Vec<u8>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            match put(&entry.wasm, &bytes, Some(&entry)).await {
+                Ok(_) => installed_from_library(&entry),
+                Err(e) => row_said(&entry.id, e),
+            }
+        });
     }
 
     fn storage() -> Option<web_sys::Storage> {
@@ -1172,14 +1520,27 @@ export async function pluginsDelete(id) {
     }
 
     async fn add(name: &str, bytes: &[u8]) {
-        let plugin = match load_bytes(name, bytes, DEFAULT_BUDGET).await {
-            Ok(plugin) => plugin,
-            Err((_, sentence)) => return say(sentence),
-        };
+        match put(name, bytes, None).await {
+            Ok((id, line)) => {
+                forget_library(&id);
+                say(line);
+            }
+            Err(e) => say(e),
+        }
+    }
+
+    /// Compile and describe `bytes`; one this app runs (and, from the
+    /// library, the one `entry` lists) is kept in this browser, replacing an
+    /// earlier version of the same plugin, and swapped in.
+    async fn put(name: &str, bytes: &[u8], entry: Option<&Entry>) -> Result<(String, String), String> {
+        let plugin = load_bytes(name, bytes, DEFAULT_BUDGET).await.map_err(|(_, sentence)| sentence)?;
+        if let Some(entry) = entry {
+            library::matches(entry, &plugin.manifest)?;
+        }
         let id = plugin.manifest.id.clone();
         if let Err(e) = plugins_put(&id, bytes).await {
             tracing::warn!("plugins: {id} could not be kept: {e:?}");
-            return say(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
+            return Err(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
         }
         // An earlier version of the same plugin goes, with any pane showing it.
         let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
@@ -1188,7 +1549,7 @@ export async function pluginsDelete(id) {
         let line = format!("Added the {} plugin {}.", plugin.manifest.name, plugin.manifest.version);
         registry.take(format!("{id}.wasm").into(), Ok(plugin));
         swapped(registry, std::slice::from_ref(&id));
-        say(line);
+        Ok((id, line))
     }
 
     /// "Remove": the plugin leaves this browser, with what it was allowed.
@@ -1202,6 +1563,7 @@ export async function pluginsDelete(id) {
             let name = manifest_of(&id).map_or(id.clone(), |m| m.name);
             APPROVALS.with(|a| a.borrow_mut().remove(&id));
             write_approvals_now();
+            forget_library(&id);
             let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
             registry.plugins.retain(|p| p.manifest.id != id);
             swapped(registry, std::slice::from_ref(&id));

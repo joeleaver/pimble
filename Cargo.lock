@@ -5077,6 +5077,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "ed25519-dalek",
  "futures",
@@ -5239,7 +5240,9 @@ dependencies = [
 name = "pimble-plugin-host"
 version = "0.19.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
  "futures",
  "js-sys",
  "pimble-api",
@@ -5250,8 +5253,10 @@ dependencies = [
  "pimble-rpc",
  "pimble-server",
  "rinch-core",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

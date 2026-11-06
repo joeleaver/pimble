@@ -6,6 +6,11 @@ license = "MIT"
 publish = false
 description = "The timeline metanode viewer: nodes on a line of time by their own fields, in any calendar (docs/TIMELINE_CONTRACT.md)"
 
+# In the plugin library (docs/SETTINGS_CONTRACT.md section 4).
+[package.metadata.pimble]
+library = true
+summary = "Nodes on a line of time by their own date fields, in any calendar."
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

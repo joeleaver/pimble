@@ -1220,6 +1220,79 @@ async fn releases_endpoint_tolerates_no_releases_yet() {
     assert_eq!(body["assets"], json!([]));
 }
 
+
+/// A release carrying the plugin library: `/plugins` is its `plugins.json`,
+/// `/plugins/<file>` serves only the files that names, and the download page's
+/// `/releases` lists none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_plugin_library_is_the_latest_releases() {
+    let index = json!({ "v": 1, "plugins": [{ "id": "kanban-viewer", "wasm": "kanban-viewer-0.1.0.wasm", "sig": "kanban-viewer-0.1.0.wasm.sig" }] });
+    let listener = bind_ephemeral_loopback().await;
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let release = json!({
+        "tag_name": "v1.2.3",
+        "published_at": "2026-01-01T00:00:00Z",
+        "assets": [
+            { "name": "pimble-1.2.3-linux-x86_64.tar.gz", "browser_download_url": format!("{base}/dl/linux"), "size": 111 },
+            { "name": "plugins.json", "browser_download_url": format!("{base}/dl/plugins.json"), "size": 1 },
+            { "name": "kanban-viewer-0.1.0.wasm", "browser_download_url": format!("{base}/dl/kanban"), "size": 4 },
+            { "name": "kanban-viewer-0.1.0.wasm.sig", "browser_download_url": format!("{base}/dl/kanban.sig"), "size": 64 },
+            { "name": "stray-0.1.0.wasm", "browser_download_url": format!("{base}/dl/stray"), "size": 4 },
+        ],
+    });
+    let served = index.clone();
+    let app = axum::Router::new()
+        .route("/repos/:owner/:repo/releases/latest", axum::routing::get(move || { let r = release.clone(); async move { axum::Json(r) } }))
+        .route("/dl/plugins.json", axum::routing::get(move || { let i = served.clone(); async move { axum::Json(i) } }))
+        .route("/dl/kanban", axum::routing::get(|| async { &b"\0asm"[..] }))
+        .route("/dl/kanban.sig", axum::routing::get(|| async { &[7u8; 64][..] }))
+        .route("/dl/stray", axum::routing::get(|| async { &b"nope"[..] }));
+    let _stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let stack = match spawn_stack_with_releases_base_url(Some(base)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+
+    let got: Value = stack.http.get(format!("{}/plugins", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(got, index);
+    let wasm = stack.http.get(format!("{}/plugins/kanban-viewer-0.1.0.wasm", stack.base_url)).send().await.unwrap();
+    assert_eq!(wasm.status(), 200);
+    assert_eq!(wasm.headers()["content-type"], "application/wasm");
+    assert_eq!(&wasm.bytes().await.unwrap()[..], b"\0asm");
+    let sig = stack.http.get(format!("{}/plugins/kanban-viewer-0.1.0.wasm.sig", stack.base_url)).send().await.unwrap();
+    assert_eq!(sig.bytes().await.unwrap().len(), 64);
+    for unlisted in ["stray-0.1.0.wasm", "pimble-1.2.3-linux-x86_64.tar.gz", "plugins.json"] {
+        let resp = stack.http.get(format!("{}/plugins/{unlisted}", stack.base_url)).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{unlisted} is not the library's to serve");
+    }
+    let releases: Value = stack.http.get(format!("{}/releases", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    let names: Vec<&str> = releases["assets"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["pimble-1.2.3-linux-x86_64.tar.gz"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_without_a_library_offers_no_plugins() {
+    let (stub_url, _stub) = spawn_github_stub(
+        json!({ "tag_name": "v1.0.0", "published_at": "2026-01-01T00:00:00Z", "assets": [] }),
+        axum::http::StatusCode::OK,
+    )
+    .await;
+    let stack = match spawn_stack_with_releases_base_url(Some(stub_url)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+    let got: Value = stack.http.get(format!("{}/plugins", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(got, json!({ "v": 1, "plugins": [] }));
+}
+
 // ── Health ──────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

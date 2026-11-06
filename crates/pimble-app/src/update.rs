@@ -18,10 +18,8 @@ use crate::state::{AppStore, UpdateStatus};
 
 /// The release feed: the accounts service's view of the latest GitHub release.
 const FEED: &str = "https://pimble.app/api/v1/releases";
-/// The Ed25519 key release packages are signed with, the raw 32 bytes in base64
-/// (`tools/update-key.sh` writes it). Anything that is not such a key refuses
-/// every update.
-const PUBLIC_KEY: &str = include_str!("../update-key.pub");
+/// The key release packages are signed with (`crate::RELEASE_KEY`).
+const PUBLIC_KEY: &str = crate::RELEASE_KEY;
 /// The file that makes a folder a managed install.
 const MARKER: &str = "pimble-install.json";
 /// Where an update waits for "Restart to update", inside the install folder.
@@ -284,16 +282,7 @@ fn verify(package: &[u8], signature: &[u8]) -> Result<(), String> {
 }
 
 fn verify_with(public_key: &str, package: &[u8], signature: &[u8]) -> Result<(), String> {
-    use base64::Engine as _;
-    use ed25519_dalek::{Signature, VerifyingKey};
-    let key: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(public_key.trim())
-        .ok()
-        .and_then(|k| k.try_into().ok())
-        .ok_or("this build has no update key (tools/update-key.sh)")?;
-    let key = VerifyingKey::from_bytes(&key).map_err(|e| format!("the update key: {e}"))?;
-    let signature = Signature::from_slice(signature).map_err(|e| format!("the signature: {e}"))?;
-    key.verify_strict(package, &signature).map_err(|_| "the package's signature does not verify".to_string())
+    pimble_plugin_host::library::verify_signature(public_key, package, signature).map_err(|e| format!("the package: {e}"))
 }
 
 // ── The app's side ──────────────────────────────────────────────────────────
@@ -447,7 +436,7 @@ mod tests {
         let (signing, _) = key_pair();
         let signature = signing.sign(b"x").to_bytes();
         let refused = verify_with("not a key", b"x", &signature).unwrap_err();
-        assert!(refused.contains("no update key"), "{refused}");
+        assert!(refused.contains("no signing key"), "{refused}");
     }
 
     #[test]

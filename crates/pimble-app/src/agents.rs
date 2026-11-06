@@ -9,6 +9,10 @@
 //! browser's server keeps no local agents (remote agents, wave 4, are where the
 //! browser gets a view).
 
+// The browser keeps no agents (Settings has no AI Agents section there), so
+// most of this is the desktop's alone.
+#![cfg_attr(not(feature = "native"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 
 use pimble_core::{NodeId, StoreId};

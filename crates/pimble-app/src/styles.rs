@@ -2904,6 +2904,8 @@ pub(crate) const APP_CSS: &str = "
     min-width: 0;
     max-height: 70vh;
     overflow-y: auto;
+    /* Room for the scrollbar, which is drawn over the content. */
+    padding-right: 16px;
 }
 
 .pimble-settings__section {
