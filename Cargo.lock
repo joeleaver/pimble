@@ -163,7 +163,7 @@ dependencies = [
  "clipboard-win",
  "image",
  "log",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -714,7 +714,7 @@ version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
- "objc2 0.6.4",
+ "objc2 0.6.5",
 ]
 
 [[package]]
@@ -1715,7 +1715,7 @@ dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
  "libc",
- "objc2 0.6.4",
+ "objc2 0.6.5",
 ]
 
 [[package]]
@@ -2116,14 +2116,13 @@ dependencies = [
 
 [[package]]
 name = "fontique"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6688bc1294fe7117d788937b6c53480169b29c566954af490830d4c09da9516a"
+version = "0.12.0"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
 dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
  "memmap2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-text",
  "objc2-foundation 0.3.2",
@@ -3005,37 +3004,23 @@ dependencies = [
 
 [[package]]
 name = "icu_collections"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6b649701667bbe825c3b7e6388cb521c23d88644678e83c0c4d0a621a34b43"
+checksum = "fe090a42a0d3140fed8c63263ed1fecc02422cb2f4bfe55cd8de2de1b8e105dd"
 dependencies = [
  "displaydoc",
  "potential_utf",
+ "utf8_iter",
  "yoke",
  "zerofrom",
  "zerovec",
 ]
 
 [[package]]
-name = "icu_locale"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "532b11722e350ab6bf916ba6eb0efe3ee54b932666afec989465f9243fe6dd60"
-dependencies = [
- "icu_collections",
- "icu_locale_core",
- "icu_locale_data",
- "icu_provider",
- "potential_utf",
- "tinystr",
- "zerovec",
-]
-
-[[package]]
 name = "icu_locale_core"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edba7861004dd3714265b4db54a3c390e880ab658fec5f7db895fae2046b5bb6"
+checksum = "25d29b57c17c6528d0dc4c2141cfa2d08200465acb537a3909c8b9b8a4a984c0"
 dependencies = [
  "displaydoc",
  "litemap",
@@ -3046,16 +3031,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "icu_locale_data"
-version = "2.1.2"
+name = "icu_locale_fallback"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c5f1d16b4c3a2642d3a719f18f6b06070ab0aef246a6418130c955ae08aa831"
+checksum = "406e9ae5b95d8aa37db6293405931b766a6172d1848daee22d70eb44aa78a43c"
+dependencies = [
+ "icu_locale_core",
+ "icu_locale_fallback_data",
+ "icu_provider",
+ "potential_utf",
+ "tinystr",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_locale_fallback_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3632ebbd0c5c3637ba1a40bdf8288f2cb9d2268e73441a69d5fc73d7cfbaa87c"
 
 [[package]]
 name = "icu_normalizer"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f6c8828b67bf8908d82127b2054ea1b4427ff0230ee9141c54251934ab1b599"
+checksum = "404a3b8c486f205c87fe7f23ab6894d84a4ad76d6e4671ae1981ba7def87c599"
 dependencies = [
  "icu_collections",
  "icu_normalizer_data",
@@ -3067,16 +3066,17 @@ dependencies = [
 
 [[package]]
 name = "icu_normalizer_data"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aedcccd01fc5fe81e6b489c15b247b8b0690feb23304303a9e560f37efc560a"
+checksum = "20f0088bfb7441f7a37fa0c9e20cb1e9cba1cac6b9ce8cd2a6dc44294f8e8cbc"
 
 [[package]]
 name = "icu_properties"
-version = "2.1.2"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "020bfc02fe870ec3a66d93e677ccca0562506e5872c650f893269e08615d74ec"
+checksum = "2ea83d991c56158f7cf898bf86436c1dfe7c07ee82fe88951f2695c9f37a379f"
 dependencies = [
+ "displaydoc",
  "icu_collections",
  "icu_locale_core",
  "icu_properties_data",
@@ -3087,15 +3087,15 @@ dependencies = [
 
 [[package]]
 name = "icu_properties_data"
-version = "2.1.2"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616c294cf8d725c6afcd8f55abc17c56464ef6211f9ed59cccffe534129c77af"
+checksum = "b98f29af82d02b163fe50161388350e743bb3107cc8e8c2f7314cb505faddfcf"
 
 [[package]]
 name = "icu_provider"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85962cf0ce02e1e0a629cc34e7ca3e373ce20dda4c4d7294bbd0bf1fdb59e614"
+checksum = "413099315636c588ee8f011190b329b971a09a8fae9d157e01dcae8379468514"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
@@ -3110,25 +3110,27 @@ dependencies = [
 
 [[package]]
 name = "icu_segmenter"
-version = "2.1.2"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a807a7488f3f758629ae86d99d9d30dce24da2fb2945d74c80a4f4a62c71db73"
+checksum = "61b195dc605f81aa181bec9b3bd14e26cc71b903e4644f6af578ca9772c7a710"
 dependencies = [
  "core_maths",
  "icu_collections",
- "icu_locale",
+ "icu_locale_fallback",
  "icu_provider",
  "icu_segmenter_data",
  "potential_utf",
+ "smallvec",
  "utf8_iter",
+ "zerotrie",
  "zerovec",
 ]
 
 [[package]]
 name = "icu_segmenter_data"
-version = "2.1.1"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ebbb7321d9e21d25f5660366cb6c08201d0175898a3a6f7a41ee9685af21c80"
+checksum = "913a7d294ad056474749152107309fdee3ec17d2482d1ab70fdc61a81c64b9a3"
 
 [[package]]
 name = "id-arena"
@@ -3842,7 +3844,7 @@ checksum = "f44db74bde26fdf427af23f1d146c211aed857c59e3be750cf2617f6b0b05c94"
 dependencies = [
  "proc-macro2",
  "syn 2.0.114",
- "synstructure",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -4315,9 +4317,9 @@ dependencies = [
 
 [[package]]
 name = "objc2"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+checksum = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8"
 dependencies = [
  "objc2-encode",
 ]
@@ -4346,7 +4348,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
@@ -4373,7 +4375,7 @@ dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
  "dispatch2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
 ]
 
 [[package]]
@@ -4385,7 +4387,7 @@ dependencies = [
  "bitflags 2.10.0",
  "dispatch2",
  "libc",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-io-surface",
 ]
@@ -4449,7 +4451,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
 ]
 
@@ -4460,7 +4462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.10.0",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
 ]
 
@@ -4484,7 +4486,7 @@ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-foundation 0.3.2",
 ]
 
@@ -4508,7 +4510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags 2.10.0",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
@@ -4522,7 +4524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
 dependencies = [
  "bitflags 2.10.0",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
@@ -4772,35 +4774,56 @@ dependencies = [
 
 [[package]]
 name = "parlance"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6937eda350acc1a5d05872c3cbf99fe78619c269096e2be3d4a350058639d5"
+version = "0.1.1"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "parley"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22d2ff88bd3f7d68d1d9b09c7e6209f9a8e8c05088295140a2bcf2e9b17038c5"
+version = "0.12.0"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
+dependencies = [
+ "fontique",
+ "hashbrown 0.17.1",
+ "linebender_resource_handle",
+ "parlance",
+ "parley_engine",
+ "smallvec",
+]
+
+[[package]]
+name = "parley_data"
+version = "0.12.0"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
+dependencies = [
+ "icu_collections",
+ "icu_properties",
+]
+
+[[package]]
+name = "parley_emoji"
+version = "0.12.0"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
+
+[[package]]
+name = "parley_engine"
+version = "0.12.0"
+source = "git+https://github.com/joeleaver/parley-fork?rev=f25dc8f3e32d5b1c589304391c9ba75f9721c8dc#f25dc8f3e32d5b1c589304391c9ba75f9721c8dc"
 dependencies = [
  "fontique",
  "harfrust",
  "hashbrown 0.17.1",
+ "icu_locale_core",
  "icu_normalizer",
  "icu_properties",
  "icu_segmenter",
  "linebender_resource_handle",
  "parlance",
  "parley_data",
+ "parley_emoji",
  "skrifa 0.44.0",
-]
-
-[[package]]
-name = "parley_data"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1567535334d6ba2d3cde19221ba9a7bd0fabb3cbd99046ddfb10ae061cfcc889"
-dependencies = [
- "icu_properties",
 ]
 
 [[package]]
@@ -4941,7 +4964,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pimble-api"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4966,7 +4989,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-app"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5018,7 +5041,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-board"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -5032,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cli"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5054,7 +5077,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-client"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5070,7 +5093,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cloud"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5106,7 +5129,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5120,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5137,7 +5160,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -5158,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-discussion"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -5169,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-image"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "image",
  "pimble-core",
@@ -5178,7 +5201,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-import"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5195,7 +5218,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-mcp"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5225,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-abi"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "pimble-api",
@@ -5238,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-host"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5270,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugins"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -5280,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
@@ -5296,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-search"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5318,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-server"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -5363,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-sheet"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5376,7 +5399,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-store"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5396,7 +5419,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-ui"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "pimble-core",
  "rinch",
@@ -5837,9 +5860,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.43"
+version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc74d9a594b72ae6656596548f56f667211f8a97b3d4c3d467150794690dc40a"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
@@ -6018,7 +6041,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40d213455a5f1dc59214213c7330e074ddf8114c9a42411eb890c767357ce135"
 dependencies = [
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
@@ -6291,7 +6314,7 @@ dependencies = [
  "dispatch2",
  "js-sys",
  "log",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
@@ -6450,16 +6473,17 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
  "futures-util",
  "js-sys",
  "keyboard-types 0.7.0",
+ "libloading 0.8.9",
  "log",
  "muda",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "parlance",
  "parley",
  "peniko",
@@ -6497,7 +6521,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -6510,7 +6534,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "arboard",
  "js-sys",
@@ -6523,7 +6547,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -6535,7 +6559,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -6545,7 +6569,7 @@ dependencies = [
 [[package]]
 name = "rinch-debug"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "serde",
  "serde_json",
@@ -6555,12 +6579,13 @@ dependencies = [
 [[package]]
 name = "rinch-dom"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "app_units",
  "atomic_refcell",
  "base64 0.22.1",
  "bitflags 2.10.0",
+ "bytemuck",
  "cssparser",
  "euclid",
  "icu_properties",
@@ -6598,7 +6623,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "rinch-words",
 ]
@@ -6606,7 +6631,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -6616,10 +6641,11 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "pulldown-cmark",
  "regex",
+ "rinch-core",
  "rinch-words",
  "thiserror 1.0.69",
 ]
@@ -6627,7 +6653,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -6638,7 +6664,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6648,7 +6674,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "peniko",
  "vello",
@@ -6658,7 +6684,7 @@ dependencies = [
 [[package]]
 name = "rinch-renderer"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "rinch-core",
  "thiserror 1.0.69",
@@ -6670,7 +6696,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "heck 0.5.0",
  "rinch-core",
@@ -6682,12 +6708,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "js-sys",
  "rinch",
@@ -6703,7 +6729,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#c69c65ec2ee223e569ebb72a023caefb1c7f9acc"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#8bfa6c4214d927e43d88e5d4e45792d3a7a6cfcb"
 dependencies = [
  "icu_segmenter",
  "regex",
@@ -7329,9 +7355,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.15.1"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
 ]
@@ -7402,7 +7428,7 @@ dependencies = [
  "js-sys",
  "memmap2",
  "ndk",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
@@ -7615,7 +7641,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
- "synstructure",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -7764,6 +7790,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "synstructure"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "901704edd0dfe137f1987838ee4f259e4e063c31371bdb423f7ae38ec6f77f02"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7800,7 +7837,7 @@ dependencies = [
 [[package]]
 name = "taffy"
 version = "0.14.0"
-source = "git+https://github.com/joeleaver/taffy-fork?rev=317d532abadd38755b46d15c298fd0a522f0f672#317d532abadd38755b46d15c298fd0a522f0f672"
+source = "git+https://github.com/joeleaver/taffy-fork?rev=25caf91e87ad8ef2929ba4625f760e41e2765a80#25caf91e87ad8ef2929ba4625f760e41e2765a80"
 dependencies = [
  "arrayvec",
  "serde",
@@ -8008,9 +8045,9 @@ dependencies = [
 
 [[package]]
 name = "tinystr"
-version = "0.8.2"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42d3e9c45c09de15d06dd8acf5f4e0e399e85927b7f00711024eb7ae10fa4869"
+checksum = "abc840c238154d58f9e86b2792261edfde565a17696e1cda1a449de27979801a"
 dependencies = [
  "displaydoc",
  "serde_core",
@@ -8056,7 +8093,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
- "synstructure",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -9597,7 +9634,7 @@ dependencies = [
  "naga",
  "naga-types",
  "ndk-sys",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
@@ -10125,7 +10162,7 @@ dependencies = [
  "block2 0.6.2",
  "dispatch2",
  "dpi",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -10146,7 +10183,7 @@ dependencies = [
  "block2 0.6.2",
  "dpi",
  "memmap2",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "smol_str",
@@ -10195,7 +10232,7 @@ dependencies = [
  "block2 0.6.2",
  "dispatch2",
  "dpi",
- "objc2 0.6.4",
+ "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-ui-kit",
@@ -10387,9 +10424,9 @@ dependencies = [
 
 [[package]]
 name = "writeable"
-version = "0.6.2"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "x11"
@@ -10518,9 +10555,9 @@ checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
 
 [[package]]
 name = "yeslogic-fontconfig-sys"
-version = "6.0.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "503a066b4c037c440169d995b869046827dbc71263f6e8f3be6d77d4f3229dbd"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
 dependencies = [
  "dlib",
  "once_cell",
@@ -10529,9 +10566,9 @@ dependencies = [
 
 [[package]]
 name = "yoke"
-version = "0.8.1"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72d6e5c6afb84d73944e5cedb052c4680d5657337201555f9f2a16b7406d4954"
+checksum = "417ef3fcf6c300b7dbd25c85531a746931c02ad536f3cf4786ed1e88223340b3"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
@@ -10540,14 +10577,14 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.1"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b659052874eb698efe5b9e8cf382204678a0086ebf46982b79d6ca3182927e5d"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
- "synstructure",
+ "syn 3.0.5",
+ "synstructure 0.14.0",
 ]
 
 [[package]]
@@ -10673,7 +10710,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
- "synstructure",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -10698,20 +10735,21 @@ dependencies = [
 
 [[package]]
 name = "zerotrie"
-version = "0.2.3"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a59c17a5562d507e4b54960e8569ebee33bee890c70aa3fe7b97e85a9fd7851"
+checksum = "4ea269c3bd32f0a32c321907a2ae912ba6f4649bb0fc764a15627e99a7095a3f"
 dependencies = [
  "displaydoc",
  "yoke",
  "zerofrom",
+ "zerovec",
 ]
 
 [[package]]
 name = "zerovec"
-version = "0.11.5"
+version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c28719294829477f525be0186d13efa9a3c602f7ec202ca9e353d310fb9a002"
+checksum = "f58a2799cfe9a1670c7ea8edbd52ef8edb93cb37a7f83bf31ba9e35d9dae6a40"
 dependencies = [
  "serde",
  "yoke",
@@ -10721,13 +10759,13 @@ dependencies = [
 
 [[package]]
 name = "zerovec-derive"
-version = "0.11.2"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eadce39539ca5cb3985590102671f2567e659fca9666581ad3411d59207951f3"
+checksum = "c3743ddbf47738d929cd1ae2e199d40d0162979dfe31aef8ae646d2bf00bf97a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 3.0.5",
 ]
 
 [[package]]

@@ -1,5 +1,31 @@
 # Next session: start here
 
+**2026-11-06 (session 78e7f30f): v0.20.0 released from branch `settings`, merged into
+`master`; rinch `main` 8bfa6c42 in all three locks (root, `web/`, `plugins/`).**
+- **Status bar:** "This computer" and "Pimble Cloud", each showing its real state
+  (`subscribeCloudConnection`). The owner's store row has no "shared from here" badge.
+- **Settings** (File > Settings..., Ctrl+,; docs/SETTINGS_CONTRACT.md): General, Keyboard,
+  Account, Shares, Plugins, AI Agents and Updates. Plugin changes take effect at once on
+  the desktop.
+- **Edit menu:** Insert ▸ and New ▸ match the toolbar and the row menu. Focus Search is
+  Ctrl+Shift+F.
+- **Split Note at Caret (Ctrl+K) and Join Note Below (Ctrl+M):** docs/SPLIT_CONTRACT.md.
+  Their shortcuts are set in Settings > Keyboard.
+- **Plugin library, all four waves** (SETTINGS_CONTRACT sections 10 to 12):
+  - CI publishes the kanban, todo list and timeline plugins, signed.
+  - The accounts service serves them at `/api/v1/plugins`.
+  - Settings > Plugins installs and verifies them, and updates them on their own.
+  - `site/plugins.html` lists them.
+  - `pimble:` links open in Pimble from outside, through OS registration and
+    `openInApp`.
+
+Open:
+- The first install signed with the real key happens against this release: check
+  `/api/v1/plugins` on pimble.app and an Install in the installed app.
+- joeleaver/rinch#2310 (`focus_current_window`) is open. When it merges, switch
+  `app::bring_to_front` to it.
+- Windows link registration has not been tried on a real machine.
+
 **2026-11-05 (session 78e7f30f): v0.19.0 released with three plugin pieces since v0.18.1,
 each merged into `master` from its own branch:**
 - **Kanban open beside** (`open-beside`, plugin ABI 6): a card opens in a pane beside the
