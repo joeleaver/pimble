@@ -218,7 +218,7 @@ types of plugins, not just what already exists." His answers:
   - for a calendar, that it reads and makes sense: seasons name months the year has, an
     era counting up has `from` and one counting down has `to`, and there is a quiet era;
 - `read_date { calendar, text }`: what a text reads as in a calendar (a calendar node's
-  link, or "gregorian"), and that moment in the Gregorian calendar.
+  link, or "gregorian"), checked in that calendar's own terms (section 11).
 
 ## 9. Wave 3 as built (2026-11-06)
 
@@ -274,8 +274,8 @@ Checked:
   - a season naming a missing month is refused;
   - a non-link and a node that is no calendar are refused;
   - a real calendar node is accepted with the Gregorian beside it;
-  - "Fir 3, 1300 YF" and "Year's Gate, 12 BF" read with their Gregorian dates, and
-    "c. 1066" reads.
+  - "Fir 3, 1300 YF" and "Year's Gate, 12 BF" read (with their weekday and day of the
+    year, and no Gregorian date since section 11), and "c. 1066" reads.
 - **The MCP's end-to-end test,** with the real built plugin in the plugins folder, adds:
   - the tools listed;
   - a timeline's bad calendar link refused with the plugin's sentence, and a good one
@@ -336,7 +336,8 @@ What it found, and what came of it:
     would draw no bar.
 - **No way to see a timeline.** The timeline now has an `outline` tool: every node on the
   line in time order, with its first and last day, whether it is a point, a span or a bar,
-  and its Gregorian days in an invented calendar; then the group labels, and what is not
+  and its Gregorian days in an invented calendar when the timeline shows the Gregorian
+  beside it (section 11); then the group labels, and what is not
   shown as meant. Run on the agent's own two timelines, it listed every event as the app
   then drew it.
 - **Left as they are:**
@@ -348,3 +349,22 @@ What it found, and what came of it:
 
 Checked: the timeline's 22 tests; `timeline_tools` with the end, an end before its start,
 "264-241 BC" and `outline`; the MCP's end-to-end test.
+
+## 11. Gregorian dates only where the timeline shows them (Joe, 2026-11-07)
+
+Joe asked what a Gregorian date is for in a made-up calendar. It let an agent check the
+calendar's arithmetic, but for an invented world it is noise, and it invites the agent to
+reason in our dates instead of the world's. So:
+
+- `check_field`, `read_date` and `outline` check a reading in the calendar's own terms: a
+  day's weekday (when the calendar has weeks) and its day of the year ("a Thirdday, day 4
+  of 181 in its year"); a year, a month, a rough date or a span its length in days.
+- A Gregorian date is added only when the timeline shows the Gregorian beside its own
+  calendar (`also` names it), so the agent sees what the person sees: "it begins on Jul
+  10, 355 BC in the Gregorian calendar beside it", and outline's "[Gregorian A to B]".
+  `read_date` names one calendar and never adds it.
+- The calendar's description keeps where year 0 begins in the Gregorian calendar: the
+  epoch is counted from the Gregorian 1 January AD 1, so that is the anchor the agent set.
+- Tests: the timeline plugin's unit test reads an invented date alone (no Gregorian) and
+  beside the Gregorian (named); the host test's answers carry the weekday and day of the
+  year.

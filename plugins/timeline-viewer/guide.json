@@ -8,7 +8,7 @@
       "fields": [
         {
           "name": "date",
-          "about": "One moment, written as the timeline's calendar writes dates: in an invented calendar its months' short names and its eras' short names (\"Fir 3, 1300 YF\"), and a day of no month by its name (\"Year's Gate, 1300 YF\"). An era left out means the calendar's quiet era. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\" (a season the calendar names), and a span in one field, \"1215-1217\". set_fields asks the timeline first: a date it cannot read is refused with forms that do, and a good one is said back with its Gregorian date. Try a form with call_plugin_tool read_date before writing many. The Gregorian calendar is proleptic: dates before 1582 are counted as if it had always been in use, not as the Julian dates many histories give.",
+          "about": "One moment, written as the timeline's calendar writes dates: in an invented calendar its months' short names and its eras' short names (\"Fir 3, 1300 YF\"), and a day of no month by its name (\"Year's Gate, 1300 YF\"). An era left out means the calendar's quiet era. Rough dates read too: \"c. 1066\", \"early 1400s\", \"the 15th century\", \"spring of 412\" (a season the calendar names), and a span in one field, \"1215-1217\". set_fields asks the timeline first: a date it cannot read is refused with forms that do, and a good one is said back with checks in the calendar's own terms (a day's weekday and its day of the year, a span's length in days), and its Gregorian date when the timeline shows the Gregorian beside its own calendar. Try a form with call_plugin_tool read_date before writing many. The Gregorian calendar is proleptic: dates before 1582 are counted as if it had always been in use, not as the Julian dates many histories give.",
           "example": "Oct 14, 1066"
         },
         {
@@ -412,7 +412,7 @@
     },
     {
       "name": "check_field",
-      "about": "Run by set_fields before it writes a date field of a node a timeline shows: the value must read as a date in the timeline's calendar (or one shown beside it). The answer says how it reads, and where that falls in the Gregorian calendar.",
+      "about": "Run by set_fields before it writes a date field of a node a timeline shows: the value must read as a date in the timeline's calendar (or one shown beside it). The answer says how it reads, with a day's weekday and day of the year (a span's length in days) to check against the calendar, and where it begins in the Gregorian calendar when the timeline shows the Gregorian beside its own.",
       "params": {
         "type": "object",
         "required": [
@@ -442,7 +442,7 @@
     },
     {
       "name": "read_date",
-      "about": "What a text reads as in a calendar, without writing anything: give calendar (a calendar node's pimble: link, or \"gregorian\") and text. Use it to try a form before writing many dates in it.",
+      "about": "What a text reads as in a calendar, without writing anything: give calendar (a calendar node's pimble: link, or \"gregorian\") and text. The answer says how it reads, with a day's weekday and day of the year (a span's length in days) to check against the calendar. Use it to try a form before writing many dates in it.",
       "params": {
         "type": "object",
         "required": [
@@ -462,7 +462,7 @@
     },
     {
       "name": "outline",
-      "about": "What a person opening a timeline sees, as text: every node on the line in time order, each with its first and last day, whether it is a point, a span or a bar, and (in an invented calendar) its Gregorian days; the group labels; and anything not shown as meant (a date that does not read, an end before its start).",
+      "about": "What a person opening a timeline sees, as text: every node on the line in time order, each with its first and last day, whether it is a point, a span or a bar, and its Gregorian days when the timeline shows the Gregorian beside an invented calendar; the group labels; and anything not shown as meant (a date that does not read, an end before its start).",
       "params": {
         "type": "object",
         "required": [

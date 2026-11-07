@@ -218,26 +218,66 @@ fn span_of<'a>(cals: &'a [Calendar], value: &str) -> Option<(&'a Calendar, (i64,
     })
 }
 
+/// Facts about the day `at` falls on, in `cal`'s own terms, that an agent can
+/// check against the calendar it defined: its weekday and its day of the year.
+fn day_facts(cal: &Calendar, at: i64) -> String {
+    let day = (at - cal.epoch).div_euclid(cal.seconds_in_day());
+    let (year, in_year) = cal.year_of_day(day);
+    let of_year = format!("day {} of {} in its year", in_year + 1, cal.year_days(year));
+    match cal.weekday(at) {
+        Some(name) => format!("a {name}, {of_year}"),
+        None => of_year,
+    }
+}
+
+/// How many of `cal`'s days run from `from` up to `to`.
+fn days_long(cal: &Calendar, from: i64, to: i64) -> String {
+    let n = (to - from).div_euclid(cal.seconds_in_day()).max(1);
+    if n == 1 { "1 day".into() } else { format!("{n} days") }
+}
+
+/// Whether a timeline reading in `cals` shows the Gregorian calendar, so a
+/// person sees Gregorian dates on it too.
+fn shows_gregorian(cals: &[Calendar]) -> bool {
+    let gregorian = Calendar::gregorian().name;
+    cals.iter().any(|c| c.name == gregorian)
+}
+
 /// `value` read in the first of `cals` that reads it, said back in that
-/// calendar and the Gregorian; or why it does not read, with forms that do.
+/// calendar with checks in its own terms (a day's weekday and day of the
+/// year, a span's length in days); and in the Gregorian too when `cals`
+/// shows it, as the timeline does; or why it does not read, with forms that do.
 fn read_in(cals: &[Calendar], value: &str) -> ToolAnswer {
     if value.is_empty() {
         return ToolAnswer::ok("An empty field puts nothing on the line.");
     }
     let gregorian = Calendar::gregorian();
     let in_greg = |at: i64| gregorian.write(Moment { at, precision: Precision::Day });
+    let beside = shows_gregorian(cals);
     for cal in cals {
         let Some(said) = cal.read_said(value) else { continue };
-        let (reads, from) = match said {
-            Said::At { moment, about } => (cal.write_about(moment, about), moment.at),
+        let (reads, from, facts) = match said {
+            Said::At { moment, about } => {
+                let facts = if moment.precision >= Precision::Day {
+                    day_facts(cal, moment.at)
+                } else if about {
+                    let (from, to) = cal.about_span(moment);
+                    days_long(cal, from, to)
+                } else {
+                    days_long(cal, moment.at, cal.end_of(moment))
+                };
+                (cal.write_about(moment, about), moment.at, facts)
+            }
             Said::Between { from, to, about } => {
                 let s = cal.write_between(from, to);
-                (if about { format!("about {s}") } else { s }, from.at)
+                (if about { format!("about {s}") } else { s }, from.at, days_long(cal, from.at, cal.end_of(to)))
             }
-            Said::Rough { from, to, .. } => (format!("roughly {} to {}", cal.write(Moment { at: from, precision: Precision::Day }), cal.write(Moment { at: to, precision: Precision::Day })), from),
+            Said::Rough { from, to, .. } => {
+                (format!("roughly {} to {}", cal.write(Moment { at: from, precision: Precision::Day }), cal.write(Moment { at: to, precision: Precision::Day })), from, days_long(cal, from, to))
+            }
         };
-        let greg = if cal.name == gregorian.name { String::new() } else { format!(", from {} in the Gregorian calendar", in_greg(from)) };
-        return ToolAnswer::ok(format!("\u{201c}{value}\u{201d} reads as {reads} in {}{greg}.", cal.called()));
+        let greg = if beside && cal.name != gregorian.name { format!("; it begins on {} in the Gregorian calendar beside it", in_greg(from)) } else { String::new() };
+        return ToolAnswer::ok(format!("\u{201c}{value}\u{201d} reads as {reads} in {} ({facts}){greg}.", cal.called()));
     }
     let cal = &cals[0];
     let now = Calendar::now();
@@ -252,8 +292,9 @@ fn read_in(cals: &[Calendar], value: &str) -> ToolAnswer {
 }
 
 /// What a person opening the timeline sees, as text: every node on the line in
-/// time order, with how its dates read and where they fall in the Gregorian
-/// calendar, then the groups, then what is not on the line and why.
+/// time order, with how its dates read (and their Gregorian days when the
+/// timeline shows the Gregorian beside its own calendar), then the groups,
+/// then what is not on the line and why.
 async fn outline(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
     let Some(metanode) = addr_of(&text(a, "timeline")) else { return ToolAnswer::no("timeline must be the timeline's pimble: link") };
     let forest = match api.metanode_source(metanode).await {
@@ -272,6 +313,7 @@ async fn outline(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
         }
     }
     let gregorian = Calendar::gregorian();
+    let beside = shows_gregorian(&cals);
     let day = |at: i64| Moment { at, precision: Precision::Day };
     let f = &settings.fields;
     let get = |node: &pimble_plugin_sdk::pimble_core::Node, name: &str| {
@@ -308,7 +350,7 @@ async fn outline(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
         } else {
             format!("{} to {} ({shape}): {title}", cal.write(day(from)), cal.write(day(to - cal.seconds_in_day())))
         };
-        if cal.name != gregorian.name {
+        if beside && cal.name != gregorian.name {
             line.push_str(&if shape == "point" {
                 format!(" [Gregorian {}]", gregorian.write(day(from)))
             } else {
@@ -334,3 +376,18 @@ async fn outline(api: &Pimble, a: &serde_json::Value) -> ToolAnswer {
     ToolAnswer::ok(out.trim_end().to_string())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_invented_date_is_checked_in_its_own_terms_and_gregorian_only_beside_it() {
+        let own = Calendar::invented();
+        let value = own.write(Moment { at: own.year_start(3), precision: Precision::Day });
+        let alone = read_in(&[own.clone()], &value);
+        assert!(alone.ok && alone.said.contains("day 1 of") && !alone.said.contains("Gregorian"), "{}", alone.said);
+        let beside = read_in(&[own, Calendar::gregorian()], &value);
+        assert!(beside.ok && beside.said.contains("in the Gregorian calendar beside it"), "{}", beside.said);
+    }
+}

@@ -79,7 +79,7 @@ fn the_timeline_reads_dates_and_checks_settings_for_an_agent() {
     for (i, answer) in answers.iter().enumerate() {
         eprintln!("{i}: {} {}", answer.ok, answer.said);
     }
-    assert_eq!(a(0), (true, "\u{201c}Mar 15, 44 BC\u{201d} reads as Mar 15, 44 BC in the Gregorian calendar."));
+    assert_eq!(a(0), (true, "\u{201c}Mar 15, 44 BC\u{201d} reads as Mar 15, 44 BC in the Gregorian calendar (a Friday, day 74 of 365 in its year)."));
     assert!(!a(1).0 && a(1).1.contains("does not read as a date in the Gregorian calendar"), "{:?}", a(1));
     assert_eq!(a(2), (true, "The timeline does not read mood."));
     assert!(a(3).0 && a(3).1.starts_with("the Reckoning of the Founding calendar reads: 181 days in a year (183 in a leap year") && a(3).1.contains("The absolute year 0 is written \u{201c}1\u{201d} and -1 \u{201c}1 BF\u{201d}"), "{:?}", a(3));
@@ -87,7 +87,9 @@ fn the_timeline_reads_dates_and_checks_settings_for_an_agent() {
     assert!(!a(5).0 && a(5).1.starts_with("calendar must be a calendar node's pimble: link"), "{:?}", a(5));
     assert!(!a(6).0 && a(6).1.contains("is not a calendar"), "{:?}", a(6));
     assert_eq!(a(7), (true, "It counts in the Reckoning of the Founding calendar, with the Gregorian calendar beside it."));
-    assert!(a(8).0 && a(8).1.contains("reads as Fir 3, 1300") && a(8).1.contains("in the Gregorian calendar"), "{:?}", a(8));
+    // An invented calendar's date is checked in its own terms; the Gregorian
+    // is said only where a timeline shows it.
+    assert!(a(8).0 && a(8).1.contains("reads as Fir 3, 1300") && a(8).1.contains("in its year") && !a(8).1.contains("Gregorian"), "{:?}", a(8));
     assert!(a(9).0 && a(9).1.contains("Year's Gate"), "{:?}", a(9));
     assert!(a(10).0 && a(10).1.contains("1066"), "{:?}", a(10));
     assert!(a(11).0 && a(11).1.ends_with("As an end it runs through Dec 31, 44 BC."), "{:?}", a(11));
