@@ -119,6 +119,19 @@ signature with `gh`, verifies the signature against the compiled-in public key,
 unpacks it into a temporary folder, and runs `pimble --install` from there. What
 is tested is what shipped.
 
+## An install replaced under a running app (2026-11-10)
+
+Installing a release by hand (`tools/install-release.sh`) while Pimble runs, or another
+window's "Restart to update", replaces the binary under a running process. Until 0.21.1,
+"Restart to update" then did nothing: Linux names the running program
+`.../pimble (deleted)`, which does not resolve, so the app no longer counted as installed.
+The old process had also downloaded the release again, comparing it only with its own
+version. Now:
+- the install folder is found once, at start, and a ` (deleted)` suffix is stripped;
+- the checker compares with the marker's version, what is on disk: a newer version
+  installed in place is offered as ready with nothing downloaded, and "Restart to update"
+  only starts it; a staged copy no newer than what is installed is thrown away.
+
 ## Not done
 
 - Windows: nothing on the PATH. The installer is checked on CI's Windows runner
