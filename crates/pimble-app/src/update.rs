@@ -455,7 +455,13 @@ pub fn start(store: AppStore) {
                     // Nothing new to fetch, but one may already be waiting
                     // for a restart: that stays what About offers.
                     Ok(None) => match waiting_version(&dir) {
-                        Some(version) => report(UpdateStatus::Ready { version }),
+                        // Installed in place under this process since it
+                        // started: the bar offers the restart too.
+                        Some(version) => {
+                            *STAGED.lock().unwrap() = Some(version.clone());
+                            run_on_main_thread(deliver);
+                            report(UpdateStatus::Ready { version });
+                        }
                         None => {
                             tracing::info!("update check: {CURRENT} is the latest");
                             report(UpdateStatus::UpToDate { at: now_text() });
