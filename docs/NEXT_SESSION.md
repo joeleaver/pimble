@@ -1,5 +1,29 @@
 # Next session: start here
 
+**2026-11-10 (session 78e7f30f): v0.21.0 released from branch `agent-guides`, merged into
+`master`; rinch `main` b0da1607 in all three locks (root, `web/`, `plugins/`).**
+- **Viewer guides and plugin tools** (docs/AGENT_GUIDES_CONTRACT.md): plugins embed a
+  guide that tells an agent what their viewers read and take, and can run checks and tools
+  for an agent headlessly. The MCP has `list_viewers`, `get_viewer_settings`,
+  `set_viewer_settings` and `call_plugin_tool`, and checks settings and fields with the
+  plugin before writing them.
+- **Timeline 0.1.1** (kanban and todo list 0.1.1 carry their guides): `check_field`,
+  `read_date` and `outline` for agents. Two blind trials fixed a day/year swap in
+  invented calendars. Dates are checked in the calendar's own terms, with the Gregorian
+  only where the timeline shows it (section 11).
+- **rinch:** subpixel (LCD) text and grayscale by the OS's settings, font fallback and
+  fontconfig substitutes as Chrome takes them, drawn faux bold and italic, a shared glyph
+  atlas, and table, float and image-layout fixes. Smooth wheel scrolling was already in
+  0.20.
+
+Open:
+- joeleaver/rinch#2310 (`focus_current_window`) is still open. When it merges, switch
+  `app::bring_to_front` to it.
+- Windows link registration has not been tried on a real machine.
+- The pimble-mcp test binary crashed with SIGSEGV once, after all 35 tests passed, as it
+  exited (the release test run, 2026-11-10); the rerun passed. Likely teardown of a
+  background thread; look if it comes back.
+
 **2026-11-06 (session 78e7f30f): v0.20.0 released from branch `settings`, merged into
 `master`; rinch `main` 8bfa6c42 in all three locks (root, `web/`, `plugins/`).**
 - **Status bar:** "This computer" and "Pimble Cloud", each showing its real state
