@@ -1,5 +1,13 @@
 # Next session: start here
 
+**2026-11-10 (session 78e7f30f): v0.21.1 released from `master`.**
+- **Explorer:** a metanode with no icon of its own shows its viewer's (a note turned into a
+  kanban by `set_metanode` or "Show as ..." looks like one made with New > Kanban;
+  docs/METANODES_CONTRACT.md).
+- **Restart to update** works after an install replaced the running binary (Linux names
+  it "pimble (deleted)"), and a version already installed in place is offered on the bar
+  with nothing downloaded (docs/UPDATE_CONTRACT.md). Checked in a scratch install.
+
 **2026-11-10 (session 78e7f30f): v0.21.0 released from branch `agent-guides`, merged into
 `master`; rinch `main` b0da1607 in all three locks (root, `web/`, `plugins/`).**
 - **Viewer guides and plugin tools** (docs/AGENT_GUIDES_CONTRACT.md): plugins embed a
