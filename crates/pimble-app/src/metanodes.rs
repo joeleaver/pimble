@@ -360,7 +360,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             node_id: entry.addr.node,
             depth: entry.depth,
             label: display_label_from_node(&entry.node),
-            icon: icon_of(&entry.node),
+            icon: store.node_icon(&entry.node),
             color: entry.node.metadata.color().map(str::to_string),
         })
         .collect();
@@ -449,12 +449,6 @@ pub(crate) fn plugins_ready(store: AppStore) {
             fill(store, pane, Ok(&forest));
         }
     }
-}
-
-/// The icon a row shows: the node's own, or its type's as the explorer
-/// draws it.
-fn icon_of(node: &Node) -> String {
-    pimble_ui::appearance::node_icon(node)
 }
 
 /// The outline a pane shows for a metanode: the lines, then the rows,

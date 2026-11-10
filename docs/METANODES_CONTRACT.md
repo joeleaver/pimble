@@ -158,8 +158,13 @@ see an ordinary node.
    outline with its two-level source kept; a row opened its note in the pane. Not checked:
    the browser (it compiles for wasm and runs the same `pimble-app` code), an encrypted
    store's forest.
-   Not built: a viewer's icon on the explorer row (no viewers yet), "Source ..." on the
-   menu, an app test of the outline (a `Forest` is made only by the API).
+   Not built: "Source ..." on the menu, an app test of the outline (a `Forest` is made
+   only by the API). The viewer's icon on the explorer row was built 2026-11-10: a
+   metanode with no icon of its own shows the icon its viewer's plugin recipe makes
+   nodes with (`AppStore::viewer_icon`, `AppStore::node_icon`), so a node turned into a
+   kanban by `set_metanode` or "Show as ..." looks like one made with New > Kanban. A
+   chosen icon still wins, a query metanode keeps its own, and nothing is written to the
+   node.
 2. **Hosting viewers:** the seam where a pane hands a metanode's forest and settings to a
    viewer and the viewer acts through `Pimble`, filled by plugins
    (`docs/PLUGINS_CONTRACT.md`); viewers' declared source shapes and the menu that offers
