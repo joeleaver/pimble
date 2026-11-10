@@ -1518,6 +1518,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // A query metanode, a query metanode: violet, its own icon unless
             // the person chose one (section 6).
             let is_query = !is_store_root && node_sig.is_some_and(|sig| sig.with(crate::metanodes::is_query));
+            // A metanode with no icon of its own shows its viewer's.
+            let viewer_icon = if is_store_root {
+                None
+            } else {
+                node_sig
+                    .and_then(|sig| sig.with(|n| n.metadata.metanode.as_ref().map(|m| m.viewer.clone())))
+                    .and_then(|viewer| store.viewer_icon(&viewer))
+                    .and_then(|name| icon_by_name(&name))
+            };
             let (custom_icon, node_color, row_color) = appearance_sig
                 .map(|sig| {
                     sig.with(|n| {
@@ -1537,6 +1546,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 TablerIcon::Link
             } else if is_query {
                 TablerIcon::FilterSearch
+            } else if let Some(icon) = viewer_icon {
+                icon
             } else if is_folder {
                 TablerIcon::Folder
             } else {

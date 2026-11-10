@@ -147,6 +147,8 @@ fn loaded(registry: Registry) {
     if let Some(store) = STORE.with(Cell::get) {
         // What the explorer's new-node menu offers from them.
         store.recipes.set(recipes());
+        // Rows of metanodes with no icon of their own show their viewer's.
+        store.bump_tree_structure();
         crate::metanodes::plugins_ready(store);
         if !CHECKING.with(|c| c.replace(true)) {
             schedule_update_check(FIRST_UPDATE_CHECK_MS);
