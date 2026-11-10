@@ -48,11 +48,37 @@ pub fn install_dir() -> Option<PathBuf> {
     Some(if cfg!(windows) { base.join("Programs").join("Pimble") } else { base.join("pimble").join("app") })
 }
 
-/// The managed install the running binary is in, if it is in one.
+/// The managed install the running binary is in, if it is in one: found
+/// once, the first time it is asked (at start), since an install replaced
+/// under a running app leaves Linux naming its program "pimble (deleted)",
+/// which no longer resolves.
 pub fn managed_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let dir = exe.parent()?.to_path_buf();
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(find_managed_dir).clone()
+}
+
+fn find_managed_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(was) => PathBuf::from(was),
+        None => exe,
+    };
+    let dir = exe.canonicalize().ok()?.parent()?.to_path_buf();
     dir.join(MARKER).is_file().then_some(dir)
+}
+
+/// The version the install's marker names: what is on disk, which is newer
+/// than this process when an update was installed under it (by hand, or by
+/// another copy's "Restart to update").
+fn installed_version(dir: &Path) -> Option<String> {
+    let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MARKER)).ok()?).ok()?;
+    Some(marker.get("version")?.as_str()?.to_string())
+}
+
+/// A version newer than this process that a restart reaches: one staged, or
+/// one already installed in place.
+fn waiting_version(dir: &Path) -> Option<String> {
+    staged_version(dir).filter(|v| newer_than_current(v)).or_else(|| installed_version(dir).filter(|v| newer_than_current(v)))
 }
 
 /// `pimble --install`: copy this binary and the `pimble-mcp` beside it into
@@ -279,9 +305,13 @@ struct FeedAsset {
 }
 
 fn newer_than_current(version: &str) -> bool {
+    newer_than(version, CURRENT)
+}
+
+fn newer_than(version: &str, than: &str) -> bool {
     let parse = |v: &str| semver::Version::parse(v.trim_start_matches('v')).ok();
-    match (parse(version), parse(CURRENT)) {
-        (Some(v), Some(current)) => v > current,
+    match (parse(version), parse(than)) {
+        (Some(v), Some(than)) => v > than,
         _ => false,
     }
 }
@@ -310,6 +340,11 @@ fn check_and_stage(dir: &Path) -> Result<Option<String>, String> {
     let version = feed.version.trim_start_matches('v').to_string();
     if !newer_than_current(&version) {
         return Ok(None);
+    }
+    // Already installed under this process: nothing to fetch, a restart
+    // reaches it.
+    if installed_version(dir).is_some_and(|v| !newer_than(&version, &v)) {
+        return Ok(installed_version(dir).filter(|v| newer_than_current(v)));
     }
     if staged_version(dir).as_deref() == Some(version.as_str()) {
         return Ok(Some(version));
@@ -397,7 +432,7 @@ pub fn start(store: AppStore) {
     STORE.with(|s| s.set(Some(store)));
     register_links(&dir);
     store.update_status.set(UpdateStatus::Waiting);
-    if let Some(version) = staged_version(&dir).filter(|v| newer_than_current(v)) {
+    if let Some(version) = waiting_version(&dir) {
         store.update_ready.set(Some(version.clone()));
         store.update_status.set(UpdateStatus::Ready { version });
     }
@@ -419,7 +454,7 @@ pub fn start(store: AppStore) {
                     }
                     // Nothing new to fetch, but one may already be waiting
                     // for a restart: that stays what About offers.
-                    Ok(None) => match staged_version(&dir).filter(|v| newer_than_current(v)) {
+                    Ok(None) => match waiting_version(&dir) {
                         Some(version) => report(UpdateStatus::Ready { version }),
                         None => {
                             tracing::info!("update check: {CURRENT} is the latest");
@@ -460,15 +495,25 @@ pub fn restart_to_update(store: AppStore) {
 
 fn apply(args: &[String]) -> Result<(), String> {
     let dir = managed_dir().ok_or("this copy of Pimble is not an installed one")?;
-    let version = staged_version(&dir).ok_or("no update is ready")?;
     let stage = dir.join(STAGE);
-    for name in [EXE, MCP] {
-        if stage.join(name).is_file() {
-            replace_file(&stage.join(name), &dir.join(name))?;
+    // A staged update newer than what is installed is moved into place; one
+    // installed under this process already is (it is only started).
+    let version = match staged_version(&dir) {
+        Some(staged) if installed_version(&dir).is_none_or(|installed| newer_than(&staged, &installed)) => {
+            for name in [EXE, MCP] {
+                if stage.join(name).is_file() {
+                    replace_file(&stage.join(name), &dir.join(name))?;
+                }
+            }
+            write_marker(&dir, &staged)?;
+            let _ = std::fs::remove_dir_all(&stage);
+            staged
         }
-    }
-    write_marker(&dir, &version)?;
-    let _ = std::fs::remove_dir_all(&stage);
+        _ => {
+            let _ = std::fs::remove_dir_all(&stage);
+            installed_version(&dir).filter(|v| newer_than_current(v)).ok_or("no update is ready")?
+        }
+    };
     std::process::Command::new(dir.join(EXE))
         .args(args)
         .env("PIMBLE_WAIT_FOR_PID", std::process::id().to_string())
@@ -480,6 +525,26 @@ fn apply(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An install replaced under the running app (tools/install-release.sh,
+    /// or another window's "Restart to update") is a restart away: nothing
+    /// to download, and a staged copy no newer than it is not moved in.
+    #[test]
+    fn a_newer_install_in_place_waits_for_a_restart() {
+        let dir = std::env::temp_dir().join(format!("pimble-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(STAGE)).unwrap();
+        write_marker(&dir, CURRENT).unwrap();
+        assert_eq!(waiting_version(&dir), None);
+        write_marker(&dir, "99.0.0").unwrap();
+        assert_eq!(installed_version(&dir).as_deref(), Some("99.0.0"));
+        assert_eq!(waiting_version(&dir).as_deref(), Some("99.0.0"));
+        std::fs::write(dir.join(STAGE).join(EXE), b"new").unwrap();
+        std::fs::write(dir.join(STAGE).join("ready.json"), r#"{"version":"99.1.0"}"#).unwrap();
+        assert_eq!(waiting_version(&dir).as_deref(), Some("99.1.0"));
+        assert!(newer_than("99.1.0", "99.0.0") && !newer_than("99.0.0", "99.0.0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     fn key_pair() -> (SigningKey, String) {
