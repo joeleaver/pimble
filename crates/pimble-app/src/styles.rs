@@ -2,6 +2,12 @@
 
 /// Application-wide layout styles.
 pub(crate) const APP_CSS: &str = "
+/* The header band under the menu bar: the search bar over the explorer and the
+   toolbar over the panes, one height so the line under them is one line. */
+:root {
+    --pimble-header-height: 48px;
+}
+
 /* ── Title bar brand (brand.rs) ─────────────────────────────── */
 
 .pimble-titlebar-brand {
@@ -27,6 +33,11 @@ pub(crate) const APP_CSS: &str = "
     align-items: flex-start;
     gap: 4px 0;
     padding: 4px 8px 2px 8px;
+    /* The header band's height, shared with the search bar beside it
+       (--pimble-header-height), so the line under both is one line across
+       the window. A narrow window that wraps the groups grows it. */
+    box-sizing: border-box;
+    min-height: var(--pimble-header-height);
 }
 
 /* A labeled run of buttons; a hairline separates it from the one before. */
@@ -2761,11 +2772,14 @@ pub(crate) const APP_CSS: &str = "
     display: flex;
     align-items: center;
     gap: 8px;
-    /* As tall as the toolbar beside it (42px), so the line under both is one
-       line across the window: the explorer header's top border here, the
-       toolbar's bottom border there. */
-    padding: 11px 12px;
-    background: var(--rinch-color-body);
+    /* The header band beside the toolbar: its height and color, so menu bar,
+       search and toolbar read as one band over the explorer and the panes, and
+       the line under it (the explorer header's top border) is on the row of
+       the panes' top line. */
+    box-sizing: border-box;
+    height: var(--pimble-header-height);
+    padding: 0 12px;
+    background: var(--rinch-color-surface);
     flex-shrink: 0;
 }
 
