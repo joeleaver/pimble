@@ -662,8 +662,10 @@ cd web && trunk build --release            # the browser build, dist/ (cargo ins
 The full local stack (accounts service, a `pimble-cli server` in JWT mode, the site and
 the web app) is described in `web/README.md` and `docs/DEPLOY.md`.
 
-The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `connect`,
-`screenshot`, `dom_tree`, `click`, `type_text`) can drive a running instance.
+The app has the rinch `debug` feature compiled in, so the rinch MCP tools (`list_apps`,
+`connect`, `screenshot`, `dom_tree`, `click`, `type_text`) and `scripts/perf/rd.py` can
+drive a running instance started with `RINCH_DEBUG=1` (rinch #2481: off otherwise, and
+the discovery file's per-session token is required).
 
 ## Dependencies
 

@@ -23,9 +23,13 @@ mkdir -p $P/env/config/pimble $P/env/data/pimble
 cp -r ~/dev/scrivener_convert/family-management.pimble $P/env/family.pimble
 ln -sfn ~/.local/share/pimble/models $P/env/data/pimble/models   # skip the model download
 printf '{"open_stores":["%s/env/family.pimble"]}\n' $P > $P/env/config/pimble/state.json
-PIMBLE_APP_ADDR=127.0.0.1:7473 XDG_CONFIG_HOME=$P/env/config XDG_DATA_HOME=$P/env/data RINCH_PERF=1 \
+PIMBLE_APP_ADDR=127.0.0.1:7473 XDG_CONFIG_HOME=$P/env/config XDG_DATA_HOME=$P/env/data RINCH_DEBUG=1 RINCH_PERF=1 \
   $P/target/release/pimble > $P/app.log 2>&1 &
 ```
+
+**Start the test app with `RINCH_DEBUG=1`** (rinch #2481, Pimble 0.21.2): without it the
+app starts no debug server, and `rd.py` finds no `~/.rinch/debug/<pid>.json`. That file is
+readable by your user only and holds a per-session token, which `rd.py` sends.
 
 **Always give the test app its own port** with `PIMBLE_APP_ADDR=127.0.0.1:7473` (any free
 port). The embedded server takes `127.0.0.1:7462` by default; if Joe's own app is running,

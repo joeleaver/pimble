@@ -39,7 +39,13 @@ class Client:
     def __init__(self, pid):
         entry = json.load(open(os.path.expanduser(f"~/.rinch/debug/{pid}.json")))
         self.sock = socket.create_connection(("127.0.0.1", entry["port"]))
-        _frame(self.sock, {"protocol": "rinch-debug", "version": 1})
+        # rinch #2481: the discovery file's per-session token, which the app
+        # wants in the handshake (and only writes when started with
+        # RINCH_DEBUG=1).
+        hello = {"protocol": "rinch-debug", "version": 1}
+        if entry.get("token"):
+            hello["token"] = entry["token"]
+        _frame(self.sock, hello)
         _read(self.sock)
         self.next_id = 0
 

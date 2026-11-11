@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-10 (session 78e7f30f): v0.21.2 released from `master`; rinch `main` b969d01a in
+all three locks.**
+- **Header:** the search is a field in the header band, which shares one height
+  (`--pimble-header-height`) and color with the toolbar, so one line runs under both. A
+  pane alone has no focus strip; in a split view the focused pane shows a short accent
+  pad centered on its top edge (docs/SPLIT_VIEW_CONTRACT.md).
+- **rinch:** the debug interface is off unless the app starts with `RINCH_DEBUG=1`, and
+  a client needs the discovery file's token (#2481; `scripts/perf/rd.py` sends it);
+  Renderer::Auto declines a software GPU adapter (#2436); system fonts scanned once per
+  process (#2467); layout fixes.
+
 **2026-11-10 (session 78e7f30f): v0.21.1 released from `master`.**
 - **Explorer:** a metanode with no icon of its own shows its viewer's (a note turned into a
   kanban by `set_metanode` or "Show as ..." looks like one made with New > Kanban;
