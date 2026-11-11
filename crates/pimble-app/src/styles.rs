@@ -904,14 +904,30 @@ pub(crate) const APP_CSS: &str = "
     padding: 0 6px 0 12px;
     font-size: 12px;
     color: var(--rinch-color-dimmed);
-    border-top: 2px solid var(--rinch-color-border);
+    /* Room for the focus pad; the lines between panes are the slots' own. */
+    border-top: 2px solid transparent;
+    position: relative;
     user-select: none;
 }
 
-/* The focused pane's strip carries the accent color. */
-.pimble-pane--focused > .pimble-pane__title {
+/* The focus pad: when the view is split, the focused pane (the one the
+   toolbar acts on) shows a short accent mark centered on its top edge. */
+.pimble-pane__focus {
+    display: none;
+    position: absolute;
+    top: -2px;
+    left: calc(50% - 24px);
+    width: 48px;
+    height: 3px;
+    border-radius: 0 0 3px 3px;
+    background: var(--rinch-primary-color);
+}
+.pimble-pane--focused > .pimble-pane__title > .pimble-pane__focus {
+    display: block;
+}
+.pimble-pane--focused > .pimble-pane__title,
+.pimble-pane--alone > .pimble-pane__title {
     color: var(--rinch-color-text);
-    border-top-color: var(--rinch-primary-color);
 }
 
 .pimble-pane__icon {
@@ -2778,9 +2794,25 @@ pub(crate) const APP_CSS: &str = "
        the panes' top line. */
     box-sizing: border-box;
     height: var(--pimble-header-height);
-    padding: 0 12px;
+    padding: 0 8px;
     background: var(--rinch-color-surface);
     flex-shrink: 0;
+}
+
+/* The search field in the band: the page's darker background, a border and
+   rounded corners, so it reads as an input. */
+.pimble-search-bar__field {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-sizing: border-box;
+    height: 30px;
+    padding: 0 8px 0 10px;
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 6px;
 }
 
 .pimble-search-bar__icon {

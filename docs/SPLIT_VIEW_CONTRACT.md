@@ -29,8 +29,10 @@ a line marked "As built".
   to bottom: a **title strip** (the document's icon and title, then "split right", "split
   down" and "close" buttons), the read-only sentence when its document is one this device
   may only read, and its document. A pane with no document shows the empty state the single pane shows today.
-- One pane is **focused**: the one last clicked in or opened into. Its title strip carries
-  the accent colour. The tree's selected row is the focused pane's document. Everything
+- One pane is **focused**: the one last clicked in or opened into. When the view is
+  split, a short accent pad centered on its top edge says so (Joe, 2026-11-10: a
+  full-width bar read as heavy; a pane alone shows none, as it is always the focused
+  one). The tree's selected row is the focused pane's document. Everything
   that today acts on "the editor" acts on the focused pane: a click in the tree, a search
   result, the Edit menu, the link picker, Copy Link to Here.
 - **Splitting** (a title-strip button, or View > "Split Right" / "Split Down") halves the

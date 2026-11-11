@@ -2663,18 +2663,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let search_bar = rsx! {
             div {
                 class: "pimble-search-bar",
-                span { class: "pimble-search-bar__icon", {search_icon} }
-                {search_input}
-                if !store.search_query.get().is_empty() {
-                    div {
-                        title: "Clear the search",
-                        style: "display: inline-flex;",
-                        ActionIcon {
-                            icon: TablerIcon::X,
-                            variant: "subtle",
-                            size: "xs",
-                            class: "pimble-search-bar__clear",
-                            onclick: move || clear_search(store),
+                // The field itself, a box in the header band, so it reads as
+                // something to type in.
+                div {
+                    class: "pimble-search-bar__field",
+                    span { class: "pimble-search-bar__icon", {search_icon} }
+                    {search_input}
+                    if !store.search_query.get().is_empty() {
+                        div {
+                            title: "Clear the search",
+                            style: "display: inline-flex;",
+                            ActionIcon {
+                                icon: TablerIcon::X,
+                                variant: "subtle",
+                                size: "xs",
+                                class: "pimble-search-bar__clear",
+                                onclick: move || clear_search(store),
+                            }
                         }
                     }
                 }

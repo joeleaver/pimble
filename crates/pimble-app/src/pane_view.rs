@@ -389,7 +389,16 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     rsx! {
         div {
             class: {move || {
-                if store.focused_pane.get() == pane { "pimble-pane pimble-pane--focused" } else { "pimble-pane" }
+                // The focus strip says which pane the toolbar acts on, so it
+                // is drawn only when there is more than one.
+                let split = store.tiling.with(|tiling| tiling.len() > 1);
+                if !split {
+                    "pimble-pane pimble-pane--alone"
+                } else if store.focused_pane.get() == pane {
+                    "pimble-pane pimble-pane--focused"
+                } else {
+                    "pimble-pane"
+                }
             }},
             // Where the tiling puts it, in percent of the area; hidden when
             // the tiling does not show it. A pane right of or below another
@@ -438,6 +447,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
 
             div {
                 class: "pimble-pane__title",
+                // The focus pad: a short accent mark centered on the focused
+                // pane's top edge, drawn only when the view is split.
+                div { class: "pimble-pane__focus" }
                 span {
                     class: "pimble-pane__icon",
                     for (name, color) in pane_icon(store, pane) {
