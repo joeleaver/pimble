@@ -6,9 +6,12 @@ rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context me
 rinch never frees a discarded node (rinch#723). Fixed by:
 - **One explorer menu** (`ExplorerMenu`, `explorer_menu` in `app.rs`): a right press on a
   row aims it; one signal per flag, written only on change.
-- **rinch#2573** (approved, batching to main): a change under a tree row redraws that row's
-  list only. Every rinch dependency points at branch `perf/tree-row-children` until it
-  merges: point them back at `main` then (all three locks).
+- **rinch#2573** (on rinch main since 758adc72, with #2549, the scrollbar over an editor):
+  a change under a tree row redraws that row's list only. All three locks pin 758adc72.
+- **Search results**: a keyed list with live row text (201 -> 0 nodes for "note" -> "notes").
+- **Long notes** (measured, not fixed; rinch editor): a 180k-word note takes ~560 ms of
+  layout in one frame to open, ~17 ms per keystroke, and +95-120 MB per open that is never
+  freed until #723 PR 2 lands; a 30k-word note is fine.
 - **One embedding model per process** (`pimble_search::embed`), rhypedb fed plain vectors;
   rhypedb at 32a5b87. Indexes rebuild once on the schema change.
 - Measured, three stores, an agent making 150 notes: 0.21.2 558 MB -> 3,757 MB; this branch

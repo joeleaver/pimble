@@ -29,7 +29,7 @@ serde_json = "1"
 # inside a host that is not a browser. rinch gates its browser halves on
 # `target_os = "unknown"` (joeleaver/rinch#2088, merged 2026-11-02), so main
 # builds for wasip1 with no panicking stubs.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children", default-features = false, features = [
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
     "components",
     "theme",
 ] }
@@ -37,4 +37,4 @@ rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-ro
 [dev-dependencies]
 # rinch's headless document, to render the same component directly and through a
 # RemoteDocument and compare the trees.
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children", features = ["test-util"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }

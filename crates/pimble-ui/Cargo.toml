@@ -18,5 +18,5 @@ description = "Pimble's own rinch components with no app state: who is here, ico
 # own pinned revision of rinch main.
 [dependencies]
 pimble-core = { path = "../pimble-core" }
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children", default-features = false }
-rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children" }
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
