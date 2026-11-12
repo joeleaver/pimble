@@ -1012,6 +1012,59 @@ fn search_rows(store: AppStore, items: Vec<pimble_rpc::SearchResultItem>) -> Vec
     }).collect()
 }
 
+/// One search result row for `key`, its text read from the current results
+/// (`search_field`), so a keystroke that keeps it rewrites it in place.
+fn search_result_row(__scope: &mut RenderScope, store: AppStore, tree_state: UseTreeReturn, key: String) -> NodeHandle {
+    let value = format!("node_{key}");
+    let (k1, k2, k3, k4, k5) = (key.clone(), key.clone(), key.clone(), key.clone(), key);
+    rsx! {
+        div {
+            class: "pimble-search-result",
+            onclick: move || {
+                clear_search(store);
+                open_node(store, tree_state, value.clone());
+            },
+            div {
+                class: "pimble-search-result__title-row",
+                span { class: "pimble-search-result__title", {move || search_field(store, &k1, |r| r.title.clone())} }
+                span {
+                    class: "pimble-search-result__kind",
+                    style: {move || if search_field(store, &k2, |r| r.kind.to_string()).is_empty() { "display: none;" } else { "" }},
+                    {move || search_field(store, &k3, |r| r.kind.to_string())}
+                }
+            }
+            div { class: "pimble-search-result__store", {move || search_field(store, &k4, |r| r.store_name.clone())} }
+            div { class: "pimble-search-result__snippet", {move || search_field(store, &k5, |r| r.snippet.clone())} }
+        }
+    }
+}
+
+/// The keys of the search results shown now (`SearchRow::key`), in rank order.
+fn search_keys(store: AppStore) -> Vec<String> {
+    store.search_results.with(|state| match state {
+        SearchState::Results(items) => items.iter().map(|i| format!("{}_{}", i.store_id, i.node_id)).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// One field of the result row `key`, read from the current results.
+fn search_field(store: AppStore, key: &str, pick: fn(&SearchRow) -> String) -> String {
+    let item = store.search_results.with(|state| match state {
+        SearchState::Results(items) => items.iter().find(|i| format!("{}_{}", i.store_id, i.node_id) == key).cloned(),
+        _ => None,
+    });
+    item.map(|item| search_rows(store, vec![item]).first().map(pick).unwrap_or_default()).unwrap_or_default()
+}
+
+/// What the search panel says in place of a list, if anything.
+fn search_message(store: AppStore) -> String {
+    store.search_results.with(|state| match state {
+        SearchState::Error(message) => message.clone(),
+        SearchState::Results(items) if items.is_empty() => "No results".to_string(),
+        _ => String::new(),
+    })
+}
+
 /// A subtle, human-readable label for a search hit's `kind` (the index unit
 /// kind the hit's chunk carries: prose, a heading, code, a table row, or a
 /// structured field). Empty or unrecognized kinds render nothing.
@@ -2745,37 +2798,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let search_panel = rsx! {
             div {
                 class: "pimble-search-results",
-                match store.search_results.get() {
-                    SearchState::Idle => "",
-                    SearchState::Error(_message) => div {
-                        class: "pimble-search-results__message", {_message}
-                    },
-                    SearchState::Results(items) if items.is_empty() => div {
-                        class: "pimble-search-results__message", "No results"
-                    },
-                    SearchState::Results(_items) => div {
-                        for row in search_rows(store, _items.clone()) {
-                            div {
-                                key: row.key.clone(),
-                                class: "pimble-search-result",
-                                onclick: {
-                                    let value = row.value.clone();
-                                    move || {
-                                        clear_search(store);
-                                        open_node(store, tree_state, value.clone());
-                                    }
-                                },
-                                div {
-                                    class: "pimble-search-result__title-row",
-                                    span { class: "pimble-search-result__title", {row.title.clone()} }
-                                    if !row.kind.is_empty() {
-                                        span { class: "pimble-search-result__kind", {row.kind} }
-                                    }
-                                }
-                                div { class: "pimble-search-result__store", {row.store_name.clone()} }
-                                div { class: "pimble-search-result__snippet", {row.snippet.clone()} }
-                            }
-                        }
+                // What the panel says when it has no list: an error, or that
+                // nothing matched.
+                div {
+                    class: "pimble-search-results__message",
+                    style: {move || if search_message(store).is_empty() { "display: none;" } else { "" }},
+                    {move || search_message(store)}
+                }
+                // The results, keyed by node, and each row's text read from
+                // the current results: a keystroke that keeps a note among
+                // the results rewrites its title and snippet in place, and
+                // only a note that newly appears is built (2026-11-12: the
+                // whole list was rebuilt on every change, about 200 DOM nodes
+                // a keystroke).
+                for key in search_keys(store) {
+                    div {
+                        key: key.clone(),
+                        style: "display: contents;",
+                        {search_result_row(__scope, store, tree_state, key.clone())}
                     }
                 }
             }
