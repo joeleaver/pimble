@@ -1,7 +1,7 @@
 # Next session: start here
 
-**2026-11-12 (session 78e7f30f): the window's memory growth, branch `perf/rebuilds`, not
-merged or released.** Joe's window reached 5 GB while an agent wrote notes: every note
+**2026-11-12 (session 78e7f30f): v0.22.0 released from `master`: the window's memory
+growth fixed.** Joe's window reached 5 GB while an agent wrote notes: every note
 rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context menu), and
 rinch never frees a discarded node (rinch#723). Fixed by:
 - **One explorer menu** (`ExplorerMenu`, `explorer_menu` in `app.rs`): a right press on a
