@@ -857,7 +857,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -874,7 +874,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -1692,7 +1692,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1898,7 +1898,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4200,7 +4200,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5861,7 +5861,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6345,7 +6345,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-authz"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -6358,7 +6358,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-client"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "rhypedb-subscribe",
  "rhypedb-wire",
@@ -6372,17 +6372,18 @@ dependencies = [
 [[package]]
 name = "rhypedb-embed"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "fastembed",
  "hf-hub",
+ "ort",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "rhypedb-engine"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -6406,7 +6407,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-query"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "bytes",
  "rhypedb-authz",
@@ -6419,7 +6420,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-schema"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -6427,7 +6428,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-storage"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "ahash",
  "bytes",
@@ -6447,7 +6448,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-subscribe"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "parking_lot",
  "serde",
@@ -6457,7 +6458,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-vector"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "boxcar",
  "parking_lot",
@@ -6468,7 +6469,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-wire"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#32a5b87d24abd06aac63b537be37e580a0d796d5"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6871,7 +6872,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7427,7 +7428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7890,7 +7891,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9777,7 +9778,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
