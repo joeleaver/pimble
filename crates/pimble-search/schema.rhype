@@ -35,7 +35,9 @@ type Node {
 // semantic:     hash: String
 // semantic:     text: String
 // semantic:     source: String
-// semantic:     embedding: Vector<384> @vectorize(source: "source", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine)
+// semantic:     // Embedded by pimble-search itself (`crate::embed`, one model for the
+// semantic:     // process), never by rhypedb: no `@vectorize`, so no store loads a model.
+// semantic:     embedding: Vector<384> @index(hnsw, metric: cosine)
 // semantic: }
 
 type Tag {

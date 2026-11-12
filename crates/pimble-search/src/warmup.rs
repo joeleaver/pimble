@@ -80,17 +80,14 @@ pub(crate) fn model_cache_dir() -> Option<PathBuf> {
 pub fn warm_embedding_model(model: &str) -> Result<Duration> {
     #[cfg(feature = "semantic")]
     {
-        use rhypedb_embed::{EmbedOptions, Embedder, FastEmbedder};
-        let options = EmbedOptions {
-            cache_dir: model_cache_dir(),
-            ..EmbedOptions::default()
-        };
+        // The process's one model (`crate::embed`), loaded now and kept: every
+        // store's index embeds with it.
+        if model != crate::embed::MODEL {
+            return Err(crate::error::SearchError::Embedding(format!("only {} is supported, not {model}", crate::embed::MODEL)));
+        }
         let start = std::time::Instant::now();
-        let mut embedder = FastEmbedder::with_options(model, &options)
-            .map_err(|e| crate::error::SearchError::Embedding(e.to_string()))?;
-        embedder
-            .embed(&["warm up"])
-            .map_err(|e| crate::error::SearchError::Embedding(e.to_string()))?;
+        crate::embed::load()?;
+        crate::embed::embed_query("warm up")?;
         Ok(start.elapsed())
     }
     #[cfg(not(feature = "semantic"))]

@@ -182,15 +182,18 @@ fn removing_a_node_drops_its_chunks() {
 /// target node, and a second hybrid query that leans on a keyword only one
 /// node contains.
 ///
-/// `SearchIndex::open` already starts a background worker
-/// (`Vectorizer::start_worker(1)`) that races this thread to claim embedding
-/// jobs, so a single `process_pending_embeddings` returning 0 does not prove
-/// embedding is finished — it may just mean the worker claimed the batch
-/// first and is still loading the model. So the readiness loop below treats
-/// "the cameras query returns all three nodes" (there are exactly three
-/// chunks, one per node) as the actual done signal, while still calling
-/// `process_pending_embeddings` on every iteration so this thread pulls its
-/// weight if the worker hasn't started yet.
+/// The process's embedding worker (`pimble_search::embed`) races this thread
+/// to claim queued chunks, so a single `process_pending_embeddings` returning
+/// 0 does not prove embedding is finished: the worker may hold the batch. So
+/// the readiness loop below waits for the cameras node to come back as a
+/// semantic (chunk) hit, calling `process_pending_embeddings` on every
+/// iteration so this thread pulls its weight too.
+///
+/// Only the cameras node is a semantic hit: the pasta and taxes chunks sit
+/// near 0.95 cosine distance from the query, past `SEMANTIC_MAX_DISTANCE`
+/// (0.65), and the query shares no word with them, so neither comes back.
+/// (Until 2026-11-12 this test expected all three nodes, which the cutoff
+/// added in b79c2c3 had made impossible; being `#[ignore]`d, nobody saw.)
 ///
 /// Two non-obvious ways this test can fail even when semantic search itself
 /// is fine, both hit while writing it:
@@ -277,27 +280,25 @@ fn semantic_search_finds_the_topically_matching_node() {
     loop {
         index.process_pending_embeddings().unwrap();
         let hits = index.search(&cameras_query).unwrap();
-        if hits.len() >= 3 {
+        if hits.first().is_some_and(|h| h.node_id == cameras && h.kind != "node") {
             indexing_elapsed = start.elapsed();
             break;
         }
         assert!(
             start.elapsed() < timeout,
-            "embeddings for all three nodes did not become ready within 5 minutes \
-             (only {} of 3 nodes indexed so far)",
-            hits.len()
+            "the cameras chunk was not embedded and found within 5 minutes: {hits:?}"
         );
         thread::sleep(Duration::from_millis(500));
     }
     // The model was already warmed up above, so this is chunking + embedding
     // + HNSW-indexing three short chunks, not a model load.
     eprintln!(
-        "all three chunks embedded and searchable {:.2}s after upsert",
+        "the cameras chunk embedded and found {:.2}s after upsert",
         indexing_elapsed.as_secs_f64()
     );
 
     let hits = index.search(&cameras_query).unwrap();
-    assert_eq!(hits.len(), 3, "expected one hit per node: {hits:?}");
+    assert_eq!(hits.len(), 1, "only the cameras node is a real match: {hits:?}");
     assert_eq!(
         hits[0].node_id, cameras,
         "top hit for a surveillance query should be the cameras node: {hits:?}"

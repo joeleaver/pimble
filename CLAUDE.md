@@ -98,7 +98,11 @@ it in-process from the same places it broadcasts change notifications, with a 2s
 debounce on content. Nodes index `title` and `text` with `@fulltext`. Semantic search is
 on by default in `pimble-app` (`onnx-download`: the ONNX runtime is linked statically,
 the int8 `all-MiniLM-L6-v2` model downloads once into the user's data dir under
-`pimble/models`, and the server warms it before any store opens; if that fails the app
+`pimble/models`, and the server warms it before any store opens; it is loaded ONCE per process
+(`pimble_search::embed`: one model, one worker in batches of 8 that steps aside for a query;
+rhypedb is handed plain vectors, `ingest_vectors`/`search_vector`, and its schema has no
+`@vectorize`, so no store loads a model; before 2026-11-12 every open store loaded its own,
+about 600 MB each); if that fails the app
 runs keyword-only). Measured on the 674-node family store after rhypedb #18: model ready
 in about 4 s, peak 767 MB resident, UI responsive during the backfill. Content is chunked (about 200 words, block-aligned, heading context, per-chunk
 hash so an edit re-embeds one chunk) into `Chunk` objects with `all-MiniLM-L6-v2`

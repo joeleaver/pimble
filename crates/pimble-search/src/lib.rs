@@ -9,6 +9,7 @@
 //! See `docs/STEP5_CONTRACT.md` for the design this crate implements.
 
 pub mod chunk;
+pub mod embed;
 pub mod error;
 pub mod index;
 pub mod query;

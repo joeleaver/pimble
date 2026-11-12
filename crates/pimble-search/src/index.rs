@@ -9,7 +9,7 @@ use std::sync::Arc;
 use pimble_core::{IndexUnit, NodeId};
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{FieldMap, Object, Value};
-use rhypedb_engine::vectorizer::{CrossEncoder, SimilarHit, VectorizeJob, Vectorizer, VectorizerConfig};
+use rhypedb_engine::vectorizer::{CrossEncoder, SimilarHit, Vectorizer, VectorizerConfig};
 use rhypedb_engine::EngineError;
 use rhypedb_schema::parser::parse_schema;
 
@@ -61,6 +61,9 @@ pub struct IndexNode {
 pub struct SearchIndex {
     db: Arc<Database>,
     vectorizer: Option<Arc<Vectorizer>>,
+    /// This index's chunks waiting for the process's one embedding model
+    /// (`crate::embed`); `Some` exactly when `vectorizer` is.
+    pending: Option<Arc<crate::embed::Pending>>,
     /// Set once `search`'s hybrid path has logged a `ModelUnavailable`
     /// degrade-to-keyword-only warning, so a run of hybrid queries while the
     /// model is down (never warmed up, still downloading, or in load-retry
@@ -107,16 +110,25 @@ impl SearchIndex {
                 config,
             )
             .map_err(map_engine_err)?;
-            let v = Arc::new(v);
-            v.start_worker(1);
-            Some(v)
+            // No worker and no model here: the vectorizer only holds this
+            // store's vector index, and `crate::embed` fills it.
+            Some(Arc::new(v))
         } else {
             None
         };
+        let pending = vectorizer.as_ref().map(|v| {
+            let v = Arc::clone(v);
+            crate::embed::Pending::register(move |rows| {
+                if let Err(e) = v.ingest_vectors("Chunk", "embedding", rows) {
+                    tracing::warn!("storing {} chunk embeddings failed: {e}", rows.len());
+                }
+            })
+        });
 
         Ok(Self {
             db,
             vectorizer,
+            pending,
             model_unavailable_warned: AtomicBool::new(false),
         })
     }
@@ -134,8 +146,8 @@ impl SearchIndex {
     /// caller that wants an upsert's embeddings ready before it returns). A
     /// no-op (`Ok(0)`) without semantic search.
     pub fn process_pending_embeddings(&self) -> Result<usize> {
-        match &self.vectorizer {
-            Some(v) => v.process_pending().map_err(map_engine_err),
+        match &self.pending {
+            Some(p) => p.drain(),
             None => Ok(0),
         }
     }
@@ -423,8 +435,8 @@ impl SearchIndex {
                     fields.insert("text".to_string(), Value::String(spec.text.clone()));
                     fields.insert("source".to_string(), Value::String(spec.source.clone()));
                     fields.insert("hash".to_string(), Value::String(spec.hash.clone()));
-                    let obj = self.db.update("Chunk", *chunk_id, fields).map_err(map_engine_err)?;
-                    self.enqueue_vectorize(&obj);
+                    self.db.update("Chunk", *chunk_id, fields).map_err(map_engine_err)?;
+                    self.enqueue_embedding(*chunk_id, &spec.source);
                 }
                 None => {
                     let mut fields = FieldMap::new();
@@ -442,7 +454,7 @@ impl SearchIndex {
                     self.db
                         .link("Chunk", obj.id, "node", node_object_id, None)
                         .map_err(map_engine_err)?;
-                    self.enqueue_vectorize(&obj);
+                    self.enqueue_embedding(obj.id, &spec.source);
                 }
             }
         }
@@ -456,26 +468,12 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Mirrors `rhypedb-server`'s own `enqueue_vectorize`: queue a background
-    /// embedding job for every `@vectorize` field on `obj`'s type. A no-op
-    /// without a live vectorizer.
-    fn enqueue_vectorize(&self, obj: &Object) {
-        let Some(vectorizer) = &self.vectorizer else {
-            return;
-        };
-        let schema = self.db.schema();
-        if let Some(type_def) = schema.get_type(&obj.type_name) {
-            for field in &type_def.fields {
-                if let Some(vec_def) = field.vectorize() {
-                    let _ = vectorizer.enqueue(VectorizeJob {
-                        type_name: obj.type_name.clone(),
-                        object_id: obj.id,
-                        source_field: vec_def.source_field.clone(),
-                        vector_field: field.name.clone(),
-                        model: vec_def.model.clone(),
-                    });
-                }
-            }
+    /// Queue a chunk's text for the process's embedding model
+    /// (`crate::embed`), whose worker stores the vector in this index. A no-op
+    /// without semantic search.
+    fn enqueue_embedding(&self, chunk_object_id: u64, source: &str) {
+        if let Some(pending) = &self.pending {
+            pending.push(chunk_object_id, source.to_string());
         }
     }
 
@@ -561,8 +559,10 @@ impl SearchIndex {
         // `SearchError::ModelUnavailable` below) rather than blocking if the
         // model hasn't loaded yet; `search`'s caller degrades to
         // keyword-only on that specific error.
+        // The query is embedded once for every store's index (`crate::embed`).
+        let query_vec = crate::embed::embed_query(query_text)?;
         let candidates = vectorizer
-            .search_text("Chunk", "embedding", query_text, k, ef, false, None)
+            .search_vector("Chunk", "embedding", &query_vec, k, ef, false, None)
             .map_err(map_engine_err)?;
         // Drop anything too far to count as a real match before grouping by
         // node, so a query with no real semantic match in the index yields
