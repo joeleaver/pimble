@@ -1,5 +1,22 @@
 # Next session: start here
 
+**2026-11-12 (session 78e7f30f): the window's memory growth, branch `perf/rebuilds`, not
+merged or released.** Joe's window reached 5 GB while an agent wrote notes: every note
+rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context menu), and
+rinch never frees a discarded node (rinch#723). Fixed by:
+- **One explorer menu** (`ExplorerMenu`, `explorer_menu` in `app.rs`): a right press on a
+  row aims it; one signal per flag, written only on change.
+- **rinch#2573** (approved, batching to main): a change under a tree row redraws that row's
+  list only. Every rinch dependency points at branch `perf/tree-row-children` until it
+  merges: point them back at `main` then (all three locks).
+- **One embedding model per process** (`pimble_search::embed`), rhypedb fed plain vectors;
+  rhypedb at 32a5b87. Indexes rebuild once on the schema change.
+- Measured, three stores, an agent making 150 notes: 0.21.2 558 MB -> 3,757 MB; this branch
+  534 MB -> 554 MB. DOM nodes per agent-made note 3,773 -> 43 (`scripts/perf`, a node
+  counter added to a scratch rinch).
+- Open: rinch#723 PR 2 (free discarded nodes; proposed as its own session); a menu switching
+  between store and node rows rebuilds that kind's items (about 240 nodes, right-click only).
+
 **2026-11-10 (session 78e7f30f): v0.21.2 released from `master`; rinch `main` b969d01a in
 all three locks.**
 - **Header:** the search is a field in the header band, which shares one height
