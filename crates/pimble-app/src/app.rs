@@ -1142,6 +1142,624 @@ fn sync_badge_text(
 /// Walk the DOM subtree to find a `data-oncontextmenu` handler and copy it
 /// to `target`. Used to hoist the context menu handler from the invisible
 /// ContextMenuTarget (display:contents) to a visible wrapper div.
+/// The kind of explorer row a context menu is open on: each kind has its own
+/// list of items (docs/MENUS_CONTRACT.md section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RowKind {
+    #[default]
+    None,
+    Store,
+    Mount,
+    Node,
+}
+
+impl RowKind {
+    fn of(store: AppStore, value: &str) -> RowKind {
+        if value.starts_with("store_") {
+            return RowKind::Store;
+        }
+        match parse_tree_value(value) {
+            Some((s_id, Some(n_id))) if store.is_mount(s_id, n_id) => RowKind::Mount,
+            Some((_, Some(_))) => RowKind::Node,
+            _ => RowKind::None,
+        }
+    }
+}
+
+/// The explorer's one context menu: which row it is aimed at, that row's kind,
+/// and what the menu's items need of the row, one signal each. A right press
+/// on a row aims it; the menu, built once for the whole tree
+/// (`explorer_menu`), reads only those signals. Each is written only when its
+/// value changes, so aiming the menu at another row of the same kind touches
+/// just the items whose state differs. Before 2026-11-12 every row built a
+/// whole menu of its own, about 500 DOM nodes a row, and every change to the
+/// tree's shape rebuilt them all.
+#[derive(Clone, Copy)]
+struct ExplorerMenu {
+    row: Signal<Option<String>>,
+    kind: Signal<RowKind>,
+    note: Signal<String>,
+    /// Which of a store row's items are off (`Capabilities::store_row_menu`).
+    store_menu: Signal<Option<pimble_core::plan::StoreRowMenu>>,
+    can_write_tree: Signal<bool>,
+    can_write_mount_source: Signal<bool>,
+    can_comment: Signal<bool>,
+    share_disabled: Signal<bool>,
+    mounts_apply: Signal<bool>,
+    cut_off: Signal<bool>,
+    paste_off: Signal<bool>,
+    delete_off: Signal<bool>,
+    /// How many rows the menu acts on: the selection when the row is one of
+    /// several selected rows (docs/TREE_CONTRACT.md "Multi-select").
+    acts_on: Signal<usize>,
+}
+
+/// Write `value` into `signal` only when it differs, so its readers hear only
+/// of real changes.
+fn put<T: PartialEq + Clone + 'static>(signal: Signal<T>, value: T) {
+    if untracked(|| signal.get()) != value {
+        signal.set(value);
+    }
+}
+
+impl ExplorerMenu {
+    fn new() -> Self {
+        ExplorerMenu {
+            row: Signal::new(None),
+            kind: Signal::new(RowKind::None),
+            note: Signal::new(String::new()),
+            store_menu: Signal::new(None),
+            can_write_tree: Signal::new(false),
+            can_write_mount_source: Signal::new(false),
+            can_comment: Signal::new(false),
+            share_disabled: Signal::new(true),
+            mounts_apply: Signal::new(true),
+            cut_off: Signal::new(true),
+            paste_off: Signal::new(true),
+            delete_off: Signal::new(true),
+            acts_on: Signal::new(1),
+        }
+    }
+
+    /// Aim the menu at `row` (or at no row: a press on the tree's empty
+    /// space), judging the row now, as each row's menu once judged it when the
+    /// row rendered.
+    fn aim(self, store: AppStore, tree_state: UseTreeReturn, row: Option<String>) {
+        use pimble_core::plan::FoundRowAction as Fra;
+        let value = row.clone().unwrap_or_default();
+        let kind = row.as_deref().map_or(RowKind::None, |value| RowKind::of(store, value));
+        let judged = untracked(|| RowMenu::of(store, &value));
+        let acts_on = untracked(|| tree_state.selected.with(|s| if s.contains(&value) { s.len().max(1) } else { 1 }));
+        put(self.kind, kind);
+        put(self.row, row);
+        put(self.note, if kind == RowKind::Mount { judged.mount_note.clone() } else { judged.note.clone() });
+        put(self.store_menu, (kind == RowKind::Store).then_some(judged.store_menu));
+        put(self.can_write_tree, judged.can_write_tree);
+        put(self.can_write_mount_source, judged.can_write_mount_source);
+        put(self.can_comment, judged.can_comment);
+        put(self.share_disabled, judged.share_disabled || acts_on > 1);
+        put(self.mounts_apply, judged.mounts_apply);
+        put(self.cut_off, !judged.can_write_tree || !judged.allows(Fra::Cut));
+        put(self.paste_off, !judged.can_write_tree || !judged.allows(Fra::PasteInto));
+        put(self.delete_off, !judged.can_write_tree || !judged.allows(Fra::Delete));
+        put(self.acts_on, acts_on);
+    }
+
+    /// The row the menu is aimed at, read without subscribing (for actions).
+    fn target(self) -> String {
+        untracked(|| self.row.get()).unwrap_or_default()
+    }
+
+    /// A store row's item switch, read reactively.
+    fn store_off(self, pick: fn(&pimble_core::plan::StoreRowMenu) -> bool) -> bool {
+        self.store_menu.with(|m| m.as_ref().map_or(true, pick))
+    }
+}
+
+/// What may be done with the row a menu is open on
+/// (`pimble_core::plan::capabilities`, one rule for every menu): what this
+/// device may change of the row's node (docs/NODE_DOCUMENT_CONTRACT.md section
+/// 5, "Roles"), judged per node because one store can hold a root this
+/// account reads beside a root it edits; a store row asks about the store.
+/// `parse_tree_value` returns the CANONICAL pair, so a node reached through a
+/// mount is judged as the node it is in its source store.
+#[derive(Clone)]
+struct RowMenu {
+    /// Which of a store row's items are off (`Capabilities::store_row_menu`).
+    store_menu: pimble_core::plan::StoreRowMenu,
+    /// The one dimmed line at the top saying why items are off, if any are.
+    note: String,
+    /// A mount's own top line.
+    mount_note: String,
+    can_write_tree: bool,
+    /// A mount's "New" makes in the mount's SOURCE node, so that node's
+    /// access governs that one item.
+    can_write_mount_source: bool,
+    can_comment: bool,
+    share_disabled: bool,
+    /// Mounts do not exist in an encrypted store (the server has no tree there).
+    mounts_apply: bool,
+    /// A row a query metanode found: its place is not changed from here.
+    found: bool,
+}
+
+impl RowMenu {
+    fn of(store: AppStore, value: &str) -> RowMenu {
+        let parsed = parse_tree_value(value);
+        let is_store_root = value.starts_with("store_");
+        let is_mount = !is_store_root && matches!(parsed, Some((s_id, Some(n_id))) if store.is_mount(s_id, n_id));
+        let found = crate::state::found_row(value);
+        let caps = parsed
+            .map(|(s_id, n_id)| pimble_core::plan::capabilities(&store.view(), s_id, n_id))
+            .unwrap_or_default();
+        let can_write_tree = caps.writable();
+        let can_write_mount_source = match parsed {
+            Some((s_id, Some(n_id))) if is_mount => store
+                .get_mount_signal(s_id, n_id)
+                .and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node))))
+                .map_or(can_write_tree, |(source_store, source_node)| store.node_access(source_store, source_node).allows_write()),
+            _ => can_write_tree,
+        };
+        // A browser build has none of these items to explain.
+        let relayed_note = if CAN_ADMINISTER_STORES && is_store_root { caps.relayed_note() } else { "" };
+        let share_note = if CAN_ADMINISTER_STORES { caps.share_note() } else { "" };
+        let access_note = crate::state::access_note(caps.access);
+        let found_note = found.as_ref().map(|f| f.refusal.clone()).unwrap_or_default();
+        let note = if is_store_root && caps.every_share_ended {
+            crate::state::ENDED_REPLICA_NOTE.to_string()
+        } else {
+            crate::state::menu_note_text(&[found_note.as_str(), access_note, share_note, relayed_note])
+        };
+        RowMenu {
+            store_menu: caps.store_row_menu(false),
+            note,
+            mount_note: crate::state::menu_note_text(&[access_note, MOUNT_NOTE]),
+            can_write_tree,
+            can_write_mount_source,
+            can_comment: caps.access.allows_comment(),
+            share_disabled: !caps.can_share(),
+            mounts_apply: parsed.map_or(true, |(s_id, _)| !store.is_vault(s_id)),
+            found: found.is_some(),
+        }
+    }
+
+    /// What a found row allows (`pimble_core::plan::FoundRowAction`, one rule
+    /// for the explorer, plugins and the MCP).
+    fn allows(&self, action: pimble_core::plan::FoundRowAction) -> bool {
+        !self.found || action.allowed()
+    }
+}
+
+/// The explorer's one context menu around `tree` (`ExplorerMenu`): one list of
+/// items per kind of row (docs/MENUS_CONTRACT.md section 3: grouped, what
+/// cannot apply left out), each kind's built the first time the menu opens on
+/// it. What varies from row to row is read reactively from the aim.
+fn explorer_menu(
+    __scope: &mut RenderScope,
+    store: AppStore,
+    tree_state: UseTreeReturn,
+    menu: ExplorerMenu,
+    tree: NodeHandle,
+) -> NodeHandle {
+    let row = move || menu.target();
+    let parsed = move || parse_tree_value(&row());
+    let store_of = move || parsed().map(|(s_id, _)| s_id);
+    // The node a store row stands for is its root.
+    let node_of = move || parsed().and_then(|(s_id, n_id)| n_id.or_else(|| store.root_node_id(s_id)).map(|n| (s_id, n)));
+
+    // With several rows selected and this one among them, the menu acts on
+    // all of them where that makes sense (Delete, Cut, Copy) and turns off
+    // what is for one row alone (docs/TREE_CONTRACT.md "Multi-select").
+    let several = move || menu.acts_on.get() > 1;
+
+    let on_start_discussion = move || {
+        if let Some((s_id, Some(n_id))) = parsed() {
+            crate::discussions::start_on(store, store.focused(), s_id, n_id);
+        }
+    };
+    let on_cut = move || {
+        let rows: Vec<String> = rows_for_menu(tree_state, &row()).into_iter().filter(|v| matches!(parse_tree_value(v), Some((_, Some(_))))).collect();
+        if !rows.is_empty() {
+            crate::tree_keys::set_cut(store, rows);
+        }
+    };
+    let on_copy = move || copy_rows(store, &rows_for_menu(tree_state, &row()));
+    let on_paste = move || crate::pasting::paste(store, &row());
+    let on_close_store = move || {
+        if let Some(s_id) = store_of() {
+            store.send(BackendCommand::CloseStore { store_id: s_id });
+        }
+    };
+    let on_link_to_remote = move || {
+        if let Some(s_id) = store_of() {
+            store.link_modal_store.set(Some(s_id));
+            store.link_modal_url.set(String::new());
+            store.link_modal_token.set(String::new());
+            store.link_modal_token_visible.set(false);
+            store.link_modal_error.set(String::new());
+        }
+    };
+    let on_unlink_from_remote = move || {
+        if let Some(s_id) = store_of() {
+            store.send(BackendCommand::SetStoreSync { store_id: s_id, remote: None });
+        }
+    };
+    let on_host_on_cloud = move || {
+        if let Some(s_id) = store_of() {
+            // Hosting asked for on its own is not on the way to sharing anything.
+            store.share_after_host.set(None);
+            open_host_modal(store, s_id);
+        }
+    };
+    let on_stop_relaying = move || {
+        if let Some(s_id) = store_of() {
+            open_stop_relay_modal(store, s_id);
+        }
+    };
+    // "Share...": grant people a scope on this store rooted at this node (a
+    // store row shares its root node), so they hold the same documents and
+    // co-author them (docs/NODE_DOCUMENT_CONTRACT.md section 5). Never off for
+    // a store that is not hosted: the modal opens on the two ways to give the
+    // share somewhere to live (docs/RELAY_CONTRACT.md).
+    let on_share = move || {
+        if let Some((s_id, n_id)) = node_of() {
+            open_share_modal(store, s_id, n_id);
+        }
+    };
+    let on_remove_replica = move || {
+        if let Some(s_id) = store_of() {
+            store.remove_replica_modal_store.set(Some(s_id));
+            store.remove_replica_modal_error.set(String::new());
+            store.remove_replica_modal_pending.set(false);
+        }
+    };
+    let on_recently_deleted = move || {
+        if let Some(s_id) = store_of() {
+            open_deleted_modal(store, s_id);
+        }
+    };
+    let on_mount_store = move || {
+        if let Some((s_id, pid)) = node_of() {
+            #[cfg(feature = "native")]
+            {
+                let dialog = rinch::dialogs::pick_folder().set_title("Select Store to Mount");
+                if let Some(path) = dialog.pick() {
+                    let path_str = path.to_string_lossy().to_string();
+                    tracing::info!("Mounting store from: {} into {:?}", path_str, s_id);
+                    store.send(BackendCommand::OpenStore { path: path_str.clone() });
+                    store.pending_mount.set(Some(PendingMount {
+                        target_store_id: s_id,
+                        target_parent_id: pid,
+                        source_path: path_str,
+                    }));
+                }
+            }
+            // A browser has no directories to offer, so it picks from the
+            // stores the account already grants. The RPC either way is
+            // `createMount`, which an editor may call.
+            #[cfg(not(feature = "native"))]
+            open_mount_picker(store, (s_id, pid));
+        }
+    };
+    // "Mount Remote Store Here...": the connect modal in mount mode with this
+    // row's canonical target (a store root's target is its own root node).
+    let on_mount_remote_store = move || {
+        if let Some(target) = crate::tree_view::create_parent_of_row(store, &row()) {
+            open_connect_modal(store, Some(target));
+        }
+    };
+    // The rows the menu acts on, all or none (`pimble_core::plan::can_delete`).
+    let on_delete = move || {
+        let Some(nodes) = crate::tree_view::deletable(store, &rows_for_menu(tree_state, &row())) else { return };
+        for (s_id, n_id) in nodes {
+            store.send(BackendCommand::DeleteNode { store_id: s_id, node_id: n_id });
+        }
+    };
+    // "Appearance...": the icon, color and tags picker for this node (a store
+    // row edits its root node).
+    let on_appearance = move || {
+        if let Some((s_id, n_id)) = node_of() {
+            open_appearance_modal(store, s_id, n_id);
+        }
+    };
+    let on_rename = move || {
+        start_rename(store, tree_state, &row());
+    };
+    // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision 2): the
+    // focused pane is split to the right and this document opens in the new
+    // half. Off with four panes open.
+    let on_open_in_split = move || {
+        let focused = store.focused();
+        if let Some(new) = crate::pane_view::split_pane(store, focused, crate::panes::Direction::Right) {
+            open_node_in(store, tree_state, new, row());
+        }
+    };
+    // New: one list, `crate::creating`, made in the row (a mount's source).
+    let make = move |kind: &crate::creating::Kind| crate::creating::make_in_row(store, kind, &row());
+
+    let sync_applies = move || !menu.store_off(|s| s.link_to_remote && s.host && s.stop_relaying && s.unlink && s.remove_replica);
+
+    // Open only on a row: a right press on the tree's empty space aims the
+    // menu at none, and the menu closes before it is drawn.
+    let opened = Signal::new(false);
+    let _ = rinch::Effect::new(move || {
+        if opened.get() && menu.kind.get() == RowKind::None {
+            opened.set(false);
+        }
+    });
+
+    let target = tree.clone();
+    let menu_view = rsx! {
+        ContextMenu {
+            opened: opened,
+            ContextMenuTarget { {tree} }
+            ContextMenuDropdown {
+                div {
+                    class: "pimble-menu-note",
+                    style: {move || if menu.note.with(|n| n.is_empty()) { "display: none;" } else { "" }},
+                    {move || menu.note.get()}
+                }
+                if menu.kind.get() == RowKind::Store {
+                    DropdownMenuSub {
+                        label: "New",
+                        left_section: TablerIcon::Plus,
+                        disabled: {move || menu.store_off(|s| s.new_node)},
+                        for item in crate::creating::kinds(store) {
+                            DropdownMenuItem {
+                                key: item.label.clone(),
+                                left_section: item.icon,
+                                onclick: { let kind = item.kind.clone(); move || make(&kind) },
+                                {item.label.clone()}
+                            }
+                        }
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Copy,
+                        onclick: on_copy,
+                        "Copy"
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Clipboard,
+                        disabled: {move || menu.store_off(|s| s.new_node)},
+                        onclick: on_paste,
+                        "Paste"
+                    }
+                    DropdownMenuDivider {}
+                    if CAN_ADMINISTER_STORES {
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Share,
+                            disabled: {move || menu.store_off(|s| s.share)},
+                            onclick: on_share,
+                            "Share..."
+                        }
+                    }
+                    // How the store reaches other places: only what can apply
+                    // to it now (principle 2), in one submenu, left out when
+                    // nothing applies.
+                    if CAN_ADMINISTER_STORES && sync_applies() {
+                        DropdownMenuSub {
+                            label: "Sync",
+                            left_section: TablerIcon::Cloud,
+                            if !menu.store_off(|s| s.link_to_remote) {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Cloud,
+                                    onclick: on_link_to_remote,
+                                    "Link to Remote..."
+                                }
+                            }
+                            if !menu.store_off(|s| s.host) {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudUpload,
+                                    onclick: on_host_on_cloud,
+                                    "Host on Pimble Cloud..."
+                                }
+                            }
+                            if !menu.store_off(|s| s.stop_relaying) {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::ShareOff,
+                                    onclick: on_stop_relaying,
+                                    "Stop Sharing from This Computer..."
+                                }
+                            }
+                            if !menu.store_off(|s| s.unlink) {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Unlink,
+                                    onclick: on_unlink_from_remote,
+                                    "Unlink from Remote"
+                                }
+                            }
+                            if !menu.store_off(|s| s.remove_replica) {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Trash,
+                                    onclick: on_remove_replica,
+                                    "Remove Replica..."
+                                }
+                            }
+                        }
+                    }
+                    if menu.mounts_apply.get() || CAN_ADMINISTER_STORES {
+                        DropdownMenuSub {
+                            label: "Mount",
+                            left_section: TablerIcon::Link,
+                            if menu.mounts_apply.get() {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Link,
+                                    disabled: {move || menu.store_off(|s| s.mount_store)},
+                                    onclick: on_mount_store,
+                                    "Mount Store Here..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudDownload,
+                                    disabled: {move || menu.store_off(|s| s.mount_remote_store)},
+                                    onclick: on_mount_remote_store,
+                                    "Mount Remote Store Here..."
+                                }
+                            }
+                        }
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Palette,
+                        disabled: {move || menu.store_off(|s| s.appearance)},
+                        onclick: on_appearance,
+                        "Appearance..."
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::History,
+                        disabled: {move || menu.store_off(|s| s.recently_deleted)},
+                        onclick: on_recently_deleted,
+                        "Recently Deleted..."
+                    }
+                    if CAN_ADMINISTER_STORES {
+                        DropdownMenuDivider {}
+                        DropdownMenuItem {
+                            left_section: TablerIcon::X,
+                            onclick: on_close_store,
+                            "Close Store"
+                        }
+                    }
+                }
+                // New makes in the mount's source, never under the mount node
+                // itself (the server rejects a mount node as a parent).
+                if menu.kind.get() == RowKind::Mount {
+                    DropdownMenuSub {
+                        label: "New",
+                        left_section: TablerIcon::Plus,
+                        disabled: {move || !menu.can_write_mount_source.get()},
+                        for item in crate::creating::kinds(store) {
+                            DropdownMenuItem {
+                                key: item.label.clone(),
+                                left_section: item.icon,
+                                onclick: { let kind = item.kind.clone(); move || make(&kind) },
+                                {item.label.clone()}
+                            }
+                        }
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Palette,
+                        disabled: {move || !menu.can_write_tree.get()},
+                        onclick: on_appearance,
+                        "Appearance..."
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Trash,
+                        disabled: {move || !menu.can_write_tree.get()},
+                        onclick: on_delete,
+                        "Delete"
+                    }
+                }
+                if menu.kind.get() == RowKind::Node {
+                    DropdownMenuItem {
+                        left_section: TablerIcon::LayoutColumns,
+                        disabled: {move || several() || !store.tiling.with(|tiling| tiling.can_split())},
+                        onclick: on_open_in_split,
+                        "Open in Split View"
+                    }
+                    DropdownMenuSub {
+                        label: "New",
+                        left_section: TablerIcon::Plus,
+                        disabled: {move || !menu.can_write_tree.get()},
+                        for item in crate::creating::kinds(store) {
+                            DropdownMenuItem {
+                                key: item.label.clone(),
+                                left_section: item.icon,
+                                onclick: { let kind = item.kind.clone(); move || make(&kind) },
+                                {item.label.clone()}
+                            }
+                        }
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::MessagePlus,
+                        // A commenter's too (docs/DISCUSSIONS_CONTRACT.md section 7).
+                        disabled: {move || !menu.can_comment.get()},
+                        onclick: on_start_discussion,
+                        "Discuss"
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Edit,
+                        disabled: {move || !menu.can_write_tree.get() || several()},
+                        onclick: on_rename,
+                        "Rename"
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Palette,
+                        disabled: {move || !menu.can_write_tree.get()},
+                        onclick: on_appearance,
+                        "Appearance..."
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Scissors,
+                        disabled: {move || menu.cut_off.get()},
+                        onclick: on_cut,
+                        "Cut"
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Copy,
+                        onclick: on_copy,
+                        "Copy"
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Clipboard,
+                        disabled: {move || menu.paste_off.get() || several()},
+                        onclick: on_paste,
+                        "Paste"
+                    }
+                    if menu.mounts_apply.get() || CAN_ADMINISTER_STORES {
+                        DropdownMenuSub {
+                            label: "Mount",
+                            left_section: TablerIcon::Link,
+                            disabled: {move || menu.paste_off.get()},
+                            if menu.mounts_apply.get() {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Link,
+                                    onclick: on_mount_store,
+                                    "Mount Store Here..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudDownload,
+                                    onclick: on_mount_remote_store,
+                                    "Mount Remote Store Here..."
+                                }
+                            }
+                        }
+                    }
+                    if CAN_ADMINISTER_STORES {
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Share,
+                            disabled: {move || menu.share_disabled.get()},
+                            onclick: on_share,
+                            "Share..."
+                        }
+                    }
+                    DropdownMenuDivider {}
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Trash,
+                        disabled: {move || menu.delete_off.get()},
+                        onclick: on_delete,
+                        {move || match menu.acts_on.get() {
+                            1 => "Delete".to_string(),
+                            n => format!("Delete {n} Nodes"),
+                        }}
+                    }
+                }
+            }
+        }
+    };
+    // ContextMenu's own boxes are `display: contents`, invisible to the hit
+    // test: the tree's box carries the handler (hoisted from the target).
+    hoist_context_menu_handler(&menu_view, &target);
+    menu_view
+}
+
 fn hoist_context_menu_handler(from: &NodeHandle, target: &NodeHandle) {
     if let Some(handler_id) = find_context_menu_handler(from) {
         target.set_attribute("data-oncontextmenu", &handler_id);
@@ -1390,6 +2008,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 untracked(|| store.build_tree_data_structural())
             });
 
+        // The explorer's one context menu, aimed by a right press on a row.
+        let menu = ExplorerMenu::new();
+
         // Custom render_node with per-node reactive Effects for label/icon/mount
         let render_node_fn: RenderTreeNode = Rc::new(move |payload: &RenderTreeNodePayload, __scope: &mut RenderScope| {
             let node_value = payload.node.value.clone();
@@ -1456,48 +2077,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 None
             };
 
-            // What may be done with this row (`pimble_core::plan::capabilities`,
-            // one rule for every menu): what this device may change of the
-            // row's node (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"),
-            // the server's own judgement of the node, because one store can
-            // hold a root this account reads beside a root it edits, and only
-            // the rows under the first have anything greyed out; a store row
-            // asks about the store. `Full` is one's own store and an editor's
-            // scope alike, so an editor of a share has nothing greyed out;
-            // only a reader does. Whether the store is linked, a replica,
-            // encrypted, shared from this computer, someone else's share, or
-            // a share's replica whose every share has ended (Joe,
-            // 2026-09-21: the row stays because the files do, everything that
-            // changes anything is off, and "Remove Replica..." is where the
-            // files go); whether the row's node carries a share marker (a
-            // store row takes its root's, like its icon and colour).
-            // `parse_tree_value` returns the CANONICAL pair, so a node
-            // reached through a mount is judged as the node it is in its
-            // source store, which is where the RPC would go. A snapshot, like
-            // `no_mount_source` below (rinch #714): the row's data carries
-            // all of it, so a change of any re-renders the row with fresh
-            // items.
+            // Whether the row's node carries a share marker (a store row takes
+            // its root's), for the badge. What the menu may do with a row is
+            // judged when the menu opens on it (`RowMenu::of`).
             let caps = parsed
                 .map(|(s_id, n_id)| pimble_core::plan::capabilities(&store.view(), s_id, n_id))
                 .unwrap_or_default();
-            let ended_now = is_store_root && caps.every_share_ended;
-            // A browser build has none of those items to explain.
-            let relayed_note_text = if CAN_ADMINISTER_STORES && is_store_root { caps.relayed_note() } else { "" };
-            let access_now = caps.access;
-            let can_write_tree = caps.writable();
-            // A mount's "New Node" creates under the mount's SOURCE node, so
-            // that node's access is what governs that one item.
-            let can_write_mount_source = mount_sig
-                .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
-                .map_or(can_write_tree, |(source_store, source_node)| store.node_access(source_store, source_node).allows_write());
             let is_shared_now = caps.shared_root;
-            // "Share...": in a store that reached this device as someone
-            // else's share nothing can be shared from here, so the item opens
-            // only on a shared root (the member's read-only face of the
-            // modal) and every other row says why it is off.
-            let share_disabled = !caps.can_share();
-            // A browser build has no "Share..." item to explain.
-            let share_note_text = if CAN_ADMINISTER_STORES { caps.share_note() } else { "" };
 
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
@@ -1581,196 +2167,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 "cursor: default; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
             };
 
-            // Context menu actions
-            let nv_ctx = node_value.clone();
-            // "Discuss": a discussion on this row's node
-            // (docs/DISCUSSIONS_CONTRACT.md); a discussion node of its own is
-            // one of New's kinds.
-            let on_start_discussion = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                        crate::discussions::start_on(store, store.focused(), s_id, n_id);
-                    }
-                }
-            };
-            // Cut, Copy and Paste (docs/MENUS_CONTRACT.md section 3.1).
-            let on_cut = {
-                let nv = nv_ctx.clone();
-                move || {
-                    let rows: Vec<String> = rows_for_menu(tree_state, &nv).into_iter().filter(|v| matches!(parse_tree_value(v), Some((_, Some(_))))).collect();
-                    if !rows.is_empty() {
-                        crate::tree_keys::set_cut(store, rows);
-                    }
-                }
-            };
-            let on_copy = {
-                let nv = nv_ctx.clone();
-                move || copy_rows(store, &rows_for_menu(tree_state, &nv))
-            };
-            let on_paste = {
-                let nv = nv_ctx.clone();
-                move || crate::pasting::paste(store, &nv)
-            };
-            let on_close_store = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        store.send(BackendCommand::CloseStore { store_id: s_id });
-                    }
-                }
-            };
-            let on_link_to_remote = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        store.link_modal_store.set(Some(s_id));
-                        store.link_modal_url.set(String::new());
-                        store.link_modal_token.set(String::new());
-                        store.link_modal_token_visible.set(false);
-                        store.link_modal_error.set(String::new());
-                    }
-                }
-            };
-            let on_unlink_from_remote = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        store.send(BackendCommand::SetStoreSync { store_id: s_id, remote: None });
-                    }
-                }
-            };
-            let on_host_on_cloud = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        // Hosting asked for on its own is not on the way to
-                        // sharing anything.
-                        store.share_after_host.set(None);
-                        open_host_modal(store, s_id);
-                    }
-                }
-            };
-            let on_stop_relaying = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        open_stop_relay_modal(store, s_id);
-                    }
-                }
-            };
-            // "Share...": grant people a scope on this store rooted at this
-            // node (a store row shares its root node), so they hold the same
-            // documents and co-author them (docs/NODE_DOCUMENT_CONTRACT.md
-            // section 5). Never disabled for a store that is not hosted: the
-            // modal opens on the two ways to give the share somewhere to live
-            // (docs/RELAY_CONTRACT.md). Disabled in someone else's store on every
-            // node but a shared root (`share_disabled` above), where it opens
-            // the member's face of the modal.
-            let on_share = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        if let Some(n_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) {
-                            open_share_modal(store, s_id, n_id);
-                        }
-                    }
-                }
-            };
-            let on_remove_replica = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        store.remove_replica_modal_store.set(Some(s_id));
-                        store.remove_replica_modal_error.set(String::new());
-                        store.remove_replica_modal_pending.set(false);
-                    }
-                }
-            };
-            let on_recently_deleted = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, _)) = parse_tree_value(&nv) {
-                        open_deleted_modal(store, s_id);
-                    }
-                }
-            };
-            let on_mount_store = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
-                        if let Some(pid) = parent_id {
-                            #[cfg(feature = "native")]
-                            {
-                                let dialog = rinch::dialogs::pick_folder()
-                                    .set_title("Select Store to Mount");
-                                if let Some(path) = dialog.pick() {
-                                    let path_str = path.to_string_lossy().to_string();
-                                    tracing::info!("Mounting store from: {} into {:?}", path_str, s_id);
-                                    store.send(BackendCommand::OpenStore { path: path_str.clone() });
-                                    store.pending_mount.set(Some(PendingMount {
-                                        target_store_id: s_id,
-                                        target_parent_id: pid,
-                                        source_path: path_str,
-                                    }));
-                                }
-                            }
-                            // A browser has no directories to offer, so it
-                            // picks from the stores the account already grants.
-                            // The RPC either way is `createMount`, which an
-                            // editor may call.
-                            #[cfg(not(feature = "native"))]
-                            open_mount_picker(store, (s_id, pid));
-                        }
-                    }
-                }
-            };
-
-            // "Mount Remote Store Here..." — store roots and ordinary nodes
-            // only. Opens the connect modal in mount mode with this row's
-            // canonical target (a store root's target is its own root node).
-            let on_mount_remote_store = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some(target) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        open_connect_modal(store, Some(target));
-                    }
-                }
-            };
-
-            // The rows the menu acts on, all or none
-            // (`pimble_core::plan::can_delete`).
-            let on_delete = {
-                let nv = nv_ctx.clone();
-                move || {
-                    let Some(nodes) = crate::tree_view::deletable(store, &rows_for_menu(tree_state, &nv)) else { return };
-                    for (s_id, n_id) in nodes {
-                        store.send(BackendCommand::DeleteNode { store_id: s_id, node_id: n_id });
-                    }
-                }
-            };
-            // "Appearance...": open the icon, colour and tags picker for this
-            // node (a store row edits its root node).
-            let on_appearance = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        if let Some(n_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) {
-                            open_appearance_modal(store, s_id, n_id);
-                        }
-                    }
-                }
-            };
-
-            // Mounts do not exist in an encrypted store: the server holds only
-            // blobs there and has no tree to point a mount at. Hiding the two
-            // items rather than disabling them keeps the menu honest — there is
-            // nothing the reader could do to enable them.
-            let mounts_apply = parsed
-                .map(|(s_id, _)| !store.is_vault(s_id))
-                .unwrap_or(true);
-
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
 
             // The badge a shared node's row carries after its label. Drawn
@@ -1836,7 +2232,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
 
             let nv_submit = node_value.clone();
-            let nv_for_context_menu = node_value.clone();
 
             // This row's own locally-computed label (see `AppStore::live_label`):
             // the label below subscribes to it and not to any other row's.
@@ -2101,43 +2496,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
-            // Why the items below are disabled, when some of them are: one
-            // dimmed line at the top of the menu, rather than the same reason
-            // repeated on every item or (worse) items greyed out saying
-            // nothing. What is shared to read has one, and so has a node of
-            // someone else's store that "Share..." is off for; an editor's
-            // menu is otherwise a full menu (docs/NODE_DOCUMENT_CONTRACT.md
-            // section 5).
-            let access_note_text = crate::state::access_note(access_now);
-            let found_note = found.as_ref().map(|f| f.refusal.clone()).unwrap_or_default();
-            let menu_note_text = if ended_now {
-                crate::state::ENDED_REPLICA_NOTE.to_string()
-            } else {
-                crate::state::menu_note_text(&[found_note.as_str(), access_note_text, share_note_text, relayed_note_text])
-            };
-            // What a found row allows (`pimble_core::plan::FoundRowAction`,
-            // one rule for the explorer, plugins and the MCP).
-            let found_allows = {
-                let is_found = found.is_some();
-                move |action: pimble_core::plan::FoundRowAction| !is_found || action.allowed()
-            };
-            use pimble_core::plan::FoundRowAction as Fra;
-            let menu_note: Option<NodeHandle> = if menu_note_text.is_empty() {
-                None
-            } else {
-                Some(rsx! { div { class: "pimble-menu-note", {menu_note_text} } })
-            };
-            let mount_menu_note: Option<NodeHandle> = if is_mount {
-                let text = crate::state::menu_note_text(&[access_note_text, MOUNT_NOTE]);
-                Some(rsx! { div { class: "pimble-menu-note", {text} } })
-            } else {
-                None
-            };
-
-            // Which of a store row's items are off: one rule, in one place
-            // (`Capabilities::store_row_menu`), from what the row snapshots.
-            let store_menu = caps.store_row_menu(false);
-
             // Remember this row for `reveal_row`, and scroll to it now if it
             // is the one a followed link revealed.
             TREE_ROWS.with(|rows| rows.borrow_mut().insert(row_value.clone(), wrapper.clone()));
@@ -2146,335 +2504,25 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 wrapper.scroll_into_view();
             }
 
-            // Wrap in ContextMenu — different items for store roots vs nodes
-            // (docs/MENUS_CONTRACT.md section 3: grouped, what cannot apply
-            // left out; New is one list, `crate::creating`, until rinch's
-            // submenus make it "New ▸").
-            let nv_new = nv_ctx.clone();
-            let context_menu = if is_store_root {
-                rsx! {
-                    ContextMenu {
-                        ContextMenuTarget { {wrapper} }
-                        ContextMenuDropdown {
-                            {menu_note}
-                            DropdownMenuSub {
-                                label: "New",
-                                left_section: TablerIcon::Plus,
-                                disabled: store_menu.new_node,
-                                for item in crate::creating::kinds(store) {
-                                    DropdownMenuItem {
-                                        key: item.label.clone(),
-                                        left_section: item.icon,
-                                        onclick: {
-                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                            move || crate::creating::make_in_row(store, &kind, &nv)
-                                        },
-                                        {item.label.clone()}
-                                    }
-                                }
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Copy,
-                                onclick: on_copy.clone(),
-                                "Copy"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Clipboard,
-                                disabled: store_menu.new_node,
-                                onclick: on_paste.clone(),
-                                "Paste"
-                            }
-                            DropdownMenuDivider {}
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Share,
-                                    disabled: store_menu.share,
-                                    onclick: on_share.clone(),
-                                    "Share..."
-                                }
-                            }
-                            // How the store reaches other places: only what
-                            // can apply to it now (principle 2), in one
-                            // submenu, left out when nothing applies.
-                            if CAN_ADMINISTER_STORES && !(store_menu.link_to_remote && store_menu.host && store_menu.stop_relaying && store_menu.unlink && store_menu.remove_replica) {
-                                DropdownMenuSub {
-                                    label: "Sync",
-                                    left_section: TablerIcon::Cloud,
-                                    if !store_menu.link_to_remote {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::Cloud,
-                                            onclick: on_link_to_remote.clone(),
-                                            "Link to Remote..."
-                                        }
-                                    }
-                                    if !store_menu.host {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::CloudUpload,
-                                            onclick: on_host_on_cloud.clone(),
-                                            "Host on Pimble Cloud..."
-                                        }
-                                    }
-                                    if !store_menu.stop_relaying {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::ShareOff,
-                                            onclick: on_stop_relaying.clone(),
-                                            "Stop Sharing from This Computer..."
-                                        }
-                                    }
-                                    if !store_menu.unlink {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::Unlink,
-                                            onclick: on_unlink_from_remote.clone(),
-                                            "Unlink from Remote"
-                                        }
-                                    }
-                                    if !store_menu.remove_replica {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::Trash,
-                                            onclick: on_remove_replica.clone(),
-                                            "Remove Replica..."
-                                        }
-                                    }
-                                }
-                            }
-                            if mounts_apply || CAN_ADMINISTER_STORES {
-                            DropdownMenuSub {
-                                label: "Mount",
-                                left_section: TablerIcon::Link,
-                                if mounts_apply {
-                                    DropdownMenuItem {
-                                        left_section: TablerIcon::Link,
-                                        disabled: store_menu.mount_store,
-                                        onclick: on_mount_store.clone(),
-                                        "Mount Store Here..."
-                                    }
-                                }
-                                if CAN_ADMINISTER_STORES {
-                                    DropdownMenuItem {
-                                        left_section: TablerIcon::CloudDownload,
-                                        disabled: store_menu.mount_remote_store,
-                                        onclick: on_mount_remote_store.clone(),
-                                        "Mount Remote Store Here..."
-                                    }
-                                }
-                            }
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Palette,
-                                disabled: store_menu.appearance,
-                                onclick: on_appearance,
-                                "Appearance..."
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::History,
-                                disabled: store_menu.recently_deleted,
-                                onclick: on_recently_deleted,
-                                "Recently Deleted..."
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuDivider {}
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::X,
-                                    onclick: on_close_store.clone(),
-                                    "Close Store"
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if is_mount {
-                // New makes in the mount's source, never under the mount node
-                // itself (the server rejects a mount node as a parent).
-                rsx! {
-                    ContextMenu {
-                        ContextMenuTarget { {wrapper} }
-                        ContextMenuDropdown {
-                            {mount_menu_note}
-                            DropdownMenuSub {
-                                label: "New",
-                                left_section: TablerIcon::Plus,
-                                disabled: !can_write_mount_source,
-                                for item in crate::creating::kinds(store) {
-                                    DropdownMenuItem {
-                                        key: item.label.clone(),
-                                        left_section: item.icon,
-                                        onclick: {
-                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                            move || crate::creating::make_in_row(store, &kind, &nv)
-                                        },
-                                        {item.label.clone()}
-                                    }
-                                }
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Palette,
-                                disabled: !can_write_tree,
-                                onclick: on_appearance,
-                                "Appearance..."
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Trash,
-                                disabled: !can_write_tree,
-                                onclick: on_delete,
-                                "Delete"
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Regular nodes: new child, mount store, rename
-                let nv_rename_ctx = nv_for_context_menu.clone();
-                let on_rename = move || {
-                    start_rename(store, tree_state, &nv_rename_ctx);
-                };
-
-                // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision
-                // 2): the focused pane is split to the right and this
-                // document opens in the new half. Off with four panes open.
-                // With several rows selected and this one among them, the
-                // menu acts on all of them where that makes sense (Delete,
-                // Cut, Copy) and turns off what is for one row alone
-                // (docs/TREE_CONTRACT.md "Multi-select").
-                let nv_count = nv_for_context_menu.clone();
-                let acts_on = Memo::new(move || tree_state.selected.with(|s| if s.contains(&nv_count) { s.len().max(1) } else { 1 }));
-                let several = move || acts_on.get() > 1;
-                let nv_split = nv_for_context_menu.clone();
-                let on_open_in_split = move || {
-                    let focused = store.focused();
-                    if let Some(new) = crate::pane_view::split_pane(store, focused, crate::panes::Direction::Right) {
-                        open_node_in(store, tree_state, new, nv_split.clone());
-                    }
-                };
-
-                rsx! {
-                    ContextMenu {
-                        ContextMenuTarget { {wrapper} }
-                        ContextMenuDropdown {
-                            {menu_note}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::LayoutColumns,
-                                disabled: {move || several() || !store.tiling.with(|tiling| tiling.can_split())},
-                                onclick: on_open_in_split.clone(),
-                                "Open in Split View"
-                            }
-                            DropdownMenuSub {
-                                label: "New",
-                                left_section: TablerIcon::Plus,
-                                disabled: !can_write_tree,
-                                for item in crate::creating::kinds(store) {
-                                    DropdownMenuItem {
-                                        key: item.label.clone(),
-                                        left_section: item.icon,
-                                        onclick: {
-                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                            move || crate::creating::make_in_row(store, &kind, &nv)
-                                        },
-                                        {item.label.clone()}
-                                    }
-                                }
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::MessagePlus,
-                                // A commenter's too (docs/DISCUSSIONS_CONTRACT.md section 7).
-                                disabled: !access_now.allows_comment(),
-                                onclick: on_start_discussion.clone(),
-                                "Discuss"
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Edit,
-                                disabled: {move || !can_write_tree || several()},
-                                onclick: on_rename.clone(),
-                                "Rename"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Palette,
-                                disabled: !can_write_tree,
-                                onclick: on_appearance,
-                                "Appearance..."
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Scissors,
-                                disabled: !can_write_tree || !found_allows(Fra::Cut),
-                                onclick: on_cut.clone(),
-                                "Cut"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Copy,
-                                onclick: on_copy.clone(),
-                                "Copy"
-                            }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Clipboard,
-                                disabled: {move || !can_write_tree || several() || !found_allows(Fra::PasteInto)},
-                                onclick: on_paste.clone(),
-                                "Paste"
-                            }
-                            if mounts_apply || CAN_ADMINISTER_STORES {
-                                DropdownMenuSub {
-                                    label: "Mount",
-                                    left_section: TablerIcon::Link,
-                                    disabled: !can_write_tree || !found_allows(Fra::PasteInto),
-                                    if mounts_apply {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::Link,
-                                            onclick: on_mount_store.clone(),
-                                            "Mount Store Here..."
-                                        }
-                                    }
-                                    if CAN_ADMINISTER_STORES {
-                                        DropdownMenuItem {
-                                            left_section: TablerIcon::CloudDownload,
-                                            onclick: on_mount_remote_store.clone(),
-                                            "Mount Remote Store Here..."
-                                        }
-                                    }
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Share,
-                                    disabled: {move || share_disabled || several()},
-                                    onclick: on_share.clone(),
-                                    "Share..."
-                                }
-                            }
-                            DropdownMenuDivider {}
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Trash,
-                                disabled: !can_write_tree || !found_allows(Fra::Delete),
-                                onclick: on_delete,
-                                {move || match acts_on.get() {
-                                    1 => "Delete".to_string(),
-                                    n => format!("Delete {n} Nodes"),
-                                }}
-                            }
-                        }
-                    }
-                }
-            };
-
-            // The ContextMenu sets data-oncontextmenu on its ContextMenuTarget,
-            // but both rinch-context-menu and rinch-context-menu__target have
-            // display:contents — they're invisible to hit testing. Wrap in a
-            // visible div that carries the context menu handler (hoisted from
-            // ContextMenuTarget), so right-click works on the full row. The
-            // Tree's own row box is the drag source and drop target
-            // (docs/TREE_CONTRACT.md "The drop model"; `tree_drop.rs`).
+            // The explorer has ONE context menu (`explorer_menu`), built once
+            // for the whole tree: a right press on a row only names the row it
+            // is for, so a row carries no menu of its own (2026-11-12: each
+            // row built its full menu, about 500 DOM nodes, and every change
+            // to the tree's shape rebuilt them all).
+            let row_for_menu = node_value.clone();
             let hit_area = rsx! {
                 div {
                     // `min-width: 0`: a flex item never narrower than its content
                     // pushed a long title out past the row (and the scrollbar).
                     style: "flex: 1; min-width: 0; display: flex; align-items: center; border-radius: 2px;",
-                    {context_menu}
+                    onmousedown: move || {
+                        if rinch::core::get_click_context().button == rinch::core::MouseButton::Right {
+                            menu.aim(store, tree_state, Some(row_for_menu.clone()));
+                        }
+                    },
+                    {wrapper}
                 }
             };
-            hoist_context_menu_handler(&hit_area, &hit_area);
             // Image files dropped on the row from the OS become image nodes
             // under it, one per file, in order (docs/IMAGE_MARKUP_CONTRACT.md
             // section 1). The browser finds the row by this attribute
@@ -2539,6 +2587,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let tree_scroll = rsx! {
             div {
                 class: "pimble-sidebar__tree",
+                // A right press on the tree's empty space aims the menu at no
+                // row (a row's own press, nearer, aims it at the row).
+                onmousedown: move || {
+                    if rinch::core::get_click_context().button == rinch::core::MouseButton::Right {
+                        menu.aim(store, tree_state, None);
+                    }
+                },
                 Tree {
                     data: untracked(|| store.build_tree_data_structural()),
                     tree: tree_state,
@@ -2565,6 +2620,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             }
         };
+        let tree_scroll = explorer_menu(__scope, store, tree_state, menu, tree_scroll);
 
         // The explorer's "+" (docs/MENUS_CONTRACT.md section 3.2): the list of
         // what can be made (`crate::creating`), made beside the selected row.
