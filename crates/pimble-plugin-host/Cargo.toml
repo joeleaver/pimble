@@ -15,7 +15,7 @@ serde = { workspace = true }
 # The same rinch-core the app's rinch uses (git main, one package in the lock):
 # the host applies a guest's ops through the app's own `dyn DomDocument` and
 # registers its proxy handlers in the app's handler registries.
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children" }
 tracing = { workspace = true }
 # The plugin library (`library`): its index, and the check every downloaded
 # plugin passes (the same key and check as desktop updates).
@@ -51,7 +51,7 @@ path = "src/bin/pimble-plugin-index.rs"
 required-features = ["index-tool"]
 
 [dev-dependencies]
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "perf/tree-row-children", features = ["test-util"] }
 
 # The API bridge end to end (tests/bridge.rs): the built hello plugin's calls made
 # through a real in-process server, as the app's backend makes them. None of it
