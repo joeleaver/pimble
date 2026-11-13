@@ -140,6 +140,7 @@ async fn a_picture_over_20_mib_is_refused_with_the_sentence() {
         offset: offset as u64,
         total: Some(2 * MIB as u64 - 1),
         blob_id,
+        copy_of: None,
     };
     let first = raw.put_blob(chunk(0, None)).await.unwrap();
     assert!(!first.complete);

@@ -643,6 +643,48 @@ fn lists_naming(tree: &Tree, node_id: NodeId) -> Vec<NodeId> {
     tree.ids().into_iter().filter(|&owner| tree.doc(owner).is_some_and(|doc| doc.children().contains(&node_id))).collect()
 }
 
+/// The second half of a transplant's pictures: see `transplant_node`.
+async fn move_pictures_planted(manager: &mut StoreManager, from: StoreId, to: StoreId, edit: &mut TreeEdit) {
+    let (Ok(from_blobs), Ok(to_blobs)) = (manager.blobs(from), manager.blobs(to)) else { return };
+    let planted: Vec<NodeId> = {
+        let mut seen = HashSet::new();
+        edit.node_ids().into_iter().filter(|id| seen.insert(*id)).collect()
+    };
+    for id in planted {
+        let named: Vec<BlobUrl> = match manager.tree(to).ok().and_then(|tree| tree.doc(id)) {
+            Some(doc) => doc.pictures().into_iter().filter(|url| url.store == from).collect(),
+            None => continue,
+        };
+        if named.is_empty() {
+            continue;
+        }
+        let mut all_here = true;
+        for url in &named {
+            match from_blobs.get(url.blob).await {
+                Ok(Some(blob)) => {
+                    if let Err(e) = to_blobs.put_as(url.blob, blob.mime.as_str(), blob.bytes).await {
+                        warn!("Transplant into store {}: picture {} was not copied: {}", to, url.blob, e);
+                        all_here = false;
+                    }
+                }
+                _ => all_here = false,
+            }
+        }
+        if !all_here {
+            continue;
+        }
+        let Ok(doc) = manager.node_doc(to, id) else { continue };
+        match doc.move_pictures(from, to) {
+            Ok(Some(update)) => {
+                edit.touched.push((id, update));
+                let _ = manager.mark_dirty(to, id);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Transplant into store {}: node {}'s pictures were not renamed: {}", to, id, e),
+        }
+    }
+}
+
 /// The write judgement `moveNode` and `transplantNode` both make on the
 /// store a node moves out of, before either touches anything
 /// (docs/MOVE_CONTRACT.md item 1 of the server's move findings): one
@@ -4464,9 +4506,16 @@ impl PimbleApiServer for RpcHandler {
             return Err(write_refusal(&manager, request.to_store_id, &[request.new_parent_id]));
         }
 
-        let outcome = manager
+        let mut outcome = manager
             .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.place)
             .map_err(to_rpc_error)?;
+        // The copy's pictures go with it (docs/IMAGES_CONTRACT.md "The
+        // shape"): every blob of the source store a planted document names
+        // is copied into the destination under its id, and the copy names it
+        // there, in the edit that plants it. A picture the source does not
+        // hold (not arrived yet) keeps its old name, which still shows
+        // wherever the source store is.
+        move_pictures_planted(&mut manager, request.from_store_id, request.to_store_id, &mut outcome.target_edit).await;
 
         manager.flush(request.from_store_id).await.map_err(to_rpc_error)?;
         manager.flush(request.to_store_id).await.map_err(to_rpc_error)?;
