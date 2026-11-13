@@ -30,7 +30,7 @@ in a shared node reached the other side as a canvas with no picture.
   / `get_picture`). Wave 5: RTF, Scrivener and Word imports bring PNG/JPEG (and Word's
   GIF/WebP) pictures in as canvases in the text (`BackendCommand::StorePicture`); the MCP's
   `attach_image` is `insert_canvas`/`create_canvas` with a picture file, already built.
-- Open: nothing tells an open note its picture arrived (reopen shows it); the browser
+- Open: an open note learns of an arrived picture only by asking again on its timer; the browser
   refetches pictures after a reload; `\NeXTGraphic`/`.rtfd` and metafile pictures are not
   imported. See IMAGES_CONTRACT "Left after waves 2 to 5".
   Deploy the hosted server (and the accounts service is unchanged) before or with the
