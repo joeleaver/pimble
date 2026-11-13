@@ -1,5 +1,10 @@
 # Next session: start here
 
+**2026-11-13 (session 78e7f30f): v0.22.6 released from `master` (hosted server first, jkbase
+v60).** Pictures in encrypted stores in the browser and from imports (images waves 4 and 5);
+a half-sent picture finished by whoever holds it whole; a canvas in text draws when its
+picture arrives (it stayed a 1 px placeholder until the note was edited).
+
 **2026-11-13 (session 78e7f30f): v0.22.4 released from `master`: a log on Windows.**
 `%LOCALAPPDATA%\pimble\logs\pimble.log` (the last run's as `pimble.previous.log`), since
 the window program has no console; a command that fails with an error the window shows
