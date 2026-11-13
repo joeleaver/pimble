@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-13 (session 78e7f30f): v0.22.3 released from `master`.**
+- **Paragraph spacing per note** (docs/PARAGRAPHS_CONTRACT.md): compact unless a note
+  says spaced; a new node copies its parent's (`Tree::add_node`), so a store's root is
+  its default; Edit > "Compact Paragraphs" and an Appearance row; imports are spaced.
+- **Windows:** `pimble.exe` carries Pimble's icon (`build.rs`, winresource); after
+  adding an agent to Claude Desktop the app says to quit it from the tray (closing its
+  window leaves it running, and it reads its config only at start).
+- Open: the selection is invisible inside code blocks, inline code, highlights and
+  table header cells (rinch paints it under opaque block backgrounds); the rinch
+  session is fixing it, then move the pin and release.
+
 **2026-11-13 (session 78e7f30f): v0.22.2 released from `master`: Windows fixes.** (v0.22.1
 was tagged but its Release run failed: Rust 1.100 links `crt1-reactor.o` into a wasip1
 plugin, and the SDK's own `_initialize` collided; `export!` defines it only before 1.100.) A

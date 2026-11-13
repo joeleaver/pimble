@@ -4967,7 +4967,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pimble-api"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4992,7 +4992,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-app"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5045,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-board"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -5059,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cli"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5081,7 +5081,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-client"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5097,7 +5097,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cloud"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5133,7 +5133,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5147,7 +5147,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5164,7 +5164,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -5185,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-discussion"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -5196,7 +5196,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-image"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "image",
  "pimble-core",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-import"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5222,7 +5222,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-mcp"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-abi"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "pimble-api",
@@ -5268,7 +5268,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-host"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5300,7 +5300,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugins"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -5310,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
@@ -5326,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-search"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5348,7 +5348,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-server"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -5393,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-sheet"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5406,7 +5406,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-store"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5426,7 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-ui"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "pimble-core",
  "rinch",
