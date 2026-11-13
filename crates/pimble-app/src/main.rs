@@ -118,17 +118,32 @@ fn main() {
     };
 
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
+    match log_file() {
+        Some(file) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
 
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
     pimble_app::app::run(renderer);
+}
+
+/// Where the log goes on Windows, where a window program has no console to
+/// print to (`windows_subsystem`): `%LOCALAPPDATA%\pimble\logs\pimble.log`,
+/// begun afresh at each start with the last run's kept beside it as
+/// `pimble.previous.log`. Elsewhere the log stays on standard error. `None`
+/// when the file cannot be made, and the log goes nowhere, as before.
+fn log_file() -> Option<std::fs::File> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let dir = dirs::data_local_dir()?.join("pimble").join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("pimble.log");
+    let _ = std::fs::rename(&path, dir.join("pimble.previous.log"));
+    std::fs::File::create(path).ok()
 }
 
 /// Hand `link` to a Pimble window on this computer's server; whether one took

@@ -148,11 +148,42 @@ fn moved_affected(node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId,
 /// it (`crate::protocol::Asked`).
 pub async fn process_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
     let asked = crate::protocol::Asked::of(&cmd);
+    // What was asked, for the log when it fails: an error the window shows
+    // ("Node not found: ...") says nothing of which request met it. Cut
+    // short, since a command may carry a document's bytes.
+    let what = described(&cmd, 300);
     let answer = match api_command(ctx, cmd).await {
         Ok(event) => event,
         Err(cmd) => host_command(ctx, cmd).await,
     };
+    if let Some(BackendEvent::Error { message }) = &answer {
+        tracing::warn!("{what} failed: {message}");
+    }
     crate::protocol::Asked::answer(asked, answer)
+}
+
+/// `value`'s `Debug` text, at most `limit` bytes of it: formatting stops
+/// there, so a command carrying a document's bytes costs no more than a short one.
+fn described(value: &impl std::fmt::Debug, limit: usize) -> String {
+    struct Bounded {
+        text: String,
+        limit: usize,
+    }
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for c in s.chars() {
+                if self.text.len() + c.len_utf8() > self.limit {
+                    self.text.push_str("...");
+                    return Err(std::fmt::Error);
+                }
+                self.text.push(c);
+            }
+            Ok(())
+        }
+    }
+    let mut out = Bounded { text: String::new(), limit };
+    let _ = std::fmt::write(&mut out, format_args!("{value:?}"));
+    out.text
 }
 
 /// Where the node and its title were before a move: after a transplant the
@@ -1236,5 +1267,20 @@ async fn shares_listed(c: &PimbleClient) -> BackendEvent {
     match c.cloud_list_shares().await {
         Ok(shares) => BackendEvent::CloudSharesListed { shares },
         Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::described;
+
+    #[test]
+    fn a_command_is_described_short_whatever_it_carries() {
+        let short = described(&("GetNode", 7), 300);
+        assert_eq!(short, "(\"GetNode\", 7)");
+        let long = described(&vec![0u8; 100_000], 40);
+        assert!(long.len() <= 43 && long.ends_with("..."), "{long}");
+        let wide = described(&"ééééé", 4);
+        assert!(wide.starts_with("\"é") && wide.ends_with("..."), "{wide}");
     }
 }
