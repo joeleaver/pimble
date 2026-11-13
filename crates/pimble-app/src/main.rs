@@ -6,6 +6,12 @@
 //! library's `native` feature (which this binary requires) is what brings in the
 //! embedded server, the tokio backend thread and the desktop shell.
 
+// A window program on Windows: started from the Start menu, a shortcut or a
+// `pimble:` link it opens no console beside its window. What it prints for
+// `--install`, `--help` or a bad argument goes to the terminal it was started
+// from (`attach_parent_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use rinch::prelude::Renderer;
 
 const USAGE: &str = "\
@@ -49,7 +55,31 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String
     Ok(renderer)
 }
 
+/// Windows: borrow the console of the terminal this was started from, if it
+/// was, so what follows prints there. A window program has none of its own.
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // Safety: no arguments to get wrong; failing (no parent console) is fine.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() {
+    // Anything but a lone `pimble:` link may print (an install, the usage, an
+    // argument refused).
+    if std::env::args().skip(1).any(|a| !a.starts_with("pimble:")) {
+        attach_parent_console();
+    }
+
     // `pimble --install` (docs/UPDATE_CONTRACT.md): copy this program into the
     // home-folder install, which keeps itself current, and stop.
     if std::env::args().nth(1).as_deref() == Some("--install") {
