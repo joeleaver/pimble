@@ -155,3 +155,9 @@ native = [
 web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "pimble-plugin-host/js-host"]
 onnx-download = ["native", "pimble-server/onnx-download"]
 onnx-dynamic = ["native", "pimble-server/onnx-dynamic"]
+
+[build-dependencies]
+# The program's own icon on Windows (`build.rs`): what Explorer, the Start
+# menu, shortcuts and a pinned taskbar button show. The window's icon is set
+# at runtime (`app.rs`, `WindowProps::icon`).
+winresource = "0.1.34"
