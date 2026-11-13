@@ -520,7 +520,7 @@ async fn listed_nodes(client: &PimbleClient, store_id: StoreId) -> std::collecti
         .into_iter()
         .filter_map(|doc| match doc.doc_id {
             VaultDocId::Node(id) => Some(id),
-            VaultDocId::Tree => None,
+            VaultDocId::Tree | VaultDocId::Blob(_) => None,
         })
         .collect()
 }
