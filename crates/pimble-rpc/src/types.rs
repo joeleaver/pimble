@@ -743,10 +743,6 @@ pub struct ApplyEditResponse {}
 /// picture is seven messages.
 pub const BLOB_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 
-/// What `getBlob` answers a share's member until blobs are judged by the
-/// nodes that name them (docs/IMAGES_CONTRACT.md wave 2).
-pub const BLOBS_IN_SHARES_REFUSAL: &str = "Pictures in shares are not available yet.";
-
 /// What `getBlob` answers for a blob the store does not hold (yet): a
 /// replica's text can arrive before its pictures do.
 pub const BLOB_NOT_HERE: &str = "This picture has not arrived yet.";
