@@ -389,6 +389,9 @@ fn fill(document: &[u8], item: &Imported) -> pimble_crdt::Result<Vec<u8>> {
         doc.set_node_type(item.node_type, &now)?;
     }
     doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::json!(true), &now)?;
+    // What is imported is writing (a Scrivener project, a Word or RTF document):
+    // its paragraphs keep a gap between them (docs/PARAGRAPHS_CONTRACT.md).
+    doc.set_custom(custom_keys::PARAGRAPHS, &serde_json::json!(pimble_core::SPACED_PARAGRAPHS), &now)?;
     if let Some(icon) = &item.icon {
         doc.set_custom(custom_keys::ICON, &serde_json::json!(icon), &now)?;
     }
@@ -441,6 +444,7 @@ mod tests {
         assert_eq!(fields.custom.get(custom_keys::ICON), Some(&serde_json::json!("star")));
         assert_eq!(fields.custom.get(custom_keys::BACKGROUND), Some(&serde_json::json!("#b0d7ff")));
         assert_eq!(fields.custom.get(custom_keys::EXPLICIT_TITLE), Some(&serde_json::json!(true)));
+        assert_eq!(fields.custom.get(custom_keys::PARAGRAPHS), Some(&serde_json::json!(pimble_core::SPACED_PARAGRAPHS)));
         assert_eq!(created.text().trim(), "It was a dark night.");
     }
 }

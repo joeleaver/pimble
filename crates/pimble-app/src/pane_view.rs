@@ -212,6 +212,15 @@ pub(crate) fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> 
     )]
 }
 
+/// Whether pane `pane`'s note draws a gap between its paragraphs
+/// (docs/PARAGRAPHS_CONTRACT.md), tracked; compact when it says nothing.
+pub(crate) fn pane_spaced(store: AppStore, pane: PaneId) -> bool {
+    let Some((store_id, node_id)) = pane_document(store, pane) else { return false };
+    // One signal read at a time (see `editor_read_only`).
+    let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
+    node.is_some_and(|sig| sig.with(|n| n.metadata.spaced_paragraphs()))
+}
+
 /// Whether the document in pane `pane` is one this device may only read
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): its store is held to
 /// read, or the server judged this node so (a reader's root in a store where
@@ -314,7 +323,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     let lost_tables = crate::sheets::in_text::render_lost(__scope, store, pane);
     let content_wrap = rsx! {
         div {
-            class: "pimble-editor__content-wrap",
+            // Its paragraphs spaced or compact, as the note says
+            // (docs/PARAGRAPHS_CONTRACT.md); the stylesheet does the rest.
+            class: {move || if pane_spaced(store, pane) { "pimble-editor__content-wrap pimble-editor__content-wrap--spaced" } else { "pimble-editor__content-wrap" }},
             // Hidden under a picture's board view while it is marked up.
             style: {move || if state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() { "" } else { "display: none;" }},
             onscroll: move |_| {
@@ -648,7 +659,46 @@ fn render_divider(__scope: &mut RenderScope, store: AppStore, index: usize) -> N
 /// The area beside the explorer: the one toolbar, then every pane slot and
 /// every divider slot, once. `hints` are the lines under the empty state's
 /// sentence.
+/// Edit > "Compact Paragraphs" and the focused pane's note, kept as one
+/// (docs/PARAGRAPHS_CONTRACT.md): the check follows the note (a focus change,
+/// another window's or person's change), and a choice of the item writes the
+/// note, or, with no note there or one this device may only read, the check
+/// goes back to what the note says. Both effects live as long as the app.
+fn follow_paragraphs(store: AppStore) {
+    let _ = rinch::Effect::new(move || {
+        let compact = !pane_spaced(store, store.focused_pane.get());
+        if untracked(|| store.compact_paragraphs.get()) != compact {
+            store.compact_paragraphs.set(compact);
+        }
+    });
+    let _ = rinch::Effect::new(move || {
+        let wanted = store.compact_paragraphs.get();
+        untracked(|| {
+            let pane = store.focused_pane.get();
+            let compact = !pane_spaced(store, pane);
+            if wanted == compact {
+                return;
+            }
+            match pane_document(store, pane) {
+                Some((store_id, node_id)) if store.pane(pane).show_editor.get() && !editor_read_only(store, pane) => {
+                    store.send(crate::protocol::BackendCommand::SetNodeAppearance {
+                        store_id,
+                        node_id,
+                        icon: None,
+                        color: None,
+                        background: None,
+                        tags: None,
+                        paragraphs: Some(!wanted),
+                    });
+                }
+                _ => store.compact_paragraphs.set(compact),
+            }
+        });
+    });
+}
+
 pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[&'static str]) -> NodeHandle {
+    follow_paragraphs(store);
     // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
     // toolbar"), and has nothing to act on while that pane holds no document
     // or one this device may only read.

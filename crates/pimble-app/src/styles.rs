@@ -509,6 +509,16 @@ pub(crate) const APP_CSS: &str = "
     width: auto;
     padding: 0 8px;
 }
+/* One of two named choices (the picker's Paragraphs row), not an absence. */
+.pimble-swatch--choice {
+    border-style: solid;
+}
+/* The chosen one of those, None and Default included: `--none`'s border
+   comes after `--active`'s and would otherwise hide which is chosen. */
+.pimble-swatch--none.pimble-swatch--active {
+    border-color: var(--rinch-color-text);
+    color: var(--rinch-color-text);
+}
 .pimble-icon-choice {
     width: 32px;
     height: 32px;
@@ -2615,6 +2625,18 @@ pub(crate) const APP_CSS: &str = "
 .pimble-editor__content-wrap > [data-pm-editor] img {
     max-width: 100%;
     height: auto;
+}
+
+/* Paragraph spacing (docs/PARAGRAPHS_CONTRACT.md): a note is compact unless it
+   says spaced, so Enter starts the next line with no gap; a spaced note keeps
+   rinch's gap after each paragraph. Headings, quotes, code blocks and tables
+   keep their own margins either way. Only how it is drawn: the paragraphs are
+   the same paragraphs. */
+.pimble-editor__content-wrap > [data-pm-editor] p {
+    margin: 0;
+}
+.pimble-editor__content-wrap--spaced > [data-pm-editor] p {
+    margin: 0 0 0.75em;
 }
 
 .editor-toolbar {

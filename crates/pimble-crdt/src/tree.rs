@@ -346,12 +346,31 @@ impl Tree {
         if self.docs.get(&id).is_some_and(NodeDoc::is_initialised) {
             return Err(CrdtError::Serialization(format!("node {id} already exists")));
         }
+        let inherited = self.inherited_from(parent);
         let mut edit = TreeEdit::default();
         let doc = self.docs.entry(id).or_default();
-        let (_, update) = doc.edit(|d, txn| d.write_init(txn, node_type, title, Some(parent), now))?;
+        let (_, update) = doc.edit(|d, txn| {
+            d.write_init(txn, node_type, title, Some(parent), now)?;
+            for (key, value) in &inherited {
+                d.write_custom(txn, key, value, now)?;
+            }
+            Ok(())
+        })?;
         edit.push(id, update);
         edit.push(parent, self.list_edit(parent, |d, txn| d.list_place(txn, place, id))?);
         Ok(edit)
+    }
+
+    /// What a node made under `parent` copies from it
+    /// (`pimble_core::custom_keys::INHERITED`: how its paragraphs are drawn,
+    /// docs/PARAGRAPHS_CONTRACT.md). Copied once, when the node is made: a
+    /// parent changed later changes none of its children.
+    fn inherited_from(&self, parent: NodeId) -> Vec<(String, serde_json::Value)> {
+        let Some(fields) = self.docs.get(&parent).and_then(|doc| doc.fields().ok()) else { return Vec::new() };
+        pimble_core::custom_keys::INHERITED
+            .iter()
+            .filter_map(|key| fields.custom.get(*key).map(|value| (key.to_string(), value.clone())))
+            .collect()
     }
 
     /// [`Tree::add_node`] for a document that already has content (the importer).
@@ -374,6 +393,9 @@ impl Tree {
             return Err(CrdtError::Serialization(format!("node {id} is already held")));
         }
         doc.init(node_type, title, Some(parent), now)?;
+        for (key, value) in self.inherited_from(parent) {
+            doc.set_custom(&key, &value, now)?;
+        }
         let mut edit = TreeEdit::default();
         edit.push(id, Some(doc.save()));
         self.docs.insert(id, doc);
@@ -1508,6 +1530,38 @@ mod tests {
         apply_edit(&mut b, &edit);
         assert_same(&a, &b);
         assert_eq!(b.get_children(root).unwrap(), vec![child]);
+    }
+
+    /// docs/PARAGRAPHS_CONTRACT.md: a new node draws its paragraphs as its
+    /// parent does, copied once into its own document (so a replica that
+    /// merges the edit sees it too); a later change to the parent changes
+    /// no child.
+    #[test]
+    fn a_new_node_takes_its_parents_paragraph_spacing() {
+        use pimble_core::custom_keys::PARAGRAPHS;
+        let spaced = serde_json::json!(pimble_core::SPACED_PARAGRAPHS);
+        let paragraphs = |t: &Tree, n: NodeId| t.doc(n).unwrap().fields().unwrap().custom.get(PARAGRAPHS).cloned();
+        let (mut a, _) = tree();
+        let mut b = replica_of(&a);
+        let (plain, novel, chapter, scene, notes) = (id(), id(), id(), id(), id());
+        a.add_node(plain, None, Place::Last, "document", "Plain", T1).unwrap();
+        assert_eq!(paragraphs(&a, plain), None, "nothing set anywhere: compact");
+
+        a.add_node(novel, None, Place::Last, "folder", "Novel", T1).unwrap();
+        a.set_custom(novel, PARAGRAPHS, &spaced, T1).unwrap();
+        let edit = a.add_node(chapter, Some(novel), Place::Last, "document", "Chapter", T2).unwrap();
+        assert_eq!(paragraphs(&a, chapter), Some(spaced.clone()));
+        apply_edit(&mut b, &edit);
+        assert_eq!(b.doc(chapter).unwrap().fields().unwrap().custom.get(PARAGRAPHS), Some(&spaced));
+
+        // A document that arrives with content takes it too.
+        a.add_node_with_doc(notes, NodeDoc::new(), Some(novel), Place::Last, "document", "Notes", T2).unwrap();
+        assert_eq!(paragraphs(&a, notes), Some(spaced.clone()));
+
+        a.remove_custom(novel, PARAGRAPHS, T3).unwrap();
+        assert_eq!(paragraphs(&a, chapter), Some(spaced.clone()), "copied, not looked up");
+        a.add_node(scene, Some(chapter), Place::Last, "document", "Scene", T3).unwrap();
+        assert_eq!(paragraphs(&a, scene), Some(spaced));
     }
 
     #[test]

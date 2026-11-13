@@ -243,7 +243,7 @@ fn edit_tag(store: AppStore, s: StoreId, n: NodeId, change: TagEdit) {
         }
         other => other,
     };
-    store.send(BackendCommand::SetNodeAppearance { store_id: s, node_id: n, icon: None, color: None, background: None, tags: Some(change) });
+    store.send(BackendCommand::SetNodeAppearance { store_id: s, node_id: n, icon: None, color: None, background: None, tags: Some(change), paragraphs: None });
 }
 
 /// What the panel shows of a node from its own signal.

@@ -244,7 +244,19 @@ pub mod custom_keys {
     pub const BACKGROUND: &str = "background";
     /// A [`super::ShareMarker`]: this node is a share's root (docs/NODE_DOCUMENT_CONTRACT.md).
     pub const SHARE: &str = "share";
+    /// How the node's paragraphs are drawn: [`super::SPACED_PARAGRAPHS`] (a gap
+    /// between them, for writing a document) or `"compact"` (none, for notes);
+    /// absent is compact (docs/PARAGRAPHS_CONTRACT.md). A new node takes its
+    /// parent's (`INHERITED`).
+    pub const PARAGRAPHS: &str = "paragraphs";
+    /// The keys a new node copies from its parent when it is made.
+    pub const INHERITED: &[&str] = &[PARAGRAPHS];
 }
+
+/// [`custom_keys::PARAGRAPHS`]'s value for a gap between paragraphs.
+pub const SPACED_PARAGRAPHS: &str = "spaced";
+/// [`custom_keys::PARAGRAPHS`]'s value for none, which absent means too.
+pub const COMPACT_PARAGRAPHS: &str = "compact";
 
 /// What a shared node carries in `metadata.custom["share"]`
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). The share is the scope
@@ -330,6 +342,12 @@ impl NodeMetadata {
     /// The custom icon name, if one is set (see [`custom_keys::ICON`]).
     pub fn icon(&self) -> Option<&str> {
         self.custom.get(custom_keys::ICON).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    }
+
+    /// Whether the node's paragraphs have a gap between them
+    /// ([`custom_keys::PARAGRAPHS`]); compact otherwise.
+    pub fn spaced_paragraphs(&self) -> bool {
+        self.custom.get(custom_keys::PARAGRAPHS).and_then(|v| v.as_str()) == Some(SPACED_PARAGRAPHS)
     }
 
     /// The custom colour, if one is set (see [`custom_keys::COLOR`]).

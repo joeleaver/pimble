@@ -229,6 +229,9 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::Sub { label: "Insert", entries: insert_entries(store) },
         // Nodes, where the explorer's "+" makes them: File > New's list.
         MenuEntry::Sub { label: "New", entries: new_entries(store) },
+        // The focused pane's note drawn with no gap between paragraphs, or
+        // with one (docs/PARAGRAPHS_CONTRACT.md): checked while compact.
+        MenuEntry::Check { label: "Compact Paragraphs", shortcut: "", checked: store.compact_paragraphs },
         // docs/SPLIT_CONTRACT.md: Scrivener's keys (Ctrl+K, Ctrl+M).
         MenuEntry::item("Split Note at Caret", crate::shortcuts::chord(crate::shortcuts::SPLIT), move || crate::splitting::split_here(store)),
         MenuEntry::item("Join Note Below", crate::shortcuts::chord(crate::shortcuts::JOIN), move || crate::splitting::join_below(store)),

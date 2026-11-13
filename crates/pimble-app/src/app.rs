@@ -3027,9 +3027,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let (s_id, n_id) = store.appearance_modal_node.get()?;
             store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.background().map(String::from))
         };
+        // How the node's paragraphs are drawn (docs/PARAGRAPHS_CONTRACT.md); a
+        // store row's picker sets its root's, which every new node copies down.
+        let appearance_node_spaced = move || -> bool {
+            let Some((s_id, n_id)) = store.appearance_modal_node.get() else { return false };
+            store.get_node_signal(s_id, n_id).is_some_and(|sig| sig.with(|n| n.metadata.spaced_paragraphs()))
+        };
+        let send_paragraphs = move |spaced: bool| {
+            if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, background: None, tags: None, paragraphs: Some(spaced) });
+            }
+        };
         let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>, background: Option<Option<String>>| {
             if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None });
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None, paragraphs: None });
             }
         };
         let swatches: Vec<NodeHandle> = COLOR_CHOICES
@@ -3095,6 +3106,22 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             "None"
                         }
                         {row_swatches}
+                    }
+                    div { class: "pimble-appearance__label", "Paragraphs" }
+                    div {
+                        class: "pimble-appearance__row",
+                        div {
+                            class: {move || if appearance_node_spaced() { "pimble-swatch pimble-swatch--none pimble-swatch--choice" } else { "pimble-swatch pimble-swatch--none pimble-swatch--choice pimble-swatch--active" }},
+                            title: "No gap between paragraphs: Enter starts the next line",
+                            onclick: move || send_paragraphs(false),
+                            "Compact"
+                        }
+                        div {
+                            class: {move || if appearance_node_spaced() { "pimble-swatch pimble-swatch--none pimble-swatch--choice pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none pimble-swatch--choice" }},
+                            title: "A gap after each paragraph, for writing a document",
+                            onclick: move || send_paragraphs(true),
+                            "Spaced"
+                        }
                     }
                     div { class: "pimble-appearance__label", "Icon" }
                     TextInput {

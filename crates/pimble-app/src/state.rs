@@ -661,6 +661,10 @@ pub struct AppStore {
     /// on this device (`views.rs`); a new field's row is showing (Edit >
     /// "Add Field"); and what the backend last said of the node it shows.
     pub properties_open: Signal<bool>,
+    /// Edit > "Compact Paragraphs": checked while the focused pane's note is
+    /// compact (docs/PARAGRAPHS_CONTRACT.md); choosing it flips the note
+    /// (`pane_view::follow_paragraphs`).
+    pub compact_paragraphs: Signal<bool>,
     pub properties_width: Signal<f32>,
     pub properties_adding_field: Signal<bool>,
     pub properties_context: Signal<Option<crate::properties::Context>>,
@@ -1089,6 +1093,7 @@ impl AppStore {
             appearance_modal_node: Signal::new(None),
             appearance_icon_query: Signal::new(String::new()),
             properties_open: Signal::new(false),
+            compact_paragraphs: Signal::new(true),
             properties_width: Signal::new(crate::properties::DEFAULT_WIDTH),
             properties_adding_field: Signal::new(false),
             properties_context: Signal::new(None),

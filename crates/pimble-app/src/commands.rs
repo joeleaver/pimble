@@ -302,7 +302,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             renamed(ctx, store_id, node_id, edited).await
         }
 
-        C::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
+        C::SetNodeAppearance { store_id, node_id, icon, color, background, tags, paragraphs } => {
             let edited = api
                 .edit(Addr::new(store_id, node_id), move |doc, now| -> Result<(), ApiError> {
                     // `None` leaves a key alone; `Some(None)`, or an empty
@@ -315,6 +315,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                                 doc.remove_custom(key, now)?;
                             }
                         }
+                    }
+                    if let Some(spaced) = paragraphs {
+                        let value = if spaced { pimble_core::SPACED_PARAGRAPHS } else { pimble_core::COMPACT_PARAGRAPHS };
+                        doc.set_custom(custom_keys::PARAGRAPHS, &serde_json::Value::String(value.to_string()), now)?;
                     }
                     // Made on the tags as the document has them now, so a
                     // tag someone else added meanwhile stays.

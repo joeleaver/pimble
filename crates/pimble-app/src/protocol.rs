@@ -144,6 +144,9 @@ pub enum BackendCommand {
         /// docs/PROPERTIES_CONTRACT.md section 4), made on the node's tags as
         /// the edit finds them.
         tags: Option<TagEdit>,
+        /// `Some(true)` for a gap between paragraphs, `Some(false)` for none
+        /// (`custom_keys::PARAGRAPHS`, docs/PARAGRAPHS_CONTRACT.md).
+        paragraphs: Option<bool>,
     },
     DeleteNode { store_id: StoreId, node_id: NodeId },
     /// Split a text node at `at`, a sticky index made at the editor's caret:
