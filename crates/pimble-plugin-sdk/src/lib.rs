@@ -53,6 +53,8 @@ mod selector;
 pub mod wasm;
 
 pub use document::{HostLink, RemoteDocument};
+#[doc(hidden)]
+pub use rustversion;
 pub use pimble_plugin_abi as abi;
 pub use pimble_plugin_abi::guide::{ToolAnswer, ToolRequest};
 
@@ -234,6 +236,9 @@ macro_rules! plugin {
             // Without a reference to `__wasm_call_ctors` the linker treats the module
             // as a command and wraps every export in constructors before and
             // destructors after, which would run libc's exit handlers on each call.
+            // Rust 1.100 links `crt1-reactor.o` into a wasip1 cdylib itself, and its
+            // `_initialize` is this one: defining it again fails to link.
+            #[$crate::rustversion::before(1.100)]
             #[unsafe(no_mangle)]
             pub extern "C" fn _initialize() {
                 unsafe { __wasm_call_ctors() }
