@@ -344,6 +344,13 @@ shared reaches a reader) and `tests/relay.rs` `pictures_go_both_ways_through_the
   it the next time it asks (opening the note, reconnecting). Nothing tells an open note
   that its picture just arrived (as in wave 1, "Not built").
 
+**Verified on the local stack** (2026-11-13, `scripts/local-stack/README.md`, "The
+pictures walk-through"): an owner's picture on a canvas in a shared folder reached both
+members byte for byte, one in an unshared note reached neither; a member's picture
+reached the other member with every owner device off and the owner when it came back;
+the hosted disk held no run of any picture's bytes; and in a member's desktop app both
+canvases opened with their pictures drawn.
+
 ### Left after waves 2 and 3
 
 - A picture whose upload stopped half way (a device that went away mid-send) stays half

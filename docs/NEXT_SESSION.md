@@ -1,5 +1,26 @@
 # Next session: start here
 
+**2026-11-13: pictures replicate (docs/IMAGES_CONTRACT.md waves 2 and 3), on branch
+`claude/exciting-wu-75d655`, not merged or released.** Joe's report: a picture on a canvas
+in a shared node reached the other side as a canvas with no picture.
+- A document's pictures are `NodeDoc::pictures()`: text image atoms and any
+  `pimble-blob:` string under `data` (canvas elements). `crate::pictures` in the server: a
+  per-state-vector cache of them, and a copier beside every link connection that copies
+  what either side lacks, after the reconcile and 400 ms after any change.
+- Plain links: `haveBlobs`/`getBlob`/`putBlob { copy_of }`. A share's member reads a blob a
+  document in its reach names (tombstones too). A transplant copies and renames them.
+- Encrypted: a picture is a vault document `blob-<id>` in 2 MiB chunks under its own data
+  key; never listed to old clients (`vaultListDocs { blobs }`) and never announced. Share
+  upkeep wraps it under each share's key and publishes it (`addScopeBlobs`); a member's
+  upload joins their scope. The relay needed nothing.
+- Tests: `tests/pictures.rs`, `tests/share_pictures.rs`, the relay test, `blobs.rs`;
+  the full server suite is green. The local-stack walk-through passed, in carol's desktop
+  app too.
+- Open: nothing tells an open note its picture arrived (reopen shows it); a half-sent
+  picture is never finished; waves 4 (browser) and 5 (importer, MCP `attach_image`).
+  Moving every device to this version together is wise: an older desktop ignores
+  pictures in vaults, which is safe, but sends none.
+
 **2026-11-13 (session 78e7f30f): v0.22.3 released from `master`.**
 - **Paragraph spacing per note** (docs/PARAGRAPHS_CONTRACT.md): compact unless a note
   says spaced; a new node copies its parent's (`Tree::add_node`), so a store's root is
