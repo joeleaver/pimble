@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pimble_core::{NodeId, StoreId, StoreKind, StoreManifest};
+use pimble_core::{BlobId, NodeId, StoreId, StoreKind, StoreManifest};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -126,6 +126,12 @@ struct ScopesFile {
     /// the server when a member starts one; it only grows.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     discussions: HashMap<NodeId, NodeId>,
+    /// The pictures each scope's documents name (docs/IMAGES_CONTRACT.md
+    /// "Replication"), published by the owner's devices and added to by the
+    /// server when a member uploads one for a node they may write. Only
+    /// grows, until the scope is removed.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    blobs: HashMap<NodeId, HashSet<BlobId>>,
 }
 
 impl ScopesFile {
@@ -388,7 +394,8 @@ impl VaultStore {
     pub async fn remove_scope(&mut self, root: NodeId) -> Result<()> {
         let published = self.scopes.scopes.remove(&root).is_some();
         let unconfirmed = self.scopes.unconfirmed.remove(&root).is_some();
-        if !published && !unconfirmed {
+        let pictures = self.scopes.blobs.remove(&root).is_some();
+        if !published && !unconfirmed && !pictures {
             return Ok(());
         }
         self.write_scopes().await
@@ -406,6 +413,43 @@ impl VaultStore {
             if scope.contains(&parent_id) && !scope.contains(&doc_id) {
                 self.scopes.unconfirmed.entry(*root).or_default().insert(doc_id);
                 changed = true;
+            }
+        }
+        if changed {
+            self.write_scopes().await?;
+        }
+        Ok(changed)
+    }
+
+    /// The pictures a principal scoped to `roots` may read.
+    pub fn scope_blobs(&self, roots: &[NodeId]) -> HashSet<BlobId> {
+        roots.iter().filter_map(|root| self.scopes.blobs.get(root)).flatten().copied().collect()
+    }
+
+    /// Add pictures to `root`'s scope (the owner's publish), and persist
+    /// when that adds anything. Returns whether it did.
+    pub async fn add_scope_blobs(&mut self, root: NodeId, blobs: impl IntoIterator<Item = BlobId>) -> Result<bool> {
+        let set = self.scopes.blobs.entry(root).or_default();
+        let before = set.len();
+        set.extend(blobs);
+        let changed = set.len() != before;
+        if set.is_empty() {
+            self.scopes.blobs.remove(&root);
+        }
+        if changed {
+            self.write_scopes().await?;
+        }
+        Ok(changed)
+    }
+
+    /// A scoped member uploaded `blob` for `node_id`, a node they may write:
+    /// it joins every one of the member's scopes (`roots`) that holds the
+    /// node. Returns whether any scope changed.
+    pub async fn extend_scope_blobs(&mut self, roots: &[NodeId], node_id: NodeId, blob: BlobId) -> Result<bool> {
+        let mut changed = false;
+        for root in roots {
+            if self.scope_union(&[*root]).contains(&node_id) {
+                changed |= self.scopes.blobs.entry(*root).or_default().insert(blob);
             }
         }
         if changed {

@@ -86,6 +86,26 @@ pub async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: Nod
         .expect("seed content applies");
 }
 
+/// Put the picture `url` on `node_id`'s canvas the way the app does (an
+/// element of kind picture in `data.board`), so it names the blob as a
+/// canvas does and not as text does.
+#[allow(dead_code)]
+pub async fn put_on_canvas(client: &PimbleClient, store_id: StoreId, node_id: NodeId, url: &pimble_core::BlobUrl) {
+    use pimble_board::{Board, Geom, Kind, NewElement, PictureGeom, Rect, Stamp};
+    let node = client.get_node(store_id, node_id).await.expect("the node is there");
+    let doc = NodeDoc::load(&node.content).expect("its document loads");
+    let before = doc.state_vector();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let board = Board::of_node(&doc);
+    if !board.exists() {
+        board.create(Stamp::new(None, &now)).expect("a canvas");
+    }
+    let geom = Geom::Picture(PictureGeom { rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 80.0 }, src: url.to_string(), px_w: 100, px_h: 80, crop: None });
+    board.add_element(Stamp::new(None, &now), NewElement::new(Kind::Picture, geom)).expect("a picture on it");
+    let changes = base64::engine::general_purpose::STANDARD.encode(doc.diff_since(&before).unwrap());
+    client.apply_edit(store_id, node_id, "canvas", EditOperation::IncrementalChanges { changes }).await.expect("the canvas edit applies");
+}
+
 /// How often a test device's key sweep runs, in place of the minute.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(1);
 

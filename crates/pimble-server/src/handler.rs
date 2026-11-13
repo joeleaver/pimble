@@ -50,12 +50,12 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_core::{AuthMethod, BlobId, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
     OpenInAppRequest, OpenInAppResponse,
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
-    GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
+    GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest, PresenceFrame, PresenceWho, PublishPresenceRequest, GetPresenceResponse, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
@@ -68,7 +68,7 @@ use pimble_rpc::{
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     BacklinksRequest, BacklinksResponse, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
-    GetScopesRequest, GetScopesResponse, Scope, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
+    AddScopeBlobsRequest, GetScopesRequest, GetScopesResponse, Scope, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
     VaultDocKeys, VaultSetDocKeysRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
@@ -989,7 +989,7 @@ fn named_by(kind: &StoreChangeKind) -> Named {
             None => Named::Nobodys,
         },
         StoreChangeKind::VaultAppended { doc_id: VaultDocId::Node(node_id), .. } => Named::Document { id: *node_id, others: Vec::new() },
-        StoreChangeKind::VaultAppended { doc_id: VaultDocId::Tree, .. } => Named::Nobodys,
+        StoreChangeKind::VaultAppended { doc_id: VaultDocId::Tree | VaultDocId::Blob(_), .. } => Named::Nobodys,
         // `SharesEnded` names roots, and says of them only that they are
         // not this device's to show any more; it is sent on a share's
         // replica, to the app whose replica it is.
@@ -1084,6 +1084,9 @@ pub struct RpcHandler {
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The Pimble windows hearing `openInApp`, oldest first.
     app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// Which pictures each document names, per its state vector
+    /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
+    pictures: Arc<crate::pictures::PictureRefs>,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1181,6 +1184,7 @@ impl RpcHandler {
             presence: Arc::new(crate::presence::PresenceHub::new()),
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
             app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pictures: Arc::new(crate::pictures::PictureRefs::default()),
         }
     }
 
@@ -1374,21 +1378,22 @@ impl RpcHandler {
     }
 
     /// The blobs of `store_id`, once `principal` is found to be allowed to
-    /// read them.
-    async fn blobs_for_read(&self, principal: &Principal, store_id: StoreId) -> Result<BlobStore, ErrorObjectOwned> {
+    /// read them, and which of `ids` it may: all of them for the operator and
+    /// whole-store readers; for a share's member, those a document it may
+    /// read names (docs/IMAGES_CONTRACT.md "Who may read a blob": tombstones
+    /// count, so "Put Back" brings a picture back with its text).
+    async fn blobs_for_read(&self, principal: &Principal, store_id: StoreId, ids: &[BlobId]) -> Result<(BlobStore, HashSet<BlobId>), ErrorObjectOwned> {
         authorize(principal, store_id, Access::Read)?;
         self.reject_if_vault(store_id).await?;
-        // TODO(images wave 2): a blob is readable by whoever may read a node
-        // whose text names it (docs/IMAGES_CONTRACT.md "Who may read a
-        // blob"): judge a scoped principal by an index `blob id ->
-        // referencing nodes` and `Reach`, tombstones included. Until that
-        // index exists a share's member is refused outright, since a blob id
-        // alone says nothing about which share it belongs to.
-        if scope_roots_of(principal, store_id, Access::Read).is_some() {
-            // The sentence is the whole message, as a reader's refusal is.
-            return Err(ErrorObjectOwned::owned(pimble_rpc::RpcError::Forbidden(String::new()).code(), BLOBS_IN_SHARES_REFUSAL, None::<()>));
-        }
-        self.store_manager.read().await.blobs(store_id).map_err(to_rpc_error)
+        let (blobs, reach) = {
+            let manager = self.store_manager.read().await;
+            (manager.blobs(store_id).map_err(to_rpc_error)?, Reach::of(&manager, principal, store_id))
+        };
+        let readable = match reach {
+            None => ids.iter().copied().collect(),
+            Some(reach) => self.readable_pictures(store_id, &reach.readable, ids).await,
+        };
+        Ok((blobs, readable))
     }
 
     // ── Scoped grants and read-only replicas (docs/NODE_DOCUMENT_CONTRACT.md
@@ -1467,6 +1472,15 @@ impl RpcHandler {
         match doc_id {
             VaultDocId::Node(id) => reach.require(*id, needed),
             VaultDocId::Tree => Err(no_grant_for_document_error()),
+            // A picture is read by whoever's scope holds it; nobody scoped
+            // writes one already there (it never changes).
+            VaultDocId::Blob(blob) => {
+                let roots = scope_roots_of(principal, store_id, Access::Read).unwrap_or_default();
+                match needed {
+                    Access::Read if manager.vault_scope_blobs(store_id, &roots).contains(blob) => Ok(()),
+                    _ => Err(no_grant_for_document_error()),
+                }
+            }
         }
     }
 
@@ -1514,6 +1528,11 @@ impl RpcHandler {
     /// state vectors, diffs) alongside the handler's own
     /// [`RpcHandler::apply_node_update_from`] (used to actually merge,
     /// persist, broadcast, and index a remote change).
+    /// Which pictures each document names (see [`crate::pictures`]).
+    pub(crate) fn picture_refs(&self) -> &crate::pictures::PictureRefs {
+        &self.pictures
+    }
+
     pub(crate) fn store_manager_handle(&self) -> Arc<RwLock<StoreManager>> {
         Arc::clone(&self.store_manager)
     }
@@ -2844,6 +2863,8 @@ impl PimbleApiServer for RpcHandler {
         let mut joins_scopes: Option<(Vec<NodeId>, NodeId, NodeId)> = None;
         // A new discussion, and the node it is on: joins the discussion set.
         let mut new_discussion: Option<(NodeId, NodeId)> = None;
+        // A member's new picture, the node naming it, and their roots.
+        let mut joins_blob_scopes: Option<(Vec<NodeId>, NodeId, BlobId)> = None;
         let scoped = Reach::of(&manager, &principal, request.store_id);
         let held = manager.vault_has_doc(request.store_id, &request.doc_id.as_str()).map_err(to_rpc_error)?;
         match (&scoped, &request.doc_id) {
@@ -2869,6 +2890,27 @@ impl PimbleApiServer for RpcHandler {
                 }
                 _ => return Err(no_grant_for_document_error()),
             },
+            // A member's picture (docs/IMAGES_CONTRACT.md "Replication"):
+            // written by an editor of the node that names it, which joins
+            // it to every scope of theirs holding that node. A picture never
+            // changes, so the only appends are its uploader's chunks: the
+            // first creates it, and later ones are taken only while it is in
+            // the member's scope (one already there that is not is refused
+            // like any other document).
+            (Some(reach), VaultDocId::Blob(blob)) => {
+                let roots = scope_roots_of(&principal, request.store_id, Access::Read).unwrap_or_default();
+                if held {
+                    if !manager.vault_scope_blobs(request.store_id, &roots).contains(blob) {
+                        return Err(no_grant_for_document_error());
+                    }
+                    authorize(&principal, request.store_id, Access::Write)?;
+                } else {
+                    let Some(node_id) = request.parent_id else { return Err(no_grant_for_document_error()) };
+                    authorize(&principal, request.store_id, Access::Write)?;
+                    reach.require(node_id, Access::Write)?;
+                    joins_blob_scopes = Some((roots, node_id, *blob));
+                }
+            }
             (Some(_), _) => return Err(no_grant_for_document_error()),
             // The whole store: an editor writes anything; a commenter a
             // discussion, held or new.
@@ -2930,7 +2972,17 @@ impl PimbleApiServer for RpcHandler {
         if let Some(discussion) = new_discussion {
             manager.vault_add_discussions(request.store_id, vec![discussion]).await.map_err(to_rpc_error)?;
         }
+        if let Some((roots, node_id, blob)) = joins_blob_scopes {
+            manager.vault_extend_scope_blobs(request.store_id, &roots, node_id, blob).await.map_err(to_rpc_error)?;
+        }
         drop(manager);
+
+        // A picture is never announced: nobody holds one open, every reader
+        // fetches it when a document names it, and a client from before
+        // pictures replicated could not read the notification.
+        if matches!(request.doc_id, VaultDocId::Blob(_)) {
+            return Ok(VaultAppendResponse { seq });
+        }
 
         // The blob rides the notification verbatim (still base64url) so a
         // live subscriber never re-fetches; `source_client_id` carries the
@@ -3022,16 +3074,22 @@ impl PimbleApiServer for RpcHandler {
         let epoch = manager.vault_epoch(request.store_id).ok();
         // A scoped member is listed its scope and nothing else: the list is
         // how a recipient's replica learns which documents exist at all.
-        let scope = scope_roots_of(&principal, request.store_id, Access::Read).map(|roots| scope_set(&manager, request.store_id, &roots));
+        let roots = scope_roots_of(&principal, request.store_id, Access::Read);
+        let scope = roots.as_ref().map(|roots| scope_set(&manager, request.store_id, roots));
+        let pictures = roots.as_ref().map(|roots| manager.vault_scope_blobs(request.store_id, roots));
 
         Ok(VaultListDocsResponse {
             docs: docs
                 .into_iter()
                 .filter_map(|doc| {
                     let doc_id = VaultDocId::parse(&doc.doc_id)?;
-                    if let Some(scope) = &scope {
+                    if matches!(doc_id, VaultDocId::Blob(_)) && !request.blobs {
+                        return None;
+                    }
+                    if let (Some(scope), Some(pictures)) = (&scope, &pictures) {
                         match &doc_id {
                             VaultDocId::Node(id) if scope.contains(id) => {}
+                            VaultDocId::Blob(blob) if pictures.contains(blob) => {}
                             _ => return None,
                         }
                     }
@@ -3598,6 +3656,21 @@ impl PimbleApiServer for RpcHandler {
         Ok(EmptyResponse {})
     }
 
+    async fn add_scope_blobs(&self, ext: &Extensions, request: AddScopeBlobsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_owner(&principal_of(ext), request.store_id, "addScopeBlobs")?;
+        let mut manager = self.store_manager.write().await;
+        match manager.store_kind(request.store_id) {
+            Some(StoreKind::Vault) => {}
+            // A plain store judges a picture by the documents that name it.
+            Some(StoreKind::Plain) => return Ok(EmptyResponse {}),
+            None => return Err(to_rpc_error(StoreError::NotOpen(request.store_id))),
+        }
+        if manager.vault_add_scope_blobs(request.store_id, request.root, request.blob_ids).await.map_err(to_rpc_error)? {
+            debug!("Scope {} of store {}: pictures added", request.root, request.store_id);
+        }
+        Ok(EmptyResponse {})
+    }
+
     async fn get_scopes(&self, ext: &Extensions, request: GetScopesRequest) -> Result<GetScopesResponse, ErrorObjectOwned> {
         authorize_owner(&principal_of(ext), request.store_id, "getScopes")?;
 
@@ -3789,6 +3862,7 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         drop(manager);
+        self.pictures.forget_store(request.store_id);
 
         // Clean up subscriptions for this store
         self.subscriptions.write().await.remove_store(request.store_id);
@@ -5081,12 +5155,24 @@ impl PimbleApiServer for RpcHandler {
         // The whole picture in one message is written in one step; anything
         // else is a chunk of an upload the store assembles and only names
         // once it is whole.
+        // A copy (`copy_of`) keeps the id it was minted with elsewhere; a
+        // copy whose store is not the node's (through a mount) is refused,
+        // since the id would then name a picture in the wrong store.
+        if request.copy_of.is_some() && store_id != request.store_id {
+            return Err(to_rpc_error("A picture is copied only into the store it was made in."));
+        }
         let (id, received, complete) = if request.blob_id.is_none() && request.offset == 0 && total == len {
-            let id = blobs.put(&request.mime, bytes).await.map_err(to_rpc_error)?;
+            let id = match request.copy_of {
+                Some(id) => {
+                    blobs.put_as(id, &request.mime, bytes).await.map_err(to_rpc_error)?;
+                    id
+                }
+                None => blobs.put(&request.mime, bytes).await.map_err(to_rpc_error)?,
+            };
             (id, len, true)
         } else {
             let upload = blobs
-                .upload_chunk(request.blob_id, &request.mime, total, request.offset, bytes)
+                .upload_chunk_as(request.blob_id, request.copy_of.filter(|_| request.blob_id.is_none()), &request.mime, total, request.offset, bytes)
                 .await
                 .map_err(to_rpc_error)?;
             (upload.id, upload.received, upload.complete)
@@ -5104,7 +5190,10 @@ impl PimbleApiServer for RpcHandler {
         request: GetBlobRequest,
     ) -> Result<GetBlobResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        let blobs = self.blobs_for_read(&principal, request.store_id).await?;
+        let (blobs, readable) = self.blobs_for_read(&principal, request.store_id, &[request.blob_id]).await?;
+        if !readable.contains(&request.blob_id) {
+            return Err(no_grant_for_document_error());
+        }
 
         // Read whole and checked against its hash for every chunk asked for:
         // a blob is at most 20 MiB, and a chunk of a file that no longer
@@ -5134,8 +5223,12 @@ impl PimbleApiServer for RpcHandler {
         request: HaveBlobsRequest,
     ) -> Result<HaveBlobsResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        let blobs = self.blobs_for_read(&principal, request.store_id).await?;
-        Ok(HaveBlobsResponse { missing: blobs.missing(&request.ids).await })
+        // A picture this principal may not read is not reported missing:
+        // whether a store holds one says nothing to someone who cannot read
+        // it, and nobody should be asked to send it.
+        let (blobs, readable) = self.blobs_for_read(&principal, request.store_id, &request.ids).await?;
+        let asked: Vec<BlobId> = request.ids.iter().copied().filter(|id| readable.contains(id)).collect();
+        Ok(HaveBlobsResponse { missing: blobs.missing(&asked).await })
     }
 
     async fn publish_presence(&self, ext: &Extensions, request: PublishPresenceRequest) -> Result<EmptyResponse, ErrorObjectOwned> {

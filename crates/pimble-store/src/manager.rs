@@ -400,6 +400,25 @@ impl StoreManager {
         store.extend_scopes(roots, parent_id, doc_id).await
     }
 
+    /// The pictures a principal scoped to `roots` may read (see
+    /// [`VaultStore::scope_blobs`]). Empty for a store that is not a vault.
+    pub fn vault_scope_blobs(&self, store_id: StoreId, roots: &[NodeId]) -> HashSet<pimble_core::BlobId> {
+        self.vault_stores.get(&store_id).map(|s| s.scope_blobs(roots)).unwrap_or_default()
+    }
+
+    /// Add pictures to a scope (see [`VaultStore::add_scope_blobs`]).
+    pub async fn vault_add_scope_blobs(&mut self, store_id: StoreId, root: NodeId, blobs: Vec<pimble_core::BlobId>) -> Result<bool> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.add_scope_blobs(root, blobs).await
+    }
+
+    /// A scoped member uploaded a picture for a node (see
+    /// [`VaultStore::extend_scope_blobs`]).
+    pub async fn vault_extend_scope_blobs(&mut self, store_id: StoreId, roots: &[NodeId], node_id: NodeId, blob: pimble_core::BlobId) -> Result<bool> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.extend_scope_blobs(roots, node_id, blob).await
+    }
+
     /// Close vault store `store_id` and delete its directory
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5: `deleteVaultStore`, the
     /// accounts service deleting a hosted store). Only a store of kind

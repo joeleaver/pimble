@@ -48,6 +48,22 @@ fn collect(node: &ModelNode, path: &str, out: &mut Vec<BlobRef>) {
     }
 }
 
+/// Every string in `value` that is a `pimble-blob:` URL, a fragment after it
+/// allowed (`#canvas=<id>`, as a source can carry), at any depth.
+pub(crate) fn blob_urls_in_json(value: &serde_json::Value, out: &mut std::collections::BTreeSet<BlobUrl>) {
+    match value {
+        serde_json::Value::String(s) => {
+            let bare = s.split('#').next().unwrap_or(s);
+            if let Some(url) = BlobUrl::parse(bare) {
+                out.insert(url);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| blob_urls_in_json(item, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|item| blob_urls_in_json(item, out)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pimble_core::{BlobId, StoreId};
@@ -112,6 +128,47 @@ mod tests {
         assert!(NodeDoc::new().blob_refs().is_empty());
         assert!(NodeDoc::from_blocks(&[Block::plain("words")]).unwrap().blob_refs().is_empty());
         assert!(NodeDoc::blob_refs_of(b"not a document").is_empty());
+    }
+
+    #[test]
+    fn pictures_counts_a_canvas_element_as_a_text_image_does() {
+        let store = StoreId::new();
+        let [in_text, on_canvas, in_plugin] = std::array::from_fn(|_| BlobUrl::new(store, BlobId::new()));
+        let mut doc = NodeDoc::from_blocks(&[Block::paragraph(vec![picture(&in_text, "a"), picture(&in_text, "again")])]).unwrap();
+        doc.set_data(
+            "board",
+            &serde_json::json!({ "elements": { "e1": { "kind": "picture", "geom": { "src": on_canvas.to_string(), "x": 0 } } } }),
+        )
+        .unwrap();
+        doc.set_data("plugin", &serde_json::json!({ "items": [format!("{in_plugin}#canvas=c1"), "pimble-blob:nonsense", 3] })).unwrap();
+        let mut want = vec![in_text, on_canvas, in_plugin];
+        want.sort();
+        assert_eq!(doc.pictures(), want);
+        assert_eq!(NodeDoc::pictures_of(&doc.save()), want);
+    }
+
+    #[test]
+    fn move_pictures_renames_a_stores_pictures_in_the_text_and_on_canvases() {
+        let (from, to, other) = (StoreId::new(), StoreId::new(), StoreId::new());
+        let [a, b, c] = std::array::from_fn(|_| BlobId::new());
+        let mut doc = NodeDoc::from_blocks(&[Block::paragraph(vec![picture(&BlobUrl::new(from, a), "a"), picture(&BlobUrl::new(other, c), "c")])]).unwrap();
+        doc.set_data("board", &serde_json::json!({ "pictures": [BlobUrl::new(from, b).to_string()] })).unwrap();
+        doc.set_data("board:x", &serde_json::json!({ "src": format!("{}#canvas=x", BlobUrl::new(from, a)) })).unwrap();
+        let before = doc.save();
+        assert!(doc.move_pictures(from, to).unwrap().is_some());
+        let mut want = vec![BlobUrl::new(to, a), BlobUrl::new(to, b), BlobUrl::new(other, c)];
+        want.sort();
+        assert_eq!(doc.pictures(), want);
+        assert_eq!(doc.data_json()["board:x"]["src"], serde_json::json!(format!("{}#canvas=x", BlobUrl::new(to, a))));
+        assert_eq!(doc.blob_refs().iter().map(|r| r.alt.as_str()).collect::<Vec<_>>(), vec!["a", "c"], "the atoms keep their alt");
+        // Nothing left to rename: nothing written.
+        assert!(doc.move_pictures(from, to).unwrap().is_none());
+        // The update brings a copy of the document before it to the same place.
+        let mut copy = NodeDoc::load(&before).unwrap();
+        let mut fresh = NodeDoc::load(&before).unwrap();
+        let update = fresh.move_pictures(from, to).unwrap().unwrap();
+        copy.apply_update(&update).unwrap();
+        assert_eq!(copy.pictures(), want);
     }
 
     #[test]

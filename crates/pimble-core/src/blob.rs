@@ -169,7 +169,7 @@ impl<'de> Deserialize<'de> for BlobId {
 /// Where a picture's bytes live: a blob in a store. Always the canonical
 /// store, as in a `pimble:` link, so an image shown through a mount or copied
 /// into another store's text still names where it is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobUrl {
     pub store: StoreId,
     pub blob: BlobId,

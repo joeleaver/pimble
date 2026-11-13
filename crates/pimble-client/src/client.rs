@@ -14,7 +14,7 @@ use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
+    AddScopeBlobsRequest, AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
     CloudHostStoreRequest, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
     CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, CloudStopRelayingRequest, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
@@ -842,6 +842,19 @@ impl PimbleClient {
     /// [`BLOB_CHUNK_BYTES`]; the caller sees one call either way. The server
     /// refuses a picture over `pimble_core::MAX_IMAGE_BYTES` with a sentence.
     pub async fn put_blob(&self, store_id: StoreId, node_id: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl> {
+        self.put_blob_as(store_id, node_id, None, mime, bytes).await
+    }
+
+    /// Copy a picture minted elsewhere into `store_id` under its own id
+    /// (`blob_id`), judged as a write of `node_id`, a node whose document
+    /// names it (docs/IMAGES_CONTRACT.md "Replication"). Nothing is sent
+    /// twice: a server that holds the picture answers the first chunk as
+    /// complete.
+    pub async fn put_blob_copy(&self, store_id: StoreId, node_id: NodeId, blob_id: BlobId, mime: &str, bytes: &[u8]) -> Result<BlobUrl> {
+        self.put_blob_as(store_id, node_id, Some(blob_id), mime, bytes).await
+    }
+
+    async fn put_blob_as(&self, store_id: StoreId, node_id: NodeId, copy_of: Option<BlobId>, mime: &str, bytes: &[u8]) -> Result<BlobUrl> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let whole = bytes.len() <= BLOB_CHUNK_BYTES;
@@ -859,6 +872,7 @@ impl PimbleClient {
                 offset: offset as u64,
                 total: (!whole).then_some(total),
                 blob_id: url.map(|url| url.blob),
+                copy_of: if url.is_none() { copy_of } else { None },
             };
             let response = self.client.put_blob(request).await.map_err(rpc_error)?;
             if response.complete {
@@ -1279,6 +1293,12 @@ impl PimbleClient {
         Ok(())
     }
 
+    /// Add pictures to a share's scope (owner); a scope's pictures only grow.
+    pub async fn add_scope_blobs(&self, store_id: StoreId, root: NodeId, blob_ids: Vec<BlobId>) -> Result<()> {
+        self.client.add_scope_blobs(AddScopeBlobsRequest { store_id, root, blob_ids }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
     /// The store's published scopes.
     pub async fn get_scopes(&self, store_id: StoreId) -> Result<Vec<Scope>> {
         let response = self.client.get_scopes(GetScopesRequest { store_id }).await.map_err(rpc_error)?;
@@ -1356,7 +1376,7 @@ impl PimbleClient {
     pub async fn vault_list_docs(&self, store_id: StoreId) -> Result<Vec<VaultDocInfo>> {
         let response = self
             .client
-            .vault_list_docs(VaultListDocsRequest { store_id })
+            .vault_list_docs(VaultListDocsRequest { store_id, blobs: false })
             .await
             .map_err(rpc_error)?;
         Ok(response.docs)
@@ -1365,7 +1385,13 @@ impl PimbleClient {
     /// [`PimbleClient::vault_list_docs`] with the rest of the answer: the
     /// `epoch` that says which log the sequence numbers belong to.
     pub async fn vault_list_docs_response(&self, store_id: StoreId) -> Result<VaultListDocsResponse> {
-        self.client.vault_list_docs(VaultListDocsRequest { store_id }).await.map_err(rpc_error)
+        self.client.vault_list_docs(VaultListDocsRequest { store_id, blobs: false }).await.map_err(rpc_error)
+    }
+
+    /// [`PimbleClient::vault_list_docs_response`] with pictures' documents
+    /// listed too (`VaultDocId::Blob`), for a client that reads them.
+    pub async fn vault_list_docs_with_blobs(&self, store_id: StoreId) -> Result<VaultListDocsResponse> {
+        self.client.vault_list_docs(VaultListDocsRequest { store_id, blobs: true }).await.map_err(rpc_error)
     }
 
     // ========================================================================

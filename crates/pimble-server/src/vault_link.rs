@@ -2119,7 +2119,7 @@ impl LinkSession<'_> {
     pub(crate) fn rekeying(&self) -> Vec<NodeId> {
         self.progress.file.rekeying.iter().filter_map(|doc| match VaultDocId::parse(doc)? {
             VaultDocId::Node(id) => Some(id),
-            VaultDocId::Tree => None,
+            VaultDocId::Tree | VaultDocId::Blob(_) => None,
         }).collect()
     }
 

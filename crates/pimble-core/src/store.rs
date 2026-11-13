@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::NodeId;
 
 /// Unique identifier for a store
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StoreId(pub Uuid);
 
 impl StoreId {
