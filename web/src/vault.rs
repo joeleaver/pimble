@@ -81,7 +81,7 @@ use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_api::ApiError;
 use pimble_client::{ClientError, PimbleClient};
 use pimble_core::{
-    node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    node_types, BlobId, BlobUrl, DeletedNode, LeftShare, LinkResolution, Node, NodeId, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{derive_changes, move_order, DocShape, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{Blob, KeyId, SymmetricKey};
@@ -604,6 +604,10 @@ pub struct VaultClient {
     pub(crate) writer: Option<String>,
     /// The changes plugins made, for [`VaultClient::pump`] to show.
     by_plugins: Vec<pimble_api::StoreChange>,
+    /// Pictures this page has decrypted or put, by store and blob
+    /// (docs/IMAGES_CONTRACT.md wave 4): a blob never changes, so one read is
+    /// enough for the page's life. The app's own loader keeps the shown ones.
+    pictures: HashMap<(StoreId, BlobId), (String, Vec<u8>)>,
 }
 
 /// The kind a change of one document is heard as through the API: one that
@@ -644,6 +648,59 @@ impl VaultClient {
             watchers: HashMap::new(),
             writer: None,
             by_plugins: Vec::new(),
+            pictures: HashMap::new(),
+        }
+    }
+
+    // ── Pictures (docs/IMAGES_CONTRACT.md, wave 4) ─────────────────────────
+
+    /// Put a picture for `node_id`'s text or canvas: a new vault document
+    /// `blob-<id>`, its entries under a fresh data key wrapped under every
+    /// scope key this page holds that covers the node (as a new document's
+    /// is), the first naming the node, which is what admits a share
+    /// member's upload. The page keeps the bytes, so it shows at once.
+    pub async fn put_picture(&mut self, wire: &dyn VaultWire, store_id: StoreId, node_id: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(|| ApiError::not_found(format!("store {store_id} is not open here")))?;
+        let blob = BlobId::new();
+        let scope_key_ids = store.scope_key_ids_for(node_id);
+        let (dek_id, dek, keys) = protocol::new_picture_key(store_id, blob, &scope_key_ids, &store.keys.scope)
+            .ok_or_else(|| ApiError::refused("This page holds no key to put a picture in this store with yet."))?;
+        let mut keys = Some(keys);
+        for chunk in protocol::picture_chunks(mime, bytes) {
+            let sealed = protocol::seal_picture(store_id, blob, dek_id, &dek, &chunk);
+            let first = keys.is_some();
+            wire.append(store_id, VaultDocId::Blob(blob), sealed, Some(self.client_id.clone()), first.then_some(node_id), None, keys.take())
+                .await
+                .map_err(|e| ApiError::store_error(e.to_string()))?;
+        }
+        self.pictures.insert((store_id, blob), (mime.to_string(), bytes.to_vec()));
+        Ok(BlobUrl::new(store_id, blob))
+    }
+
+    /// Forget the pictures this page holds (a test of reading one back).
+    #[cfg(test)]
+    pub(crate) fn forget_pictures(&mut self) {
+        self.pictures.clear();
+    }
+
+    /// A picture of `store_id`: the page's copy, or fetched and decrypted
+    /// through `wire`. "This picture has not arrived yet." while it is not
+    /// there whole, or not readable with a key this page holds: the app asks
+    /// again when the note opens and when the connection comes back.
+    pub async fn get_picture(&mut self, wire: Option<&dyn VaultWire>, store_id: StoreId, blob: BlobId) -> Result<(String, Vec<u8>), ApiError> {
+        if let Some(picture) = self.pictures.get(&(store_id, blob)) {
+            return Ok(picture.clone());
+        }
+        let not_here = || ApiError::not_found(pimble_rpc::BLOB_NOT_HERE);
+        let wire = wire.ok_or_else(not_here)?;
+        let store = self.stores.get(&store_id).ok_or_else(not_here)?;
+        let fetched = wire.fetch(store_id, VaultDocId::Blob(blob), 0).await.map_err(|_| not_here())?;
+        match protocol::open_picture(store_id, blob, &fetched, &store.keys.scope) {
+            Ok(Some(picture)) => {
+                self.pictures.insert((store_id, blob), picture.clone());
+                Ok(picture)
+            }
+            _ => Err(not_here()),
         }
     }
 
@@ -3304,6 +3361,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetStoreSync { store_id, .. }
         | GetStoreSync { store_id }
         | PutBlob { store_id, .. }
+        | StorePicture { store_id, .. }
         | RemoveReplica { store_id, .. }
         | PublishPresence { store_id, .. }
         | SubscribePresence { store_id } => *store_id,

@@ -63,6 +63,30 @@ impl Format {
     }
 }
 
+/// A picture found in what is imported (docs/IMAGES_CONTRACT.md wave 5): its
+/// bytes, and its type as one of the image types a store keeps. Its place in
+/// the blocks is an image whose `src` is [`picture_src`] of its index in
+/// [`Imported::pictures`]; the writer stores it as a blob and makes it a
+/// canvas in the text, as any picture put in text is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// What an imported picture's `src` is until the writer stores it.
+pub const PICTURE_SCHEME: &str = "pimble-import:";
+
+/// The `src` of the picture at `index` of a node's [`Imported::pictures`].
+pub fn picture_src(index: usize) -> String {
+    format!("{PICTURE_SCHEME}{index}")
+}
+
+/// The index an imported picture's `src` names, when it is one.
+pub fn picture_index(src: &str) -> Option<usize> {
+    src.strip_prefix(PICTURE_SCHEME)?.parse().ok()
+}
+
 /// One node of an import, and the nodes beneath it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Imported {
@@ -77,6 +101,8 @@ pub struct Imported {
     /// `#rrggbb`, for the whole row in the tree.
     pub background: Option<String>,
     pub tags: Vec<String>,
+    /// The pictures its blocks name, by index ([`picture_src`]).
+    pub pictures: Vec<Picture>,
     pub children: Vec<Imported>,
 }
 
@@ -90,6 +116,7 @@ impl Imported {
             color: None,
             background: None,
             tags: Vec::new(),
+            pictures: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -106,6 +133,11 @@ impl Imported {
     /// Whether any block has text in it.
     pub fn has_text(&self) -> bool {
         self.blocks.iter().any(|b| !b.plain_text().trim().is_empty())
+    }
+
+    /// Whether there is anything to write in its content: text, or a picture.
+    pub fn has_content(&self) -> bool {
+        self.has_text() || !self.pictures.is_empty()
     }
 }
 
@@ -124,11 +156,12 @@ pub fn import(format: Format, name: &str, files: &Files) -> Result<Imported> {
                     if !bytes.starts_with(b"{\\rtf") {
                         bail!("\"{name}\" is not an RTF file.");
                     }
-                    rtf::rtf_to_blocks(bytes)
+                    rtf::rtf_to_document(bytes)
                 }
-                _ => docx::docx_to_blocks(bytes).map_err(|e| anyhow::anyhow!("\"{name}\" could not be read as a Word document: {e}"))?,
+                _ => docx::docx_to_document(bytes).map_err(|e| anyhow::anyhow!("\"{name}\" could not be read as a Word document: {e}"))?,
             };
-            Ok(Imported::document(title, blocks))
+            let (blocks, pictures) = blocks;
+            Ok(Imported { pictures, ..Imported::document(title, blocks) })
         }
     }
 }

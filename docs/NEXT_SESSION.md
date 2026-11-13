@@ -8,7 +8,9 @@ showing "Node not found"; read his log after he updates (nico-top, read-only, er
 
 **2026-11-13: pictures replicate (docs/IMAGES_CONTRACT.md waves 2 and 3), released in
 v0.22.5 (hosted server deployed first, jkbase v58).** An open note or canvas asks again
-for a missing picture on a timer (2 s doubling to a minute). Joe's report: a picture on a canvas
+for a missing picture on a timer (2 s doubling to a minute). Waves 4 and 5 (the browser,
+imports), the half-sent fix and a canvas-in-text redraw fix follow on branch
+`claude/exciting-wu-75d655`. Joe's report: a picture on a canvas
 in a shared node reached the other side as a canvas with no picture.
 - A document's pictures are `NodeDoc::pictures()`: text image atoms and any
   `pimble-blob:` string under `data` (canvas elements). `crate::pictures` in the server: a
@@ -24,7 +26,13 @@ in a shared node reached the other side as a canvas with no picture.
   the full server suite is green. The local-stack walk-through passed, in carol's desktop
   app too.
 - A half-sent picture is finished by whichever device holds it whole when it next connects.
-- Open: nothing tells an open note its picture arrived (reopen shows it); waves 4 (browser) and 5 (importer, MCP `attach_image`).
+- Wave 4: the browser puts and shows pictures in encrypted stores (`VaultClient::put_picture`
+  / `get_picture`). Wave 5: RTF, Scrivener and Word imports bring PNG/JPEG (and Word's
+  GIF/WebP) pictures in as canvases in the text (`BackendCommand::StorePicture`); the MCP's
+  `attach_image` is `insert_canvas`/`create_canvas` with a picture file, already built.
+- Open: nothing tells an open note its picture arrived (reopen shows it); the browser
+  refetches pictures after a reload; `\NeXTGraphic`/`.rtfd` and metafile pictures are not
+  imported. See IMAGES_CONTRACT "Left after waves 2 to 5".
   Deploy the hosted server (and the accounts service is unchanged) before or with the
   desktop release: a new desktop against an old hosted server cannot upload a picture (the
   old server cannot read a `blob-` document id) and keeps retrying on its backoff. An older

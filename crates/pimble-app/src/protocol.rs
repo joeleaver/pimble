@@ -239,6 +239,11 @@ pub enum BackendCommand {
     /// pane that asked finds the place the picture was aimed at. Nothing is
     /// written to the node; the insert is an ordinary edit made afterwards.
     PutBlob { store_id: StoreId, node_id: NodeId, bytes: Vec<u8>, request_id: u64 },
+    /// `PutBlob` answered in line rather than beside the command loop: for a
+    /// caller that writes the picture's URL into a document next, such as the
+    /// importer (docs/IMAGES_CONTRACT.md wave 5). Answers `BlobStored` with
+    /// `request_id` 0.
+    StorePicture { store_id: StoreId, node_id: NodeId, bytes: Vec<u8> },
     /// Fetch the picture a `pimble-blob:` URL names, for showing. Answers
     /// `BlobLoaded`.
     GetBlob { url: BlobUrl },

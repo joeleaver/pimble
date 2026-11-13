@@ -352,10 +352,31 @@ mod import_tests {
         let one = c.get_node(store_id, chapters[0].id).await.unwrap();
         assert_eq!(pimble_crdt::NodeDoc::text_of(&one.content).trim(), "First.");
 
+        // A picture in the RTF becomes a canvas in the text holding it, its
+        // bytes a blob of the store (docs/IMAGES_CONTRACT.md wave 5).
+        let mut png = Vec::new();
+        ::image::RgbImage::from_pixel(40, 30, ::image::Rgb([200, 120, 40]))
+            .write_to(&mut std::io::Cursor::new(&mut png), ::image::ImageFormat::Png)
+            .unwrap();
+        let hex: String = png.iter().map(|b| format!("{b:02x}")).collect();
+        let rtf = format!(r"{{\rtf1\ansi Before {{\*\shppict{{\pict\pngblip {hex}}}}} after\par}}");
+        let pictured = Files::from([("Pictured.rtf".to_string(), rtf.into_bytes())]);
+        let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Rtf, "Pictured.rtf", &pictured).await;
+        let BackendEvent::Imported { node_id: pictured, .. } = event else { panic!("{event:?}") };
+        let node = c.get_node(store_id, pictured).await.unwrap();
+        let doc = pimble_crdt::NodeDoc::load(&node.content).unwrap();
+        let named = doc.pictures();
+        assert_eq!(named.len(), 1, "one picture, named by the atom and its canvas");
+        assert_eq!(named[0].store, store_id);
+        assert_eq!(c.get_blob(store_id, named[0].blob).await.unwrap(), ("image/png".to_string(), png));
+        assert_eq!(doc.held_canvases().len(), 1, "a canvas in the text");
+        let md = doc.markdown().unwrap();
+        assert!(md.contains(&format!("{}#canvas=", named[0])) && md.contains("Before") && md.contains("after"), "{md}");
+
         // Something that is not what it says is refused before anything is made.
         let bad = Files::from([("x.rtf".to_string(), b"hello".to_vec())]);
         let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Rtf, "x.rtf", &bad).await;
         assert!(matches!(event, BackendEvent::ImportFailed { .. }), "{event:?}");
-        assert_eq!(c.get_children(store_id, parent).await.unwrap().1.len(), 2);
+        assert_eq!(c.get_children(store_id, parent).await.unwrap().1.len(), 3);
     }
 }

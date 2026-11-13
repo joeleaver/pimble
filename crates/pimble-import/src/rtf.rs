@@ -162,6 +162,8 @@ enum Dest {
     ListTable,
     ListOverrideTable,
     FieldInst,
+    /// A `\pict` group: its hex data is a picture.
+    Pict,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +238,11 @@ struct Interp {
     style_name: String,
     all_bold: bool,
     para_size: Option<i32>,
+    /// The `\pict` being read: its hex digits, and its type when it is one a
+    /// store keeps (`\pngblip`, `\jpegblip`).
+    pict_hex: String,
+    pict_mime: Option<&'static str>,
+    pictures: Vec<crate::Picture>,
 }
 
 impl Interp {
@@ -265,6 +272,9 @@ impl Interp {
             style_name: String::new(),
             all_bold: true,
             para_size: None,
+            pict_hex: String::new(),
+            pict_mime: None,
+            pictures: Vec::new(),
         }
     }
 
@@ -306,7 +316,8 @@ impl Interp {
         // entry inside `\fonttbl`, a level inside `\listtable`); only a group in
         // document text has its own destination to decide.
         let dest = match self.effective_dest() {
-            Dest::Skip | Dest::PendingStar => Dest::Skip,
+            // A group inside a picture (`{\*\blipuid ...}`) is not its data.
+            Dest::Skip | Dest::PendingStar | Dest::Pict => Dest::Skip,
             Dest::Text | Dest::Pending => Dest::Pending,
             table => table,
         };
@@ -332,6 +343,7 @@ impl Interp {
             }
             Dest::FontTable => self.finish_font(),
             Dest::StyleSheet => self.finish_style(),
+            Dest::Pict => self.finish_pict(),
             Dest::Text | Dest::Pending => {
                 // Character formatting changes on the way out: flush what was
                 // written under the closing group's formatting first.
@@ -374,8 +386,16 @@ impl Interp {
                         }
                         Dest::Text
                     }
-                    "info" | "header" | "footer" | "headerl" | "headerr" | "footerl" | "footerr" | "pict"
-                    | "shppict" | "nonshppict" | "listtext" | "pntext" | "footnote" | "annotation" | "object"
+                    // A picture, and the group a modern writer wraps it in
+                    // (whose `\nonshppict` twin, an old format's copy, is skipped).
+                    "pict" => {
+                        self.pict_hex.clear();
+                        self.pict_mime = None;
+                        Dest::Pict
+                    }
+                    "shppict" => Dest::Text,
+                    "info" | "header" | "footer" | "headerl" | "headerr" | "footerl" | "footerr"
+                    | "nonshppict" | "listtext" | "pntext" | "footnote" | "annotation" | "object"
                     | "xe" | "tc" | "themedata" | "colorschememapping" | "datastore" | "latentstyles" | "rsidtbl"
                     | "generator" | "userprops" | "docvar" => Dest::Skip,
                     _ => Dest::Text,
@@ -396,6 +416,9 @@ impl Interp {
                     }
                     "listtable" => Dest::ListTable,
                     "listoverridetable" => Dest::ListOverrideTable,
+                    // `{\*\shppict{\pict ...}}`: a picture, in the wrapper a
+                    // reader that knows it reads (others read `\nonshppict`).
+                    "shppict" => Dest::Text,
                     _ => Dest::Skip,
                 };
                 self.group().dest = dest;
@@ -406,6 +429,11 @@ impl Interp {
 
         match self.effective_dest() {
             Dest::Skip | Dest::FieldInst => {}
+            Dest::Pict => match word {
+                "pngblip" => self.pict_mime = Some("image/png"),
+                "jpegblip" => self.pict_mime = Some("image/jpeg"),
+                _ => {}
+            },
             Dest::FontTable => self.font_table_word(word, param),
             Dest::ColorTable => self.color_table_word(word, param),
             Dest::StyleSheet => {
@@ -547,6 +575,11 @@ impl Interp {
     fn character(&mut self, c: char) {
         match self.effective_dest() {
             Dest::Skip => {}
+            Dest::Pict => {
+                if c.is_ascii_hexdigit() {
+                    self.pict_hex.push(c);
+                }
+            }
             Dest::FieldInst => self.inst.push(c),
             Dest::FontTable => {
                 if c == ';' {
@@ -647,6 +680,21 @@ impl Interp {
     }
 
     /// Turn the pending text into a run carrying the formatting it was written under.
+    /// A `\pict` group ended: a picture of a type a store keeps becomes an
+    /// image where it stood; any other (a metafile, a bitmap) is left out.
+    fn finish_pict(&mut self) {
+        let hex = std::mem::take(&mut self.pict_hex);
+        let Some(mime) = self.pict_mime.take() else { return };
+        let bytes: Vec<u8> = hex.as_bytes().chunks_exact(2).filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()).collect();
+        if bytes.is_empty() {
+            return;
+        }
+        self.flush_run();
+        let index = self.pictures.len();
+        self.pictures.push(crate::Picture { mime, bytes });
+        self.runs.push(Inline::Image(pimble_crdt::Image::new(crate::picture_src(index), "")));
+    }
+
     fn flush_run(&mut self) {
         if self.text.is_empty() {
             return;
@@ -774,11 +822,17 @@ fn is_near_white(hex: &str) -> bool {
 
 /// Convert RTF bytes into the blocks a content document is built from.
 pub fn rtf_to_blocks(rtf: &[u8]) -> Vec<Block> {
+    rtf_to_document(rtf).0
+}
+
+/// The blocks and the pictures they name (`\pict` groups of PNG or JPEG data;
+/// docs/IMAGES_CONTRACT.md wave 5).
+pub fn rtf_to_document(rtf: &[u8]) -> (Vec<Block>, Vec<crate::Picture>) {
     let tokens = tokenize(rtf);
     let mut interp = Interp::new();
     interp.run(&tokens);
-    let Interp { tables, paras, .. } = interp;
-    paras_to_blocks(paras, &tables)
+    let Interp { tables, paras, pictures, .. } = interp;
+    (paras_to_blocks(paras, &tables), pictures)
 }
 
 /// The plain text of the RTF: block texts joined by newlines.
@@ -800,7 +854,8 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
             para.runs.pop();
         }
     }
-    while paras.last().map_or(false, |p| p.end == ParaEnd::Par && para_text(p).trim().is_empty()) {
+    let has_picture = |p: &Para| p.runs.iter().any(|r| matches!(r, Inline::Image(_)));
+    while paras.last().map_or(false, |p| p.end == ParaEnd::Par && para_text(p).trim().is_empty() && !has_picture(p)) {
         paras.pop();
     }
 
@@ -1348,7 +1403,33 @@ mod tests {
     }
 
     #[test]
-    fn tables_are_tables_and_pictures_are_skipped() {
+    fn png_and_jpeg_pictures_become_images_and_a_metafile_is_left_out() {
+        // A PNG (in the modern wrapper, with its old-format twin beside it), a
+        // JPEG on its own, and a metafile nothing here can store.
+        let rtf = br"{\rtf1 \pard before {\*\shppict{\pict{\*\picprop}\picw10\pngblip{\*\blipuid 0011223344556677}89504e470d0a1a0a0102}}{\nonshppict{\pict\wmetafile8 0102}} mid {\pict\jpegblip ffd8ffe0aa} {\pict\emfblip 0102}\par}";
+        let (blocks, pictures) = rtf_to_document(rtf);
+        assert_eq!(pictures.len(), 2, "{pictures:?}");
+        assert_eq!(pictures[0], crate::Picture { mime: "image/png", bytes: vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02] });
+        assert_eq!(pictures[1], crate::Picture { mime: "image/jpeg", bytes: vec![0xff, 0xd8, 0xff, 0xe0, 0xaa] });
+        let Block::Paragraph { runs, .. } = &blocks[0] else { panic!("{blocks:?}") };
+        let srcs: Vec<&str> = runs.iter().filter_map(|i| match i {
+            Inline::Image(image) => Some(image.src.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(srcs, vec!["pimble-import:0", "pimble-import:1"]);
+        assert_eq!(blocks[0].plain_text().split_whitespace().collect::<Vec<_>>(), vec!["before", "mid"]);
+        pimble_crdt::NodeDoc::from_blocks(&blocks).unwrap();
+    }
+
+    #[test]
+    fn a_paragraph_holding_only_a_picture_stays() {
+        let (blocks, pictures) = rtf_to_document(br"{\rtf1 \pard text\par \pard {\pict\pngblip 89504e470d0a1a0a}\par}");
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+    }
+
+    #[test]
+    fn tables_are_tables_and_a_pictures_data_is_never_text() {
         let rtf = br"{\rtf1 \trowd\cellx100\cellx200 \pard\intbl a\cell \pard\intbl b\cell \row \trowd\cellx100\cellx200 \pard\intbl c\par more\cell \pard\intbl\cell \row \pard {\*\shppict{\pict\pngblip 89504e470d}} after\par}";
         let blocks = rtf_to_blocks(rtf);
         let Block::Table { rows } = &blocks[0] else { panic!("{:?}", blocks[0]) };

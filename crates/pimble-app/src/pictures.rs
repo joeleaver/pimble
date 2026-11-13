@@ -38,11 +38,6 @@ use crate::state::AppStore;
 const SCHEME: &str = "pimble-blob";
 
 
-/// What the browser answers for a picture in an encrypted store: pictures in
-/// ciphertext are a later wave (docs/IMAGES_CONTRACT.md, wave 3), and until
-/// then nothing is written.
-pub const ENCRYPTED_IN_BROWSER: &str = "Pictures in encrypted stores are not available in the browser yet.";
-
 /// "Insert Image..." with no note in the focused pane.
 const NO_NOTE: &str = "Open a note to add a picture to it.";
 

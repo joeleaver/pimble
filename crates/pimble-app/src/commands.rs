@@ -651,6 +651,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             None
         }
 
+        C::StorePicture { store_id, node_id, bytes } => {
+            Some(BackendEvent::BlobStored { request_id: 0, result: store_picture(&api, Addr::new(store_id, node_id), bytes).await })
+        }
+
         C::GetBlob { url } => {
             let (api, event_tx, signal_ui) = (api.clone(), ctx.event_tx.clone(), ctx.signal_ui.clone());
             spawn_task(async move {

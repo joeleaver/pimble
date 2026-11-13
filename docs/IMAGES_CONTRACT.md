@@ -7,8 +7,9 @@ end. The app's loader and inserting are built on branch `pictures-ui` (2026-10-0
 merged), for the desktop and for plain stores in the browser: see "Built in wave 1 (app
 side)". Waves 2 and 3 are built (2026-11-13, see "Built in wave 2" and "Built in wave
 3"): pictures replicate to every replica and every share member whose documents name
-them, plain and encrypted, hosted and relayed. Waves 4 and 5 are not: an encrypted store
-in the browser takes and shows no pictures, and the importer brings none.
+them, plain and encrypted, hosted and relayed. Waves 4 and 5 are built too (2026-11-13,
+"Built in wave 4", "Built in wave 5"): the browser puts and shows pictures in encrypted
+stores, and an import brings its pictures in as canvases.
 
 ## The decisions (Joe, 2026-10-01)
 
@@ -362,14 +363,70 @@ reached the other member with every owner device off and the owner when it came 
 the hosted disk held no run of any picture's bytes; and in a member's desktop app both
 canvases opened with their pictures drawn.
 
-### Left after waves 2 and 3
+## Built in wave 4 (the browser, encrypted stores)
+
+Built 2026-11-13. Plain stores in the browser had pictures since wave 1; an encrypted
+one now does too.
+
+- `VaultClient::put_picture` (`web/src/vault.rs`) makes a picture's vault document the way
+  the desktop's vault link does (`pimble_rpc::vault::new_picture_key`, `picture_chunks`,
+  `seal_picture`: a fresh data key wrapped under every scope key the page holds that
+  covers the node, the first entry naming the node), and keeps the bytes for the page's
+  life, so the picture shows at once. `get_picture` answers from that copy or fetches the
+  document and opens it (`open_picture`); a picture not there whole, or not readable yet,
+  is "This picture has not arrived yet.", which the app's loader asks again about when the
+  note opens and when the connection comes back.
+- `VaultBackend::put_blob`/`get_blob` call them; `CAPABILITIES.pictures` is true. The
+  refusal sentence "Pictures in encrypted stores are not available in the browser yet."
+  is gone. Paste, drop and Edit > "Insert Image..." are the app's own, unchanged
+  (`crate::pictures`), and rinch PR 2 was not needed: one `pimble-blob:` scheme loader
+  serves both targets since wave 1.
+- Share upkeep stays the owner's desktop's: a picture a member or the owner puts in the
+  browser is wrapped under the keys the page holds, and an owner's device adds the rest.
+- Test: `web/src/vault_backend/tests.rs`
+  `a_picture_goes_out_encrypted_and_comes_back_from_the_twin`.
+
+## Built in wave 5 (import; the MCP)
+
+Built 2026-11-13.
+
+- **Import** (`pimble-import`): an import's pictures are `Imported::pictures` (`Picture {
+  mime, bytes }`), each named in the blocks by an image whose `src` is
+  `pimble-import:<index>`. RTF (and so Scrivener's `content.rtf`): `\pict` groups with
+  `\pngblip` or `\jpegblip` data, inside `{\*\shppict}` or alone; `\nonshppict` (an old
+  format's copy) and metafiles are left out. Word: each `w:drawing`'s `a:blip r:embed`,
+  or an old `w:pict`'s `v:imagedata r:id`, read from the part its relationship names, when
+  it is a PNG, JPEG, GIF or WebP; its `wp:docPr descr` is the alt text.
+- **Writing** (`pimble-app/src/import.rs`): every picture is stored first with the new
+  `BackendCommand::StorePicture` (the `PutBlob` path, scaling included, answered in line),
+  then the node's blocks go in with each picture as a canvas in the text, as any picture
+  put in text is (docs/CANVAS_CONTRACT.md): `data["board:<id>"]` started from the picture
+  (`BoardTxn::start_canvas`) and the atom naming it (`NodeDoc::adopt_canvas_urls`), in one
+  update. A picture that cannot be stored is left out and the import goes on. It runs the
+  same in the browser, through the router, so an encrypted store's import brings its
+  pictures in as vault documents.
+- Tests: `pimble-import` (`png_and_jpeg_pictures_become_images_and_a_metafile_is_left_out`,
+  `a_paragraph_holding_only_a_picture_stays`,
+  `a_drawings_picture_is_an_image_with_its_description`) and `pimble-app`
+  `import_tests::imports_land_under_the_chosen_node` (an RTF with a PNG, end to end on a
+  real server).
+- **The MCP**: `attach_image` is not a tool of its own. Pictures are canvases
+  (docs/MCP_CONTRACT.md): `insert_canvas` with `picture` (a file) puts a picture in a
+  note's text and `create_canvas` with `picture` makes a canvas node of one, both through
+  the same blob store. That is what this wave asked of the MCP.
+
+### Left after waves 2 to 5
 
 - No notification tells the app a picture arrived; an open note asks again on a timer
   (2 s doubling to a minute) until it does.
+- The browser keeps the pictures it decrypted for the page's life only: a reload fetches
+  them again.
+- Import reads pictures embedded as `\pict` data. A picture a Mac RTF names as a file
+  beside it (`\NeXTGraphic`, an `.rtfd` bundle, what Scrivener on the Mac can write) and a
+  Word picture that is a metafile (`.emf`, `.wmf`) are left out.
 - `haveBlobs`/`vaultListDocs` are asked about every named picture at every look after a
   reconcile (a listing per look on a vault link): fine for hundreds, not measured for tens
   of thousands.
-- Browser (wave 4) and importer/MCP (wave 5), as above.
 
 ## Later
 

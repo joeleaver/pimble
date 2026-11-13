@@ -219,7 +219,7 @@ fn split_canvas_url(src: &str) -> (&str, Option<&str>) {
 /// The inverse of [`with_canvas_urls`]: each picture whose URL names a canvas takes
 /// the id back into `data-board`, its URL as stored. A canvas that began empty
 /// (`pimble-board:in-text`) is only a canvas, so one naming none is refused.
-fn with_canvas_attrs(doc: &Node) -> Result<Node> {
+pub(crate) fn with_canvas_attrs(doc: &Node) -> Result<Node> {
     fn walk(node: &Node, schema: &Schema) -> Result<Node> {
         if node.type_name() == "image" {
             let src = node.attrs().get_str("src").unwrap_or_default();

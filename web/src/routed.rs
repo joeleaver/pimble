@@ -35,6 +35,7 @@ pub fn write_of(cmd: &BackendCommand) -> Option<Write> {
         | MoveNodes { .. }
         | TransplantNode { .. }
         | PutBlob { .. }
+        | StorePicture { .. }
         | CreateMount { .. }
         | MountRemoteStore { .. }
         | SetStoreSync { .. }
@@ -50,6 +51,7 @@ pub fn gate(router: &Router, store: StoreId, cmd: &BackendCommand) -> Option<Bac
     let refusal = router.gate(store, write).err()?;
     Some(match cmd {
         BackendCommand::PutBlob { request_id, .. } => BackendEvent::BlobStored { request_id: *request_id, result: Err(refusal.sentence()) },
+        BackendCommand::StorePicture { .. } => BackendEvent::BlobStored { request_id: 0, result: Err(refusal.sentence()) },
         _ => error_event(refusal),
     })
 }

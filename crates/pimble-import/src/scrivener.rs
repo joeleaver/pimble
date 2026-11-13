@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::rtf::rtf_to_blocks;
+use crate::rtf::rtf_to_document;
 use crate::{Files, Imported};
 
 /// A parsed binder item from the .scrivx file
@@ -241,19 +241,19 @@ fn convert(item: &BinderItem, files: &Files, labels: &HashMap<i32, Label>, displ
     // The item's RTF, as rich blocks: paragraphs with their marks (bold, italic,
     // underline, strike, link, color, highlight, code, sub/superscript),
     // headings, nested bullet and ordered lists, tables, alignment and indent.
-    let blocks = files
+    let (blocks, pictures) = files
         .get(&format!("Files/Data/{}/content.rtf", item.uuid))
-        .map(|rtf| rtf_to_blocks(rtf))
+        .map(|rtf| rtf_to_document(rtf))
         .unwrap_or_default();
 
     let mut node = if is_folder {
         stats.folders += 1;
-        Imported { blocks, ..Imported::folder(&item.title) }
+        Imported { blocks, pictures, ..Imported::folder(&item.title) }
     } else {
         stats.documents += 1;
-        Imported::document(&item.title, blocks)
+        Imported { pictures, ..Imported::document(&item.title, blocks) }
     };
-    if node.has_text() {
+    if node.has_content() {
         stats.with_content += 1;
         stats.count_blocks(&node.blocks);
     } else {

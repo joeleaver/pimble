@@ -30,11 +30,12 @@ use crate::vault::{VaultClient, VaultWire};
 
 /// What an encrypted store can do in the browser: its words are searched in
 /// the page, so there is no index to rebuild and no meaning to search by;
-/// pictures in ciphertext, mounts and sync links are not built for it.
+/// mounts and sync links are not built for it. Pictures are: each is a vault
+/// document of its own, decrypted in the page (docs/IMAGES_CONTRACT.md wave 4).
 pub const CAPABILITIES: StoreCapabilities = StoreCapabilities {
     encrypted: true,
     mounts: false,
-    pictures: false,
+    pictures: true,
     sync_links: false,
     semantic_search: false,
     index_rebuild: false,
@@ -233,12 +234,17 @@ impl Backend for VaultBackend {
         Ok(self.lock().await.backlinks(store, node))
     }
 
-    async fn put_blob(&self, _store: StoreId, _node: NodeId, _mime: &str, _bytes: &[u8]) -> Result<BlobUrl, ApiError> {
-        Err(ApiError::not_available(pimble_app::pictures::ENCRYPTED_IN_BROWSER))
+    /// A picture is a vault document of its own (docs/IMAGES_CONTRACT.md
+    /// "Replication"), encrypted here and appended.
+    async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {
+        let wire = self.wire(store)?;
+        self.lock().await.put_picture(&*wire, store, node, mime, bytes).await
     }
 
-    async fn get_blob(&self, _store: StoreId, _blob: BlobId) -> Result<(String, Vec<u8>), ApiError> {
-        Err(ApiError::not_available(pimble_app::pictures::ENCRYPTED_IN_BROWSER))
+    /// Fetched and decrypted in the page, and kept for its life.
+    async fn get_blob(&self, store: StoreId, blob: BlobId) -> Result<(String, Vec<u8>), ApiError> {
+        let wire = self.wires.wire(store);
+        self.lock().await.get_picture(wire.as_deref(), store, blob).await
     }
 
     // What follows is not this backend's to answer through the trait. A

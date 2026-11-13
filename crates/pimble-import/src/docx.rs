@@ -35,6 +35,13 @@ const NOT_A_DOCX: &str = "This is not a Word document (.docx).";
 
 /// Convert the body of a .docx into the blocks a content document is built from.
 pub fn docx_to_blocks(bytes: &[u8]) -> Result<Vec<Block>> {
+    docx_to_document(bytes).map(|(blocks, _)| blocks)
+}
+
+/// The blocks, and the pictures they name: each drawing's (or old-style
+/// `w:pict`'s) image part, when it is a PNG, JPEG, GIF or WebP
+/// (docs/IMAGES_CONTRACT.md wave 5).
+pub fn docx_to_document(bytes: &[u8]) -> Result<(Vec<Block>, Vec<crate::Picture>)> {
     let archive = Archive::open(bytes).map_err(|_| anyhow!(NOT_A_DOCX))?;
     let main = main_part_name(&archive);
     let document = archive.read(&main).ok().flatten().ok_or_else(|| anyhow!(NOT_A_DOCX))?;
@@ -52,12 +59,15 @@ pub fn docx_to_blocks(bytes: &[u8]) -> Result<Vec<Block>> {
         .map(|el| Numbering::read(&el))
         .unwrap_or_default();
 
-    let Some(body) = document.child("w:body") else { return Ok(Vec::new()) };
+    let Some(body) = document.child("w:body") else { return Ok((Vec::new(), Vec::new())) };
     let walk = |code: bool| {
         let mut walker = Walker {
             styles: &styles,
             numbering: &numbering,
             links: &rels.links,
+            images: &rels.images,
+            archive: &archive,
+            pictures: Vec::new(),
             fields: Vec::new(),
             counters: HashMap::new(),
             code,
@@ -66,13 +76,42 @@ pub fn docx_to_blocks(bytes: &[u8]) -> Result<Vec<Block>> {
         };
         let mut items = Vec::new();
         walker.blocks_in(body, &mut items, false);
-        (items, walker.monospace_chars * 2 > walker.text_chars)
+        let mostly_monospace = walker.monospace_chars * 2 > walker.text_chars;
+        (items, walker.pictures, mostly_monospace)
     };
     // A monospaced run is code, unless most of the document is monospaced: then it
     // is a manuscript typed in Courier, and the font is only how it looks.
-    let (items, mostly_monospace) = walk(true);
-    let items = if mostly_monospace { walk(false).0 } else { items };
-    Ok(items_to_blocks(items))
+    let (items, pictures, mostly_monospace) = walk(true);
+    let (items, pictures) = if mostly_monospace {
+        let (items, pictures, _) = walk(false);
+        (items, pictures)
+    } else {
+        (items, pictures)
+    };
+    Ok((items_to_blocks(items), pictures))
+}
+
+/// The image type a picture part is, by its first bytes: one a store keeps.
+fn sniff_picture(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The first element under `el` (itself included) whose local name is `local`.
+fn descendant<'e>(el: &'e El, local: &str) -> Option<&'e El> {
+    if el.name.rsplit(':').next() == Some(local) {
+        return Some(el);
+    }
+    el.elements().find_map(|child| descendant(child, local))
 }
 
 /// The main document part's name: the package relationship of type `officeDocument`,
@@ -270,6 +309,8 @@ fn int_attr(el: &El, name: &str) -> Option<i64> {
 struct Rels {
     /// Relationship id to hyperlink target.
     links: HashMap<String, String>,
+    /// Relationship id to an image part's name inside the archive.
+    images: HashMap<String, String>,
     /// Relationship type (its last path segment: `styles`, `numbering`, ...) to the
     /// part's name inside the archive.
     parts: HashMap<String, String>,
@@ -285,6 +326,8 @@ impl Rels {
             let kind = kind.rsplit('/').next().unwrap_or(kind);
             if kind == "hyperlink" {
                 rels.links.insert(id.to_string(), target.to_string());
+            } else if kind == "image" && rel.attr("TargetMode") != Some("External") {
+                rels.images.insert(id.to_string(), join(dir, target));
             } else if rel.attr("TargetMode") != Some("External") {
                 rels.parts.entry(kind.to_string()).or_insert_with(|| join(dir, target));
             }
@@ -645,6 +688,11 @@ struct Walker<'a> {
     styles: &'a Styles,
     numbering: &'a Numbering,
     links: &'a HashMap<String, String>,
+    /// Relationship id to image part, and the archive to read them from.
+    images: &'a HashMap<String, String>,
+    archive: &'a Archive<'a>,
+    /// The pictures read so far, in the order their images appear.
+    pictures: Vec<crate::Picture>,
     /// Open complex fields, the innermost last. They span runs and even paragraphs.
     fields: Vec<Field>,
     /// The next number of each `(numId, ilvl)`, so a list interrupted by a paragraph
@@ -834,8 +882,22 @@ impl Walker<'_> {
                 // A line break; a page or column break has nothing to be here.
                 "w:br" if matches!(child.attr("w:type"), None | Some("textWrapping")) => out.push(Inline::HardBreak),
                 "w:cr" => out.push(Inline::HardBreak),
+                // A picture: a drawing's `a:blip`, or an old-style `w:pict`'s
+                // `v:imagedata`, naming an image part by relationship id.
+                "w:drawing" | "w:pict" if self.visible() => {
+                    let found = descendant(child, "blip")
+                        .and_then(|blip| blip.attr("r:embed"))
+                        .or_else(|| descendant(child, "imagedata").and_then(|data| data.attr("r:id")));
+                    let alt = descendant(child, "docPr").and_then(|pr| pr.attr("descr")).unwrap_or_default().to_string();
+                    let bytes = found.and_then(|id| self.images.get(id)).and_then(|part| self.archive.read(part).ok().flatten());
+                    if let Some((bytes, mime)) = bytes.and_then(|bytes| sniff_picture(&bytes).map(|mime| (bytes, mime))) {
+                        let index = self.pictures.len();
+                        self.pictures.push(crate::Picture { mime, bytes });
+                        out.push(Inline::Image(pimble_crdt::Image::new(crate::picture_src(index), alt)));
+                    }
+                }
                 // `w:softHyphen` (invisible unless the line breaks there), symbols in
-                // symbol fonts, drawings, pictures, embedded objects, footnote,
+                // symbol fonts, embedded objects, metafile pictures, footnote,
                 // endnote and comment references: nothing to read.
                 _ => {}
             }
@@ -1157,6 +1219,35 @@ mod tests {
 
     fn docx(body: &str) -> Vec<u8> {
         docx_with(body, None, None, &[])
+    }
+
+    /// A drawing names its image part by relationship id; the picture comes
+    /// back with its description as alt text, where it stood in the text.
+    #[test]
+    fn a_drawings_picture_is_an_image_with_its_description() {
+        let png = b"\x89PNG\r\n\x1a\n-picture-bytes".to_vec();
+        let body = r#"<w:p><w:r><w:t xml:space="preserve">Look: </w:t></w:r><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:docPr id="1" name="Picture 1" descr="a cat"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r><w:r><w:t xml:space="preserve"> there.</w:t></w:r></w:p>"#;
+        let document = format!(r#"<?xml version="1.0"?><w:document {NS}><w:body>{body}</w:body></w:document>"#);
+        let package_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#;
+        let zip = write_zip(
+            &[
+                ("_rels/.rels", package_rels.as_bytes(), false),
+                ("word/_rels/document.xml.rels", rels.as_bytes(), false),
+                ("word/document.xml", document.as_bytes(), true),
+                ("word/media/image1.png", &png, false),
+            ],
+            b"",
+        );
+        let (blocks, pictures) = docx_to_document(&zip).unwrap();
+        assert_eq!(pictures, vec![crate::Picture { mime: "image/png", bytes: png }]);
+        let Block::Paragraph { runs, .. } = &blocks[0] else { panic!("{blocks:?}") };
+        let image = runs.iter().find_map(|i| match i {
+            Inline::Image(image) => Some(image),
+            _ => None,
+        });
+        assert_eq!(image.map(|i| (i.src.as_str(), i.alt.as_str())), Some(("pimble-import:0", "a cat")));
+        assert_eq!(blocks[0].plain_text(), "Look:  there.");
     }
 
     fn runs_of(block: &Block) -> Vec<Run> {

@@ -693,6 +693,20 @@ impl NodeDoc {
         })
     }
 
+    /// Every picture written with its canvas in its URL (`<src>#canvas=<id>`,
+    /// as Markdown writes one) takes the id into its atom's `data-board` and
+    /// keeps the bare URL, the form a canvas in text is stored in
+    /// (docs/CANVAS_CONTRACT.md). Each canvas named must be in `data` already
+    /// (`data["board:<id>"]`). What an importer that built its blocks with
+    /// such URLs calls once the canvases are made. `None` when none was.
+    pub fn adopt_canvas_urls(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.markdown_edit(|_, doc| markdown::with_canvas_attrs(doc)) {
+            Ok(delta) => Ok(Some(delta)),
+            Err(CrdtError::Refused(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// [`NodeDoc::pictures`] of a serialized document.
     pub fn pictures_of(bytes: &[u8]) -> Vec<pimble_core::BlobUrl> {
         Self::load(bytes).map(|doc| doc.pictures()).unwrap_or_default()

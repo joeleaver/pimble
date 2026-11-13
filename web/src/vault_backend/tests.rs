@@ -118,10 +118,85 @@ fn the_vault_behind_a_router_conforms() {
 fn an_encrypted_store_says_what_it_cannot_do() {
     let page = page();
     let caps = page.backend.capabilities(page.store);
-    assert!(caps.encrypted);
-    assert!(!caps.mounts && !caps.pictures && !caps.sync_links && !caps.semantic_search && !caps.index_rebuild);
-    let refused = block_on(page.backend.put_blob(page.store, page.root, "image/png", b"png")).unwrap_err();
-    assert_eq!(refused, ApiError::not_available(pimble_app::pictures::ENCRYPTED_IN_BROWSER));
+    assert!(caps.encrypted && caps.pictures);
+    assert!(!caps.mounts && !caps.sync_links && !caps.semantic_search && !caps.index_rebuild);
+}
+
+/// A twin that keeps what is appended, and the keys a document came with.
+#[derive(Default)]
+struct Twin {
+    docs: Mutex<HashMap<(StoreId, VaultDocId), (Vec<pimble_rpc::VaultEntry>, Option<VaultDocKeys>)>>,
+}
+
+#[async_trait]
+impl VaultWire for Twin {
+    async fn append(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        _client_id: Option<String>,
+        _parent_id: Option<NodeId>,
+        _discussion_host: Option<NodeId>,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64, ClientError> {
+        let mut docs = self.docs.lock().unwrap();
+        let (entries, held) = docs.entry((store_id, doc_id)).or_default();
+        if held.is_none() {
+            *held = keys;
+        }
+        let seq = entries.len() as u64 + 1;
+        entries.push(pimble_rpc::VaultEntry { seq, blob });
+        Ok(seq)
+    }
+
+    async fn snapshot(&self, _store_id: StoreId, _doc_id: VaultDocId, _upto_seq: u64, _blob: String) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
+        let docs = self.docs.lock().unwrap();
+        let (entries, keys) = docs.get(&(store_id, doc_id)).cloned().unwrap_or_default();
+        Ok(VaultFetchResponse { snapshot: None, head: entries.len() as u64, updates: entries.into_iter().filter(|e| e.seq > after_seq).collect(), keys })
+    }
+}
+
+struct TwinTable(Arc<Twin>);
+
+impl WireTable for TwinTable {
+    fn wire(&self, _store: StoreId) -> Option<Arc<dyn VaultWire>> {
+        Some(self.0.clone() as Arc<dyn VaultWire>)
+    }
+}
+
+/// A picture put in the page goes out as a vault document of its own,
+/// encrypted, in chunks; read back from the twin it is the same picture
+/// (docs/IMAGES_CONTRACT.md wave 4).
+#[test]
+fn a_picture_goes_out_encrypted_and_comes_back_from_the_twin() {
+    let mut vault = VaultClient::new("page".to_string());
+    let store = StoreId::new();
+    let root = vault.hold_new_store(store, "Vault");
+    let twin = Arc::new(Twin::default());
+    let backend = VaultBackend::new(vault, Arc::new(TwinTable(twin.clone())));
+
+    let mut picture = b"\x89PNG\r\n\x1a\n".to_vec();
+    picture.extend((0..(pimble_rpc::vault::PICTURE_CHUNK + 300)).map(|i| (i % 253) as u8));
+    let url = block_on(backend.put_blob(store, root, "image/png", &picture)).unwrap();
+    assert_eq!(url.store, store);
+    {
+        let docs = twin.docs.lock().unwrap();
+        let (entries, keys) = &docs[&(store, VaultDocId::Blob(url.blob))];
+        assert_eq!(entries.len(), 2, "in chunks");
+        assert!(keys.is_some(), "with its wraps on the first");
+        let run = &picture[1000..1064];
+        let plain_in = |e: &pimble_rpc::VaultEntry| pimble_rpc::vault::decode_blob(&e.blob).unwrap().windows(run.len()).any(|w| w == run);
+        assert!(!entries.iter().any(plain_in), "ciphertext only");
+    }
+    block_on(backend.vault.lock()).forget_pictures();
+    assert_eq!(block_on(backend.get_blob(store, url.blob)).unwrap(), ("image/png".to_string(), picture));
+    let missing = block_on(backend.get_blob(store, pimble_core::BlobId::new())).unwrap_err();
+    assert_eq!(missing, ApiError::not_found(pimble_rpc::BLOB_NOT_HERE));
 }
 
 // ── The router's word ───────────────────────────────────────────────────────

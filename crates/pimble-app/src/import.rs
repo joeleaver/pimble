@@ -367,11 +367,23 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
         Some(BackendEvent::NodeCreated { node_id, .. }) => node_id,
         other => return Err(unexpected(other)),
     };
+    // Its pictures first, each a blob of the store (docs/IMAGES_CONTRACT.md
+    // wave 5); one that cannot be stored is left out and the rest goes on.
+    let mut stored = Vec::with_capacity(item.pictures.len());
+    for picture in &item.pictures {
+        match runner.run(BackendCommand::StorePicture { store_id, node_id, bytes: picture.bytes.clone() }).await {
+            Some(BackendEvent::BlobStored { result: Ok(blob), .. }) => stored.push(Some(blob)),
+            other => {
+                tracing::warn!("A picture in \"{}\" was left out: {}", item.title, unexpected(other));
+                stored.push(None);
+            }
+        }
+    }
     let content = match runner.run(BackendCommand::GetNode { store_id, node_id }).await {
         Some(BackendEvent::NodeLoaded { node, .. }) => node.content,
         other => return Err(unexpected(other)),
     };
-    let delta = fill(&content, item).map_err(|e| format!("\"{}\" could not be written: {e}", item.title))?;
+    let delta = fill(&content, item, &stored).map_err(|e| format!("\"{}\" could not be written: {e}", item.title))?;
     match runner.run(BackendCommand::ApplyUpdate { store_id, node_id, update: delta }).await {
         Some(BackendEvent::NodeContentUpdated { .. }) => Ok(node_id),
         other => Err(unexpected(other)),
@@ -381,7 +393,7 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
 /// The update that gives a freshly created node's document `item`'s type,
 /// appearance, tags and blocks. Its title came with `CreateNode`, and is
 /// marked as chosen so the tree never retitles it from its first words.
-fn fill(document: &[u8], item: &Imported) -> pimble_crdt::Result<Vec<u8>> {
+fn fill(document: &[u8], item: &Imported, stored: &[Option<crate::protocol::StoredBlob>]) -> pimble_crdt::Result<Vec<u8>> {
     let mut doc = NodeDoc::load(document)?;
     let before = doc.state_vector();
     let now = chrono::Utc::now().to_rfc3339();
@@ -404,10 +416,69 @@ fn fill(document: &[u8], item: &Imported) -> pimble_crdt::Result<Vec<u8>> {
     if !item.tags.is_empty() {
         doc.set_tags(&item.tags, &now)?;
     }
-    if item.has_text() {
-        doc.append_blocks(&item.blocks)?;
+    if item.has_content() {
+        // Each stored picture is a canvas in the text, as any picture put in
+        // text is (docs/CANVAS_CONTRACT.md): the canvas made in `data`, the
+        // image naming it. One not stored is left out.
+        let mut canvases: Vec<(String, &crate::protocol::StoredBlob)> = Vec::new();
+        let blocks = with_pictures(&item.blocks, &mut |index| {
+            let blob = stored.get(index)?.as_ref()?;
+            let id = pimble_board::doc::new_id();
+            let src = format!("{}{}{}", blob.url, pimble_crdt::markdown::CANVAS_FRAGMENT, id);
+            canvases.push((id, blob));
+            Some(src)
+        });
+        doc.append_blocks(&blocks)?;
+        for (id, blob) in &canvases {
+            let (px_w, px_h) = blob.size.unwrap_or((800, 600));
+            let src = blob.url.to_string();
+            let board = pimble_board::Board::in_text(&doc, id);
+            board
+                .edit(pimble_board::Stamp::new(None, &now), |t| t.start_canvas(Some(pimble_board::StartingPicture { src: &src, px_w, px_h })))
+                .into_result()
+                .map_err(|e| pimble_crdt::CrdtError::Serialization(e.to_string()))?;
+        }
+        if !canvases.is_empty() {
+            doc.adopt_canvas_urls()?;
+        }
     }
     doc.diff_since(&before)
+}
+
+/// `blocks` with every imported picture's `src` (`pimble-import:<n>`) given by
+/// `src_of(n)`, and those it answers `None` for left out.
+fn with_pictures(blocks: &[pimble_crdt::Block], src_of: &mut dyn FnMut(usize) -> Option<String>) -> Vec<pimble_crdt::Block> {
+    use pimble_crdt::{Block, Inline, ListItem, TableCell, TableRow};
+    let inlines = |runs: &[Inline], src_of: &mut dyn FnMut(usize) -> Option<String>| -> Vec<Inline> {
+        runs.iter()
+            .filter_map(|inline| match inline {
+                Inline::Image(image) => match pimble_import::picture_index(&image.src) {
+                    Some(index) => src_of(index).map(|src| Inline::Image(pimble_crdt::Image { src, ..image.clone() })),
+                    None => Some(inline.clone()),
+                },
+                other => Some(other.clone()),
+            })
+            .collect()
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Paragraph { runs, align, indent } => Block::Paragraph { runs: inlines(runs, src_of), align: *align, indent: *indent },
+            Block::Heading { level, runs } => Block::Heading { level: *level, runs: inlines(runs, src_of) },
+            Block::BulletList { items } => Block::BulletList { items: items.iter().map(|i| ListItem { blocks: with_pictures(&i.blocks, src_of) }).collect() },
+            Block::OrderedList { start, items } => {
+                Block::OrderedList { start: *start, items: items.iter().map(|i| ListItem { blocks: with_pictures(&i.blocks, src_of) }).collect() }
+            }
+            Block::Blockquote { blocks } => Block::Blockquote { blocks: with_pictures(blocks, src_of) },
+            Block::Table { rows } => Block::Table {
+                rows: rows
+                    .iter()
+                    .map(|row| TableRow { cells: row.cells.iter().map(|cell| TableCell { blocks: with_pictures(&cell.blocks, src_of), ..cell.clone() }).collect(), ..row.clone() })
+                    .collect(),
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 fn unexpected(answer: Option<BackendEvent>) -> String {
@@ -434,7 +505,7 @@ mod tests {
         item.icon = Some("star".into());
         item.tags = vec!["Draft".into()];
 
-        let delta = fill(&created.save(), &item).unwrap();
+        let delta = fill(&created.save(), &item, &[]).unwrap();
         created.apply_update(&delta).unwrap();
 
         let fields = created.fields().unwrap();
