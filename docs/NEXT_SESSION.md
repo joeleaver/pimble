@@ -30,6 +30,12 @@ in a shared node reached the other side as a canvas with no picture.
   / `get_picture`). Wave 5: RTF, Scrivener and Word imports bring PNG/JPEG (and Word's
   GIF/WebP) pictures in as canvases in the text (`BackendCommand::StorePicture`); the MCP's
   `attach_image` is `insert_canvas`/`create_canvas` with a picture file, already built.
+- Browser walk-through on the local stack (Chromium, a share's editor of an encrypted
+  store): the owner's canvas drew; pictures put with "Insert Canvas from Picture..." reached
+  the owner byte for byte and drew in the note at once and after a reload. It found a bug
+  in every kind of store: a canvas in text whose picture was not held when first drawn stayed
+  a 1-pixel placeholder until the note was edited (`BlobLoaded` now calls
+  `text_boards::picture_arrived`).
 - Open: an open note learns of an arrived picture only by asking again on its timer; the browser
   refetches pictures after a reload; `\NeXTGraphic`/`.rtfd` and metafile pictures are not
   imported. See IMAGES_CONTRACT "Left after waves 2 to 5".
