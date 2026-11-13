@@ -588,6 +588,16 @@ async fn connect_and_sync(
     // (docs/PRESENCE_CONTRACT.md sections 2 and 9), for as long as this
     // connection lives.
     let _presence = crate::presence_link::spawn(handler, Arc::clone(&client), store_id, link_id, true);
+    // Pictures ride beside the documents that name them, each a document of
+    // its own on the twin (docs/IMAGES_CONTRACT.md "Replication"), for as
+    // long as this connection lives.
+    let pictures = crate::pictures::spawn_copier(
+        handler,
+        store_id,
+        crate::pictures::VaultRemote { handler: handler.clone(), client: Arc::clone(&client), store_id, link_key_id: key_id, link_id: link_id.to_string() },
+    )
+    .await;
+    pictures.all();
 
     // The shares' upkeep at connect: a pass as soon as the loop below turns
     // (reconciled first, so the pass judges the converged tree), and the
@@ -1501,7 +1511,7 @@ enum Applying {
 /// Whether the remote refused a call for this one document (it is out of
 /// the account's scope now, or under a root the account only reads) as
 /// opposed to failing: the document is left for later and the link stays up.
-fn is_refusal(error: &pimble_client::ClientError) -> bool {
+pub(crate) fn is_refusal(error: &pimble_client::ClientError) -> bool {
     let message = error.to_string();
     message.contains(crate::principal::NO_GRANT_FOR_DOCUMENT) || StoreAccess::refusal_in(&message).is_some()
 }

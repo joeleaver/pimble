@@ -1528,3 +1528,62 @@ async fn stopping_is_refused_while_a_share_stands_and_undoes_everything_after() 
 
     a.stop().await.unwrap();
 }
+
+// ── Pictures through the relay (docs/IMAGES_CONTRACT.md, wave 3) ───────
+
+/// A picture on `node_id`'s canvas, as the app puts one (`data.board`).
+async fn put_on_canvas(client: &PimbleClient, store_id: StoreId, node_id: NodeId, url: &pimble_core::BlobUrl) {
+    use pimble_board::{Board, Geom, Kind, NewElement, PictureGeom, Rect, Stamp};
+    let node = client.get_node(store_id, node_id).await.unwrap();
+    let doc = NodeDoc::load(&node.content).unwrap();
+    let before = doc.state_vector();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let board = Board::of_node(&doc);
+    if !board.exists() {
+        board.create(Stamp::new(None, &now)).unwrap();
+    }
+    let geom = Geom::Picture(PictureGeom { rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, src: url.to_string(), px_w: 10, px_h: 10, crop: None });
+    board.add_element(Stamp::new(None, &now), NewElement::new(Kind::Picture, geom)).unwrap();
+    let changes = base64::engine::general_purpose::STANDARD.encode(doc.diff_since(&before).unwrap());
+    client.apply_edit(store_id, node_id, "canvas", EditOperation::IncrementalChanges { changes }).await.unwrap();
+}
+
+fn png(len: usize, seed: u8) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend((0..len.saturating_sub(8)).map(|i| ((i * 11 + i / 89) as u8).wrapping_add(seed)));
+    bytes
+}
+
+async fn holds(client: &PimbleClient, store_id: StoreId, blob: pimble_core::BlobId, bytes: &[u8]) -> bool {
+    client.get_blob(store_id, blob).await.is_ok_and(|(_, got)| got == bytes)
+}
+
+#[tokio::test]
+async fn pictures_go_both_ways_through_the_relay_and_nothing_is_hosted() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = relayed_fixture(&env, &alice, a_dir.path()).await;
+    let store_id = fx.store_id;
+    let owners = png(3_500_000, 7);
+    let url = alice.put_blob(store_id, fx.inside, "image/png", &owners).await.unwrap();
+    put_on_canvas(&alice, store_id, fx.inside, &url).await;
+    share_with(&alice, &fx, &[(BOB, MemberRole::Editor), (CAROL, MemberRole::Editor)]).await;
+
+    let (mut b, bob, _b_dir) = member_device(&env, BOB, &fx).await;
+    let (mut c, carol, _c_dir) = member_device(&env, CAROL, &fx).await;
+    assert!(wait_until(Duration::from_secs(30), || holds(&bob, store_id, url.blob, &owners)).await, "the owner's picture reaches a member through the relay");
+
+    let bobs = png(50_000, 8);
+    let bobs_url = bob.put_blob(store_id, fx.leaf, "image/png", &bobs).await.unwrap();
+    put_on_canvas(&bob, store_id, fx.leaf, &bobs_url).await;
+    assert!(wait_until(Duration::from_secs(30), || holds(&carol, store_id, bobs_url.blob, &bobs)).await, "a member's picture reaches another member");
+    assert!(wait_until(Duration::from_secs(30), || holds(&alice, store_id, bobs_url.blob, &bobs)).await, "and the owner");
+
+    // The twin on the owner's machine holds ciphertext only; nothing is hosted.
+    let needle = &owners[owners.len() / 2..owners.len() / 2 + 64];
+    assert!(!contains_bytes_recursive(&twin_dir(a_dir.path(), store_id), needle));
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+    c.stop().await.unwrap();
+}

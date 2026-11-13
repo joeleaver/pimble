@@ -768,6 +768,11 @@ impl Env {
         contains_bytes_recursive(&self.h_store_path(store_id).join("vault"), needle.as_bytes())
     }
 
+    #[allow(dead_code)]
+    pub fn hosted_store_contains_plaintext_bytes(&self, store_id: StoreId, needle: &[u8]) -> bool {
+        contains_bytes_recursive(&self.h_store_path(store_id), needle)
+    }
+
     pub async fn sign_in(&self, client: &PimbleClient, who: (&str, &str)) {
         client.cloud_sign_in(&self.stub_url, who.0, who.1).await.expect("sign in");
     }

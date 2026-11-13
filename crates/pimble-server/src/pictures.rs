@@ -34,7 +34,8 @@ use jsonrpsee::core::async_trait;
 use pimble_client::PimbleClient;
 use pimble_core::{BlobId, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
-use pimble_rpc::{StoreChangeKind, BLOB_NOT_HERE};
+use pimble_rpc::vault as protocol;
+use pimble_rpc::{StoreChangeKind, VaultDocId, BLOB_NOT_HERE};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -188,6 +189,105 @@ impl PictureRemote for PlainRemote {
             debug!("Store {}: the remote takes picture {} from no document naming it here ({})", self.store_id, id, e);
         }
         Ok(false)
+    }
+}
+
+/// A vault link's remote: the store's encrypted twin (hosted, or a relay's),
+/// where a picture is a document of its own, `blob-<id>`, under its own data
+/// key wrapped per scope key (docs/IMAGES_CONTRACT.md "Replication").
+pub(crate) struct VaultRemote {
+    pub handler: RpcHandler,
+    pub client: Arc<PimbleClient>,
+    pub store_id: StoreId,
+    /// The scope key the link writes under: the store key on a whole
+    /// replica, the share's on a member's.
+    pub link_key_id: uuid::Uuid,
+    pub link_id: String,
+}
+
+#[async_trait]
+impl PictureRemote for VaultRemote {
+    async fn missing(&self, ids: &[BlobId]) -> anyhow::Result<HashSet<BlobId>> {
+        let listing = self.client.vault_list_docs_with_blobs(self.store_id).await.map_err(|e| anyhow::anyhow!("vaultListDocs: {e}"))?;
+        let held: HashSet<BlobId> = listing
+            .docs
+            .into_iter()
+            .filter(|doc| doc.head > 0)
+            .filter_map(|doc| match doc.doc_id {
+                VaultDocId::Blob(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        Ok(ids.iter().copied().filter(|id| !held.contains(id)).collect())
+    }
+
+    async fn fetch(&self, id: BlobId) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let fetched = match self.client.vault_fetch(self.store_id, VaultDocId::Blob(id), 0).await {
+            Ok(fetched) => fetched,
+            // Not in this account's reach yet (the owner's upkeep has not
+            // added it to the share): looked for again later.
+            Err(e) if crate::vault_link::is_refusal(&e) => return Ok(None),
+            Err(e) => return Err(anyhow::anyhow!("vaultFetch picture {id}: {e}")),
+        };
+        if fetched.head == 0 {
+            return Ok(None);
+        }
+        let scope = self.handler.keystore().store_keys(self.store_id).await;
+        match protocol::open_picture(self.store_id, id, &fetched, &scope) {
+            Ok(picture) => Ok(picture),
+            // No wrap this device can open yet (its share's key is on its
+            // way, or the upkeep has not wrapped it): looked for again.
+            Err(protocol::Unopened::NoKey(_)) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("picture {id}: {e}")),
+        }
+    }
+
+    async fn send(&self, id: BlobId, named_by: &[NodeId], mime: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        let Some(&node) = named_by.first() else { return Ok(false) };
+        // Wrapped under every scope key covering the node that names it, as
+        // a new document's data key is (`seal_plan`): the store key on a
+        // whole replica, every share the node is under, or on a member's
+        // replica with no marker on the way up, the share's key it holds.
+        let scope_key_ids = {
+            let manager = self.handler.store_manager_handle();
+            let manager = manager.read().await;
+            let partial = !manager.scope_roots(self.store_id).is_empty();
+            let tree = manager.tree(self.store_id).map_err(|e| anyhow::anyhow!("store unavailable: {e}"))?;
+            let mut ids = Vec::new();
+            for named in named_by {
+                for key in protocol::scope_key_ids(tree, *named, (!partial).then_some(self.link_key_id), [self.link_key_id]) {
+                    if !ids.contains(&key) {
+                        ids.push(key);
+                    }
+                }
+            }
+            ids
+        };
+        let scope = self.handler.keystore().store_keys(self.store_id).await;
+        let Some((dek_id, dek, keys)) = protocol::new_picture_key(self.store_id, id, &scope_key_ids, &scope) else {
+            return Err(anyhow::anyhow!("no scope key held for store {} to seal picture {id} under", self.store_id));
+        };
+        let mut keys = Some(keys);
+        for chunk in protocol::picture_chunks(mime, bytes) {
+            let sealed = protocol::seal_picture(self.store_id, id, dek_id, &dek, &chunk);
+            // The first entry creates the document with its wraps, and names
+            // the node it is for, which is what admits a member's upload
+            // (the picture joins every scope of theirs holding that node).
+            let first = keys.is_some();
+            let appended = self
+                .client
+                .vault_append_with_keys(self.store_id, VaultDocId::Blob(id), sealed, Some(self.link_id.clone()), first.then_some(node), keys.take())
+                .await;
+            match appended {
+                Ok(_) => {}
+                Err(e) if crate::vault_link::is_refusal(&e) => {
+                    debug!("Store {}: picture {} refused by the remote ({})", self.store_id, id, e);
+                    return Ok(false);
+                }
+                Err(e) => return Err(anyhow::anyhow!("vaultAppend picture {id}: {e}")),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -383,6 +483,12 @@ pub(crate) async fn look_once(handler: &RpcHandler, store_id: StoreId, remote: &
     }
     if fetched + sent > 0 {
         info!("Pictures of store {}: {} fetched, {} sent", store_id, fetched, sent);
+    }
+    // A picture just sent may be under a share: the owner's upkeep wraps its
+    // key for the share and adds it to the share's scope, now rather than at
+    // its next pass (a no-op on a store with no vault link or no shares).
+    if sent > 0 {
+        handler.share_command(store_id, crate::share::ShareCommand::PassNow(None)).await;
     }
     Ok(owed)
 }
