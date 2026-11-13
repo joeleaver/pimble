@@ -29,7 +29,7 @@ members = [
 exclude = ["crates/pimble-plugin-sdk", "plugins"]
 
 [workspace.package]
-version = "0.22.1"
+version = "0.22.2"
 edition = "2021"
 authors = ["Pimble Contributors"]
 license = "MIT"

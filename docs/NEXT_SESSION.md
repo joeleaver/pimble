@@ -1,6 +1,8 @@
 # Next session: start here
 
-**2026-11-13 (session 78e7f30f): v0.22.1 released from `master`: Windows fixes.** A
+**2026-11-13 (session 78e7f30f): v0.22.2 released from `master`: Windows fixes.** (v0.22.1
+was tagged but its Release run failed: Rust 1.100 links `crt1-reactor.o` into a wasip1
+plugin, and the SDK's own `_initialize` collided; `export!` defines it only before 1.100.) A
 Windows user reported no File/Edit/View menu and a console window beside the app.
 - **Menu bar on Windows:** a borderless window there got a native Win32 menu, which a
   borderless window never shows. rinch#2642 (on main at c5e02314, all three locks) draws
