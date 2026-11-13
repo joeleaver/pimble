@@ -5,8 +5,10 @@ store, over images inline in the document or links only). Wave 1's server side i
 on branch `images` (2026-10-06, not merged): see "Built in wave 1 (server side)" at the
 end. The app's loader and inserting are built on branch `pictures-ui` (2026-10-07, not
 merged), for the desktop and for plain stores in the browser: see "Built in wave 1 (app
-side)". Waves 2 to 5 are not: pictures do not replicate, and an encrypted store in the
-browser takes and shows none.
+side)". Waves 2 and 3 are built (2026-11-13, see "Built in wave 2" and "Built in wave
+3"): pictures replicate to every replica and every share member whose documents name
+them, plain and encrypted, hosted and relayed. Waves 4 and 5 are not: an encrypted store
+in the browser takes and shows no pictures, and the importer brings none.
 
 ## The decisions (Joe, 2026-10-01)
 
@@ -203,10 +205,9 @@ stores or the web yet.
   `PimbleClient::put_blob` / `get_blob` / `have_blobs` hide the chunks.
 - **Who may**: `putBlob` is judged as `applyEdit` on `node_id` is (role, a member's
   scope, a read-only replica); for a mount node the picture goes to the mount's source
-  store, judged there, and the URL names that store. `getBlob` / `haveBlobs` are for the
-  operator and whole-store readers; **a share's member is refused** with "Pictures in
-  shares are not available yet." until wave 2 judges a blob by the nodes that name it
-  (`TODO(images wave 2)` in `handler.rs`). A vault store answers `-32005`.
+  store, judged there, and the URL names that store. `getBlob` / `haveBlobs` were for the
+  operator and whole-store readers, a share's member refused, until wave 2 (below). A
+  vault store answers `-32005`.
 - **CLI**: `put-blob <store> <node> <file>` (prints the URL; the type comes from the
   file's first bytes) and `get-blob <url> <out file>`.
 
@@ -268,6 +269,98 @@ desktop and the browser; only the file picker differs between them.
   unreferenced. `PIMBLE_DEBUG_PICTURE` (and `PIMBLE_DEBUG_PICTURE_AS=paste|drop`) names a
   file that "Insert Image..." takes instead of opening the dialog, for driving the
   desktop app over rinch's debug port; it is read only when set.
+
+## Built in wave 2 (plain replicas)
+
+Built 2026-11-13. Tests: `crates/pimble-server/tests/pictures.rs` (two servers: live both
+ways, a 7 MiB picture in chunks, a cut link, a picture named before its bytes exist, a
+transplant) and `tests/blobs.rs` (who reads what).
+
+- **What a document names** is `NodeDoc::pictures()`: the image atoms of its text
+  (`blob_refs`) and every `pimble-blob:` string under its `data` root, a fragment allowed,
+  which is how a canvas element's picture counts (`data.board`, `data["board:<id>"]`) and
+  how any plugin's would. `crate::pictures::PictureRefs` in the server caches each
+  document's pictures by its state vector, so asking again about an unchanged document
+  costs a state vector, not a projection. **Deviation:** the contract's index `blob id ->
+  referencing nodes` "kept beside the search index" is this in-memory cache, filled on
+  demand; nothing is stored.
+- **The copier** (`crate::pictures::spawn_copier`), one per link connection, beside the
+  presence link: after the reconcile it looks at every document; afterwards, 400 ms after
+  any document of the store changes here (an edit here, or one the link merged in), at
+  those. A look asks `haveBlobs` of the remote and the local blob store which side lacks
+  each picture named, and copies it with `getBlob` and `putBlob { copy_of }`, either way.
+  A picture neither side holds yet (its uploader is still sending it) is looked for again
+  at 2 s, doubling to a minute. The text is never held up by its pictures.
+- **`putBlob { copy_of }`** keeps the id a blob was minted with (`BlobStore::put_as`, and
+  `upload_chunk_as` for one in chunks); one already held is answered complete at once. A
+  copy through a mount is refused (the id would name the wrong store).
+- **Who may read**: `getBlob`/`haveBlobs` for a share's member are judged by the
+  documents in the member's reach that name the blob (`RpcHandler::readable_pictures`),
+  tombstones included. A blob no readable document names is refused as "no grant for this
+  document"; `haveBlobs` never reports one missing. `BLOBS_IN_SHARES_REFUSAL` is gone from
+  the server.
+- **Transplant**: every blob of the source store a planted document names is copied into
+  the destination under its id, and the planted copy is renamed to it
+  (`NodeDoc::move_pictures`, text atoms and `data` strings) in the same broadcast edit. A
+  picture the source does not hold keeps its old name.
+- A read-only replica fetches and never sends.
+
+## Built in wave 3 (encrypted: vault link, shares, relay)
+
+Built 2026-11-13. Tests: `crates/pimble-server/tests/share_pictures.rs` (only ciphertext
+on the hosted disk; a 5 MiB picture in chunks; a member gets the owner's picture, a second
+member sees a member's picture with every owner device off, and it reaches the owner when
+it is back; a picture outside the share reaches no member; one put in a node already
+shared reaches a reader) and `tests/relay.rs` `pictures_go_both_ways_through_the_relay...`.
+
+- **A picture is a vault document**, `VaultDocId::Blob(id)`, named `blob-<id>` on disk
+  and in its associated data (**deviation:** a dash, not the contract's colon, because the
+  name is a directory and a relay's twin can be on Windows). Its entries are
+  `pimble_rpc::vault::PictureChunk`s (`PBLC`, version, MIME type, total length, offset,
+  bytes), at most 2 MiB of picture each, encrypted in the `PB` layout under the picture's
+  own data key; `open_picture` assembles them in order and takes only a run that starts at
+  0 and continues where the last stopped, so a stray entry is passed over. The first
+  append carries the key's wraps (`new_picture_key`: every scope key covering a node that
+  names it, as `seal_plan` chooses for a new document) and names that node as `parent_id`.
+- **Never seen by a client from before**: blob documents are listed only to a
+  `vaultListDocs { blobs: true }` and their appends are never announced (`VaultAppended`
+  is not sent), so an older desktop or web app never meets the new variant. Readers
+  fetch a picture when a document names it (the copier, `VaultRemote`), and look again on
+  the copier's backoff while it is absent or not yet readable.
+- **Hosted server**: a scoped member reads a blob document in its scope's picture set
+  (`scopes.json` `blobs`, per root, which only grows until the scope is removed); a
+  member's first append of a new one, naming a node they may write, adds it to every scope
+  of theirs holding that node (`vault_extend_scope_blobs`). Owners publish with the new
+  `addScopeBlobs { store_id, root, blob_ids }`.
+- **Share upkeep** (`Upkeep::pictures` in `share.rs`): for each share, the pictures its
+  documents name get their data key wrapped under the share key (and the store key, for a
+  member's), then join the share's scope, wraps first. It runs with every pass; a pass is
+  now also due a second after a text or data change (a picture put in a shared node), and
+  at once after a copier sends a picture (`ShareCommand::PassNow`). What a connection has
+  wrapped and published is remembered, so a quiet pass is in memory.
+- **The relay** needed nothing of its own: its face is the same server, its twin the same
+  vault store, the link the same vault link.
+- The app is unchanged: a fetched picture lands in the local blob store, and the app shows
+  it the next time it asks (opening the note, reconnecting). Nothing tells an open note
+  that its picture just arrived (as in wave 1, "Not built").
+
+**Verified on the local stack** (2026-11-13, `scripts/local-stack/README.md`, "The
+pictures walk-through"): an owner's picture on a canvas in a shared folder reached both
+members byte for byte, one in an unshared note reached neither; a member's picture
+reached the other member with every owner device off and the owner when it came back;
+the hosted disk held no run of any picture's bytes; and in a member's desktop app both
+canvases opened with their pictures drawn.
+
+### Left after waves 2 and 3
+
+- A picture whose upload stopped half way (a device that went away mid-send) stays half
+  on the twin: readers keep looking and never complete it, and its sender, seeing it
+  listed, does not send it again.
+- No notification tells the app a picture arrived; an open note shows it when reopened.
+- `haveBlobs`/`vaultListDocs` are asked about every named picture at every look after a
+  reconcile (a listing per look on a vault link): fine for hundreds, not measured for tens
+  of thousands.
+- Browser (wave 4) and importer/MCP (wave 5), as above.
 
 ## Later
 

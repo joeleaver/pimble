@@ -1080,6 +1080,9 @@ impl VaultClient {
                 // A hosted twin from before this layout keeps its tree
                 // document, superseded by the node documents.
                 VaultDocId::Tree => tracing::debug!("Store {} lists a tree document; skipping it", store_id),
+                // Pictures are not read in the browser yet (docs/IMAGES_CONTRACT.md
+                // wave 4), and are never listed unless asked for.
+                VaultDocId::Blob(_) => {}
             }
         }
 
@@ -1308,6 +1311,8 @@ impl VaultClient {
                     tracing::debug!("An append to the tree document of {}; nothing reads it", store_id);
                     continue;
                 }
+                // Never announced; nothing to do if one ever is.
+                VaultDocId::Blob(_) => continue,
             };
             let seq = *seq;
             let Some(blob) = notification.update.clone() else {

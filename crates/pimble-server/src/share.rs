@@ -456,6 +456,12 @@ pub(crate) struct Upkeep {
     round: Round,
     /// How long until the next look at what a pass left owed.
     retry_wait: Duration,
+    /// Pictures whose keys are wrapped for every share naming them this
+    /// connection, and those known added to each root's scope
+    /// (docs/IMAGES_CONTRACT.md "Replication"). A picture never changes, so
+    /// once is enough per connection.
+    pictures_wrapped: HashMap<pimble_core::BlobId, HashSet<Uuid>>,
+    pictures_published: HashMap<NodeId, HashSet<pimble_core::BlobId>>,
 }
 
 #[derive(Default)]
@@ -467,7 +473,7 @@ struct Round {
 
 impl Upkeep {
     pub(crate) fn new() -> Self {
-        Self { due: None, first_noted: None, published: HashMap::new(), retired: HashSet::new(), owner: None, roots: HashSet::new(), round: Round::default(), retry_wait: UPKEEP_RETRY }
+        Self { due: None, first_noted: None, published: HashMap::new(), retired: HashSet::new(), owner: None, roots: HashSet::new(), round: Round::default(), retry_wait: UPKEEP_RETRY, pictures_wrapped: HashMap::new(), pictures_published: HashMap::new() }
     }
 
     pub(crate) fn due(&self) -> Option<Instant> {
@@ -478,6 +484,8 @@ impl Upkeep {
     pub(crate) fn connected(&mut self, handler: &RpcHandler, store_id: StoreId, owner: Option<bool>) {
         self.published.clear();
         self.retired.clear();
+        self.pictures_wrapped.clear();
+        self.pictures_published.clear();
         self.round = Round::default();
         self.retry_wait = UPKEEP_RETRY;
         self.owner = owner;
@@ -521,9 +529,12 @@ impl Upkeep {
             | StoreChangeKind::NodeMoved { .. }
             | StoreChangeKind::MetadataUpdated { .. }
             | StoreChangeKind::AttachmentChanged { .. }
-            | StoreChangeKind::TreeStructure { .. } => {}
-            StoreChangeKind::ContentUpdated { .. }
-            | StoreChangeKind::SyncStateChanged { .. }
+            | StoreChangeKind::TreeStructure { .. }
+            // A picture put in a shared node's text or on its canvas is
+            // the share's to read (docs/IMAGES_CONTRACT.md "Replication").
+            // A pass that finds nothing new is in memory only.
+            | StoreChangeKind::ContentUpdated { .. } => {}
+            StoreChangeKind::SyncStateChanged { .. }
             | StoreChangeKind::MountStateChanged { .. }
             | StoreChangeKind::ShareStateChanged { .. }
             | StoreChangeKind::SharesEnded { .. }
@@ -623,6 +634,7 @@ impl Upkeep {
             return Ok(());
         }
         let unsettled = std::mem::take(&mut self.round).unsettled;
+        let pictures_owed = self.pictures(link, &shares).await?;
 
         for share in &shares {
             if self.retired.contains(&share.root) {
@@ -688,12 +700,63 @@ impl Upkeep {
             link.handler().shares().set_reach(link.handler(), store_id, share.root, if settled { Reach::Settled } else { Reach::Pending }).await;
         }
 
-        if unsettled.is_empty() {
+        if unsettled.is_empty() && !pictures_owed {
             self.retry_wait = UPKEEP_RETRY;
         } else {
             self.retry_later();
         }
         Ok(())
+    }
+
+    /// The shares' pictures (docs/IMAGES_CONTRACT.md "Replication"): every
+    /// blob a document under a share names gets its data key wrapped under
+    /// that share's key, and then joins the share's scope, the same two
+    /// steps a document entering a share takes, in that order. Answers
+    /// whether something is still owed: a picture not on the twin yet (this
+    /// store's own link uploads it), or a share key not held here.
+    async fn pictures(&mut self, link: &mut LinkSession<'_>, shares: &[SharePlan]) -> anyhow::Result<bool> {
+        let store_id = link.store_id();
+        let mut owed = false;
+        let mut wanted: HashMap<pimble_core::BlobId, Vec<Uuid>> = HashMap::new();
+        let mut per_root: Vec<(NodeId, HashSet<pimble_core::BlobId>)> = Vec::new();
+        for share in shares.iter().filter(|share| !self.retired.contains(&share.root)) {
+            let docs: Vec<NodeId> = share.docs.iter().copied().chain(std::iter::once(share.root)).collect();
+            let named = link.handler().pictures_named(store_id, Some(&docs)).await;
+            for blob in named.keys() {
+                wanted.entry(*blob).or_default().push(share.marker.key_id);
+            }
+            per_root.push((share.root, named.into_keys().collect()));
+        }
+        let mut ready: HashSet<pimble_core::BlobId> = HashSet::new();
+        for (blob, share_keys) in wanted {
+            let mut want: Vec<Uuid> = vec![link.link_key_id()];
+            want.extend(share_keys.iter().filter(|key| **key != link.link_key_id()));
+            if self.pictures_wrapped.get(&blob).is_some_and(|done| want.iter().all(|key| done.contains(key))) {
+                ready.insert(blob);
+                continue;
+            }
+            match settle_picture(link, blob, &want).await? {
+                true => {
+                    self.pictures_wrapped.insert(blob, want.into_iter().collect());
+                    ready.insert(blob);
+                }
+                false => owed = true,
+            }
+        }
+        for (root, blobs) in per_root {
+            let known = self.pictures_published.entry(root).or_default();
+            let new: Vec<pimble_core::BlobId> = blobs.iter().filter(|blob| ready.contains(blob) && !known.contains(blob)).copied().collect();
+            if new.is_empty() {
+                continue;
+            }
+            link.client()
+                .add_scope_blobs(store_id, root, new.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("remote addScopeBlobs for {} failed: {}", root, e))?;
+            debug!("Share {} of store {}: {} picture(s) added to its scope", root, store_id, new.len());
+            known.extend(new);
+        }
+        Ok(owed)
     }
 
     pub(crate) async fn command(&mut self, link: &mut LinkSession<'_>, command: ShareCommand, sweep_kick: &Notify) -> anyhow::Result<()> {
@@ -782,6 +845,45 @@ async fn settle(link: &mut LinkSession<'_>, doc: NodeId, share_keys: &[Uuid], re
         return Ok(Settle::NotYet { wants_key: false });
     }
     Ok(if lacking { Settle::NotYet { wants_key: true } } else { Settle::Done })
+}
+
+/// Bring a picture's wraps up to `want` (the store key and its shares'
+/// keys). `false` while it cannot be: the picture is not on the twin yet,
+/// or no wrap opens here, or a wanted key is not held.
+async fn settle_picture(link: &mut LinkSession<'_>, blob: pimble_core::BlobId, want: &[Uuid]) -> anyhow::Result<bool> {
+    let store_id = link.store_id();
+    let doc = pimble_rpc::VaultDocId::Blob(blob);
+    let fetched = match link.client().vault_fetch(store_id, doc.clone(), u64::MAX).await {
+        Ok(fetched) => fetched,
+        Err(e) if crate::vault_link::is_refusal(&e) => return Ok(false),
+        Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for picture {} failed: {}", blob, e)),
+    };
+    let Some(keys) = fetched.keys.filter(|_| fetched.head > 0) else { return Ok(false) };
+    let missing: Vec<Uuid> = want.iter().copied().filter(|id| !keys.wraps.iter().any(|wrap| wrap.scope_key_id == *id)).collect();
+    if missing.is_empty() {
+        return Ok(true);
+    }
+    let keystore = link.handler().keystore();
+    let scope = keystore.store_keys(store_id).await;
+    let Some(dek) = pimble_rpc::vault::picture_key(store_id, blob, &keys, &scope) else {
+        debug!("Store {} picture {}: no wrap of its data key opens here yet", store_id, blob);
+        return Ok(false);
+    };
+    let mut wraps = Vec::new();
+    let mut lacking = false;
+    for scope_key_id in missing {
+        match scope.get(&scope_key_id) {
+            Some(scope_key) => wraps.push(pimble_rpc::vault::wrap_picture_key(store_id, blob, &dek, scope_key, scope_key_id)),
+            None => lacking = true,
+        }
+    }
+    if !wraps.is_empty() {
+        link.client()
+            .vault_set_doc_keys(store_id, doc, VaultDocKeys { dek_id: keys.dek_id, wraps })
+            .await
+            .map_err(|e| anyhow::anyhow!("remote vaultSetDocKeys for picture {} failed: {}", blob, e))?;
+    }
+    Ok(!lacking)
 }
 
 /// Take `root`'s scope off the hosted server. First, every document the
@@ -1318,9 +1420,10 @@ mod tests {
         let mut upkeep = Upkeep::new();
         assert!(upkeep.due().is_none());
 
-        // Text is not the tree's business, nor is another store's tree this one's.
+        // Who is who is not the shares' business, nor is another store's tree
+        // this one's. (Text is: a picture put in it may be under a share.)
         let start = Instant::now();
-        upkeep.note_at(start, store_id, &change(store_id, StoreChangeKind::ContentUpdated { node_id }));
+        upkeep.note_at(start, store_id, &change(store_id, StoreChangeKind::PeopleChanged));
         upkeep.note_at(start, StoreId::new(), &change(store_id, StoreChangeKind::MetadataUpdated { node_id }));
         assert!(upkeep.due().is_none());
 

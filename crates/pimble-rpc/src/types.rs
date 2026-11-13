@@ -35,6 +35,12 @@ pub struct CreateStoreRequest {
 pub enum VaultDocId {
     Node(NodeId),
     Tree,
+    /// A picture's bytes (docs/IMAGES_CONTRACT.md "Replication"): one entry,
+    /// or several chunks in order, under the picture's own data key. Never
+    /// listed unless asked for (`VaultListDocsRequest::blobs`) and never
+    /// announced (`VaultAppended`), so a client from before pictures
+    /// replicated never meets one.
+    Blob(BlobId),
 }
 
 impl VaultDocId {
@@ -43,8 +49,14 @@ impl VaultDocId {
         match self {
             VaultDocId::Node(id) => id.to_string(),
             VaultDocId::Tree => "tree".to_string(),
+            VaultDocId::Blob(id) => format!("{}{}", Self::BLOB_PREFIX, id),
         }
     }
+
+    /// What a blob document's name starts with: `blob-<blob id>`. A dash,
+    /// not a colon: the name is a directory on disk, and a relay's twin can
+    /// live on Windows.
+    pub const BLOB_PREFIX: &'static str = "blob-";
 
     /// The inverse of [`VaultDocId::as_str`]: `"tree"` parses to
     /// [`VaultDocId::Tree`], anything else as a node id. Used to reconstruct
@@ -53,6 +65,8 @@ impl VaultDocId {
     pub fn parse(s: &str) -> Option<VaultDocId> {
         if s == "tree" {
             Some(VaultDocId::Tree)
+        } else if let Some(blob) = s.strip_prefix(Self::BLOB_PREFIX) {
+            blob.parse().ok().map(VaultDocId::Blob)
         } else {
             NodeId::parse(s).ok().map(VaultDocId::Node)
         }
@@ -151,6 +165,10 @@ pub struct VaultSnapshotRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultListDocsRequest {
     pub store_id: StoreId,
+    /// List pictures' documents too (`VaultDocId::Blob`). Off for a client
+    /// from before pictures replicated, which could not read one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blobs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,10 +743,6 @@ pub struct ApplyEditResponse {}
 /// picture is seven messages.
 pub const BLOB_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 
-/// What `getBlob` answers a share's member until blobs are judged by the
-/// nodes that name them (docs/IMAGES_CONTRACT.md wave 2).
-pub const BLOBS_IN_SHARES_REFUSAL: &str = "Pictures in shares are not available yet.";
-
 /// What `getBlob` answers for a blob the store does not hold (yet): a
 /// replica's text can arrive before its pictures do.
 pub const BLOB_NOT_HERE: &str = "This picture has not arrived yet.";
@@ -763,6 +777,12 @@ pub struct PutBlobRequest {
     /// The upload this chunk continues. Absent on the first or only request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_id: Option<BlobId>,
+    /// On the first or only request: keep the picture under this id, minted
+    /// elsewhere (a replica copying a blob, docs/IMAGES_CONTRACT.md
+    /// "Replication"). One the server holds already is answered as complete
+    /// and not written again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_of: Option<BlobId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1509,6 +1529,17 @@ pub struct SetScopeRequest {
     /// discussion set, which only grows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discussions: Vec<(NodeId, NodeId)>,
+}
+
+/// Add pictures to a share's scope (owner): the blobs its documents name
+/// (docs/IMAGES_CONTRACT.md "Replication"). A scope's pictures only grow,
+/// until the scope is removed: a blob never changes, and "Put Back" can bring
+/// back the text that names one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddScopeBlobsRequest {
+    pub store_id: StoreId,
+    pub root: NodeId,
+    pub blob_ids: Vec<BlobId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

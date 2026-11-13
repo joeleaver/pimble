@@ -249,6 +249,24 @@ impl BlobStore {
     /// nothing is readable under the id, and an upload that is never finished
     /// leaves only a part file, removed when the store next opens.
     pub async fn upload_chunk(&self, upload: Option<BlobId>, mime: &str, total: u64, offset: u64, bytes: Vec<u8>) -> Result<BlobUpload> {
+        self.upload_chunk_as(upload, None, mime, total, offset, bytes).await
+    }
+
+    /// [`BlobStore::upload_chunk`], with the first chunk naming the id the
+    /// blob will have (`copy_of`: a replica copying a blob minted
+    /// elsewhere, docs/IMAGES_CONTRACT.md "Replication"). A blob the store
+    /// already holds under that id is answered as complete at once and
+    /// nothing is written: a blob is immutable, so a second copy can only be
+    /// the same picture.
+    pub async fn upload_chunk_as(
+        &self,
+        upload: Option<BlobId>,
+        copy_of: Option<BlobId>,
+        mime: &str,
+        total: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<BlobUpload> {
         let mime = admit(mime, total)?;
         if bytes.is_empty() {
             return Err(StoreError::InvalidOperation("A chunk of a picture cannot be empty.".into()));
@@ -256,7 +274,14 @@ impl BlobStore {
         if offset.checked_add(bytes.len() as u64).is_none_or(|end| end > total) {
             return Err(StoreError::InvalidOperation("A chunk of a picture runs past the length it was given.".into()));
         }
-        self.blocking(move |this| this.write_chunk(upload, mime, total, offset, &bytes)).await
+        if upload.is_none() {
+            if let Some(id) = copy_of {
+                if self.has(id).await {
+                    return Ok(BlobUpload { id, received: total, complete: true });
+                }
+            }
+        }
+        self.blocking(move |this| this.write_chunk(upload, copy_of, mime, total, offset, &bytes)).await
     }
 
     /// Remove what unfinished uploads left behind. Run when a store opens:
@@ -313,7 +338,7 @@ impl BlobStore {
         Ok(written?)
     }
 
-    fn write_chunk(&self, upload: Option<BlobId>, mime: ImageMime, total: u64, offset: u64, bytes: &[u8]) -> Result<BlobUpload> {
+    fn write_chunk(&self, upload: Option<BlobId>, copy_of: Option<BlobId>, mime: ImageMime, total: u64, offset: u64, bytes: &[u8]) -> Result<BlobUpload> {
         let _writing = self.writing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let out_of_step = || StoreError::InvalidOperation("This picture's upload is out of step; start it again.".into());
         let head = Header::size(mime) as u64;
@@ -330,7 +355,7 @@ impl BlobStore {
                 }
                 fs::create_dir_all(&self.dir)?;
                 self.remove_parts(Some(STALE_UPLOAD))?;
-                let id = BlobId::new();
+                let id = copy_of.unwrap_or_else(BlobId::new);
                 // The hash is not known until the last byte: zeros until then.
                 let header = Header { mime, len: total, hash: [0; HASH_LEN] };
                 fs::File::create(self.part_path(id))?.write_all(&header.encode())?;
@@ -569,6 +594,23 @@ mod tests {
         assert!(blobs.upload_chunk(Some(first.id), "image/png", total, total - 1, vec![0]).await.is_err());
         // An upload nobody started.
         assert!(blobs.upload_chunk(Some(BlobId::new()), "image/png", total, 4096, image[4096..].to_vec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_copy_keeps_the_id_it_was_given_and_a_held_one_is_done_at_once() {
+        let (_dir, blobs) = store();
+        let image = png(10_000, 6);
+        let total = image.len() as u64;
+        let id = BlobId::new();
+        let first = blobs.upload_chunk_as(None, Some(id), "image/png", total, 0, image[..5000].to_vec()).await.unwrap();
+        assert_eq!((first.id, first.complete), (id, false));
+        let last = blobs.upload_chunk(Some(id), "image/png", total, 5000, image[5000..].to_vec()).await.unwrap();
+        assert!(last.complete);
+        assert_eq!(blobs.get(id).await.unwrap().unwrap().bytes, image);
+
+        let again = blobs.upload_chunk_as(None, Some(id), "image/png", total, 0, image[..5000].to_vec()).await.unwrap();
+        assert_eq!((again.id, again.received, again.complete), (id, total, true));
+        assert_eq!(names(&blobs), vec![id.to_string()]);
     }
 
     #[tokio::test]

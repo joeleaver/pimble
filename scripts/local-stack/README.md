@@ -127,6 +127,29 @@ must be `document`s (a `note` selects in the tree and never opens).
    `Family/Private`, the one to `Hotel` reveals it under `Family`'s `Holiday` (its own
    store, not the mount), and `[[diary` offers the private note and links it.
 
+## The pictures walk-through (2026-11-13, docs/IMAGES_CONTRACT.md waves 2 and 3)
+
+Accounts as above. `~/dev/rhypedb` had only a debug `rhypedb-server`; a copy of `up.sh`
+pointing at it worked the same. `edge.js` stops at the first request if `web/dist` has no
+`index.html`; a placeholder does when the browser is not part of the run.
+
+1. `own create-store`, a `Holiday` folder and a `Private` note; `own cloud-host-store`,
+   `own cloud-share <store> <Holiday> --name "Holiday plans"`, invite bob and carol as
+   editors; `own create-agent "Walk Agent" <store>=editor`.
+2. Through `pimble-mcp` on the owner's server (`scripts/mcp/drive.py`, `PIMBLE_SERVER`,
+   `PIMBLE_AGENT_KEY`): `create_canvas` under Holiday with a PNG file, `insert_canvas`
+   into Private with another. `ls $STACK/stores/*/vault` shows `blob-<id>` for each.
+3. bob and carol `cloud-add-hosted`. `bob get-blob pimble-blob:<store>/<id>` gives the
+   Holiday picture byte for byte within a second; the Private one answers "This picture
+   has not arrived yet." and is not in his replica's `blobs/`. No file under
+   `$STACK/stores` holds a run of the pictures' pixel bytes.
+4. `kill` the owner. bob's agent makes a canvas in Holiday from a third PNG; `carol
+   get-blob` has it within a second. `desk.sh owner ...` again: `own get-blob` has it
+   within two seconds.
+5. carol's desktop app on her identity (her headless server stopped, `RINCH_DEBUG=1`,
+   `scripts/perf/rd.py` to click and screenshot): Holiday shows both canvases, and each
+   opens with its picture drawn.
+
 ## The apps on the same identities
 
 Stop the headless desktop for that name, write

@@ -421,6 +421,10 @@ pub trait PimbleApi {
     #[method(name = "setScope", with_extensions)]
     async fn set_scope(&self, request: SetScopeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    /// Add pictures to a share's scope (owner).
+    #[method(name = "addScopeBlobs", with_extensions)]
+    async fn add_scope_blobs(&self, request: AddScopeBlobsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// The store's published scopes (owner).
     #[method(name = "getScopes", with_extensions)]
     async fn get_scopes(&self, request: GetScopesRequest) -> Result<GetScopesResponse, ErrorObjectOwned>;

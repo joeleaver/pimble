@@ -277,6 +277,11 @@ async fn connect_and_sync(
     // Presence rides beside the edits, for as long as this connection lives
     // (docs/PRESENCE_CONTRACT.md section 2).
     let _presence = crate::presence_link::spawn(handler, Arc::clone(&client), store_id, link_id, false);
+    // Pictures ride beside the documents that name them, both ways
+    // (docs/IMAGES_CONTRACT.md "Replication"), for as long as this
+    // connection lives.
+    let pictures = crate::pictures::spawn_copier(handler, store_id, crate::pictures::PlainRemote { client: Arc::clone(&client), store_id }).await;
+    pictures.all();
 
     loop {
         tokio::select! {

@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
-use pimble_core::{custom_keys, node_types, NodeId, ShareMarker, StoreId};
+use pimble_core::{custom_keys, node_types, BlobId, NodeId, ShareMarker, StoreId};
 use pimble_crdt::{NodeFields, Tree};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
 
@@ -407,6 +407,143 @@ pub fn new_data_key(store_id: StoreId, node_id: NodeId, scope_key_ids: &[KeyId],
     Some((dek_id, dek, VaultDocKeys { dek_id, wraps }))
 }
 
+// ── Pictures (docs/IMAGES_CONTRACT.md "Replication") ─────────────────────────
+
+/// How much of a picture one entry of its document carries, before
+/// encryption: under the vault's 4 MiB per blob and the links' 3 MiB catch-up
+/// size, with room for the header and the cipher's overhead.
+pub const PICTURE_CHUNK: usize = 2 * 1024 * 1024;
+
+const PICTURE_MAGIC: &[u8; 4] = b"PBLC";
+const PICTURE_VERSION: u8 = 1;
+
+/// One entry of a picture's document, decrypted: which picture it is part
+/// of (its type and whole length) and where its bytes go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureChunk {
+    pub mime: String,
+    pub total: u64,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl PictureChunk {
+    pub fn encode(&self) -> Vec<u8> {
+        let mime = self.mime.as_bytes();
+        let mut out = Vec::with_capacity(4 + 1 + 1 + mime.len() + 16 + self.bytes.len());
+        out.extend_from_slice(PICTURE_MAGIC);
+        out.push(PICTURE_VERSION);
+        out.push(mime.len().min(255) as u8);
+        out.extend_from_slice(&mime[..mime.len().min(255)]);
+        out.extend_from_slice(&self.total.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&self.bytes);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 6 || &bytes[..4] != PICTURE_MAGIC || bytes[4] != PICTURE_VERSION {
+            return None;
+        }
+        let mime_len = bytes[5] as usize;
+        let rest = bytes.get(6..)?;
+        let mime = std::str::from_utf8(rest.get(..mime_len)?).ok()?.to_string();
+        let rest = rest.get(mime_len..)?;
+        let total = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+        let offset = u64::from_le_bytes(rest.get(8..16)?.try_into().ok()?);
+        Some(Self { mime, total, offset, bytes: rest.get(16..)?.to_vec() })
+    }
+}
+
+/// A picture as the entries of its document, in order.
+pub fn picture_chunks(mime: &str, bytes: &[u8]) -> Vec<PictureChunk> {
+    let total = bytes.len() as u64;
+    if bytes.is_empty() {
+        return vec![PictureChunk { mime: mime.to_string(), total, offset: 0, bytes: Vec::new() }];
+    }
+    bytes
+        .chunks(PICTURE_CHUNK)
+        .scan(0u64, |offset, chunk| {
+            let at = *offset;
+            *offset += chunk.len() as u64;
+            Some(PictureChunk { mime: mime.to_string(), total, offset: at, bytes: chunk.to_vec() })
+        })
+        .collect()
+}
+
+fn picture_doc(blob: BlobId) -> String {
+    VaultDocId::Blob(blob).as_str()
+}
+
+/// Encrypt one entry of a picture's document under its data key.
+pub fn seal_picture(store_id: StoreId, blob: BlobId, dek_id: KeyId, dek: &SymmetricKey, chunk: &PictureChunk) -> String {
+    let aad = blob_aad(&store_id.to_string(), &picture_doc(blob));
+    URL_SAFE_NO_PAD.encode(Blob::encrypt(dek, dek_id, &aad, &chunk.encode()))
+}
+
+/// A fresh data key for a picture, wrapped under every scope key in
+/// `scope_key_ids` that is held. `None` when none is.
+pub fn new_picture_key(store_id: StoreId, blob: BlobId, scope_key_ids: &[KeyId], scope: &impl ScopeKeys) -> Option<(KeyId, SymmetricKey, VaultDocKeys)> {
+    let dek = SymmetricKey::generate();
+    let dek_id = KeyId::new_v4();
+    let aad = dek_aad(&store_id.to_string(), &picture_doc(blob));
+    let mut wraps: Vec<WrappedDek> = Vec::new();
+    for scope_key_id in scope_key_ids {
+        if wraps.iter().any(|w| w.scope_key_id == *scope_key_id) {
+            continue;
+        }
+        if let Some(scope_key) = scope.scope_key(scope_key_id) {
+            wraps.push(wrap_dek(&dek, &scope_key, *scope_key_id, &aad));
+        }
+    }
+    (!wraps.is_empty()).then(|| (dek_id, dek.clone(), VaultDocKeys { dek_id, wraps }))
+}
+
+/// A picture's data key, from its wraps and whichever scope key held here
+/// opens one of them.
+pub fn picture_key(store_id: StoreId, blob: BlobId, keys: &VaultDocKeys, scope: &impl ScopeKeys) -> Option<SymmetricKey> {
+    let aad = dek_aad(&store_id.to_string(), &picture_doc(blob));
+    keys.wraps.iter().find_map(|wrap| unwrap_dek(wrap, &scope.scope_key(&wrap.scope_key_id)?, &aad).ok())
+}
+
+/// Wrap a picture's data key under one more scope key (a share it entered).
+pub fn wrap_picture_key(store_id: StoreId, blob: BlobId, dek: &SymmetricKey, scope_key: &SymmetricKey, scope_key_id: KeyId) -> WrappedDek {
+    wrap_dek(dek, scope_key, scope_key_id, &dek_aad(&store_id.to_string(), &picture_doc(blob)))
+}
+
+/// A picture read out of its document's fetch: its type and bytes, once
+/// every chunk from the first is here and opens. `Err(NoKey)` when no wrap
+/// opens with a key held here; `Ok(None)` while the picture is not whole
+/// (its uploader is still sending it). An entry that does not open, or does
+/// not continue the picture where the last one stopped, is passed over.
+pub fn open_picture(store_id: StoreId, blob: BlobId, fetched: &VaultFetchResponse, scope: &impl ScopeKeys) -> Result<Option<(String, Vec<u8>)>, Unopened> {
+    let keys = fetched.keys.as_ref().ok_or(Unopened::NoKey(KeyId::nil()))?;
+    let dek = picture_key(store_id, blob, keys, scope).ok_or(Unopened::NoKey(keys.dek_id))?;
+    let aad = blob_aad(&store_id.to_string(), &picture_doc(blob));
+    let mut picture: Option<(String, u64, Vec<u8>)> = None;
+    for (_, encoded) in fetched_entries(fetched) {
+        let Ok(sealed) = decode_blob(encoded) else { continue };
+        let Ok(plain) = Blob::decrypt(&dek, &aad, &sealed) else { continue };
+        let Some(chunk) = PictureChunk::decode(&plain) else { continue };
+        match &mut picture {
+            None if chunk.offset == 0 => picture = Some((chunk.mime, chunk.total, chunk.bytes)),
+            Some((mime, total, bytes)) if *mime == chunk.mime && *total == chunk.total && bytes.len() as u64 == chunk.offset => {
+                bytes.extend_from_slice(&chunk.bytes)
+            }
+            _ => continue,
+        }
+        if let Some((mime, total, bytes)) = &picture {
+            if bytes.len() as u64 == *total {
+                return Ok(Some((mime.clone(), bytes.clone())));
+            }
+            if bytes.len() as u64 > *total {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The share's marker a node carries, when it is a share's root
 /// (`pimble_core::NodeMetadata::share`, read from a document's fields).
 pub fn share_marker(fields: &NodeFields) -> Option<ShareMarker> {
@@ -469,6 +606,34 @@ impl NewDocument {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_picture_goes_out_in_chunks_and_comes_back_whole_only_to_a_key_holder() {
+        use super::*;
+        use crate::VaultEntry;
+        let store_id = StoreId::new();
+        let blob = BlobId::new();
+        let scope_key_id = KeyId::new_v4();
+        let mut scope: HashMap<KeyId, SymmetricKey> = HashMap::new();
+        scope.insert(scope_key_id, SymmetricKey::generate());
+        let bytes: Vec<u8> = (0..(PICTURE_CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        let chunks = picture_chunks("image/png", &bytes);
+        assert_eq!(chunks.len(), 3);
+        let (dek_id, dek, keys) = new_picture_key(store_id, blob, &[scope_key_id], &scope).unwrap();
+        let sealed: Vec<String> = chunks.iter().map(|c| seal_picture(store_id, blob, dek_id, &dek, c)).collect();
+        let fetch = |upto: usize, keys: Option<VaultDocKeys>| VaultFetchResponse {
+            snapshot: None,
+            updates: sealed[..upto].iter().enumerate().map(|(i, blob)| VaultEntry { seq: i as u64 + 1, blob: blob.clone() }).collect(),
+            head: upto as u64,
+            keys,
+        };
+        assert_eq!(open_picture(store_id, blob, &fetch(2, Some(keys.clone())), &scope), Ok(None), "not whole yet");
+        assert_eq!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &scope), Ok(Some(("image/png".to_string(), bytes))));
+        let stranger: HashMap<KeyId, SymmetricKey> = HashMap::new();
+        assert!(matches!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &stranger), Err(Unopened::NoKey(_))));
+        // Another picture's entries do not open as this one's.
+        assert_eq!(open_picture(store_id, BlobId::new(), &fetch(3, Some(keys)), &scope).ok().flatten(), None);
+    }
+
     use super::*;
     use crate::VaultEntry;
 

@@ -16,6 +16,7 @@ pub mod jwt;
 pub mod keystore;
 pub mod local;
 mod people;
+pub mod pictures;
 mod presence;
 mod presence_link;
 pub mod principal;

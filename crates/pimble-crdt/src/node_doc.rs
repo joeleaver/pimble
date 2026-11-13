@@ -550,6 +550,154 @@ impl NodeDoc {
         Self::load(bytes).map(|doc| doc.blob_refs()).unwrap_or_default()
     }
 
+    /// Every blob this document names anywhere, each once, sorted: the
+    /// pictures in its text ([`NodeDoc::blob_refs`]) and every
+    /// `pimble-blob:` string under its `data` root (a canvas element's
+    /// picture, in `data.board` or a canvas in text's `data["board:<id>"]`,
+    /// and whatever a plugin keeps). This is what replication copies and
+    /// what judges who may read a blob (docs/IMAGES_CONTRACT.md
+    /// "Replication", "Who may read a blob").
+    pub fn pictures(&self) -> Vec<pimble_core::BlobUrl> {
+        let mut out: std::collections::BTreeSet<pimble_core::BlobUrl> = self.blob_refs().into_iter().map(|r| r.url).collect();
+        crate::blobs::blob_urls_in_json(&self.data_json(), &mut out);
+        out.into_iter().collect()
+    }
+
+    /// Every picture this document names that is kept in store `from`,
+    /// renamed as kept in `to` under the same blob id: in the text's image
+    /// atoms and in every string under `data` (a canvas's pictures). What a
+    /// transplant does to the copy it plants, whose blobs it has copied into
+    /// `to` (docs/IMAGES_CONTRACT.md "The shape"). Answers the update, or
+    /// `None` when nothing named one.
+    pub fn move_pictures(&mut self, from: pimble_core::StoreId, to: pimble_core::StoreId) -> Result<Option<Vec<u8>>> {
+        use pimble_core::BlobUrl;
+        let moved = move |src: &str| -> Option<String> {
+            let (bare, rest) = src.split_at(src.find('#').unwrap_or(src.len()));
+            let url = BlobUrl::parse(bare).filter(|url| url.store == from)?;
+            Some(format!("{}{}", BlobUrl::new(to, url.blob), rest))
+        };
+
+        // The text: image atoms whose `src` names `from`.
+        let mut updates: Vec<Vec<u8>> = Vec::new();
+        if self.has_projection() && self.blob_refs().iter().any(|r| r.url.store == from) {
+            fn rewrite(node: &rinch_editor_core::Node, schema: &rinch_editor_core::Schema, moved: &dyn Fn(&str) -> Option<String>) -> Result<rinch_editor_core::Node> {
+                if node.type_name() == "image" {
+                    if let Some(src) = node.attrs().get_str("src").and_then(moved) {
+                        let attrs = node.attrs().with("src", src);
+                        let image = schema
+                            .create_node("image", attrs, node.content().clone())
+                            .map_err(|e| CrdtError::Collab(e.to_string()))?
+                            .with_marks(node.marks().to_vec());
+                        return Ok(image);
+                    }
+                    return Ok(node.clone());
+                }
+                if node.is_leaf() || node.is_text() {
+                    return Ok(node.clone());
+                }
+                let children = node.content().iter().map(|c| rewrite(c, schema, moved)).collect::<Result<Vec<_>>>()?;
+                Ok(node.copy_with_content(rinch_editor_core::Fragment::from_children(children)))
+            }
+            match self.markdown_edit(|schema, doc| rewrite(doc, schema, &moved)) {
+                Ok(delta) => updates.push(delta),
+                Err(CrdtError::Refused(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // The data: any string, wherever it sits.
+        let (_, update) = self.edit(|d, txn| {
+            fn any_moved(any: &Any, moved: &dyn Fn(&str) -> Option<String>) -> Option<Any> {
+                match any {
+                    Any::String(s) => moved(s).map(|s| Any::String(s.into())),
+                    Any::Array(items) => {
+                        let new: Vec<Option<Any>> = items.iter().map(|item| any_moved(item, moved)).collect();
+                        new.iter().any(Option::is_some).then(|| {
+                            Any::Array(items.iter().zip(new).map(|(old, new)| new.unwrap_or_else(|| old.clone())).collect::<Vec<_>>().into())
+                        })
+                    }
+                    Any::Map(fields) => {
+                        let mut changed = false;
+                        let mut out = HashMap::new();
+                        for (key, value) in fields.iter() {
+                            match any_moved(value, moved) {
+                                Some(new) => {
+                                    changed = true;
+                                    out.insert(key.clone(), new);
+                                }
+                                None => {
+                                    out.insert(key.clone(), value.clone());
+                                }
+                            }
+                        }
+                        changed.then(|| Any::Map(std::sync::Arc::new(out)))
+                    }
+                    _ => None,
+                }
+            }
+            fn walk_map(txn: &mut TransactionMut, map: &MapRef, moved: &dyn Fn(&str) -> Option<String>) {
+                let entries: Vec<(String, Out)> = map.iter(txn).map(|(k, v)| (k.to_string(), v)).collect();
+                for (key, value) in entries {
+                    match value {
+                        Out::Any(any) => {
+                            if let Some(new) = any_moved(&any, moved) {
+                                map.insert(txn, key, new);
+                            }
+                        }
+                        Out::YText(text) => {
+                            let old = text.get_string(txn);
+                            if let Some(new) = moved(&old) {
+                                let len = yrs::Text::len(&text, txn);
+                                yrs::Text::remove_range(&text, txn, 0, len);
+                                yrs::Text::insert(&text, txn, 0, &new);
+                            }
+                        }
+                        Out::YMap(inner) => walk_map(txn, &inner, moved),
+                        Out::YArray(inner) => walk_array(txn, &inner, moved),
+                        _ => {}
+                    }
+                }
+            }
+            fn walk_array(txn: &mut TransactionMut, array: &ArrayRef, moved: &dyn Fn(&str) -> Option<String>) {
+                let items: Vec<Out> = array.iter(txn).collect();
+                for (index, item) in items.into_iter().enumerate() {
+                    match item {
+                        Out::Any(any) => {
+                            if let Some(new) = any_moved(&any, moved) {
+                                array.remove(txn, index as u32);
+                                array.insert(txn, index as u32, new);
+                            }
+                        }
+                        Out::YText(text) => {
+                            let old = text.get_string(txn);
+                            if let Some(new) = moved(&old) {
+                                let len = yrs::Text::len(&text, txn);
+                                yrs::Text::remove_range(&text, txn, 0, len);
+                                yrs::Text::insert(&text, txn, 0, &new);
+                            }
+                        }
+                        Out::YMap(inner) => walk_map(txn, &inner, moved),
+                        Out::YArray(inner) => walk_array(txn, &inner, moved),
+                        _ => {}
+                    }
+                }
+            }
+            walk_map(txn, &d.data, &moved);
+            Ok(())
+        })?;
+        updates.extend(update);
+        Ok(match updates.len() {
+            0 => None,
+            1 => updates.pop(),
+            _ => Some(yrs::merge_updates_v1(&updates).map_err(|e| CrdtError::Serialization(e.to_string()))?),
+        })
+    }
+
+    /// [`NodeDoc::pictures`] of a serialized document.
+    pub fn pictures_of(bytes: &[u8]) -> Vec<pimble_core::BlobUrl> {
+        Self::load(bytes).map(|doc| doc.pictures()).unwrap_or_default()
+    }
+
     /// A deep-link anchor at `spot` (docs/LINKS_CONTRACT.md "The URL"):
     /// `None` when the content has no such textblock.
     pub fn anchor_at(&self, spot: Spot) -> Option<Anchor> {

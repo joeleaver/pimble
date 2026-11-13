@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, BlobId, BlobUrl, NodeId, StoreAccess, StoreId, StoreKind, IMAGE_TOO_LARGE, MAX_IMAGE_BYTES, NOT_AN_IMAGE};
-use pimble_rpc::{PimbleApiClient, PutBlobRequest, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE};
+use pimble_rpc::{PimbleApiClient, PutBlobRequest, BLOB_CHUNK_BYTES, BLOB_NOT_HERE};
 use pimble_server::{PimbleServer, ServerConfig};
 use serde_json::json;
 
@@ -140,6 +140,7 @@ async fn a_picture_over_20_mib_is_refused_with_the_sentence() {
         offset: offset as u64,
         total: Some(2 * MIB as u64 - 1),
         blob_id,
+        copy_of: None,
     };
     let first = raw.put_blob(chunk(0, None)).await.unwrap();
     assert!(!first.complete);
@@ -207,6 +208,7 @@ async fn an_abandoned_chunked_upload_leaves_nothing() {
             offset: 0,
             total: Some(image.len() as u64),
             blob_id: None,
+            copy_of: None,
         })
         .await
         .unwrap();
@@ -274,7 +276,7 @@ async fn a_vault_store_answers_as_it_does_to_every_plain_rpc() {
     let raw = raw_client(&_server).await;
 
     let put = raw
-        .put_blob(PutBlobRequest { store_id: vault, node_id: root, mime: "image/png".into(), bytes: STANDARD.encode(png(100, 0)), offset: 0, total: None, blob_id: None })
+        .put_blob(PutBlobRequest { store_id: vault, node_id: root, mime: "image/png".into(), bytes: STANDARD.encode(png(100, 0)), offset: 0, total: None, blob_id: None, copy_of: None })
         .await
         .unwrap_err();
     let get = raw.get_blob(pimble_rpc::GetBlobRequest { store_id: vault, blob_id: BlobId::new(), offset: 0 }).await.unwrap_err();
@@ -387,10 +389,11 @@ async fn a_reader_may_get_a_picture_and_not_put_one() {
 }
 
 #[tokio::test]
-async fn a_shares_member_puts_where_they_may_write_and_cannot_get_yet() {
+async fn a_shares_member_puts_where_they_may_write_and_reads_what_their_documents_name() {
     let h = Hosted::start().await;
     let image = png(8000, 14);
     let owners = h.admin.put_blob(h.store_id, h.inside, "image/png", &image).await.unwrap();
+    let elsewhere = h.admin.put_blob(h.store_id, h.outside, "image/png", &png(8000, 15)).await.unwrap();
     let roots = |role: &str| json!({ "roots": { h.shared.to_string(): role } });
 
     // An editor of the share: judged as `applyEdit` on the node would be.
@@ -404,15 +407,33 @@ async fn a_shares_member_puts_where_they_may_write_and_cannot_get_yet() {
     let reader = h.user("ron", roots("reader")).await;
     assert_eq!(refusal(reader.put_blob(h.store_id, h.inside, "image/png", &image).await, "a share's reader"), StoreAccess::READ_ONLY_REFUSAL);
 
-    // Reading in a share waits for wave 2 (a blob judged by the nodes that
-    // name it); until then a member is told so, whichever blob they ask for.
+    // A blob is read by whoever may read a document naming it
+    // (docs/IMAGES_CONTRACT.md "Who may read a blob"). Named by nothing yet:
+    // nobody in the share reads it, and nothing says whether it is here.
     for who in [&member, &reader] {
-        for blob in [owners.blob, theirs.blob, BlobId::new()] {
-            let err = refusal(who.get_blob(h.store_id, blob).await, "a member's get");
-            assert_eq!(err, BLOBS_IN_SHARES_REFUSAL);
+        for blob in [owners.blob, theirs.blob, elsewhere.blob, BlobId::new()] {
+            let err = refusal(who.get_blob(h.store_id, blob).await, "a picture no document of theirs names");
+            assert!(err.contains("no grant for this document"), "{err}");
         }
-        assert_eq!(refusal(who.have_blobs(h.store_id, &[owners.blob]).await, "a member's have"), BLOBS_IN_SHARES_REFUSAL);
+        assert!(who.have_blobs(h.store_id, &[owners.blob, BlobId::new()]).await.unwrap().is_empty());
     }
+
+    // On a canvas inside the share, and in a document outside it.
+    common::put_on_canvas(&h.admin, h.store_id, h.inside, &owners).await;
+    common::put_on_canvas(&h.admin, h.store_id, h.inside, &theirs).await;
+    common::put_on_canvas(&h.admin, h.store_id, h.outside, &elsewhere).await;
+    for who in [&member, &reader] {
+        assert_eq!(who.get_blob(h.store_id, owners.blob).await.unwrap().1, image);
+        assert_eq!(who.get_blob(h.store_id, theirs.blob).await.unwrap().1, image);
+        let err = refusal(who.get_blob(h.store_id, elsewhere.blob).await, "named only outside the share");
+        assert!(err.contains("no grant for this document"), "{err}");
+        let lost = BlobId::new();
+        assert!(who.have_blobs(h.store_id, &[owners.blob, elsewhere.blob, lost]).await.unwrap().is_empty());
+    }
+
+    // Deleted, the document still names it: "Put Back" brings it back whole.
+    h.admin.delete_node(h.store_id, h.inside).await.unwrap();
+    assert_eq!(member.get_blob(h.store_id, owners.blob).await.unwrap().1, image);
 }
 
 /// A `haveBlobs` or `getBlob` naming something that is not a blob id never
