@@ -6,8 +6,9 @@ the window program has no console; a command that fails with an error the window
 is logged with what it asked (`commands::process_command`). Open: Nico's window keeps
 showing "Node not found"; read his log after he updates (nico-top, read-only, error lines).
 
-**2026-11-13: pictures replicate (docs/IMAGES_CONTRACT.md waves 2 and 3), on branch
-`claude/exciting-wu-75d655`, not merged or released.** Joe's report: a picture on a canvas
+**2026-11-13: pictures replicate (docs/IMAGES_CONTRACT.md waves 2 and 3), released in
+v0.22.5 (hosted server deployed first, jkbase v58).** An open note or canvas asks again
+for a missing picture on a timer (2 s doubling to a minute). Joe's report: a picture on a canvas
 in a shared node reached the other side as a canvas with no picture.
 - A document's pictures are `NodeDoc::pictures()`: text image atoms and any
   `pimble-blob:` string under `data` (canvas elements). `crate::pictures` in the server: a
