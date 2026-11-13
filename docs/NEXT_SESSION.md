@@ -5,6 +5,7 @@
 the window program has no console; a command that fails with an error the window shows
 is logged with what it asked (`commands::process_command`). Open: Nico's window keeps
 showing "Node not found"; read his log after he updates (nico-top, read-only, error lines).
+
 **2026-11-13: pictures replicate (docs/IMAGES_CONTRACT.md waves 2 and 3), on branch
 `claude/exciting-wu-75d655`, not merged or released.** Joe's report: a picture on a canvas
 in a shared node reached the other side as a canvas with no picture.
