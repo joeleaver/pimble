@@ -1273,6 +1273,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::BlobLoaded { url, result } => {
                 crate::pictures::loaded(*url, result);
                 crate::boards::blob_loaded(url, result);
+                // A canvas in text asks for its picture itself
+                // (`text_boards::held_picture`), not through the canvas view's
+                // asking, so `blob_loaded` does not tell it: told here, it draws
+                // again with the bytes it was waiting for.
+                if result.is_ok() {
+                    crate::text_boards::picture_arrived();
+                }
             }
 
             BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::MetanodeSetup(pane), results } => {

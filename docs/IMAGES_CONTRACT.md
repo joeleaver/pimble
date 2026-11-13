@@ -385,6 +385,15 @@ one now does too.
   browser is wrapped under the keys the page holds, and an owner's device adds the rest.
 - Test: `web/src/vault_backend/tests.rs`
   `a_picture_goes_out_encrypted_and_comes_back_from_the_twin`.
+- **Verified on the local stack** (2026-11-13), as a share's editor in Chromium: the
+  owner's canvas drew its picture; three pictures put in a note with "Insert Canvas from
+  Picture..." reached the twin as `blob-<id>` documents and the owner's machine byte for
+  byte; each drew in the note at once and again after a reload.
+- **Found by that walk-through, and fixed**: a canvas in text whose picture was not held
+  when it was first drawn stayed a one-pixel placeholder until something else edited the
+  note (in every kind of store, desktop and browser): it asks for the bytes itself
+  (`text_boards::held_picture`), and `boards::blob_loaded` tells only the canvas view.
+  `BlobLoaded` now also tells the text's canvases (`text_boards::picture_arrived`).
 
 ## Built in wave 5 (import; the MCP)
 

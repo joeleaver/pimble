@@ -692,15 +692,34 @@ impl VaultClient {
             return Ok(picture.clone());
         }
         let not_here = || ApiError::not_found(pimble_rpc::BLOB_NOT_HERE);
-        let wire = wire.ok_or_else(not_here)?;
-        let store = self.stores.get(&store_id).ok_or_else(not_here)?;
-        let fetched = wire.fetch(store_id, VaultDocId::Blob(blob), 0).await.map_err(|_| not_here())?;
+        let Some(wire) = wire else {
+            tracing::debug!("Picture {blob} of {store_id}: no connection to fetch it through yet");
+            return Err(not_here());
+        };
+        let Some(store) = self.stores.get(&store_id) else {
+            tracing::warn!("Picture {blob} of {store_id}: the store is not held in this page");
+            return Err(not_here());
+        };
+        let fetched = match wire.fetch(store_id, VaultDocId::Blob(blob), 0).await {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                tracing::warn!("Picture {blob} of {store_id}: fetching it failed: {e}");
+                return Err(not_here());
+            }
+        };
         match protocol::open_picture(store_id, blob, &fetched, &store.keys.scope) {
             Ok(Some(picture)) => {
                 self.pictures.insert((store_id, blob), picture.clone());
                 Ok(picture)
             }
-            _ => Err(not_here()),
+            Ok(None) => {
+                tracing::info!("Picture {blob} of {store_id}: not whole yet ({} entries)", fetched.head);
+                Err(not_here())
+            }
+            Err(e) => {
+                tracing::warn!("Picture {blob} of {store_id}: {e}");
+                Err(not_here())
+            }
         }
     }
 
