@@ -1,5 +1,11 @@
 # Next session: start here
 
+**2026-11-13 (session 78e7f30f): v0.22.4 released from `master`: a log on Windows.**
+`%LOCALAPPDATA%\pimble\logs\pimble.log` (the last run's as `pimble.previous.log`), since
+the window program has no console; a command that fails with an error the window shows
+is logged with what it asked (`commands::process_command`). Open: Nico's window keeps
+showing "Node not found"; read his log after he updates (nico-top, read-only, error lines).
+
 **2026-11-13 (session 78e7f30f): v0.22.3 released from `master`.**
 - **Paragraph spacing per note** (docs/PARAGRAPHS_CONTRACT.md): compact unless a note
   says spaced; a new node copies its parent's (`Tree::add_node`), so a store's root is
