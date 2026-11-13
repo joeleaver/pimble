@@ -1,5 +1,20 @@
 # Next session: start here
 
+**2026-11-13 (session 78e7f30f): v0.22.1 released from `master`: Windows fixes.** A
+Windows user reported no File/Edit/View menu and a console window beside the app.
+- **Menu bar on Windows:** a borderless window there got a native Win32 menu, which a
+  borderless window never shows. rinch#2642 (on main at c5e02314, all three locks) draws
+  the bar in the title bar as on Linux. Checked on nico-top (Windows 11), isolated (its own
+  port, a scratch profile through a test build of dirs-sys): File/Account/Edit/View/Help
+  in the title bar, menus open.
+- **No console window:** `pimble.exe` is a GUI-subsystem program; `--install`, `--help` and
+  argument errors attach to the parent terminal's console (`main.rs`).
+- Also in this release: rinch#2619 (discarded nodes freed), #2624 (long notes laid out
+  only where seen), #2613 (a press on a scrollbar over draggable content).
+- Flaky under a full release run, both green alone 5/5: `vault_link`
+  `restarting_a_server_resumes...` (an IO NotFound at `stop`) and `pimble-api`
+  `a_query_metanode_finds...` (Order::Modified ties).
+
 **2026-11-12 (session 78e7f30f): v0.22.0 released from `master`: the window's memory
 growth fixed.** Joe's window reached 5 GB while an agent wrote notes: every note
 rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context menu), and
