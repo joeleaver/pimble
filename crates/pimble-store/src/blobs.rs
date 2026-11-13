@@ -233,6 +233,20 @@ impl BlobStore {
         self.blocking(move |this| Ok(this.holds(id))).await.unwrap_or(false)
     }
 
+    /// The length of each of `ids` the store holds whole (from its header).
+    pub async fn sizes(&self, ids: &[BlobId]) -> std::collections::HashMap<BlobId, u64> {
+        let ids = ids.to_vec();
+        self.blocking(move |this| {
+            Ok(ids
+                .into_iter()
+                .filter(|id| this.holds(*id))
+                .filter_map(|id| Header::read_from(&this.path(id)).map(|header| (id, header.len)))
+                .collect())
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Which of `ids` the store lacks, in the order given.
     pub async fn missing(&self, ids: &[BlobId]) -> Vec<BlobId> {
         let ids = ids.to_vec();

@@ -511,37 +511,91 @@ pub fn wrap_picture_key(store_id: StoreId, blob: BlobId, dek: &SymmetricKey, sco
     wrap_dek(dek, scope_key, scope_key_id, &dek_aad(&store_id.to_string(), &picture_doc(blob)))
 }
 
-/// A picture read out of its document's fetch: its type and bytes, once
-/// every chunk from the first is here and opens. `Err(NoKey)` when no wrap
-/// opens with a key held here; `Ok(None)` while the picture is not whole
-/// (its uploader is still sending it). An entry that does not open, or does
-/// not continue the picture where the last one stopped, is passed over.
-pub fn open_picture(store_id: StoreId, blob: BlobId, fetched: &VaultFetchResponse, scope: &impl ScopeKeys) -> Result<Option<(String, Vec<u8>)>, Unopened> {
+/// How many entries a picture of `len` bytes is sent as.
+pub fn picture_chunk_count(len: usize) -> u64 {
+    len.div_ceil(PICTURE_CHUNK).max(1) as u64
+}
+
+/// How far a picture's document has got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PictureProgress {
+    /// Every chunk from the first is here: its type and bytes.
+    Whole(String, Vec<u8>),
+    /// A run from the first chunk that stops short: the type and length it
+    /// says the picture has, and how many bytes of it are here. Its sender
+    /// finishes it by appending from `have` (`continue_picture`).
+    Partial { mime: String, total: u64, have: u64 },
+    /// No first chunk opens (nothing sent yet, or nothing readable).
+    Nothing,
+}
+
+/// Read a picture's document as far as it goes. Entries are taken in order:
+/// a chunk that continues a run where it stopped extends it, a first chunk
+/// starts the run again (a sender that could not finish started over), and
+/// anything else, or anything that does not open, is passed over.
+/// `Err(NoKey)` when no wrap opens with a key held here.
+pub fn picture_progress(store_id: StoreId, blob: BlobId, fetched: &VaultFetchResponse, scope: &impl ScopeKeys) -> Result<PictureProgress, Unopened> {
     let keys = fetched.keys.as_ref().ok_or(Unopened::NoKey(KeyId::nil()))?;
     let dek = picture_key(store_id, blob, keys, scope).ok_or(Unopened::NoKey(keys.dek_id))?;
     let aad = blob_aad(&store_id.to_string(), &picture_doc(blob));
-    let mut picture: Option<(String, u64, Vec<u8>)> = None;
+    let mut run: Option<(String, u64, Vec<u8>)> = None;
     for (_, encoded) in fetched_entries(fetched) {
         let Ok(sealed) = decode_blob(encoded) else { continue };
         let Ok(plain) = Blob::decrypt(&dek, &aad, &sealed) else { continue };
         let Some(chunk) = PictureChunk::decode(&plain) else { continue };
-        match &mut picture {
-            None if chunk.offset == 0 => picture = Some((chunk.mime, chunk.total, chunk.bytes)),
-            Some((mime, total, bytes)) if *mime == chunk.mime && *total == chunk.total && bytes.len() as u64 == chunk.offset => {
-                bytes.extend_from_slice(&chunk.bytes)
+        if chunk.offset == 0 {
+            run = Some((chunk.mime, chunk.total, chunk.bytes));
+        } else if let Some((mime, total, bytes)) = &mut run {
+            if *mime == chunk.mime && *total == chunk.total && bytes.len() as u64 == chunk.offset {
+                bytes.extend_from_slice(&chunk.bytes);
+            } else {
+                continue;
             }
-            _ => continue,
+        } else {
+            continue;
         }
-        if let Some((mime, total, bytes)) = &picture {
+        if let Some((mime, total, bytes)) = &run {
             if bytes.len() as u64 == *total {
-                return Ok(Some((mime.clone(), bytes.clone())));
-            }
-            if bytes.len() as u64 > *total {
-                return Ok(None);
+                return Ok(PictureProgress::Whole(mime.clone(), bytes.clone()));
             }
         }
     }
-    Ok(None)
+    Ok(match run {
+        Some((mime, total, bytes)) if (bytes.len() as u64) < total => PictureProgress::Partial { mime, total, have: bytes.len() as u64 },
+        _ => PictureProgress::Nothing,
+    })
+}
+
+/// A picture read out of its document's fetch: its type and bytes, once
+/// every chunk from the first is here and opens. `Err(NoKey)` when no wrap
+/// opens with a key held here; `Ok(None)` while the picture is not whole
+/// (its uploader is still sending it, or stopped half way and has not come
+/// back to finish it).
+pub fn open_picture(store_id: StoreId, blob: BlobId, fetched: &VaultFetchResponse, scope: &impl ScopeKeys) -> Result<Option<(String, Vec<u8>)>, Unopened> {
+    Ok(match picture_progress(store_id, blob, fetched, scope)? {
+        PictureProgress::Whole(mime, bytes) => Some((mime, bytes)),
+        _ => None,
+    })
+}
+
+/// The chunks a sender holding the whole picture appends to a document that
+/// got only part of it: from where its run stopped when the run is this
+/// picture's, every chunk again from the first otherwise (which
+/// `picture_progress` reads as a fresh start).
+pub fn continue_picture(progress: &PictureProgress, mime: &str, bytes: &[u8]) -> Vec<PictureChunk> {
+    let from = match progress {
+        PictureProgress::Partial { mime: m, total, have } if m == mime && *total == bytes.len() as u64 => *have,
+        _ => 0,
+    };
+    picture_chunks(mime, bytes).into_iter().filter(|chunk| chunk.offset + chunk.bytes.len() as u64 > from).map(|mut chunk| {
+        // A chunk that straddles `from` is trimmed to start there.
+        if chunk.offset < from {
+            let skip = (from - chunk.offset) as usize;
+            chunk.bytes.drain(..skip);
+            chunk.offset = from;
+        }
+        chunk
+    }).collect()
 }
 
 /// The share's marker a node carries, when it is a share's root
@@ -627,9 +681,30 @@ mod tests {
             keys,
         };
         assert_eq!(open_picture(store_id, blob, &fetch(2, Some(keys.clone())), &scope), Ok(None), "not whole yet");
-        assert_eq!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &scope), Ok(Some(("image/png".to_string(), bytes))));
+        assert_eq!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &scope), Ok(Some(("image/png".to_string(), bytes.clone()))));
         let stranger: HashMap<KeyId, SymmetricKey> = HashMap::new();
         assert!(matches!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &stranger), Err(Unopened::NoKey(_))));
+        // Cut short after the first chunk: partial, and the sender finishes it
+        // from where it stopped.
+        let partial = picture_progress(store_id, blob, &fetch(1, Some(keys.clone())), &scope).unwrap();
+        assert_eq!(partial, PictureProgress::Partial { mime: "image/png".into(), total: bytes.len() as u64, have: PICTURE_CHUNK as u64 });
+        let rest = continue_picture(&partial, "image/png", &bytes);
+        assert_eq!(rest.iter().map(|c| c.offset).collect::<Vec<_>>(), vec![PICTURE_CHUNK as u64, 2 * PICTURE_CHUNK as u64]);
+        let mut resumed = fetch(1, Some(keys.clone()));
+        for (i, chunk) in rest.iter().enumerate() {
+            resumed.updates.push(VaultEntry { seq: i as u64 + 2, blob: seal_picture(store_id, blob, dek_id, &dek, chunk) });
+        }
+        assert_eq!(open_picture(store_id, blob, &resumed, &scope).unwrap().map(|(_, b)| b.len()), Some(bytes.len()));
+        // A run that cannot be continued (a stray chunk after it) is started
+        // over from the first chunk, and that reads whole too.
+        let mut restarted = fetch(1, Some(keys.clone()));
+        let stray = PictureChunk { mime: "image/png".into(), total: bytes.len() as u64, offset: 5, bytes: vec![1, 2, 3] };
+        restarted.updates.push(VaultEntry { seq: 2, blob: seal_picture(store_id, blob, dek_id, &dek, &stray) });
+        for (i, chunk) in continue_picture(&PictureProgress::Nothing, "image/png", &bytes).iter().enumerate() {
+            restarted.updates.push(VaultEntry { seq: i as u64 + 3, blob: seal_picture(store_id, blob, dek_id, &dek, chunk) });
+        }
+        assert_eq!(open_picture(store_id, blob, &restarted, &scope).unwrap().map(|(_, b)| b), Some(bytes.clone()));
+        assert_eq!(picture_chunk_count(bytes.len()), 3);
         // Another picture's entries do not open as this one's.
         assert_eq!(open_picture(store_id, BlobId::new(), &fetch(3, Some(keys)), &scope).ok().flatten(), None);
     }

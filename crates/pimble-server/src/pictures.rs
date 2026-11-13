@@ -137,8 +137,10 @@ impl RpcHandler {
 /// The other end of a link, as far as pictures go.
 #[async_trait]
 pub(crate) trait PictureRemote: Send + Sync + 'static {
-    /// Which of `ids` the remote lacks.
-    async fn missing(&self, ids: &[BlobId]) -> anyhow::Result<HashSet<BlobId>>;
+    /// Which of `ids` the remote lacks, or holds only part of. `held` gives
+    /// the length of each one this store holds whole: what a remote that
+    /// keeps a picture in chunks judges a part by.
+    async fn missing(&self, ids: &[BlobId], held: &HashMap<BlobId, u64>) -> anyhow::Result<HashSet<BlobId>>;
     /// A picture the remote holds: its type and bytes. `None` when it does
     /// not hold it whole (yet).
     async fn fetch(&self, id: BlobId) -> anyhow::Result<Option<(String, Vec<u8>)>>;
@@ -157,7 +159,9 @@ pub(crate) struct PlainRemote {
 
 #[async_trait]
 impl PictureRemote for PlainRemote {
-    async fn missing(&self, ids: &[BlobId]) -> anyhow::Result<HashSet<BlobId>> {
+    // A plain server never names a blob until it is whole (an upload cut
+    // short is a part file, sent again from the start).
+    async fn missing(&self, ids: &[BlobId], _held: &HashMap<BlobId, u64>) -> anyhow::Result<HashSet<BlobId>> {
         let mut missing = HashSet::new();
         for chunk in ids.chunks(ASK_AT_ONCE) {
             let answer = self.client.have_blobs(self.store_id, chunk).await.map_err(|e| anyhow::anyhow!("haveBlobs: {e}"))?;
@@ -207,18 +211,28 @@ pub(crate) struct VaultRemote {
 
 #[async_trait]
 impl PictureRemote for VaultRemote {
-    async fn missing(&self, ids: &[BlobId]) -> anyhow::Result<HashSet<BlobId>> {
+    async fn missing(&self, ids: &[BlobId], held: &HashMap<BlobId, u64>) -> anyhow::Result<HashSet<BlobId>> {
         let listing = self.client.vault_list_docs_with_blobs(self.store_id).await.map_err(|e| anyhow::anyhow!("vaultListDocs: {e}"))?;
-        let held: HashSet<BlobId> = listing
+        let heads: HashMap<BlobId, u64> = listing
             .docs
             .into_iter()
-            .filter(|doc| doc.head > 0)
             .filter_map(|doc| match doc.doc_id {
-                VaultDocId::Blob(id) => Some(id),
+                VaultDocId::Blob(id) => Some((id, doc.head)),
                 _ => None,
             })
             .collect();
-        Ok(ids.iter().copied().filter(|id| !held.contains(id)).collect())
+        // Missing: not there at all, or (for one this store holds) with fewer
+        // entries than the picture takes, which is an upload that stopped
+        // half way. Its sender, or anyone holding it whole, finishes it.
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| match (heads.get(id), held.get(id)) {
+                (None | Some(0), _) => true,
+                (Some(head), Some(len)) => *head < protocol::picture_chunk_count(*len as usize),
+                (Some(_), None) => false,
+            })
+            .collect())
     }
 
     async fn fetch(&self, id: BlobId) -> anyhow::Result<Option<(String, Vec<u8>)>> {
@@ -244,10 +258,14 @@ impl PictureRemote for VaultRemote {
 
     async fn send(&self, id: BlobId, named_by: &[NodeId], mime: &str, bytes: &[u8]) -> anyhow::Result<bool> {
         let Some(&node) = named_by.first() else { return Ok(false) };
-        // Wrapped under every scope key covering the node that names it, as
-        // a new document's data key is (`seal_plan`): the store key on a
-        // whole replica, every share the node is under, or on a member's
-        // replica with no marker on the way up, the share's key it holds.
+        // A document there already got only part of the picture: finished
+        // under the key it was begun with, from where it stopped.
+        match self.client.vault_fetch(self.store_id, VaultDocId::Blob(id), 0).await {
+            Ok(fetched) if fetched.head > 0 => return self.finish(id, &fetched, mime, bytes).await,
+            Ok(_) => {}
+            Err(e) if crate::vault_link::is_refusal(&e) => {}
+            Err(e) => return Err(anyhow::anyhow!("vaultFetch picture {id}: {e}")),
+        }
         let scope_key_ids = {
             let manager = self.handler.store_manager_handle();
             let manager = manager.read().await;
@@ -284,6 +302,36 @@ impl PictureRemote for VaultRemote {
                     debug!("Store {}: picture {} refused by the remote ({})", self.store_id, id, e);
                     return Ok(false);
                 }
+                Err(e) => return Err(anyhow::anyhow!("vaultAppend picture {id}: {e}")),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl VaultRemote {
+    /// Append what a picture's document lacks, under the data key its wraps
+    /// hold (`pimble_rpc::vault::continue_picture`). `Ok(false)` when no wrap
+    /// opens here or the remote refuses: someone else's to finish.
+    async fn finish(&self, id: BlobId, fetched: &pimble_rpc::VaultFetchResponse, mime: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        let scope = self.handler.keystore().store_keys(self.store_id).await;
+        let progress = match protocol::picture_progress(self.store_id, id, fetched, &scope) {
+            Ok(progress) => progress,
+            Err(_) => return Ok(false),
+        };
+        if matches!(progress, protocol::PictureProgress::Whole(..)) {
+            return Ok(true);
+        }
+        let (Some(keys), Some(dek)) = (fetched.keys.as_ref(), fetched.keys.as_ref().and_then(|keys| protocol::picture_key(self.store_id, id, keys, &scope))) else {
+            return Ok(false);
+        };
+        let chunks = protocol::continue_picture(&progress, mime, bytes);
+        info!("Store {}: finishing picture {} ({} of its entries were missing)", self.store_id, id, chunks.len());
+        for chunk in chunks {
+            let sealed = protocol::seal_picture(self.store_id, id, keys.dek_id, &dek, &chunk);
+            match self.client.vault_append_with_keys(self.store_id, VaultDocId::Blob(id), sealed, Some(self.link_id.clone()), None, None).await {
+                Ok(_) => {}
+                Err(e) if crate::vault_link::is_refusal(&e) => return Ok(false),
                 Err(e) => return Err(anyhow::anyhow!("vaultAppend picture {id}: {e}")),
             }
         }
@@ -446,8 +494,9 @@ pub(crate) async fn look_once(handler: &RpcHandler, store_id: StoreId, remote: &
         let manager = manager.read().await;
         (manager.blobs(store_id)?, manager.store_access(store_id).allows_write())
     };
-    let here_missing: HashSet<BlobId> = blobs.missing(&ids).await.into_iter().collect();
-    let there_missing = remote.missing(&ids).await?;
+    let held = blobs.sizes(&ids).await;
+    let here_missing: HashSet<BlobId> = ids.iter().copied().filter(|id| !held.contains_key(id)).collect();
+    let there_missing = remote.missing(&ids, &held).await?;
     let (mut fetched, mut sent) = (0usize, 0usize);
     for id in ids {
         let named_by = &named[&id];

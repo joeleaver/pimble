@@ -23,8 +23,8 @@ in a shared node reached the other side as a canvas with no picture.
 - Tests: `tests/pictures.rs`, `tests/share_pictures.rs`, the relay test, `blobs.rs`;
   the full server suite is green. The local-stack walk-through passed, in carol's desktop
   app too.
-- Open: nothing tells an open note its picture arrived (reopen shows it); a half-sent
-  picture is never finished; waves 4 (browser) and 5 (importer, MCP `attach_image`).
+- A half-sent picture is finished by whichever device holds it whole when it next connects.
+- Open: nothing tells an open note its picture arrived (reopen shows it); waves 4 (browser) and 5 (importer, MCP `attach_image`).
   Deploy the hosted server (and the accounts service is unchanged) before or with the
   desktop release: a new desktop against an old hosted server cannot upload a picture (the
   old server cannot read a `blob-` document id) and keeps retrying on its backoff. An older

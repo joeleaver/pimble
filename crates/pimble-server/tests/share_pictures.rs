@@ -113,3 +113,49 @@ async fn a_picture_put_in_a_node_already_shared_reaches_the_member() {
     a.stop().await.unwrap();
     b.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_picture_whose_upload_stopped_half_way_is_finished_by_its_sender() {
+    use pimble_rpc::vault as protocol;
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let store_id = fx.store_id;
+    alice.cloud_share_node(store_id, fx.shared, "Holiday Plans").await.unwrap();
+    alice.cloud_share_invite(store_id, fx.shared, BOB.0, MemberRole::Editor).await.unwrap();
+    let (mut b, bob, _b_dir) = member_device(&env, BOB, &fx).await;
+
+    // The owner's device goes offline and puts a three-chunk picture on a
+    // canvas in the share.
+    env.relay.cut();
+    let picture = png(2 * protocol::PICTURE_CHUNK + 5000, 9);
+    let url = alice.put_blob(store_id, fx.inside, "image/png", &picture).await.unwrap();
+    put_on_canvas(&alice, store_id, fx.inside, &url).await;
+
+    // What a send cut short leaves on the twin: the document, its wraps, and
+    // the first chunk only.
+    let (key_id, key) = scope_keys_in(a_dir.path(), store_id).pop().unwrap();
+    let scope: std::collections::HashMap<uuid::Uuid, pimble_crypto::SymmetricKey> = [(key_id, key)].into_iter().collect();
+    let (dek_id, dek, keys) = protocol::new_picture_key(store_id, url.blob, &[key_id], &scope).unwrap();
+    let first = &protocol::picture_chunks("image/png", &picture)[0];
+    env.h_admin
+        .vault_append_with_keys(store_id, VaultDocId::Blob(url.blob), protocol::seal_picture(store_id, url.blob, dek_id, &dek, first), None, Some(fx.inside), Some(keys))
+        .await
+        .unwrap();
+    let fetched = env.h_admin.vault_fetch(store_id, VaultDocId::Blob(url.blob), 0).await.unwrap();
+    assert!(matches!(protocol::picture_progress(store_id, url.blob, &fetched, &scope), Ok(protocol::PictureProgress::Partial { .. })));
+
+    // Back online: the sender sees the picture is short and finishes it, and
+    // the member gets it whole.
+    env.relay.restore();
+    let finished = wait_until(Duration::from_secs(40), || async {
+        let Ok(fetched) = env.h_admin.vault_fetch(store_id, VaultDocId::Blob(url.blob), 0).await else { return false };
+        protocol::open_picture(store_id, url.blob, &fetched, &scope).ok().flatten().is_some_and(|(_, bytes)| bytes == picture)
+    })
+    .await;
+    assert!(finished, "the owner's device finishes the picture under the key it was begun with");
+    assert!(wait_until(Duration::from_secs(40), || holds(&bob, store_id, url.blob, &picture)).await, "the member gets it whole");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}

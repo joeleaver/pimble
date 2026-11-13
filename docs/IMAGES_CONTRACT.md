@@ -341,6 +341,14 @@ shared reaches a reader) and `tests/relay.rs` `pictures_go_both_ways_through_the
   now also due a second after a text or data change (a picture put in a shared node), and
   at once after a copier sends a picture (`ShareCommand::PassNow`). What a connection has
   wrapped and published is remembered, so a quiet pass is in memory.
+- **A send cut short is finished** (2026-11-13, after the first cut): a picture whose
+  document on the twin has fewer entries than the picture takes
+  (`picture_chunk_count`) counts as missing there for any device that holds it whole, and
+  that device's send reads the document (`picture_progress`) and appends what it lacks
+  under the key it was begun with (`continue_picture`): from where its run stopped, or
+  every chunk again when the run cannot be continued, which a reader takes as a fresh
+  start (a first chunk restarts the run). Test: `share_pictures.rs`
+  `a_picture_whose_upload_stopped_half_way_is_finished_by_its_sender`.
 - **The relay** needed nothing of its own: its face is the same server, its twin the same
   vault store, the link the same vault link.
 - The app is unchanged: a fetched picture lands in the local blob store, and the app shows
@@ -356,9 +364,6 @@ canvases opened with their pictures drawn.
 
 ### Left after waves 2 and 3
 
-- A picture whose upload stopped half way (a device that went away mid-send) stays half
-  on the twin: readers keep looking and never complete it, and its sender, seeing it
-  listed, does not send it again.
 - No notification tells the app a picture arrived; an open note asks again on a timer
   (2 s doubling to a minute) until it does.
 - `haveBlobs`/`vaultListDocs` are asked about every named picture at every look after a
