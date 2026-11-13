@@ -238,7 +238,10 @@ desktop and the browser; only the file picker differs between them.
   `GetBlob` once and answered "not yet", and `rinch::image::reload_image` is called when
   `BlobLoaded` brings the bytes. Fetched bytes sit in a cache keyed by `BlobUrl`, 64 MiB,
   oldest out first. A picture that is not here is asked for again when a document opens
-  and when the connection comes back. Pictures are never wider than their pane.
+  and when the connection comes back, and, while any is missing, on a timer (2 s, doubling
+  to once a minute, back to 2 s when one arrives; `pictures::ask_again_later`, canvases'
+  too through `boards::retry_missing_pictures`), so an open note or canvas shows a picture
+  a moment after the copier brings it (2026-11-13). Pictures are never wider than their pane.
 - **Pasted HTML** (`PicturesPlugin::handle_paste`): every `<img>` whose `src` is not a
   `pimble-blob:` URL of a store open here is left out, with a sentence; a top-level block
   that held only such pictures goes with them. No `data:` or remote address enters a
@@ -263,8 +266,8 @@ desktop and the browser; only the file picker differs between them.
 - **Not built, against the text above**: the placeholder that says "This picture has not
   arrived yet." (a missing picture shows whatever rinch shows for an image that failed to
   load); a share's member on a plain hosted store is still refused `getBlob` by the
-  server, so sees no pictures; nothing tells the app that a blob arrived, so a missing
-  picture appears when its note is next opened, not the moment it lands. A picture stored
+  server, so sees no pictures (wave 2 lifted that). A missing picture was shown only when
+  its note was next opened until the retry timer (2026-11-13, "Showing"). A picture stored
   for a note that was closed before the upload finished stays in the blob store,
   unreferenced. `PIMBLE_DEBUG_PICTURE` (and `PIMBLE_DEBUG_PICTURE_AS=paste|drop`) names a
   file that "Insert Image..." takes instead of opening the dialog, for driving the
@@ -341,8 +344,8 @@ shared reaches a reader) and `tests/relay.rs` `pictures_go_both_ways_through_the
 - **The relay** needed nothing of its own: its face is the same server, its twin the same
   vault store, the link the same vault link.
 - The app is unchanged: a fetched picture lands in the local blob store, and the app shows
-  it the next time it asks (opening the note, reconnecting). Nothing tells an open note
-  that its picture just arrived (as in wave 1, "Not built").
+  it the next time it asks: opening the note, reconnecting, or the retry timer an open
+  note or canvas runs while a picture is missing ("Showing"). Nothing announces it.
 
 **Verified on the local stack** (2026-11-13, `scripts/local-stack/README.md`, "The
 pictures walk-through"): an owner's picture on a canvas in a shared folder reached both
@@ -356,7 +359,8 @@ canvases opened with their pictures drawn.
 - A picture whose upload stopped half way (a device that went away mid-send) stays half
   on the twin: readers keep looking and never complete it, and its sender, seeing it
   listed, does not send it again.
-- No notification tells the app a picture arrived; an open note shows it when reopened.
+- No notification tells the app a picture arrived; an open note asks again on a timer
+  (2 s doubling to a minute) until it does.
 - `haveBlobs`/`vaultListDocs` are asked about every named picture at every look after a
   reconcile (a listing per look on a vault link): fine for hundreds, not measured for tens
   of thousands.

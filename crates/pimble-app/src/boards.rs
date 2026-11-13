@@ -1530,6 +1530,8 @@ struct Pictures {
     wanted: HashSet<String>,
     /// Asked of the backend (or being decoded).
     asked: HashSet<String>,
+    /// Answered "not here": asked again by [`retry_missing_pictures`].
+    missing: HashSet<String>,
 }
 
 thread_local! {
@@ -1586,6 +1588,21 @@ fn request_wanted_pictures() {
     }
 }
 
+/// Ask again for the pictures boards wanted that were not here: one that
+/// arrives is decoded and drawn as if it had been there all along.
+pub(crate) fn retry_missing_pictures() {
+    let any = PICTURES.with(|p| {
+        let mut p = p.borrow_mut();
+        let missing: Vec<String> = p.missing.drain().collect();
+        let any = !missing.is_empty();
+        p.wanted.extend(missing);
+        any
+    });
+    if any {
+        request_wanted_pictures();
+    }
+}
+
 /// The answer to a `GetBlob`: a board waiting for that picture gets it.
 pub(crate) fn blob_loaded(url: &BlobUrl, result: &Result<Arc<Vec<u8>>, String>) {
     let src = url.to_string();
@@ -1594,10 +1611,15 @@ pub(crate) fn blob_loaded(url: &BlobUrl, result: &Result<Arc<Vec<u8>>, String>) 
     }
     match result {
         Ok(bytes) => decode(src, bytes.clone()),
-        // Not here (yet): asked again the next time a board opens.
-        Err(_) => PICTURES.with(|p| {
-            p.borrow_mut().asked.remove(&src);
-        }),
+        // Not here (yet): asked again shortly (`pictures::ask_again_later`).
+        Err(_) => {
+            PICTURES.with(|p| {
+                let mut p = p.borrow_mut();
+                p.asked.remove(&src);
+                p.missing.insert(src);
+            });
+            crate::pictures::ask_again_later();
+        }
     }
 }
 

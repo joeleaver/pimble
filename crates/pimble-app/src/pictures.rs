@@ -405,8 +405,50 @@ pub(crate) fn loaded(url: BlobUrl, result: &Result<Arc<Vec<u8>>, String>) {
             }
         }
     });
+    match result {
+        Ok(_) => RETRY_MS.with(|ms| ms.set(FIRST_RETRY_MS)),
+        Err(_) => ask_again_later(),
+    }
     for src in sources {
         rinch::image::reload_image(&src);
+    }
+}
+
+/// The first wait before asking again for a picture that was not here, and
+/// the longest (docs/IMAGES_CONTRACT.md "Showing"): a picture arrives on its
+/// own a moment after the document that names it (the server's copier), and
+/// nothing announces it, so a note or a canvas that is open asks again,
+/// sooner at first.
+const FIRST_RETRY_MS: u32 = 2_000;
+const LAST_RETRY_MS: u32 = 60_000;
+
+thread_local! {
+    static RETRY_MS: Cell<u32> = const { Cell::new(FIRST_RETRY_MS) };
+    static RETRY_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Ask again for the pictures that were not here (text's and canvases'),
+/// once, after the current wait; the wait doubles each time until one
+/// arrives. Called on the UI thread, where answers land.
+pub(crate) fn ask_again_later() {
+    if RETRY_ARMED.with(|armed| armed.replace(true)) {
+        return;
+    }
+    let ms = RETRY_MS.with(|ms| {
+        let now = ms.get();
+        ms.set((now * 2).min(LAST_RETRY_MS));
+        now
+    });
+    let fire = || {
+        RETRY_ARMED.with(|armed| armed.set(false));
+        retry_missing();
+        crate::boards::retry_missing_pictures();
+    };
+    #[cfg(not(test))]
+    rinch::core::reactive::unowned(|| rinch::prelude::set_timeout(ms, fire));
+    #[cfg(test)]
+    {
+        let _ = (ms, fire);
     }
 }
 
