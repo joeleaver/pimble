@@ -472,7 +472,13 @@ fn set_up(store: AppStore) {
         _ => write_entry(&path, &entry_name(&agent.name), entry_json(app, &mcp_path(), &key)),
     };
     let sentence = match written {
-        Ok(()) => format!("Added to {}. Restart {} to connect it.", app.name(), app.name()),
+        // Claude Desktop on Windows keeps running in the tray when its window
+        // closes, and reads its config only when it starts (2026-11-13: a
+        // closed window looked like a restart, and nothing connected).
+        Ok(()) if cfg!(windows) && app == ClientApp::ClaudeDesktop => {
+            "Added to Claude Desktop. Quit it from its tray icon (right-click, Quit: closing its window leaves it running), then open it again to connect it.".to_string()
+        }
+        Ok(()) => format!("Added to {}. Quit {} and open it again to connect it.", app.name(), app.name()),
         Err(e) => format!("{e}. Copy the setup below into {} instead.", app.name()),
     };
     ui.setup.set(sentence);
