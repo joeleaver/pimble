@@ -18,8 +18,10 @@ in a shared node reached the other side as a canvas with no picture.
   app too.
 - Open: nothing tells an open note its picture arrived (reopen shows it); a half-sent
   picture is never finished; waves 4 (browser) and 5 (importer, MCP `attach_image`).
-  Moving every device to this version together is wise: an older desktop ignores
-  pictures in vaults, which is safe, but sends none.
+  Deploy the hosted server (and the accounts service is unchanged) before or with the
+  desktop release: a new desktop against an old hosted server cannot upload a picture (the
+  old server cannot read a `blob-` document id) and keeps retrying on its backoff. An older
+  desktop against the new server ignores pictures, which is safe, but sends none.
 
 **2026-11-13 (session 78e7f30f): v0.22.3 released from `master`.**
 - **Paragraph spacing per note** (docs/PARAGRAPHS_CONTRACT.md): compact unless a note
