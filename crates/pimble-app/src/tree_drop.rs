@@ -365,6 +365,11 @@ mod tests {
         let (folder, x, y, leaf) = (Node::folder("Folder"), Node::document("X"), Node::document("Y"), Node::document("Leaf"));
         let ids = (folder.id, x.id, y.id, leaf.id);
         let root = a_root.unwrap();
+        let (mut folder, mut x, mut y, mut leaf) = (folder, x, y, leaf);
+        folder.parent_id = Some(root);
+        leaf.parent_id = Some(root);
+        x.parent_id = Some(ids.0);
+        y.parent_id = Some(ids.0);
         for n in [folder, x, y, leaf] {
             app.upsert_node(a, n);
         }
@@ -426,6 +431,57 @@ mod tests {
         let b = f.stores[1];
         let across = drop_of(&[row(a, f.x)], Some(format!("store_{b}")), TreeSlot::First);
         assert!(matches!(plan_drop(f.app, &across), DropPlan::Send { cmds, .. } if matches!(cmds.as_slice(), [BackendCommand::TransplantNode { place: Place::First, .. }])));
+    }
+
+    /// Joe, 2026-11-14: just below an expanded row there are two positions,
+    /// picked by the pointer's column. Inside, the Tree offers the row as
+    /// parent and `First`; outside, the row's parent and `After(row)`. Both
+    /// plan exactly that, for node rows and store rows.
+    #[test]
+    fn below_an_expanded_row_inside_and_outside_are_two_places() {
+        let f = fixture();
+        let [a, b, _] = f.stores;
+        let store_row = |s: StoreId| format!("store_{s}");
+        // Inside Folder: its first child.
+        let inside = drop_of(&[row(a, f.leaf)], Some(row(a, f.folder)), TreeSlot::First);
+        match plan_drop(f.app, &inside) {
+            DropPlan::Send { cmds, hint, .. } => {
+                assert!(matches!(
+                    cmds.as_slice(),
+                    [BackendCommand::MoveNode { new_parent_id, place: Place::First, .. }] if *new_parent_id == f.folder
+                ));
+                assert_eq!(hint.line, "Into Folder, first");
+            }
+            other => panic!("expected a move, got {other:?}"),
+        }
+        // Outside Folder: its next sibling, after its whole subtree. `y` is
+        // inside Folder now, so this takes it out.
+        let outside = drop_of(&[row(a, f.y)], Some(store_row(a)), TreeSlot::After(row(a, f.folder)));
+        match plan_drop(f.app, &outside) {
+            DropPlan::Send { cmds, hint, .. } => {
+                assert!(matches!(
+                    cmds.as_slice(),
+                    [BackendCommand::MoveNode { node_id, place: Place::After(anchor), .. }] if (*node_id, *anchor) == (f.y, f.folder)
+                ));
+                assert_eq!(hint.line, "In A, after Folder");
+            }
+            other => panic!("expected a move, got {other:?}"),
+        }
+        // `leaf` already follows Folder: outside is where it is.
+        let stays = drop_of(&[row(a, f.leaf)], Some(store_row(a)), TreeSlot::After(row(a, f.folder)));
+        assert!(matches!(plan_drop(f.app, &stays), DropPlan::Stays(h) if h.line == WHERE_IT_IS));
+
+        // Below an expanded store row. A node: inside is the top of the
+        // store; outside (beside the store) is refused.
+        let node_inside = drop_of(&[row(a, f.x)], Some(store_row(b)), TreeSlot::First);
+        assert!(matches!(plan_drop(f.app, &node_inside), DropPlan::Send { hint, .. } if hint.line == "Into B, first"));
+        let node_outside = drop_of(&[row(a, f.x)], None, TreeSlot::After(store_row(b)));
+        assert!(matches!(plan_drop(f.app, &node_outside), DropPlan::Refused(h) if h.line == pimble_core::plan::BESIDE_A_STORE));
+        // A store: outside is after it; inside is refused.
+        let store_outside = drop_of(&[store_row(a)], None, TreeSlot::After(store_row(b)));
+        assert!(matches!(plan_drop(f.app, &store_outside), DropPlan::Stores { hint, .. } if hint.line == "After B"));
+        let store_inside = drop_of(&[store_row(a)], Some(store_row(b)), TreeSlot::First);
+        assert!(matches!(plan_drop(f.app, &store_inside), DropPlan::Refused(h) if h.line == STORES_SIDE_BY_SIDE));
     }
 
     /// docs/TREE_CONTRACT.md "Reordering stores": store rows move among the

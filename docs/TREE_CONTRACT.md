@@ -70,20 +70,32 @@ from the `ondragover` click context on both backends):
 | middle half | inside the row, last | an outline around the row |
 | bottom quarter | after the row (see below) | a line below the row, at the chosen depth |
 
-- **"After" on an expanded row with children** means *after it among its siblings*, after
-  its whole subtree, as after any other row (Joe, 2026-11-14: just before or after any
-  row, at any depth, makes the node that row's sibling). The line is drawn under the row at
-  the row's own depth; *first inside* is the top edge of its first child, a line one level
-  deeper. Until 2026-11-14 this band meant first inside (rinch's default; Pimble sets
-  `Tree::sibling_after_open_row`).
+- **The line shows the depth.** A before or after line starts at the indent of the depth
+  the node will land at and runs to the row's right edge (rinch draws it at
+  `--tree-drop-level`). It moves as the pointer moves sideways, and the strip's sentence
+  always agrees with it.
+- **"After" on an expanded row with children has two positions, outside and inside**
+  (Joe, 2026-11-14: "two drop positions, outside and inside, and the little target bar
+  should update its length/left start position to show that"). The pointer's indent
+  column picks, as it does at the end of a group:
+  - **Inside**: the pointer one indent in from the row's own indent or further (over the
+    row's title, say). The line starts one level in, and the node becomes the row's first
+    child: "Into Projects, first".
+  - **Outside**: the pointer at the row's own indent or to its left (over its chevron or
+    the indent before it). The line starts at the row's indent, and the node becomes its
+    next sibling, after its whole subtree: "In Notes, after Projects".
+  - No shallower depth is offered there: the row drawn below is its own first child.
+  This replaces "the bottom quarter of an expanded row is first inside" (rinch
+  `Tree::after_open_row: AfterOpenRow::ByColumn`, joeleaver/rinch#2685; rinch's default
+  stays first inside).
 - **"After" on the last row of a group** offers every depth that ends there. If the next
   visible row is shallower than this one, the line's depth follows the pointer's x
   position, from this row's depth up to the next row's depth, one indent per step. The
   place is `After(ancestor at that depth)`. This is the drag that outdents.
 - **"Before" a row** is the same spot as "after" the previous visible row, and the two
-  resolve to the same `Place`, so the indicator never jumps between them; the one
-  exception is the first child of an expanded row (first inside) against the bottom of
-  that row (after it).
+  resolve to the same `Place`, so the indicator never jumps between them. Above the first
+  child of an expanded row is first inside it, the same as the bottom of that row with
+  the pointer inside.
 - **A store row** takes "inside" from a dragged node, which means the root's last child.
   Store rows themselves drag, and reorder among the store rows (see "Reordering stores",
   2026-11-14).
@@ -457,9 +469,10 @@ dragged it onto the parent first, then reordered. What was found before changing
   an *expanded* row with children: the contract made it "first inside it". Dropping just
   below an open folder to put a node after that folder therefore put it inside, and the
   only place beside the folder was the top edge of the row after its whole subtree,
-  often off screen. That is the case Joe's words describe ("just before or after any
-  visible row ... that row's sibling"), and it is now beside the row (rinch
-  `Tree::sibling_after_open_row`, joeleaver/rinch#2679; "Zones" above).
+  often off screen. A first cut made that band always "beside the row" (rinch #2679).
+  Joe then asked for two positions, outside and inside, picked by the pointer's column
+  and shown by where the line starts; that is what "Zones" above describes now (rinch
+  #2685).
 - The bands are a quarter of a row each (about 6 px at the default size), the same at
   every level; nothing about a different level makes them harder to hit.
 
@@ -486,9 +499,11 @@ dragged it onto the parent first, then reordered. What was found before changing
   as each one opens, so the saved order is read once per process
   (`persistence::store_rank`), and `upsert_store` puts a store that opens before the first
   store saved after it. A store never placed (newly opened or created) goes last.
-- **Over a store row**, its top quarter is before it and its bottom quarter after it,
-  expanded or not (after an expanded store is after its whole subtree, "Zones" above);
-  the middle (inside) is refused, and so is any row under a store.
+- **Over a store row**, its top quarter is before it and its bottom quarter after it; on
+  an expanded store row the bottom quarter is after it (after its whole subtree) with the
+  pointer at the store row's own indent, the first indent column, and inside (refused)
+  further right, as "Zones" above says for any expanded row. The middle (inside) is
+  refused, and so is any row under a store.
 
 ## Out of scope
 
