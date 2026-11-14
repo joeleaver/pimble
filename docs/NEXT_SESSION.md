@@ -1,5 +1,12 @@
 # Next session: start here
 
+**2026-11-14 (session 78e7f30f): v0.22.7 released from `master`.** Other people's carets are
+clipped to the text's box (a caret beside a picture, as tall as it, stood over the strip,
+toolbar and status bar); the canvas-in-text redraw timer is armed unowned. Open: a share
+member's agent edit to a canvas did not show in Joe's note (the server path is proven by
+`relay.rs` `a_members_canvas_edit_reaches_the_owners_copy...`; not reproduced in the app on one
+machine); the note scroll thumb cannot be grabbed (sent to rinch); explorer drags (session).
+
 **2026-11-13 (session 78e7f30f): v0.22.6 released from `master` (hosted server first, jkbase
 v60).** Pictures in encrypted stores in the browser and from imports (images waves 4 and 5);
 a half-sent picture finished by whoever holds it whole; a canvas in text draws when its
