@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-11-14 (session 78e7f30f): v0.22.9 released from `master`; rinch `main` a83aaa43 in all
+three locks.** The note scroll thumb can be grabbed (rinch #2681: the scrollbar search went
+through the `display: contents` pane slot). Explorer: store rows drag to reorder (the order
+is the window's), and below an expanded row the pointer's column picks inside or outside
+with the drop line showing which (branch `tree-drops-stores`, docs/TREE_CONTRACT.md). Next:
+docs/DRAWING_CONTRACT.md (vector and paint tools, layer groups, the floating canvas UI;
+Joe's decisions of 2026-11-14), wave 1 starting with a mockup he saw in chat. rinch #2691
+(a scrollbar under a popover takes no press) in review. `sharing_against_the_real_accounts_service`
+can fail under load when rhypedb-server takes over 15 s to start; it passes alone.
+
 **2026-11-14 (session 78e7f30f): v0.22.8 released from `master`; rinch `main` 78528484 in all
 three locks.** The selection shows over code blocks, inline code, highlights and table
 headers (rinch #2670, #2673). Canvases in text redraw on completion (`text_boards::pump`,
