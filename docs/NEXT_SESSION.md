@@ -261,7 +261,7 @@ where, tests, and what was checked in the app):
 
 **How to work here** (all in memory and CLAUDE.md; the ones that bit this session):
 - ONE heavy cargo job at a time on this machine (other projects build too; load 40-60 is
-  normal): every cargo command through `scripts/guarded.sh -j 6 --release`; never the whole
+  normal): every cargo command through `CARGO_BUILD_JOBS=6 scripts/guarded.sh cargo ... --release`; never the whole
   workspace suite except before a big release.
 - Check UI in the release desktop app isolated from Joe's: the scratch environment of this
   session was `/tmp/claude-1000/-home-joe-dev-pimble/b7ec70bd-7c99-4bc0-bd8c-ff39695a2ced/scratchpad/desk`
