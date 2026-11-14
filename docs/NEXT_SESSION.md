@@ -1,5 +1,13 @@
 # Next session: start here
 
+**2026-11-14 (session 78e7f30f): v0.22.8 released from `master`; rinch `main` 78528484 in all
+three locks.** The selection shows over code blocks, inline code, highlights and table
+headers (rinch #2670, #2673). Canvases in text redraw on completion (`text_boards::pump`,
+`plan_renders`: at once, one render at a time per source, at most every 100 ms), no
+debounce flag that a dropped timer could leave set: the cause of Joe's Testing Doc canvas
+showing a share member's agent's strokes only in the canvas view. Open: the note scroll
+thumb (rinch #2681, the `display: contents` pane slot); explorer drops (session).
+
 **2026-11-14 (session 78e7f30f): v0.22.7 released from `master`.** Other people's carets are
 clipped to the text's box (a caret beside a picture, as tall as it, stood over the strip,
 toolbar and status bar); the canvas-in-text redraw timer is armed unowned. Open: a share
