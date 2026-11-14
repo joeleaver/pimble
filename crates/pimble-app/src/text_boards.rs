@@ -19,9 +19,10 @@
 //!
 //! Rendering happens here on the UI thread's terms: the loader (on a thread
 //! of rinch's own on the desktop) answers from [`RENDERED`] or asks for a
-//! render; a render is debounced ([`RENDER_DEBOUNCE_MS`]) after every change
-//! of what it shows, and `rinch::image::reload_image` hands the new picture
-//! to every `<img>` naming it.
+//! render; a change of what it shows draws it again at once, one render at a
+//! time per source and at most every [`RENDER_GAP_MS`] (`pump`), and
+//! `rinch::image::reload_image` hands the new picture to every `<img>` naming
+//! it.
 //!
 //! What a host node's boards are read from is the host's document as this
 //! window holds it ([`HOSTS`]): loaded when a pane opens the note, fed every
@@ -72,11 +73,12 @@ const BOARD_FRAGMENT: &str = "#board=";
 /// there is no picture, and the atom's `data-board` names its canvas.
 pub(crate) const IN_TEXT_SRC: &str = "pimble-board:in-text";
 
-/// How long after the last change of a board its picture in text is drawn
-/// again (contract section 2: a stroke being drawn appears as it is drawn,
-/// without a render per point).
+/// The shortest time between two renders of one source's picture in text
+/// (contract section 2: a stroke being drawn appears as it is drawn, without
+/// a render per point). A change draws at once when the last render of that
+/// source began longer ago than this and is done; otherwise when it is.
 #[cfg_attr(test, allow(dead_code))]
-const RENDER_DEBOUNCE_MS: u32 = 150;
+const RENDER_GAP_MS: f64 = 100.0;
 
 /// How long the floating controls stay after the pointer leaves the picture,
 /// so it can reach them.
@@ -280,7 +282,12 @@ thread_local! {
     static RESOLVING: RefCell<HashMap<String, (StoreId, NodeId)>> = RefCell::new(HashMap::new());
     /// Sources to render again, and the pending timer.
     static DIRTY: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    static RENDER_TIMER: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
+    /// Sources being drawn now (one render at a time per source), and when
+    /// each last began.
+    static IN_FLIGHT: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static STARTED: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+    /// The wake for a source waiting out its gap: when it is due, and its timer.
+    static WAKE: RefCell<Option<(f64, TimeoutHandle)>> = const { RefCell::new(None) };
     /// The sweep of embeds no text shows any more.
     static SWEEP_TIMER: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
     /// Placeholder pictures, by sentence.
@@ -468,46 +475,120 @@ fn schedule_marked(store_id: StoreId, node_id: NodeId) {
     schedule(srcs, false);
 }
 
-/// Draw `srcs` again after the debounce (`now`: on the next turn).
+/// Draw `srcs` again (`now`: without waiting out the gap, a picture first
+/// shown).
+///
+/// Nothing here can stop a later change from being drawn: a render's end
+/// pumps again whatever became of it, and the only timer is the wake for a
+/// gap, which a later pump replaces when it is overdue. Before 2026-11-14 a
+/// "render pending" flag waited on a debounce timer, and a timer dropped with
+/// the effect that armed it left every canvas in text undrawn for good (Joe:
+/// a share member's agent drew on a canvas; the owner's note never showed it).
 fn schedule(srcs: impl IntoIterator<Item = String>, now: bool) {
-    let mut any = false;
-    DIRTY.with(|d| {
+    let srcs: Vec<String> = srcs.into_iter().collect();
+    if now {
+        STARTED.with(|s| {
+            let mut s = s.borrow_mut();
+            for src in &srcs {
+                s.remove(src);
+            }
+        });
+    }
+    DIRTY.with(|d| d.borrow_mut().extend(srcs));
+    pump();
+}
+
+/// Start every dirty source that is not being drawn and whose gap is over,
+/// and wake for the first of the rest.
+fn pump() {
+    #[cfg(test)]
+    let gap = 0.0;
+    #[cfg(not(test))]
+    let gap = RENDER_GAP_MS;
+    let at = now_ms();
+    let (ready, wait) = DIRTY.with(|d| {
         let mut d = d.borrow_mut();
-        for src in srcs {
-            any |= d.insert(src);
+        let (ready, wait) = IN_FLIGHT.with(|f| STARTED.with(|s| plan_renders(&d, &f.borrow(), &s.borrow(), at, gap)));
+        for src in &ready {
+            d.remove(src);
         }
+        (ready, wait)
     });
-    if !any && !now {
+    for src in ready {
+        IN_FLIGHT.with(|f| f.borrow_mut().insert(src.clone()));
+        STARTED.with(|s| s.borrow_mut().insert(src.clone(), at));
+        start(src);
+    }
+    if let Some(due) = wait {
+        wake_at(due, at);
+    }
+}
+
+/// Which dirty sources start now (not being drawn, gap over), and when the
+/// first of the others that only waits out its gap is due.
+fn plan_renders(dirty: &HashSet<String>, in_flight: &HashSet<String>, started: &HashMap<String, f64>, at: f64, gap: f64) -> (Vec<String>, Option<f64>) {
+    let mut ready = Vec::new();
+    let mut wait: Option<f64> = None;
+    for src in dirty {
+        if in_flight.contains(src) {
+            // Drawn again when this render ends.
+            continue;
+        }
+        let due = started.get(src).map_or(at, |t| t + gap);
+        if due <= at {
+            ready.push(src.clone());
+        } else {
+            wait = Some(wait.map_or(due, |w: f64| w.min(due)));
+        }
+    }
+    ready.sort();
+    (ready, wait)
+}
+
+/// Pump again at `due`, unless a wake no later than that is still to come.
+fn wake_at(due: f64, at: f64) {
+    let keep = WAKE.with(|w| w.borrow().as_ref().is_some_and(|(when, _)| *when <= due && *when + 1_000.0 > at));
+    if keep {
         return;
     }
-    let pending = RENDER_TIMER.with(|t| t.borrow().is_some());
-    if pending && !now {
-        return;
-    }
-    if let Some(old) = RENDER_TIMER.with(|t| t.borrow_mut().take()) {
+    if let Some((_, old)) = WAKE.with(|w| w.borrow_mut().take()) {
         clear_timeout(old);
     }
     #[cfg(test)]
     {
-        flush();
+        let _ = (due, at);
     }
     #[cfg(not(test))]
     {
-        let delay = if now { 0 } else { RENDER_DEBOUNCE_MS };
-        // Armed by no owner: a timeout armed inside an effect or a render is
-        // dropped when that owner re-runs or goes (rinch `set_timeout`), and
-        // `RENDER_TIMER` would then name a timer that never fires, so every
-        // later change waited on it for good. Only the explicit `now` draws
-        // still happened: a canvas in text drew once and never again for a
-        // peer's edit (Joe, 2026-11-14: a share member's agent drew on a
-        // canvas; the owner saw it only on opening the canvas).
+        let delay = (due - at).max(0.0).ceil() as u32;
+        // Armed by no owner, so no effect or render that happens to be
+        // running takes it with it (rinch `set_timeout`).
         let handle = rinch::core::reactive::unowned(|| {
             set_timeout(delay, || {
-                RENDER_TIMER.with(|t| t.borrow_mut().take());
-                flush();
+                WAKE.with(|w| w.borrow_mut().take());
+                pump();
             })
         });
-        RENDER_TIMER.with(|t| *t.borrow_mut() = Some(handle));
+        WAKE.with(|w| *w.borrow_mut() = Some((due, handle)));
+    }
+}
+
+/// A render of `src` ended, with a picture or without one: it may be drawn
+/// again, and is when it changed meanwhile.
+fn finished(src: &str) {
+    IN_FLIGHT.with(|f| f.borrow_mut().remove(src));
+    pump();
+}
+
+/// Draw `src` now.
+fn start(src: String) {
+    match prepare(&src) {
+        None => finished(&src),
+        Some(Job::Ready(bytes)) => {
+            deliver(src.clone(), bytes);
+            finished(&src);
+        }
+        Some(Job::Draw { snapshot, pictures, area }) => draw(src, snapshot, pictures, area),
     }
 }
 
@@ -518,18 +599,6 @@ fn wanted(src: &str) {
         hold_embed(url, src);
     }
     schedule([src.to_string()], true);
-}
-
-/// Draw every dirty source and hand rinch the new pictures.
-fn flush() {
-    let dirty: Vec<String> = DIRTY.with(|d| d.borrow_mut().drain().collect());
-    for src in dirty {
-        let Some(job) = prepare(&src) else { continue };
-        match job {
-            Job::Ready(bytes) => deliver(src, bytes),
-            Job::Draw { snapshot, pictures, area } => draw(src, snapshot, pictures, area),
-        }
-    }
 }
 
 /// What drawing a source takes.
@@ -661,15 +730,17 @@ fn draw(src: String, snapshot: BoardSnapshot, pictures: HashMap<String, Arc<Pict
         let bytes = work();
         run_on_main_thread(move || {
             if let Some(bytes) = bytes {
-                deliver(src, Arc::new(bytes));
+                deliver(src.clone(), Arc::new(bytes));
             }
+            finished(&src);
         });
     });
     #[cfg(any(not(feature = "native"), test))]
     {
         if let Some(bytes) = work() {
-            deliver(src, Arc::new(bytes));
+            deliver(src.clone(), Arc::new(bytes));
         }
+        finished(&src);
     }
 }
 
@@ -2158,6 +2229,36 @@ mod tests {
         assert_eq!(parse_source(&embed.to_string()), Some(Source::Embed(embed)));
         assert_eq!(parse_source(&blob.to_string()), None, "a plain picture is the blob loader's");
         assert_eq!(parse_source(&format!("{blob}#board=<x>")), None);
+    }
+}
+
+#[cfg(test)]
+mod render_plan_tests {
+    use super::plan_renders;
+    use std::collections::{HashMap, HashSet};
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_change_draws_at_once_one_render_at_a_time_and_waits_out_only_the_gap() {
+        let started: HashMap<String, f64> = [("a".to_string(), 1_000.0), ("b".to_string(), 1_050.0)].into();
+        // Never drawn: at once. Drawn 150 ms ago: at once. Drawn 100 ms ago
+        // with a 100 ms gap: at once too.
+        let (ready, wait) = plan_renders(&set(&["new", "a"]), &set(&[]), &started, 1_150.0, 100.0);
+        assert_eq!((ready, wait), (vec!["a".to_string(), "new".to_string()], None));
+        // Drawn 50 ms ago: due at its start plus the gap, not before.
+        let (ready, wait) = plan_renders(&set(&["b"]), &set(&[]), &started, 1_100.0, 100.0);
+        assert_eq!((ready, wait), (Vec::<String>::new(), Some(1_150.0)));
+        // Being drawn: neither started again nor woken for; its render's end
+        // pumps again.
+        let (ready, wait) = plan_renders(&set(&["a"]), &set(&["a"]), &started, 5_000.0, 100.0);
+        assert_eq!((ready, wait), (Vec::<String>::new(), None));
+        // The wake is for the first due.
+        let started: HashMap<String, f64> = [("x".to_string(), 990.0), ("y".to_string(), 960.0)].into();
+        let (_, wait) = plan_renders(&set(&["x", "y"]), &set(&[]), &started, 1_000.0, 100.0);
+        assert_eq!(wait, Some(1_060.0));
     }
 }
 
