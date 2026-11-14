@@ -208,7 +208,10 @@ fn write_picture(out: &mut String, e: &Element, p: &PictureGeom, picture_bytes: 
 /// page's fill first (unless `only` is given).
 ///
 /// An element's opacity applies to each of its parts, as the renderer's
-/// does, so it is on each part, not on the element's group.
+/// does, so it is on each part, not on the element's group. A layer or
+/// group the renderer gives a buffer of its own (an opacity below 1, a
+/// blend that is not normal) is a `<g>` carrying `opacity` and
+/// `mix-blend-mode` around its elements.
 pub fn render_svg(
     snapshot: &BoardSnapshot,
     rect: Rect,
@@ -238,6 +241,8 @@ pub fn render_svg(
         out.push_str("/>");
     }
     let mask = only.map(|ids| included(snapshot, ids));
+    let mut open_layers: Vec<usize> = Vec::new();
+    const NONE: &[usize] = &[];
     for i in snapshot.query(&rect) {
         if mask.as_ref().is_some_and(|m| !m[i]) {
             continue;
@@ -246,6 +251,24 @@ pub fn render_svg(
         let ops = element_ops(e, &rect, None);
         if ops.is_empty() {
             continue;
+        }
+        let chain = e.layer_index.and_then(|l| snapshot.chains.get(l)).map_or(NONE, |c| c.as_slice());
+        let common = open_layers.iter().zip(chain).take_while(|(a, b)| a == b).count();
+        while open_layers.len() > common {
+            open_layers.pop();
+            out.push_str("</g>");
+        }
+        for layer in &chain[open_layers.len()..] {
+            let l = &snapshot.layers[*layer];
+            out.push_str("<g");
+            if l.opacity < 1.0 {
+                let _ = write!(out, " opacity=\"{}\"", n(l.opacity));
+            }
+            if let Some(mode) = l.blend.css() {
+                let _ = write!(out, " style=\"mix-blend-mode:{mode}\"");
+            }
+            out.push('>');
+            open_layers.push(*layer);
         }
         // Consecutive ops in one space share a group.
         let mut open: Option<Space> = None;
@@ -270,6 +293,9 @@ pub fn render_svg(
                 _ => write_op(&mut out, op),
             }
         }
+        out.push_str("</g>");
+    }
+    for _ in open_layers {
         out.push_str("</g>");
     }
     out.push_str("</svg>");

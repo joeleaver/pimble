@@ -19,6 +19,9 @@
 //!   rinch's `paint` example (contract spike 1), with a per-viewer grid.
 //! - [`Element::hits`], [`BoardSnapshot::hit_precise`],
 //!   [`BoardSnapshot::within`]: hit testing against painted geometry.
+//! - [`layer_tree`]: the layers read as a tree (groups, inherited
+//!   visibility and locks, blending, draw order), the one resolution
+//!   everything else reads.
 //! - [`locks`]: what a lock guards, judged by [`BoardTxn`] for every
 //!   caller, and the same rules read over a snapshot (which layer new
 //!   elements go into, what can be edited).
@@ -31,6 +34,7 @@
 
 pub mod doc;
 mod hit;
+pub mod layer_tree;
 pub mod locks;
 pub mod model;
 pub mod options;
@@ -48,6 +52,7 @@ pub use doc::{
     Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, LockedLayer, RawBoard, RawElement, RawLayer, text_board_key,
     TEXT_BOARD_PREFIX, BOARD_KEY,
 };
+pub use layer_tree::{LayerTree, TreeEntry};
 pub use locks::Deleted;
 pub use recipe::{NewCanvas, StartingPicture};
 pub use model::*;

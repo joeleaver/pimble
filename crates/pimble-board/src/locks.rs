@@ -6,6 +6,7 @@
 //! it writes (what a press can pick, which layer a tool draws in).
 
 use crate::doc::{BoardError, LockedLayer, Result};
+use crate::model::LayerKind;
 use crate::snapshot::{BoardSnapshot, Element, Layer};
 
 /// The sentences a person reads for each refusal (the `Display` of the
@@ -15,6 +16,16 @@ pub const ELEMENT_LOCKED: &str = "That is locked. Unlock it in the layers panel 
 pub const LAYER_LOCKED: &str = "That layer is locked. Unlock it, or pick another layer to draw in.";
 pub const LAYER_LOCKED_AGAINST_REMOVAL: &str = "That layer is locked. Unlock it to delete or merge it.";
 pub const EVERY_LAYER_LOCKED: &str = "Every layer is locked. Unlock one, or add a layer to draw in.";
+pub const NO_VECTOR_LAYER: &str = "This canvas has no vector layer. Add one to draw shapes, text and strokes in.";
+
+/// The sentence for elements sent to a layer of `kind` that holds none.
+pub fn not_a_vector_layer(kind: &LayerKind) -> String {
+    match kind {
+        LayerKind::Group => "That is a group. Pick a layer inside it, or another layer.".to_string(),
+        LayerKind::Paint => "That is a paint layer. Shapes, text and strokes go in a vector layer.".to_string(),
+        other => format!("That is a {other} layer. Shapes, text and strokes go in a vector layer."),
+    }
+}
 
 /// The one judgement of an element edit: refused when the element is locked
 /// or the layer it is drawn in is (`layer`, when that layer is locked). The
@@ -52,39 +63,55 @@ impl Deleted {
 
 impl BoardSnapshot {
     /// Whether element `id` takes edits: it exists, and neither it nor the
-    /// layer it is drawn in is locked.
+    /// layer it is drawn in is locked (a layer in a locked group is).
     pub fn editable(&self, id: &str) -> bool {
         self.judge_edit(id).is_ok()
+    }
+
+    /// The lock that guards layer `id`: its own, or a group's above it.
+    pub fn layer_lock(&self, id: &str) -> Option<LockedLayer> {
+        let layer = self.layer(id)?;
+        let by = layer.locked_by.as_deref()?;
+        self.layer(by).map(locked)
     }
 
     /// Element `id` for an edit, or the refusal [`crate::BoardTxn`] would
     /// give.
     pub fn judge_edit(&self, id: &str) -> Result<&Element> {
         let e = self.get(id).ok_or_else(|| BoardError::NoElement(id.to_string()))?;
-        judge_element(id, e.raw.locked, self.layer(&e.layer).filter(|l| l.locked).map(locked))?;
+        judge_element(id, e.raw.locked, self.layer_lock(&e.layer))?;
         Ok(e)
     }
 
-    /// Whether the layer an element is drawn in is locked (what a press, a
-    /// marquee or Select All passes over: a locked picture layer is the
-    /// screenshot under the marks).
+    /// Whether the layer an element is drawn in is locked, itself or by a
+    /// group (what a press, a marquee or Select All passes over: a locked
+    /// picture layer is the screenshot under the marks).
     pub fn in_locked_layer(&self, e: &Element) -> bool {
-        self.layer(&e.layer).is_some_and(|l| l.locked)
+        self.layer(&e.layer).is_some_and(|l| l.effective_locked)
     }
 
     /// The layer something new goes into: `picked` when given (refused when
-    /// it is locked), else the top layer that is not locked. The same rule
-    /// [`crate::BoardTxn::add_element`] follows when no layer is named.
+    /// it is locked, itself or by a group, or is not a vector layer), else
+    /// the top vector layer that is not locked and not inside a hidden
+    /// group. The same rule [`crate::BoardTxn::add_element`] follows when no
+    /// layer is named.
     pub fn layer_for_new(&self, picked: Option<&str>) -> Result<&Layer> {
         match picked {
             Some(id) => {
                 let layer = self.layer(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
-                if layer.locked {
-                    return Err(BoardError::LayerLocked(locked(layer)));
+                if !layer.kind.is_vector() {
+                    return Err(BoardError::NotAVectorLayer { id: id.to_string(), kind: layer.kind.clone() });
+                }
+                if let Some(lock) = self.layer_lock(id) {
+                    return Err(BoardError::LayerLocked(lock));
                 }
                 Ok(layer)
             }
-            None => self.layers.iter().rev().find(|l| !l.locked).ok_or(BoardError::EveryLayerLocked),
+            None => match self.default_layer() {
+                Some(layer) => Ok(layer),
+                None if self.layers.iter().any(|l| l.kind.is_vector()) => Err(BoardError::EveryLayerLocked),
+                None => Err(BoardError::NoVectorLayer),
+            },
         }
     }
 }

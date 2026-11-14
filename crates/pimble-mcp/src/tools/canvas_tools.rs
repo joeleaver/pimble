@@ -18,8 +18,8 @@ use std::sync::Arc;
 use base64::Engine;
 use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
-    selection_bounds, Align, ArrowHeads, Author, Board, BoardError, BoardSnapshot, BoardTxn, CardLabel, Color, Dash, End,
-    Geom, Kind, NewElement, Page, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform,
+    selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot, BoardTxn, CardLabel, Color, Dash, End,
+    Geom, Kind, LayerKind, NewElement, Page, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform,
     ViewOptions,
 };
 use pimble_core::{node_types, BlobUrl, Node, Place, PimbleUrl};
@@ -343,8 +343,25 @@ pub struct AddLayerParams {
     #[serde(default)]
     pub canvas: Option<String>,
     pub name: String,
-    /// Where it goes: "top" (the default), "bottom", "above:<layer>" or
-    /// "below:<layer>" (a layer's name or id).
+    /// What it holds: "vector" (the default: elements), "paint" (painting,
+    /// which comes later: a paint layer holds no elements) or "group" (other
+    /// layers).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The group it goes in (a group's name or id). Left out: the top level,
+    /// or the group of the layer `order` names.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// How it is laid over what is below it: "normal" (a layer's default),
+    /// "multiply", "screen", "overlay", "darken", "lighten", "color-dodge",
+    /// "color-burn", "hard-light", "soft-light", "difference", "exclusion",
+    /// or "pass-through" (a group's default: its layers blend as if not
+    /// grouped).
+    #[serde(default)]
+    pub blend: Option<String>,
+    /// Where it goes among the layers of its group: "top" (the default),
+    /// "bottom", "above:<layer>" or "below:<layer>" (a layer's name or id;
+    /// it then goes in that layer's group).
     #[serde(default)]
     pub order: Option<String>,
     /// What the layer holds, in words ("Contour lines, one every 20 m").
@@ -373,7 +390,15 @@ pub struct UpdateLayerParams {
     /// 0 to 1.
     #[serde(default)]
     pub opacity: Option<f32>,
-    /// "top", "bottom", "above:<layer>" or "below:<layer>".
+    /// A blend mode, as add_layer takes it ("pass-through" only for a group).
+    #[serde(default)]
+    pub blend: Option<String>,
+    /// Move it into this group (a group's name or id), or "" for the top
+    /// level. On top of the group unless `order` says where.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// "top", "bottom", "above:<layer>" or "below:<layer>", among the layers
+    /// of its group (above or below a layer in another group moves it there).
     #[serde(default)]
     pub order: Option<String>,
     /// A new note ("" empties it).
@@ -391,8 +416,10 @@ pub struct DeleteLayerParams {
     pub canvas: Option<String>,
     /// The layer: its name or id.
     pub layer: String,
-    /// Keep its elements: they go on top of the layer below ("Merge Down").
-    /// Left out, they are deleted with it.
+    /// Keep its elements: they go on top of the layer below in its group
+    /// ("Merge Down"); for a group, every layer in it becomes one layer
+    /// ("Merge Group"). Left out, they are deleted with it (a group with
+    /// every layer in it).
     #[serde(default)]
     pub merge_down: bool,
 }
@@ -531,7 +558,10 @@ fn said(e: &BoardError) -> String {
         BoardError::LayerLocked(layer) | BoardError::LayerLockedAgainstRemoval(layer) => {
             format!("layer \"{}\" is locked; update_layer can unlock it", layer.name)
         }
-        BoardError::EveryLayerLocked => "every layer of this canvas is locked; update_layer can unlock one, or add_layer adds one".into(),
+        BoardError::EveryLayerLocked => "every layer of this canvas is locked (or in a locked or hidden group); update_layer can unlock one, or add_layer adds one".into(),
+        BoardError::NoVectorLayer => "this canvas has no vector layer for elements; add_layer adds one".into(),
+        BoardError::NotAVectorLayer { kind, .. } if kind.is_group() => "that layer is a group, which holds layers, not elements; name a layer inside it".into(),
+        BoardError::NotAVectorLayer { kind, .. } => format!("that is a {kind} layer, which holds no elements; name a vector layer"),
         other => other.to_string(),
     }
 }
@@ -615,6 +645,7 @@ fn anchor_of(rect: &Rect, side: Option<Side>) -> Point {
 struct LayerInfo {
     id: String,
     name: String,
+    group: bool,
 }
 
 /// The canvas as it was when the write began, and the elements this write made.
@@ -636,10 +667,15 @@ impl Scene {
         let layers = snapshot
             .layers
             .iter()
-            .map(|l| LayerInfo { id: l.id.clone(), name: l.name.clone() })
+            .map(|l| LayerInfo { id: l.id.clone(), name: l.name.clone(), group: l.kind.is_group() })
             .collect::<Vec<_>>();
         let elements = snapshot.elements.iter().map(|e| (e.raw.id.clone(), e.bounds)).collect();
         Self { layers, elements, refs: HashMap::new(), pictures: HashMap::new(), cards: HashMap::new(), touched: Vec::new() }
+    }
+
+    /// Whether layer `id` is a group.
+    fn is_group(&self, id: &str) -> bool {
+        self.layers.iter().any(|l| l.id == id && l.group)
     }
 
     fn layer(&self, name: &str) -> Result<&LayerInfo, BoardError> {
@@ -1117,6 +1153,30 @@ fn meaning_text(note: Option<&str>, fields: &[(String, String)]) -> String {
     out
 }
 
+/// `word` with its first letter in capitals ("paint" -> "Paint").
+fn capitalized(word: &str) -> String {
+    let mut c = word.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// A layer kind as an agent writes it.
+fn layer_kind(kind: Option<&str>) -> Result<LayerKind, BoardError> {
+    match kind.map(str::trim).unwrap_or("vector") {
+        "" | "vector" => Ok(LayerKind::Vector),
+        "paint" => Ok(LayerKind::Paint),
+        "group" => Ok(LayerKind::Group),
+        other => Err(bad(format!("kind \"{other}\" is not vector, paint or group"))),
+    }
+}
+
+/// A blend mode as an agent writes it.
+fn blend_mode(blend: &str) -> Result<Blend, BoardError> {
+    Blend::parse(blend.trim()).ok_or_else(|| {
+        let all: Vec<&str> = Blend::ALL.iter().map(|b| b.as_str()).collect();
+        bad(format!("blend \"{}\" is not one of {}", blend.trim(), all.join(", ")))
+    })
+}
+
 /// Whether `fields` has the field `wanted` names ("role", or "role=door").
 fn has_field(fields: &[(String, String)], wanted: &str) -> bool {
     let (name, value) = match wanted.split_once('=') {
@@ -1154,23 +1214,48 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
     let mut listed = 0;
     for layer in snapshot.layers.iter().rev() {
         let mut flags = Vec::new();
+        if let Some(group) = layer.parent.as_deref().and_then(|p| snapshot.layer(p)) {
+            flags.push(format!("in group \"{}\"", group.name));
+        }
+        if layer.blend != layer.kind.default_blend() {
+            flags.push(format!("blend {}", layer.blend));
+        }
         if !layer.visible {
             flags.push("hidden".to_string());
+        } else if !layer.effective_visible {
+            flags.push("hidden by its group".to_string());
         }
         if layer.locked {
             flags.push("locked".to_string());
+        } else if layer.effective_locked {
+            flags.push("locked by its group".to_string());
         }
         if layer.opacity < 1.0 {
             flags.push(format!("opacity {}", n(layer.opacity)));
         }
-        out.push_str(&format!(
-            "\n## Layer \"{}\" ({}){}, {} element{}, top first\n",
-            layer.name,
-            layer.id,
-            if flags.is_empty() { String::new() } else { format!(", {}", flags.join(", ")) },
-            layer.count,
-            if layer.count == 1 { "" } else { "s" }
-        ));
+        let flags = if flags.is_empty() { String::new() } else { format!(", {}", flags.join(", ")) };
+        let heading = "#".repeat(2 + layer.depth.min(4));
+        match &layer.kind {
+            LayerKind::Group => {
+                let held = snapshot.children_of(Some(&layer.id)).len();
+                out.push_str(&format!(
+                    "\n{heading} Group \"{}\" ({}){flags}, {held} layer{}, top first\n",
+                    layer.name,
+                    layer.id,
+                    if held == 1 { "" } else { "s" }
+                ));
+                out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
+                continue;
+            }
+            LayerKind::Vector => out.push_str(&format!(
+                "\n{heading} Layer \"{}\" ({}){flags}, {} element{}, top first\n",
+                layer.name,
+                layer.id,
+                layer.count,
+                if layer.count == 1 { "" } else { "s" }
+            )),
+            other => out.push_str(&format!("\n{heading} {} layer \"{}\" ({}){flags}\n", capitalized(other.as_str()), layer.name, layer.id)),
+        }
         out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
         for e in snapshot.elements.iter().rev().filter(|e| e.layer == layer.id && with_field.is_none_or(|w| has_field(&e.raw.fields, w))) {
             if listed == LIST_LIMIT {
@@ -1483,9 +1568,9 @@ fn build_canvas(
     let mut touched = Vec::new();
     if let Some((layer, element)) = made.picture {
         touched.push(element);
-        layers.push(LayerInfo { id: layer, name: PICTURE_LAYER_NAME.into() });
+        layers.push(LayerInfo { id: layer, name: PICTURE_LAYER_NAME.into(), group: false });
     }
-    layers.push(LayerInfo { id: made.draw_layer, name: pimble_board::doc::FIRST_LAYER_NAME.into() });
+    layers.push(LayerInfo { id: made.draw_layer, name: pimble_board::doc::FIRST_LAYER_NAME.into(), group: false });
     let mut scene = Scene { layers, elements: HashMap::new(), refs: HashMap::new(), pictures: prepared.0, cards: prepared.1, touched: Vec::new() };
     let ids = add_specs(t, &mut scene, specs, None)?;
     touched.extend(ids.iter().cloned());
@@ -1801,7 +1886,8 @@ impl Pimble {
         Ok(out)
     }
 
-    /// Add a layer to a canvas (layers organize; who made what is on each element).
+    /// Add a layer or a group of layers to a canvas (layers organize; who made
+    /// what is on each element).
     #[tool(name = "add_layer")]
     async fn add_layer(&self, Parameters(p): Parameters<AddLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
@@ -1811,10 +1897,20 @@ impl Pimble {
         }
         let order = p.order.clone().unwrap_or_default();
         let (note, fields) = (p.note.clone(), p.fields.clone());
+        let (kind, parent, blend) = (p.kind.clone(), p.parent.clone(), p.blend.clone());
         let id = self
             .canvas_edit(&target, Default::default(), move |t, scene, _| {
                 let at = placement(&order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
-                let id = t.add_layer(&name, at)?;
+                let kind = layer_kind(kind.as_deref())?;
+                let blend = blend.as_deref().map(blend_mode).transpose()?;
+                let parent = match parent.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                    Some(p) => Some(scene.layer(p)?.id.clone()),
+                    None => None,
+                };
+                let id = t.add_layer_in(&name, kind, parent.as_deref(), at)?;
+                if let Some(blend) = blend {
+                    t.set_layer_blend(&id, blend)?;
+                }
                 if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
                     t.set_layer_note(&id, note)?;
                 }
@@ -1824,17 +1920,19 @@ impl Pimble {
                 Ok(id)
             })
             .await?;
-        Ok(format!("Added layer \"{}\" ({id}) to {}.", p.name.trim(), target.what()))
+        let what = if p.kind.as_deref().map(str::trim) == Some("group") { "group" } else { "layer" };
+        Ok(format!("Added {what} \"{}\" ({id}) to {}.", p.name.trim(), target.what()))
     }
 
-    /// Rename, show or hide, lock or unlock, fade, or reorder a layer of a
-    /// canvas, or say what it holds (its note and fields).
+    /// Rename, show or hide, lock or unlock, fade, blend, reorder or move into
+    /// or out of a group a layer of a canvas, or say what it holds (its note
+    /// and fields). Hiding or locking a group hides or locks what is in it.
     /// What a layer shows is the same for everyone who opens the canvas.
     #[tool(name = "update_layer")]
     async fn update_layer(&self, Parameters(p): Parameters<UpdateLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, name, visible, locked, opacity, order) = (p.layer.clone(), p.name.clone(), p.visible, p.locked, p.opacity, p.order.clone());
-        let (note, fields) = (p.note.clone(), p.fields.clone());
+        let (note, fields, blend, parent) = (p.note.clone(), p.fields.clone(), p.blend.clone(), p.parent.clone());
         self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -1849,9 +1947,20 @@ impl Pimble {
             if let Some(o) = opacity {
                 t.set_layer_opacity(&id, o)?;
             }
-            if let Some(order) = order.as_deref() {
-                let at = placement(order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
-                t.move_layer(&id, at)?;
+            if let Some(blend) = blend.as_deref() {
+                t.set_layer_blend(&id, blend_mode(blend)?)?;
+            }
+            match (parent.as_deref().map(str::trim), order.as_deref()) {
+                (Some(parent), order) => {
+                    let at = placement(order.unwrap_or("top"), &|l| scene.layer(l).map(|l| l.id.clone()))?;
+                    let group = if parent.is_empty() { None } else { Some(scene.layer(parent)?.id.clone()) };
+                    t.move_layer_into(&id, group.as_deref(), at)?;
+                }
+                (None, Some(order)) => {
+                    let at = placement(order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
+                    t.move_layer(&id, at)?;
+                }
+                (None, None) => {}
             }
             if let Some(note) = &note {
                 t.set_layer_note(&id, note)?;
@@ -1865,15 +1974,18 @@ impl Pimble {
         Ok(format!("Changed layer \"{}\" of {}.", p.layer.trim(), target.what()))
     }
 
-    /// Delete a layer of a canvas, with its elements, or merge it into the layer
-    /// below. A canvas keeps at least one layer.
+    /// Delete a layer of a canvas, with its elements (a group with every layer
+    /// in it), or merge it into the layer below (a group into one layer). A
+    /// canvas keeps at least one layer that is not a group.
     #[tool(name = "delete_layer")]
     async fn delete_layer(&self, Parameters(p): Parameters<DeleteLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, merge) = (p.layer.clone(), p.merge_down);
         self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
-            if merge {
+            if merge && scene.is_group(&id) {
+                t.merge_group(&id)
+            } else if merge {
                 t.merge_layer_down(&id)
             } else {
                 t.delete_layer(&id)
@@ -2118,5 +2230,30 @@ mod tests {
         assert_eq!(canvas_id(" abc "), "abc");
         assert_eq!(canvas_id("pimble-blob:s/h#board=old"), "old");
         assert_eq!(picture_title("/tmp/Screenshot 1.png"), "Screenshot 1");
+    }
+
+    #[test]
+    fn get_canvas_shows_groups_kinds_and_blends() {
+        let board = fresh();
+        let st = Stamp::new(None, "2026-10-29T00:00:00.000Z");
+        board
+            .edit(st, |t| {
+                let g = t.add_group("Shading", None, Placement::Top)?;
+                let a = t.add_layer_in("Shadows", LayerKind::Vector, Some(&g), Placement::Top)?;
+                t.add_layer_in("Wash", LayerKind::Paint, Some(&g), Placement::Top)?;
+                t.set_layer_blend(&a, blend_mode("multiply")?)?;
+                t.set_layer_locked(&g, true)
+            })
+            .into_result()
+            .unwrap();
+        let text = describe(&board.snapshot(), &HashMap::new());
+        assert!(text.contains("## Group \"Shading\""), "{text}");
+        assert!(text.contains("locked, 2 layers"), "{text}");
+        assert!(text.contains("### Layer \"Shadows\""), "{text}");
+        assert!(text.contains("in group \"Shading\", blend multiply, locked by its group"), "{text}");
+        assert!(text.contains("### Paint layer \"Wash\""), "{text}");
+        assert!(text.find("Group \"Shading\"").unwrap() < text.find("Layer \"Shadows\"").unwrap(), "a group before what it holds");
+        assert!(layer_kind(Some("sketch")).is_err());
+        assert!(blend_mode("burn").is_err());
     }
 }

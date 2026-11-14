@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided, not built.** Written 2026-11-14 from Joe's answers of that day
+Status: **decided; wave 1's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -292,3 +292,65 @@ Each wave ships when it is done, in both apps, with its MCP part and tests.
 - **Brush engine speed**: stamping dabs into tiles while drawing a long pressure stroke at
   4K, on the desktop and in the browser.
 - **Replay cost**: opening a paint layer with 5,000 strokes cold, and with the cache.
+
+## Built in wave 1 (model)
+
+Built 2026-11-14 in `crates/pimble-board` and `crates/pimble-mcp`, no UI (the layers panel
+still lists every entry flat, groups included, until the canvas UI shell is built).
+
+- **Storage**: three new keys on a layer's map, nothing else changed: `kind` (`vector`,
+  `paint`, `group`; absent reads as vector; written on every new layer), `blend` (the twelve
+  modes plus `pass-through`; absent or unknown reads as the kind's default, pass-through on
+  a layer that is not a group reads as normal) and `parent` (a group's id; `order` is then
+  among that group's layers). `RawLayer` carries them, `copy_from` (Convert to Node) copies
+  them. A paint layer stores nothing else yet and draws nothing. Search indexes layers'
+  meaning as before; the new keys add nothing to it.
+- **One resolution**: `pimble_board::layer_tree::resolve(&[RawLayer]) -> LayerTree`, pure
+  and unit-tested, is what the snapshot, the renderer, the SVG export, the locks and
+  `BoardTxn` all read: dangling parents and parents that are not groups read as top level,
+  each cycle's smallest id reads as top level, siblings by order then id, draw order depth
+  first with a group right after its children, inherited visibility and locks (`locked_by`
+  names the lock that applies: the nearest locked group, else the layer's own), and
+  isolation (a blend that is not normal or opacity below 1; a group not in pass-through at
+  full opacity).
+- **Rendering**: the fast path is unchanged (elements of layers that are not isolated draw
+  straight into the target). An isolated layer or group gets a buffer of its own, opened at
+  its first element in the drawing order and blended down with its opacity and
+  `tiny_skia::BlendMode` when the order leaves it; one stack of buffers covers any nesting.
+  **Deviation**: a layer's opacity below 1 now fades the layer as a whole (overlapping
+  elements no longer show through each other), and an element's `opacity` is its style's
+  alone. SVG export wraps an isolated layer's elements in `<g opacity mix-blend-mode>`.
+  A layer's composite (its chain's ids, opacities, blends) and its place in the draw order
+  are folded into its elements' fingerprints, so the raster cache redraws them when either
+  changes.
+- **Where new elements go**: `add_element` with no layer, and
+  `BoardSnapshot::layer_for_new(None)` / `default_layer()`, take the top vector layer in
+  draw order that is not effectively locked and not inside a hidden group; a layer hidden
+  by its own flag is still picked, as before groups (the contract's rule is about groups).
+  A layer named explicitly is refused when it is locked, itself or by a group
+  (`LayerLocked` naming the group), or is not a vector layer (`NotAVectorLayer`). A board
+  with no vector layer refuses with `NoVectorLayer`; the model does not make "Vector 1" by
+  itself (the tools will, wave 2).
+- **Edits**: `add_layer` (vector, unchanged signature), `add_layer_in(name, kind, parent,
+  placement)`, `add_group`, `set_layer_blend` (pass-through refused on a layer that is not a
+  group), `move_layer` (among siblings; above or below a layer in another group moves it
+  there), `move_layer_into` / `set_layer_parent` (refused into a non-group, itself or a
+  group it holds), `group_layers(ids, name)` (a picked layer whose group is also picked
+  stays in it), `ungroup` (refused on a locked group: ungrouping would unlock its layers),
+  `delete_layer` (a group with everything in it; refused when the group is locked, a group
+  above it is, or any layer inside it is; a board keeps one layer that is not a group),
+  `merge_group` (in place: the group entry becomes the vector layer, keeping its id, name,
+  visibility, opacity and blend, pass-through dropped; refused with a paint layer inside),
+  `merge_layer_down` (the sibling just below; a group, a group below, and any paint layer
+  refused with a sentence until wave 4). Moving layers is open on locked layers, as before.
+  **Deviation**: merging a group does not bake the children's own opacity, blend or
+  visibility into their elements (hidden children's elements show once merged).
+- **Snapshot**: `layers` is every entry in draw order bottom to top (reversed, a group
+  comes before what it holds). `Layer` gains `kind`, `blend`, `parent` (effective),
+  `depth`, `effective_visible`, `effective_locked`, `locked_by`, `isolated`; `count` stays.
+  New reads: `layer_tree()`, `children_of(id)`, `default_layer()`, `layer_lock(id)`;
+  `top_layer()` is now the top vector layer.
+- **MCP**: `get_canvas` lists the tree (group headings, depth by heading level, kind,
+  blend, inherited flags); `add_layer` takes `kind`, `parent`, `blend`; `update_layer`
+  takes `blend` and `parent`; `delete_layer` deletes a group with its contents and
+  `merge_down` on a group merges it.

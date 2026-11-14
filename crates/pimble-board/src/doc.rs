@@ -7,6 +7,7 @@
 //!   markup_visible: bool,
 //!   edited_by: Any { id, name }?, edited_at: String?,   // board-level writes
 //!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity,
+//!                               kind: String?, blend: String?, parent: String?,
 //!                               note: Text?, "field:<name>": String... }>,
 //!   elements: Map<element id, Map {
 //!     layer, order, parent?, kind,
@@ -42,7 +43,9 @@
 //! the caller sends through `applyEdit` like every other edit (CLAUDE.md:
 //! "one way to write node content").
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use pimble_crdt::NodeDoc;
@@ -54,6 +57,7 @@ use yrs::{
     StateVector, Text, TextPrelim, Transact, TransactionMut,
 };
 
+use crate::layer_tree::LayerTree;
 use crate::locks::Deleted;
 use crate::model::*;
 use crate::order;
@@ -100,6 +104,7 @@ pub(crate) mod keys {
     pub const EDITED_BY: &str = "edited_by";
     pub const EDITED_AT: &str = "edited_at";
     pub const NOTE: &str = "note";
+    pub const BLEND: &str = "blend";
 }
 
 /// The prefix of an element's or layer's named fields (see the module doc).
@@ -133,6 +138,13 @@ pub enum BoardError {
     /// Nothing named a layer and every layer is locked.
     #[error("{}", crate::locks::EVERY_LAYER_LOCKED)]
     EveryLayerLocked,
+    /// Elements were to go into a layer that holds none: a paint layer or a
+    /// group (docs/DRAWING_CONTRACT.md section 1).
+    #[error("{}", crate::locks::not_a_vector_layer(kind))]
+    NotAVectorLayer { id: String, kind: LayerKind },
+    /// Nothing named a layer and the board has no vector layer.
+    #[error("{}", crate::locks::NO_VECTOR_LAYER)]
+    NoVectorLayer,
     #[error("{0}")]
     Invalid(String),
 }
@@ -252,7 +264,7 @@ impl Board {
             None => self.doc.transact_mut(),
         };
         let board = self.board_map(&txn);
-        let mut bt = BoardTxn { txn: &mut txn, location: self, board, stamp, tops: HashMap::new() };
+        let mut bt = BoardTxn { txn: &mut txn, location: self, board, stamp, tops: HashMap::new(), layer_cache: RefCell::new(None) };
         let result = f(&mut bt);
         txn.commit();
         let changed = *txn.before_state() != *txn.after_state() || !txn.delete_set().is_empty();
@@ -458,6 +470,94 @@ pub struct BoardTxn<'a, 'doc> {
     /// date as elements are added, so adding many elements in one
     /// transaction is not quadratic.
     tops: HashMap<String, Option<String>>,
+    /// The layers read as a tree, until a layer is written.
+    layer_cache: RefCell<Option<Rc<Layers>>>,
+}
+
+/// A board's layers as stored and read as a tree, for the judgements of a
+/// write.
+struct Layers {
+    raw: Vec<RawLayer>,
+    tree: LayerTree,
+}
+
+impl Layers {
+    /// The entry of layer `id`.
+    fn entry(&self, id: &str) -> Option<usize> {
+        self.tree.entries.iter().position(|e| self.raw[e.index].id == id)
+    }
+
+    fn raw_of(&self, entry: usize) -> &RawLayer {
+        &self.raw[self.tree.entries[entry].index]
+    }
+
+    fn id(&self, entry: usize) -> &str {
+        &self.raw_of(entry).id
+    }
+
+    fn locked_layer(&self, entry: usize) -> LockedLayer {
+        let l = self.raw_of(entry);
+        LockedLayer { id: l.id.clone(), name: l.name.clone() }
+    }
+
+    /// The lock that guards `entry` (its own, or a group's above it).
+    fn locked(&self, entry: usize) -> Option<LockedLayer> {
+        self.tree.entries[entry].locked_by.map(|by| self.locked_layer(by))
+    }
+
+    /// Whether new elements may go into `entry`: a vector layer, not locked.
+    fn judge_new_into(&self, entry: usize) -> Result<()> {
+        let e = &self.tree.entries[entry];
+        if !e.kind.is_vector() {
+            return Err(BoardError::NotAVectorLayer { id: self.id(entry).to_string(), kind: e.kind.clone() });
+        }
+        match self.locked(entry) {
+            Some(locked) => Err(BoardError::LayerLocked(locked)),
+            None => Ok(()),
+        }
+    }
+
+    /// The ids and orders of the layers in group `parent` (top level when
+    /// `None`), bottom to top.
+    fn sibling_orders(&self, parent: Option<usize>) -> Vec<(String, String)> {
+        let list = match parent {
+            Some(p) => &self.tree.entries[p].children,
+            None => &self.tree.roots,
+        };
+        list.iter().map(|at| (self.id(*at).to_string(), self.raw_of(*at).order.clone())).collect()
+    }
+
+    /// The group a layer placed at `placement` goes into: where the layer
+    /// the placement names is, else `parent` (`Some(None)` top level, `None`
+    /// where `moving` is now, top level for a new layer). Refused when
+    /// `parent` names no group, or disagrees with the named layer's place.
+    fn target_parent(&self, moving: Option<usize>, parent: Option<Option<&str>>, placement: &Placement) -> Result<Option<usize>> {
+        let named = match parent {
+            Some(Some(pid)) => {
+                let p = self.entry(pid).ok_or_else(|| BoardError::NoLayer(pid.to_string()))?;
+                if !self.tree.entries[p].kind.is_group() {
+                    return Err(BoardError::Invalid("Layers go only into a group.".into()));
+                }
+                Some(Some(p))
+            }
+            Some(None) => Some(None),
+            None => None,
+        };
+        match placement {
+            Placement::Above(other) | Placement::Below(other) => {
+                let o = self.entry(other).ok_or_else(|| BoardError::NoLayer(other.clone()))?;
+                let there = self.tree.entries[o].parent;
+                if named.is_some_and(|p| p != there) {
+                    return Err(BoardError::Invalid("That layer is not in that group.".into()));
+                }
+                Ok(there)
+            }
+            Placement::Top | Placement::Bottom => Ok(match named {
+                Some(p) => p,
+                None => moving.and_then(|m| self.tree.entries[m].parent),
+            }),
+        }
+    }
 }
 
 impl<'a, 'doc> BoardTxn<'a, 'doc> {
@@ -530,6 +630,15 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 map.insert(self.txn, VISIBLE, layer.visible);
                 map.insert(self.txn, LOCKED, layer.locked);
                 map.insert(self.txn, OPACITY, layer.opacity as f64);
+                if !layer.kind.is_vector() {
+                    map.insert(self.txn, KIND, layer.kind.as_str().to_string());
+                }
+                if let Some(blend) = layer.blend {
+                    map.insert(self.txn, BLEND, blend.as_str());
+                }
+                if let Some(parent) = &layer.parent {
+                    map.insert(self.txn, PARENT, parent.clone());
+                }
                 copy_meaning(self.txn, &map, layer.note.as_deref(), &layer.fields);
             }
         }
@@ -643,78 +752,99 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
     }
 
-    /// Layer ids with their orders, sorted bottom to top.
-    fn layer_orders(&self) -> Result<Vec<(String, String)>> {
-        let layers = self.layers()?;
-        let mut out: Vec<(String, String)> = layers
-            .iter(self.txn)
-            .filter_map(|(id, out)| match out {
-                Out::YMap(map) => Some((id.to_string(), string_of(map.get(self.txn, ORDER)).unwrap_or_default())),
-                _ => None,
-            })
-            .collect();
-        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(out)
+    /// The layers as stored, read as a tree once per transaction until a
+    /// layer is written ([`BoardTxn::layers_changed`]).
+    fn tree(&self) -> Result<Rc<Layers>> {
+        if let Some(cached) = self.layer_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let raw = read_layers(self.txn, &self.layers()?);
+        let tree = crate::layer_tree::resolve(&raw);
+        let layers = Rc::new(Layers { raw, tree });
+        *self.layer_cache.borrow_mut() = Some(layers.clone());
+        Ok(layers)
+    }
+
+    /// Forget the tree read so far: a layer was written.
+    fn layers_changed(&mut self) {
+        *self.layer_cache.borrow_mut() = None;
     }
 
     fn bottom_layer(&self) -> Option<String> {
-        self.layer_orders().ok()?.into_iter().next().map(|(id, _)| id)
+        let ls = self.tree().ok()?;
+        ls.tree.entries.iter().position(|e| !e.kind.is_group()).map(|at| ls.id(at).to_string())
     }
 
-    fn top_layer(&self) -> Result<String> {
-        self.layer_orders()?.into_iter().last().map(|(id, _)| id).ok_or(BoardError::LastLayer)
-    }
-
-    /// The layer `id` when it is locked, by id and name.
+    /// The layer `id` when it is locked, itself or by a group it is in: the
+    /// lock that guards it, by id and name (the group's when it is the
+    /// group's).
     fn locked_layer(&self, id: &str) -> Result<Option<LockedLayer>> {
-        let layer = self.layer_map(id)?;
-        if !bool_of(layer.get(self.txn, LOCKED)).unwrap_or(false) {
-            return Ok(None);
-        }
-        let name = match layer.get(self.txn, NAME) {
-            Some(Out::YText(t)) => t.get_string(self.txn),
-            other => string_of(other).unwrap_or_default(),
-        };
-        Ok(Some(LockedLayer { id: id.to_string(), name }))
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        Ok(ls.locked(at))
     }
 
     /// The layer something new goes into: `layer` when given (refused when
-    /// it is locked), else the top layer that is not locked
+    /// it is locked, itself or by a group, or holds no elements), else the
+    /// top vector layer that is not locked and not in a hidden group
     /// ([`crate::BoardSnapshot::layer_for_new`] is the same rule, read).
     fn layer_for_new(&self, layer: Option<&str>) -> Result<String> {
+        let ls = self.tree()?;
         match layer {
-            Some(id) => match self.locked_layer(id)? {
-                Some(locked) => Err(BoardError::LayerLocked(locked)),
-                None => Ok(id.to_string()),
-            },
-            None => {
-                for (id, _) in self.layer_orders()?.into_iter().rev() {
-                    if self.locked_layer(&id)?.is_none() {
-                        return Ok(id);
-                    }
-                }
-                Err(BoardError::EveryLayerLocked)
+            Some(id) => {
+                let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+                ls.judge_new_into(at)?;
+                Ok(id.to_string())
             }
+            None => match ls.tree.default_target() {
+                Some(at) => Ok(ls.id(at).to_string()),
+                None if ls.tree.has_vector() => Err(BoardError::EveryLayerLocked),
+                None => Err(BoardError::NoVectorLayer),
+            },
         }
     }
 
-    /// The layer an element is drawn in: its own, or the top layer when its
-    /// own is gone (as [`crate::BoardSnapshot`] resolves it).
+    /// The layer an element is drawn in: its own, or the top vector layer
+    /// when its own is gone (as [`crate::BoardSnapshot`] resolves it).
     fn drawn_in(&self, element: &MapRef) -> Result<String> {
         let own = string_of(element.get(self.txn, LAYER)).unwrap_or_default();
-        if self.layer_map(&own).is_ok() {
-            return Ok(own);
-        }
-        self.top_layer()
+        let ls = self.tree()?;
+        ls.tree.home_of(&ls.raw, &own).map(|at| ls.id(at).to_string()).ok_or(BoardError::LastLayer)
     }
 
-    /// A new layer at `placement`; answers its id.
+    /// A new vector layer at `placement`; answers its id. Placed above or
+    /// below a layer in a group, it goes into that group.
     pub fn add_layer(&mut self, name: &str, placement: Placement) -> Result<String> {
-        let orders = self.layer_orders()?;
-        let key = place(&orders, None, &placement)?;
+        self.add_layer_in(name, LayerKind::Vector, None, placement)
+    }
+
+    /// A new group at `placement` in `parent` (top level when `None`);
+    /// answers its id. It passes through until a blend mode is set.
+    pub fn add_group(&mut self, name: &str, parent: Option<&str>, placement: Placement) -> Result<String> {
+        self.add_layer_in(name, LayerKind::Group, parent, placement)
+    }
+
+    /// A new layer of `kind` in group `parent` (top level when `None`) at
+    /// `placement` among that group's layers; answers its id. Placed above
+    /// or below a layer, it goes where that layer is (refused when that is
+    /// not `parent`, when `parent` is given).
+    pub fn add_layer_in(&mut self, name: &str, kind: LayerKind, parent: Option<&str>, placement: Placement) -> Result<String> {
+        if let LayerKind::Other(k) = &kind {
+            return Err(BoardError::Invalid(format!("a layer is vector, paint or group, not {k}")));
+        }
+        let ls = self.tree()?;
+        let parent = ls.target_parent(None, parent.map(Some), &placement)?;
+        let key = place(&ls.sibling_orders(parent), None, &placement)?;
         let id = new_id();
         let layers = self.layers()?;
         insert_layer(self.txn, &layers, &id, name, &key);
+        if let Some(Out::YMap(map)) = layers.get(self.txn, &id) {
+            map.insert(self.txn, KIND, kind.as_str().to_string());
+            if let Some(p) = parent {
+                map.insert(self.txn, PARENT, ls.id(p).to_string());
+            }
+        }
+        self.layers_changed();
         self.stamp_board();
         Ok(id)
     }
@@ -727,98 +857,326 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             _ => layer.insert(self.txn, NAME, TextPrelim::new("")),
         };
         edit_text(self.txn, &text, name);
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
     pub fn set_layer_visible(&mut self, id: &str, visible: bool) -> Result<()> {
         self.layer_map(id)?.insert(self.txn, VISIBLE, visible);
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
     pub fn set_layer_locked(&mut self, id: &str, locked: bool) -> Result<()> {
         self.layer_map(id)?.insert(self.txn, LOCKED, locked);
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
     pub fn set_layer_opacity(&mut self, id: &str, opacity: f32) -> Result<()> {
         self.layer_map(id)?.insert(self.txn, OPACITY, opacity.clamp(0.0, 1.0) as f64);
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
-    /// Move a layer in the order: one key of one map, so two people moving
-    /// the same layer at once leave it in one place, never twice.
+    /// A layer's blend mode (docs/DRAWING_CONTRACT.md section 1). Pass
+    /// through is a group's alone.
+    pub fn set_layer_blend(&mut self, id: &str, blend: Blend) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if blend == Blend::PassThrough && !ls.tree.entries[at].kind.is_group() {
+            return Err(BoardError::Invalid("Pass Through is for groups. Pick another blend mode for a layer.".into()));
+        }
+        self.layer_map(id)?.insert(self.txn, BLEND, blend.as_str());
+        self.layers_changed();
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// Move a layer among its siblings: one key of one map, so two people
+    /// moving the same layer at once leave it in one place, never twice.
+    /// Placed above or below a layer in another group, it moves into that
+    /// group.
     pub fn move_layer(&mut self, id: &str, placement: Placement) -> Result<()> {
-        let layer = self.layer_map(id)?;
-        let orders = self.layer_orders()?;
-        let key = place(&orders, Some(id), &placement)?;
-        layer.insert(self.txn, ORDER, key);
+        self.relocate(id, None, placement)
+    }
+
+    /// Move a layer into group `parent` (top level when `None`) at
+    /// `placement` among that group's layers. Refused when `parent` is not
+    /// a group, or is the layer itself or inside it.
+    pub fn move_layer_into(&mut self, id: &str, parent: Option<&str>, placement: Placement) -> Result<()> {
+        self.relocate(id, Some(parent), placement)
+    }
+
+    /// Put a layer on top of group `parent` (top level when `None`).
+    pub fn set_layer_parent(&mut self, id: &str, parent: Option<&str>) -> Result<()> {
+        self.relocate(id, Some(parent), Placement::Top)
+    }
+
+    /// Where a layer goes: `parent` `None` keeps its group (unless the
+    /// placement names a layer elsewhere).
+    fn relocate(&mut self, id: &str, parent: Option<Option<&str>>, placement: Placement) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if let Placement::Above(other) | Placement::Below(other) = &placement {
+            if other == id {
+                return Err(BoardError::Invalid("a layer is placed next to another layer, not itself".into()));
+            }
+        }
+        let parent = ls.target_parent(Some(at), parent, &placement)?;
+        if parent.is_some_and(|p| ls.tree.is_within(p, at)) {
+            return Err(BoardError::Invalid("A group cannot go inside itself or a group it holds.".into()));
+        }
+        let key = place(&ls.sibling_orders(parent), Some(id), &placement)?;
+        let map = self.layer_map(id)?;
+        map.insert(self.txn, ORDER, key);
+        match parent {
+            Some(p) => {
+                map.insert(self.txn, PARENT, ls.id(p).to_string());
+            }
+            None => {
+                map.remove(self.txn, PARENT);
+            }
+        }
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
-    /// Delete a layer with its elements. A board keeps at least one layer,
-    /// and a locked layer stays. The lock judged is the layer's: deleting a
-    /// layer is a deliberate act on the layer, and takes its elements with
-    /// it whether or not they are locked one by one.
-    pub fn delete_layer(&mut self, id: &str) -> Result<()> {
-        if let Some(locked) = self.locked_layer(id)? {
+    /// "Group Layers": a new group named `name` at the place of the topmost
+    /// of `ids`, holding them in their order. A layer whose group is also
+    /// picked stays in that group. Answers the group's id.
+    pub fn group_layers(&mut self, ids: &[String], name: &str) -> Result<String> {
+        let ls = self.tree()?;
+        let mut picked: Vec<usize> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.clone()))?;
+            if !picked.contains(&at) {
+                picked.push(at);
+            }
+        }
+        let outer: Vec<usize> = picked.iter().copied().filter(|at| !ls.tree.ancestors(*at).any(|a| picked.contains(&a))).collect();
+        // Entries are in draw order: the largest is the topmost.
+        let Some(&topmost) = outer.iter().max() else {
+            return Err(BoardError::Invalid("pick the layers to group".into()));
+        };
+        let parent = ls.tree.entries[topmost].parent;
+        let key = place(&ls.sibling_orders(parent), None, &Placement::Above(ls.id(topmost).to_string()))?;
+        let gid = new_id();
+        let layers = self.layers()?;
+        insert_layer(self.txn, &layers, &gid, name, &key);
+        if let Some(Out::YMap(map)) = layers.get(self.txn, &gid) {
+            map.insert(self.txn, KIND, LayerKind::Group.as_str().to_string());
+            if let Some(p) = parent {
+                map.insert(self.txn, PARENT, ls.id(p).to_string());
+            }
+        }
+        let mut members = outer;
+        members.sort_unstable();
+        let keys = order::n_between(None, None, members.len());
+        for (at, key) in members.iter().zip(keys) {
+            let map = self.layer_map(ls.id(*at))?;
+            map.insert(self.txn, PARENT, gid.clone());
+            map.insert(self.txn, ORDER, key);
+        }
+        self.layers_changed();
+        self.stamp_board();
+        Ok(gid)
+    }
+
+    /// "Ungroup": the group's layers move up to its place, in their order,
+    /// and the group goes (its own visibility, lock and opacity with it;
+    /// the layers keep theirs). Refused when the group is locked.
+    pub fn ungroup(&mut self, id: &str) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if !ls.tree.entries[at].kind.is_group() {
+            return Err(BoardError::Invalid("That layer is not a group.".into()));
+        }
+        if let Some(locked) = ls.locked(at) {
             return Err(BoardError::LayerLockedAgainstRemoval(locked));
         }
-        if self.layer_orders()?.len() <= 1 {
+        let parent = ls.tree.entries[at].parent;
+        let siblings = ls.sibling_orders(parent);
+        let i = siblings.iter().position(|(s, _)| s == id).unwrap_or(0);
+        let below = i.checked_sub(1).map(|b| siblings[b].1.clone());
+        let above = siblings.get(i + 1).map(|(_, o)| o.clone());
+        let children = ls.tree.entries[at].children.clone();
+        let keys = order::n_between(below.as_deref(), above.as_deref(), children.len());
+        for (child, key) in children.iter().zip(keys) {
+            let map = self.layer_map(ls.id(*child))?;
+            map.insert(self.txn, ORDER, key);
+            match parent {
+                Some(p) => {
+                    map.insert(self.txn, PARENT, ls.id(p).to_string());
+                }
+                None => {
+                    map.remove(self.txn, PARENT);
+                }
+            }
+        }
+        self.layers()?.remove(self.txn, id);
+        self.layers_changed();
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// Delete a layer with its elements; a group with every layer in it and
+    /// their elements (one write, so one undo). A board keeps at least one
+    /// layer that is not a group, and a locked layer stays: locked itself,
+    /// by a group it is in, or (deleting a group) any layer inside it. The
+    /// lock judged is the layers': deleting a layer is a deliberate act on
+    /// the layer, and takes its elements with it whether or not they are
+    /// locked one by one.
+    pub fn delete_layer(&mut self, id: &str) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if let Some(locked) = ls.locked(at) {
+            return Err(BoardError::LayerLockedAgainstRemoval(locked));
+        }
+        let mut doomed = ls.tree.descendants(at);
+        if let Some(inner) = doomed.iter().find(|d| ls.raw_of(**d).locked) {
+            return Err(BoardError::LayerLockedAgainstRemoval(ls.locked_layer(*inner)));
+        }
+        doomed.push(at);
+        let left = ls.tree.entries.iter().enumerate().filter(|(i, e)| !e.kind.is_group() && !doomed.contains(i)).count();
+        if left == 0 {
             return Err(BoardError::LastLayer);
         }
+        let doomed_ids: HashSet<String> = doomed.iter().map(|d| ls.id(*d).to_string()).collect();
         let elements = self.elements()?;
-        let doomed: Vec<String> = elements
+        let gone: Vec<String> = elements
             .iter(self.txn)
             .filter_map(|(eid, out)| match out {
-                Out::YMap(map) if string_of(map.get(self.txn, LAYER)).as_deref() == Some(id) => Some(eid.to_string()),
+                Out::YMap(map) if string_of(map.get(self.txn, LAYER)).is_some_and(|l| doomed_ids.contains(&l)) => Some(eid.to_string()),
                 _ => None,
             })
             .collect();
-        for eid in doomed {
+        for eid in gone {
             elements.remove(self.txn, &eid);
         }
-        self.layers()?.remove(self.txn, id);
-        self.tops.remove(id);
+        let layers = self.layers()?;
+        for d in &doomed_ids {
+            layers.remove(self.txn, d);
+            self.tops.remove(d);
+        }
+        self.layers_changed();
         self.stamp_board();
         Ok(())
     }
 
-    /// "Merge Down": the layer's elements go on top of the layer below, in
-    /// their order, and the layer goes. Refused when either layer is locked;
-    /// elements locked one by one go along, still locked (as with
-    /// [`BoardTxn::delete_layer`], the act is on the layer).
+    /// "Merge Down": the layer's elements go on top of the layer below it in
+    /// its group, in their order, and the layer goes. Refused when either
+    /// layer is locked; elements locked one by one go along, still locked
+    /// (as with [`BoardTxn::delete_layer`], the act is on the layer). Only
+    /// vector layers merge for now: a group merges with
+    /// [`BoardTxn::merge_group`], and paint layers wait for painting.
     pub fn merge_layer_down(&mut self, id: &str) -> Result<()> {
-        let orders = self.layer_orders()?;
-        let at = orders.iter().position(|(l, _)| l == id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
-        if at == 0 {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if ls.tree.entries[at].kind.is_group() {
+            return Err(BoardError::Invalid("That is a group. Merge it with Merge Group.".into()));
+        }
+        let siblings = ls.tree.siblings(at);
+        let pos = siblings.iter().position(|s| *s == at).unwrap_or(0);
+        if pos == 0 {
             return Err(BoardError::Invalid("the bottom layer has nothing below it".into()));
         }
-        if let Some(locked) = self.locked_layer(id)? {
+        let below = siblings[pos - 1];
+        let (kind, below_kind) = (&ls.tree.entries[at].kind, &ls.tree.entries[below].kind);
+        if below_kind.is_group() {
+            return Err(BoardError::Invalid("The layer below is a group. Move this layer into it, or merge the group first.".into()));
+        }
+        match (kind.is_vector(), below_kind.is_vector()) {
+            (true, true) => {}
+            (true, false) => return Err(BoardError::Invalid("Merging a vector layer onto a paint layer comes with painting.".into())),
+            (false, true) => return Err(BoardError::Invalid("A paint layer cannot merge onto a vector layer.".into())),
+            (false, false) => return Err(BoardError::Invalid("Merging paint layers comes with painting.".into())),
+        }
+        if let Some(locked) = ls.locked(at) {
             return Err(BoardError::LayerLockedAgainstRemoval(locked));
         }
-        let below = orders[at - 1].0.clone();
-        if let Some(locked) = self.locked_layer(&below)? {
+        if let Some(locked) = ls.locked(below) {
             return Err(BoardError::LayerLocked(locked));
         }
+        let below = ls.id(below).to_string();
         let ids = self.element_ids_in_layer(id)?;
         self.move_into_layer(&ids, &below, false)?;
         self.layers()?.remove(self.txn, id);
         self.tops.remove(id);
+        self.layers_changed();
+        Ok(())
+    }
+
+    /// "Merge Group": every vector layer in the group, at any depth, becomes
+    /// one vector layer in the group's place, with the group's id, name,
+    /// visibility, opacity and blend (pass-through reads as normal), the
+    /// elements in their drawing order. The layers' own opacity, blend and
+    /// visibility are not carried into the elements. Refused when the group
+    /// or any layer in it is locked, and (until painting) when it holds a
+    /// paint layer.
+    pub fn merge_group(&mut self, id: &str) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if !ls.tree.entries[at].kind.is_group() {
+            return Err(BoardError::Invalid("That layer is not a group.".into()));
+        }
+        if let Some(locked) = ls.locked(at) {
+            return Err(BoardError::LayerLockedAgainstRemoval(locked));
+        }
+        let inside = ls.tree.descendants(at);
+        if let Some(inner) = inside.iter().find(|d| ls.raw_of(**d).locked) {
+            return Err(BoardError::LayerLockedAgainstRemoval(ls.locked_layer(*inner)));
+        }
+        if inside.iter().any(|d| !ls.tree.entries[*d].kind.is_vector() && !ls.tree.entries[*d].kind.is_group()) {
+            return Err(BoardError::Invalid("That group holds a paint layer. Merging it comes with painting.".into()));
+        }
+        let rank: HashMap<String, usize> = inside.iter().map(|d| (ls.id(*d).to_string(), *d)).collect();
+        let elements = self.elements()?;
+        let mut moving: Vec<(usize, String, String, MapRef)> = elements
+            .iter(self.txn)
+            .filter_map(|(eid, out)| match out {
+                Out::YMap(map) => {
+                    let r = *rank.get(&string_of(map.get(self.txn, LAYER))?)?;
+                    Some((r, string_of(map.get(self.txn, ORDER)).unwrap_or_default(), eid.to_string(), map))
+                }
+                _ => None,
+            })
+            .collect();
+        moving.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+        let keys = order::n_between(None, None, moving.len());
+        for ((_, _, _, map), key) in moving.into_iter().zip(keys.iter()) {
+            map.insert(self.txn, LAYER, id.to_string());
+            map.insert(self.txn, ORDER, key.clone());
+        }
+        let group = self.layer_map(id)?;
+        group.insert(self.txn, KIND, LayerKind::Vector.as_str().to_string());
+        if ls.tree.entries[at].blend == Blend::PassThrough {
+            group.remove(self.txn, BLEND);
+        }
+        let layers = self.layers()?;
+        for d in rank.keys() {
+            layers.remove(self.txn, d);
+            self.tops.remove(d);
+        }
+        self.tops.insert(id.to_string(), keys.last().cloned());
+        self.layers_changed();
+        self.stamp_board();
         Ok(())
     }
 
     /// "Move Selection to Layer": the elements go on top of `layer`, keeping
     /// their order among themselves. Refused, before anything is written,
-    /// when `layer` or any of the elements is locked.
+    /// when `layer` is locked (itself or by a group), is not a vector layer,
+    /// or any of the elements is locked.
     pub fn move_to_layer(&mut self, ids: &[String], layer: &str) -> Result<()> {
-        if let Some(locked) = self.locked_layer(layer)? {
-            return Err(BoardError::LayerLocked(locked));
-        }
+        let ls = self.tree()?;
+        let at = ls.entry(layer).ok_or_else(|| BoardError::NoLayer(layer.to_string()))?;
+        ls.judge_new_into(at)?;
         self.move_into_layer(ids, layer, true)
     }
 
@@ -1212,6 +1570,15 @@ pub struct RawLayer {
     pub note: Option<String>,
     /// Its named fields, by name.
     pub fields: Vec<(String, String)>,
+    /// What it holds (docs/DRAWING_CONTRACT.md section 1); absent reads as
+    /// vector.
+    pub kind: LayerKind,
+    /// Its blend mode as stored; `None` when absent or not one this version
+    /// knows (the kind's default, [`LayerKind::default_blend`]).
+    pub blend: Option<Blend>,
+    /// The group it is in, as stored (`order` is then among that group's
+    /// layers). [`crate::layer_tree::resolve`] reads what it means.
+    pub parent: Option<String>,
 }
 
 /// An element as stored.
@@ -1265,25 +1632,10 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         _ => None,
     };
     let markup_visible = bool_of(board.get(txn, MARKUP_VISIBLE)).unwrap_or(true);
-    let mut layers = Vec::new();
-    if let Some(Out::YMap(map)) = board.get(txn, LAYERS) {
-        for (id, out) in map.iter(txn) {
-            let Out::YMap(layer) = out else { continue };
-            layers.push(RawLayer {
-                id: id.to_string(),
-                name: match layer.get(txn, NAME) {
-                    Some(Out::YText(t)) => t.get_string(txn),
-                    other => string_of(other).unwrap_or_default(),
-                },
-                order: string_of(layer.get(txn, ORDER)).unwrap_or_default(),
-                visible: bool_of(layer.get(txn, VISIBLE)).unwrap_or(true),
-                locked: bool_of(layer.get(txn, LOCKED)).unwrap_or(false),
-                opacity: number_of(layer.get(txn, OPACITY)).unwrap_or(1.0).clamp(0.0, 1.0),
-                note: read_note(txn, &layer),
-                fields: read_fields(txn, &layer),
-            });
-        }
-    }
+    let layers = match board.get(txn, LAYERS) {
+        Some(Out::YMap(map)) => read_layers(txn, &map),
+        _ => Vec::new(),
+    };
     let mut elements = Vec::new();
     if with_elements {
         if let Some(Out::YMap(map)) = board.get(txn, ELEMENTS) {
@@ -1303,6 +1655,31 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         layers,
         elements,
     }
+}
+
+/// The layers of a board's `layers` map, in no particular order.
+pub(crate) fn read_layers<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<RawLayer> {
+    let mut layers = Vec::new();
+    for (id, out) in map.iter(txn) {
+        let Out::YMap(layer) = out else { continue };
+        layers.push(RawLayer {
+            id: id.to_string(),
+            name: match layer.get(txn, NAME) {
+                Some(Out::YText(t)) => t.get_string(txn),
+                other => string_of(other).unwrap_or_default(),
+            },
+            order: string_of(layer.get(txn, ORDER)).unwrap_or_default(),
+            visible: bool_of(layer.get(txn, VISIBLE)).unwrap_or(true),
+            locked: bool_of(layer.get(txn, LOCKED)).unwrap_or(false),
+            opacity: number_of(layer.get(txn, OPACITY)).unwrap_or(1.0).clamp(0.0, 1.0),
+            note: read_note(txn, &layer),
+            fields: read_fields(txn, &layer),
+            kind: LayerKind::parse(&string_of(layer.get(txn, KIND)).unwrap_or_default()),
+            blend: string_of(layer.get(txn, BLEND)).as_deref().and_then(Blend::parse),
+            parent: string_of(layer.get(txn, PARENT)).filter(|p| !p.is_empty()),
+        });
+    }
+    layers
 }
 
 fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {

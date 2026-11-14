@@ -419,15 +419,59 @@ pub fn draw_region(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn
 
 /// [`draw_region`], drawing only the elements `mask` (by z-order index)
 /// allows when given.
+///
+/// Layers are composited in drawing order (docs/DRAWING_CONTRACT.md
+/// section 1): an element of a layer at full opacity and normal blend, in
+/// no group that needs a buffer, is drawn straight into `pixmap` (the fast
+/// path, what every board without blending takes); an isolated layer or
+/// group gets a buffer of its own, opened at its first element and blended
+/// down with its opacity and blend when the drawing order leaves it. The
+/// drawing order keeps each layer's and group's elements together, so one
+/// stack of buffers is enough.
 fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>) {
     let region = view.board_rect(pixmap.width(), pixmap.height());
     let vt = view.transform();
+    let (w, h) = (pixmap.width(), pixmap.height());
+    let mut stack: Vec<(usize, Pixmap)> = Vec::new();
+    const NONE: &[usize] = &[];
     for i in snapshot.query(&region) {
         if mask.is_some_and(|m| !m[i]) {
             continue;
         }
-        draw_element(pixmap, &snapshot.elements[i], pictures, vt, &region);
+        let e = &snapshot.elements[i];
+        let chain = e.layer_index.and_then(|l| snapshot.chains.get(l)).map_or(NONE, |c| c.as_slice());
+        let common = stack.iter().zip(chain).take_while(|((open, _), want)| open == *want).count();
+        while stack.len() > common {
+            close_buffer(pixmap, &mut stack, snapshot);
+        }
+        for layer in &chain[stack.len()..] {
+            match Pixmap::new(w, h) {
+                Some(buffer) => stack.push((*layer, buffer)),
+                None => return,
+            }
+        }
+        let target = match stack.last_mut() {
+            Some((_, buffer)) => buffer,
+            None => &mut *pixmap,
+        };
+        draw_element(target, e, pictures, vt, &region);
     }
+    while !stack.is_empty() {
+        close_buffer(pixmap, &mut stack, snapshot);
+    }
+}
+
+/// Blend the innermost open buffer into the one below it (or `pixmap`) with
+/// its layer's opacity and blend.
+fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, snapshot: &BoardSnapshot) {
+    let Some((layer, buffer)) = stack.pop() else { return };
+    let l = &snapshot.layers[layer];
+    let paint = PixmapPaint { opacity: l.opacity, blend_mode: l.blend.to_tiny(), quality: FilterQuality::Nearest };
+    let target = match stack.last_mut() {
+        Some((_, below)) => below,
+        None => pixmap,
+    };
+    target.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
 }
 
 fn paint_of(color: Color, opacity: f32) -> Paint<'static> {

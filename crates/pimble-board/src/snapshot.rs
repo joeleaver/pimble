@@ -10,7 +10,8 @@ use std::sync::{Arc, OnceLock};
 
 use tiny_skia::{Path, Transform as Affine};
 
-use crate::doc::{Board, Changes, RawBoard, RawElement, RawLayer};
+use crate::doc::{Board, Changes, RawBoard, RawElement};
+use crate::layer_tree::LayerTree;
 use crate::model::*;
 use crate::options::{author_color, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 use crate::spatial::Grid;
@@ -24,20 +25,44 @@ pub const STICKY_PADDING: f32 = 0.6;
 /// A step badge's radius as a multiple of its font size.
 pub const STEP_RADIUS: f32 = 0.75;
 
-/// One layer, resolved.
+/// One layer, resolved (docs/DRAWING_CONTRACT.md section 1): a vector
+/// layer, a paint layer or a group, read in the tree
+/// [`crate::layer_tree::resolve`] makes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub id: String,
     pub name: String,
+    /// Its order among its siblings.
     pub order: String,
+    /// Its own flag; [`Layer::effective_visible`] says whether it shows.
     pub visible: bool,
+    /// Its own flag; [`Layer::effective_locked`] says whether it is locked.
     pub locked: bool,
     pub opacity: f32,
-    /// How many elements it holds.
+    /// How many elements it holds (none for a group or a paint layer).
     pub count: usize,
     /// What it is for (`doc` module, "Meaning").
     pub note: Option<String>,
     pub fields: Vec<(String, String)>,
+    pub kind: LayerKind,
+    /// Its blend mode as read: the kind's default when it names none.
+    pub blend: Blend,
+    /// The group it is read inside (a dangling or cyclic `parent` reads as
+    /// top level), by id.
+    pub parent: Option<String>,
+    /// 0 at top level, 1 inside a top-level group, and so on.
+    pub depth: usize,
+    /// It and every group above it are visible.
+    pub effective_visible: bool,
+    /// It or a group above it is locked.
+    pub effective_locked: bool,
+    /// The layer whose own lock locks it (itself, or the nearest locked
+    /// group above it).
+    pub locked_by: Option<String>,
+    /// Drawn into a buffer of its own and then blended (a blend that is not
+    /// normal, opacity below 1; a group that does not pass through at full
+    /// opacity).
+    pub isolated: bool,
 }
 
 /// One element, as stored and as resolved for drawing.
@@ -64,10 +89,15 @@ pub struct Element {
     /// `local_bounds` through `world`, axis-aligned, in board units. A
     /// connector's is in board units directly.
     pub bounds: Rect,
-    /// Drawn: its layer is visible, and it is a picture or the markup shows.
+    /// Drawn: its layer and every group above it are visible, and it is a
+    /// picture or the markup shows.
     pub visible: bool,
-    /// Style opacity times layer opacity.
+    /// Its style's opacity. A layer's opacity and blend apply to the layer
+    /// as a whole, composited by the renderer.
     pub opacity: f32,
+    /// The index (into [`BoardSnapshot::layers`]) of the layer it is drawn
+    /// in.
+    pub layer_index: Option<usize>,
     /// A connector's two ends, routed, in board units.
     pub route: Option<(Point, Point)>,
     /// Text laid out at the element's font size (kinds with text, and a
@@ -120,7 +150,9 @@ pub struct BoardSnapshot {
     pub markup_visible: bool,
     pub edited_by: Option<Author>,
     pub edited_at: Option<String>,
-    /// Bottom to top.
+    /// Every layer entry, groups included, in draw order bottom to top:
+    /// depth first, a group right after the layers it holds (so read in
+    /// reverse, a group comes before its layers, as a panel lists them).
     pub layers: Vec<Layer>,
     /// Bottom to top: by layer order, then element order, ties by id.
     pub elements: Vec<Element>,
@@ -128,6 +160,11 @@ pub struct BoardSnapshot {
     index: HashMap<u64, usize>,
     grid: Grid,
     options: ViewOptions,
+    /// The layers' tree; its entries are `layers`, index for index.
+    tree: LayerTree,
+    /// Per layer (as `layers`), the isolated layers it draws through,
+    /// outermost first: the buffers the renderer opens.
+    pub(crate) chains: Vec<Vec<usize>>,
 }
 
 impl BoardSnapshot {
@@ -155,6 +192,8 @@ impl BoardSnapshot {
                 index: HashMap::new(),
                 grid: Grid::default(),
                 options,
+                tree: LayerTree::default(),
+                chains: Vec::new(),
             };
         };
         Resolver::run(raw, HashMap::new(), options)
@@ -239,9 +278,34 @@ impl BoardSnapshot {
         self.layers.iter().find(|l| l.id == id)
     }
 
-    /// The top layer (where new elements go by default).
+    /// The layers' tree (entries index for index with `layers`).
+    pub fn layer_tree(&self) -> &LayerTree {
+        &self.tree
+    }
+
+    /// The layers group `id` holds, bottom to top (the top-level layers
+    /// when `None`).
+    pub fn children_of(&self, id: Option<&str>) -> Vec<&Layer> {
+        let list = match id {
+            None => &self.tree.roots,
+            Some(id) => match self.layers.iter().position(|l| l.id == id) {
+                Some(at) => &self.tree.entries[at].children,
+                None => return Vec::new(),
+            },
+        };
+        list.iter().map(|at| &self.layers[*at]).collect()
+    }
+
+    /// The top vector layer (where elements whose layer is gone are drawn).
     pub fn top_layer(&self) -> Option<&Layer> {
-        self.layers.last()
+        self.tree.fallback().map(|at| &self.layers[at])
+    }
+
+    /// Where new elements go when nothing names a layer: the top vector
+    /// layer that is not locked and not inside a hidden group
+    /// ([`crate::layer_tree::LayerTree::default_target`]).
+    pub fn default_layer(&self) -> Option<&Layer> {
+        self.tree.default_target().map(|at| &self.layers[at])
     }
 
     /// How many elements the markup toggle hides (contract section 5:
@@ -337,7 +401,12 @@ impl Reuse {
 struct Resolver {
     reuse: HashMap<String, Reuse>,
     layers: Vec<Layer>,
-    layer_rank: HashMap<String, usize>,
+    /// Per element, the layer it is drawn in (index into `layers`).
+    homes: Vec<Option<usize>>,
+    /// Per layer, a hash of how it is composited (its chain's ids,
+    /// opacities and blends) and its place in the draw order, folded into
+    /// its elements' fingerprints so the raster cache redraws them.
+    composite: Vec<u64>,
     raws: Vec<RawElement>,
     by_id: HashMap<u64, usize>,
     options: ViewOptions,
@@ -346,32 +415,58 @@ struct Resolver {
 impl Resolver {
     fn run(raw: RawBoard, reuse: HashMap<String, Reuse>, options: ViewOptions) -> BoardSnapshot {
         let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements } = raw;
-        let mut raw_layers: Vec<RawLayer> = raw_layers;
-        raw_layers.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
-        let layers: Vec<Layer> = raw_layers
-            .into_iter()
-            .map(|l| Layer {
-                id: l.id,
-                name: l.name,
-                order: l.order,
-                visible: l.visible,
-                locked: l.locked,
-                opacity: l.opacity,
-                count: 0,
-                note: l.note,
-                fields: l.fields,
+        let tree = crate::layer_tree::resolve(&raw_layers);
+        let layers: Vec<Layer> = tree
+            .entries
+            .iter()
+            .map(|e| {
+                let l = &raw_layers[e.index];
+                Layer {
+                    id: l.id.clone(),
+                    name: l.name.clone(),
+                    order: l.order.clone(),
+                    visible: l.visible,
+                    locked: l.locked,
+                    opacity: l.opacity,
+                    count: 0,
+                    note: l.note.clone(),
+                    fields: l.fields.clone(),
+                    kind: e.kind.clone(),
+                    blend: e.blend,
+                    parent: e.parent.map(|p| raw_layers[tree.entries[p].index].id.clone()),
+                    depth: e.depth,
+                    effective_visible: e.effective_visible,
+                    effective_locked: e.effective_locked,
+                    locked_by: e.locked_by.map(|b| raw_layers[tree.entries[b].index].id.clone()),
+                    isolated: e.isolated,
+                }
             })
             .collect();
-        let layer_rank: HashMap<String, usize> = layers.iter().enumerate().map(|(i, l)| (l.id.clone(), i)).collect();
-        let top = layers.len().saturating_sub(1);
+        let chains: Vec<Vec<usize>> = (0..layers.len()).map(|at| tree.chain(at)).collect();
+        let composite: Vec<u64> = chains
+            .iter()
+            .enumerate()
+            .map(|(at, chain)| {
+                let mut h = Fx::default();
+                at.hash(&mut h);
+                for c in chain {
+                    let l = &layers[*c];
+                    l.id.hash(&mut h);
+                    l.opacity.to_bits().hash(&mut h);
+                    l.blend.hash(&mut h);
+                }
+                h.finish()
+            })
+            .collect();
 
-        // z-order.
-        let mut ranked: Vec<(usize, RawElement)> =
-            elements.into_iter().map(|e| (layer_rank.get(&e.layer).copied().unwrap_or(top), e)).collect();
+        // z-order: by the drawing order of the layers, then element order.
+        let mut ranked: Vec<(Option<usize>, RawElement)> =
+            elements.into_iter().map(|e| (tree.home_of(&raw_layers, &e.layer), e)).collect();
         ranked.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.order.cmp(&b.order)).then_with(|| a.id.cmp(&b.id)));
+        let homes: Vec<Option<usize>> = ranked.iter().map(|(h, _)| *h).collect();
         let raws: Vec<RawElement> = ranked.into_iter().map(|(_, e)| e).collect();
         let by_id: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, e)| (id_hash(&e.id), i)).collect();
-        let mut r = Resolver { reuse, layers, layer_rank, raws, by_id, options };
+        let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options };
         let snapshot_elements = r.resolve(markup_visible);
         let index = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
         let grid = Grid::build(&snapshot_elements);
@@ -387,6 +482,8 @@ impl Resolver {
             index,
             grid,
             options: r.options,
+            tree,
+            chains,
         }
     }
 
@@ -397,12 +494,10 @@ impl Resolver {
 
     fn resolve(&mut self, markup_visible: bool) -> Vec<Element> {
         let n = self.raws.len();
-        let top = self.layers.len().checked_sub(1);
 
         // Effective layers (as indices into `layers`), counts, parents (a
         // parent that names nothing, or makes a cycle, reads as none).
-        let layer_of: Vec<Option<usize>> =
-            self.raws.iter().map(|e| self.layer_rank.get(&e.layer).copied().or(top)).collect();
+        let layer_of: Vec<Option<usize>> = std::mem::take(&mut self.homes);
         for l in layer_of.iter().flatten() {
             self.layers[*l].count += 1;
         }
@@ -597,15 +692,15 @@ impl Resolver {
         let parent_ids: Vec<Option<String>> = parent.iter().map(|p| p.map(|p| self.raws[p].id.clone())).collect();
         let raws = std::mem::take(&mut self.raws);
         for (i, raw) in raws.into_iter().enumerate() {
-            let (layer, layer_visible, layer_opacity) = match layer_of[i] {
-                Some(l) => (self.layers[l].id.clone(), self.layers[l].visible, self.layers[l].opacity),
-                None => (raw.layer.clone(), true, 1.0),
+            let (layer, layer_visible, composite) = match layer_of[i] {
+                Some(l) => (self.layers[l].id.clone(), self.layers[l].effective_visible, self.composite[l]),
+                None => (raw.layer.clone(), true, 0),
             };
             let show_all = self.options.show_all;
             let known = !matches!(raw.kind, Kind::Other(_));
             let visible = known && (layer_visible || show_all) && (markup_visible || show_all || raw.kind.is_picture());
             let style = styles[i].clone();
-            let opacity = style.opacity * layer_opacity;
+            let opacity = style.opacity;
             let global = matches!(raw.kind, Kind::Spotlight);
             let text_path = OnceLock::new();
             if let Some(path) = text_paths[i].take() {
@@ -622,6 +717,7 @@ impl Resolver {
                 bounds: bounds[i],
                 visible,
                 opacity,
+                layer_index: layer_of[i],
                 route: routes[i],
                 layout: layouts[i].take(),
                 text_box: text_boxes[i],
@@ -633,7 +729,7 @@ impl Resolver {
                 text_path,
                 raw,
             };
-            e.fingerprint = fingerprint(&e);
+            e.fingerprint = fingerprint(&e) ^ composite;
             out.push(e);
         }
         out

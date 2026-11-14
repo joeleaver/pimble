@@ -310,7 +310,7 @@ what it touched and that selected (`Presence::say_on_board`).
 | `add_elements` | any kind (sticky, text, rect, ellipse, diamond, frame, line, arrow, connector, pen, highlighter, step, callout, card, picture, spotlight, group) with text, style, rotation, layer, frame or group membership and lock; `ref` names an element within the call, so connectors, parents and a group's `members` can point at elements made in the same call; connectors are added after the rest whatever their place in the list; picture `file`s are stored as blobs first (`pimble_image::fit`, as the app) |
 | `update_elements` | per element, only what is given: geometry merged into what it has, points, text (smallest edit), style keys set or cleared, `move_by` and `rotation` (its transform, so a frame's members move with it), layer, parent, stacking order, lock |
 | `delete_elements` | by id |
-| `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order; delete with its elements or `merge_down` |
+| `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order, `blend`, `parent` (the group it is in; `""` in an update moves it to the top level); `add_layer` takes `kind` (`vector`, the default, `paint` or `group`); delete with its elements (a group with everything in it) or `merge_down` (a group: Merge Group) |
 | `set_canvas` | a page (or one fitted to what shows, or none) and the markup switch |
 
 Added the same day, from sketching a floor plan and a game level with contour lines
@@ -319,6 +319,18 @@ eight steps a segment, stored as ordinary points) and `closed`; a pen with a `fi
 filled freehand shape (rendered, exported and hit as one, `pimble-board`; the app's style
 panel does not offer it yet); a text label takes `center` (x, y its center); `get_canvas`
 gives text and grown sticky notes the size their text takes.
+
+**Layer kinds, blend modes and groups** (docs/DRAWING_CONTRACT.md sections 1 and 5, built
+2026-11-14): `get_canvas` lists the layers top first as a tree, a group's heading (`## Group
+"Name" (id)`) before the layers it holds, each level one `#` deeper; a layer's line says its
+group, a blend that is not its kind's default, and "hidden by its group" or "locked by its
+group" when a group's flag is what hides or locks it; a paint layer reads `Paint layer` and
+holds no elements until painting is built (wave 4), so elements named into it or a group are
+refused with a sentence, and with no layer named they go to the top vector layer that is not
+locked and not inside a hidden or locked group. `update_layer` with `parent` moves a layer
+into a group (on top unless `order` says where); a group is never moved into itself or a
+group it holds. Merging a group that holds a paint layer, and merging down across kinds,
+wait for painting.
 
 **Meaning** (Joe, 2026-10-29; docs/IMAGE_MARKUP_CONTRACT.md "Meaning"): `add_elements` and
 `update_elements` take `note` and `fields` (in an update, a field given as null is removed),

@@ -414,6 +414,178 @@ impl ArrowHeads {
     }
 }
 
+/// What a layer holds (docs/DRAWING_CONTRACT.md section 1): elements (a
+/// vector layer, every layer made before kinds), paint operations (a paint
+/// layer), or other layers (a group). Stored as the layer's `kind`; absent
+/// reads as [`LayerKind::Vector`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LayerKind {
+    Vector,
+    Paint,
+    Group,
+    /// A kind this version does not know: drawn as nothing, takes nothing.
+    Other(String),
+}
+
+impl LayerKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            LayerKind::Vector => "vector",
+            LayerKind::Paint => "paint",
+            LayerKind::Group => "group",
+            LayerKind::Other(s) => s,
+        }
+    }
+
+    pub fn parse(s: &str) -> LayerKind {
+        match s {
+            "" | "vector" => LayerKind::Vector,
+            "paint" => LayerKind::Paint,
+            "group" => LayerKind::Group,
+            other => LayerKind::Other(other.to_string()),
+        }
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self, LayerKind::Vector)
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self, LayerKind::Group)
+    }
+
+    /// The blend mode a layer of this kind has when it names none: a group
+    /// passes through, every other layer is normal.
+    pub fn default_blend(&self) -> Blend {
+        if self.is_group() {
+            Blend::PassThrough
+        } else {
+            Blend::Normal
+        }
+    }
+}
+
+impl fmt::Display for LayerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a layer is laid over what is below it (docs/DRAWING_CONTRACT.md
+/// section 1), as painting apps name the modes. `PassThrough` is a group's
+/// alone: its children blend with what is below the group as if they were
+/// not grouped; on any other layer it reads as `Normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Blend {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    PassThrough,
+}
+
+impl Blend {
+    /// Every mode, in the order a menu offers them.
+    pub const ALL: [Blend; 13] = [
+        Blend::PassThrough,
+        Blend::Normal,
+        Blend::Multiply,
+        Blend::Screen,
+        Blend::Overlay,
+        Blend::Darken,
+        Blend::Lighten,
+        Blend::ColorDodge,
+        Blend::ColorBurn,
+        Blend::HardLight,
+        Blend::SoftLight,
+        Blend::Difference,
+        Blend::Exclusion,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Blend::Normal => "normal",
+            Blend::Multiply => "multiply",
+            Blend::Screen => "screen",
+            Blend::Overlay => "overlay",
+            Blend::Darken => "darken",
+            Blend::Lighten => "lighten",
+            Blend::ColorDodge => "color-dodge",
+            Blend::ColorBurn => "color-burn",
+            Blend::HardLight => "hard-light",
+            Blend::SoftLight => "soft-light",
+            Blend::Difference => "difference",
+            Blend::Exclusion => "exclusion",
+            Blend::PassThrough => "pass-through",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Blend> {
+        Blend::ALL.iter().copied().find(|b| b.as_str() == s)
+    }
+
+    /// The name a person reads ("Color Dodge").
+    pub fn label(&self) -> &'static str {
+        match self {
+            Blend::Normal => "Normal",
+            Blend::Multiply => "Multiply",
+            Blend::Screen => "Screen",
+            Blend::Overlay => "Overlay",
+            Blend::Darken => "Darken",
+            Blend::Lighten => "Lighten",
+            Blend::ColorDodge => "Color Dodge",
+            Blend::ColorBurn => "Color Burn",
+            Blend::HardLight => "Hard Light",
+            Blend::SoftLight => "Soft Light",
+            Blend::Difference => "Difference",
+            Blend::Exclusion => "Exclusion",
+            Blend::PassThrough => "Pass Through",
+        }
+    }
+
+    /// The renderer's mode (`PassThrough` composites as normal when a group
+    /// needs a buffer at all, which is only below 100% opacity).
+    pub fn to_tiny(&self) -> tiny_skia::BlendMode {
+        use tiny_skia::BlendMode as B;
+        match self {
+            Blend::Normal | Blend::PassThrough => B::SourceOver,
+            Blend::Multiply => B::Multiply,
+            Blend::Screen => B::Screen,
+            Blend::Overlay => B::Overlay,
+            Blend::Darken => B::Darken,
+            Blend::Lighten => B::Lighten,
+            Blend::ColorDodge => B::ColorDodge,
+            Blend::ColorBurn => B::ColorBurn,
+            Blend::HardLight => B::HardLight,
+            Blend::SoftLight => B::SoftLight,
+            Blend::Difference => B::Difference,
+            Blend::Exclusion => B::Exclusion,
+        }
+    }
+
+    /// The CSS `mix-blend-mode` value (SVG export); `None` for normal.
+    pub fn css(&self) -> Option<&'static str> {
+        match self {
+            Blend::Normal | Blend::PassThrough => None,
+            other => Some(other.as_str()),
+        }
+    }
+}
+
+impl fmt::Display for Blend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dash {
     Solid,
