@@ -494,9 +494,18 @@ fn schedule(srcs: impl IntoIterator<Item = String>, now: bool) {
     #[cfg(not(test))]
     {
         let delay = if now { 0 } else { RENDER_DEBOUNCE_MS };
-        let handle = set_timeout(delay, || {
-            RENDER_TIMER.with(|t| t.borrow_mut().take());
-            flush();
+        // Armed by no owner: a timeout armed inside an effect or a render is
+        // dropped when that owner re-runs or goes (rinch `set_timeout`), and
+        // `RENDER_TIMER` would then name a timer that never fires, so every
+        // later change waited on it for good. Only the explicit `now` draws
+        // still happened: a canvas in text drew once and never again for a
+        // peer's edit (Joe, 2026-11-14: a share member's agent drew on a
+        // canvas; the owner saw it only on opening the canvas).
+        let handle = rinch::core::reactive::unowned(|| {
+            set_timeout(delay, || {
+                RENDER_TIMER.with(|t| t.borrow_mut().take());
+                flush();
+            })
         });
         RENDER_TIMER.with(|t| *t.borrow_mut() = Some(handle));
     }
