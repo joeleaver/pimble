@@ -2660,6 +2660,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     oncollapse: on_tree_collapse,
                     render_node: render_node_fn,
                     draggable: true,
+                    // Just below any row, an expanded one too, is beside that
+                    // row (Joe, 2026-11-14); first inside is just above the
+                    // first child.
+                    sibling_after_open_row: true,
                     drag_values: tree_drag_values,
                     judge_drop: tree_judge_drop,
                     ondropchange: on_tree_drop_change,
