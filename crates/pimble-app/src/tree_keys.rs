@@ -122,7 +122,7 @@ pub(crate) fn move_cut_into(store: AppStore, row: &str) {
 /// a node beside a store (outdenting the top level) does nothing.
 fn deliver(store: AppStore, drop: &TreeDrop) {
     match plan_drop(store, drop) {
-        DropPlan::Refused(hint) if hint.line == BESIDE_A_STORE => {}
+        DropPlan::Refused(hint) if hint.line == BESIDE_A_STORE || hint.line == crate::tree_drop::STORES_SIDE_BY_SIDE => {}
         DropPlan::Refused(hint) => crate::events::show_notice(store, hint.line),
         plan => {
             send_plan(store, plan);

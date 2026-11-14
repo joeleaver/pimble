@@ -54,6 +54,28 @@ mod imp {
         write_state(&state);
     }
 
+    /// The order the person put the stores in: the open-store list itself
+    /// (docs/TREE_CONTRACT.md "Reordering stores"). Under test, none: the
+    /// real file is whoever ran the tests'.
+    #[cfg(not(test))]
+    pub(super) fn load_store_order() -> Vec<String> {
+        load_app_state_file()
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_store_order() -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Save a new order of the stores: the open-store list, the open stores
+    /// in their order (`open`; a store saved before and closed now is not
+    /// reopened). Each key is a store's path (`super::store_order_key`); a
+    /// store with no folder here has none to reopen.
+    pub(super) fn save_store_order(open: &[String], _with_closed: &[String]) {
+        let paths: Vec<String> = open.iter().filter(|k| pimble_core::StoreId::parse(k).is_err()).cloned().collect();
+        save_app_state_file(&paths);
+    }
+
     /// Whether the app uses the dark theme (the default when nothing is saved).
     pub(crate) fn load_dark_mode() -> bool {
         read_state()["dark_mode"].as_bool().unwrap_or(true)
@@ -227,6 +249,26 @@ mod imp {
         }
     }
 
+    /// Where the order the person put the stores in lives in the browser
+    /// (docs/TREE_CONTRACT.md "Reordering stores"): their ids, as JSON.
+    const STORE_ORDER_KEY: &str = "pimble.store_order";
+
+    pub(super) fn load_store_order() -> Vec<String> {
+        storage()
+            .and_then(|s| s.get_item(STORE_ORDER_KEY).ok().flatten())
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default()
+    }
+
+    /// The stores this browser lists now, and those it listed before in
+    /// their places after them (`with_closed`), so a store missing for a
+    /// while comes back where it was.
+    pub(super) fn save_store_order(_open: &[String], with_closed: &[String]) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(STORE_ORDER_KEY, &serde_json::to_string(with_closed).unwrap_or_default());
+        }
+    }
+
     /// Where the explorer's width lives in the browser.
     const SIDEBAR_WIDTH_KEY: &str = "pimble.sidebar_width";
 
@@ -381,6 +423,45 @@ pub(crate) fn save_panes(panes: &crate::panes::SavedPanes) {
     if let Ok(json) = serde_json::to_value(panes) {
         imp::save_panes_json(json);
     }
+}
+
+thread_local! {
+    /// The saved order of the stores, read once: the desktop rewrites the
+    /// open-store list as each store opens, so reading it again mid-start
+    /// would find only the stores open so far.
+    static STORE_ORDER: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What names a store in the saved order: its folder on the desktop (the
+/// open-store list; its id when it has none here), its id in the browser
+/// (where a store's path is the hosted server's, not this window's).
+pub(crate) fn store_order_key(store: &pimble_core::Store) -> String {
+    match store.local_path() {
+        Some(path) if cfg!(feature = "native") => path.to_string_lossy().to_string(),
+        _ => store.id.to_string(),
+    }
+}
+
+/// Where the store named `key` stands in the saved order, when it has a
+/// place there.
+pub(crate) fn store_rank(key: &str) -> Option<usize> {
+    STORE_ORDER.with(|order| {
+        let mut order = order.borrow_mut();
+        order.get_or_insert_with(imp::load_store_order).iter().position(|k| k == key)
+    })
+}
+
+/// Save the stores' order as the person left it, `keys` top to bottom. A
+/// store saved before and not open now keeps its place after them.
+pub(crate) fn save_store_order(keys: &[String]) {
+    STORE_ORDER.with(|order| {
+        let mut order = order.borrow_mut();
+        let before = order.take().unwrap_or_else(imp::load_store_order);
+        let mut next = keys.to_vec();
+        next.extend(before.into_iter().filter(|k| !keys.contains(k)));
+        imp::save_store_order(keys, &next);
+        *order = Some(next);
+    });
 }
 
 pub(crate) use imp::{

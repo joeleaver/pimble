@@ -1502,6 +1502,7 @@ impl AppStore {
     /// HashMap borrow to avoid RefCell re-entrancy if subscribers read back.
     pub fn upsert_store(&self, store: Store) {
         let sid = store.id;
+        let rank = crate::persistence::store_rank(&crate::persistence::store_order_key(&store));
         let existing = self.store_data.with(|map| map.get(&sid).copied());
         if let Some(sig) = existing {
             sig.set(store);
@@ -1513,11 +1514,55 @@ impl AppStore {
                 map.insert(sid, new_sig);
             });
         }
-        self.store_ids.update(|ids| {
-            if !ids.contains(&sid) {
-                ids.push(sid);
-            }
+        // A new store takes its place in the order the person left the
+        // stores in (docs/TREE_CONTRACT.md "Reordering stores"): before the
+        // first store saved after it; one never placed goes last.
+        if untracked(|| self.store_ids.with(|ids| ids.contains(&sid))) {
+            return;
+        }
+        let ranks: Vec<Option<usize>> = untracked(|| {
+            self.store_ids.with(|ids| {
+                ids.iter()
+                    .map(|id| {
+                        let key = self.store_data.with(|map| map.get(id).map(|sig| sig.with(crate::persistence::store_order_key)));
+                        key.and_then(|k| crate::persistence::store_rank(&k))
+                    })
+                    .collect()
+            })
         });
+        let at = rank.and_then(|rank| ranks.iter().position(|r| r.is_none_or(|r| r > rank)));
+        self.store_ids.update(|ids| match at {
+            Some(at) => ids.insert(at, sid),
+            None => ids.push(sid),
+        });
+    }
+
+    /// Move the stores `moved` (top to bottom) to just after `after`, or to
+    /// the top when it is `None`, and save the order the person picked: the
+    /// window's open-store list, nothing in any store (docs/TREE_CONTRACT.md
+    /// "Reordering stores").
+    pub fn move_stores(&self, moved: &[StoreId], after: Option<StoreId>) {
+        let mut ids = untracked(|| self.store_ids.get());
+        let moving: Vec<StoreId> = moved.iter().copied().filter(|id| ids.contains(id)).collect();
+        ids.retain(|id| !moving.contains(id));
+        let at = match after {
+            Some(anchor) => match ids.iter().position(|&id| id == anchor) {
+                Some(at) => at + 1,
+                None => ids.len(),
+            },
+            None => 0,
+        };
+        ids.splice(at..at, moving);
+        self.store_ids.set(ids);
+        let keys: Vec<String> = untracked(|| {
+            self.store_ids.with(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.store_data.with(|map| map.get(id).map(|sig| sig.with(crate::persistence::store_order_key))))
+                    .collect()
+            })
+        });
+        crate::persistence::save_store_order(&keys);
+        self.bump_tree_structure();
     }
 
     /// Remove a store and all its associated per-entity signals.
