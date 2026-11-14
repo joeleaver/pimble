@@ -70,16 +70,23 @@ from the `ondragover` click context on both backends):
 | middle half | inside the row, last | an outline around the row |
 | bottom quarter | after the row (see below) | a line below the row, at the chosen depth |
 
-- **"After" on an expanded row with children** means *first inside it*: the line under
-  the parent row is drawn above its first child, so that is where it goes.
+- **"After" on an expanded row with children** means *after it among its siblings*, after
+  its whole subtree, as after any other row (Joe, 2026-11-14: just before or after any
+  row, at any depth, makes the node that row's sibling). The line is drawn under the row at
+  the row's own depth; *first inside* is the top edge of its first child, a line one level
+  deeper. Until 2026-11-14 this band meant first inside (rinch's default; Pimble sets
+  `Tree::sibling_after_open_row`).
 - **"After" on the last row of a group** offers every depth that ends there. If the next
   visible row is shallower than this one, the line's depth follows the pointer's x
   position, from this row's depth up to the next row's depth, one indent per step. The
   place is `After(ancestor at that depth)`. This is the drag that outdents.
 - **"Before" a row** is the same spot as "after" the previous visible row, and the two
-  resolve to the same `Place`, so the indicator never jumps between them.
-- **A store row** takes only "inside", which means the root's last child. Reordering the
-  stores themselves is out of scope.
+  resolve to the same `Place`, so the indicator never jumps between them; the one
+  exception is the first child of an expanded row (first inside) against the bottom of
+  that row (after it).
+- **A store row** takes "inside" from a dragged node, which means the root's last child.
+  Store rows themselves drag, and reorder among the store rows (see "Reordering stores",
+  2026-11-14).
 - **The dragged rows and their subtrees** are not targets. Nothing is drawn over them.
 
 ### Feedback
@@ -432,9 +439,60 @@ deletes, creates, renames from the tree), cleared on restart.
   on), one `deleteNodes` request (several `DeleteNode`s, each its own Recently Deleted
   entry until wave 4's undo).
 
+## Drops beside rows at other levels (Joe, 2026-11-14)
+
+Joe reported that a node could not be dropped as a sibling of a row at another level: he
+dragged it onto the parent first, then reordered. What was found before changing anything:
+
+- **`plan_drop` and `plan_move` were right.** Given a `TreeDrop` whose parent is another
+  level's row, they plan the move into that parent at that place, within a store and
+  across stores (`a_drop_beside_a_row_at_another_level_moves_in_beside_it`).
+- **rinch's placement was right for "before" and for the end of a group.** In an isolated
+  app on the family store copy, and in the browser on the local stack (an encrypted
+  store), the top edge of any row put the node beside it at its depth, deeper or
+  shallower than where it came from, across stores, with the tree scrolled, and after a
+  hover-to-expand. The bottom edge of the last row of a group takes its depth from the
+  pointer's indent column, as before.
+- **The one place "after a row" did not mean "beside that row"** was the bottom quarter of
+  an *expanded* row with children: the contract made it "first inside it". Dropping just
+  below an open folder to put a node after that folder therefore put it inside, and the
+  only place beside the folder was the top edge of the row after its whole subtree,
+  often off screen. That is the case Joe's words describe ("just before or after any
+  visible row ... that row's sibling"), and it is now beside the row (rinch
+  `Tree::sibling_after_open_row`, joeleaver/rinch#2679; "Zones" above).
+- The bands are a quarter of a row each (about 6 px at the default size), the same at
+  every level; nothing about a different level makes them harder to hit.
+
+## Reordering stores (Joe, 2026-11-14)
+
+- **Store rows drag.** `tree_drop::drag_values` carries a store row as it carries a node
+  row, so a store drags, a selection of stores drags as one block, and Alt+Shift+Up/Down
+  moves the selected store rows by keyboard.
+- **Only among the store rows.** A drag that carries stores lands only at the top level,
+  before or after another store row (`plan_store_drop`, inside `plan_drop`, the one
+  judgement). Anywhere else is refused while dragging: inside a store or a node says
+  "Stores go beside other stores." (the keyboard's indent says nothing), and a drag
+  carrying stores and nodes together says "Drag stores and nodes separately." A node
+  beside the stores is refused as before ("Nodes go inside a store, not beside it.").
+- **The strip** says "First of the stores", "After Family Management", "2 stores after
+  Notes", or "Where it is" (nothing changes).
+- **The order is the window's, never a store's.** A drop is `DropPlan::Stores`, and sending
+  it is `AppStore::move_stores`: it reorders `store_ids` and saves the order. Nothing is
+  sent to any server or written into any store. On the desktop the order is the open-store
+  list itself (`state.json` `open_stores`, the stores' paths top to bottom); in the
+  browser it is `localStorage` `pimble.store_order` (store ids, the ones not listed now
+  kept after the rest so a store that comes back has its place).
+- **Opening keeps it.** Stores open asynchronously and the desktop rewrites `open_stores`
+  as each one opens, so the saved order is read once per process
+  (`persistence::store_rank`), and `upsert_store` puts a store that opens before the first
+  store saved after it. A store never placed (newly opened or created) goes last.
+- **Over a store row**, its top quarter is before it and its bottom quarter after it,
+  expanded or not (after an expanded store is after its whole subtree, "Zones" above);
+  the middle (inside) is refused, and so is any row under a store.
+
 ## Out of scope
 
-Reordering stores in the explorer; duplicating a node (a separate decision: its content
+Duplicating a node (a separate decision: its content
 would be a fresh projection, as a transplant's is); dragging rows into an editor as
 links; touch-specific gestures beyond what rinch's drag gives a pointer; sorting a folder
 by name or date.
