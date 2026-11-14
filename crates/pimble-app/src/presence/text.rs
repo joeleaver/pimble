@@ -69,6 +69,8 @@ thread_local! {
     static FLAG_TIMER: [Cell<bool>; MAX_PANES] = const { [Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false)] };
     /// What each pane draws.
     static CARETS: RefCell<[Option<Signal<Vec<Caret>>>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    /// Each pane's caret layer: the text's box, which clips what it holds.
+    static FRAMES: RefCell<[Option<Signal<String>>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// The selections each pane's editor was last given.
     static GIVEN: RefCell<[Ranges; MAX_PANES]> = RefCell::new(Default::default());
     /// Where each session's caret last resolved in each pane: the place a
@@ -230,6 +232,24 @@ fn carets(pane: PaneId) -> Signal<Vec<Caret>> {
     CARETS.with(|c| *c.borrow_mut()[pane.index()].get_or_insert_with(|| Signal::new(Vec::new())))
 }
 
+/// Pane `pane`'s caret layer's place: the text's box, so a caret partly
+/// scrolled out of it is cut at its edge with its flag, never drawn over the
+/// strip, the toolbar or the status bar (Joe, 2026-11-14: a caret as tall as
+/// the picture beside it stood out of the pane on Windows). Empty while the
+/// box is not known: the layer is the window then, as before.
+pub(crate) fn frame(pane: PaneId) -> Signal<String> {
+    FRAMES.with(|f| *f.borrow_mut()[pane.index()].get_or_insert_with(|| Signal::new(String::new())))
+}
+
+/// The caret layer's style for the text box `clip`, and the offset a caret's
+/// window-frame place is moved by to be in it.
+fn frame_of(clip: Option<(f32, f32, f32, f32)>) -> (String, (f32, f32)) {
+    match clip {
+        Some((x, y, w, h)) => (format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px; overflow: hidden;"), (x, y)),
+        None => (String::new(), (0.0, 0.0)),
+    }
+}
+
 /// Frames arrived or went: every pane looks again.
 pub(crate) fn frames_changed(store: AppStore) {
     for pane in PaneId::ALL {
@@ -328,6 +348,7 @@ fn redraw(store: AppStore, pane: PaneId) {
     let now = crate::boards::now_ms();
     let me = crate::boards::current_author().map(|a| a.id);
     let clip = text_rect(pane);
+    let (frame_style, (dx, dy)) = frame_of(clip);
     let mut drawn = Vec::new();
     let mut ranges = Ranges::default();
     let mut name_until: Option<f64> = None;
@@ -355,7 +376,7 @@ fn redraw(store: AppStore, pane: PaneId) {
             session: p.session.clone(),
             key: who.key.clone(),
             class: if placed.dim { "pimble-presence-caret pimble-presence-caret--dim" } else { "pimble-presence-caret" },
-            style: format!("left: {:.1}px; top: {:.1}px; height: {:.1}px; background: {};", rect.x - 1.0, rect.y, rect.height.max(1.0), who.color),
+            style: format!("left: {:.1}px; top: {:.1}px; height: {:.1}px; background: {};", rect.x - 1.0 - dx, rect.y - dy, rect.height.max(1.0), who.color),
             flag_style: format!("background: {};", who.color),
             label: if fresh { who.name.clone() } else { who.initials.clone() },
             title,
@@ -372,6 +393,10 @@ fn redraw(store: AppStore, pane: PaneId) {
                 })
             });
         }
+    }
+    let frame = frame(pane);
+    if untracked(|| frame.get()) != frame_style {
+        frame.set(frame_style);
     }
     show(store, pane, drawn, ranges, stickies);
 }

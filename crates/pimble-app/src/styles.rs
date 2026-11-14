@@ -2197,8 +2197,11 @@ pub(crate) const APP_CSS: &str = "
     pointer-events: none;
 }
 
+/* In the layer, which sits on the text's box and clips to it
+   (`presence::text::frame`): a caret partly scrolled out is cut there, its
+   flag too. Fixed would escape the clip. */
 .pimble-presence-caret {
-    position: fixed;
+    position: absolute;
     width: 2px;
     pointer-events: none;
 }

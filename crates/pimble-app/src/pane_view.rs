@@ -357,9 +357,12 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // Other people's carets in the text (docs/PRESENCE_CONTRACT.md section
     // 4), in the window frame the editor answers `caret_rect` in.
     let carets = crate::presence::text::watch(pane);
+    let caret_frame = crate::presence::text::frame(pane);
     let presence_carets = rsx! {
         div {
             class: "pimble-presence-carets",
+            // The text's box, clipping the carets to it.
+            style: {move || caret_frame.get()},
             for caret in carets.get() {
                 div {
                     // A keyed row is drawn once: everything it shows is in its key.
