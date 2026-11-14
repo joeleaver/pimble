@@ -50,6 +50,44 @@ layers: Map<layer id, Map {
 - Merge Down of a vector layer onto a paint layer rasterizes it there (one `pixels`
   operation); a paint layer onto a vector layer is refused with a sentence.
 
+### Layer groups
+
+A group is a layer entry of `kind: "group"` that holds other layers, groups included, to
+any depth. Every layer entry gains a `parent`:
+
+```
+layers: Map<layer id, Map {
+  ...
+  kind: "vector" | "paint" | "group",
+  parent: group id?,             // absent = top level; moving into a group is setting this
+  order: String,                 // now the order among its siblings
+  blend: ... | "pass-through",   // groups only: the default
+}>
+```
+
+- **Hiding or locking a group hides or locks everything in it**, for everyone, as a layer's
+  own flags do; the children keep their own flags, which apply again when the group is shown
+  or unlocked. Tools never pick a layer inside a hidden or locked group.
+- **Blending**: a group in `pass-through` at 100% opacity draws its children as if they
+  were not grouped. Any other blend mode or opacity draws the group into its own buffer
+  first and then blends that buffer, as painting apps do.
+- **Concurrency**: `parent` is last writer wins like `layer` on an element. A group deleted
+  while someone moves a layer into it leaves a `parent` naming nothing, which reads as top
+  level. Two people nesting A into B and B into A at once make a cycle; it is read
+  deterministically: walking up from each layer, the first entry met twice, the one with
+  the smaller id, is read as top level. Nothing is rewritten, so every device reads the
+  same tree.
+- **Deleting a group** deletes what is in it (one undo), with the same lock rules as
+  deleting a layer; **Ungroup** moves its children up to its place, in order.
+- **Merge Group**: all vector children become one vector layer; any paint child makes it one
+  paint layer, with the vector layers rasterized into it.
+- **The panel**: groups fold and unfold (that is each viewer's own state, not the
+  document's), layers drag into and out of groups and between them, "New Group" and "Group
+  Layers" (Ctrl+G while the layers panel has the focus; on the canvas Ctrl+G still groups
+  elements) put the picked layers in a new group at the topmost one's place.
+- Older versions draw the layers inside groups as top-level layers in their order and skip
+  the group entries; the groups' own visibility and opacity are lost there.
+
 ## 2. Vector drawing
 
 ### The path element
@@ -230,13 +268,13 @@ The look is settled with a mockup before the build (wave 1).
   already write well) plus fill and stroke; `get_canvas` returns paths that way.
 - A `paint` tool adds strokes (preset, color, size, point lists) and fills to a paint layer,
   making the layer if it is not named. `render_canvas` shows paint layers.
-- Layers report and take `kind` and `blend`.
+- Layers report and take `kind`, `blend` and `parent`; `add_layer` makes groups too.
 
 ## 6. Waves
 
 1. **The canvas UI shell**: a mockup for Joe first, then the floating rail with flyouts,
-   context bar, color well, panels and keys, carrying today's tools. Nothing new to draw
-   yet, everything existing moved.
+   context bar, color well, panels and keys, carrying today's tools, and the layers panel
+   rebuilt with layer groups and blend modes. Nothing new to draw yet.
 2. **Paths**: the `path` element, Pen, Direct select, Pencil, live shapes (polygon, star,
    corner radius), fill and stroke detail. MCP paths.
 3. **Combining, gradients, flip, SVG in**.
