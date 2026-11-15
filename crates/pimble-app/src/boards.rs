@@ -28,15 +28,20 @@
 //! * [`tools`]: the pointer and the keyboard (every tool, selection, moving,
 //!   resizing, rotating, typing text, arranging);
 //! * [`ui`]: the board view's DOM (the surface and what floats over it, the
-//!   side panel with the navigator, style and layers) and the board toolbar;
-//! * [`nav`]: the navigator's own surface;
+//!   panels: layers, meaning, frames);
+//! * [`rail`]: the floating chrome (docs/DRAWING_CONTRACT.md section 4): the
+//!   tool rail, the context bar, the color well, the zoom corner, its keys;
+//! * [`layers`]: the layers panel, a tree of layers and groups;
+//! * [`nav`]: the navigator's own surface (the map in the zoom corner);
 //! * [`export`]: Copy Picture, Save Picture As, Save Original As, Flatten.
 //!
 //! Pictures on a board come from the same blob cache text pictures do
 //! (`GetBlob`/`BlobLoaded`), decoded off the UI thread on the desktop.
 
 mod export;
+mod layers;
 mod nav;
+mod rail;
 mod tools;
 mod ui;
 
@@ -60,12 +65,12 @@ use crate::protocol::{BackendCommand, NodeInit, StoredBlob};
 use crate::state::{ActiveEdit, AppStore};
 
 pub(crate) use tools::delete_selected;
-pub(crate) use ui::{render_board, render_board_toolbar};
+pub(crate) use ui::render_board;
 
 // ── Tools ───────────────────────────────────────────────────────────────────
 
-/// The board tools (contract section 4). One set for the one toolbar; they act
-/// on whichever board pane has the focus.
+/// The board tools (contract section 4). One set for the window, on the tool
+/// rail of every canvas; they act on whichever board pane has the focus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tool {
     #[default]
@@ -228,7 +233,7 @@ pub(crate) const FONT_SIZES: [(&str, f32); 4] = [("S", 16.0), ("M", 24.0), ("L",
 /// The grid's spacing, in board units (contract section 4, "grid").
 pub(crate) const GRID: f32 = 20.0;
 
-/// The style new elements take, and what the style panel shows: one set for
+/// The style new elements take, and what the context bar shows: one set for
 /// the window, like the tool. Selecting elements loads the first one's style
 /// here; changing a value writes it to every selected element too.
 #[derive(Clone, Copy)]
@@ -246,8 +251,17 @@ pub struct StyleUi {
     /// Per viewer (contract section 4): the grid shown, and snapping to it.
     pub grid: Signal<bool>,
     pub snap: Signal<bool>,
-    /// The side panel (navigator, style, layers) shown beside every board.
-    pub panel: Signal<bool>,
+    /// The navigator (the map in the bottom right corner) shown on every
+    /// board.
+    pub map: Signal<bool>,
+    /// Each tool rail flyout's face: the tool last used from it
+    /// (docs/DRAWING_CONTRACT.md section 4), by flyout, for this session.
+    pub faces: Signal<Vec<Tool>>,
+    /// Which square of the color well is in front (the one a picked color
+    /// goes to).
+    pub front: Signal<rail::Well>,
+    /// The colors last picked, newest first.
+    pub recent: Signal<Vec<String>>,
 }
 
 impl StyleUi {
@@ -263,7 +277,10 @@ impl StyleUi {
             heads: Signal::new(ArrowHeads::End),
             grid: Signal::new(false),
             snap: Signal::new(false),
-            panel: Signal::new(true),
+            map: Signal::new(true),
+            faces: Signal::new(rail::default_faces()),
+            front: Signal::new(rail::Well::Stroke),
+            recent: Signal::new(Vec::new()),
         }
     }
 }
@@ -274,15 +291,50 @@ impl Default for StyleUi {
     }
 }
 
-/// One layer as the layers panel shows it.
+/// One layer as the layers panel shows it, in the panel's order (top
+/// first, a group right before what it holds).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerRow {
     pub id: String,
     pub name: String,
+    /// Its own flags.
     pub visible: bool,
     pub locked: bool,
     pub opacity: f32,
+    /// Elements in it (none for a group).
     pub count: usize,
+    pub kind: pimble_board::LayerKind,
+    pub blend: pimble_board::Blend,
+    /// The group it is read inside.
+    pub parent: Option<String>,
+    pub depth: usize,
+    /// It shows (it and every group above it are visible).
+    pub shown: bool,
+    /// It is locked, by its own flag or a group's.
+    pub held: bool,
+    /// Layers directly inside it (a group's).
+    pub children: usize,
+}
+
+impl LayerRow {
+    pub fn is_group(&self) -> bool {
+        self.kind.is_group()
+    }
+}
+
+/// The one popup a board's floating chrome has open at a time: a rail
+/// flyout, the color well's picker, a menu of the context bar or the zoom
+/// corner, the layers panel's blend list. A press on the canvas closes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Popup {
+    #[default]
+    None,
+    Flyout(usize),
+    Well,
+    Arrange,
+    Align,
+    Export,
+    Blend,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -317,7 +369,7 @@ pub struct TextBox {
     pub align: Align,
 }
 
-/// What a pane's board view shows over its surface, and its side panel, as
+/// What a pane's board view shows over its surface, and its floating chrome and panels, as
 /// signals (logical pixels).
 #[derive(Clone, Copy)]
 pub struct PaneUi {
@@ -377,6 +429,27 @@ pub struct PaneUi {
     pub field_edit: Signal<(String, String)>,
     /// The new field being typed: its name and value.
     pub new_field: Signal<(String, String)>,
+    /// The kinds of the selected elements (what the context bar offers).
+    pub selected_kinds: Signal<Vec<Kind>>,
+    /// The zoom, in percent of one board unit to a CSS pixel.
+    pub zoom: Signal<f32>,
+    /// The popup open over the board.
+    pub popup: Signal<Popup>,
+    /// Tab hid the panels.
+    pub panels_hidden: Signal<bool>,
+    /// The panels folded to their title rows: layers, meaning, frames.
+    pub folded: Signal<[bool; 3]>,
+    /// The layer groups folded in the layers panel (this viewer's own,
+    /// never the document's).
+    pub folded_groups: Signal<Vec<String>>,
+    /// Layers picked besides `layer` (Ctrl or Shift clicks), for Group
+    /// Layers.
+    pub picked_layers: Signal<Vec<String>>,
+    /// Where the last press on the board was, which says who hears keys
+    /// the canvas's surface no longer does.
+    pub keys: Signal<rail::Keys>,
+    /// A layer row being dragged over: the row and where it would land.
+    pub drop_at: Signal<Option<(String, layers::DropZone)>>,
 }
 
 impl PaneUi {
@@ -406,6 +479,15 @@ impl PaneUi {
             note_value: Signal::new((0, String::new())),
             field_edit: Signal::new((String::new(), String::new())),
             new_field: Signal::new((String::new(), String::new())),
+            selected_kinds: Signal::new(Vec::new()),
+            zoom: Signal::new(100.0),
+            popup: Signal::new(Popup::None),
+            panels_hidden: Signal::new(false),
+            folded: Signal::new([false; 3]),
+            folded_groups: Signal::new(Vec::new()),
+            picked_layers: Signal::new(Vec::new()),
+            keys: Signal::new(rail::Keys::Canvas),
+            drop_at: Signal::new(None),
         }
     }
 }
@@ -1291,7 +1373,7 @@ fn new_undo_step(pane: PaneId) {
 }
 
 /// After the pane's board or view changed: what floats over the board and the
-/// side panel follow, then the surface is handed a frame if one is due.
+/// panels follow, then the surface is handed a frame if one is due.
 fn after_change(store: AppStore, pane: PaneId) {
     let scale = scale_of(pane);
     remember_camera(pane, scale);
@@ -1308,12 +1390,9 @@ fn after_change(store: AppStore, pane: PaneId) {
         } else {
             None
         };
-        let layers: Vec<LayerRow> = snapshot
-            .layers
-            .iter()
-            .rev()
-            .map(|l| LayerRow { id: l.id.clone(), name: l.name.clone(), visible: l.visible, locked: l.locked, opacity: l.opacity, count: l.count })
-            .collect();
+        let layers = layers::rows_of(snapshot);
+        let kinds: Vec<Kind> = s.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| e.raw.kind.clone()).collect();
+        let zoom = (s.view.zoom() / scale * 100.0).round();
         let frames: Vec<(String, String)> = snapshot
             .frames()
             .into_iter()
@@ -1343,7 +1422,7 @@ fn after_change(store: AppStore, pane: PaneId) {
                 .collect()
         };
         ui.pins.set(pins);
-        (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len())
+        (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len(), kinds, zoom)
     });
     // An image opens on the arrow, a whiteboard on select (contract section
     // 4), once its board is here.
@@ -1364,15 +1443,21 @@ fn after_change(store: AppStore, pane: PaneId) {
         }
     }
     match published {
-        Some((marks, outlines, handles, layers, frames, picture, authors, marquee, count)) => {
+        Some((marks, outlines, handles, layers, frames, picture, authors, marquee, count, kinds, zoom)) => {
             state.board_marks.set_if_changed(marks);
             ui.outlines.set_if_changed(outlines);
             ui.handles.set_if_changed(handles);
             ui.selected.set_if_changed(count);
+            ui.selected_kinds.set_if_changed(kinds);
+            ui.zoom.set_if_changed(zoom);
             // The selected layer must still exist.
             let chosen = untracked(|| ui.layer.get());
             if chosen.as_ref().is_some_and(|id| !layers.iter().any(|l| &l.id == id)) {
                 ui.layer.set(None);
+            }
+            let extra = untracked(|| ui.picked_layers.get());
+            if extra.iter().any(|id| !layers.iter().any(|l| &l.id == id)) {
+                ui.picked_layers.set(extra.into_iter().filter(|id| layers.iter().any(|l| &l.id == id)).collect());
             }
             ui.layers.set_if_changed(layers);
             publish_meaning(pane, ui);
@@ -2103,7 +2188,7 @@ fn place_batch(store: AppStore, batch: BoardBatch) {
 }
 
 /// A row's "New Canvas from Picture..." (an image node of each picture picked), or the
-/// board toolbar's picture button (each picture onto the board).
+/// tool rail's picture button (each picture onto the board).
 pub(crate) fn pick_images(store: AppStore, dest: Dest) {
     #[cfg(feature = "native")]
     {

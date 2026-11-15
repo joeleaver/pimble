@@ -47,6 +47,9 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
     let selected = with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false);
     match key.key.as_str() {
         " " | "Shift" => true,
+        // Tab hides the panels (docs/DRAWING_CONTRACT.md section 4).
+        "Tab" => !primary && !key.alt,
+        "x" | "X" if !primary && !key.alt => true,
         "Delete" | "Backspace" => selected,
         "Escape" => active,
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => selected,
@@ -372,7 +375,12 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
     crate::editor::give_keyboard_to(store, pane);
     // A press anywhere else ends the text being typed.
     end_text(store, pane);
-    store.pane(pane).board_ui.tip.set(None);
+    let ui = store.pane(pane).board_ui;
+    ui.tip.set(None);
+    // A press on the canvas closes the chrome's popup, and the keys are the
+    // canvas's again (Ctrl+G groups elements, not layers).
+    ui.popup.set_if_changed(Popup::None);
+    ui.keys.set_if_changed(super::rail::Keys::Canvas);
     let now = now_ms();
     let (space, double) = with_session(pane, |s| {
         let (t, lx, ly) = s.last_press;
@@ -1801,7 +1809,7 @@ fn with_layer(element: NewElement, layer: &str) -> NewElement {
     element.in_layer(layer.to_string())
 }
 
-/// The style a new element of `kind` takes from the style panel.
+/// The style a new element of `kind` takes from the context bar.
 pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     let st = store.board_style;
     let (stroke, fill, width, opacity, dash, font_size, align, heads) = untracked(|| {
@@ -1840,7 +1848,7 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     }
 }
 
-/// The style panel shows the first selected element's style (and new
+/// The context bar shows the first selected element's style (and new
 /// elements take it, as in most drawing tools).
 fn load_selection_style(store: AppStore, pane: PaneId) {
     let style = with_session(pane, |s| {
@@ -2260,6 +2268,10 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
         "Shift" => {
             with_session(pane, |s| s.shift = true);
         }
+        "Tab" if !primary && !key.alt => {
+            store.pane(pane).board_ui.panels_hidden.update(|h| *h = !*h);
+        }
+        "x" | "X" if !primary && !key.alt => super::rail::swap_colors(store, pane),
         "Delete" | "Backspace" => delete_selected(store, pane),
         "Escape" => {
             // Escape mid-gesture takes the gesture back, as a cancelled
@@ -2290,6 +2302,9 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             "y" => undo(store, pane, true),
             "d" => duplicate(store, pane),
             "g" if key.shift => ungroup(store, pane),
+            // Ctrl+G while the layers panel has the focus groups the picked
+            // layers (docs/DRAWING_CONTRACT.md, "Layer groups").
+            "g" if untracked(|| store.pane(pane).board_ui.keys.get()) == super::rail::Keys::Layers => super::layers::group_picked(store, pane),
             "g" => group(store, pane),
             "a" => select_all(store, pane),
             "c" => export::copy_picture(store, pane),

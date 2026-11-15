@@ -354,3 +354,74 @@ still lists every entry flat, groups included, until the canvas UI shell is buil
   blend, inherited flags); `add_layer` takes `kind`, `parent`, `blend`; `update_layer`
   takes `blend` and `parent`; `delete_layer` deletes a group with its contents and
   `merge_down` on a group merges it.
+
+## Built in wave 1 (UI)
+
+Built 2026-11-14 in `crates/pimble-app` (both apps, one code path), on the model above.
+The canvas fills the pane and everything floats over it; the app's toolbar shows nothing of
+the canvas and dims for a canvas pane as for a pane with no document (`pane_view.rs`: the
+board toolbar is gone, `usable`/`commentable` are false while the focused pane shows a
+board).
+
+- **Files**: `boards/rail.rs` (the tool rail and flyouts, the context bar, the color well,
+  the zoom corner, the chrome's keys), `boards/layers.rs` (the layers panel), `boards/ui.rs`
+  (the surface and its overlays, the panel stack, Meaning, Frames). State: `StyleUi` gained
+  `map` (was `panel`), `faces`, `front`, `recent`; `PaneUi` gained `selected_kinds`, `zoom`,
+  `popup` (one `Popup` open at a time; a press on the canvas closes it), `panels_hidden`,
+  `folded` (per pane), `folded_groups`, `picked_layers`, `keys`, `drop_at`. `LayerRow`
+  carries kind, blend, parent, depth, the inherited flags and a child count.
+- **Tool rail**: Select, Hand | Pen, Highlighter (still in Draw: Paint does not exist
+  yet), the shapes flyout (Rectangle, Ellipse, Diamond, Line, Arrow), Eraser | Text,
+  Sticky note, the diagram flyout (Connector, Numbered step, Frame), Discussion pin |
+  Insert pictures. Every `Tool` is on it exactly once (a test). Direct select is left out
+  until paths (wave 2). A flyout button shows the tool last used from it (`StyleUi::faces`,
+  for the session; a tool picked by its letter becomes its flyout's face too); its corner
+  mark opens the flyout, and so does a press held 350 ms. **Deviation**: on the desktop a
+  press on a flyout button also uses its face tool at once (rinch delivers the click with
+  the press), so holding opens the siblings with the face already picked.
+- **Context bar**: the tool's name (or the selection's: its kind, or "N selected"), then
+  only what applies (`rail::controls_for` over the selected kinds, else the tool's kind):
+  stroke and fill swatches (they open the color well's picker on that square), width,
+  dash, arrow heads, font size, alignment, opacity; a hint for tools with nothing to set;
+  for a selection Duplicate, Bring Forward, Send Backward, a menu with Bring to Front and
+  Send to Back, Align and distribute (a menu, two or more), Group (two or more), Ungroup (a
+  group selected), Lock, Delete; Undo and Redo always. "Done" leads it while marking up a
+  picture in text. It scrolls sideways (thin scrollbar) when the pane is too narrow.
+- **Color well**: the stroke (a ring) and fill squares, the front one where a picked color
+  goes (a click brings a square to the front, a second click opens the picker); swap (X;
+  with no fill, the stroke color becomes the fill too and the stroke stays, since a stroke
+  cannot be nothing); the picker is rinch's `ColorPicker` with the appearance palette and a
+  hex box, "No fill" for the fill, and up to eight recent colors. Picking writes to the
+  selection as the old style section did.
+- **Panels**: Layers, Meaning, Frames, each folding to its title row; Tab hides the stack.
+  The layers panel is the tree: indented by depth, groups fold (this viewer's own), eye
+  and lock (dimmed when a group's flag decides), a kind icon, the name (click a picked
+  row's name to rename it in place), the element count (a group's: its layers). The picked
+  layer's blend (a list of `Blend::ALL` by label; Pass Through only on a group) and opacity
+  are under the list, then New Layer, New Group, Group Layers, Ungroup, Merge Down (a
+  group: Merge Group), Move Selection to Layer, Delete. Ctrl or Shift clicks pick several
+  rows for Group Layers (Ctrl+G while the panel has the focus). Rows drag above, below and
+  into groups (`layers::zone_at`, `layers::drop_move`, tested: below an open group that
+  holds layers is its top; a group never goes inside itself), through `move_layer_into`.
+  Refusals the model makes are said (`layer_edit`), not only logged.
+- **Zoom corner**: the map (the navigator, toggled), zoom out, the zoom in percent (a click
+  is actual size), zoom in, fit; the grid, snapping and Color by Author (each only here),
+  and the export menu.
+- **Keys**: tool letters, Space held pans, Shift constrains, X swaps, Tab hides the panels,
+  Ctrl+G groups layers after a press in the layers panel. A press on the floating chrome
+  takes the keyboard from the canvas's surface (rinch gives it back only on a press on the
+  surface), so the chrome listens through the keyboard interceptor (`rail::keys_to`,
+  `rail::key_act`, tested): it answers only while the last press on the board was on the
+  chrome, its pane is focused and nothing else holds the focus (a field, the editor, the
+  tree, the surface itself); everything with Ctrl or Alt is the app's. Alt-picking colors
+  and `[`/`]` wait for paint layers.
+- **Small panes**: a pane less than about half the window wide is narrow (the context bar
+  takes the whole top, the panels start below it); a quarter or less is small (the panels
+  fold when it becomes small, the rail tightens, the map shrinks and the well's squares
+  hide; the context bar's swatches still open the picker).
+- **Theme**: floating chrome is `.pimble-float` (the body color, a hairline border, a 6 px
+  radius, a faint shadow), rinch's semantic variables only, both schemes.
+- **Not built**: layer thumbnails (the contract's panel line); panels folding to an icon
+  (they fold to their title row); the hue ring (rinch's picker has a square and a hue
+  bar). Embedded canvases in text are unchanged; marking up a picture in text opens this
+  same view.

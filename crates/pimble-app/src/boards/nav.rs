@@ -1,5 +1,5 @@
 //! The navigator (docs/IMAGE_MARKUP_CONTRACT.md section 8): a second, small
-//! surface in the board's side panel showing the whole board (its visible
+//! surface in the board's zoom corner (the map) showing the whole board (its visible
 //! extent and wherever the view is), with the view's rectangle over it. A
 //! press or a drag on it moves the view there. It is re-rendered a moment
 //! after changes stop, never per pointer move.
@@ -65,7 +65,7 @@ fn nav_view(s: &Session, width: u32, height: u32, scale: f32) -> pimble_board::V
 fn render(store: AppStore, pane: PaneId) {
     let Some(surface) = NAV_SURFACES.with(|s| s.borrow()[pane.index()].clone()) else { return };
     let (width, height) = surface.layout_size();
-    if width == 0 || height == 0 || !untracked(|| store.board_style.panel.get()) {
+    if width == 0 || height == 0 || !untracked(|| store.board_style.map.get()) {
         return;
     }
     let scale = scale_of(pane);

@@ -2146,9 +2146,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-board__markup {
-    position: absolute;
-    top: 8px;
-    right: 8px;
+    pointer-events: auto;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -2283,42 +2281,16 @@ pub(crate) const APP_CSS: &str = "
     position: static;
 }
 
-/* The Done button over a picture being marked up in text. */
-.pimble-board__done {
-    position: absolute;
-    top: 8px;
-    left: 8px;
-    z-index: 5;
-}
-
-.pimble-board__panel {
-    width: 232px;
-    flex-shrink: 0;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 8px;
-    border-left: 1px solid var(--rinch-color-border);
-    background: var(--rinch-color-body);
-    font-size: 12px;
-    color: var(--rinch-color-text);
-}
-
 .pimble-board__panel-title {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     color: var(--rinch-color-dimmed);
-    margin: 6px 0 4px 0;
-}
-
-.pimble-board__nav {
-    position: relative;
-    width: 214px;
-    height: 140px;
-    display: flex;
-    overflow: hidden;
-    border: 1px solid var(--rinch-color-border);
-    border-radius: 4px;
+    padding: 6px 8px;
+    cursor: pointer;
 }
 
 .pimble-board__nav-view {
@@ -2531,6 +2503,470 @@ pub(crate) const APP_CSS: &str = "
 .pimble-board-width {
     border-radius: 50%;
     background: currentColor;
+}
+
+/* ── The canvas's floating chrome (docs/DRAWING_CONTRACT.md section 4) ──
+   Everything floats over the canvas, which fills the pane: the tool rail
+   and the color well on the left, the context bar at the top, the panels
+   and the zoom corner on the right. The columns let the pointer through to
+   the canvas except where their boxes are. */
+.pimble-float {
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+    color: var(--rinch-color-text);
+    font-size: 12px;
+    pointer-events: auto;
+}
+
+.pimble-board__grow {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+}
+
+.pimble-board__left {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    bottom: 8px;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    pointer-events: none;
+}
+
+.pimble-board__left > div {
+    pointer-events: auto;
+}
+
+.pimble-board__left > .pimble-board__grow {
+    pointer-events: none;
+}
+
+.pimble-board__rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 3px;
+}
+
+.pimble-board__rail-gap {
+    width: 22px;
+    height: 1px;
+    margin: 3px 0;
+    background: var(--rinch-color-border);
+}
+
+.pimble-board-tool:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-board-tool--small {
+    width: 24px;
+    height: 24px;
+}
+
+.pimble-board__slot {
+    position: relative;
+}
+
+.pimble-board__slot > .pimble-board-tool {
+    position: relative;
+}
+
+.pimble-board__face {
+    display: inline-flex;
+}
+
+/* A flyout button's corner mark: a small triangle in the bottom right (a
+   square turned 45 degrees, half of it cut off by the mark's box). */
+.pimble-board__corner-mark {
+    position: absolute;
+    right: 1px;
+    bottom: 1px;
+    width: 7px;
+    height: 7px;
+    overflow: hidden;
+    cursor: pointer;
+}
+
+.pimble-board__corner-fill {
+    position: absolute;
+    left: 3px;
+    top: 3px;
+    width: 9px;
+    height: 9px;
+    transform: rotate(45deg);
+    background: var(--rinch-color-dimmed);
+}
+
+.pimble-board__flyout {
+    position: absolute;
+    left: 38px;
+    top: -4px;
+    z-index: 8;
+    min-width: 168px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+}
+
+.pimble-board__menu {
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    margin-top: 4px;
+}
+
+.pimble-board__menu--up {
+    position: absolute;
+    right: 0;
+    bottom: 100%;
+    margin-bottom: 4px;
+    z-index: 8;
+}
+
+.pimble-board__menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.pimble-board__menu-item:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-board__menu-item--active {
+    color: var(--rinch-primary-color-4);
+}
+
+.pimble-board__menu-icon {
+    display: inline-flex;
+    width: 16px;
+    height: 16px;
+}
+
+.pimble-board__menu-key {
+    color: var(--rinch-color-dimmed);
+    font-size: 11px;
+}
+
+.pimble-board__top {
+    position: absolute;
+    top: 8px;
+    left: 56px;
+    right: 256px;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+}
+
+.pimble-board__top > div {
+    pointer-events: auto;
+}
+
+.pimble-board__context {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 6px 5px 6px;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    scrollbar-width: thin;
+}
+
+.pimble-board__context .pimble-board-tool {
+    width: 26px;
+    height: 26px;
+}
+
+.pimble-board__context > .pimble-board__ctx-group {
+    margin-top: 3px;
+}
+
+.pimble-board__context .pimble-board-chip {
+    padding: 1px 5px;
+}
+
+.pimble-board__ctx-group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+}
+
+.pimble-board__ctx-sep {
+    border-left: 1px solid var(--rinch-color-border);
+    padding-left: 4px;
+    margin-left: 2px;
+    align-self: stretch;
+}
+
+.pimble-board__ctx-label {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 0 6px 0 2px;
+    color: var(--rinch-color-text);
+}
+
+.pimble-board__ctx-hint {
+    color: var(--rinch-color-dimmed);
+    padding-right: 4px;
+}
+
+.pimble-board__ctx-number {
+    color: var(--rinch-color-dimmed);
+    font-size: 11px;
+    min-width: 30px;
+}
+
+.pimble-board__ctx-opacity {
+    width: 64px;
+    padding: 0 4px;
+}
+
+/* The context bar's stroke and fill: a ring in the stroke's color, a disc
+   in the fill's. */
+.pimble-board__ctx-color {
+    width: 18px;
+    height: 18px;
+    margin: 0 3px;
+    border-radius: 50%;
+    cursor: pointer;
+    box-sizing: border-box;
+    border: 1px solid var(--rinch-color-border);
+}
+
+.pimble-board__ctx-color--stroke {
+    border-width: 4px;
+}
+
+.pimble-board__well-wrap {
+    position: relative;
+}
+
+.pimble-board__well {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    padding: 5px;
+}
+
+.pimble-board__well-squares {
+    position: relative;
+    width: 40px;
+    height: 40px;
+}
+
+.pimble-board__well-fill,
+.pimble-board__well-stroke {
+    position: absolute;
+    width: 26px;
+    height: 26px;
+    border-radius: 4px;
+    box-sizing: border-box;
+    cursor: pointer;
+}
+
+.pimble-board__well-fill {
+    right: 0;
+    bottom: 0;
+    border: 1px solid var(--rinch-color-border);
+}
+
+.pimble-board__well-stroke {
+    left: 0;
+    top: 0;
+    border: 7px solid;
+    background: transparent;
+    box-shadow: 0 0 0 1px var(--rinch-color-border);
+}
+
+.pimble-board__well-pop {
+    position: absolute;
+    left: 0;
+    bottom: 100%;
+    margin-bottom: 6px;
+    width: 236px;
+    padding: 8px;
+    z-index: 8;
+}
+
+.pimble-board__right {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    bottom: 8px;
+    width: 236px;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    pointer-events: none;
+}
+
+/* A small pane (a quarter of a split view): a tighter rail, and no color
+   well squares (the context bar's swatches open its picker). */
+.pimble-board--small .pimble-board__rail .pimble-board-tool {
+    width: 24px;
+    height: 24px;
+}
+
+.pimble-board--small .pimble-board__rail-gap {
+    margin: 2px 0;
+}
+
+.pimble-board--small .pimble-board__well {
+    display: none;
+}
+
+.pimble-board--small .pimble-board__map {
+    width: 140px;
+    height: 88px;
+}
+
+/* A narrow pane: the context bar has the whole top, the panels and the
+   corner start below it. */
+.pimble-board--narrow .pimble-board__right {
+    top: 48px;
+}
+
+.pimble-board__panels {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    pointer-events: auto;
+}
+
+.pimble-board__panel-box {
+    flex-shrink: 0;
+}
+
+.pimble-board__panel-body {
+    padding: 0 8px 8px 8px;
+}
+
+.pimble-board__corner {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    pointer-events: auto;
+}
+
+.pimble-board__map {
+    position: relative;
+    width: 200px;
+    height: 128px;
+    display: flex;
+    overflow: hidden;
+}
+
+.pimble-board__zoombar {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 2px;
+}
+
+.pimble-board__zoombar .pimble-board-tool {
+    width: 26px;
+    height: 26px;
+}
+
+.pimble-board__zoom {
+    min-width: 44px;
+    text-align: center;
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--rinch-color-text);
+}
+
+.pimble-board__bottom-center {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 10px;
+    z-index: 5;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+}
+
+.pimble-board__layers-body {
+    display: flex;
+    flex-direction: column;
+}
+
+.pimble-board__layer-fold {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__layer-kind {
+    width: 14px;
+    height: 14px;
+}
+
+/* An eye or lock that a group's own flag decides. */
+.pimble-board__layer-icon--inherited {
+    opacity: 0.4;
+}
+
+.pimble-board__layer--drop-above {
+    border-top-color: var(--rinch-primary-color-5);
+}
+
+.pimble-board__layer--drop-below {
+    border-bottom-color: var(--rinch-primary-color-5);
+}
+
+.pimble-board__layer--drop-into {
+    border-color: var(--rinch-primary-color-5);
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-board__layer-props {
+    margin-top: 6px;
+    padding-right: 8px;
+}
+
+.pimble-board__blend {
+    white-space: nowrap;
+}
+
+.pimble-board__blends {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin: 4px 0;
+}
+
+.pimble-board-chip--hidden {
+    display: none;
 }
 
 .pimble-editor__content-wrap {

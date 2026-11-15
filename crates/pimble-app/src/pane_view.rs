@@ -705,20 +705,19 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
     // toolbar"), and has nothing to act on while that pane holds no document
     // or one this device may only read.
+    // A canvas pane shows nothing of the canvas in it (docs/DRAWING_CONTRACT.md
+    // section 4: the canvas's tools float over the canvas), so it dims as
+    // for a pane with no document.
     let usable = move || {
         let pane = store.focused_pane.get();
-        store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
+        store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get() && !editor_read_only(store, pane)
     };
     let commentable = move || {
         let pane = store.focused_pane.get();
-        store.pane(pane).show_editor.get() && pane_access(store, pane).allows_comment()
+        store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get() && pane_access(store, pane).allows_comment()
     };
     let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable, commentable);
-    // The board tools take the toolbar's place while the focused pane shows a
-    // board (docs/IMAGE_MARKUP_CONTRACT.md section 1).
-    let board_toolbar = crate::boards::render_board_toolbar(__scope, store);
-    let board_focused = move || store.pane(store.focused_pane.get()).show_board.get();
-    // And the sheet's own while it shows a sheet node (Joe, 2026-10-22).
+    // The sheet's own toolbar while it shows a sheet node (Joe, 2026-10-22).
     let sheet_toolbar = crate::sheets::toolbar::render_sheet_toolbar(__scope, store);
     let sheet_focused = move || {
         let pane = store.pane(store.focused_pane.get());
@@ -745,15 +744,11 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
             div {
                 class: "pimble-editor__toolbar-wrap",
                 div {
-                    style: {move || if board_focused() || sheet_focused() { "display: none;" } else { "" }},
+                    style: {move || if sheet_focused() { "display: none;" } else { "" }},
                     {toolbar}
                 }
                 div {
-                    style: {move || if board_focused() { "" } else { "display: none;" }},
-                    {board_toolbar}
-                }
-                div {
-                    style: {move || if sheet_focused() && !board_focused() { "" } else { "display: none;" }},
+                    style: {move || if sheet_focused() { "" } else { "display: none;" }},
                     {sheet_toolbar}
                 }
             }
