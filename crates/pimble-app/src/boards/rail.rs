@@ -331,6 +331,19 @@ fn icon_button(__scope: &mut RenderScope, icon: TablerIcon, tip: String, active:
     }
 }
 
+/// A context-bar button that opens `popup`, a row of choices under the bar,
+/// showing the current choice as its face.
+fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, face: NodeHandle) -> NodeHandle {
+    rsx! {
+        div {
+            title: tip,
+            class: {move || if ui.popup.get() == popup { "pimble-board-tool pimble-board__chooser pimble-board-tool--active" } else { "pimble-board-tool pimble-board__chooser" }},
+            onclick: move || toggle(ui, popup),
+            {face}
+        }
+    }
+}
+
 /// A text button.
 fn text_button(__scope: &mut RenderScope, label: &'static str, tip: &'static str, active: impl Fn() -> bool + 'static, run: impl Fn() + 'static) -> NodeHandle {
     rsx! {
@@ -530,6 +543,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     class: {move || if st.width.get() == w { "pimble-board-tool pimble-board-tool--active" } else { "pimble-board-tool" }},
                     onclick: move || {
                         st.width.set(w);
+                        ui.popup.set(Popup::None);
                         apply(Style { width: Some(w), ..Style::default() });
                     },
                     div { class: "pimble-board-width", style: format!("width: {dot}px; height: {dot}px;") }
@@ -542,6 +556,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         .map(|(dash, icon, tip)| {
             icon_button(__scope, icon, tip.to_string(), move || st.dash.get() == dash, move || {
                 st.dash.set(dash);
+                ui.popup.set(Popup::None);
                 apply(Style { dash: Some(dash), ..Style::default() });
             })
         })
@@ -556,6 +571,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     .map(|(h, icon, tip)| {
         icon_button(__scope, icon, tip.to_string(), move || st.heads.get() == h, move || {
             st.heads.set(h);
+            ui.popup.set(Popup::None);
             apply(Style { arrow_heads: Some(h), ..Style::default() });
         })
     })
@@ -566,6 +582,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             let size = *size;
             text_button(__scope, label, "Font size", move || st.font_size.get() == size, move || {
                 st.font_size.set(size);
+                ui.popup.set(Popup::None);
                 apply(Style { font_size: Some(size), ..Style::default() });
             })
         })
@@ -575,6 +592,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         .map(|(align, icon, tip)| {
             icon_button(__scope, icon, tip.to_string(), move || st.align.get() == align, move || {
                 st.align.set(align);
+                ui.popup.set(Popup::None);
                 apply(Style { align: Some(align), ..Style::default() });
             })
         })
@@ -583,21 +601,15 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     // The selection's arrangement.
     let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
     let duplicate = act(__scope, TablerIcon::Copy, "Duplicate (Ctrl+D)", tools::duplicate);
-    let forward = act(__scope, TablerIcon::ChevronUp, "Bring Forward (Ctrl+])", |s, p| tools::reorder(s, p, Order::Forward));
-    let backward = act(__scope, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", |s, p| tools::reorder(s, p, Order::Backward));
     let group = act(__scope, TablerIcon::BoxMultiple, "Group (Ctrl+G)", tools::group);
     let ungroup = act(__scope, TablerIcon::Package, "Ungroup (Ctrl+Shift+G)", tools::ungroup);
     let lock = act(__scope, TablerIcon::Lock, "Lock / Unlock (Ctrl+L)", tools::toggle_lock);
     let delete = act(__scope, TablerIcon::Trash, "Delete (Delete)", delete_selected);
-    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: bring to front, send to back".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
+    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
     let align_btn = icon_button(__scope, TablerIcon::LayoutAlignCenter, "Align and distribute".to_string(), move || ui.popup.get() == Popup::Align, move || toggle(ui, Popup::Align));
     let undo_btn = act(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |s, p| tools::undo(s, p, false));
     let redo_btn = act(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |s, p| tools::undo(s, p, true));
 
-    let arrange_items: Vec<NodeHandle> = vec![
-        menu_item(__scope, store, pane, TablerIcon::StackPush, "Bring to Front (Ctrl+Shift+])", Box::new(|s, p| tools::reorder(s, p, Order::Front))),
-        menu_item(__scope, store, pane, TablerIcon::StackPop, "Send to Back (Ctrl+Shift+[)", Box::new(|s, p| tools::reorder(s, p, Order::Back))),
-    ];
     let align_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::LayoutAlignLeft, "Align Left", Box::new(|s, p| tools::align(s, p, Align2::Left))),
         menu_item(__scope, store, pane, TablerIcon::LayoutAlignCenter, "Align Centers", Box::new(|s, p| tools::align(s, p, Align2::Center))),
@@ -607,6 +619,51 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::LayoutAlignBottom, "Align Bottom", Box::new(|s, p| tools::align(s, p, Align2::Bottom))),
         menu_item(__scope, store, pane, TablerIcon::LayoutDistributeVertical, "Distribute Across", Box::new(|s, p| tools::align(s, p, Align2::SpreadAcross))),
         menu_item(__scope, store, pane, TablerIcon::LayoutDistributeHorizontal, "Distribute Down", Box::new(|s, p| tools::align(s, p, Align2::SpreadDown))),
+    ];
+    // The pickers' faces: the current choice.
+    let width_face = rsx! {
+        div { class: "pimble-board-width", style: {move || { let d = (st.width.get() * 1.2 + 2.0).min(18.0).round(); format!("width: {d}px; height: {d}px;") }} }
+    };
+    let icon_face = |__scope: &mut RenderScope, options: Vec<(TablerIcon, Box<dyn Fn() -> bool>)>| -> NodeHandle {
+        let spans: Vec<NodeHandle> = options
+            .into_iter()
+            .map(|(icon, on)| rsx! { span { class: "pimble-board__face", style: {|| if on() { "" } else { "display: none;" }}, IconGlyph { name: icon.name().to_string() } } })
+            .collect();
+        rsx! { div { class: "pimble-board__face-wrap", {spans} } }
+    };
+    let dash_face = icon_face(__scope, vec![
+        (TablerIcon::Line, Box::new(move || st.dash.get() == Dash::Solid)),
+        (TablerIcon::LineDashed, Box::new(move || st.dash.get() == Dash::Dashed)),
+        (TablerIcon::LineDotted, Box::new(move || st.dash.get() == Dash::Dotted)),
+    ]);
+    let heads_face = icon_face(__scope, vec![
+        (TablerIcon::ArrowRight, Box::new(move || st.heads.get() == ArrowHeads::End)),
+        (TablerIcon::ArrowLeft, Box::new(move || st.heads.get() == ArrowHeads::Start)),
+        (TablerIcon::ArrowsLeftRight, Box::new(move || st.heads.get() == ArrowHeads::Both)),
+        (TablerIcon::Minus, Box::new(move || st.heads.get() == ArrowHeads::None)),
+    ]);
+    let align_face = icon_face(__scope, vec![
+        (TablerIcon::AlignLeft, Box::new(move || st.align.get() == Align::Left)),
+        (TablerIcon::AlignCenter, Box::new(move || st.align.get() == Align::Center)),
+        (TablerIcon::AlignRight, Box::new(move || st.align.get() == Align::Right)),
+    ]);
+    let font_face = rsx! {
+        span { class: "pimble-board__face-text", {move || { let size = st.font_size.get(); FONT_SIZES.iter().find(|(_, s)| *s == size).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{size}")) }} }
+    };
+    let opacity_face = rsx! {
+        span { class: "pimble-board__face-text", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
+    };
+    let width_btn = picker_button(__scope, ui, "Width", Popup::Width, width_face);
+    let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, dash_face);
+    let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, heads_face);
+    let font_btn = picker_button(__scope, ui, "Font size", Popup::Font, font_face);
+    let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, align_face);
+    let opacity_btn = picker_button(__scope, ui, "Opacity", Popup::Opacity, opacity_face);
+    let more_items: Vec<NodeHandle> = vec![
+        menu_item(__scope, store, pane, TablerIcon::ChevronUp, "Bring Forward (Ctrl+])", Box::new(|s, p| tools::reorder(s, p, Order::Forward))),
+        menu_item(__scope, store, pane, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", Box::new(|s, p| tools::reorder(s, p, Order::Backward))),
+        menu_item(__scope, store, pane, TablerIcon::StackPush, "Bring to Front (Ctrl+Shift+])", Box::new(|s, p| tools::reorder(s, p, Order::Front))),
+        menu_item(__scope, store, pane, TablerIcon::StackPop, "Send to Back (Ctrl+Shift+[)", Box::new(|s, p| tools::reorder(s, p, Order::Back))),
     ];
     let writable = move || {
         state
@@ -651,41 +708,23 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().stroke)}, {stroke_swatch} }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().fill)}, {fill_swatch} }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().width)}, {widths} }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().dash)}, {dashes} }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().heads)}, {heads} }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().font)}, {sizes} }
-                    div { class: "pimble-board__ctx-group", style: {move || shown(controls().align)}, {aligns} }
-                    div {
-                        class: "pimble-board__ctx-group pimble-board__ctx-sep",
-                        style: {move || shown(controls().opacity)},
-                        title: "Opacity",
-                        div { class: "pimble-board__ctx-opacity",
-                            Slider {
-                                min: 0.1,
-                                max: 1.0,
-                                step: 0.05,
-                                size: "xs",
-                                value_signal: Some(super::ui::opacity_signal(store)),
-                                onchange: move |v: f64| {
-                                    st.opacity.set(v as f32);
-                                    apply(Style { opacity: Some(v as f32), ..Style::default() });
-                                },
-                            }
-                        }
-                        span { class: "pimble-board__ctx-number", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
+                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().width || controls().dash || controls().heads || controls().font || controls().align || controls().opacity)},
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().width)}, {width_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().dash)}, {dash_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().heads)}, {heads_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().font)}, {font_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().align)}, {align_text_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().opacity)}, {opacity_btn} }
                     }
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
                         style: {move || shown(ui.selected.get() > 0)},
                         {duplicate}
-                        {forward}
-                        {backward}
-                        {arrange_btn}
                         div { class: "pimble-board__ctx-group", style: {move || shown(ui.selected.get() > 1)}, {align_btn} {group} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(ui.selected_kinds.get().contains(&Kind::Group))}, {ungroup} }
                         {lock}
                         {delete}
+                        {arrange_btn}
                     }
                     div { class: "pimble-board__ctx-group pimble-board__ctx-sep", {undo_btn} {redo_btn} }
                 }
@@ -693,7 +732,30 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div {
                 class: "pimble-float pimble-board__menu",
                 style: {move || shown(ui.popup.get() == Popup::Arrange)},
-                {arrange_items}
+                {more_items}
+            }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Width)}, {widths} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Dash)}, {dashes} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Heads)}, {heads} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Font)}, {sizes} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::TextAlign)}, {aligns} }
+            div {
+                class: "pimble-float pimble-board__options",
+                style: {move || shown(ui.popup.get() == Popup::Opacity)},
+                div { class: "pimble-board__ctx-opacity",
+                    Slider {
+                        min: 0.1,
+                        max: 1.0,
+                        step: 0.05,
+                        size: "xs",
+                        value_signal: Some(super::ui::opacity_signal(store)),
+                        onchange: move |v: f64| {
+                            st.opacity.set(v as f32);
+                            apply(Style { opacity: Some(v as f32), ..Style::default() });
+                        },
+                    }
+                }
+                span { class: "pimble-board__ctx-number", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
             }
             div {
                 class: "pimble-float pimble-board__menu",

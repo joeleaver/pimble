@@ -381,12 +381,15 @@ board).
   the press), so holding opens the siblings with the face already picked.
 - **Context bar**: the tool's name (or the selection's: its kind, or "N selected"), then
   only what applies (`rail::controls_for` over the selected kinds, else the tool's kind):
-  stroke and fill swatches (they open the color well's picker on that square), width,
-  dash, arrow heads, font size, alignment, opacity; a hint for tools with nothing to set;
-  for a selection Duplicate, Bring Forward, Send Backward, a menu with Bring to Front and
-  Send to Back, Align and distribute (a menu, two or more), Group (two or more), Ungroup (a
-  group selected), Lock, Delete; Undo and Redo always. "Done" leads it while marking up a
-  picture in text. It scrolls sideways (thin scrollbar) when the pane is too narrow.
+  stroke and fill swatches (they open the color well's picker on that square), then one
+  picker button each for width, dash, arrow heads, font size, text alignment and opacity:
+  its face is the current choice and a press opens the choices in a row under the bar
+  (Joe, 2026-11-14: the first cut showed every choice inline and scrolled sideways at
+  1200 pixels); a hint for tools with nothing to set; for a selection Duplicate, Align and
+  distribute (a menu, two or more), Group (two or more), Ungroup (a group selected), Lock,
+  Delete, and a "more" menu with Bring Forward, Send Backward, Bring to Front and Send to
+  Back; Undo and Redo always. "Done" leads it while marking up a picture in text. A pen
+  stroke selected is about 370 pixels wide; a pane narrower than the bar scrolls it.
 - **Color well**: the stroke (a ring) and fill squares, the front one where a picked color
   goes (a click brings a square to the front, a second click opens the picker); swap (X;
   with no fill, the stroke color becomes the fill too and the stroke stays, since a stroke

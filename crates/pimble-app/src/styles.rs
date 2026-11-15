@@ -2416,6 +2416,26 @@ pub(crate) const APP_CSS: &str = "
     box-sizing: border-box;
 }
 
+/* The Meaning section's note box and field inputs: the same quiet box as
+   the rest of the floating chrome. */
+.pimble-board__note,
+.pimble-board__field-name-input,
+.pimble-board__field-value {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    padding: 3px 6px;
+    font-family: inherit;
+    outline: none;
+}
+
+.pimble-board__note:focus,
+.pimble-board__field-name-input:focus,
+.pimble-board__field-value:focus {
+    border-color: var(--rinch-primary-color);
+}
+
 .pimble-board__fields {
     display: flex;
     flex-direction: column;
@@ -2446,7 +2466,8 @@ pub(crate) const APP_CSS: &str = "
     flex: 0 0 38%;
     min-width: 0;
     font-size: 12px;
-    height: 18px;
+    height: 24px;
+    box-sizing: border-box;
 }
 
 .pimble-board__field-value {
@@ -2580,6 +2601,44 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__face {
     display: inline-flex;
+}
+
+/* A context-bar picker: its face is the current choice, a press opens a
+   row of choices under the bar. */
+.pimble-board__chooser {
+    position: relative;
+}
+
+.pimble-board__context .pimble-board__chooser {
+    width: auto;
+    min-width: 26px;
+    padding: 0 3px;
+    box-sizing: border-box;
+}
+
+.pimble-board__face-wrap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.pimble-board__face-text {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--rinch-color-text);
+}
+
+.pimble-board__options {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px 4px;
+    margin-top: 4px;
+}
+
+.pimble-board__options .pimble-board-tool {
+    width: 26px;
+    height: 26px;
 }
 
 /* A flyout button's corner mark: a small triangle in the bottom right (a

@@ -331,10 +331,18 @@ pub enum Popup {
     None,
     Flyout(usize),
     Well,
+    /// The context bar's "more" menu: forward, backward, front, back.
     Arrange,
     Align,
     Export,
     Blend,
+    /// The context bar's pickers, each a row under the bar.
+    Width,
+    Dash,
+    Heads,
+    Font,
+    TextAlign,
+    Opacity,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
