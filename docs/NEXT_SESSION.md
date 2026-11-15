@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-11-14 (session 78e7f30f): v0.23.0 released from `master`: drawing wave 1.** The
+canvas tab is redesigned (docs/DRAWING_CONTRACT.md section 4, "Built in wave 1 (UI)"):
+floating tool rail with flyouts, a context bar of picker buttons, the color well, folding
+panels, the zoom corner; the app toolbar dims for a canvas. Layers have a kind (vector,
+paint, group), a blend mode and a parent: groups nest, hide and lock what they hold, and
+fold in the rebuilt Layers panel ("Built in wave 1 (model)"). Layer opacity now fades the
+layer as a whole. Next: wave 2, paths (Pen, Direct select, Pencil, live shapes, fill and
+stroke detail). `a_subtree_transplanted_between_shares_is_readable_at_every_planted_node`
+can time out under load; it passes alone.
+
 **2026-11-14 (session 78e7f30f): v0.22.9 released from `master`; rinch `main` a83aaa43 in all
 three locks.** The note scroll thumb can be grabbed (rinch #2681: the scrollbar search went
 through the `display: contents` pane slot). Explorer: store rows drag to reorder (the order
