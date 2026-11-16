@@ -132,6 +132,17 @@ impl Element {
                 }
             }
             (Kind::Line | Kind::Arrow, Geom::Segment { a, b }) => hits_segment(s, *a, *b, q, half + tol, tol),
+            (Kind::Path, Geom::Path(path)) => {
+                let filled = s.fill.is_some_and(|f| f.a > 0);
+                (filled && path.contains(q)) || (s.width > 0.0 && path.distance_to(q) <= half + tol)
+            }
+            (Kind::Rect | Kind::Polygon | Kind::Star, Geom::Rect(r)) if self.raw.kind != Kind::Rect || s.radius > 0.0 => {
+                let filled = s.fill.is_some() || self.raw.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+                match crate::path::shape(&self.raw.kind, &r.normalized(), s) {
+                    Some(path) => (filled && path.contains(q)) || path.distance_to(q) <= half + tol,
+                    None => false,
+                }
+            }
             (Kind::Rect | Kind::Ellipse | Kind::Diamond, Geom::Rect(r)) => {
                 let r = r.normalized();
                 let filled = s.fill.is_some() || self.raw.text.as_deref().is_some_and(|t| !t.trim().is_empty());

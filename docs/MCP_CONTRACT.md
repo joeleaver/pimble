@@ -307,8 +307,8 @@ what it touched and that selected (`Presence::say_on_board`).
 | `render_canvas` | the canvas as a PNG (all of it, an `area`, or `elements` with their members), flattened onto white, longest side `max_size` (1024, at most 2048), with a sentence mapping pixels back to canvas units; pictures fetched through `getBlob`, card titles live; `show_all` shows hidden layers and markup |
 | `create_canvas` | a canvas node under a parent, empty ("Canvas", chalkboard icon) or from a picture file (its name, photo icon, the picture locked in a layer "Picture" under "Layer 1"), with first elements, written in the `createNode` that makes it, as the app does |
 | `insert_canvas` | a canvas into a note's text after a quoted block (or at the end): a picture file, a `pimble-blob:` picture, or empty; the canvas and the picture naming it in one edit (the app needs two, since its picture lives in the editor) |
-| `add_elements` | any kind (sticky, text, rect, ellipse, diamond, frame, line, arrow, connector, pen, highlighter, step, callout, card, picture, spotlight, group) with text, style, rotation, layer, frame or group membership and lock; `ref` names an element within the call, so connectors, parents and a group's `members` can point at elements made in the same call; connectors are added after the rest whatever their place in the list; picture `file`s are stored as blobs first (`pimble_image::fit`, as the app) |
-| `update_elements` | per element, only what is given: geometry merged into what it has, points, text (smallest edit), style keys set or cleared, `move_by` and `rotation` (its transform, so a frame's members move with it), layer, parent, stacking order, lock |
+| `add_elements` | any kind (sticky, text, rect, ellipse, diamond, polygon, star, path, frame, line, arrow, connector, pen, highlighter, step, callout, card, picture, spotlight, group) with text, style, rotation, layer, frame or group membership and lock; `ref` names an element within the call, so connectors, parents and a group's `members` can point at elements made in the same call; connectors are added after the rest whatever their place in the list; picture `file`s are stored as blobs first (`pimble_image::fit`, as the app) |
+| `update_elements` | per element, only what is given: geometry merged into what it has, points, a path's `d` and `rule`, text (smallest edit), style keys set or cleared, `move_by` and `rotation` (its transform, so a frame's members move with it), layer, parent, stacking order, lock |
 | `delete_elements` | by id |
 | `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order, `blend`, `parent` (the group it is in; `""` in an update moves it to the top level); `add_layer` takes `kind` (`vector`, the default, `paint` or `group`); delete with its elements (a group with everything in it) or `merge_down` (a group: Merge Group) |
 | `set_canvas` | a page (or one fitted to what shows, or none) and the markup switch |
@@ -331,6 +331,23 @@ locked and not inside a hidden or locked group. `update_layer` with `parent` mov
 into a group (on top unless `order` says where); a group is never moved into itself or a
 group it holds. Merging a group that holds a paint layer, and merging down across kinds,
 wait for painting.
+
+**Paths, live shapes and stroke detail** (docs/DRAWING_CONTRACT.md sections 2 and 5, built
+2026-11-16): `add_elements` takes kind `path` with its outline as SVG path data (`d`: `M L H
+V C S Q T A Z`, absolute or relative, several subpaths; quadratics and arcs become cubics)
+and `rule` (`nonzero`, the default, or `evenodd` for holes); kinds `polygon` and `star` fill
+the box `x, y, w, h`. The style takes `cap` (`butt`, `round`, `square`), `join` (`miter`,
+`round`, `bevel`), `miter`, `dash` as a preset or a custom pattern of lengths (`"8 4"`), and
+the live shapes' parameters: `radius` (rect), `sides` (polygon, 3 or more), `points` and
+`inner` (star); `clear_style` clears any of them. `get_canvas` writes a path as `d="..."`
+(with `, rule evenodd` when it has holes; a path whose data passes 4,000 characters is
+summarized with its anchor count and extent), a polygon's sides and a star's points even
+when they are the defaults, and the new style keys as set. `update_elements` takes `d` and
+`rule`: on a path they replace its outline or rule, `x, y, w, h` move and stretch its
+extent; `d` on a rect, ellipse, diamond, polygon, star, a line without arrow heads or a pen
+stroke turns it into a path first (same id, style and place, `BoardTxn::convert_to_path`),
+and on anything else is refused with a sentence. A preset `dash` replaces a custom pattern.
+`render_canvas` draws all of it.
 
 **Meaning** (Joe, 2026-10-29; docs/IMAGE_MARKUP_CONTRACT.md "Meaning"): `add_elements` and
 `update_elements` take `note` and `fields` (in an update, a field given as null is removed),

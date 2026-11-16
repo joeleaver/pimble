@@ -17,6 +17,10 @@
 //!   `fonts/OFL.txt`).
 //! - [`BoardView`]: the raster cache the board view paints from, after
 //!   rinch's `paint` example (contract spike 1), with a per-viewer grid.
+//! - [`path`]: the `path` element's geometry ([`PathGeom`]) and the pure
+//!   helpers the vector tools edit it with (hit an anchor, a handle or a
+//!   segment; insert, delete, move; corner and smooth), Bézier fitting for
+//!   the Pencil, SVG path data in and out, live shapes as paths.
 //! - [`Element::hits`], [`BoardSnapshot::hit_precise`],
 //!   [`BoardSnapshot::within`]: hit testing against painted geometry.
 //! - [`layer_tree`]: the layers read as a tree (groups, inherited
@@ -41,6 +45,7 @@ pub mod options;
 pub mod recipe;
 pub use pimble_crdt::order;
 mod paint;
+pub mod path;
 pub mod render;
 pub mod snapshot;
 mod spatial;
@@ -57,6 +62,7 @@ pub use locks::Deleted;
 pub use recipe::{NewCanvas, StartingPicture};
 pub use model::*;
 pub use paint::pressure_width;
+pub use path::{Anchor, AnchorMode, AnchorRef, HandleRef, HandleSide, PathError, PathGeom, PathRule, SegmentHit, Subpath};
 pub use options::{author_color, author_color_index, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 pub use render::{
     draw_region, render, render_area, render_extent, selection_bounds, NoPictures, Picture, PictureSource, Rendered,

@@ -147,6 +147,14 @@ pub enum Kind {
     Group,
     Card,
     Spotlight,
+    /// Cubic Bézier subpaths (docs/DRAWING_CONTRACT.md section 2): what the
+    /// Pen and the Pencil draw, and what a live shape becomes when one of
+    /// its points is edited.
+    Path,
+    /// A regular polygon fitted to its box (`style.sides`).
+    Polygon,
+    /// A star fitted to its box (`style.points`, `style.inner`).
+    Star,
     Other(String),
 }
 
@@ -170,6 +178,9 @@ impl Kind {
             Kind::Group => "group",
             Kind::Card => "card",
             Kind::Spotlight => "spotlight",
+            Kind::Path => "path",
+            Kind::Polygon => "polygon",
+            Kind::Star => "star",
             Kind::Other(s) => s,
         }
     }
@@ -193,6 +204,9 @@ impl Kind {
             "group" => Kind::Group,
             "card" => Kind::Card,
             "spotlight" => Kind::Spotlight,
+            "path" => Kind::Path,
+            "polygon" => Kind::Polygon,
+            "star" => Kind::Star,
             other => Kind::Other(other.to_string()),
         }
     }
@@ -200,6 +214,13 @@ impl Kind {
     /// A stroke: its geometry is the appendable point array.
     pub fn is_stroke(&self) -> bool {
         matches!(self, Kind::Pen | Kind::Highlighter)
+    }
+
+    /// A live shape: a box with a look of its own (rectangle with its
+    /// corner radius, ellipse, diamond, polygon, star). [`crate::path::to_path`]
+    /// turns one into a path.
+    pub fn is_shape(&self) -> bool {
+        matches!(self, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star)
     }
 
     /// Whether the markup toggle leaves it showing (contract section 5:
@@ -299,6 +320,33 @@ pub enum Geom {
     /// Pen and highlighter: the points live in the element's appendable
     /// array ([`crate::Board`]'s `append_points`), never in this value.
     Stroke,
+    /// A path's subpaths and fill rule, one value like every geometry.
+    Path(crate::path::PathGeom),
+}
+
+impl Geom {
+    /// The geometry with every point mapped by `f` (an affine map: a
+    /// handle's offset maps as `f(p + h) - f(p)`). Rectangles map by two
+    /// corners. `None` for a group and a stroke (whose points are not in
+    /// this value). What a geometric resize writes.
+    pub fn mapped(&self, f: impl Fn(Point) -> Point) -> Option<Geom> {
+        let mr = |r: &Rect| Rect::from_points(f(Point::new(r.x, r.y)), f(Point::new(r.right(), r.bottom())));
+        let end = |e: &End| match e {
+            End::Point(p) => End::Point(f(*p)),
+            End::Element { id, side, last } => End::Element { id: id.clone(), side: *side, last: f(*last) },
+        };
+        Some(match self {
+            Geom::None | Geom::Stroke => return None,
+            Geom::Rect(r) => Geom::Rect(mr(r)),
+            Geom::Picture(p) => Geom::Picture(PictureGeom { rect: mr(&p.rect), ..p.clone() }),
+            Geom::Segment { a, b } => Geom::Segment { a: f(*a), b: f(*b) },
+            Geom::Anchor(p) => Geom::Anchor(f(*p)),
+            Geom::Callout { rect, tip } => Geom::Callout { rect: mr(rect), tip: f(*tip) },
+            Geom::Connector { from, to } => Geom::Connector { from: end(from), to: end(to) },
+            Geom::Card { rect, link } => Geom::Card { rect: mr(rect), link: link.clone() },
+            Geom::Path(p) => Geom::Path(p.map(&f)),
+        })
+    }
 }
 
 /// An RGBA color, straight (not premultiplied) alpha.
@@ -612,6 +660,96 @@ impl Dash {
     }
 }
 
+/// How the ends of an open stroke are drawn. Absent reads as round, or
+/// butt for the dashed preset: the look every element had before caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Cap {
+    Butt,
+    Round,
+    Square,
+}
+
+impl Cap {
+    pub const ALL: [Cap; 3] = [Cap::Butt, Cap::Round, Cap::Square];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Cap::Butt => "butt",
+            Cap::Round => "round",
+            Cap::Square => "square",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Cap> {
+        Cap::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    pub fn to_tiny(&self) -> tiny_skia::LineCap {
+        match self {
+            Cap::Butt => tiny_skia::LineCap::Butt,
+            Cap::Round => tiny_skia::LineCap::Round,
+            Cap::Square => tiny_skia::LineCap::Square,
+        }
+    }
+}
+
+/// How a stroke turns a corner. Absent reads as round (the look every
+/// element had before joins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Join {
+    Miter,
+    Round,
+    Bevel,
+}
+
+impl Join {
+    pub const ALL: [Join; 3] = [Join::Miter, Join::Round, Join::Bevel];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Join::Miter => "miter",
+            Join::Round => "round",
+            Join::Bevel => "bevel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Join> {
+        Join::ALL.iter().copied().find(|j| j.as_str() == s)
+    }
+
+    pub fn to_tiny(&self) -> tiny_skia::LineJoin {
+        match self {
+            Join::Miter => tiny_skia::LineJoin::Miter,
+            Join::Round => tiny_skia::LineJoin::Round,
+            Join::Bevel => tiny_skia::LineJoin::Bevel,
+        }
+    }
+}
+
+/// The default miter limit (SVG's).
+pub const DEFAULT_MITER: f32 = 4.0;
+/// A polygon's sides when its style names none.
+pub const DEFAULT_SIDES: u32 = 6;
+/// A star's points when its style names none.
+pub const DEFAULT_STAR_POINTS: u32 = 5;
+/// A star's inner radius, as a fraction of its outer one, when its style
+/// names none.
+pub const DEFAULT_STAR_INNER: f32 = 0.4;
+
+/// A custom dash pattern as stored: lengths in board units, on and off in
+/// turn, space separated (`"6 3 1 3"`, SVG's `stroke-dasharray`). `None` for
+/// anything that is not a list of finite non-negative numbers adding up to
+/// more than zero.
+pub fn parse_dash_pattern(s: &str) -> Option<Vec<f32>> {
+    let v: Vec<f32> = s.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).map(|t| t.parse::<f32>().ok()).collect::<Option<_>>()?;
+    (!v.is_empty() && v.iter().all(|x| x.is_finite() && *x >= 0.0) && v.iter().sum::<f32>() > 0.0).then_some(v)
+}
+
+/// A dash pattern as stored (see [`parse_dash_pattern`]).
+pub fn dash_pattern_text(v: &[f32]) -> String {
+    v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(" ")
+}
+
 /// An element's style map: each key its own last-writer-wins value, so one
 /// person changing the color while another changes the width keeps both.
 /// `None` is "not set": writing a `Style` sets only the keys that are `Some`,
@@ -628,6 +766,24 @@ pub struct Style {
     pub shadow: Option<bool>,
     pub arrow_heads: Option<ArrowHeads>,
     pub dash: Option<Dash>,
+    /// Stroke ends (drawing wave 2): absent is round, butt when dashed.
+    pub cap: Option<Cap>,
+    /// Stroke corners: absent is round.
+    pub join: Option<Join>,
+    /// The miter limit, for a mitered join: absent is [`DEFAULT_MITER`].
+    pub miter: Option<f32>,
+    /// A custom dash pattern in board units (on, off, ...); when set it
+    /// wins over `dash`. Stored as text ([`dash_pattern_text`]).
+    pub dash_pattern: Option<Vec<f32>>,
+    /// A rectangle's corner radius in board units: absent is 0.
+    pub radius: Option<f32>,
+    /// A polygon's sides (3 or more): absent is [`DEFAULT_SIDES`].
+    pub sides: Option<u32>,
+    /// A star's points (3 or more): absent is [`DEFAULT_STAR_POINTS`].
+    pub points: Option<u32>,
+    /// A star's inner radius as a fraction of its outer one (0 to 1):
+    /// absent is [`DEFAULT_STAR_INNER`].
+    pub inner: Option<f32>,
 }
 
 /// A [`Style`] with every key decided, by the element or by its kind's
@@ -643,6 +799,36 @@ pub struct ResolvedStyle {
     pub shadow: bool,
     pub arrow_heads: ArrowHeads,
     pub dash: Dash,
+    pub cap: Cap,
+    pub join: Join,
+    pub miter: f32,
+    /// A custom pattern, when set (it wins over `dash`).
+    pub dash_pattern: Option<Vec<f32>>,
+    pub radius: f32,
+    pub sides: u32,
+    pub points: u32,
+    pub inner: f32,
+}
+
+impl ResolvedStyle {
+    /// Dashed in any way (a preset or a custom pattern): a pen drawn dashed
+    /// is drawn at one width.
+    pub fn is_dashed(&self) -> bool {
+        self.dash != Dash::Solid || self.dash_pattern.is_some()
+    }
+
+    /// How far its stroke can reach past the geometry: half the width,
+    /// times the miter limit for a mitered join and √2 for square caps.
+    pub fn stroke_reach(&self) -> f32 {
+        let mut k: f32 = 1.0;
+        if self.join == Join::Miter {
+            k = k.max(self.miter);
+        }
+        if self.cap == Cap::Square {
+            k = k.max(std::f32::consts::SQRT_2);
+        }
+        self.width / 2.0 * k
+    }
 }
 
 /// The default red of marks (Spectacle's annotation red).
@@ -661,7 +847,7 @@ impl Style {
             Kind::Line => (MARK_RED, None, 4.0, 24.0, ArrowHeads::None, Align::Left, false),
             Kind::Arrow => (MARK_RED, None, 4.0, 24.0, ArrowHeads::End, Align::Left, false),
             Kind::Connector => (Color::rgb(0x42, 0x42, 0x42), None, 2.0, 18.0, ArrowHeads::End, Align::Center, false),
-            Kind::Rect | Kind::Ellipse | Kind::Diamond => (MARK_RED, None, 4.0, 24.0, ArrowHeads::None, Align::Center, false),
+            Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Path => (MARK_RED, None, 4.0, 24.0, ArrowHeads::None, Align::Center, false),
             Kind::Text => (MARK_RED, None, 0.0, 24.0, ArrowHeads::None, Align::Left, false),
             Kind::Sticky => (Color::rgb(0x21, 0x21, 0x21), Some(STICKY_YELLOW), 0.0, 20.0, ArrowHeads::None, Align::Left, true),
             Kind::Step => (MARK_RED, None, 0.0, 24.0, ArrowHeads::None, Align::Center, false),
@@ -681,6 +867,14 @@ impl Style {
             shadow: self.shadow.unwrap_or(shadow),
             arrow_heads: self.arrow_heads.unwrap_or(arrow_heads),
             dash: self.dash.unwrap_or(Dash::Solid),
+            cap: self.cap.unwrap_or(if self.dash == Some(Dash::Dashed) && self.dash_pattern.is_none() { Cap::Butt } else { Cap::Round }),
+            join: self.join.unwrap_or(Join::Round),
+            miter: self.miter.filter(|m| m.is_finite()).unwrap_or(DEFAULT_MITER).max(1.0),
+            dash_pattern: self.dash_pattern.clone().filter(|v| !v.is_empty() && v.iter().all(|x| x.is_finite() && *x >= 0.0) && v.iter().sum::<f32>() > 0.0),
+            radius: self.radius.filter(|r| r.is_finite()).unwrap_or(0.0).max(0.0),
+            sides: self.sides.unwrap_or(DEFAULT_SIDES).clamp(3, 1000),
+            points: self.points.unwrap_or(DEFAULT_STAR_POINTS).clamp(3, 1000),
+            inner: self.inner.filter(|r| r.is_finite()).unwrap_or(DEFAULT_STAR_INNER).clamp(0.0, 1.0),
         }
     }
 }
@@ -697,6 +891,14 @@ pub enum StyleKey {
     Shadow,
     ArrowHeads,
     Dash,
+    Cap,
+    Join,
+    Miter,
+    DashPattern,
+    Radius,
+    Sides,
+    Points,
+    Inner,
 }
 
 impl StyleKey {
@@ -711,6 +913,14 @@ impl StyleKey {
             StyleKey::Shadow => "shadow",
             StyleKey::ArrowHeads => "arrow_heads",
             StyleKey::Dash => "dash",
+            StyleKey::Cap => "cap",
+            StyleKey::Join => "join",
+            StyleKey::Miter => "miter",
+            StyleKey::DashPattern => "dash_pattern",
+            StyleKey::Radius => "radius",
+            StyleKey::Sides => "sides",
+            StyleKey::Points => "points",
+            StyleKey::Inner => "inner",
         }
     }
 }
@@ -835,5 +1045,10 @@ impl NewElement {
     /// A pen or highlighter stroke through `points`.
     pub fn stroke(kind: Kind, points: Vec<[f32; 3]>) -> Self {
         Self::new(kind, Geom::Stroke).with_points(points)
+    }
+
+    /// A path element.
+    pub fn path(geom: crate::path::PathGeom) -> Self {
+        Self::new(Kind::Path, Geom::Path(geom))
     }
 }

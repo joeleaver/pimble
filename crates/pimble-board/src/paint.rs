@@ -4,7 +4,7 @@
 //! so the two agree by construction. Pictures are the one part each draws
 //! its own way.
 
-use tiny_skia::{FillRule, LineCap, LineJoin, Path, PathBuilder, Stroke, StrokeDash};
+use tiny_skia::{FillRule, Path, PathBuilder, Stroke, StrokeDash};
 
 use crate::model::*;
 use crate::snapshot::{head_size, Element, STEP_RADIUS};
@@ -34,37 +34,72 @@ pub(crate) enum Space {
 }
 
 /// How a stroke is drawn.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StrokeStyle {
     pub width: f32,
     pub dash: Dash,
+    /// `None`: round, butt for the dashed preset (the look before caps).
+    pub cap: Option<Cap>,
+    pub join: Join,
+    pub miter: f32,
+    /// A custom pattern in board units; wins over `dash`.
+    pub pattern: Option<Vec<f32>>,
 }
 
 impl StrokeStyle {
-    /// Round caps and joins, except a dashed line's butt caps.
-    pub(crate) fn cap(&self) -> LineCap {
-        if self.dash == Dash::Dashed {
-            LineCap::Butt
-        } else {
-            LineCap::Round
-        }
+    /// Round caps and joins, butt caps when dashed: the look of a stroke
+    /// that names no stroke detail.
+    pub(crate) fn plain(width: f32, dash: Dash) -> Self {
+        Self { width, dash, cap: None, join: Join::Round, miter: DEFAULT_MITER, pattern: None }
     }
 
-    /// The dash intervals (on, off, ...), `None` when solid.
-    pub(crate) fn intervals(&self) -> Option<[f32; 2]> {
+    /// Everything the element's style says about its stroke.
+    pub(crate) fn of(s: &ResolvedStyle) -> Self {
+        Self { width: s.width, dash: s.dash, cap: Some(s.cap), join: s.join, miter: s.miter, pattern: s.dash_pattern.clone() }
+    }
+
+    pub(crate) fn with_width(mut self, width: f32) -> Self {
+        self.width = width;
+        self
+    }
+
+    pub(crate) fn cap(&self) -> Cap {
+        self.cap.unwrap_or(if self.dash == Dash::Dashed && self.pattern.is_none() { Cap::Butt } else { Cap::Round })
+    }
+
+    /// The dash intervals (on, off, ...), `None` when solid. An odd custom
+    /// list repeats once, as SVG reads it.
+    pub(crate) fn intervals(&self) -> Option<Vec<f32>> {
+        if let Some(p) = &self.pattern {
+            let mut v: Vec<f32> = p.iter().map(|x| x.max(0.0)).collect();
+            if v.len() % 2 == 1 {
+                v.extend_from_within(..);
+            }
+            // tiny-skia takes no zero-length dash: a dot is a hair long.
+            for x in v.iter_mut().step_by(2) {
+                *x = x.max(0.01);
+            }
+            return (v.iter().sum::<f32>() > 0.0).then_some(v);
+        }
         match self.dash {
             Dash::Solid => None,
-            Dash::Dashed => Some([self.width * 3.0, self.width * 2.0]),
-            Dash::Dotted => Some([0.01, self.width * 2.0]),
+            Dash::Dashed => Some(vec![self.width * 3.0, self.width * 2.0]),
+            Dash::Dotted => Some(vec![0.01, self.width * 2.0]),
         }
     }
 
     /// As tiny-skia's stroke.
     pub(crate) fn tiny(&self) -> Stroke {
         let width = self.width.max(0.01);
-        let mut s = Stroke { width, line_cap: self.cap(), line_join: LineJoin::Round, ..Stroke::default() };
-        if let Some([on, off]) = (StrokeStyle { width, dash: self.dash }).intervals() {
-            s.dash = StrokeDash::new(vec![on, off], 0.0);
+        let mut s = Stroke {
+            width,
+            line_cap: self.cap().to_tiny(),
+            line_join: self.join.to_tiny(),
+            miter_limit: self.miter.max(1.0),
+            ..Stroke::default()
+        };
+        if let Some(v) = (StrokeStyle { width, ..self.clone() }).intervals() {
+            s.dash = StrokeDash::new(v, 0.0);
         }
         s
     }
@@ -102,11 +137,15 @@ impl<'a> Op<'a> {
     }
 
     fn shadow(path: Path, opacity: f32) -> Self {
+        Self::shadow_with(path, opacity, FillRule::Winding)
+    }
+
+    fn shadow_with(path: Path, opacity: f32, rule: FillRule) -> Self {
         Op::Fill {
             path: PathRef::Owned(path),
             color: SHADOW_COLOR,
             opacity,
-            rule: FillRule::Winding,
+            rule,
             space: Space::Element,
             shadow: true,
             multiply: false,
@@ -144,10 +183,14 @@ pub(crate) fn polygon_path(pts: &[Point]) -> Option<Path> {
     pb.finish()
 }
 
-pub(crate) fn shape_path(kind: &Kind, r: &Rect) -> Option<Path> {
+/// A live shape's outline: rectangle (rounded by its style's radius),
+/// ellipse, diamond, polygon, star.
+pub(crate) fn shape_path(kind: &Kind, r: &Rect, s: &ResolvedStyle) -> Option<Path> {
     match kind {
         Kind::Ellipse => tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(0.01), r.h.max(0.01)).and_then(PathBuilder::from_oval),
         Kind::Diamond => polygon_path(&diamond_points(r)),
+        Kind::Rect if s.radius <= 0.0 => rect_path(r),
+        Kind::Rect | Kind::Polygon | Kind::Star => crate::path::shape(kind, r, s)?.to_tiny(),
         _ => rect_path(r),
     }
 }
@@ -303,7 +346,7 @@ pub(crate) fn stroke_shape(kind: &Kind, points: &[[f32; 3]], width: f32, dash: D
     let finite: Vec<[f32; 3]> = points.iter().copied().filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
     let first = width_at(kind, width, dash, finite.first()?[2]);
     if finite.iter().all(|p| (width_at(kind, width, dash, p[2]) - first).abs() < 1e-4) {
-        return Some(StrokeShape::Line(stroke_path(&finite)?, StrokeStyle { width: first, dash }));
+        return Some(StrokeShape::Line(stroke_path(&finite)?, StrokeStyle::plain(first, dash)));
     }
     let discs: Vec<(f32, f32, f32)> = finite.iter().map(|p| (p[0], p[1], width_at(kind, width, dash, p[2]) / 2.0)).collect();
     pressure_outline(&discs).map(StrokeShape::Outline)
@@ -389,7 +432,7 @@ fn segment_ops<'a>(out: &mut Vec<Op<'a>>, e: &Element, a: Point, b: Point, space
     pb.move_to(a2.x, a2.y);
     pb.line_to(b2.x, b2.y);
     if let Some(path) = pb.finish() {
-        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle { width: s.width, dash: s.dash }, space));
+        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), space));
     }
 }
 
@@ -417,15 +460,28 @@ fn text_ops<'a>(out: &mut Vec<Op<'a>>, e: &'a Element, color: Color, space: Spac
 
 /// Shadow, fill and outline of `path` per the element's style.
 fn fill_and_stroke_ops<'a>(out: &mut Vec<Op<'a>>, e: &Element, path: Path) {
+    fill_and_stroke_ops_with(out, e, path, FillRule::Winding);
+}
+
+/// [`fill_and_stroke_ops`] filling by `rule` (a path's holes).
+fn fill_and_stroke_ops_with<'a>(out: &mut Vec<Op<'a>>, e: &Element, path: Path, rule: FillRule) {
     let s = &e.style;
     if s.shadow {
-        out.push(Op::shadow(path.clone(), e.opacity));
+        out.push(Op::shadow_with(path.clone(), e.opacity, rule));
     }
     if let Some(fill) = s.fill {
-        out.push(Op::fill(PathRef::Owned(path.clone()), fill, e.opacity, Space::Element));
+        out.push(Op::Fill {
+            path: PathRef::Owned(path.clone()),
+            color: fill,
+            opacity: e.opacity,
+            rule,
+            space: Space::Element,
+            shadow: false,
+            multiply: false,
+        });
     }
     if s.width > 0.0 {
-        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle { width: s.width, dash: s.dash }, Space::Element));
+        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), Space::Element));
     }
 }
 
@@ -487,11 +543,16 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
             out.push(Op::Picture(p));
         }
         (Kind::Line | Kind::Arrow, Geom::Segment { a, b }) => segment_ops(&mut out, e, *a, *b, el),
-        (Kind::Rect | Kind::Ellipse | Kind::Diamond, Geom::Rect(r)) => {
-            if let Some(path) = shape_path(&e.raw.kind, &r.normalized()) {
+        (Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star, Geom::Rect(r)) => {
+            if let Some(path) = shape_path(&e.raw.kind, &r.normalized(), s) {
                 fill_and_stroke_ops(&mut out, e, path);
             }
             text_ops(&mut out, e, s.stroke, el, px_per_unit);
+        }
+        (Kind::Path, Geom::Path(p)) => {
+            if let Some(path) = p.to_tiny() {
+                fill_and_stroke_ops_with(&mut out, e, path, p.rule.to_tiny());
+            }
         }
         (Kind::Text, Geom::Rect(_)) => {
             if let Some(fill) = s.fill {
@@ -510,7 +571,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 let fill = s.fill.unwrap_or(STICKY_YELLOW);
                 out.push(Op::fill(PathRef::Owned(path.clone()), fill, e.opacity, el));
                 if s.width > 0.0 {
-                    out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle { width: s.width, dash: s.dash }, el));
+                    out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), el));
                 }
             }
             text_ops(&mut out, e, s.stroke, el, px_per_unit);
@@ -537,7 +598,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                         PathRef::Owned(path.clone()),
                         s.stroke,
                         e.opacity,
-                        StrokeStyle { width: s.width * 2.0, dash: Dash::Solid },
+                        StrokeStyle::plain(s.width * 2.0, Dash::Solid),
                         el,
                     ));
                 }
@@ -568,7 +629,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 if let Some(fill) = s.fill {
                     out.push(Op::fill(PathRef::Owned(path.clone()), fill, e.opacity, el));
                 }
-                out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle { width: s.width.max(0.5), dash: s.dash }, el));
+                out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s).with_width(s.width.max(0.5)), el));
             }
             text_ops(&mut out, e, Color::rgb(0x61, 0x61, 0x61), el, px_per_unit);
         }

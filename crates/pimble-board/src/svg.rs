@@ -105,22 +105,25 @@ fn write_op(out: &mut String, op: &Op<'_>) {
         }
         Op::Stroke { path, color, opacity, stroke, multiply, .. } => {
             let (hex, alpha) = paint(*color, *opacity);
-            let StrokeStyle { width, dash } = *stroke;
-            let width = width.max(0.01);
-            let cap = if dash == Dash::Dashed { "butt" } else { "round" };
+            let width = stroke.width.max(0.01);
             let _ = write!(
                 out,
-                "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-linecap=\"{}\" stroke-linejoin=\"round\"",
+                "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-linecap=\"{}\" stroke-linejoin=\"{}\"",
                 path_data(path.get()),
                 hex,
                 n(width),
-                cap
+                stroke.cap().as_str(),
+                stroke.join.as_str()
             );
+            if stroke.join == Join::Miter && (stroke.miter - DEFAULT_MITER).abs() > 1e-4 {
+                let _ = write!(out, " stroke-miterlimit=\"{}\"", n(stroke.miter));
+            }
             if alpha < 1.0 {
                 let _ = write!(out, " stroke-opacity=\"{}\"", n(alpha));
             }
-            if let Some([on, off]) = (StrokeStyle { width, dash }).intervals() {
-                let _ = write!(out, " stroke-dasharray=\"{} {}\"", n(on), n(off));
+            if let Some(v) = (StrokeStyle { width, ..stroke.clone() }).intervals() {
+                let list: Vec<String> = v.iter().map(|x| n(*x)).collect();
+                let _ = write!(out, " stroke-dasharray=\"{}\"", list.join(" "));
             }
             if *multiply {
                 out.push_str(" style=\"mix-blend-mode:multiply\"");

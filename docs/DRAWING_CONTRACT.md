@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; wave 1's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; wave 1 built (model and UI), wave 2's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -428,3 +428,142 @@ board).
   (they fold to their title row); the hue ring (rinch's picker has a square and a hue
   bar). Embedded canvases in text are unchanged; marking up a picture in text opens this
   same view.
+
+## Built in wave 2 (model)
+
+Built 2026-11-16 in `crates/pimble-board` and `crates/pimble-mcp`, no UI: the Pen, Direct
+select, Pencil and shape tools, the context bar's new controls and the rail entries are the
+UI half. Gradients, combining and SVG import are wave 3. `crates/pimble-app` gained only
+the match arms the new kinds need to compile (`boards/rail.rs` `controls_of` and
+`kind_word`: polygon and star as shapes, a path with stroke, fill, width, dash and opacity;
+`boards/tools.rs` `kind_label`).
+
+- **Storage**: only new keys and one new kind's value; every element that exists reads and
+  draws as before.
+  - Kind `path`: `geom` is one `Any` value, written whole like every geometry: `{ subpaths:
+    [{ closed: bool, anchors: [x, y, in_dx, in_dy, out_dx, out_dy, mode, ...] }], rule:
+    "nonzero" | "evenodd" }`. Handles are offsets from their anchor. `mode` is stored as a
+    number (0 corner, 1 smooth, 2 symmetric); a reader also takes the names. A malformed
+    anchor (a value that is not a finite number) is skipped on read, a missing `rule` reads
+    as nonzero.
+  - Kinds `polygon` and `star`: `geom` is a rectangle (their box), as a rect's. The shape is
+    stretched to fill the box exactly (a pentagon's box is the element's box, so selection
+    and resizing need nothing new).
+  - **Deviation**: the live shapes' parameters are **style keys**, not geometry keys:
+    `radius` (rect corner radius, board units, absent 0), `sides` (polygon, absent 6),
+    `points` and `inner` (star tips, absent 5; inner radius as a fraction of the outer,
+    absent 0.4). Geometry is written whole on every move and resize, so parameters inside it
+    would be lost to the app's resize (which writes `Geom::Rect`) and would collide with a
+    concurrent resize; as style keys each merges on its own, like width and color.
+  - Stroke detail, style keys: `cap` (`butt`/`round`/`square`), `join`
+    (`miter`/`round`/`bevel`), `miter` (absent 4), `dash_pattern` (text, lengths in board
+    units, `"6 3 1 3"`; when set it wins over the `dash` preset). Absent keys read as
+    today's look: round caps (butt for the dashed preset), round joins, so no existing
+    element changes. These apply to paths, rect, ellipse, diamond, polygon, star, sticky,
+    frame, line, arrow and connector. **Not** to pen and highlighter strokes, which keep
+    their pressure outline and round ends; nor to the callout's doubled outline.
+  - Fill: paths, polygons and stars fill as rect, ellipse and diamond already did (`fill`);
+    a path fills by its `rule`, open subpaths filling as if closed (SVG's rule).
+- **An older app** reads `path`, `polygon` and `star` as `Kind::Other`: kept, never drawn,
+  never hit, not in its bounds (a path's geometry has no `x`/`y`, so it reads as no
+  geometry; a polygon or star reads its box). It ignores the new style keys, so a rounded
+  rect is square there and a custom dash is solid.
+- **Rendering, bounds, hit, export**: tiny-skia draws paths and the shapes through the same
+  op list as every element (`paint.rs`), so SVG export writes them as `<path d=...>` with
+  `fill-rule`, `stroke-linecap`, `stroke-linejoin`, `stroke-miterlimit` (when not 4) and
+  `stroke-dasharray` (an odd custom list repeats, as SVG reads it). A path's extent is its
+  curves' exact extent (cubic extrema); the painted extent grows by
+  `ResolvedStyle::stroke_reach` (half the width, times the miter limit for a mitered join
+  and √2 for square caps), which every kind now uses. Hit testing: on the stroke within the
+  tolerance, inside the fill (by the rule) when filled; a rounded rect, polygon and star hit
+  on their real outline. The spatial index and the raster cache take paths through bounds
+  and fingerprints (the anchors, the rule and every new style key are fingerprinted).
+- **Moving and resizing** work as for every element: moving writes the transform; the app's
+  resize scales the transform of kinds its geometric resize does not name, which includes
+  `Geom::Path`, and resizes polygon and star geometrically (they are `Geom::Rect`). For the
+  UI to resize a path geometrically (outline width kept), `Geom::mapped(f)` maps any
+  geometry through an affine map (a path's handles as `f(p + h) - f(p)`), and
+  `PathGeom::rescaled(from, to)` maps one box onto another.
+- **The `path` module** (`pimble_board::path`, types re-exported at the crate root), pure:
+  - Types: `PathGeom { subpaths, rule }`, `Subpath { closed, anchors }`, `Anchor { p, h_in,
+    h_out, mode }` (`Anchor::corner(p)`, `in_point()`, `out_point()`), `AnchorMode
+    { Corner, Smooth, Symmetric }`, `PathRule { NonZero, EvenOdd }`, `AnchorRef { subpath,
+    index }`, `HandleSide { In, Out }`, `HandleRef { anchor, side }`, `SegmentHit { subpath,
+    segment, t, point, distance }`, `PathError { Syntax { at, message }, Empty }`.
+  - Building: `PathGeom::from_anchors(anchors, closed)`, `PathGeom::polyline(points,
+    closed)`, `PathGeom::new(subpaths, rule)`; `NewElement::path(geom)`.
+  - Reading: `bounds()`, `segments()` (subpath, segment, cubic), `Subpath::segment(i)`,
+    `Subpath::is_line(i)`, `flatten(tolerance)`, `to_tiny()`, `anchor(at)`,
+    `anchor_mut(at)`, `anchor_refs()`, `anchor_count()`, `is_empty()`, `contains(p)` (fill,
+    by rule), `distance_to(p)` (outline); free `cubic_at(c, t)`, `split_cubic(c, t)`,
+    `infer_mode(h_in, h_out)`.
+  - Hitting (board units, in the element's own space: the UI maps the pointer through the
+    inverse of `Element::world` first): `hit_anchor(p, tol) -> Option<AnchorRef>`,
+    `hit_handle(p, tol, only: Option<&[AnchorRef]>) -> Option<HandleRef>` (zero handles
+    are not there; `only` limits it to the selected anchors' handles), `hit_segment(p,
+    tol) -> Option<SegmentHit>`.
+  - Editing (in memory; the caller writes the result with `set_geom`):
+    `insert_anchor(subpath, segment, t) -> Option<AnchorRef>` (de Casteljau, shape
+    unchanged; a straight segment gets a corner), `delete_anchors(&[AnchorRef]) -> bool`
+    (true when the path is emptied: delete the element; a subpath left with fewer than two
+    anchors goes), `toggle_smooth(at) -> Option<AnchorMode>` (a corner becomes smooth with
+    collinear handles, made a third of the way toward each neighbor along the line between
+    the neighbors when both were zero; smooth or symmetric becomes a corner with its handles
+    pulled in), `set_mode(at, mode)`, `move_anchor(at, to)`, `move_anchors(refs, dx, dy)`
+    (handles follow), `move_handle(handle, to, break_link)` (corner: alone; smooth: the
+    other turns to stay opposite keeping its length; symmetric: mirrored; `break_link`, the
+    Alt-drag, makes the anchor a corner first), `close(subpath)`, `map(f)`, `translated(dx,
+    dy)`, `rescaled(from, to)`.
+  - Live shapes: `rect(r, radius)` (eight anchors when rounded), `ellipse(r)`,
+    `diamond(r)`, `polygon(r, sides)`, `star(r, points, inner)`, `shape(kind, r,
+    resolved_style)`, and `to_path(kind, geom, style, points) -> Option<PathGeom>` for
+    rect, ellipse, diamond, polygon, star, a line with no arrow heads, a pen stroke (fitted
+    within `STROKE_TO_PATH_TOLERANCE`, 0.5; closed when it has a fill) and a path; `None`
+    for the rest (arrows, connectors, text, sticky notes, pictures...).
+  - Fitting: `fit(points: &[Point], tolerance) -> PathGeom` and `fit_stroke(&[[f32; 3]],
+    tolerance)` (Schneider's algorithm in f64; every point within `tolerance` of the curve;
+    turns sharper than about 60 degrees become corners, found over neighbors about twice the
+    tolerance away so jitter does not make corners; joins inside a run are smooth; straight
+    pieces get zero handles; one open subpath; one point gives a dot of two anchors).
+    Tested on a circle (within tolerance both ways, at most 16 anchors at 0.5), a zigzag
+    (corner anchors at its corners) and a straight line (two anchors, a plain line).
+  - SVG path data: `to_d(&PathGeom) -> String` (absolute `M L C Z`, three decimals) and
+    `parse_d(&str) -> Result<PathGeom, PathError>` (`M L H V C S Q T A Z`, absolute and
+    relative, implicit repeats, numbers run together as SVG allows, arc flags without
+    separators; quadratics exactly and arcs as at most quarter-turn cubics; a closing point
+    equal to the start merges into the first anchor; modes inferred from the handles;
+    single-point subpaths dropped; nothing drawn is `Empty`). Round-trip tested.
+- **Edits** (`BoardTxn`, each judged by locks as every edit is):
+  - `convert_to_path(id) -> Result<PathGeom>`: turns a shape, a line without heads or a pen
+    stroke into a `path` **in the same transaction**, keeping its id, layer, order, parent,
+    style, text, meaning and lock, and adjusting its transform so it stays exactly where it
+    was (a path pivots on its own extent; a pen's pivot was its points' box). Direct select
+    on a live shape calls it first, edits the answered path, then `set_geom`, all in one
+    `Board::edit` (one undo, tested). A path answers itself; other kinds are refused with a
+    sentence. A rect's text stays stored but a path does not draw text.
+  - `stroke_to_path(id, points, tolerance) -> Result<PathGeom>`: the Pencil's release. The
+    Pencil streams as today's pen does (a `pen` element and `append_points`, so others watch
+    it drawn); on release this replaces that pen's kind and point array with the fitted
+    path in one write, keeping id, layer, order and style. `add_fitted_path(points,
+    tolerance, element) -> Result<String>`: a Pencil stroke released before anything was
+    streamed. The tolerance is the caller's (the contract's setting).
+  - `set_geom` takes `Geom::Path`; `add_element` and `set_geom` refuse a path's geometry on
+    another kind, another geometry on a path, and anything but a box on polygon and star.
+  - Style: `set_style` with the new `Style` keys (`cap`, `join`, `miter`, `dash_pattern`,
+    `radius`, `sides`, `points`, `inner`) and `clear_style` with the new `StyleKey`s
+    (`Cap`, `Join`, `Miter`, `DashPattern`, `Radius`, `Sides`, `Points`, `Inner`). A UI
+    picking a dash preset while a custom pattern is set clears `DashPattern` (the MCP does).
+    `ResolvedStyle` carries all of them resolved (`cap`, `join`, `miter`, `dash_pattern`,
+    `radius`, `sides`, `points`, `inner`) plus `is_dashed()` and `stroke_reach()`; constants
+    `DEFAULT_MITER`, `DEFAULT_SIDES`, `DEFAULT_STAR_POINTS`, `DEFAULT_STAR_INNER`; helpers
+    `parse_dash_pattern`, `dash_pattern_text`; `Cap::ALL`, `Join::ALL` for menus;
+    `Kind::is_shape()`.
+- **MCP**: see docs/MCP_CONTRACT.md "Paths, live shapes and stroke detail": `add_elements`
+  takes `path` with `d` and `rule`, `polygon`, `star`, and the new style keys (`dash` takes
+  a preset or a pattern); `get_canvas` writes paths as `d`; `update_elements` takes `d` and
+  `rule` (and `d` turns a shape, line or pen stroke into a path); `render_canvas` draws them.
+- **Not built**: the UI (Pen, Direct select with marquee of anchors, Pencil and its
+  tolerance setting, the shapes flyout's polygon and star, the context bar's cap, join,
+  dash pattern, radius, sides, points and inner controls); a path does not draw text;
+  converting an arrow, connector or a pen's pressure widths to a path; stroke detail on pen
+  and highlighter strokes; gradients, combining, flip and SVG in (wave 3).

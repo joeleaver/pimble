@@ -2190,6 +2190,9 @@ pub(super) fn kind_label(e: &pimble_board::Element) -> String {
         Kind::Group => "Group".to_string(),
         Kind::Card => "Node card".to_string(),
         Kind::Spotlight => "Spotlight".to_string(),
+        Kind::Path => "Path".to_string(),
+        Kind::Polygon => "Polygon".to_string(),
+        Kind::Star => "Star".to_string(),
         Kind::Other(k) => k.clone(),
     }
 }

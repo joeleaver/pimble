@@ -124,9 +124,10 @@ pub fn controls_of(kind: &Kind) -> Controls {
         Kind::Highlighter => Controls { stroke: true, width: true, opacity: true, ..none },
         Kind::Line => Controls { stroke: true, width: true, dash: true, opacity: true, ..none },
         Kind::Arrow | Kind::Connector => Controls { stroke: true, width: true, dash: true, heads: true, opacity: true, ..none },
-        Kind::Rect | Kind::Ellipse | Kind::Diamond => {
+        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star => {
             Controls { stroke: true, fill: true, width: true, dash: true, font: true, align: true, opacity: true, ..none }
         }
+        Kind::Path => Controls { stroke: true, fill: true, width: true, dash: true, opacity: true, ..none },
         Kind::Text | Kind::Callout => Controls { stroke: true, fill: true, font: true, align: true, opacity: true, ..none },
         // A sticky note's color is its fill.
         Kind::Sticky => Controls { fill: true, font: true, align: true, opacity: true, ..none },
@@ -786,6 +787,9 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Group => "Group",
         Kind::Card => "Node card",
         Kind::Spotlight => "Spotlight",
+        Kind::Path => "Path",
+        Kind::Polygon => "Polygon",
+        Kind::Star => "Star",
         Kind::Other(_) => "Element",
     }
 }

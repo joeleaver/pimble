@@ -18,10 +18,11 @@ use std::sync::Arc;
 use base64::Engine;
 use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
-    selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot, BoardTxn, CardLabel, Color, Dash, End,
-    Geom, Kind, LayerKind, NewElement, Page, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform,
-    ViewOptions,
+    dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
+    BoardTxn, Cap, CardLabel, Color, Dash, End, Geom, Join, Kind, LayerKind, NewElement, Page, PathGeom, PathRule, Picture,
+    PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform, ViewOptions,
 };
+use pimble_board::path::{parse_d, to_d};
 use pimble_core::{node_types, BlobUrl, Node, Place, PimbleUrl};
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{BoardPoint, BoardPresence, BoardRect};
@@ -43,6 +44,8 @@ fn now() -> String {
 
 /// How many elements get_canvas lists before it stops.
 const LIST_LIMIT: usize = 400;
+/// The longest path data get_canvas writes out for one path.
+const PATH_TEXT_LIMIT: usize = 4000;
 
 /// What a list of specs needs from outside the document, by spec index:
 /// each picture's URL and pixel size, each card's link and title.
@@ -121,17 +124,42 @@ pub struct StyleSpec {
     /// Lines, arrows and connectors: "none", "start", "end" or "both".
     #[serde(default)]
     pub arrow_heads: Option<String>,
-    /// "solid", "dashed" or "dotted".
+    /// "solid", "dashed" or "dotted", or a custom pattern of dash and gap
+    /// lengths in canvas units ("8 4", "6 3 1 3"), as SVG's stroke-dasharray.
     #[serde(default)]
     pub dash: Option<String>,
+    /// How open line ends are drawn: "butt", "round" (the default; butt when
+    /// dashed) or "square".
+    #[serde(default)]
+    pub cap: Option<String>,
+    /// How corners are drawn: "miter", "round" (the default) or "bevel".
+    #[serde(default)]
+    pub join: Option<String>,
+    /// The miter limit for "miter" joins (default 4).
+    #[serde(default)]
+    pub miter: Option<f32>,
+    /// rect: corner radius in canvas units (default 0).
+    #[serde(default)]
+    pub radius: Option<f32>,
+    /// polygon: its number of sides, 3 or more (default 6).
+    #[serde(default)]
+    pub sides: Option<u32>,
+    /// star: its number of points, 3 or more (default 5).
+    #[serde(default)]
+    pub points: Option<u32>,
+    /// star: the inner radius as a fraction of the outer, 0 to 1 (default 0.4).
+    #[serde(default)]
+    pub inner: Option<f32>,
 }
 
 /// One element to add. Coordinates are canvas units (one unit is one pixel of a
 /// picture placed at 100%); x grows right, y grows down.
 #[derive(Deserialize, JsonSchema, Clone, Default)]
 pub struct ElementSpec {
-    /// One of: sticky, text, rect, ellipse, diamond, frame, line, arrow,
-    /// connector, pen, highlighter, step, callout, card, picture, spotlight, group.
+    /// One of: sticky, text, rect, ellipse, diamond, polygon, star, path, frame,
+    /// line, arrow, connector, pen, highlighter, step, callout, card, picture,
+    /// spotlight, group. A polygon and a star fill the box x, y, w, h (style
+    /// `sides`; `points` and `inner`); a rect takes style `radius`.
     pub kind: String,
     /// A name for this element within this call, so a connector's from/to, a
     /// parent or a group's members can point at it before it has an id.
@@ -166,6 +194,16 @@ pub struct ElementSpec {
     /// text: x and y are the label's center instead of its top-left corner.
     #[serde(default)]
     pub center: Option<bool>,
+    /// path: its outline as SVG path data in canvas units ("M0 0 L100 0
+    /// C150 0 150 80 100 80 Z"): M L H V C S Q T A Z, absolute or relative,
+    /// several subpaths allowed (holes: give `rule` "evenodd"). Style it with
+    /// stroke, fill, width, cap, join and dash.
+    #[serde(default)]
+    pub d: Option<String>,
+    /// path: how overlapping subpaths fill, "nonzero" (the default) or
+    /// "evenodd" (inner subpaths cut holes).
+    #[serde(default)]
+    pub rule: Option<String>,
     /// callout: the point its pointer touches, [x,y].
     #[serde(default)]
     pub tip: Option<Vec<f32>>,
@@ -267,6 +305,15 @@ pub struct ElementChange {
     /// A callout's new pointer tip, [x,y].
     #[serde(default)]
     pub tip: Option<Vec<f32>>,
+    /// A path's new outline, SVG path data as add_elements takes it. Given
+    /// for a rect, ellipse, diamond, polygon, star, a line without arrow
+    /// heads or a pen stroke, it turns that element into a path (same id,
+    /// style and place). On a path, x, y, w and h move and stretch its extent.
+    #[serde(default)]
+    pub d: Option<String>,
+    /// A path's fill rule: "nonzero" or "evenodd".
+    #[serde(default)]
+    pub rule: Option<String>,
     /// A connector's new ends, as in add_elements.
     #[serde(default)]
     pub from: Option<String>,
@@ -291,7 +338,8 @@ pub struct ElementChange {
     #[serde(default)]
     pub style: Option<StyleSpec>,
     /// Style keys to clear back to the kind's default: stroke, fill, width,
-    /// opacity, font_size, align, shadow, arrow_heads, dash.
+    /// opacity, font_size, align, shadow, arrow_heads, dash (a custom pattern
+    /// too), cap, join, miter, radius, sides, points, inner.
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -586,7 +634,13 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
     };
     pick(&spec.align, "align", &|s| Align::parse(s).is_some(), "left, center, right")?;
     pick(&spec.arrow_heads, "arrow_heads", &|s| ArrowHeads::parse(s).is_some(), "none, start, end, both")?;
-    pick(&spec.dash, "dash", &|s| Dash::parse(s).is_some(), "solid, dashed, dotted")?;
+    pick(&spec.dash, "dash", &|s| Dash::parse(s).is_some() || parse_dash_pattern(s).is_some(), "solid, dashed, dotted, or a pattern of lengths like \"8 4\"")?;
+    pick(&spec.cap, "cap", &|s| Cap::parse(s).is_some(), "butt, round, square")?;
+    pick(&spec.join, "join", &|s| Join::parse(s).is_some(), "miter, round, bevel")?;
+    if spec.sides.is_some_and(|n| n < 3) || spec.points.is_some_and(|n| n < 3) {
+        return Err(bad("a polygon has 3 sides or more, and a star 3 points or more"));
+    }
+    let dash = spec.dash.as_deref().map(str::trim);
     Ok(Style {
         stroke: spec.stroke.as_deref().map(|s| color(s, "stroke")).transpose()?,
         fill: match spec.fill.as_deref() {
@@ -602,8 +656,25 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         align: spec.align.as_deref().and_then(|s| Align::parse(s.trim())),
         shadow: spec.shadow,
         arrow_heads: spec.arrow_heads.as_deref().and_then(|s| ArrowHeads::parse(s.trim())),
-        dash: spec.dash.as_deref().and_then(|s| Dash::parse(s.trim())),
+        dash: dash.and_then(Dash::parse),
+        cap: spec.cap.as_deref().and_then(|s| Cap::parse(s.trim())),
+        join: spec.join.as_deref().and_then(|s| Join::parse(s.trim())),
+        miter: spec.miter.filter(|m| m.is_finite()).map(|m| m.max(1.0)),
+        dash_pattern: dash.filter(|s| Dash::parse(s).is_none()).and_then(parse_dash_pattern),
+        radius: spec.radius.filter(|r| r.is_finite()).map(|r| r.max(0.0)),
+        sides: spec.sides.map(|n| n.min(1000)),
+        points: spec.points.map(|n| n.min(1000)),
+        inner: spec.inner.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0)),
     })
+}
+
+/// A path's outline from SVG path data and a fill rule.
+fn path_of(d: &str, rule: Option<&str>) -> Result<PathGeom, BoardError> {
+    let mut p = parse_d(d).map_err(|e| bad(format!("d: {e}")))?;
+    if let Some(rule) = rule.map(str::trim).filter(|r| !r.is_empty()) {
+        p.rule = PathRule::parse(rule).ok_or_else(|| bad(format!("rule \"{rule}\" is not nonzero or evenodd")))?;
+    }
+    Ok(p)
 }
 
 fn style_key(s: &str) -> Result<StyleKey, BoardError> {
@@ -617,6 +688,14 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "shadow" => StyleKey::Shadow,
         "arrow_heads" => StyleKey::ArrowHeads,
         "dash" => StyleKey::Dash,
+        "dash_pattern" => StyleKey::DashPattern,
+        "cap" => StyleKey::Cap,
+        "join" => StyleKey::Join,
+        "miter" => StyleKey::Miter,
+        "radius" => StyleKey::Radius,
+        "sides" => StyleKey::Sides,
+        "points" => StyleKey::Points,
+        "inner" => StyleKey::Inner,
         other => return Err(bad(format!("\"{other}\" is not a style key"))),
     })
 }
@@ -751,7 +830,13 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         spec.points.as_ref().ok_or_else(|| bad(format!("a {what} needs points")))?.iter().map(|p| point(p, "each point")).collect()
     };
     let geom = match &kind {
-        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Frame | Kind::Spotlight => Geom::Rect(rect(kind.as_str(), None)?),
+        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Frame | Kind::Spotlight => {
+            Geom::Rect(rect(kind.as_str(), None)?)
+        }
+        Kind::Path => {
+            let d = spec.d.as_deref().ok_or_else(|| bad("a path needs its outline as SVG path data (`d`)"))?;
+            Geom::Path(path_of(d, spec.rule.as_deref())?)
+        }
         Kind::Sticky => Geom::Rect(rect("sticky note", Some((STICKY_SIZE, STICKY_SIZE)))?),
         Kind::Text if spec.center == Some(true) => {
             let (cx, cy) = xy("text label")?;
@@ -804,8 +889,8 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         Kind::Group => Geom::None,
         Kind::Other(k) => {
             return Err(bad(format!(
-                "\"{k}\" is not a kind; use sticky, text, rect, ellipse, diamond, frame, line, arrow, connector, pen, \
-                 highlighter, step, callout, card, picture, spotlight or group"
+                "\"{k}\" is not a kind; use sticky, text, rect, ellipse, diamond, polygon, star, path, frame, line, arrow, \
+                 connector, pen, highlighter, step, callout, card, picture, spotlight or group"
             )))
         }
     };
@@ -862,6 +947,7 @@ fn rect_of_geom(geom: &Geom, points: &[[f32; 3]]) -> Rect {
             .reduce(|a, b| a.union(&b))
             .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0)),
         Geom::Connector { from, to } => Rect::from_points(from.last_point(), to.last_point()),
+        Geom::Path(p) => p.bounds().unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0)),
         Geom::None => Rect::new(0.0, 0.0, 0.0, 0.0),
     }
 }
@@ -891,7 +977,7 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
         let mut element = NewElement::new(kind.clone(), geom.clone()).with_points(points.clone());
         element.layer = scene.named_layer(spec.layer.as_deref(), call_layer)?;
         if let Some(text) = &spec.text {
-            if matches!(kind, Kind::Pen | Kind::Highlighter | Kind::Picture | Kind::Group | Kind::Step | Kind::Line | Kind::Arrow) {
+            if matches!(kind, Kind::Pen | Kind::Highlighter | Kind::Picture | Kind::Group | Kind::Step | Kind::Line | Kind::Arrow | Kind::Path) {
                 return Err(bad(format!("a {kind} holds no text")));
             }
             element = element.with_text(text.clone());
@@ -961,6 +1047,8 @@ fn change_names_geometry(c: &ElementChange) -> bool {
         || [&c.from, &c.from_side, &c.to, &c.to_side, &c.node].iter().any(|v| v.is_some())
         || c.from_point.is_some()
         || c.to_point.is_some()
+        || c.d.is_some()
+        || c.rule.is_some()
 }
 
 /// Apply one change to an element. Locks are `pimble_board`'s to judge: a
@@ -973,7 +1061,19 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
     if element.raw.locked && change.locked == Some(false) {
         t.set_locked(&id, false)?;
     }
+    // New path data for a shape, a line or a pen stroke makes it a path.
+    let converted = match (&change.d, &element.raw.geom) {
+        (Some(_), Geom::Path(_)) | (None, _) => None,
+        (Some(_), _) => Some(t.convert_to_path(&id).map_err(|e| match e {
+            BoardError::Invalid(_) => bad(format!("a {} cannot take path data; only shapes, lines without arrow heads and pen strokes turn into paths", element.raw.kind)),
+            other => other,
+        })?),
+    };
     let raw = &element.raw;
+    let raw_geom = match &converted {
+        Some(p) => Geom::Path(p.clone()),
+        None => raw.geom.clone(),
+    };
     // Geometry, merged into what it has.
     let r = |r: &Rect| Rect::new(change.x.unwrap_or(r.x), change.y.unwrap_or(r.y), change.w.unwrap_or(r.w), change.h.unwrap_or(r.h)).normalized();
     let new_points = || -> Result<Option<Vec<Point>>, BoardError> {
@@ -982,7 +1082,26 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
     let geom = if !change_names_geometry(change) {
         None
     } else {
-        match &raw.geom {
+        match &raw_geom {
+            Geom::Path(p) => {
+                let mut p = match change.d.as_deref() {
+                    Some(d) => path_of(d, None)?,
+                    None => p.clone(),
+                };
+                if [change.x, change.y, change.w, change.h].iter().any(Option::is_some) {
+                    if let Some(b) = p.bounds() {
+                        p = p.rescaled(&b, &r(&b));
+                    }
+                }
+                if let Some(rule) = change.rule.as_deref() {
+                    p.rule = path_of("M0 0 L1 0", Some(rule))?.rule;
+                } else if change.d.is_some() {
+                    if let Geom::Path(old) = &raw_geom {
+                        p.rule = old.rule;
+                    }
+                }
+                Some(Geom::Path(p))
+            }
             Geom::Rect(rect) => Some(Geom::Rect(r(rect))),
             Geom::Picture(p) => Some(Geom::Picture(PictureGeom { rect: r(&p.rect), ..p.clone() })),
             Geom::Callout { rect, tip } => Some(Geom::Callout {
@@ -1028,14 +1147,19 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
             Geom::None => None,
         }
     };
-    if let Some(geom) = geom.filter(|g| *g != raw.geom) {
+    if let Some(geom) = geom.filter(|g| *g != raw_geom) {
         t.set_geom(&id, &geom)?;
     }
     if let Some(text) = &change.text {
         t.set_text(&id, text)?;
     }
     if let Some(style) = &change.style {
-        t.set_style(&id, &style_of(style)?)?;
+        let style = style_of(style)?;
+        // A preset dash replaces a custom pattern (which would win over it).
+        if style.dash.is_some() && raw.style.dash_pattern.is_some() {
+            t.clear_style(&id, StyleKey::DashPattern)?;
+        }
+        t.set_style(&id, &style)?;
     }
     for key in &change.clear_style {
         t.clear_style(&id, style_key(key)?)?;
@@ -1134,6 +1258,30 @@ fn style_text(style: &Style) -> Vec<String> {
     }
     if let Some(d) = style.dash {
         out.push(d.as_str().to_string());
+    }
+    if let Some(p) = &style.dash_pattern {
+        out.push(format!("dash \"{}\"", dash_pattern_text(p)));
+    }
+    if let Some(c) = style.cap {
+        out.push(format!("cap {}", c.as_str()));
+    }
+    if let Some(j) = style.join {
+        out.push(format!("join {}", j.as_str()));
+    }
+    if let Some(m) = style.miter {
+        out.push(format!("miter {}", n(m)));
+    }
+    if let Some(r) = style.radius {
+        out.push(format!("radius {}", n(r)));
+    }
+    if let Some(v) = style.sides {
+        out.push(format!("{v} sides"));
+    }
+    if let Some(v) = style.points {
+        out.push(format!("{v} points"));
+    }
+    if let Some(v) = style.inner {
+        out.push(format!("inner {}", n(v)));
     }
     out
 }
@@ -1304,6 +1452,19 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
                     link
                 ),
                 Geom::Stroke => format!("{} points within {}", raw.points.len(), rect_text(&e.bounds)),
+                Geom::Path(p) => {
+                    let d = to_d(p);
+                    let rule = if p.rule == PathRule::EvenOdd { ", rule evenodd" } else { "" };
+                    if d.len() > PATH_TEXT_LIMIT {
+                        format!(
+                            "{} anchors within {}{rule}, d too long to list (render_canvas shows it)",
+                            p.anchor_count(),
+                            rect_text(&p.bounds().unwrap_or_default())
+                        )
+                    } else {
+                        format!("d=\"{d}\"{rule}")
+                    }
+                }
                 Geom::None => format!("holding what is within {}", rect_text(&e.bounds)),
             };
             line.push_str(&format!(" {geom}"));
@@ -1317,7 +1478,12 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
             if t.sx != 1.0 || t.sy != 1.0 {
                 line.push_str(&format!(", scaled {}x{}", n(t.sx), n(t.sy)));
             }
-            let style = style_text(&raw.style);
+            let mut style = style_text(&raw.style);
+            match raw.kind {
+                Kind::Polygon if raw.style.sides.is_none() => style.insert(0, format!("{} sides", e.style.sides)),
+                Kind::Star if raw.style.points.is_none() => style.insert(0, format!("{} points", e.style.points)),
+                _ => {}
+            }
             if !style.is_empty() {
                 line.push_str(&format!(" · {}", style.join(", ")));
             }
@@ -1583,7 +1749,8 @@ fn build_canvas(
 impl Pimble {
     /// Read a canvas (a whiteboard, or the marks on a picture) as a list: its
     /// page, its layers, and every element with its id, kind, position and
-    /// size, text, style, frame or group, lock and author, and what layers and
+    /// size (a path as its SVG path data, `d`), text, style, frame or group,
+    /// lock and author, and what layers and
     /// elements mean (their notes and fields). `with_field` lists only the
     /// elements with a field ("role=door"). Name a canvas node,
     /// or a note plus the id of a canvas in its text (`#canvas=<id>` in its
@@ -1798,10 +1965,12 @@ impl Pimble {
         Ok(out)
     }
 
-    /// Draw on a canvas: sticky notes, text, shapes, frames, lines, arrows,
-    /// connectors between elements (they follow the elements when moved), pen
-    /// strokes, numbered steps, callouts, node cards, pictures and groups, in one
-    /// edit. Give elements a `ref` to connect or group them in the same call.
+    /// Draw on a canvas: sticky notes, text, shapes (rectangles with a corner
+    /// radius, ellipses, diamonds, polygons, stars), vector paths written as SVG
+    /// path data (`d`, with fill, stroke, width, cap, join, dash and `rule`),
+    /// frames, lines, arrows, connectors between elements (they follow the
+    /// elements when moved), pen strokes, numbered steps, callouts, node cards,
+    /// pictures and groups, in one edit. Give elements a `ref` to connect or group them in the same call.
     /// Answers each new element's id.
     #[tool(name = "add_elements")]
     async fn add_elements(&self, Parameters(p): Parameters<AddElementsParams>) -> Result<String, String> {
@@ -1818,8 +1987,9 @@ impl Pimble {
         Ok(format!("Added to {}:\n{}", target.what(), made(&p.elements, &ids)))
     }
 
-    /// Change elements of a canvas: position, size, points, text, style,
-    /// rotation, layer, frame or group, stacking order, lock. Only what a change
+    /// Change elements of a canvas: position, size, points, a path's outline
+    /// (`d`, which also turns a shape, line or pen stroke into a path), text,
+    /// style, rotation, layer, frame or group, stacking order, lock. Only what a change
     /// names is written, so someone else editing another property keeps theirs.
     #[tool(name = "update_elements")]
     async fn update_elements(&self, Parameters(p): Parameters<UpdateElementsParams>) -> Result<String, String> {
@@ -2255,5 +2425,63 @@ mod tests {
         assert!(text.find("Group \"Shading\"").unwrap() < text.find("Layer \"Shadows\"").unwrap(), "a group before what it holds");
         assert!(layer_kind(Some("sketch")).is_err());
         assert!(blend_mode("burn").is_err());
+    }
+
+    #[test]
+    fn paths_go_in_as_path_data_and_come_back_as_it() {
+        let board = fresh();
+        let path = ElementSpec {
+            d: Some("M0 0 H100 V100 H0 Z M30 30 h40 v40 h-40 z".into()),
+            rule: Some("evenodd".into()),
+            style: Some(StyleSpec { fill: Some("#3366ff".into()), cap: Some("square".into()), join: Some("bevel".into()), dash: Some("8 4".into()), ..Default::default() }),
+            ..spec("path")
+        };
+        let star = ElementSpec { x: Some(200.0), y: Some(0.0), w: Some(100.0), h: Some(100.0), style: Some(StyleSpec { points: Some(7), inner: Some(0.5), ..Default::default() }), ..spec("star") };
+        let poly = ElementSpec { x: Some(400.0), y: Some(0.0), w: Some(100.0), h: Some(100.0), ..spec("polygon") };
+        let rect = ElementSpec { x: Some(600.0), y: Some(0.0), w: Some(100.0), h: Some(60.0), style: Some(StyleSpec { radius: Some(12.0), ..Default::default() }), ..spec("rect") };
+        let ids = add(&board, &[path, star, poly, rect]).unwrap();
+        let snap = board.snapshot();
+        let text = describe(&snap, &HashMap::new());
+        assert!(text.contains(&format!("{} path d=\"M0 0L100 0L100 100L0 100ZM30 30L70 30L70 70L30 70Z\", rule evenodd", ids[0])), "{text}");
+        assert!(text.contains("dash \"8 4\", cap square, join bevel"), "{text}");
+        assert!(text.contains("star at 200,0 size 100x100 · 7 points, inner 0.5"), "{text}");
+        assert!(text.contains("polygon at 400,0 size 100x100 · 6 sides"), "{text}");
+        assert!(text.contains("radius 12"), "{text}");
+
+        // A new outline for the rectangle turns it into a path; x and w stretch a path.
+        let st = Stamp::new(None, "2026-10-29T00:00:00.000Z");
+        let change = |c: ElementChange| {
+            let snapshot = board.snapshot();
+            let mut scene = Scene::of(&snapshot);
+            board.edit(st, |t| change_element(t, &mut scene, &snapshot, &c, 0)).result
+        };
+        change(ElementChange { id: ids[3].clone(), d: Some("M600 0 L700 0 L650 80 Z".into()), ..Default::default() }).unwrap();
+        let snap = board.snapshot();
+        let e = snap.get(&ids[3]).unwrap();
+        assert_eq!(e.raw.kind, Kind::Path);
+        assert_eq!(e.raw.style.radius, Some(12.0), "its style stays");
+        change(ElementChange { id: ids[3].clone(), x: Some(0.0), w: Some(50.0), rule: Some("evenodd".into()), ..Default::default() }).unwrap();
+        let snap = board.snapshot();
+        let Geom::Path(p) = &snap.get(&ids[3]).unwrap().raw.geom else { panic!() };
+        assert_eq!(p.bounds().unwrap(), Rect::new(0.0, 0.0, 50.0, 80.0));
+        assert_eq!(p.rule, PathRule::EvenOdd);
+        // A preset dash replaces a custom pattern.
+        change(ElementChange { id: ids[0].clone(), style: Some(StyleSpec { dash: Some("dotted".into()), ..Default::default() }), ..Default::default() }).unwrap();
+        let snap = board.snapshot();
+        let s = &snap.get(&ids[0]).unwrap().raw.style;
+        assert_eq!((s.dash, s.dash_pattern.clone()), (Some(Dash::Dotted), None));
+
+        // Refusals say why and write nothing.
+        let err = add(&board, &[ElementSpec { d: Some("L 1 2".into()), ..spec("path") }]).unwrap_err();
+        assert!(err.to_string().contains("d: the path data has a mistake"), "{err}");
+        let err = add(&board, &[spec("path")]).unwrap_err();
+        assert!(err.to_string().contains("needs its outline"), "{err}");
+        let err = add(&board, &[ElementSpec { d: Some("M0 0 L1 1".into()), rule: Some("odd".into()), ..spec("path") }]).unwrap_err();
+        assert!(err.to_string().contains("not nonzero or evenodd"), "{err}");
+        let err = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(1.0), h: Some(1.0), style: Some(StyleSpec { sides: Some(2), ..Default::default() }), ..spec("polygon") }]).unwrap_err();
+        assert!(err.to_string().contains("3 sides or more"), "{err}");
+        let arrow = add(&board, &[ElementSpec { points: Some(vec![vec![0.0, 0.0], vec![5.0, 5.0]]), ..spec("arrow") }]).unwrap();
+        let err = change(ElementChange { id: arrow[0].clone(), d: Some("M0 0 L1 1".into()), ..Default::default() }).unwrap_err();
+        assert!(err.to_string().contains("cannot take path data"), "{err}");
     }
 }

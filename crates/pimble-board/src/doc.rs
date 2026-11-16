@@ -12,8 +12,12 @@
 //!   elements: Map<element id, Map {
 //!     layer, order, parent?, kind,
 //!     geom: Any {..} (per kind, written whole) | Array<Buffer> (pen, highlighter),
+//!           a path's: Any { subpaths: [{ closed, anchors: [x, y, in_dx, in_dy,
+//!                     out_dx, out_dy, mode, ...] }], rule } (crate::path),
 //!     text: Text?, style: Map { stroke, fill, width, opacity, font_size, align,
-//!                               shadow, arrow_heads, dash },
+//!                               shadow, arrow_heads, dash,
+//!                               cap?, join?, miter?, dash_pattern?,   // stroke detail
+//!                               radius?, sides?, points?, inner? },   // live shapes
 //!     transform: Any { tx, ty, rot, sx, sy }?, locked,
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
 //!     note: Text?, "field:<name>": String...,   // what it means (below)
@@ -1284,6 +1288,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if element.kind.is_stroke() != matches!(element.geom, Geom::Stroke) {
             return Err(BoardError::Invalid(format!("a {} takes {}", element.kind, if element.kind.is_stroke() { "stroke geometry" } else { "geometry of its own" })));
         }
+        judge_geom(&element.kind, &element.geom)?;
         let key = match &element.placement {
             None | Some(Placement::Top) => {
                 let top = self.top_order(&layer)?;
@@ -1379,6 +1384,8 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if matches!(geom, Geom::Stroke) || matches!(map.get(self.txn, GEOM), Some(Out::YArray(_))) {
             return Err(BoardError::Invalid("a stroke's geometry is its points".into()));
         }
+        let kind = Kind::parse(&string_of(map.get(self.txn, KIND)).unwrap_or_default());
+        judge_geom(&kind, geom)?;
         map.insert(self.txn, GEOM, geom_any(geom));
         self.stamp_element(&map);
         Ok(())
@@ -1471,6 +1478,91 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         self.tops.remove(&layer);
         self.stamp_element(&map);
         Ok(())
+    }
+
+    // ── Paths (docs/DRAWING_CONTRACT.md section 2) ───────────────────────
+
+    /// Turn an element into a `path` in this same edit (Direct select on a
+    /// live shape: "turns it into a path in that same edit"): a rectangle
+    /// (with its radius), ellipse, diamond, polygon, star, a line with no
+    /// arrow heads, or a pen stroke ([`crate::path::to_path`]). It keeps its
+    /// id, layer, order, parent, style, text, meaning and lock; its
+    /// transform is adjusted so it stays exactly where it was drawn (a
+    /// path's rotation pivots on its own extent). Answers the path written
+    /// (in element space); a path is answered as it is, unchanged. Refused
+    /// when locked or when the kind has no path ("Only shapes, lines and pen
+    /// strokes turn into paths.").
+    pub fn convert_to_path(&mut self, id: &str) -> Result<crate::path::PathGeom> {
+        let map = self.editable(id)?;
+        let raw = read_element(self.txn, id, &map);
+        if raw.kind == Kind::Path {
+            if let Geom::Path(p) = raw.geom {
+                return Ok(p);
+            }
+        }
+        let path = crate::path::to_path(&raw.kind, &raw.geom, &raw.style, &raw.points)
+            .ok_or_else(|| BoardError::Invalid("Only shapes, lines without arrow heads and pen strokes turn into paths.".into()))?;
+        self.write_as_path(&map, &raw, &path);
+        Ok(path)
+    }
+
+    /// Finish a Pencil stroke: the pen element `id` streamed while drawing
+    /// (others watched it grow, as a pen) becomes a `path` fitted to
+    /// `points` (the whole stroke, as the drawer's device holds it) within
+    /// `tolerance` board units ([`crate::path::fit_stroke`]), in one write.
+    /// It keeps its id, layer, order and style. Refused when it is not a
+    /// pen or highlighter stroke, or when the points fit to nothing.
+    pub fn stroke_to_path(&mut self, id: &str, points: &[[f32; 3]], tolerance: f32) -> Result<crate::path::PathGeom> {
+        let map = self.editable(id)?;
+        if !matches!(map.get(self.txn, GEOM), Some(Out::YArray(_))) {
+            return Err(BoardError::NotAStroke(id.to_string()));
+        }
+        let path = crate::path::fit_stroke(points, tolerance);
+        if path.is_empty() {
+            return Err(BoardError::Invalid("the stroke has no points".into()));
+        }
+        let mut raw = read_element(self.txn, id, &map);
+        // The streamed points' extent is the pivot the transform was made for.
+        raw.points = points.to_vec();
+        self.write_as_path(&map, &raw, &path);
+        Ok(path)
+    }
+
+    /// A new `path` element fitted to freehand `points` within `tolerance`
+    /// (a Pencil stroke released before anything was streamed); answers its
+    /// id. Goes where [`BoardTxn::add_element`] puts `element` (its kind and
+    /// geometry are replaced by the fitted path).
+    pub fn add_fitted_path(&mut self, points: &[[f32; 3]], tolerance: f32, mut element: NewElement) -> Result<String> {
+        let path = crate::path::fit_stroke(points, tolerance);
+        if path.is_empty() {
+            return Err(BoardError::Invalid("the stroke has no points".into()));
+        }
+        element.kind = Kind::Path;
+        element.geom = Geom::Path(path);
+        element.points.clear();
+        self.add_element(element)
+    }
+
+    /// Write `path` over an element read as `raw`: kind, geometry (a stroke's
+    /// point array replaced by one value) and a transform that keeps it in
+    /// place.
+    fn write_as_path(&mut self, map: &MapRef, raw: &RawElement, path: &crate::path::PathGeom) {
+        let style = raw.style.resolved(&raw.kind);
+        let old_pivot = crate::snapshot::pivot_of(raw, &style);
+        let new_pivot = path.bounds();
+        map.insert(self.txn, KIND, Kind::Path.as_str().to_string());
+        map.insert(self.txn, GEOM, geom_any(&Geom::Path(path.clone())));
+        if let (Some(old), Some(new)) = (old_pivot, new_pivot) {
+            let t = repivot(&raw.transform, old, new);
+            if t != raw.transform {
+                if t.is_identity() {
+                    map.remove(self.txn, TRANSFORM);
+                } else {
+                    map.insert(self.txn, TRANSFORM, transform_any(&t));
+                }
+            }
+        }
+        self.stamp_element(map);
     }
 
     // ── Meaning ──────────────────────────────────────────────────────────
@@ -1698,6 +1790,8 @@ fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
         _ => {
             if kind.is_stroke() {
                 Geom::Stroke
+            } else if kind == Kind::Path {
+                Geom::Path(Default::default())
             } else {
                 Geom::None
             }
@@ -1819,6 +1913,14 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         shadow: bool_of(m.get(txn, "shadow")),
         arrow_heads: s("arrow_heads").and_then(|v| ArrowHeads::parse(&v)),
         dash: s("dash").and_then(|v| Dash::parse(&v)),
+        cap: s("cap").and_then(|v| Cap::parse(&v)),
+        join: s("join").and_then(|v| Join::parse(&v)),
+        miter: number_of(m.get(txn, "miter")),
+        dash_pattern: s("dash_pattern").and_then(|v| parse_dash_pattern(&v)),
+        radius: number_of(m.get(txn, "radius")),
+        sides: number_of(m.get(txn, "sides")).filter(|v| *v >= 0.0).map(|v| v.round() as u32),
+        points: number_of(m.get(txn, "points")).filter(|v| *v >= 0.0).map(|v| v.round() as u32),
+        inner: number_of(m.get(txn, "inner")),
     }
 }
 
@@ -1850,6 +1952,30 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
     if let Some(v) = style.dash {
         m.insert(txn, "dash", v.as_str());
     }
+    if let Some(v) = style.cap {
+        m.insert(txn, "cap", v.as_str());
+    }
+    if let Some(v) = style.join {
+        m.insert(txn, "join", v.as_str());
+    }
+    if let Some(v) = style.miter {
+        m.insert(txn, "miter", v as f64);
+    }
+    if let Some(v) = &style.dash_pattern {
+        m.insert(txn, "dash_pattern", dash_pattern_text(v));
+    }
+    if let Some(v) = style.radius {
+        m.insert(txn, "radius", v as f64);
+    }
+    if let Some(v) = style.sides {
+        m.insert(txn, "sides", v as f64);
+    }
+    if let Some(v) = style.points {
+        m.insert(txn, "points", v as f64);
+    }
+    if let Some(v) = style.inner {
+        m.insert(txn, "inner", v as f64);
+    }
 }
 
 // ── Encoding helpers ─────────────────────────────────────────────────────
@@ -1871,6 +1997,37 @@ fn insert_layer(txn: &mut TransactionMut, layers: &MapRef, id: &str, name: &str,
     layer.insert(txn, VISIBLE, true);
     layer.insert(txn, LOCKED, false);
     layer.insert(txn, OPACITY, 1.0f64);
+}
+
+/// Whether `geom` is the shape of geometry `kind` takes: a path takes a
+/// path's, and only a path does; polygons and stars take a box.
+fn judge_geom(kind: &Kind, geom: &Geom) -> Result<()> {
+    let ok = match (kind, geom) {
+        (Kind::Path, g) => matches!(g, Geom::Path(_)),
+        (_, Geom::Path(_)) => false,
+        (Kind::Polygon | Kind::Star, g) => matches!(g, Geom::Rect(_)),
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(BoardError::Invalid(format!("a {kind} does not take that geometry")))
+    }
+}
+
+/// `t` adjusted so that an element whose pivot (the extent its rotation and
+/// scale turn about) goes from `old` to `new` maps every point where it did.
+pub(crate) fn repivot(t: &Transform, old: Rect, new: Rect) -> Transform {
+    if t.is_identity() {
+        return *t;
+    }
+    let (c, c2) = (old.center(), new.center());
+    // t' = t + (c - c') + RS(c' - c), RS the rotation after the scale.
+    let (dx, dy) = (c2.x - c.x, c2.y - c.y);
+    let (sx, sy) = (dx * t.sx, dy * t.sy);
+    let (sin, cos) = t.rot.to_radians().sin_cos();
+    let (rx, ry) = (sx * cos - sy * sin, sx * sin + sy * cos);
+    Transform { tx: t.tx - dx + rx, ty: t.ty - dy + ry, ..*t }
 }
 
 /// The order key for `placement` among `siblings` (sorted bottom to top),
@@ -2036,8 +2193,65 @@ fn geom_any(geom: &Geom) -> Any {
             m.insert("link".into(), Any::String(link.as_str().into()));
             m
         }
+        Geom::Path(p) => path_fields(p),
     };
     Any::Map(Arc::new(m))
+}
+
+/// A path's geometry value (see [`crate::path`]): `mode` as a number.
+fn path_fields(p: &crate::path::PathGeom) -> HashMap<String, Any> {
+    let subpaths: Vec<Any> = p
+        .subpaths
+        .iter()
+        .map(|sp| {
+            let mut nums = Vec::with_capacity(sp.anchors.len() * 7);
+            for a in &sp.anchors {
+                for v in [a.p.x, a.p.y, a.h_in.x, a.h_in.y, a.h_out.x, a.h_out.y] {
+                    nums.push(Any::Number(v as f64));
+                }
+                nums.push(Any::Number(a.mode.code() as f64));
+            }
+            let mut m = HashMap::new();
+            m.insert("closed".to_string(), Any::Bool(sp.closed));
+            m.insert("anchors".to_string(), Any::Array(nums.into()));
+            Any::Map(Arc::new(m))
+        })
+        .collect();
+    let mut m = HashMap::new();
+    m.insert("subpaths".to_string(), Any::Array(subpaths.into()));
+    m.insert("rule".to_string(), Any::String(p.rule.as_str().into()));
+    m
+}
+
+/// A path's geometry read back; what is not a finite anchor is skipped.
+fn path_of(m: &HashMap<String, Any>) -> crate::path::PathGeom {
+    use crate::path::{Anchor, AnchorMode, PathGeom, PathRule, Subpath};
+    let rule = m.get("rule").and_then(any_str).and_then(PathRule::parse).unwrap_or_default();
+    let mut subpaths = Vec::new();
+    if let Some(Any::Array(list)) = m.get("subpaths") {
+        for sp in list.iter() {
+            let Any::Map(sm) = sp else { continue };
+            let closed = matches!(sm.get("closed"), Some(Any::Bool(true)));
+            let mut anchors = Vec::new();
+            if let Some(Any::Array(nums)) = sm.get("anchors") {
+                for chunk in nums.chunks_exact(7) {
+                    let v: Vec<f32> = chunk[..6].iter().map(|a| number(a).unwrap_or(f64::NAN) as f32).collect();
+                    if v.iter().any(|x| !x.is_finite()) {
+                        continue;
+                    }
+                    let mode = match &chunk[6] {
+                        Any::String(s) => AnchorMode::parse(s).unwrap_or_default(),
+                        other => AnchorMode::from_code(number(other).unwrap_or(0.0)),
+                    };
+                    anchors.push(Anchor::new(Point::new(v[0], v[1]), Point::new(v[2], v[3]), Point::new(v[4], v[5]), mode));
+                }
+            }
+            if !anchors.is_empty() {
+                subpaths.push(Subpath::new(anchors, closed));
+            }
+        }
+    }
+    PathGeom::new(subpaths, rule)
 }
 
 fn geom_of(kind: &Kind, m: &HashMap<String, Any>) -> Geom {
@@ -2061,6 +2275,7 @@ fn geom_of(kind: &Kind, m: &HashMap<String, Any>) -> Geom {
         Kind::Card => Geom::Card { rect: rect(), link: m.get("link").and_then(any_str).unwrap_or("").to_string() },
         Kind::Group => Geom::None,
         Kind::Pen | Kind::Highlighter => Geom::Stroke,
+        Kind::Path => Geom::Path(path_of(m)),
         _ => match rect_of(m) {
             Some(r) => Geom::Rect(r),
             None => Geom::None,

@@ -773,7 +773,7 @@ fn lay_out(
             let tb = Rect::new(r.x + pad, r.y + pad, inner_w, l.height);
             (Some(l), Some(tb), Some(grown))
         }
-        (Kind::Rect | Kind::Ellipse | Kind::Diamond, Geom::Rect(r)) if !text.is_empty() => {
+        (Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star, Geom::Rect(r)) if !text.is_empty() => {
             let pad = s.font_size * 0.4;
             let inner_w = (r.w - 2.0 * pad).max(1.0);
             let l = text::layout(text, s.font_size, Some(inner_w));
@@ -812,7 +812,8 @@ fn lay_out(
 /// paints). `None` for a group (its extent is its members') or a kind with
 /// nothing to show.
 fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: Option<Rect>, ink_below: f32) -> Option<(Rect, Rect)> {
-    let half = s.width / 2.0;
+    // Half the stroke, and more where a miter or a square cap reaches out.
+    let half = s.stroke_reach();
     let shadow = |r: Rect| if s.shadow { r.union(&Rect::new(r.x + SHADOW_OFFSET, r.y + SHADOW_OFFSET, r.w, r.h)) } else { r };
     Some(match (&e.kind, &e.geom) {
         (Kind::Pen | Kind::Highlighter, _) => {
@@ -826,6 +827,10 @@ fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: 
             (r, r.inflate((crate::paint::stroke_max_width(&e.kind, &e.points, s.width, s.dash) / 2.0).max(0.5)))
         }
         (Kind::Group | Kind::Other(_), _) => return None,
+        (Kind::Path, Geom::Path(p)) => {
+            let r = p.bounds()?;
+            (r, shadow(r.inflate(half)))
+        }
         (_, Geom::Picture(p)) => {
             let r = p.rect.normalized();
             (r, shadow(r))
@@ -878,6 +883,13 @@ fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: 
         }
         _ => return None,
     })
+}
+
+/// The extent an element's rotation and scale turn about (its own geometry
+/// before any transform), for the kinds whose extent needs no text layout:
+/// what [`crate::BoardTxn::convert_to_path`] keeps an element in place by.
+pub(crate) fn pivot_of(e: &RawElement, s: &ResolvedStyle) -> Option<Rect> {
+    own_extent(e, s, None, None, 0.0).map(|(p, _)| p)
 }
 
 /// The matrix of a stored transform about `pivot`'s center.
@@ -1019,12 +1031,31 @@ fn fingerprint(e: &Element) -> u64 {
         }
         // A connector's look is its route, hashed below.
         Geom::Connector { .. } => 1u8.hash(&mut h),
+        Geom::Path(p) => {
+            p.rule.hash(&mut h);
+            for sp in &p.subpaths {
+                (sp.closed, sp.anchors.len()).hash(&mut h);
+                for a in &sp.anchors {
+                    for v in [a.p.x, a.p.y, a.h_in.x, a.h_in.y, a.h_out.x, a.h_out.y] {
+                        f(&mut h, v);
+                    }
+                    a.mode.hash(&mut h);
+                }
+            }
+        }
     }
     r.text.hash(&mut h);
     let s = &e.style;
     (s.stroke, s.fill, s.align, s.shadow, s.arrow_heads, s.dash).hash(&mut h);
-    for v in [s.width, s.opacity, s.font_size] {
+    (s.cap, s.join, s.sides, s.points).hash(&mut h);
+    for v in [s.width, s.opacity, s.font_size, s.miter, s.radius, s.inner] {
         f(&mut h, v);
+    }
+    if let Some(pattern) = &s.dash_pattern {
+        pattern.len().hash(&mut h);
+        for v in pattern {
+            f(&mut h, *v);
+        }
     }
     for v in [e.world.sx, e.world.kx, e.world.ky, e.world.sy, e.world.tx, e.world.ty, e.opacity] {
         f(&mut h, v);

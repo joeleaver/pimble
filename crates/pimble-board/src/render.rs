@@ -482,7 +482,7 @@ fn paint_of(color: Color, opacity: f32) -> Paint<'static> {
 }
 
 fn stroke_of(width: f32, dash: Dash) -> Stroke {
-    StrokeStyle { width, dash }.tiny()
+    StrokeStyle::plain(width, dash).tiny()
 }
 
 /// The scale a transform applies (its area factor's square root).
