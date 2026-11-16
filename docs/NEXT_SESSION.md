@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-16 (session 78e7f30f): v0.24.0 released from `master`: drawing wave 2, paths.**
+docs/DRAWING_CONTRACT.md "Built in wave 2 (model)" and "(UI)": the `path` element (SVG `d`
+in and out of the MCP), Bezier fitting, live shapes (rect radius, polygon, star) that turn
+into a path when a point is edited, stroke caps, joins, miter and dash patterns. Tools: Pen
+(P), Direct select (A), Pencil (N, today's pen, fitted on release), Polygon (G), Star (K);
+Arrow moved to W, Numbered step to I. Not tried by hand in the browser yet. Not built:
+multi-element direct select, point snapping, miter and custom-dash controls, pressure on
+fitted strokes. Next: wave 3 (combining, gradients, flip, SVG in) after its boolean spike.
+
 **2026-11-14 (session 78e7f30f): v0.23.0 released from `master`: drawing wave 1.** The
 canvas tab is redesigned (docs/DRAWING_CONTRACT.md section 4, "Built in wave 1 (UI)"):
 floating tool rail with flyouts, a context bar of picker buttons, the color well, folding
