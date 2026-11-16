@@ -2016,8 +2016,10 @@ fn judge_geom(kind: &Kind, geom: &Geom) -> Result<()> {
 }
 
 /// `t` adjusted so that an element whose pivot (the extent its rotation and
-/// scale turn about) goes from `old` to `new` maps every point where it did.
-pub(crate) fn repivot(t: &Transform, old: Rect, new: Rect) -> Transform {
+/// scale turn about) goes from `old` to `new` maps every point where it did
+/// (Direct select writes it with a path's new geometry, so editing a point
+/// of a turned or scaled path leaves the rest where it was).
+pub fn repivot(t: &Transform, old: Rect, new: Rect) -> Transform {
     if t.is_identity() {
         return *t;
     }

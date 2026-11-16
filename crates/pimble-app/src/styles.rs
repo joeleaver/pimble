@@ -2614,6 +2614,9 @@ pub(crate) const APP_CSS: &str = "
     min-width: 26px;
     padding: 0 3px;
     box-sizing: border-box;
+    /* Its min-width would otherwise let the bar squeeze a face of words
+       (100%, Medium) to an icon width. */
+    flex-shrink: 0;
 }
 
 .pimble-board__face-wrap {
@@ -2628,6 +2631,16 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-text);
 }
 
+/* Pickers whose face is words or a number: wide enough for them, as the
+   button does not grow with its face. */
+.pimble-board__context .pimble-board__chooser--number {
+    min-width: 40px;
+}
+
+.pimble-board__context .pimble-board__chooser--words {
+    min-width: 54px;
+}
+
 .pimble-board__options {
     display: flex;
     align-items: center;
@@ -2639,6 +2652,19 @@ pub(crate) const APP_CSS: &str = "
 .pimble-board__options .pimble-board-tool {
     width: 26px;
     height: 26px;
+}
+
+/* A picker with several rows (a shape's parameters, stroke detail): a
+   label and its choices per row. */
+.pimble-board__options--rows {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: 6px 8px;
+}
+
+.pimble-board__options--rows .pimble-board__ctx-label {
+    min-width: 52px;
 }
 
 /* A flyout button's corner mark: a small triangle in the bottom right (a

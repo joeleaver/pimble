@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; wave 1 built (model and UI), wave 2's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1 and 2 built (model and UI)** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -567,3 +567,100 @@ the match arms the new kinds need to compile (`boards/rail.rs` `controls_of` and
   dash pattern, radius, sides, points and inner controls); a path does not draw text;
   converting an arrow, connector or a pen's pressure widths to a path; stroke detail on pen
   and highlighter strokes; gradients, combining, flip and SVG in (wave 3).
+
+## Built in wave 2 (UI)
+
+Built 2026-11-16 in `crates/pimble-app` (both apps, one code path), on the model above, with
+two small additions to `crates/pimble-board`: `BoardView::set_overlay` (an `EditOverlay` of
+outlines, handle arms, anchors and handle tips, drawn over each frame and never into the
+cache, at a constant size on screen) and `repivot` made public.
+
+- **Files**: `boards/points.rs` (new: the Pen and Direct select, their pure state machines,
+  the overlay), `boards/tools.rs` (the Pencil's release, the tools' routing, the layer rule,
+  styles, the fill rule), `boards/rail.rs` (the rail, the flyout, the context bar's new
+  pickers), `boards.rs` (`Tool`, `StyleUi`, `Popup`, the gestures and the session's `pen`,
+  `points`, `alt` and held undo clock), `boards/ui.rs` (an effect per pane: another tool
+  finishes the Pen's path and lets go of Direct select's points, run on the next turn),
+  `styles.rs`. **Fixed on the way**: `after_change` set the pins signal while it held the
+  session, so an effect run by that set and reading the session panicked ("RefCell already
+  borrowed", found switching tools in the test app); the pins are set after it lets go.
+  A context-bar picker whose face is words or a number now has a width class
+  (`picker_button`'s `size`): the button did not grow with its face, and "100%" ran
+  into the next one.
+- **Tools and letters**: the rail is Select, Direct select (A), Hand | Pen (P), Pencil (N),
+  Highlighter, the shapes flyout (Rectangle, Ellipse, Diamond, Polygon, Star, Line,
+  Arrow), Eraser | Text, Sticky note, the diagram flyout, Discussion pin | pictures. Every
+  `Tool` is on it exactly once and has its own letter (tests). **Deviation**: P, A and N
+  were the old pen, the arrow and the numbered step, which moved: Arrow is W, Numbered
+  step I; Polygon is G and Star K (the shapes flyout's own letter, U, is not bound: every
+  tool has one).
+- **Pen**: a click places a corner, a press-drag a symmetric anchor whose handles follow
+  the drag (Alt held moves the outgoing handle alone and makes a corner), a press on the
+  last anchor gives it a new outgoing handle alone (a cusp), a click on the first anchor
+  closes the path and finishes it, Enter or Escape finishes an open one (a path of one
+  anchor was never written), so does picking another tool, and so does undo (which then
+  takes it back whole). The element is written when the second anchor goes down and
+  rewritten with each anchor and about every 80 ms while a handle is dragged, so others
+  watch it drawn. **One undo step** for the whole path: the session holds the undo
+  manager's clock while it is drawn (`undo_options`: every edit then reads the same time
+  and joins one step), and a new step starts when it is finished. The overlay shows the
+  path, its anchors (the last filled), the handles being dragged and a dashed segment to
+  the pointer; the first anchor is drawn larger when a click would close the path.
+- **Direct select**: a click on a path or a live shape (rectangle, ellipse, diamond,
+  polygon, star, line without heads, pen stroke) shows its anchors (inside groups too: it
+  picks the element, not its group), and a press on an anchor takes it at once; Shift
+  adds or takes back anchors; a press on a segment takes its two anchors; a drag moves the
+  selected anchors (several together when the pressed one was selected); the selected
+  anchors' handles show and drag (Alt breaks the link); a marquee selects anchors of the
+  element shown, or, when none is shown, shows the topmost element with anchors inside
+  it; a click on empty board lets go; a double-click on an anchor switches corner and
+  smooth, on a segment adds an anchor; Delete or Backspace removes the selected anchors
+  (an emptied path deletes the element). Everything is worked in element space (the
+  pointer through the inverse of `Element::world`, the reach divided by its scale). The
+  first write of a live shape calls `convert_to_path` in the same edit; every write of new
+  geometry also writes the transform `repivot` gives, so a turned or scaled path keeps the
+  rest of itself where it was as its extent changes. A drag is one undo step (the held
+  clock again). The selection box and outline are not drawn over the element whose points
+  show; the context bar shows its style.
+- **Pencil**: streams as the pen did (a `pen` element and `append_points`), and on release
+  `stroke_to_path` with the "Smoothing" setting (Low, Medium, High: 0.75, 2 and 5 logical
+  pixels at the zoom it is drawn at, so a stroke drawn zoomed in is fitted as finely);
+  released before anything streamed, `add_fitted_path`; should fitting be refused it stays
+  a pen stroke. The setting is in `StyleUi` with the other tool options (for the session,
+  as they are). Markup on pictures in text uses the same tools, so the Pencil marks
+  pictures there too. The highlighter is unchanged.
+- **Shapes**: Polygon and Star in the flyout, dragged out (Shift: square) or clicked like
+  the other shapes. The context bar's shape picker: a rectangle's corner radius (a
+  slider, 0 to 100), a polygon's sides (3 to 12), a star's points (4 to 12) and inner
+  radius (a slider); new shapes take them, and changing them writes the selected shapes
+  that have them (each key only on its own kind) live.
+- **Stroke detail**: one picker for ends (butt, round, square), corners (miter, round,
+  bevel) and, for a selected path, the fill rule (nonzero, even-odd, written as the path's
+  geometry). **Deviation**: one picker for the three instead of one each, so the bar still
+  fits at 1200 pixels. Ends show for paths, shapes, lines, arrows and connectors, corners
+  for paths and shapes; never for pen and highlighter strokes. New elements take the
+  chosen ends and corners; unchosen they keep the kind's own (absent keys). Picking a dash
+  preset clears a custom `dash_pattern` (tested). "No fill" is now judged as an empty
+  style (the old check listed keys and would have cleared the fill on every new key).
+- **Tools pick their layer** (`tools::target_layer`, every tool): the picked layer when it
+  is a vector layer, else the nearest vector layer above it that is shown and not locked,
+  else the topmost that takes elements; with no vector layer at all a new "Vector 1" (or
+  the next free number) is made above the picked layer and picked (tested).
+- **Resizing paths**: a path that is not turned or scaled is resized geometrically
+  (`PathGeom::map` through the box's map, as rectangles are), so its outline keeps its
+  width; a turned or scaled one scales its transform, as every element does.
+- **Keys**: P, A, N through `Tool::from_key` (the surface) and `rail::key_act` (the
+  chrome), tested; Enter is the board's while a Pen path is drawn, Delete and Backspace
+  while anchors are selected, Alt while the Pen or Direct select works (its state is
+  tracked from the surface's keys; pointer events carry no modifiers).
+- **Tests**: the Pen's state machine, Direct select's press priorities (a selected
+  anchor's handle, an anchor, a segment), shift selection, anchors through a turned
+  transform (`points.rs`); a closed curve drawn by pointer events in one undo step, Escape
+  finishing an open path, the Pencil streaming a pen stroke and leaving a path (and one
+  released at once), Direct select turning a rectangle into a path with one undo for both,
+  deleting an anchor, live star and rectangle parameters, the dash pattern cleared, the
+  Pen making "Vector 1" (`boards.rs`); letters, controls and the rail (`rail.rs`).
+- **Not built**: anchors of several elements at once (Direct select shows one element's
+  points; a marquee picks one); snapping or Shift constraints while dragging points;
+  a miter limit or custom dash pattern control; converting arrows and connectors;
+  pressure widths survive the Pencil only while it streams (the path has one width).

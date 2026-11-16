@@ -31,20 +31,22 @@ pub enum Slot {
 /// The flyouts' tools, the first of each its face until another is used.
 pub const FLYOUTS: [&[Tool]; 2] = [
     // Shapes (Draw).
-    &[Tool::Rect, Tool::Ellipse, Tool::Diamond, Tool::Line, Tool::Arrow],
+    &[Tool::Rect, Tool::Ellipse, Tool::Diamond, Tool::Polygon, Tool::Star, Tool::Line, Tool::Arrow],
     // More diagram tools.
     &[Tool::Connector, Tool::Step, Tool::Frame],
 ];
 
-/// The rail, top to bottom: Select and Hand; Draw (the pen, which becomes
-/// the Pencil with paths, the highlighter, which moves to Paint with paint
-/// layers, the shapes, the eraser); Diagram (text, sticky notes, the other
-/// diagram tools, discussion pins); pictures.
-pub const RAIL: [Slot; 13] = [
+/// The rail, top to bottom: Select, Direct select and Hand; Draw (the Pen,
+/// the Pencil, the highlighter, which moves to Paint with paint layers, the
+/// shapes, the eraser); Diagram (text, sticky notes, the other diagram
+/// tools, discussion pins); pictures.
+pub const RAIL: [Slot; 15] = [
     Slot::Tool(Tool::Select),
+    Slot::Tool(Tool::DirectSelect),
     Slot::Tool(Tool::Hand),
     Slot::Gap,
     Slot::Tool(Tool::Pen),
+    Slot::Tool(Tool::Pencil),
     Slot::Tool(Tool::Highlighter),
     Slot::Flyout(0),
     Slot::Tool(Tool::Eraser),
@@ -94,11 +96,43 @@ pub struct Controls {
     pub font: bool,
     pub align: bool,
     pub opacity: bool,
+    /// Stroke ends and corners.
+    pub cap: bool,
+    pub join: bool,
+    /// A rectangle's corner radius.
+    pub radius: bool,
+    /// A polygon's sides.
+    pub sides: bool,
+    /// A star's points and inner radius.
+    pub star: bool,
+    /// A path's fill rule.
+    pub rule: bool,
+    /// The Pencil's smoothing (the tool's, never a selection's).
+    pub smoothing: bool,
 }
 
 impl Controls {
     pub fn any(&self) -> bool {
-        self.stroke || self.fill || self.width || self.dash || self.heads || self.font || self.align || self.opacity
+        self.stroke
+            || self.fill
+            || self.width
+            || self.dash
+            || self.heads
+            || self.font
+            || self.align
+            || self.opacity
+            || self.cap
+            || self.join
+            || self.radius
+            || self.sides
+            || self.star
+            || self.rule
+            || self.smoothing
+    }
+
+    /// Any of the pickers (everything but the two swatches).
+    pub fn pickers(&self) -> bool {
+        Controls { stroke: false, fill: false, ..*self }.any()
     }
 
     fn or(self, o: Controls) -> Controls {
@@ -111,6 +145,13 @@ impl Controls {
             font: self.font || o.font,
             align: self.align || o.align,
             opacity: self.opacity || o.opacity,
+            cap: self.cap || o.cap,
+            join: self.join || o.join,
+            radius: self.radius || o.radius,
+            sides: self.sides || o.sides,
+            star: self.star || o.star,
+            rule: self.rule || o.rule,
+            smoothing: self.smoothing || o.smoothing,
         }
     }
 }
@@ -122,12 +163,24 @@ pub fn controls_of(kind: &Kind) -> Controls {
     match kind {
         Kind::Pen => Controls { stroke: true, width: true, dash: true, opacity: true, ..none },
         Kind::Highlighter => Controls { stroke: true, width: true, opacity: true, ..none },
-        Kind::Line => Controls { stroke: true, width: true, dash: true, opacity: true, ..none },
-        Kind::Arrow | Kind::Connector => Controls { stroke: true, width: true, dash: true, heads: true, opacity: true, ..none },
-        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star => {
-            Controls { stroke: true, fill: true, width: true, dash: true, font: true, align: true, opacity: true, ..none }
-        }
-        Kind::Path => Controls { stroke: true, fill: true, width: true, dash: true, opacity: true, ..none },
+        Kind::Line => Controls { stroke: true, width: true, dash: true, opacity: true, cap: true, ..none },
+        Kind::Arrow | Kind::Connector => Controls { stroke: true, width: true, dash: true, heads: true, opacity: true, cap: true, ..none },
+        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star => Controls {
+            stroke: true,
+            fill: true,
+            width: true,
+            dash: true,
+            font: true,
+            align: true,
+            opacity: true,
+            cap: true,
+            join: true,
+            radius: *kind == Kind::Rect,
+            sides: *kind == Kind::Polygon,
+            star: *kind == Kind::Star,
+            ..none
+        },
+        Kind::Path => Controls { stroke: true, fill: true, width: true, dash: true, opacity: true, cap: true, join: true, rule: true, ..none },
         Kind::Text | Kind::Callout => Controls { stroke: true, fill: true, font: true, align: true, opacity: true, ..none },
         // A sticky note's color is its fill.
         Kind::Sticky => Controls { fill: true, font: true, align: true, opacity: true, ..none },
@@ -142,10 +195,30 @@ pub fn controls_for(kinds: &[Kind]) -> Controls {
     kinds.iter().fold(Controls::default(), |c, k| c.or(controls_of(k)))
 }
 
+/// What the context bar offers for `tool` with nothing selected: what it
+/// makes takes, and the Pencil's smoothing. The Pen makes paths, whose fill
+/// rule is only a selected path's.
+pub fn controls_of_tool(tool: Tool) -> Controls {
+    let mut c = tool.kind().map(|k| controls_of(&k)).unwrap_or_default();
+    c.rule = false;
+    c.smoothing = tool == Tool::Pencil;
+    c
+}
+
+/// The Pencil's smoothing steps: how far (logical pixels at the zoom it is
+/// drawn at) the fitted path may stray from the freehand points.
+pub const SMOOTHING: [(&str, f32); 3] = [("Low", 0.75), ("Medium", 2.0), ("High", 5.0)];
+/// The Pencil's first smoothing.
+pub const DEFAULT_SMOOTHING: f32 = 2.0;
+/// The polygon sides and star points the context bar offers.
+pub const SIDES: [u32; 7] = [3, 4, 5, 6, 8, 10, 12];
+pub const STAR_POINTS: [u32; 6] = [4, 5, 6, 7, 8, 12];
+
 /// What the context bar says when the tool has nothing to set.
 pub fn hint(tool: Tool) -> &'static str {
     match tool {
         Tool::Select => "Click to select, drag to select several",
+        Tool::DirectSelect => "Click a path or shape to edit its points; double-click adds or smooths one",
         Tool::Hand => "Drag to move around (Space held does it with any tool)",
         Tool::Eraser => "Drag across marks to erase them",
         Tool::Pin => "Click to start a discussion there",
@@ -334,11 +407,16 @@ fn icon_button(__scope: &mut RenderScope, icon: TablerIcon, tip: String, active:
 
 /// A context-bar button that opens `popup`, a row of choices under the bar,
 /// showing the current choice as its face.
-fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, face: NodeHandle) -> NodeHandle {
+///
+/// `size` is a class giving a face of words its width ("" for an icon's):
+/// the button does not grow with its face.
+fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, size: &'static str, face: NodeHandle) -> NodeHandle {
+    let class = format!("pimble-board-tool pimble-board__chooser {size}");
+    let active = format!("{class} pimble-board-tool--active");
     rsx! {
         div {
             title: tip,
-            class: {move || if ui.popup.get() == popup { "pimble-board-tool pimble-board__chooser pimble-board-tool--active" } else { "pimble-board-tool pimble-board__chooser" }},
+            class: {move || if ui.popup.get() == popup { active.clone() } else { class.clone() }},
             onclick: move || toggle(ui, popup),
             {face}
         }
@@ -495,7 +573,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         if ui.selected.get() > 0 {
             controls_for(&ui.selected_kinds.get())
         } else {
-            store.board_tool.get().kind().map(|k| controls_of(&k)).unwrap_or_default()
+            controls_of_tool(store.board_tool.get())
         }
     };
     let shown = move |on: bool| if on { "" } else { "display: none;" };
@@ -599,6 +677,108 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         })
         .collect();
 
+    // A live shape's parameters (they stay live until a point is edited).
+    let radius_slider = rsx! {
+        div { class: "pimble-board__ctx-opacity",
+            Slider {
+                min: 0.0,
+                max: 100.0,
+                step: 1.0,
+                size: "xs",
+                value_signal: Some(mirror(store, 0, |st| st.radius.get() as f64)),
+                onchange: move |v: f64| {
+                    st.radius.set(v as f32);
+                    apply(Style { radius: Some(v as f32), ..Style::default() });
+                },
+            }
+        }
+    };
+    let inner_slider = rsx! {
+        div { class: "pimble-board__ctx-opacity",
+            Slider {
+                min: 0.1,
+                max: 0.9,
+                step: 0.05,
+                size: "xs",
+                value_signal: Some(mirror(store, 1, |st| st.inner.get() as f64)),
+                onchange: move |v: f64| {
+                    st.inner.set(v as f32);
+                    apply(Style { inner: Some(v as f32), ..Style::default() });
+                },
+            }
+        }
+    };
+    let sides: Vec<NodeHandle> = SIDES
+        .iter()
+        .map(|&n| {
+            text_button(__scope, number_label(n), "Sides", move || st.sides.get() == n, move || {
+                st.sides.set(n);
+                apply(Style { sides: Some(n), ..Style::default() });
+            })
+        })
+        .collect();
+    let star_points: Vec<NodeHandle> = STAR_POINTS
+        .iter()
+        .map(|&n| {
+            text_button(__scope, number_label(n), "Points", move || st.points.get() == n, move || {
+                st.points.set(n);
+                apply(Style { points: Some(n), ..Style::default() });
+            })
+        })
+        .collect();
+    // Stroke ends and corners, and a path's fill rule.
+    let dashed = move || st.dash.get() != Dash::Solid;
+    let caps: Vec<NodeHandle> = pimble_board::Cap::ALL
+        .into_iter()
+        .map(|cap| {
+            text_button(__scope, cap_word(cap), "Stroke ends", move || st.cap.get().unwrap_or(if dashed() { pimble_board::Cap::Butt } else { pimble_board::Cap::Round }) == cap, move || {
+                st.cap.set(Some(cap));
+                apply(Style { cap: Some(cap), ..Style::default() });
+            })
+        })
+        .collect();
+    let joins: Vec<NodeHandle> = pimble_board::Join::ALL
+        .into_iter()
+        .map(|join| {
+            text_button(__scope, join_word(join), "Stroke corners", move || st.join.get().unwrap_or(pimble_board::Join::Round) == join, move || {
+                st.join.set(Some(join));
+                apply(Style { join: Some(join), ..Style::default() });
+            })
+        })
+        .collect();
+    let rules: Vec<NodeHandle> = [(pimble_board::PathRule::NonZero, "Nonzero", "Overlaps fill"), (pimble_board::PathRule::EvenOdd, "Even-odd", "Overlaps make holes")]
+        .into_iter()
+        .map(|(rule, label, tip)| {
+            text_button(__scope, label, tip, move || st.rule.get() == rule, move || {
+                st.rule.set(rule);
+                tools::set_rule(store, pane, rule);
+            })
+        })
+        .collect();
+    let smoothings: Vec<NodeHandle> = SMOOTHING
+        .iter()
+        .map(|&(label, v)| {
+            text_button(__scope, label, "How far the fitted path may stray from the stroke", move || st.smoothing.get() == v, move || {
+                st.smoothing.set(v);
+                ui.popup.set(Popup::None);
+            })
+        })
+        .collect();
+    let shape_face = rsx! {
+        div { class: "pimble-board__face-wrap",
+            span { class: "pimble-board__face-text", style: {move || shown(controls().radius)}, {move || format!("r {}", st.radius.get().round())} }
+            span { class: "pimble-board__face-text", style: {move || shown(controls().sides)}, {move || format!("{} sides", st.sides.get())} }
+            span { class: "pimble-board__face-text", style: {move || shown(controls().star)}, {move || format!("{} pts", st.points.get())} }
+        }
+    };
+    let detail_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: TablerIcon::BorderCornerRounded.name().to_string() } } };
+    let smoothing_face = rsx! {
+        span { class: "pimble-board__face-text", {move || { let v = st.smoothing.get(); SMOOTHING.iter().find(|(_, s)| *s == v).map(|(l, _)| l.to_string()).unwrap_or_default() }} }
+    };
+    let shape_btn = picker_button(__scope, ui, "Shape: corner radius, sides, points", Popup::Shape, "pimble-board__chooser--words", shape_face);
+    let detail_btn = picker_button(__scope, ui, "Stroke ends and corners, fill rule", Popup::Detail, "", detail_face);
+    let smoothing_btn = picker_button(__scope, ui, "Smoothing", Popup::Smoothing, "pimble-board__chooser--words", smoothing_face);
+
     // The selection's arrangement.
     let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
     let duplicate = act(__scope, TablerIcon::Copy, "Duplicate (Ctrl+D)", tools::duplicate);
@@ -654,12 +834,12 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let opacity_face = rsx! {
         span { class: "pimble-board__face-text", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
     };
-    let width_btn = picker_button(__scope, ui, "Width", Popup::Width, width_face);
-    let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, dash_face);
-    let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, heads_face);
-    let font_btn = picker_button(__scope, ui, "Font size", Popup::Font, font_face);
-    let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, align_face);
-    let opacity_btn = picker_button(__scope, ui, "Opacity", Popup::Opacity, opacity_face);
+    let width_btn = picker_button(__scope, ui, "Width", Popup::Width, "", width_face);
+    let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, "", dash_face);
+    let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, "", heads_face);
+    let font_btn = picker_button(__scope, ui, "Font size", Popup::Font, "", font_face);
+    let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, "", align_face);
+    let opacity_btn = picker_button(__scope, ui, "Opacity", Popup::Opacity, "pimble-board__chooser--number", opacity_face);
     let more_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::ChevronUp, "Bring Forward (Ctrl+])", Box::new(|s, p| tools::reorder(s, p, Order::Forward))),
         menu_item(__scope, store, pane, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", Box::new(|s, p| tools::reorder(s, p, Order::Backward))),
@@ -709,13 +889,16 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().stroke)}, {stroke_swatch} }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().fill)}, {fill_swatch} }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().width || controls().dash || controls().heads || controls().font || controls().align || controls().opacity)},
+                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().pickers())},
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().width)}, {width_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().dash)}, {dash_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().heads)}, {heads_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().font)}, {font_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().align)}, {align_text_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().opacity)}, {opacity_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().radius || controls().sides || controls().star)}, {shape_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().cap || controls().join || controls().rule)}, {detail_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().smoothing)}, {smoothing_btn} }
                     }
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
@@ -763,7 +946,87 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                 style: {move || shown(ui.popup.get() == Popup::Align)},
                 {align_items}
             }
+            div {
+                class: "pimble-float pimble-board__options pimble-board__options--rows",
+                style: {move || shown(ui.popup.get() == Popup::Shape)},
+                div { class: "pimble-board__row", style: {move || shown(controls().radius)},
+                    span { class: "pimble-board__ctx-label", "Corners" }
+                    {radius_slider}
+                    span { class: "pimble-board__ctx-number", {move || format!("{}", st.radius.get().round())} }
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().sides)},
+                    span { class: "pimble-board__ctx-label", "Sides" }
+                    {sides}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().star)},
+                    span { class: "pimble-board__ctx-label", "Points" }
+                    {star_points}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().star)},
+                    span { class: "pimble-board__ctx-label", "Inner" }
+                    {inner_slider}
+                    span { class: "pimble-board__ctx-number", {move || format!("{}%", (st.inner.get() * 100.0).round())} }
+                }
+            }
+            div {
+                class: "pimble-float pimble-board__options pimble-board__options--rows",
+                style: {move || shown(ui.popup.get() == Popup::Detail)},
+                div { class: "pimble-board__row", style: {move || shown(controls().cap)},
+                    span { class: "pimble-board__ctx-label", "Ends" }
+                    {caps}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().join)},
+                    span { class: "pimble-board__ctx-label", "Corners" }
+                    {joins}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().rule && ui.selected.get() > 0)},
+                    span { class: "pimble-board__ctx-label", "Fill" }
+                    {rules}
+                }
+            }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Smoothing)}, {smoothings} }
         }
+    }
+}
+
+/// A slider's value mirrored from the style (slot `slot`: 0 the corner
+/// radius, 1 a star's inner radius), so the slider follows a selection.
+fn mirror(store: AppStore, slot: usize, read: fn(&StyleUi) -> f64) -> Signal<f64> {
+    thread_local! {
+        static SIGNALS: RefCell<[Option<Signal<f64>>; 2]> = const { RefCell::new([None, None]) };
+    }
+    if let Some(sig) = SIGNALS.with(|s| s.borrow()[slot]) {
+        return sig;
+    }
+    let st = store.board_style;
+    let sig = Signal::new(read(&st));
+    let _ = rinch::Effect::new(move || {
+        let v = read(&st);
+        untracked(|| sig.set_if_changed(v));
+    });
+    SIGNALS.with(|s| s.borrow_mut()[slot] = Some(sig));
+    sig
+}
+
+/// A small number as a chip's label.
+fn number_label(n: u32) -> &'static str {
+    const LABELS: [&str; 13] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
+    LABELS.get(n as usize).copied().unwrap_or("?")
+}
+
+fn cap_word(cap: pimble_board::Cap) -> &'static str {
+    match cap {
+        pimble_board::Cap::Butt => "Butt",
+        pimble_board::Cap::Round => "Round",
+        pimble_board::Cap::Square => "Square",
+    }
+}
+
+fn join_word(join: pimble_board::Join) -> &'static str {
+    match join {
+        pimble_board::Join::Miter => "Miter",
+        pimble_board::Join::Round => "Round",
+        pimble_board::Join::Bevel => "Bevel",
     }
 }
 
@@ -992,6 +1255,8 @@ mod tests {
     fn flyouts_remember_the_tool_last_used() {
         let faces = default_faces();
         assert_eq!(faces, vec![Tool::Rect, Tool::Connector]);
+        assert_eq!(flyout_of(Tool::Star), Some(0));
+        assert_eq!(flyout_of(Tool::Polygon), Some(0));
         let faces = remember_face(&faces, Tool::Ellipse);
         assert_eq!(faces, vec![Tool::Ellipse, Tool::Connector]);
         // A tool outside every flyout changes no face.
@@ -1008,6 +1273,21 @@ mod tests {
     fn tips_name_the_letter() {
         assert_eq!(tip(Tool::Rect), "Rectangle (R)");
         assert_eq!(tip(Tool::Pin), "Discussion pin (Q)");
+        assert_eq!(tip(Tool::Pen), "Pen (P)");
+        assert_eq!(tip(Tool::DirectSelect), "Direct select (A)");
+        assert_eq!(tip(Tool::Pencil), "Pencil (N)");
+    }
+
+    /// Every tool has its own letter, and the contract's P, A and N.
+    #[test]
+    fn every_tool_has_its_own_letter() {
+        for tool in Tool::ALL {
+            assert_eq!(Tool::from_key(&tool.key().to_string()), Some(tool), "{tool:?}");
+            assert_ne!(tool.key(), 'x', "X swaps colors");
+        }
+        assert_eq!(Tool::from_key("P"), Some(Tool::Pen));
+        assert_eq!(Tool::from_key("a"), Some(Tool::DirectSelect));
+        assert_eq!(Tool::from_key("n"), Some(Tool::Pencil));
     }
 
     #[test]
@@ -1025,6 +1305,17 @@ mod tests {
         assert!(mixed.stroke && mixed.fill && mixed.width && mixed.font && !mixed.heads);
         assert!(!controls_for(&[]).any());
         assert!(!controls_for(&[Kind::Picture, Kind::Group]).any());
+        // Stroke detail and the live shapes' own parameters.
+        let rect = controls_of(&Kind::Rect);
+        assert!(rect.radius && rect.cap && rect.join && !rect.sides && !rect.star && !rect.rule);
+        assert!(controls_of(&Kind::Polygon).sides && controls_of(&Kind::Star).star);
+        let path = controls_of(&Kind::Path);
+        assert!(path.cap && path.join && path.rule && path.fill && !path.radius);
+        assert!(!pen.cap && !pen.join, "pen strokes keep their round ends");
+        assert!(controls_of(&Kind::Line).cap && !controls_of(&Kind::Line).join);
+        // The Pencil offers smoothing; the Pen no fill rule until a path is selected.
+        assert!(controls_of_tool(Tool::Pencil).smoothing && !controls_of(&Kind::Pen).smoothing);
+        assert!(!controls_of_tool(Tool::Pen).rule && controls_of_tool(Tool::Pen).join);
         // Every tool that makes something has controls, but the frame.
         for tool in Tool::ALL {
             if let Some(kind) = tool.kind() {
@@ -1036,6 +1327,9 @@ mod tests {
     #[test]
     fn the_chrome_hears_the_canvas_keys() {
         assert_eq!(key_act(Keys::Chrome, "r", false, false, false), Some(KeyAct::Tool(Tool::Rect)));
+        assert_eq!(key_act(Keys::Chrome, "p", false, false, false), Some(KeyAct::Tool(Tool::Pen)));
+        assert_eq!(key_act(Keys::Chrome, "a", false, false, false), Some(KeyAct::Tool(Tool::DirectSelect)));
+        assert_eq!(key_act(Keys::Chrome, "N", false, true, false), Some(KeyAct::Tool(Tool::Pencil)));
         assert_eq!(key_act(Keys::Chrome, "X", false, true, false), Some(KeyAct::Swap));
         assert_eq!(key_act(Keys::Chrome, "Tab", false, false, false), Some(KeyAct::TogglePanels));
         // The app's own shortcuts win: nothing with Ctrl or Alt.

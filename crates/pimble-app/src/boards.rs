@@ -41,6 +41,7 @@
 mod export;
 mod layers;
 mod nav;
+mod points;
 mod rail;
 mod tools;
 mod ui;
@@ -75,14 +76,23 @@ pub(crate) use ui::render_board;
 pub enum Tool {
     #[default]
     Select,
+    /// Direct select (docs/DRAWING_CONTRACT.md section 2): a path's anchors
+    /// and handles.
+    DirectSelect,
     Hand,
+    /// The vector Pen: anchors by clicks and drags.
     Pen,
+    /// Freehand, fitted to a path on release (today's pen became it,
+    /// docs/DRAWING_CONTRACT.md decision 3).
+    Pencil,
     Highlighter,
     Line,
     Arrow,
     Rect,
     Ellipse,
     Diamond,
+    Polygon,
+    Star,
     Text,
     Step,
     Sticky,
@@ -96,16 +106,20 @@ pub enum Tool {
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 16] = [
+    pub const ALL: [Tool; 20] = [
         Tool::Select,
+        Tool::DirectSelect,
         Tool::Hand,
         Tool::Pen,
+        Tool::Pencil,
         Tool::Highlighter,
         Tool::Line,
         Tool::Arrow,
         Tool::Rect,
         Tool::Ellipse,
         Tool::Diamond,
+        Tool::Polygon,
+        Tool::Star,
         Tool::Text,
         Tool::Step,
         Tool::Sticky,
@@ -116,21 +130,27 @@ impl Tool {
     ];
 
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
-    /// where they do not collide; a board only hears plain letters while it
-    /// has the keyboard, so none of them reach the app's own keys).
+    /// where they do not collide, docs/DRAWING_CONTRACT.md's P, A and N for
+    /// the Pen, Direct select and the Pencil; a board only hears plain
+    /// letters while it has the keyboard, so none of them reach the app's
+    /// own keys).
     pub fn key(self) -> char {
         match self {
             Tool::Select => 'v',
+            Tool::DirectSelect => 'a',
             Tool::Hand => 'h',
             Tool::Pen => 'p',
+            Tool::Pencil => 'n',
             Tool::Highlighter => 'm',
             Tool::Line => 'l',
-            Tool::Arrow => 'a',
+            Tool::Arrow => 'w',
             Tool::Rect => 'r',
             Tool::Ellipse => 'o',
             Tool::Diamond => 'd',
+            Tool::Polygon => 'g',
+            Tool::Star => 'k',
             Tool::Text => 't',
-            Tool::Step => 'n',
+            Tool::Step => 'i',
             Tool::Sticky => 's',
             Tool::Connector => 'c',
             Tool::Frame => 'f',
@@ -152,14 +172,18 @@ impl Tool {
     pub fn name(self) -> &'static str {
         match self {
             Tool::Select => "Select",
+            Tool::DirectSelect => "Direct select",
             Tool::Hand => "Hand",
             Tool::Pen => "Pen",
+            Tool::Pencil => "Pencil",
             Tool::Highlighter => "Highlighter",
             Tool::Line => "Line",
             Tool::Arrow => "Arrow",
             Tool::Rect => "Rectangle",
             Tool::Ellipse => "Ellipse",
             Tool::Diamond => "Diamond",
+            Tool::Polygon => "Polygon",
+            Tool::Star => "Star",
             Tool::Text => "Text",
             Tool::Step => "Numbered step",
             Tool::Sticky => "Sticky note",
@@ -173,14 +197,18 @@ impl Tool {
     pub fn icon(self) -> TablerIcon {
         match self {
             Tool::Select => TablerIcon::Pointer,
+            Tool::DirectSelect => TablerIcon::Vector,
             Tool::Hand => TablerIcon::HandStop,
-            Tool::Pen => TablerIcon::Pencil,
+            Tool::Pen => TablerIcon::VectorBezier2,
+            Tool::Pencil => TablerIcon::Pencil,
             Tool::Highlighter => TablerIcon::Highlight,
             Tool::Line => TablerIcon::Line,
             Tool::Arrow => TablerIcon::ArrowUpRight,
             Tool::Rect => TablerIcon::Square,
             Tool::Ellipse => TablerIcon::Circle,
             Tool::Diamond => TablerIcon::Diamond,
+            Tool::Polygon => TablerIcon::Hexagon,
+            Tool::Star => TablerIcon::Star,
             Tool::Text => TablerIcon::Typography,
             Tool::Step => TablerIcon::CircleNumber1,
             Tool::Sticky => TablerIcon::Note,
@@ -191,22 +219,26 @@ impl Tool {
         }
     }
 
-    /// What the tool's style controls apply to: the kind it makes.
+    /// What the tool's style controls apply to: the kind it makes (the
+    /// Pencil streams a pen stroke, which becomes a path on release).
     pub fn kind(self) -> Option<Kind> {
         Some(match self {
-            Tool::Pen => Kind::Pen,
+            Tool::Pen => Kind::Path,
+            Tool::Pencil => Kind::Pen,
             Tool::Highlighter => Kind::Highlighter,
             Tool::Line => Kind::Line,
             Tool::Arrow => Kind::Arrow,
             Tool::Rect => Kind::Rect,
             Tool::Ellipse => Kind::Ellipse,
             Tool::Diamond => Kind::Diamond,
+            Tool::Polygon => Kind::Polygon,
+            Tool::Star => Kind::Star,
             Tool::Text => Kind::Text,
             Tool::Step => Kind::Step,
             Tool::Sticky => Kind::Sticky,
             Tool::Connector => Kind::Connector,
             Tool::Frame => Kind::Frame,
-            Tool::Select | Tool::Hand | Tool::Eraser | Tool::Pin => return None,
+            Tool::Select | Tool::DirectSelect | Tool::Hand | Tool::Eraser | Tool::Pin => return None,
         })
     }
 }
@@ -262,6 +294,21 @@ pub struct StyleUi {
     pub front: Signal<rail::Well>,
     /// The colors last picked, newest first.
     pub recent: Signal<Vec<String>>,
+    /// Stroke ends and corners (`None`: the kind's own, round).
+    pub cap: Signal<Option<pimble_board::Cap>>,
+    pub join: Signal<Option<pimble_board::Join>>,
+    /// A rectangle's corner radius, board units.
+    pub radius: Signal<f32>,
+    /// A polygon's sides.
+    pub sides: Signal<u32>,
+    /// A star's points, and its inner radius as a fraction of its outer.
+    pub points: Signal<u32>,
+    pub inner: Signal<f32>,
+    /// The fill rule of a selected path.
+    pub rule: Signal<pimble_board::PathRule>,
+    /// The Pencil's fitting tolerance, logical pixels at the zoom it is
+    /// drawn at (`rail::SMOOTHING`).
+    pub smoothing: Signal<f32>,
 }
 
 impl StyleUi {
@@ -281,6 +328,14 @@ impl StyleUi {
             faces: Signal::new(rail::default_faces()),
             front: Signal::new(rail::Well::Stroke),
             recent: Signal::new(Vec::new()),
+            cap: Signal::new(None),
+            join: Signal::new(None),
+            radius: Signal::new(0.0),
+            sides: Signal::new(pimble_board::DEFAULT_SIDES),
+            points: Signal::new(pimble_board::DEFAULT_STAR_POINTS),
+            inner: Signal::new(pimble_board::DEFAULT_STAR_INNER),
+            rule: Signal::new(pimble_board::PathRule::NonZero),
+            smoothing: Signal::new(rail::DEFAULT_SMOOTHING),
         }
     }
 }
@@ -343,6 +398,13 @@ pub enum Popup {
     Font,
     TextAlign,
     Opacity,
+    /// A live shape's parameters: corner radius, sides, star points and
+    /// inner radius.
+    Shape,
+    /// Stroke ends and corners, and a path's fill rule.
+    Detail,
+    /// The Pencil's smoothing.
+    Smoothing,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -590,12 +652,19 @@ pub(crate) fn now_stamp() -> String {
 
 /// A per-person undo manager's options (contract section 4), with a clock
 /// that works in the browser too.
-fn undo_options() -> yrs::undo::Options<()> {
+/// The undo manager's options. `held` is the session's held clock: while it
+/// is not zero the manager reads that time, so every edit made meanwhile
+/// joins one undo step however long it takes (a Pen path drawn anchor by
+/// anchor, a point dragged with pauses); zero is the real clock.
+fn undo_options(held: Arc<std::sync::atomic::AtomicU64>) -> yrs::undo::Options<()> {
     yrs::undo::Options {
         capture_timeout_millis: 500,
         tracked_origins: Default::default(),
         capture_transaction: None,
-        timestamp: Arc::new(|| now_ms() as u64),
+        timestamp: Arc::new(move || match held.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => now_ms() as u64,
+            t => t,
+        }),
         init_undo_stack: Vec::new(),
         init_redo_stack: Vec::new(),
     }
@@ -648,7 +717,7 @@ enum Gesture {
     /// first ~100 ms of points make it, so a stroke cancelled at once, a
     /// finger that turns out to be the first of a pinch, writes nothing),
     /// what it is made with, and the points not yet appended.
-    Stroke { id: Option<String>, kind: Kind, style: Style, layer: String, pending: Vec<[f32; 3]>, appended_at: f64 },
+    Stroke { id: Option<String>, kind: Kind, style: Style, layer: String, pending: Vec<[f32; 3]>, appended_at: f64, pencil: bool },
     /// A line, arrow, shape or frame being dragged out from `start`: its
     /// element once the drag has gone far enough to make one.
     Shape { kind: Kind, start: Point, last: Point, id: Option<String>, written_at: f64 },
@@ -668,6 +737,15 @@ enum Gesture {
     /// Two fingers down: their moves pan, their spread zooms (`Pinch`),
     /// until the last of them is lifted.
     Pinch,
+    /// The Pen's press, placing an anchor (or closing): the path is the
+    /// session's `pen`.
+    PenPlace,
+    /// Direct select dragging anchors or a handle of the session's
+    /// `points` element.
+    Points(points::Drag),
+    /// Direct select's marquee over anchors, from `start` (physical
+    /// pixels); `base` is the anchor selection it adds to.
+    PointMarquee { start: (f32, f32), now: (f32, f32), base: Vec<pimble_board::AnchorRef> },
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -731,6 +809,14 @@ struct Session {
     /// The board view is over a note's text, marking up one of its pictures
     /// (contract section 2): the board is `data["board:<id>"]` of the note.
     markup: Option<Markup>,
+    /// Alt is held (the Pen and Direct select break a handle's link).
+    alt: bool,
+    /// The Pen's path being drawn.
+    pen: Option<points::PenSession>,
+    /// The element Direct select shows the points of.
+    points: Option<points::PointEdit>,
+    /// The undo manager's held clock ([`undo_options`]).
+    clock: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A picture in text being marked up in a pane.
@@ -771,7 +857,7 @@ impl Session {
             }
         }
         if self.undo.is_none() {
-            self.undo = self.board.undo_manager(undo_options());
+            self.undo = self.board.undo_manager(undo_options(self.clock.clone()));
         }
         let snapshot = self.view.snapshot();
         self.selected.retain(|id| snapshot.get(id).is_some());
@@ -944,6 +1030,10 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         nav_generation: 0,
         tool_chosen: false,
         markup: None,
+        alt: false,
+        pen: None,
+        points: None,
+        clock: Arc::default(),
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -1175,6 +1265,10 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         nav_generation: 0,
         tool_chosen: false,
         markup: Some(Markup { src: src.to_string(), pos, board_id, pending, attr_needed }),
+        alt: false,
+        pen: None,
+        points: None,
+        clock: Arc::default(),
     };
     // The watch and the undo manager start after the board was made here,
     // so undo never takes back the board itself.
@@ -1387,13 +1481,23 @@ fn after_change(store: AppStore, pane: PaneId) {
     remember_camera(pane, scale);
     let state = store.pane(pane);
     let ui = state.board_ui;
+    // Set after the session is let go of: a signal set while it is held
+    // runs effects that may want it.
+    let mut pins_out: Option<Vec<PinView>> = None;
     let published = with_session(pane, |s| {
         let snapshot = s.snapshot();
         let marks = (snapshot.markup_count(), snapshot.markup_visible);
         let logical = |r: (f32, f32, f32, f32)| (r.0 / scale, r.1 / scale, r.2 / scale, r.3 / scale);
-        let outlines: Vec<(f32, f32, f32, f32)> =
-            s.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| logical(s.to_screen(&e.bounds))).collect();
-        let handles = if s.selected.iter().any(|id| s.editable(id)) {
+        // Direct select shows the points of what it edits, not its box.
+        let pointing = s.points.as_ref().map(|p| p.id.clone());
+        let outlines: Vec<(f32, f32, f32, f32)> = s
+            .selected
+            .iter()
+            .filter(|id| pointing.as_ref() != Some(*id))
+            .filter_map(|id| snapshot.get(id))
+            .map(|e| logical(s.to_screen(&e.bounds)))
+            .collect();
+        let handles = if pointing.is_none() && s.selected.iter().any(|id| s.editable(id)) {
             s.selection_bounds().map(|b| logical(s.to_screen(&b)))
         } else {
             None
@@ -1409,7 +1513,7 @@ fn after_change(store: AppStore, pane: PaneId) {
         let picture = s.selected.len() == 1 && snapshot.get(&s.selected[0]).is_some_and(|e| e.raw.kind.is_picture());
         let authors = snapshot.authors().len();
         let marquee = match &s.gesture {
-            Gesture::Marquee { start, now, .. } => {
+            Gesture::Marquee { start, now, .. } | Gesture::PointMarquee { start, now, .. } => {
                 let (x0, y0) = (start.0.min(now.0), start.1.min(now.1));
                 Some(logical((x0, y0, (start.0 - now.0).abs(), (start.1 - now.1).abs())))
             }
@@ -1429,9 +1533,12 @@ fn after_change(store: AppStore, pane: PaneId) {
                 })
                 .collect()
         };
-        ui.pins.set(pins);
+        pins_out = Some(pins);
         (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len(), kinds, zoom)
     });
+    if let Some(pins) = pins_out {
+        ui.pins.set(pins);
+    }
     // An image opens on the arrow, a whiteboard on select (contract section
     // 4), once its board is here.
     let opening = with_session(pane, |s| {
@@ -1481,6 +1588,7 @@ fn after_change(store: AppStore, pane: PaneId) {
             ui.handles.set_if_changed(None);
         }
     }
+    points::refresh_overlay(store, pane);
     present(pane);
     nav::changed(store, pane);
     draw_others(store, pane);
@@ -2786,7 +2894,9 @@ mod tests {
         let (store, commands) = store_with_commands();
         let (store_id, node_id) = (StoreId::new(), NodeId::new());
         start(store, P[0], store_id, node_id, &whiteboard_bytes());
-        store.board_tool.set(Tool::Pen);
+        // The highlighter streams pressure as the pen did (the Pencil makes
+        // paths, `the_pencil_streams_a_stroke_and_leaves_a_path`).
+        store.board_tool.set(Tool::Highlighter);
         let _ = broadcasts(&commands);
 
         // A pen pressed harder as it goes.
@@ -2851,7 +2961,230 @@ mod tests {
         tools::pointer_down(store, P[0], on_first.0, on_first.1, left, eraser);
         tools::pointer_up(store, P[0], on_first.0, on_first.1, left, eraser);
         assert_eq!(element_count(P[0]), 1);
-        assert_eq!(untracked(|| store.board_tool.get()), Tool::Pen);
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Highlighter);
+        stop(store, P[0]);
+    }
+
+    fn mouse_click(store: AppStore, (x, y): (f32, f32)) {
+        use rinch::render_surface::SurfacePointer;
+        tools::pointer_down(store, P[0], x, y, SurfaceMouseButton::Left, SurfacePointer::mouse(true));
+        tools::pointer_up(store, P[0], x, y, SurfaceMouseButton::Left, SurfacePointer::mouse(false));
+    }
+
+    fn mouse_drag(store: AppStore, from: (f32, f32), to: (f32, f32)) {
+        use rinch::render_surface::SurfacePointer;
+        tools::pointer_down(store, P[0], from.0, from.1, SurfaceMouseButton::Left, SurfacePointer::mouse(true));
+        for i in 1..=4 {
+            let k = i as f32 / 4.0;
+            tools::pointer_move(store, P[0], from.0 + (to.0 - from.0) * k, from.1 + (to.1 - from.1) * k, SurfacePointer::mouse(true));
+        }
+        tools::pointer_up(store, P[0], to.0, to.1, SurfaceMouseButton::Left, SurfacePointer::mouse(false));
+    }
+
+    /// Board point `p` on pane 0's surface, physical pixels.
+    fn on_screen(p: Point) -> (f32, f32) {
+        with_session(P[0], |s| s.view.board_to_screen(p)).unwrap()
+    }
+
+    /// An element as a test reads it.
+    struct Seen {
+        raw: pimble_board::RawElement,
+        layer: String,
+    }
+
+    fn only_element() -> Seen {
+        with_session(P[0], |s| {
+            assert_eq!(s.snapshot().elements.len(), 1);
+            let e = &s.snapshot().elements[0];
+            Seen { raw: e.raw.clone(), layer: e.layer.clone() }
+        })
+        .unwrap()
+    }
+
+    fn path_of(e: &Seen) -> pimble_board::PathGeom {
+        match &e.raw.geom {
+            Geom::Path(p) => p.clone(),
+            other => panic!("not a path: {other:?}"),
+        }
+    }
+
+    /// The Pen (docs/DRAWING_CONTRACT.md section 2): clicks place corners,
+    /// a press-drag a smooth anchor, a click on the first anchor closes the
+    /// path; the element is written from its second anchor on, and the
+    /// whole path is one undo step.
+    #[test]
+    fn the_pen_draws_a_closed_curve_in_one_undo_step() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        store.board_tool.set(Tool::Pen);
+        let a = on_screen(Point::new(0.0, 0.0));
+        mouse_click(store, a);
+        assert_eq!(element_count(P[0]), 0, "one anchor is not written");
+        let b = on_screen(Point::new(200.0, 0.0));
+        mouse_drag(store, b, (b.0 + 50.0, b.1 + 50.0));
+        let e = only_element();
+        assert_eq!(e.raw.kind, Kind::Path);
+        let path = path_of(&e);
+        assert_eq!(path.anchor_count(), 2);
+        let curve = path.subpaths[0].anchors[1];
+        assert!((curve.h_out.x - 50.0).abs() < 0.01 && (curve.h_out.y - 50.0).abs() < 0.01, "{curve:?}");
+        assert_eq!(curve.mode, pimble_board::AnchorMode::Symmetric);
+        // Hovering shows the segment to the pointer; it writes nothing.
+        tools::pointer_move(store, P[0], 300.0, 400.0, rinch::render_surface::SurfacePointer::mouse(false));
+        mouse_click(store, on_screen(Point::new(100.0, 150.0)));
+        mouse_click(store, on_screen(Point::new(1.0, -1.0)));
+        let e = only_element();
+        let path = path_of(&e);
+        assert_eq!(path.anchor_count(), 3);
+        assert!(path.subpaths[0].closed, "a click on the first anchor closes it");
+        assert!(!points::drawing(P[0]), "closing finishes the path");
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![e.raw.id.clone()]);
+
+        tools::undo(store, P[0], false);
+        assert_eq!(element_count(P[0]), 0, "the whole path is one undo step");
+        stop(store, P[0]);
+    }
+
+    /// Escape finishes an open Pen path as it is; a path of one anchor is
+    /// never written.
+    #[test]
+    fn escape_finishes_an_open_pen_path() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        store.board_tool.set(Tool::Pen);
+        let escape = rinch::render_surface::SurfaceKeyData { key: "Escape".into(), code: "Escape".into(), ctrl: false, shift: false, alt: false, meta: false };
+        mouse_click(store, on_screen(Point::new(0.0, 0.0)));
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(escape.clone()));
+        assert!(!points::drawing(P[0]));
+        assert_eq!(element_count(P[0]), 0);
+        mouse_click(store, on_screen(Point::new(0.0, 0.0)));
+        mouse_click(store, on_screen(Point::new(100.0, 0.0)));
+        mouse_click(store, on_screen(Point::new(100.0, 100.0)));
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(escape));
+        let path = path_of(&only_element());
+        assert_eq!(path.anchor_count(), 3);
+        assert!(!path.subpaths[0].closed);
+        assert!(!points::drawing(P[0]));
+        stop(store, P[0]);
+    }
+
+    /// The Pencil streams a pen stroke while drawing (others watch it) and
+    /// leaves a path fitted to it on release; one released at once is
+    /// written as that path directly.
+    #[test]
+    fn the_pencil_streams_a_stroke_and_leaves_a_path() {
+        use rinch::render_surface::SurfacePointer;
+        let left = SurfaceMouseButton::Left;
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        store.board_tool.set(Tool::Pencil);
+        tools::pointer_down(store, P[0], 100.0, 100.0, left, SurfacePointer::mouse(true));
+        for i in 1..=20 {
+            let x = 100.0 + i as f32 * 10.0;
+            let y = 100.0 + (i as f32 * 0.4).sin() * 40.0;
+            tools::pointer_move(store, P[0], x, y, SurfacePointer::mouse(true));
+            if i == 10 {
+                std::thread::sleep(std::time::Duration::from_millis(APPEND_EVERY_MS as u64 + 20));
+            }
+        }
+        assert_eq!(only_element().raw.kind, Kind::Pen, "streamed as a pen stroke");
+        tools::pointer_up(store, P[0], 300.0, 100.0, left, SurfacePointer::mouse(false));
+        let e = only_element();
+        assert_eq!(e.raw.kind, Kind::Path, "a path once released");
+        assert!(e.raw.points.is_empty());
+        let n = path_of(&e).anchor_count();
+        assert!(n >= 2 && n < 20, "fitted to a few anchors: {n}");
+
+        // Released before anything streamed.
+        mouse_drag(store, (100.0, 300.0), (300.0, 320.0));
+        let kinds: Vec<Kind> = with_session(P[0], |s| s.snapshot().elements.iter().map(|e| e.raw.kind.clone()).collect()).unwrap();
+        assert_eq!(kinds, vec![Kind::Path, Kind::Path]);
+        stop(store, P[0]);
+    }
+
+    /// Direct select on a live rectangle: dragging a corner turns it into a
+    /// path in that same edit (one undo takes both back).
+    #[test]
+    fn direct_select_turns_a_shape_into_a_path_when_a_point_moves() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let id = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(100.0, 100.0, 200.0, 100.0))))).unwrap();
+        store.board_tool.set(Tool::DirectSelect);
+        let corner = on_screen(Point::new(100.0, 100.0));
+        mouse_drag(store, corner, (corner.0 + 40.0, corner.1));
+        let e = only_element();
+        assert_eq!(e.raw.id, id, "it keeps its id");
+        assert_eq!(e.raw.kind, Kind::Path);
+        let path = path_of(&e);
+        assert_eq!(path.anchor_count(), 4);
+        let anchors: Vec<Point> = path.subpaths[0].anchors.iter().map(|a| a.p).collect();
+        assert!(anchors.iter().any(|p| (p.x - 140.0).abs() < 0.01 && (p.y - 100.0).abs() < 0.01), "{anchors:?}");
+        assert!(anchors.iter().any(|p| (p.x - 300.0).abs() < 0.01 && (p.y - 200.0).abs() < 0.01), "the rest stay");
+        assert!(points::anchors_selected(P[0]));
+
+        // Delete removes the selected anchor.
+        points::delete_anchors(store, P[0]);
+        assert_eq!(path_of(&only_element()).anchor_count(), 3);
+        tools::undo(store, P[0], false);
+        assert_eq!(path_of(&only_element()).anchor_count(), 4);
+        tools::undo(store, P[0], false);
+        assert_eq!(only_element().raw.kind, Kind::Rect, "one undo takes the move and the conversion back");
+        stop(store, P[0]);
+    }
+
+    /// Shapes stay live: a star's points and a rectangle's radius change
+    /// from the context bar, each only on the kinds that have them.
+    #[test]
+    fn live_shapes_take_their_own_parameters() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let star = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Star, Geom::Rect(Rect::new(0.0, 0.0, 100.0, 100.0))))).unwrap();
+        let rect = local_edit(store, P[0], |t| t.add_element(rect_element(200.0))).unwrap();
+        tools::select(store, P[0], vec![star.clone(), rect.clone()]);
+        tools::apply_style(store, P[0], Style { points: Some(8), ..Style::default() });
+        tools::apply_style(store, P[0], Style { radius: Some(12.0), ..Style::default() });
+        let (star_e, rect_e) = with_session(P[0], |s| (s.snapshot().get(&star).unwrap().raw.clone(), s.snapshot().get(&rect).unwrap().raw.clone())).unwrap();
+        assert_eq!(star_e.kind, Kind::Star);
+        assert_eq!(star_e.style.points, Some(8));
+        assert_eq!(star_e.style.radius, None, "a star has no corner radius");
+        assert_eq!(rect_e.style.radius, Some(12.0));
+        assert_eq!(rect_e.style.points, None);
+        // A dash preset clears a custom pattern, which would still win.
+        local_edit(store, P[0], |t| t.set_style(&rect, &Style { dash_pattern: Some(vec![6.0, 3.0]), ..Style::default() }));
+        tools::apply_style(store, P[0], Style { dash: Some(Dash::Dashed), ..Style::default() });
+        let pattern = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().raw.style.dash_pattern.clone()).unwrap();
+        assert_eq!(pattern, None);
+        stop(store, P[0]);
+    }
+
+    /// Tools pick their layer (docs/DRAWING_CONTRACT.md section 1): with no
+    /// vector layer to draw in, the Pen makes "Vector 1" and draws there.
+    #[test]
+    fn the_pen_makes_a_vector_layer_when_there_is_none() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let vector = with_session(P[0], |s| s.snapshot().layers[0].id.clone()).unwrap();
+        local_edit(store, P[0], |t| {
+            t.add_layer_in("Paint 1", pimble_board::LayerKind::Paint, None, Placement::Top)?;
+            t.delete_layer(&vector)
+        })
+        .unwrap();
+        store.board_tool.set(Tool::Pen);
+        mouse_click(store, on_screen(Point::new(0.0, 0.0)));
+        mouse_click(store, on_screen(Point::new(100.0, 0.0)));
+        let e = only_element();
+        let (name, vector) = with_session(P[0], |s| {
+            let l = s.snapshot().layer(&e.layer).unwrap();
+            (l.name.clone(), l.kind.is_vector())
+        })
+        .unwrap();
+        assert_eq!(name, "Vector 1");
+        assert!(vector);
         stop(store, P[0]);
     }
 }

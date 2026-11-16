@@ -252,6 +252,14 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         });
     });
 
+    // Another tool finishes the Pen's path and lets go of Direct select's
+    // points.
+    let _ = rinch::Effect::new(move || {
+        let _ = store.board_tool.get();
+        // Later, never inside whatever set the tool.
+        run_on_main_thread(move || super::points::tool_changed(store, pane));
+    });
+
     // Node cards show their node's title and color live (contract section
     // 4): read from the node cache, tracked, so a rename shows at once.
     let _ = rinch::Effect::new(move || {

@@ -12,6 +12,7 @@ use pimble_board::recipe::{CARD_SIZE, STICKY_SIZE};
 use pimble_board::{End, Side};
 use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
 
+use super::rail::controls_of;
 use super::*;
 
 /// Two presses closer than this are a double-click.
@@ -43,10 +44,14 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
         return false;
     }
     let primary = key.ctrl || key.meta;
-    let active = with_session(pane, |s| !s.selected.is_empty() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false);
-    let selected = with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false);
+    let pointing = points::drawing(pane) || points::editing(pane);
+    let active = with_session(pane, |s| !s.selected.is_empty() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false) || pointing;
+    let selected = with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false) || points::anchors_selected(pane);
     match key.key.as_str() {
         " " | "Shift" => true,
+        // Alt breaks a handle's link while the Pen or Direct select works.
+        "Alt" => pointing,
+        "Enter" => points::drawing(pane),
         // Tab hides the panels (docs/DRAWING_CONTRACT.md section 4).
         "Tab" => !primary && !key.alt,
         "x" | "X" if !primary && !key.alt => true,
@@ -144,6 +149,7 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
             with_session(pane, |s| match key.key.as_str() {
                 " " => s.space = false,
                 "Shift" => s.shift = false,
+                "Alt" => s.alt = false,
                 _ => {}
             });
         }
@@ -162,6 +168,7 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
             with_session(pane, |s| {
                 s.space = false;
                 s.shift = false;
+                s.alt = false;
             });
         }
         SurfaceEvent::DragOver { x, y } | SurfaceEvent::DragEnter { x, y } => {
@@ -336,6 +343,7 @@ pub(super) fn cancel_gesture(store: AppStore, pane: PaneId) {
     }) else {
         return;
     };
+    let Err(gesture) = points::cancelled(store, pane, gesture) else { return };
     match gesture {
         Gesture::Stroke { id, .. } => {
             with_session(pane, |s| s.view.cancel_stroke());
@@ -395,7 +403,11 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
         SurfaceMouseButton::Middle => begin_pan(pane, px, py),
         SurfaceMouseButton::Left if space || tool == Tool::Hand => begin_pan(pane, px, py),
         SurfaceMouseButton::Left => {
-            if double && tool != Tool::Eraser && double_click(store, pane, px, py) {
+            if double && tool == Tool::DirectSelect {
+                if points::double_click(store, pane, px, py) {
+                    return;
+                }
+            } else if double && !matches!(tool, Tool::Eraser | Tool::Pen) && double_click(store, pane, px, py) {
                 return;
             }
             press(store, pane, tool, px, py);
@@ -414,8 +426,10 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
     let Some(p) = with_session(pane, |s| s.view.screen_to_board(px, py)) else { return };
     match tool {
         Tool::Select | Tool::Hand => begin_select(store, pane, px, py),
-        Tool::Pen | Tool::Highlighter => begin_stroke(store, pane, tool.kind().unwrap_or(Kind::Pen), p),
-        Tool::Line | Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Diamond | Tool::Frame => {
+        Tool::DirectSelect => points::press(store, pane, px, py),
+        Tool::Pen => points::pen_press(store, pane, px, py),
+        Tool::Pencil | Tool::Highlighter => begin_stroke(store, pane, tool.kind().unwrap_or(Kind::Pen), p, tool == Tool::Pencil),
+        Tool::Line | Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Diamond | Tool::Polygon | Tool::Star | Tool::Frame => {
             if !writable_or_say(store, pane) || target_layer(store, pane).is_none() {
                 return;
             }
@@ -494,7 +508,7 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
 /// The element a press at `p` hits, on its own geometry (contract section
 /// 4: never just its bounds), skipping elements in locked layers (a locked
 /// picture layer is the screenshot under the marks).
-fn hit_at<'a>(s: &'a Session, p: Point) -> Option<&'a pimble_board::Element> {
+pub(super) fn hit_at<'a>(s: &'a Session, p: Point) -> Option<&'a pimble_board::Element> {
     let snapshot = s.snapshot();
     let tolerance = HIT_SLOP * scale_hint(s) / s.view.zoom().max(1e-3);
     // The topmost hit that is not in a locked layer: look again below a
@@ -614,7 +628,9 @@ fn begin_select(store: AppStore, pane: PaneId, px: f32, py: f32) {
     after_change(store, pane);
 }
 
-fn begin_stroke(store: AppStore, pane: PaneId, kind: Kind, p: Point) {
+/// A pen or highlighter stroke from `p`; `pencil`: a Pencil stroke, fitted
+/// to a path on release.
+fn begin_stroke(store: AppStore, pane: PaneId, kind: Kind, p: Point, pencil: bool) {
     if !writable_or_say(store, pane) {
         return;
     }
@@ -627,7 +643,7 @@ fn begin_stroke(store: AppStore, pane: PaneId, kind: Kind, p: Point) {
         s.view.begin_stroke(kind.clone(), &style, point);
         s.selected.clear();
         // Its element is written with its first append (`Write::MakeStroke`).
-        s.gesture = Gesture::Stroke { id: None, kind, style, layer, pending: vec![point], appended_at: now_ms() };
+        s.gesture = Gesture::Stroke { id: None, kind, style, layer, pending: vec![point], appended_at: now_ms(), pencil };
     });
     after_change(store, pane);
 }
@@ -679,6 +695,10 @@ enum Write {
 }
 
 fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
+    with_session(pane, |s| s.pointer = (px, py));
+    if points::moved(store, pane, px, py) {
+        return;
+    }
     let writable = with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()).unwrap_or(false);
     let snap_on = untracked(|| store.board_style.snap.get());
     let scale = scale_of(pane);
@@ -702,7 +722,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 s.view.pan_by(dx, dy);
                 Write::Redraw
             }
-            Gesture::Stroke { id, kind, style, layer, pending, appended_at } => {
+            Gesture::Stroke { id, kind, style, layer, pending, appended_at, .. } => {
                 let point = [p.x, p.y, s.pressure];
                 pending.push(point);
                 let batch = if now_ms() - *appended_at >= APPEND_EVERY_MS {
@@ -787,13 +807,14 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 Write::Redraw
             }
             Gesture::Erase => Write::Erase(p),
-            Gesture::Pinch => Write::Nothing,
+            Gesture::Pinch | Gesture::PenPlace | Gesture::Points(_) | Gesture::PointMarquee { .. } => Write::Nothing,
         }
     });
     let Some(next) = next else { return };
     match next {
         Write::Nothing => {
             hover_attribution(store, pane, px, py);
+            points::hovered(store, pane);
         }
         Write::Redraw => after_change(store, pane),
         Write::Append(id, points) => {
@@ -859,8 +880,9 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
     let Some(gesture) = gesture else { return };
     let shift = with_session(pane, |s| s.shift).unwrap_or(false);
     let p = with_session(pane, |s| s.view.screen_to_board(px, py)).unwrap_or_default();
+    let Err(gesture) = points::released(store, pane, gesture, px, py) else { return };
     match gesture {
-        Gesture::Stroke { id, kind, style, layer, mut pending, .. } => {
+        Gesture::Stroke { id, kind, style, layer, mut pending, pencil, .. } => {
             let (points, min_gap) = with_session(pane, |s| {
                 // The release's own pressure is none: the stroke ends at the
                 // last it was drawn with.
@@ -874,6 +896,10 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
             .unwrap_or_default();
             // Smoothed once, on release, and never edited after.
             let smoothed = smooth_stroke(&points, min_gap);
+            if pencil {
+                finish_pencil(store, pane, id, kind, style, layer, &smoothed);
+                return;
+            }
             match id {
                 Some(id) => {
                     local_edit(store, pane, |t| t.replace_points(&id, &smoothed));
@@ -897,7 +923,7 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 }
                 select(store, pane, vec![id]);
             }
-            None if matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond) => {
+            None if matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star) => {
                 // A click: a shape of the usual size, centered there.
                 let Some(layer) = target_layer(store, pane) else { return };
                 let (w, h) = CLICKED_SHAPE;
@@ -958,6 +984,34 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
         }
         _ => after_change(store, pane),
     }
+}
+
+/// A Pencil stroke released (docs/DRAWING_CONTRACT.md section 2): the pen
+/// element it streamed becomes a path fitted to its points within the
+/// smoothing setting (logical pixels at the zoom it was drawn at), in one
+/// write; a stroke released before anything was streamed is written as that
+/// path at once. Should fitting be refused, the stroke stays a pen stroke.
+fn finish_pencil(store: AppStore, pane: PaneId, id: Option<String>, kind: Kind, style: Style, layer: String, points: &[[f32; 3]]) {
+    let scale = scale_of(pane);
+    let smoothing = untracked(|| store.board_style.smoothing.get());
+    let tolerance = with_session(pane, |s| smoothing * scale / s.view.zoom().max(1e-3)).unwrap_or(1.0).max(0.05);
+    match id {
+        Some(id) => {
+            if local_edit(store, pane, |t| t.stroke_to_path(&id, points, tolerance)).is_none() {
+                local_edit(store, pane, |t| t.replace_points(&id, points));
+            }
+        }
+        None => {
+            let element = with_layer(NewElement::stroke(kind.clone(), points.to_vec()).with_style(style.clone()), &layer);
+            if local_edit(store, pane, |t| t.add_fitted_path(points, tolerance, element)).is_none() {
+                let element = with_layer(NewElement::stroke(kind, points.to_vec()).with_style(style), &layer);
+                if local_edit(store, pane, |t| t.add_element(element)).is_none() {
+                    with_session(pane, |s| s.view.invalidate_all());
+                }
+            }
+        }
+    }
+    after_change(store, pane);
 }
 
 /// Write each element's new geometry and transform in one edit.
@@ -1053,7 +1107,7 @@ fn constrain(kind: &Kind, start: Point, p: Point, shift: bool) -> Point {
             let a = (dy.atan2(dx) / step).round() * step;
             Point::new(start.x + len * a.cos(), start.y + len * a.sin())
         }
-        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Frame => {
+        Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Frame => {
             let d = dx.abs().max(dy.abs());
             Point::new(start.x + d * dx.signum(), start.y + d * dy.signum())
         }
@@ -1189,6 +1243,9 @@ fn resized(b: &Base, from: &Rect, to: &Rect) -> Option<(String, Option<Geom>, Op
             Geom::Card { rect, link } => Some(Geom::Card { rect: mr(rect), link: link.clone() }),
             Geom::Segment { a, b } => Some(Geom::Segment { a: mp(a), b: mp(b) }),
             Geom::Callout { rect, tip } => Some(Geom::Callout { rect: mr(rect), tip: mp(tip) }),
+            // A path's anchors and handles are mapped, so its outline keeps
+            // its width (scaling its transform would thicken it).
+            Geom::Path(path) => Some(Geom::Path(path.map(|q| mp(&q)))),
             Geom::Connector { from, to } => {
                 let end = |e: &End| match e {
                     End::Point(p) => End::Point(mp(p)),
@@ -1784,25 +1841,60 @@ fn erase_at(store: AppStore, pane: PaneId, p: Point) {
 
 // ── Style ───────────────────────────────────────────────────────────────────
 
-/// The layer new elements go into: the one picked in the layers panel, else
-/// the topmost that is not locked. `None` (with a sentence) when that layer
-/// is locked.
+/// The layer new elements go into (docs/DRAWING_CONTRACT.md section 1,
+/// "Tools pick their layer"): the one picked in the layers panel when it is a
+/// vector layer, else the nearest vector layer above it that takes
+/// elements, else the topmost; with no vector layer at all, a new "Vector 1"
+/// made above the picked layer. `None` (with a sentence) when that layer is
+/// locked, or every vector layer is.
 pub(super) fn target_layer(store: AppStore, pane: PaneId) -> Option<String> {
     let chosen = untracked(|| store.pane(pane).board_ui.layer.get());
+    enum Found {
+        Layer(String),
+        Make(Option<String>, String),
+        Refused(String),
+    }
     let found = with_session(pane, |s| {
         let snapshot = s.snapshot();
         // A picked layer someone else deleted is no pick.
         let picked = chosen.as_deref().filter(|id| snapshot.layer(id).is_some());
-        snapshot.layer_for_new(picked).map(|l| l.id.clone())
+        match snapshot.layer_for_new(picked) {
+            Ok(l) => Found::Layer(l.id.clone()),
+            Err(pimble_board::BoardError::NotAVectorLayer { id, .. }) => {
+                // The nearest vector layer above the picked one, else a new one.
+                let rows = layers::rows_of(snapshot);
+                let at = rows.iter().position(|r| r.id == id).unwrap_or(0);
+                let above = rows[..at].iter().rev().find(|r| r.kind.is_vector() && r.shown && !r.held).map(|r| r.id.clone());
+                match above {
+                    Some(id) => Found::Layer(id),
+                    None => Found::Make(Some(id), new_layer_name(snapshot)),
+                }
+            }
+            Err(pimble_board::BoardError::NoVectorLayer) => Found::Make(picked.map(str::to_string), new_layer_name(snapshot)),
+            Err(e) => Found::Refused(e.to_string()),
+        }
     });
     match found {
-        Some(Ok(id)) => Some(id),
-        Some(Err(e)) => {
-            crate::events::show_notice(store, e.to_string());
+        Some(Found::Layer(id)) => Some(id),
+        Some(Found::Make(above, name)) => {
+            let placement = above.map(Placement::Above).unwrap_or(Placement::Top);
+            let made = local_edit(store, pane, |t| t.add_layer(&name, placement));
+            if let Some(id) = &made {
+                store.pane(pane).board_ui.layer.set(Some(id.clone()));
+            }
+            made
+        }
+        Some(Found::Refused(sentence)) => {
+            crate::events::show_notice(store, sentence);
             None
         }
         None => None,
     }
+}
+
+/// "Vector 1", or the first such name the board does not have yet.
+fn new_layer_name(snapshot: &BoardSnapshot) -> String {
+    (1..).map(|n| format!("Vector {n}")).find(|name| !snapshot.layers.iter().any(|l| &l.name == name)).unwrap_or_default()
 }
 
 fn with_layer(element: NewElement, layer: &str) -> NewElement {
@@ -1826,6 +1918,20 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     });
     let opacity = (opacity < 0.999).then_some(opacity);
     let dash = (dash != Dash::Solid).then_some(dash);
+    let (cap, join, radius, sides, points, inner) =
+        untracked(|| (st.cap.get(), st.join.get(), st.radius.get(), st.sides.get(), st.points.get(), st.inner.get()));
+    let shape = |kind_extra: Style| Style {
+        stroke,
+        fill,
+        width: Some(width),
+        opacity,
+        dash,
+        cap,
+        join,
+        font_size: Some(font_size),
+        align: Some(align),
+        ..kind_extra
+    };
     match kind {
         Kind::Pen => Style { stroke, width: Some(width), opacity, dash, ..Style::default() },
         // The marks' red multiplied over a picture reads as a dark smear: a
@@ -1834,12 +1940,14 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
             let stroke = stroke.filter(|c| c.to_hex() != DEFAULT_COLOR);
             Style { stroke, width: Some(width * 5.0), opacity, ..Style::default() }
         }
-        Kind::Line => Style { stroke, width: Some(width), opacity, dash, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
-        Kind::Arrow => Style { stroke, width: Some(width), opacity, dash, arrow_heads: Some(heads), ..Style::default() },
+        Kind::Line => Style { stroke, width: Some(width), opacity, dash, cap, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
+        Kind::Arrow => Style { stroke, width: Some(width), opacity, dash, cap, arrow_heads: Some(heads), ..Style::default() },
         Kind::Connector => Style { stroke, width: Some((width / 2.0).max(1.0)), opacity, dash, arrow_heads: Some(heads), ..Style::default() },
-        Kind::Rect | Kind::Ellipse | Kind::Diamond => {
-            Style { stroke, fill, width: Some(width), opacity, dash, font_size: Some(font_size), align: Some(align), ..Style::default() }
-        }
+        Kind::Rect => shape(Style { radius: (radius > 0.0).then_some(radius), ..Style::default() }),
+        Kind::Ellipse | Kind::Diamond => shape(Style::default()),
+        Kind::Polygon => shape(Style { sides: Some(sides), ..Style::default() }),
+        Kind::Star => shape(Style { points: Some(points), inner: Some(inner), ..Style::default() }),
+        Kind::Path => Style { stroke, fill, width: Some(width), opacity, dash, cap, join, ..Style::default() },
         Kind::Text => Style { stroke, fill, opacity, font_size: Some(font_size), align: Some(align), ..Style::default() },
         Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..Style::default() },
         Kind::Step => Style { stroke, opacity, font_size: Some(font_size), ..Style::default() },
@@ -1850,15 +1958,38 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
 
 /// The context bar shows the first selected element's style (and new
 /// elements take it, as in most drawing tools).
-fn load_selection_style(store: AppStore, pane: PaneId) {
+pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
     let style = with_session(pane, |s| {
         let snapshot = s.snapshot();
         let e = s.selected.first().and_then(|id| snapshot.get(id))?;
-        (!matches!(e.raw.kind, Kind::Picture | Kind::Group | Kind::Card)).then(|| (e.raw.kind.clone(), e.style.clone()))
+        let rule = match &e.raw.geom {
+            Geom::Path(p) => Some(p.rule),
+            _ => None,
+        };
+        (!matches!(e.raw.kind, Kind::Picture | Kind::Group | Kind::Card)).then(|| (e.raw.kind.clone(), e.style.clone(), e.raw.style.clone(), rule))
     })
     .flatten();
-    let Some((kind, s)) = style else { return };
+    let Some((kind, s, raw, rule)) = style else { return };
     let st = store.board_style;
+    // Stroke detail and the live shapes' parameters.
+    if controls_of(&kind).cap {
+        st.cap.set_if_changed(raw.cap);
+    }
+    if controls_of(&kind).join {
+        st.join.set_if_changed(raw.join);
+    }
+    match kind {
+        Kind::Rect => st.radius.set_if_changed(s.radius),
+        Kind::Polygon => st.sides.set_if_changed(s.sides),
+        Kind::Star => {
+            st.points.set_if_changed(s.points);
+            st.inner.set_if_changed(s.inner);
+        }
+        _ => {}
+    }
+    if let Some(rule) = rule {
+        st.rule.set_if_changed(rule);
+    }
     match kind {
         // A sticky note's color is its own: shapes drawn next do not take it.
         Kind::Sticky => {}
@@ -1868,7 +1999,7 @@ fn load_selection_style(store: AppStore, pane: PaneId) {
         }
         _ => {
             st.stroke.set_if_changed(Color { a: 255, ..s.stroke }.to_hex());
-            if matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Text) {
+            if matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Path | Kind::Text) {
                 st.fill.set_if_changed(s.fill.map(|c| c.to_hex()));
             }
             if s.width > 0.0 {
@@ -1896,6 +2027,10 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
     let kinds: HashMap<String, Kind> =
         with_session(pane, |s| ids.iter().filter_map(|id| s.snapshot().get(id).map(|e| (id.clone(), e.raw.kind.clone()))).collect())
             .unwrap_or_default();
+    let has_pattern: HashSet<String> = with_session(pane, |s| {
+        ids.iter().filter(|id| s.snapshot().get(id).is_some_and(|e| e.raw.style.dash_pattern.is_some())).cloned().collect()
+    })
+    .unwrap_or_default();
     new_undo_step(pane);
     local_edit(store, pane, |t| {
         for id in &ids {
@@ -1904,6 +2039,27 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
                 continue;
             }
             let mut s = style.clone();
+            // Each live shape's own parameters, and stroke detail where
+            // strokes have it.
+            if *kind != Kind::Rect {
+                s.radius = None;
+            }
+            if *kind != Kind::Polygon {
+                s.sides = None;
+            }
+            if *kind != Kind::Star {
+                s.points = None;
+                s.inner = None;
+            }
+            if !controls_of(kind).cap {
+                s.cap = None;
+            }
+            if !controls_of(kind).join {
+                s.join = None;
+            }
+            if s == Style::default() && style != Style::default() {
+                continue;
+            }
             if *kind == Kind::Highlighter {
                 s.width = s.width.map(|w| w * 5.0);
             }
@@ -1917,15 +2073,39 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
                 }
             }
             t.set_style(id, &s)?;
-            if style.fill.is_none() && style.stroke.is_none() && style.width.is_none() && style.opacity.is_none() && style.dash.is_none()
-                && style.font_size.is_none() && style.align.is_none() && style.arrow_heads.is_none()
-            {
+            if style == Style::default() {
                 // "No fill" is clearing the key.
                 t.clear_style(id, pimble_board::StyleKey::Fill)?;
+            }
+            if style.dash.is_some() && has_pattern.contains(id) {
+                // A dash preset picked: a custom pattern would still win.
+                t.clear_style(id, pimble_board::StyleKey::DashPattern)?;
             }
         }
         Ok(())
     });
+}
+
+/// The selected paths fill by `rule` (holes: nonzero or even-odd).
+pub(super) fn set_rule(store: AppStore, pane: PaneId, rule: pimble_board::PathRule) {
+    let writes: Vec<(String, Geom)> = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        s.selected
+            .iter()
+            .filter(|id| s.editable(id))
+            .filter_map(|id| match &snapshot.get(id)?.raw.geom {
+                Geom::Path(p) if p.rule != rule => Some((id.clone(), Geom::Path(pimble_board::PathGeom { rule, ..p.clone() }))),
+                _ => None,
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    if writes.is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    let writes: Vec<_> = writes.into_iter().map(|(id, g)| (id, Some(g), None)).collect();
+    write_elements(store, pane, &writes);
 }
 
 // ── Text ────────────────────────────────────────────────────────────────────
@@ -2275,12 +2455,26 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             store.pane(pane).board_ui.panels_hidden.update(|h| *h = !*h);
         }
         "x" | "X" if !primary && !key.alt => super::rail::swap_colors(store, pane),
+        "Alt" => {
+            with_session(pane, |s| s.alt = true);
+        }
+        "Enter" => points::finish_pen(store, pane),
+        "Delete" | "Backspace" if points::anchors_selected(pane) => points::delete_anchors(store, pane),
         "Delete" | "Backspace" => delete_selected(store, pane),
+        "Escape" if points::drawing(pane) => {
+            // Escape finishes the Pen's path (a press under way is taken
+            // back first).
+            cancel_gesture(store, pane);
+            points::finish_pen(store, pane);
+        }
         "Escape" => {
             // Escape mid-gesture takes the gesture back, as a cancelled
             // pointer does.
             cancel_gesture(store, pane);
-            with_session(pane, |s| s.selected.clear());
+            with_session(pane, |s| {
+                s.selected.clear();
+                s.points = None;
+            });
             after_change(store, pane);
         }
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
@@ -2331,6 +2525,8 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
 /// collaborator's (contract section 4).
 pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) {
     let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    // A Pen path under way is finished first, so undo takes it back whole.
+    points::finish_pen(store, pane);
     if !store.node_access(held.0, held.1).allows_write() {
         return;
     }

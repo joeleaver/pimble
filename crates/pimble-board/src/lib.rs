@@ -54,7 +54,7 @@ pub mod text;
 pub mod view;
 
 pub use doc::{
-    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, LockedLayer, RawBoard, RawElement, RawLayer, text_board_key,
+    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
     TEXT_BOARD_PREFIX, BOARD_KEY,
 };
 pub use layer_tree::{LayerTree, TreeEntry};
@@ -70,7 +70,7 @@ pub use render::{
 };
 pub use snapshot::{BoardSnapshot, Element, Layer};
 pub use svg::render_svg;
-pub use view::{grid_color, BoardView};
+pub use view::{grid_color, BoardView, EditOverlay};
 
 /// The renderer's pixel types, for callers that keep a pixmap.
 pub use tiny_skia;

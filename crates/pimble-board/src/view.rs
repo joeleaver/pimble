@@ -81,6 +81,48 @@ pub struct BoardView {
     seen: HashMap<u64, (u64, Rect, bool)>,
     /// Grid spacing in board units, when this viewer shows a grid.
     grid: Option<f32>,
+    /// What point editing draws over the frame (never into the cache).
+    overlay: Option<EditOverlay>,
+}
+
+/// What the Pen and Direct select draw over the board while they work
+/// (docs/DRAWING_CONTRACT.md section 2, "Tools"): outlines, handle arms,
+/// anchors and handle tips. Positions are board units; sizes are logical
+/// pixels times `scale` (the physical pixels per logical pixel), so the
+/// marks stay the same size at every zoom. Drawn over each frame, never
+/// into the cache.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditOverlay {
+    /// Cubic segments outlined thinly (the path being edited or drawn).
+    pub curves: Vec<[Point; 4]>,
+    /// A cubic drawn dashed (the Pen's segment to the pointer).
+    pub pending: Option<[Point; 4]>,
+    /// Handle arms: an anchor to its handle's tip.
+    pub arms: Vec<(Point, Point)>,
+    /// Anchors, and whether each is selected (drawn filled).
+    pub anchors: Vec<(Point, bool)>,
+    /// Handle tips.
+    pub tips: Vec<Point>,
+    /// An anchor drawn larger (the Pen's first anchor, when a click there
+    /// closes the path).
+    pub hot: Option<Point>,
+    pub color: Color,
+    pub scale: f32,
+}
+
+impl Default for EditOverlay {
+    fn default() -> Self {
+        EditOverlay {
+            curves: Vec::new(),
+            pending: None,
+            arms: Vec::new(),
+            anchors: Vec::new(),
+            tips: Vec::new(),
+            hot: None,
+            color: Color { r: 34, g: 139, b: 230, a: 255 },
+            scale: 1.0,
+        }
+    }
 }
 
 impl BoardView {
@@ -102,6 +144,7 @@ impl BoardView {
             live: None,
             seen: HashMap::new(),
             grid: None,
+            overlay: None,
         }
     }
 
@@ -303,6 +346,16 @@ impl BoardView {
         self.cache = None;
         self.dirty.clear();
         self.frame_dirty = true;
+    }
+
+    // ── Point editing ────────────────────────────────────────────────────
+
+    /// Draw `overlay` over every frame from now on (`None`: nothing).
+    pub fn set_overlay(&mut self, overlay: Option<EditOverlay>) {
+        if self.overlay != overlay {
+            self.overlay = overlay;
+            self.frame_dirty = true;
+        }
     }
 
     // ── A stroke being drawn ─────────────────────────────────────────────
@@ -525,6 +578,75 @@ impl BoardView {
             let sy0 = (view.y - cache.origin.y) * cache.zoom;
             resample_nearest(&cache.pixmap, sx0, sy0, k, &mut self.frame, self.background);
         }
+        if let Some(overlay) = &self.overlay {
+            draw_overlay(&mut self.frame, &view, overlay);
+        }
+    }
+}
+
+/// Draw point editing's marks over `frame` (see [`EditOverlay`]).
+fn draw_overlay(frame: &mut Pixmap, view: &View, o: &EditOverlay) {
+    use tiny_skia::{Paint, PathBuilder, Stroke, StrokeDash};
+    let k = o.scale.max(0.25);
+    let at = |p: Point| view.to_pixels(p);
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.set_color(tiny_color(o.color, 1.0));
+    let mut white = Paint::default();
+    white.anti_alias = true;
+    white.set_color(tiny_skia::Color::WHITE);
+    let id = Affine::identity();
+    let cubic = |pb: &mut PathBuilder, c: &[Point; 4]| {
+        let (a, b, cc, d) = (at(c[0]), at(c[1]), at(c[2]), at(c[3]));
+        pb.move_to(a.0, a.1);
+        pb.cubic_to(b.0, b.1, cc.0, cc.1, d.0, d.1);
+    };
+    if !o.curves.is_empty() {
+        let mut pb = PathBuilder::new();
+        for c in &o.curves {
+            cubic(&mut pb, c);
+        }
+        if let Some(path) = pb.finish() {
+            frame.stroke_path(&path, &paint, &Stroke { width: 1.5 * k, ..Stroke::default() }, id, None);
+        }
+    }
+    if let Some(c) = &o.pending {
+        let mut pb = PathBuilder::new();
+        cubic(&mut pb, c);
+        if let Some(path) = pb.finish() {
+            let stroke = Stroke { width: 1.0 * k, dash: StrokeDash::new(vec![4.0 * k, 3.0 * k], 0.0), ..Stroke::default() };
+            frame.stroke_path(&path, &paint, &stroke, id, None);
+        }
+    }
+    if !o.arms.is_empty() {
+        let mut pb = PathBuilder::new();
+        for (a, b) in &o.arms {
+            let (a, b) = (at(*a), at(*b));
+            pb.move_to(a.0, a.1);
+            pb.line_to(b.0, b.1);
+        }
+        if let Some(path) = pb.finish() {
+            frame.stroke_path(&path, &paint, &Stroke { width: 1.0 * k, ..Stroke::default() }, id, None);
+        }
+    }
+    for p in &o.tips {
+        let (x, y) = at(*p);
+        if let Some(path) = PathBuilder::from_circle(x, y, 3.5 * k) {
+            frame.fill_path(&path, &paint, tiny_skia::FillRule::Winding, id, None);
+        }
+    }
+    let square = |frame: &mut Pixmap, p: Point, half: f32, filled: bool| {
+        let (x, y) = at(p);
+        let Some(r) = tiny_skia::Rect::from_xywh(x - half, y - half, half * 2.0, half * 2.0) else { return };
+        let path = PathBuilder::from_rect(r);
+        frame.fill_path(&path, if filled { &paint } else { &white }, tiny_skia::FillRule::Winding, id, None);
+        frame.stroke_path(&path, &paint, &Stroke { width: 1.0 * k, ..Stroke::default() }, id, None);
+    };
+    for (p, selected) in &o.anchors {
+        square(frame, *p, 3.5 * k, *selected);
+    }
+    if let Some(p) = o.hot {
+        square(frame, p, 5.5 * k, false);
     }
 }
 
