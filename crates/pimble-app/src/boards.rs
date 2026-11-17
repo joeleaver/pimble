@@ -42,6 +42,7 @@ mod export;
 mod gradient;
 mod layers;
 mod nav;
+mod paint;
 mod points;
 mod rail;
 mod svg_import;
@@ -67,6 +68,7 @@ use crate::panes::{PaneId, MAX_PANES};
 use crate::protocol::{BackendCommand, NodeInit, StoredBlob};
 use crate::state::{ActiveEdit, AppStore};
 
+pub(crate) use paint::shared_cache as shared_paint_cache;
 pub(crate) use tools::delete_selected;
 pub(crate) use ui::render_board;
 
@@ -87,6 +89,12 @@ pub enum Tool {
     /// Freehand, fitted to a path on release (today's pen became it,
     /// docs/DRAWING_CONTRACT.md decision 3).
     Pencil,
+    /// The paint brush (docs/DRAWING_CONTRACT.md section 3), with the preset
+    /// picked in the context bar.
+    Brush,
+    /// The brush's highlighter preset (decision 3: the highlighter became a
+    /// brush preset), a face of its own in the Paint flyout: it always
+    /// paints into a multiply "Highlights" layer.
     Highlighter,
     Line,
     Arrow,
@@ -101,6 +109,8 @@ pub enum Tool {
     Connector,
     Frame,
     Eraser,
+    /// Picks the color under the pointer from the composited canvas.
+    Eyedropper,
     /// A discussion at a point (docs/DISCUSSIONS_CONTRACT.md section 6): a
     /// pin, which is not a board element.
     Pin,
@@ -108,12 +118,13 @@ pub enum Tool {
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 20] = [
+    pub const ALL: [Tool; 22] = [
         Tool::Select,
         Tool::DirectSelect,
         Tool::Hand,
         Tool::Pen,
         Tool::Pencil,
+        Tool::Brush,
         Tool::Highlighter,
         Tool::Line,
         Tool::Arrow,
@@ -128,14 +139,18 @@ impl Tool {
         Tool::Connector,
         Tool::Frame,
         Tool::Eraser,
+        Tool::Eyedropper,
         Tool::Pin,
     ];
 
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
     /// where they do not collide, docs/DRAWING_CONTRACT.md's P, A and N for
-    /// the Pen, Direct select and the Pencil; a board only hears plain
-    /// letters while it has the keyboard, so none of them reach the app's
-    /// own keys).
+    /// the Pen, Direct select and the Pencil, B, E and I for the Brush, the
+    /// Eraser and the Eyedropper; G and R are kept free for wave 5's Fill
+    /// and Smudge, so the Rectangle is U (the shapes flyout's letter), the
+    /// Polygon Y and the numbered step J; a board only hears plain letters
+    /// while it has the keyboard, so none of them reach the app's own
+    /// keys).
     pub fn key(self) -> char {
         match self {
             Tool::Select => 'v',
@@ -143,20 +158,22 @@ impl Tool {
             Tool::Hand => 'h',
             Tool::Pen => 'p',
             Tool::Pencil => 'n',
+            Tool::Brush => 'b',
             Tool::Highlighter => 'm',
             Tool::Line => 'l',
             Tool::Arrow => 'w',
-            Tool::Rect => 'r',
+            Tool::Rect => 'u',
             Tool::Ellipse => 'o',
             Tool::Diamond => 'd',
-            Tool::Polygon => 'g',
+            Tool::Polygon => 'y',
             Tool::Star => 'k',
             Tool::Text => 't',
-            Tool::Step => 'i',
+            Tool::Step => 'j',
             Tool::Sticky => 's',
             Tool::Connector => 'c',
             Tool::Frame => 'f',
             Tool::Eraser => 'e',
+            Tool::Eyedropper => 'i',
             Tool::Pin => 'q',
         }
     }
@@ -178,6 +195,7 @@ impl Tool {
             Tool::Hand => "Hand",
             Tool::Pen => "Pen",
             Tool::Pencil => "Pencil",
+            Tool::Brush => "Brush",
             Tool::Highlighter => "Highlighter",
             Tool::Line => "Line",
             Tool::Arrow => "Arrow",
@@ -192,6 +210,7 @@ impl Tool {
             Tool::Connector => "Connector",
             Tool::Frame => "Frame",
             Tool::Eraser => "Eraser",
+            Tool::Eyedropper => "Eyedropper",
             Tool::Pin => "Discussion pin",
         }
     }
@@ -203,6 +222,7 @@ impl Tool {
             Tool::Hand => TablerIcon::HandStop,
             Tool::Pen => TablerIcon::VectorBezier2,
             Tool::Pencil => TablerIcon::Pencil,
+            Tool::Brush => TablerIcon::Brush,
             Tool::Highlighter => TablerIcon::Highlight,
             Tool::Line => TablerIcon::Line,
             Tool::Arrow => TablerIcon::ArrowUpRight,
@@ -217,17 +237,18 @@ impl Tool {
             Tool::Connector => TablerIcon::Route,
             Tool::Frame => TablerIcon::Frame,
             Tool::Eraser => TablerIcon::Eraser,
+            Tool::Eyedropper => TablerIcon::ColorPicker,
             Tool::Pin => TablerIcon::MessagePlus,
         }
     }
 
     /// What the tool's style controls apply to: the kind it makes (the
-    /// Pencil streams a pen stroke, which becomes a path on release).
+    /// Pencil streams a pen stroke, which becomes a path on release). The
+    /// paint tools make no element.
     pub fn kind(self) -> Option<Kind> {
         Some(match self {
             Tool::Pen => Kind::Path,
             Tool::Pencil => Kind::Pen,
-            Tool::Highlighter => Kind::Highlighter,
             Tool::Line => Kind::Line,
             Tool::Arrow => Kind::Arrow,
             Tool::Rect => Kind::Rect,
@@ -240,8 +261,22 @@ impl Tool {
             Tool::Sticky => Kind::Sticky,
             Tool::Connector => Kind::Connector,
             Tool::Frame => Kind::Frame,
-            Tool::Select | Tool::DirectSelect | Tool::Hand | Tool::Eraser | Tool::Pin => return None,
+            Tool::Select
+            | Tool::DirectSelect
+            | Tool::Hand
+            | Tool::Eraser
+            | Tool::Pin
+            | Tool::Brush
+            | Tool::Highlighter
+            | Tool::Eyedropper => return None,
         })
+    }
+
+    /// The tools that paint (docs/DRAWING_CONTRACT.md section 3): the
+    /// brush cursor follows the pointer, `[` and `]` resize, Alt picks a
+    /// color (the eraser's Alt does nothing).
+    pub fn paints(self) -> bool {
+        matches!(self, Tool::Brush | Tool::Highlighter | Tool::Eraser)
     }
 }
 
@@ -318,6 +353,15 @@ pub struct StyleUi {
     pub stroke_gradient: Signal<Option<pimble_board::Gradient>>,
     /// The stop picked on the well's stop bar.
     pub stop: Signal<usize>,
+    /// The Brush's preset, by name (the highlighter's is the Highlighter
+    /// tool's own).
+    pub brush: Signal<&'static str>,
+    /// Each preset's settings as the context bar left them, in
+    /// `pimble_board::PRESETS` order (docs/DRAWING_CONTRACT.md, "Built in
+    /// wave 4 (UI)").
+    pub brushes: Signal<Vec<pimble_board::BrushSettings>>,
+    /// The eraser's size in paint layers, board units.
+    pub eraser_size: Signal<f32>,
 }
 
 impl StyleUi {
@@ -348,6 +392,9 @@ impl StyleUi {
             fill_gradient: Signal::new(None),
             stroke_gradient: Signal::new(None),
             stop: Signal::new(0),
+            brush: Signal::new(pimble_board::brush::ROUND.name),
+            brushes: Signal::new(paint::default_brushes()),
+            eraser_size: Signal::new(paint::ERASER_SIZE),
         }
     }
 }
@@ -419,6 +466,12 @@ pub enum Popup {
     Smoothing,
     /// Combining two or more elements: union, subtract, intersect, exclude.
     Combine,
+    /// The brush's preset, size, opacity, flow and hardness.
+    Preset,
+    BrushSize,
+    BrushOpacity,
+    Flow,
+    Hardness,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -534,6 +587,9 @@ pub struct PaneUi {
     pub keys: Signal<rail::Keys>,
     /// A layer row being dragged over: the row and where it would land.
     pub drop_at: Signal<Option<(String, layers::DropZone)>>,
+    /// Each layer's thumbnail, a `data:` URL, by layer id (drawn again a
+    /// moment after the layer changes, `paint::thumbs_due`).
+    pub thumbs: Signal<HashMap<String, String>>,
 }
 
 impl PaneUi {
@@ -572,6 +628,7 @@ impl PaneUi {
             picked_layers: Signal::new(Vec::new()),
             keys: Signal::new(rail::Keys::Canvas),
             drop_at: Signal::new(None),
+            thumbs: Signal::new(HashMap::new()),
         }
     }
 }
@@ -762,6 +819,12 @@ enum Gesture {
     PointMarquee { start: (f32, f32), now: (f32, f32), base: Vec<pimble_board::AnchorRef> },
     /// Dragging a handle of the selected element's gradient.
     GradientHandle(gradient::HandleDrag),
+    /// A paint stroke (the Brush, the Highlighter, the Eraser in a paint
+    /// layer) being drawn.
+    Paint(paint::Stroke),
+    /// The Eyedropper (or Alt with a brush) held down: the color under the
+    /// pointer is picked as it moves.
+    Eyedrop,
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -833,6 +896,15 @@ struct Session {
     points: Option<points::PointEdit>,
     /// The undo manager's held clock ([`undo_options`]).
     clock: Arc<std::sync::atomic::AtomicU64>,
+    /// Paint edits made here and not sent yet, and when the last went
+    /// (`paint::flush`).
+    outbox: Vec<Vec<u8>>,
+    outbox_at: f64,
+    /// Bumped by every change to the board (the thumbnails wait for it to
+    /// settle).
+    version: u64,
+    /// The pressure a paint tool paints with (1 for a mouse).
+    paint_pressure: f32,
 }
 
 /// A picture in text being marked up in a pane.
@@ -862,6 +934,9 @@ impl Session {
         match &self.watch {
             Some(watch) => {
                 let changes = watch.take();
+                if !changes.is_empty() {
+                    self.version += 1;
+                }
                 self.view.update(&self.board, &changes);
             }
             None => {
@@ -869,6 +944,7 @@ impl Session {
                     self.watch = Some(watch);
                     let snapshot = self.board.snapshot().with_options(self.options.clone(), &self.board);
                     self.view.set_snapshot(snapshot);
+                    self.version += 1;
                 }
             }
         }
@@ -1017,6 +1093,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     let dark = untracked(|| store.dark_mode.get());
     let ui = store.pane(pane).board_ui;
     let mut view = BoardView::new(1, 1, background(dark));
+    view.set_paint_cache(paint::shared_cache());
     if untracked(|| store.board_style.grid.get()) {
         view.set_grid(Some(GRID));
     }
@@ -1050,6 +1127,10 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         pen: None,
         points: None,
         clock: Arc::default(),
+        outbox: Vec::new(),
+        outbox_at: 0.0,
+        version: 0,
+        paint_pressure: 1.0,
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -1067,6 +1148,21 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
     remember_camera(pane, scale_of(pane));
+    // A paint stroke under way ends here, and what it held goes out.
+    let painting = with_session(pane, |s| match std::mem::replace(&mut s.gesture, Gesture::Idle) {
+        Gesture::Paint(stroke) => Some(stroke),
+        other => {
+            s.gesture = other;
+            None
+        }
+    })
+    .flatten();
+    if let Some(stroke) = painting {
+        let last = stroke.last;
+        paint::released(store, pane, stroke, last);
+    }
+    paint::flush(store, pane, true);
+    paint::forget_thumbs(store, pane);
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
     let state = store.pane(pane);
     if session.markup.is_some() {
@@ -1252,6 +1348,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
     let dark = untracked(|| store.dark_mode.get());
     let ui = store.pane(pane).board_ui;
     let mut view = BoardView::new(1, 1, background(dark));
+    view.set_paint_cache(paint::shared_cache());
     if untracked(|| store.board_style.grid.get()) {
         view.set_grid(Some(GRID));
     }
@@ -1285,6 +1382,10 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         pen: None,
         points: None,
         clock: Arc::default(),
+        outbox: Vec::new(),
+        outbox_at: 0.0,
+        version: 0,
+        paint_pressure: 1.0,
     };
     // The watch and the undo manager start after the board was made here,
     // so undo never takes back the board itself.
@@ -1307,6 +1408,22 @@ pub(crate) fn mark_for_test(store: AppStore, pane: PaneId) {
     local_edit(store, pane, |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(10.0, 10.0, 20.0, 20.0)))));
 }
 
+/// A highlighter stroke from board point `from` to `to` on pane `pane`'s
+/// board, by mouse events (tests).
+#[cfg(test)]
+pub(crate) fn highlight_for_test(store: AppStore, pane: PaneId, from: Point, to: Point) {
+    use rinch::render_surface::SurfacePointer;
+    store.board_tool.set(Tool::Highlighter);
+    let screen = |p: Point| with_session(pane, |s| s.view.board_to_screen(p)).unwrap_or_default();
+    let (a, b) = (screen(from), screen(to));
+    tools::pointer_down(store, pane, a.0, a.1, SurfaceMouseButton::Left, SurfacePointer::mouse(true));
+    for i in 1..=4 {
+        let k = i as f32 / 4.0;
+        tools::pointer_move(store, pane, a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k, SurfacePointer::mouse(true));
+    }
+    tools::pointer_up(store, pane, b.0, b.1, SurfaceMouseButton::Left, SurfacePointer::mouse(false));
+}
+
 /// "Done" on the board view over pane `pane`'s text: back to the text.
 pub(crate) fn end_markup(store: AppStore, pane: PaneId) {
     if with_session(pane, |s| s.markup.is_some()) != Some(true) {
@@ -1324,14 +1441,13 @@ pub(crate) fn pictures_of(snapshot: &BoardSnapshot) -> (HashMap<String, Arc<Pict
     let source = picture_source();
     let mut found = HashMap::new();
     let mut all = true;
-    for e in &snapshot.elements {
-        if let Geom::Picture(g) = &e.raw.geom {
-            match source(&g.src) {
-                Some(picture) => {
-                    found.insert(g.src.clone(), picture);
-                }
-                None => all = false,
+    // Pictures, and the pictures paint layers' `pixels` operations draw.
+    for src in snapshot.picture_srcs() {
+        match source(&src) {
+            Some(picture) => {
+                found.insert(src, picture);
             }
+            None => all = false,
         }
     }
     if !all {
@@ -1617,6 +1733,7 @@ fn after_change(store: AppStore, pane: PaneId) {
     points::refresh_overlay(store, pane);
     present(pane);
     nav::changed(store, pane);
+    paint::thumbs_due(store, pane);
     draw_others(store, pane);
     crate::presence::moved(store, pane);
 }
@@ -1882,7 +1999,7 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
     }
     for pane in PaneId::ALL {
         let touched = with_session(pane, |s| {
-            let rects: Vec<Rect> = s
+            let mut rects: Vec<Rect> = s
                 .view
                 .snapshot()
                 .elements
@@ -1890,6 +2007,7 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
                 .filter(|e| matches!(&e.raw.geom, Geom::Picture(g) if g.src == src))
                 .map(|e| e.bounds)
                 .collect();
+            rects.extend(paint::pixels_bounds(s.view.snapshot(), &src));
             for rect in &rects {
                 s.view.invalidate(*rect);
             }
@@ -2929,19 +3047,34 @@ mod tests {
         commands.try_iter().filter(|c| matches!(c, BackendCommand::BroadcastChanges { .. })).count()
     }
 
-    /// Pointer events (rinch's `set_pointer_events`): a pen's pressure is
-    /// stored with each point, a mouse's is 0.5; a cancelled stroke and a
-    /// finger that turns out to be the first of a pinch write nothing; the
-    /// pen's eraser end erases whatever the tool; one gesture at a time.
+    /// The paint operations on pane 0's board, in drawing order.
+    fn strokes() -> Vec<(String, std::sync::Arc<pimble_board::StrokeOp>)> {
+        with_session(P[0], |s| {
+            s.snapshot()
+                .paint
+                .iter()
+                .filter_map(|op| match &op.raw.body {
+                    pimble_board::PaintBody::Stroke(st) => Some((op.raw.layer.clone(), st.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// Pointer events (rinch's `set_pointer_events`) on a paint tool: a
+    /// pen's pressure is stored with each point, a mouse paints at full
+    /// pressure; a cancelled stroke and a finger that turns out to be the
+    /// first of a pinch leave nothing; the pen's eraser end erases whatever
+    /// the tool; one gesture at a time. The highlighter paints into a
+    /// multiply "Highlights" layer.
     #[test]
-    fn pointers_draw_with_their_pressure_and_cancelled_strokes_leave_nothing() {
+    fn pointers_paint_with_their_pressure_and_cancelled_strokes_leave_nothing() {
         use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
         let left = SurfaceMouseButton::Left;
         let (store, commands) = store_with_commands();
         let (store_id, node_id) = (StoreId::new(), NodeId::new());
         start(store, P[0], store_id, node_id, &whiteboard_bytes());
-        // The highlighter streams pressure as the pen did (the Pencil makes
-        // paths, `the_pencil_streams_a_stroke_and_leaves_a_path`).
         store.board_tool.set(Tool::Highlighter);
         let _ = broadcasts(&commands);
 
@@ -2954,32 +3087,41 @@ mod tests {
         tools::pointer_down(store, P[0], 50.0, 50.0, left, SurfacePointer::mouse(true));
         tools::pointer_up(store, P[0], 50.0, 50.0, left, SurfacePointer::mouse(false));
         tools::pointer_up(store, P[0], 80.0, 0.0, left, pen(7, 0.0));
-        assert_eq!(element_count(P[0]), 1);
-        let pressures: Vec<f32> = with_session(P[0], |s| s.snapshot().elements[0].raw.points.iter().map(|p| p[2]).collect()).unwrap();
+        let all = strokes();
+        assert_eq!(all.len(), 1);
+        let pressures: Vec<f32> = all[0].1.points.iter().map(|p| p[2]).collect();
         assert!(pressures.first().unwrap() < &0.35 && pressures.last().unwrap() > &0.8, "{pressures:?}");
-        assert_eq!(broadcasts(&commands), 1, "written once, whole, on release");
+        assert_eq!(all[0].1.preset, "highlighter");
+        // Into "Highlights", multiplied (no picture here: the bottom layer).
+        let layer = with_session(P[0], |s| s.snapshot().layer(&all[0].0).cloned()).flatten().unwrap();
+        assert_eq!(layer.name, pimble_board::doc::HIGHLIGHTS_LAYER_NAME);
+        assert_eq!(layer.blend, pimble_board::Blend::Multiply);
+        assert_eq!(layer.kind, pimble_board::LayerKind::Paint);
+        // Begun on the press, the appends sent together about every 100 ms
+        // (here, mostly on release), never one per point.
+        let sent = broadcasts(&commands);
+        assert!((2..=6).contains(&sent), "{sent}");
 
-        // A mouse draws at 0.5, whatever it reports.
+        // A mouse paints at full pressure, whatever it reports.
         let mut mouse = SurfacePointer::mouse(true);
-        mouse.pressure = 0.9;
+        mouse.pressure = 0.5;
         tools::pointer_down(store, P[0], 0.0, 40.0, left, mouse);
         tools::pointer_move(store, P[0], 30.0, 40.0, mouse);
         tools::pointer_up(store, P[0], 30.0, 40.0, left, SurfacePointer::mouse(false));
-        assert_eq!(element_count(P[0]), 2);
-        let all_half = with_session(P[0], |s| s.snapshot().elements[1].raw.points.iter().all(|p| p[2] == 0.5)).unwrap();
-        assert!(all_half);
-        let _ = broadcasts(&commands);
+        let all = strokes();
+        assert_eq!(all.len(), 2);
+        assert!(all[1].1.points.iter().all(|p| p[2] == 1.0), "{:?}", all[1].1.points);
+        assert_eq!(all[1].0, all[0].0, "the same Highlights layer, reused");
 
-        // A stroke the platform cancels is gone, and nothing was written.
+        // A stroke the platform cancels is gone.
         tools::pointer_down(store, P[0], 0.0, 80.0, left, pen(7, 0.5));
         tools::pointer_move(store, P[0], 40.0, 80.0, pen(7, 0.6));
         tools::pointer_cancel(store, P[0], pen(7, 0.0));
-        assert_eq!(element_count(P[0]), 2);
-        assert_eq!(broadcasts(&commands), 0);
-        assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Idle) && s.driver.is_none()).unwrap());
+        assert_eq!(strokes().len(), 2);
+        assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Idle) && s.driver.is_none() && s.outbox.is_empty()).unwrap());
 
         // One finger starts a stroke; a second makes it a pinch: the stroke
-        // goes unwritten, and moving the fingers pans.
+        // goes, and moving the fingers pans.
         tools::pointer_down(store, P[0], 0.0, 120.0, left, finger(10));
         tools::pointer_move(store, P[0], 10.0, 120.0, finger(10));
         tools::pointer_down(store, P[0], 100.0, 120.0, left, finger(11));
@@ -2993,21 +3135,157 @@ mod tests {
         tools::pointer_up(store, P[0], 30.0, 140.0, left, finger(10));
         tools::pointer_move(store, P[0], 200.0, 200.0, finger(11));
         tools::pointer_up(store, P[0], 200.0, 200.0, left, finger(11));
-        assert_eq!(element_count(P[0]), 2);
-        assert_eq!(broadcasts(&commands), 0);
+        assert_eq!(strokes().len(), 2);
         assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Idle) && s.touches.is_empty()).unwrap());
 
-        // The pen's eraser end erases with the pen tool still chosen.
-        let on_first = with_session(P[0], |s| {
-            let e = &s.snapshot().elements[0];
-            s.view.board_to_screen(Point::new(e.raw.points[3][0], e.raw.points[3][1]))
-        })
-        .unwrap();
+        // The pen's eraser end erases with the highlighter still chosen:
+        // nothing picked and no element there, so the paint layer under it,
+        // with an erasing stroke.
+        let on_first = on_screen(Point::new(all[0].1.points[3][0], all[0].1.points[3][1]));
         let eraser = SurfacePointer { kind: SurfacePointerKind::Eraser, ..pen(8, 0.5) };
         tools::pointer_down(store, P[0], on_first.0, on_first.1, left, eraser);
-        tools::pointer_up(store, P[0], on_first.0, on_first.1, left, eraser);
-        assert_eq!(element_count(P[0]), 1);
+        tools::pointer_move(store, P[0], on_first.0 + 10.0, on_first.1, eraser);
+        tools::pointer_up(store, P[0], on_first.0 + 10.0, on_first.1, left, eraser);
+        let all = strokes();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].1.blend, pimble_board::StrokeBlend::Erase);
+        assert_eq!(all[2].0, all[0].0);
         assert_eq!(untracked(|| store.board_tool.get()), Tool::Highlighter);
+        stop(store, P[0]);
+    }
+
+    /// The Brush (docs/DRAWING_CONTRACT.md section 3): a stroke goes into a
+    /// new "Paint 1" made with it (picked in the panel) in one undo step,
+    /// with the preset and settings of the context bar; the next stroke
+    /// goes into the picked layer; `]` makes the brush larger; the eraser
+    /// on the picked paint layer erases with a stroke; the eyedropper picks
+    /// the color under the pointer into the well's front square.
+    #[test]
+    fn the_brush_paints_into_a_paint_layer_in_one_undo_step() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        start(store, P[0], store_id, node_id, &whiteboard_bytes());
+        let st = store.board_style;
+        st.stroke.set("#00c000".to_string());
+        st.brush.set("ink");
+        store.board_tool.set(Tool::Brush);
+        let layers_before = with_session(P[0], |s| s.snapshot().layers.len()).unwrap();
+        let _ = broadcasts(&commands);
+
+        mouse_drag(store, (100.0, 100.0), (300.0, 100.0));
+        let all = strokes();
+        assert_eq!(all.len(), 1);
+        let (layer_id, stroke) = &all[0];
+        assert_eq!(stroke.preset, "ink");
+        assert_eq!(stroke.color.to_hex(), "#00c000");
+        assert!(stroke.points.len() >= 5, "{:?}", stroke.points);
+        let layer = with_session(P[0], |s| s.snapshot().layer(layer_id).cloned()).flatten().unwrap();
+        assert_eq!((layer.name.as_str(), layer.kind.clone()), ("Paint 1", pimble_board::LayerKind::Paint));
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.layer.get()).as_deref(), Some(layer_id.as_str()));
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before + 1);
+        let sent = broadcasts(&commands);
+        assert!((2..=4).contains(&sent), "begun on the press, the rest batched: {sent}");
+
+        // `]`: larger; the next stroke takes the new size, in the same layer.
+        let size = untracked(|| paint::current_settings(store)).unwrap().size;
+        paint::step_size(store, P[0], true);
+        let larger = untracked(|| paint::current_settings(store)).unwrap().size;
+        assert!(larger > size);
+        mouse_drag(store, (100.0, 200.0), (300.0, 200.0));
+        let all = strokes();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].0, *layer_id);
+        assert_eq!(all[1].1.settings.size, larger);
+
+        // The eyedropper picks the green under the first stroke into the
+        // front square (the stroke's), and the recent colors.
+        st.stroke.set("#000000".to_string());
+        store.board_tool.set(Tool::Eyedropper);
+        let at = on_screen(Point::new(200.0, 100.0));
+        mouse_click(store, at);
+        let picked = Color::parse(&untracked(|| st.stroke.get())).unwrap();
+        assert!(picked.g > 150 && picked.r < 60 && picked.b < 60, "{picked:?}");
+        assert_eq!(untracked(|| st.recent.get()).first(), Some(&picked.to_hex()));
+
+        // The eraser on the picked paint layer erases with a stroke.
+        store.board_tool.set(Tool::Eraser);
+        mouse_drag(store, (150.0, 100.0), (250.0, 100.0));
+        let all = strokes();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].1.blend, pimble_board::StrokeBlend::Erase);
+        assert_eq!(all[2].0, *layer_id);
+
+        // Undo takes each stroke back whole, then the first with its layer.
+        tools::undo(store, P[0], false);
+        assert_eq!(strokes().len(), 2);
+        tools::undo(store, P[0], false);
+        assert_eq!(strokes().len(), 1);
+        tools::undo(store, P[0], false);
+        assert_eq!(strokes().len(), 0);
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before, "the layer went with its first stroke");
+        stop(store, P[0]);
+    }
+
+    /// Alt held with a brush picks the color under the press instead of
+    /// painting.
+    #[test]
+    fn alt_with_a_brush_picks_a_color() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let st = store.board_style;
+        st.stroke.set("#2050e0".to_string());
+        store.board_tool.set(Tool::Brush);
+        mouse_drag(store, on_screen(Point::new(0.0, 0.0)), on_screen(Point::new(200.0, 0.0)));
+        assert_eq!(strokes().len(), 1);
+        st.stroke.set("#000000".to_string());
+        let alt = rinch::render_surface::SurfaceKeyData { key: "Alt".into(), code: "AltLeft".into(), ctrl: false, shift: false, alt: true, meta: false };
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(alt.clone()));
+        mouse_click(store, on_screen(Point::new(100.0, 0.0)));
+        assert_eq!(strokes().len(), 1, "nothing painted");
+        assert_eq!(untracked(|| st.stroke.get()), "#2050e0");
+        tools::on_event(store, P[0], SurfaceEvent::KeyUp(alt));
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Brush);
+        stop(store, P[0]);
+    }
+
+    /// The highlighter over a picture paints into a "Highlights" layer
+    /// right above the picture's (multiply), and hiding the markup hides it.
+    #[test]
+    fn the_highlighter_marks_a_picture_in_a_highlights_layer() {
+        let url = BlobUrl::parse("pimble-blob:00000000-0000-0000-0000-000000000001/aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut doc = NodeDoc::new();
+        doc.init(node_types::BOARD, "Shot", None, "2026-10-09T10:00:00.000Z").unwrap();
+        doc.apply_update(&new_board(Some((&url, 640, 480))).unwrap()).unwrap();
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &doc.save());
+        store.board_tool.set(Tool::Highlighter);
+        let from = on_screen(Point::new(100.0, 100.0));
+        let to = on_screen(Point::new(300.0, 100.0));
+        mouse_drag(store, from, to);
+        let all = strokes();
+        assert_eq!(all.len(), 1);
+        let (picture_layer, rows) = with_session(P[0], |s| {
+            let snapshot = s.snapshot();
+            (snapshot.elements[0].layer.clone(), layers::rows_of(snapshot))
+        })
+        .unwrap();
+        // Top first: the Highlights row sits right above the picture's.
+        let at = rows.iter().position(|r| r.id == picture_layer).unwrap();
+        assert!(at > 0);
+        assert_eq!(rows[at - 1].id, all[0].0);
+        assert_eq!(rows[at - 1].name, pimble_board::doc::HIGHLIGHTS_LAYER_NAME);
+        assert_eq!(rows[at - 1].blend, pimble_board::Blend::Multiply);
+        // Its yellow, not the marks' red.
+        assert_eq!(all[0].1.color, pimble_board::brush::HIGHLIGHTER.color);
+        // Hiding the markup hides it.
+        toggle_markup(store, P[0]);
+        let shown = with_session(P[0], |s| {
+            let snapshot = s.snapshot();
+            let i = snapshot.layers.iter().position(|l| l.id == all[0].0).unwrap();
+            snapshot.paint_shown(i)
+        })
+        .unwrap();
+        assert!(!shown);
         stop(store, P[0]);
     }
 

@@ -933,6 +933,7 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
     let scale = scale_of(pane);
     let tool = untracked(|| store.board_tool.get());
     let color = Color::parse(OVERLAY_COLOR).unwrap_or(EditOverlay::default().color);
+    let brush = if tool.paints() { super::paint::cursor_size(store) } else { None };
     with_session(pane, |s| {
         // Points of an element that went are no longer shown.
         if s.points.as_ref().is_some_and(|pe| s.snapshot().get(&pe.id).is_none()) {
@@ -946,6 +947,9 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
             // The selected element's gradient handles, while the well's
             // picker edits its gradient.
             super::gradient::shown(store, pane, s).map(|sh| super::gradient::overlay(&sh))
+        } else if let Some(size) = brush {
+            // The brush cursor: a circle of the brush's size.
+            super::paint::cursor_overlay(s, size, scale)
         } else {
             None
         };

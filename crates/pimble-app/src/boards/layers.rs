@@ -256,6 +256,22 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
             ui.layer.set(Some(id));
         }
     });
+    let new_paint = small_button(__scope, TablerIcon::Brush, "New Paint Layer (above the picked one)", move || {
+        let rows = untracked(|| ui.layers.get());
+        let above = untracked(|| ui.layer.get());
+        let parent = above.as_ref().and_then(|id| rows.iter().find(|r| &r.id == id)).and_then(|r| r.parent.clone());
+        let name = (1..).map(|n| format!("Paint {n}")).find(|name| !rows.iter().any(|r| &r.name == name)).unwrap_or_default();
+        let made = layer_edit(store, pane, |t| {
+            let placement = match &above {
+                Some(id) => Placement::Above(id.clone()),
+                None => Placement::Top,
+            };
+            t.add_layer_in(&name, LayerKind::Paint, parent.as_deref(), placement)
+        });
+        if let Some(id) = made {
+            ui.layer.set(Some(id));
+        }
+    });
     let new_group = small_button(__scope, TablerIcon::FolderPlus, "New Group (above the picked layer)", move || {
         let rows = untracked(|| ui.layers.get());
         let count = rows.iter().filter(|r| r.is_group()).count();
@@ -341,7 +357,7 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
             },
             div {
                 class: "pimble-board__layers",
-                for (row, v, class_id) in row_views(&ui.layers.get(), &ui.folded_groups.get()).into_iter().map(|(r, v)| { let c = r.id.clone(); (r, v, c) }) {
+                for (row, v, class_id, thumb_id) in row_views(&ui.layers.get(), &ui.folded_groups.get()).into_iter().map(|(r, v)| { let c = r.id.clone(); let t = r.id.clone(); (r, v, c, t) }) {
                     div {
                         // A keyed row is drawn once: everything it shows is in its key.
                         key: format!(
@@ -451,6 +467,14 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                             title: v.kind_title,
                             IconGlyph { name: v.kind_glyph }
                         }
+                        // A thumbnail of what the layer holds (drawn again a
+                        // moment after it changes, never per frame).
+                        if !v.group {
+                            img {
+                                class: "pimble-board__layer-thumb",
+                                src: move || ui.thumbs.get().get(&thumb_id).cloned().unwrap_or_else(super::paint::blank_thumb),
+                            }
+                        }
                         {name_cell(__scope, pane, ui, &row)}
                         span {
                             class: "pimble-board__layer-count",
@@ -493,6 +517,7 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
             div {
                 class: "pimble-board__row pimble-board__row--wrap",
                 {new_layer}
+                {new_paint}
                 {new_group}
                 {group_btn}
                 {ungroup_btn}

@@ -11,7 +11,9 @@
 
 use super::export::Format;
 use super::gradient;
+use super::paint;
 use super::tools::{Align2, Order};
+use pimble_board::BrushSettings;
 use super::*;
 use pimble_board::{CombineOp, FlipAxis, GradientKind, Paint};
 use crate::appearance::IconGlyph;
@@ -31,27 +33,31 @@ pub enum Slot {
 }
 
 /// The flyouts' tools, the first of each its face until another is used.
-pub const FLYOUTS: [&[Tool]; 2] = [
+pub const FLYOUTS: [&[Tool]; 3] = [
     // Shapes (Draw).
     &[Tool::Rect, Tool::Ellipse, Tool::Diamond, Tool::Polygon, Tool::Star, Tool::Line, Tool::Arrow],
     // More diagram tools.
     &[Tool::Connector, Tool::Step, Tool::Frame],
+    // The brush and its highlighter preset (Paint).
+    &[Tool::Brush, Tool::Highlighter],
 ];
 
 /// The rail, top to bottom: Select, Direct select and Hand; Draw (the Pen,
-/// the Pencil, the highlighter, which moves to Paint with paint layers, the
-/// shapes, the eraser); Diagram (text, sticky notes, the other diagram
+/// the Pencil, the shapes); Paint (the brush and the highlighter, the
+/// eraser, the eyedropper); Diagram (text, sticky notes, the other diagram
 /// tools, discussion pins); pictures.
-pub const RAIL: [Slot; 15] = [
+pub const RAIL: [Slot; 17] = [
     Slot::Tool(Tool::Select),
     Slot::Tool(Tool::DirectSelect),
     Slot::Tool(Tool::Hand),
     Slot::Gap,
     Slot::Tool(Tool::Pen),
     Slot::Tool(Tool::Pencil),
-    Slot::Tool(Tool::Highlighter),
     Slot::Flyout(0),
+    Slot::Gap,
+    Slot::Flyout(2),
     Slot::Tool(Tool::Eraser),
+    Slot::Tool(Tool::Eyedropper),
     Slot::Gap,
     Slot::Tool(Tool::Text),
     Slot::Tool(Tool::Sticky),
@@ -111,6 +117,14 @@ pub struct Controls {
     pub rule: bool,
     /// The Pencil's smoothing (the tool's, never a selection's).
     pub smoothing: bool,
+    /// A paint tool's: the color it paints with (the well's front square),
+    /// its preset, size, opacity, flow and hardness. The eraser has a size.
+    pub color: bool,
+    pub preset: bool,
+    pub size: bool,
+    pub brush_opacity: bool,
+    pub flow: bool,
+    pub hardness: bool,
 }
 
 impl Controls {
@@ -130,11 +144,17 @@ impl Controls {
             || self.star
             || self.rule
             || self.smoothing
+            || self.color
+            || self.preset
+            || self.size
+            || self.brush_opacity
+            || self.flow
+            || self.hardness
     }
 
     /// Any of the pickers (everything but the two swatches).
     pub fn pickers(&self) -> bool {
-        Controls { stroke: false, fill: false, ..*self }.any()
+        Controls { stroke: false, fill: false, color: false, ..*self }.any()
     }
 
     fn or(self, o: Controls) -> Controls {
@@ -154,6 +174,12 @@ impl Controls {
             star: self.star || o.star,
             rule: self.rule || o.rule,
             smoothing: self.smoothing || o.smoothing,
+            color: self.color || o.color,
+            preset: self.preset || o.preset,
+            size: self.size || o.size,
+            brush_opacity: self.brush_opacity || o.brush_opacity,
+            flow: self.flow || o.flow,
+            hardness: self.hardness || o.hardness,
         }
     }
 }
@@ -201,6 +227,13 @@ pub fn controls_for(kinds: &[Kind]) -> Controls {
 /// makes takes, and the Pencil's smoothing. The Pen makes paths, whose fill
 /// rule is only a selected path's.
 pub fn controls_of_tool(tool: Tool) -> Controls {
+    match tool {
+        Tool::Brush | Tool::Highlighter => {
+            return Controls { color: true, preset: true, size: true, brush_opacity: true, flow: true, hardness: true, ..Controls::default() };
+        }
+        Tool::Eraser => return Controls { size: true, ..Controls::default() },
+        _ => {}
+    }
     let mut c = tool.kind().map(|k| controls_of(&k)).unwrap_or_default();
     c.rule = false;
     c.smoothing = tool == Tool::Pencil;
@@ -223,6 +256,7 @@ pub fn hint(tool: Tool) -> &'static str {
         Tool::DirectSelect => "Click a path or shape to edit its points; double-click adds or smooths one",
         Tool::Hand => "Drag to move around (Space held does it with any tool)",
         Tool::Eraser => "Drag across marks to erase them",
+        Tool::Eyedropper => "Click to pick the color under the pointer (Alt with a brush does it too)",
         Tool::Pin => "Click to start a discussion there",
         Tool::Frame => "Drag out a frame; what it covers goes with it",
         _ => "",
@@ -289,6 +323,8 @@ pub enum KeyAct {
     /// Shift+H or Shift+V: flip the selection (with nothing selected, the
     /// letter's tool).
     Flip(FlipAxis),
+    /// `[` (false) or `]` (true): a paint tool's size.
+    Bracket(bool),
 }
 
 /// The chrome's key judgement, pure: plain letters, X and Tab from the
@@ -298,6 +334,8 @@ pub fn key_act(keys: Keys, key: &str, ctrl: bool, shift: bool, alt: bool) -> Opt
         Keys::Chrome if !ctrl && !alt => match key {
             "Tab" => Some(KeyAct::TogglePanels),
             "x" | "X" => Some(KeyAct::Swap),
+            "[" => Some(KeyAct::Bracket(false)),
+            "]" => Some(KeyAct::Bracket(true)),
             k if shift && tools::flip_key(k).is_some() => tools::flip_key(k).map(KeyAct::Flip),
             k => Tool::from_key(k).map(KeyAct::Tool),
         },
@@ -336,6 +374,11 @@ pub(super) fn keys_to(store: AppStore, pane: PaneId, keys: Keys) {
             KeyAct::Flip(axis) if untracked(|| ui.selected.get()) > 0 => tools::flip(store, pane, axis),
             KeyAct::Flip(FlipAxis::Horizontal) => pick_tool(store, pane, Tool::Hand),
             KeyAct::Flip(FlipAxis::Vertical) => pick_tool(store, pane, Tool::Select),
+            KeyAct::Bracket(larger) => {
+                if untracked(|| store.board_tool.get()).paints() {
+                    super::paint::step_size(store, pane, larger);
+                }
+            }
         });
         true
     });
@@ -829,6 +872,44 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let detail_btn = picker_button(__scope, ui, "Stroke ends and corners, fill rule", Popup::Detail, "", detail_face);
     let smoothing_btn = picker_button(__scope, ui, "Smoothing", Popup::Smoothing, "pimble-board__chooser--words", smoothing_face);
 
+    // A paint tool's: the color it paints with (the color well's front
+    // square), its preset, size, opacity, flow and hardness.
+    let brush_swatch = rsx! {
+        div {
+            title: "Brush color: the color well's front square (the eyedropper, or Alt held while painting, picks one)",
+            class: "pimble-board__ctx-color pimble-board__ctx-brush",
+            style: {move || format!("background: {};", paint::brush_color(store).to_hex())},
+            onclick: move || ui.popup.set(Popup::Well),
+        }
+    };
+    let presets: Vec<NodeHandle> = paint::preset_choices()
+        .into_iter()
+        .map(|(name, label)| {
+            text_button(__scope, label, "Brush preset", move || paint::current_preset(store).map(|p| p.name) == Some(name), move || {
+                paint::pick_preset(store, name);
+                ui.popup.set(Popup::None);
+            })
+        })
+        .collect();
+    let setting = move |read: fn(&BrushSettings) -> f32| paint::current_settings(store).map(|s| read(&s)).unwrap_or(0.0);
+    let preset_face = rsx! {
+        span { class: "pimble-board__face-text", {move || paint::current_preset(store).map(|p| p.label).unwrap_or("")} }
+    };
+    let size_face = rsx! { span { class: "pimble-board__face-text", {move || size_label(setting(|s| s.size))} } };
+    let brush_opacity_face = rsx! { span { class: "pimble-board__face-text", {move || format!("{}%", (setting(|s| s.opacity) * 100.0).round())} } };
+    let flow_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Flow {}%", (setting(|s| s.flow) * 100.0).round())} } };
+    let hardness_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Hard {}%", (setting(|s| s.hardness) * 100.0).round())} } };
+    let preset_btn = picker_button(__scope, ui, "Brush preset", Popup::Preset, "pimble-board__chooser--words", preset_face);
+    let size_btn = picker_button(__scope, ui, "Size ([ and ] change it)", Popup::BrushSize, "pimble-board__chooser--number", size_face);
+    let brush_opacity_btn = picker_button(__scope, ui, "Opacity of the stroke", Popup::BrushOpacity, "pimble-board__chooser--number", brush_opacity_face);
+    let flow_btn = picker_button(__scope, ui, "Flow: how much paint each dab lays down", Popup::Flow, "pimble-board__chooser--words", flow_face);
+    let hardness_btn = picker_button(__scope, ui, "Hardness of the brush's edge", Popup::Hardness, "pimble-board__chooser--words", hardness_face);
+    // The size slider is logarithmic: fine steps where brushes are small.
+    let size_row = paint_slider(__scope, store, 0, "Size", (0.0, 1.0, 0.005), |s| size_to_slider(s.size), |s, v| s.size = slider_to_size(v), |s| size_label(s.size));
+    let brush_opacity_row = paint_slider(__scope, store, 1, "Opacity", (0.05, 1.0, 0.05), |s| s.opacity as f64, |s, v| s.opacity = v as f32, |s| format!("{}%", (s.opacity * 100.0).round()));
+    let flow_row = paint_slider(__scope, store, 2, "Flow", (0.02, 1.0, 0.02), |s| s.flow as f64, |s, v| s.flow = v as f32, |s| format!("{}%", (s.flow * 100.0).round()));
+    let hardness_row = paint_slider(__scope, store, 3, "Hardness", (0.0, 1.0, 0.05), |s| s.hardness as f64, |s, v| s.hardness = v as f32, |s| format!("{}%", (s.hardness * 100.0).round()));
+
     // The selection's arrangement.
     let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
     let duplicate = act(__scope, TablerIcon::Copy, "Duplicate (Ctrl+D)", tools::duplicate);
@@ -952,6 +1033,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().stroke)}, {stroke_swatch} }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().fill)}, {fill_swatch} }
+                    div { class: "pimble-board__ctx-group", style: {move || shown(controls().color)}, {brush_swatch} }
                     div { class: "pimble-board__ctx-group pimble-board__ctx-sep", style: {move || shown(controls().pickers())},
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().width)}, {width_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().dash)}, {dash_btn} }
@@ -962,6 +1044,11 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().radius || controls().sides || controls().star)}, {shape_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().cap || controls().join || controls().rule)}, {detail_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().smoothing)}, {smoothing_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().preset)}, {preset_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().size)}, {size_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().brush_opacity)}, {brush_opacity_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().flow)}, {flow_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().hardness)}, {hardness_btn} }
                     }
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
@@ -1053,6 +1140,11 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                 }
             }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Smoothing)}, {smoothings} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Preset)}, {presets} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::BrushSize)}, {size_row} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::BrushOpacity)}, {brush_opacity_row} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Flow)}, {flow_row} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Hardness)}, {hardness_row} }
         }
     }
 }
@@ -1071,6 +1163,86 @@ fn mirror(store: AppStore, slot: usize, read: fn(&StyleUi) -> f64) -> Signal<f64
     let _ = rinch::Effect::new(move || {
         let v = read(&st);
         untracked(|| sig.set_if_changed(v));
+    });
+    SIGNALS.with(|s| s.borrow_mut()[slot] = Some(sig));
+    sig
+}
+
+/// A brush size as the context bar shows it: whole units, halves below ten.
+pub fn size_label(size: f32) -> String {
+    if size < 10.0 && (size.fract() - 0.5).abs() < 0.01 {
+        format!("{size:.1}")
+    } else {
+        format!("{}", size.round())
+    }
+}
+
+/// The size slider's place for a brush size: logarithmic over the sizes it
+/// offers, so small brushes get fine steps.
+pub fn size_to_slider(size: f32) -> f64 {
+    let (lo, hi) = paint::SIZE_RANGE;
+    ((size.clamp(lo, hi) / lo).ln() / (hi / lo).ln()) as f64
+}
+
+/// The brush size at a place of the size slider (whole units above ten,
+/// halves below).
+pub fn slider_to_size(v: f64) -> f32 {
+    let (lo, hi) = paint::SIZE_RANGE;
+    let size = lo * (hi / lo).powf(v.clamp(0.0, 1.0) as f32);
+    if size < 10.0 {
+        (size * 2.0).round() / 2.0
+    } else {
+        size.round()
+    }
+}
+
+/// A slider row of a paint setting's popup (`slot`: its mirror), with its
+/// label and value.
+#[allow(clippy::too_many_arguments)]
+fn paint_slider(
+    __scope: &mut RenderScope,
+    store: AppStore,
+    slot: usize,
+    label: &'static str,
+    (min, max, step): (f64, f64, f64),
+    read: fn(&BrushSettings) -> f64,
+    write: fn(&mut BrushSettings, f64),
+    shown: fn(&BrushSettings) -> String,
+) -> NodeHandle {
+    let value = paint_mirror(store, slot, read);
+    rsx! {
+        div { class: "pimble-board__row",
+            span { class: "pimble-board__ctx-label", {label} }
+            div { class: "pimble-board__ctx-slider",
+                Slider {
+                    min: min,
+                    max: max,
+                    step: step,
+                    size: "xs",
+                    value_signal: Some(value),
+                    onchange: move |v: f64| paint::change_settings(store, |s| write(s, v)),
+                }
+            }
+            span { class: "pimble-board__ctx-number", {move || paint::current_settings(store).map(|s| shown(&s)).unwrap_or_default()} }
+        }
+    }
+}
+
+/// A paint setting mirrored onto its slider (slot `slot`), so the slider
+/// follows the tool, the preset and `[`/`]`.
+fn paint_mirror(store: AppStore, slot: usize, read: fn(&BrushSettings) -> f64) -> Signal<f64> {
+    thread_local! {
+        static SIGNALS: RefCell<[Option<Signal<f64>>; 4]> = const { RefCell::new([None, None, None, None]) };
+    }
+    if let Some(sig) = SIGNALS.with(|s| s.borrow()[slot]) {
+        return sig;
+    }
+    let sig = Signal::new(untracked(|| paint::current_settings(store)).map(|s| read(&s)).unwrap_or(0.0));
+    let _ = rinch::Effect::new(move || {
+        if let Some(s) = paint::current_settings(store) {
+            let v = read(&s);
+            untracked(|| sig.set_if_changed(v));
+        }
     });
     SIGNALS.with(|s| s.borrow_mut()[slot] = Some(sig));
     sig
@@ -1403,31 +1575,38 @@ mod tests {
     #[test]
     fn flyouts_remember_the_tool_last_used() {
         let faces = default_faces();
-        assert_eq!(faces, vec![Tool::Rect, Tool::Connector]);
+        assert_eq!(faces, vec![Tool::Rect, Tool::Connector, Tool::Brush]);
         assert_eq!(flyout_of(Tool::Star), Some(0));
         assert_eq!(flyout_of(Tool::Polygon), Some(0));
         let faces = remember_face(&faces, Tool::Ellipse);
-        assert_eq!(faces, vec![Tool::Ellipse, Tool::Connector]);
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Connector, Tool::Brush]);
         // A tool outside every flyout changes no face.
         assert_eq!(remember_face(&faces, Tool::Pen), faces);
         let faces = remember_face(&faces, Tool::Frame);
-        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame]);
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Brush]);
+        // The highlighter is the Paint flyout's other face.
+        let faces = remember_face(&faces, Tool::Highlighter);
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Highlighter]);
         // Faces of the wrong shape start again from the defaults.
-        assert_eq!(remember_face(&[], Tool::Step), vec![Tool::Rect, Tool::Step]);
+        assert_eq!(remember_face(&[], Tool::Step), vec![Tool::Rect, Tool::Step, Tool::Brush]);
         assert_eq!(flyout_of(Tool::Arrow), Some(0));
         assert_eq!(flyout_of(Tool::Text), None);
+        assert_eq!(flyout_of(Tool::Eraser), None);
     }
 
     #[test]
     fn tips_name_the_letter() {
-        assert_eq!(tip(Tool::Rect), "Rectangle (R)");
+        assert_eq!(tip(Tool::Rect), "Rectangle (U)");
+        assert_eq!(tip(Tool::Brush), "Brush (B)");
+        assert_eq!(tip(Tool::Eyedropper), "Eyedropper (I)");
         assert_eq!(tip(Tool::Pin), "Discussion pin (Q)");
         assert_eq!(tip(Tool::Pen), "Pen (P)");
         assert_eq!(tip(Tool::DirectSelect), "Direct select (A)");
         assert_eq!(tip(Tool::Pencil), "Pencil (N)");
     }
 
-    /// Every tool has its own letter, and the contract's P, A and N.
+    /// Every tool has its own letter, and the contract's P, A and N, B, E
+    /// and I; G and R wait for wave 5's Fill and Smudge.
     #[test]
     fn every_tool_has_its_own_letter() {
         for tool in Tool::ALL {
@@ -1437,6 +1616,41 @@ mod tests {
         assert_eq!(Tool::from_key("P"), Some(Tool::Pen));
         assert_eq!(Tool::from_key("a"), Some(Tool::DirectSelect));
         assert_eq!(Tool::from_key("n"), Some(Tool::Pencil));
+        assert_eq!(Tool::from_key("b"), Some(Tool::Brush));
+        assert_eq!(Tool::from_key("e"), Some(Tool::Eraser));
+        assert_eq!(Tool::from_key("I"), Some(Tool::Eyedropper));
+        assert_eq!(Tool::from_key("g"), None, "Fill, wave 5");
+        assert_eq!(Tool::from_key("r"), None, "Smudge, wave 5");
+        assert_eq!(Tool::from_key("u"), Some(Tool::Rect));
+        assert_eq!(Tool::from_key("y"), Some(Tool::Polygon));
+        assert_eq!(Tool::from_key("j"), Some(Tool::Step));
+    }
+
+    #[test]
+    fn paint_tools_offer_their_settings() {
+        let brush = controls_of_tool(Tool::Brush);
+        assert!(brush.color && brush.preset && brush.size && brush.brush_opacity && brush.flow && brush.hardness);
+        assert!(!brush.stroke && !brush.fill && !brush.width && !brush.opacity, "the brush's own, not a shape's");
+        assert_eq!(controls_of_tool(Tool::Highlighter), brush);
+        let eraser = controls_of_tool(Tool::Eraser);
+        assert!(eraser.size && !eraser.color && !eraser.preset);
+        assert!(!controls_of_tool(Tool::Eyedropper).any());
+        assert!(!hint(Tool::Eyedropper).is_empty());
+        assert!(Tool::Brush.paints() && Tool::Highlighter.paints() && Tool::Eraser.paints());
+        assert!(!Tool::Eyedropper.paints() && !Tool::Pencil.paints());
+    }
+
+    #[test]
+    fn the_size_slider_is_logarithmic() {
+        assert_eq!(slider_to_size(0.0), paint::SIZE_RANGE.0);
+        assert_eq!(slider_to_size(1.0), paint::SIZE_RANGE.1);
+        for size in [1.0, 2.5, 8.0, 24.0, 60.0, 250.0] {
+            assert!((slider_to_size(size_to_slider(size)) - size).abs() <= 0.5, "{size}");
+        }
+        // The middle of the slider is a small brush, not a huge one.
+        assert!(slider_to_size(0.5) < 20.0);
+        assert_eq!(size_label(2.5), "2.5");
+        assert_eq!(size_label(12.0), "12");
     }
 
     #[test]
@@ -1475,12 +1689,15 @@ mod tests {
 
     #[test]
     fn the_chrome_hears_the_canvas_keys() {
-        assert_eq!(key_act(Keys::Chrome, "r", false, false, false), Some(KeyAct::Tool(Tool::Rect)));
+        assert_eq!(key_act(Keys::Chrome, "u", false, false, false), Some(KeyAct::Tool(Tool::Rect)));
         assert_eq!(key_act(Keys::Chrome, "p", false, false, false), Some(KeyAct::Tool(Tool::Pen)));
         assert_eq!(key_act(Keys::Chrome, "a", false, false, false), Some(KeyAct::Tool(Tool::DirectSelect)));
         assert_eq!(key_act(Keys::Chrome, "N", false, true, false), Some(KeyAct::Tool(Tool::Pencil)));
         assert_eq!(key_act(Keys::Chrome, "X", false, true, false), Some(KeyAct::Swap));
         assert_eq!(key_act(Keys::Chrome, "Tab", false, false, false), Some(KeyAct::TogglePanels));
+        assert_eq!(key_act(Keys::Chrome, "[", false, false, false), Some(KeyAct::Bracket(false)));
+        assert_eq!(key_act(Keys::Chrome, "]", false, false, false), Some(KeyAct::Bracket(true)));
+        assert_eq!(key_act(Keys::Chrome, "b", false, false, false), Some(KeyAct::Tool(Tool::Brush)));
         // Shift+H and Shift+V flip; plain H and V are their tools.
         assert_eq!(key_act(Keys::Chrome, "H", false, true, false), Some(KeyAct::Flip(FlipAxis::Horizontal)));
         assert_eq!(key_act(Keys::Chrome, "V", false, true, false), Some(KeyAct::Flip(FlipAxis::Vertical)));

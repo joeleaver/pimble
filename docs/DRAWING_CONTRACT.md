@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1, 2 and 3 built (model and UI); wave 4 model built, its UI next** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1, 2, 3 and 4 built (model and UI); wave 5 next** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -1199,3 +1199,142 @@ Merge Down across kinds and Merge Group with paint (wave 5). Dab shapes other th
 smoothing, a live preview of the stroke between appends (each append goes through the
 document). Pictures in text replay their paint on every render (each render builds its
 snapshot, so its cache is new); a cache shared per board on that thread would keep it.
+
+## Built in wave 4 (UI)
+
+Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model above;
+`crates/pimble-board` is not touched.
+
+Wave 4 (Joe, 2026-11-17, accepting the defaults offered):
+
+10. **The highlighter always paints into a multiply "Highlights" layer**
+    (`highlights_layer`), over a picture or not.
+11. **Hiding markup hides the Highlights layer too** (the model's rule for every paint
+    layer).
+12. **The tile cache**: 256 MB in memory; on the desktop a disk cache under the user's
+    cache folder, pruned to 512 MB when the app starts.
+
+- **Files**: `boards/paint.rs` (new: presets and settings, pressure, `[`/`]`, a stroke's
+  press, appends, release and cancel, the held outbox, the eyedropper, the brush cursor,
+  the shared tile cache, the layers' thumbnails), `boards.rs` (`Tool::Brush`,
+  `Tool::Eyedropper`, `StyleUi.brush`/`brushes`/`eraser_size`, `Popup::Preset`,
+  `BrushSize`, `BrushOpacity`, `Flow`, `Hardness`, `PaneUi.thumbs`, `Gesture::Paint` and
+  `Eyedrop`, the session's `outbox`, `version`, `paint_pressure`; `pictures_of` reads
+  `picture_srcs()`, so `pixels` operations load their pictures, and a picture that
+  arrives redraws them), `boards/tools.rs` (routing, pressure, keys), `boards/rail.rs`
+  (the Paint group, the context bar's paint pickers, `[`/`]` from the chrome),
+  `boards/layers.rs` (thumbnails, New Paint Layer), `boards/points.rs` (the cursor in the
+  edit overlay), `text_boards.rs` (the shared cache), `styles.rs`.
+- **Tools and letters**: the rail is Select (V), Direct select (A), Hand (H) | Pen (P),
+  Pencil (N), the shapes flyout (Rectangle U, Ellipse O, Diamond D, Polygon Y, Star K,
+  Line L, Arrow W) | the Paint flyout (Brush B, Highlighter M), Eraser (E), Eyedropper (I) |
+  Text (T), Sticky note (S), the diagram flyout (Connector C, Numbered step J, Frame F),
+  Discussion pin (Q) | pictures. **G and R are unbound**, kept for wave 5's Fill and Smudge
+  (Shift+R Blur). **Moved**: Rectangle R to U (the contract's shapes letter), Polygon G to
+  Y, Numbered step I to J. Every tool still has its own letter (tested). Wave 5's M and L
+  (paint selections) collide with the Highlighter and the Line; that wave decides.
+- **The Highlighter is the brush's highlighter preset** (decision 3): a tool of its own
+  only so the Paint flyout can show it as a face and M can pick it. It paints with the
+  `highlighter` preset into `highlights_layer(picture)`: the picture under the press (a
+  picture in a locked layer counts), else, while marking up a picture in text, that
+  picture, else `None` (the bottom of the canvas). It leaves the layers panel's pick
+  alone. Picking "Highlighter" in the brush's preset picker picks the tool; picking any
+  other preset there picks the Brush. Old vector highlighter strokes stay elements and
+  are selected and styled as before; nothing makes new ones.
+- **A stroke** (Brush, Highlighter, Eraser in a paint layer), the model's recommended
+  flow: on the press one edit with the layer (`paint_layer_for(picked)` for the brush,
+  which picks the answered layer in the panel, so "Paint 1" made by the first stroke is
+  picked) and `begin_stroke` with the first point, sent at once; each pointer move
+  appends its point to the document here at once (`append_stroke`; the view redraws only
+  the new dabs) and the updates are kept in the session's outbox and sent merged
+  (`yrs::merge_updates_v1`) about every 100 ms (a timer sends what a still pointer left);
+  the release appends its point and `end_stroke`s, and sends the rest. The undo clock is
+  held from the press to the release: **a stroke is one undo step**, and a stroke that
+  made its layer takes the layer back with it (tested). A cancelled pointer, the first
+  finger of a pinch or Escape deletes the operation (unlike the vector pen, whose element
+  is written only after its first 100 ms, the stroke's begin was already sent, so a
+  cancel sends a delete). Closing the pane mid-stroke ends the stroke.
+- **Settings**: the color is the color well's **front square** (a gradient's first color;
+  the highlighter left on the marks' red paints its own yellow); each preset keeps its own
+  size, opacity, flow and hardness for the session (`StyleUi.brushes`, starting from the
+  preset); the stroke stores them whole (`NewStroke::with_settings`). The eraser is the
+  round brush at its own size (`eraser_size`, 24 units first).
+- **Pressure**: a pen's (and a pen's eraser end's) pressure as rinch reports it, a
+  moment of none mid-stroke keeping the last; a mouse and a finger paint at 1 (a touch
+  screen without force sensing reports 0.5 whatever the touch). **Tilt is always 0**:
+  rinch's `SurfacePointer` carries no tilt (a rinch mechanism to add, not done here).
+- **Context bar** for the Brush and the Highlighter: the brush color (a disc; a click opens
+  the well), then pickers in the `picker_button` style: the preset (its label; the eight
+  presets as chips), the size (a logarithmic slider, 1 to 250 units, halves below ten),
+  the opacity, "Flow N%", "Hard N%" (each a slider with its value). The Eraser shows its
+  size only; the Eyedropper a hint. The bar is about 460 pixels wide for the brush.
+- **Keys**: B, M, E, I; `[` and `]` make the brush (or the eraser) about a fifth smaller
+  or larger, at least a unit (`paint::next_size`, tested), on the canvas and from the
+  chrome (`KeyAct::Bracket`); Ctrl+`[`/`]` still order the selection. **Alt held with the
+  Brush or the Highlighter picks colors**: a press is the eyedropper's (the surface
+  tracks Alt from its keys, pointer events carry no modifiers).
+- **Eraser**: by the picked layer's kind: a paint layer is erased with an erasing stroke
+  (`NewStroke::erasing()`, the eraser's size), a locked one is refused with the layer's
+  sentence; a vector layer loses whole elements as before. **With nothing picked**: an
+  element under the press is erased as before, else the topmost shown, unlocked paint
+  layer painting there is erased with a stroke (a pen's eraser end does the same with any
+  tool).
+- **Eyedropper**: a press (and a drag, and the release) reads `BoardView::color_at`
+  (what the person sees, background included), `sample_color` over the background when
+  the view has no settled pixels there; the color goes into the well's front square
+  (its gradient cleared) and the recent colors. **Deviation**: it does not write the
+  selection's style as picking a color in the well does: picking is looking.
+- **Brush cursor**: a circle of the brush's (or eraser's) size at full pressure where the
+  pointer is, drawn as four cubic curves of wave 2's edit overlay (at least 3 logical
+  pixels across), hidden while panning, while Alt picks, and when the pointer leaves.
+- **The tile cache**: one `PaintCache` for the app (`boards::shared_paint_cache`):
+  every board pane (`BoardView::set_paint_cache`), the navigator, exports, the thumbnails
+  and pictures in text (`text_boards::draw` hands each render's snapshot the shared
+  cache, so a picture in text keeps its tiles between renders and shares them with a
+  pane showing the same canvas: the model's "not built" line). Tiles are keyed by layer
+  and operations, so one cache for every board is safe; 256 MB. **Desktop**: a
+  `DirTileStore` at `<cache dir>/pimble/tiles` (one folder for every board, as
+  `DirTileStore` keys tiles), pruned to 512 MB on a background thread when the cache is
+  first made (the first canvas shown in a run), not again per store opened. **Browser**:
+  memory only; **the IndexedDB tile store is not built** (IndexedDB is asynchronous and
+  `TileStore::load` must answer at once, so it needs a prefetch layer: not small). Tests
+  use memory only.
+- **Layers panel**: a **thumbnail per layer** between the kind icon and the name (48 ×
+  36 pixels shown at 24 × 18, a `data:` PNG in an `<img>`): a paint layer through
+  `render_paint_layer` (from the shared tiles), a vector layer through `render_area`
+  limited to its elements; groups have none. They are drawn a moment (600 ms) after the
+  board stops changing and no gesture is under way, only for layers whose operations or
+  elements' fingerprints changed, off the UI thread on the desktop; never per frame. The
+  paint layer's row counts its operations. **New Paint Layer** (a brush icon) beside New
+  Layer makes "Paint N" above the picked layer, in its group, and picks it.
+- **Tests**: the preset picker's data and the highlighter as its own tool, pressure (a
+  mouse 1, a pen its own, a pen's nothing kept), `[`/`]` steps, the cursor's circle, the
+  thumbnail box (`paint.rs`); the Paint group's flyout and faces, letters (G and R free),
+  the paint tools' controls, the logarithmic size slider, `[`/`]` from the chrome
+  (`rail.rs`); pointer events on the highlighter (pressure stored, a mouse at 1, the
+  Highlights layer multiply and reused, appends batched, a cancel and a pinch leave
+  nothing, the pen's eraser end erasing paint with a stroke); the brush making a picked
+  "Paint 1" with its preset, color and settings, `]` sizing the next stroke, the
+  eyedropper picking the stroke's green, the eraser on the picked paint layer, undo stroke
+  by stroke and the layer with the first; the highlighter over a picture making
+  "Highlights" right above the picture's layer and hidden with the markup, Alt with the
+  brush picking instead of painting (`boards.rs`); the highlighter on a picture in text
+  minting the board and painting into its Highlights (`text_boards.rs`).
+- **Checked in the test app** (desktop, scratch store, a 1200-pixel window): strokes with
+  Round, Watercolor, Charcoal and Airbrush (the context bar fits with room to spare), the
+  eraser across three of them with `]` twice (24 to 35), the eyedropper taking a blue off
+  a gradient rectangle and an Ink stroke in it, that stroke undone whole, "Paint 1" made
+  and picked with its thumbnail, a picture inserted and highlighted twice from the Paint
+  flyout's Highlighter (a "Highlights" layer right above the picture's, Multiply, its
+  yellow multiplied to green over blue), the brush cursor at each size; the app
+  restarted twice: tiles written under `<cache dir>/pimble/tiles` by the first run were
+  neither written again nor added to by the second reopen (the painting came from disk).
+  Alt picking and pictures in text are covered by tests only (the driver cannot hold
+  Alt; the markup view is the same session).
+- **Not built**: tilt (rinch has none); the browser's IndexedDB tile store; a live
+  preview between pointer events (each event goes through the document, as the model
+  says); pruning the disk cache when a store opens (only at the first canvas of a run);
+  thumbnails while the panel is folded are still drawn; a brush cursor that shows the
+  pressure's size. **Rough edges**: the cursor can stay drawn where the pointer left the
+  canvas for the floating chrome (the surface hears no leave there); deep layer groups
+  squeeze a row's name now that a thumbnail sits beside it.

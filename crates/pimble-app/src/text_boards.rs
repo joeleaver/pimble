@@ -710,6 +710,10 @@ fn held_picture(blob: &BlobUrl) -> Option<Arc<Vec<u8>>> {
 /// Render a board, off the UI thread on the desktop.
 fn draw(src: String, snapshot: BoardSnapshot, pictures: HashMap<String, Arc<Picture>>, area: Option<Rect>) {
     let width = text_width();
+    // Paint layers draw from the app's one tile cache, so a picture in text
+    // keeps its tiles from one render to the next (each render's snapshot is
+    // new) and shares them with a board pane showing the same canvas.
+    let snapshot = snapshot.with_paint_cache(crate::boards::shared_paint_cache());
     let work = move || -> Option<Vec<u8>> {
         let fit = |rect: &Rect| TEXT_SCALE.min(MAX_TEXT_PX / rect.w.max(rect.h).max(1.0)).min(width / rect.w.max(1.0));
         let rendered = match area {
@@ -1949,6 +1953,31 @@ mod tests {
         assert_eq!(board_snapshot(store_id, node_id, &board).unwrap().markup_count(), 3);
         crate::editor::stop_editing(store, P[0]);
         assert!(!store.pane(P[0]).markup.get());
+    }
+
+    /// The highlighter marks a picture in text (decision 3: it is the
+    /// brush's preset now): the first stroke mints the board as any mark
+    /// does, and paints into a multiply "Highlights" layer right above the
+    /// picture's.
+    #[test]
+    fn the_highlighter_marks_a_picture_in_text() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id, src) = note_with_picture(store, P[0]);
+        let (pos, _) = atoms(P[0]).remove(0);
+        let _ = commands.try_iter().count();
+        crate::boards::start_markup(store, P[0], store_id, node_id, &src, pos, None);
+        crate::boards::highlight_for_test(store, P[0], pimble_board::Point::new(20.0, 20.0), pimble_board::Point::new(200.0, 40.0));
+        let board = atoms(P[0])[0].1.get_str(BOARD_ATTR).map(str::to_string).expect("the picture names its board");
+        let snapshot = board_snapshot(store_id, node_id, &board).expect("the note's board here");
+        assert_eq!(snapshot.paint.len(), 1);
+        let layer = snapshot.layer(&snapshot.paint[0].raw.layer).unwrap();
+        assert_eq!(layer.name, pimble_board::doc::HIGHLIGHTS_LAYER_NAME);
+        assert_eq!(layer.blend, pimble_board::Blend::Multiply);
+        let picture = snapshot.elements.iter().find(|e| e.raw.kind == Kind::Picture).unwrap();
+        let picture_at = snapshot.layers.iter().position(|l| l.id == picture.layer).unwrap();
+        assert_eq!(snapshot.layers[picture_at + 1].id, layer.id, "right above the picture's layer");
+        crate::boards::end_markup(store, P[0]);
+        crate::editor::stop_editing(store, P[0]);
     }
 
     /// The first broadcast of node `node` in `sent`, applied to an empty

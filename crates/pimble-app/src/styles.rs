@@ -2841,6 +2841,17 @@ pub(crate) const APP_CSS: &str = "
     position: relative;
 }
 
+/* The brush's color: a disc (it paints with the well's front square). */
+.pimble-board__ctx-brush {
+    border-radius: 50%;
+}
+
+/* A paint setting's slider in its popup, with its value beside it. */
+.pimble-board__ctx-slider {
+    width: 140px;
+    padding: 0 6px;
+}
+
 /* A gradient stroke: the swatch is painted whole, and a hole in the
    panel's color leaves its ring (border-image is not drawn). */
 .pimble-board__ctx-hole {
@@ -3071,6 +3082,18 @@ pub(crate) const APP_CSS: &str = "
 .pimble-board__layer-kind {
     width: 14px;
     height: 14px;
+}
+
+/* A layer's thumbnail (docs/DRAWING_CONTRACT.md section 4): drawn at twice
+   its size, on a faint panel so a white mark shows. */
+.pimble-board__layer-thumb {
+    width: 24px;
+    height: 18px;
+    flex-shrink: 0;
+    margin: 0 4px 0 2px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 2px;
+    background: var(--rinch-color-default-hover);
 }
 
 /* An eye or lock that a group's own flag decides. */

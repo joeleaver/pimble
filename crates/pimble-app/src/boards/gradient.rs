@@ -311,7 +311,7 @@ pub(super) struct Shown {
 /// Whether the gradient's handles take presses with `tool` (the Pen and
 /// Direct select have their own points, the Hand pans, the eraser erases).
 pub(super) fn handles_with(tool: Tool) -> bool {
-    !matches!(tool, Tool::Pen | Tool::DirectSelect | Tool::Hand | Tool::Eraser)
+    !matches!(tool, Tool::Pen | Tool::DirectSelect | Tool::Hand | Tool::Eraser | Tool::Brush | Tool::Highlighter | Tool::Eyedropper)
 }
 
 /// What [`Shown`] the session has now, judged from what the well shows.
