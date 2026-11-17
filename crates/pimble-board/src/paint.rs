@@ -105,11 +105,35 @@ impl StrokeStyle {
     }
 }
 
+/// A gradient laid over an element's box (its own extent before its
+/// transform, element space): see [`Gradient`] for what the handles mean.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GradientPaint {
+    pub gradient: Gradient,
+    pub bbox: Rect,
+}
+
+impl GradientPaint {
+    fn of(gradient: &Option<Gradient>, bbox: Rect) -> Option<Self> {
+        gradient.as_ref().map(|g| GradientPaint { gradient: g.clone(), bbox: Gradient::box_for(bbox) })
+    }
+
+    /// Its handles in element space, and a radial one's radius there.
+    pub(crate) fn points(&self) -> (Point, Point, f32) {
+        let b = &self.bbox;
+        let at = |p: Point| Point::new(b.x + p.x * b.w, b.y + p.y * b.h);
+        let (from, to) = (at(self.gradient.from), at(self.gradient.to));
+        (from, to, ((to.x - from.x).powi(2) + (to.y - from.y).powi(2)).sqrt())
+    }
+}
+
 /// One thing an element paints.
 pub(crate) enum Op<'a> {
     Fill {
         path: PathRef<'a>,
         color: Color,
+        /// Paints with this instead of `color` (its fallback) when set.
+        gradient: Option<GradientPaint>,
         /// Multiplies the color's alpha.
         opacity: f32,
         rule: FillRule,
@@ -122,6 +146,7 @@ pub(crate) enum Op<'a> {
     Stroke {
         path: PathRef<'a>,
         color: Color,
+        gradient: Option<GradientPaint>,
         opacity: f32,
         stroke: StrokeStyle,
         space: Space,
@@ -133,7 +158,7 @@ pub(crate) enum Op<'a> {
 
 impl<'a> Op<'a> {
     fn fill(path: PathRef<'a>, color: Color, opacity: f32, space: Space) -> Self {
-        Op::Fill { path, color, opacity, rule: FillRule::Winding, space, shadow: false, multiply: false }
+        Op::Fill { path, color, gradient: None, opacity, rule: FillRule::Winding, space, shadow: false, multiply: false }
     }
 
     fn shadow(path: Path, opacity: f32) -> Self {
@@ -144,6 +169,7 @@ impl<'a> Op<'a> {
         Op::Fill {
             path: PathRef::Owned(path),
             color: SHADOW_COLOR,
+            gradient: None,
             opacity,
             rule,
             space: Space::Element,
@@ -153,7 +179,7 @@ impl<'a> Op<'a> {
     }
 
     fn stroke(path: PathRef<'a>, color: Color, opacity: f32, stroke: StrokeStyle, space: Space) -> Self {
-        Op::Stroke { path, color, opacity, stroke, space, multiply: false }
+        Op::Stroke { path, color, gradient: None, opacity, stroke, space, multiply: false }
     }
 }
 
@@ -422,17 +448,29 @@ fn pressure_outline(discs: &[(f32, f32, f32)]) -> Option<Path> {
 
 fn segment_ops<'a>(out: &mut Vec<Op<'a>>, e: &Element, a: Point, b: Point, space: Space) {
     let s = &e.style;
+    // A gradient runs along a line or arrow in its own box (a connector,
+    // drawn in board units, keeps its solid color).
+    let gradient = if space == Space::Element { GradientPaint::of(&s.stroke_gradient, e.pivot_bounds) } else { None };
     let (heads, a2, b2) = segment_parts(s, a, b);
     for tri in heads {
         if let Some(path) = polygon_path(&tri) {
-            out.push(Op::fill(PathRef::Owned(path), s.stroke, e.opacity, space));
+            out.push(Op::Fill {
+                path: PathRef::Owned(path),
+                color: s.stroke,
+                gradient: gradient.clone(),
+                opacity: e.opacity,
+                rule: FillRule::Winding,
+                space,
+                shadow: false,
+                multiply: false,
+            });
         }
     }
     let mut pb = PathBuilder::new();
     pb.move_to(a2.x, a2.y);
     pb.line_to(b2.x, b2.y);
     if let Some(path) = pb.finish() {
-        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), space));
+        out.push(Op::Stroke { path: PathRef::Owned(path), color: s.stroke, gradient, opacity: e.opacity, stroke: StrokeStyle::of(s), space, multiply: false });
     }
 }
 
@@ -473,6 +511,7 @@ fn fill_and_stroke_ops_with<'a>(out: &mut Vec<Op<'a>>, e: &Element, path: Path, 
         out.push(Op::Fill {
             path: PathRef::Owned(path.clone()),
             color: fill,
+            gradient: GradientPaint::of(&s.fill_gradient, e.pivot_bounds),
             opacity: e.opacity,
             rule,
             space: Space::Element,
@@ -481,7 +520,15 @@ fn fill_and_stroke_ops_with<'a>(out: &mut Vec<Op<'a>>, e: &Element, path: Path, 
         });
     }
     if s.width > 0.0 {
-        out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), Space::Element));
+        out.push(Op::Stroke {
+            path: PathRef::Owned(path),
+            color: s.stroke,
+            gradient: GradientPaint::of(&s.stroke_gradient, e.pivot_bounds),
+            opacity: e.opacity,
+            stroke: StrokeStyle::of(s),
+            space: Space::Element,
+            multiply: false,
+        });
     }
 }
 
@@ -505,6 +552,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                     out.push(Op::Fill {
                         path: PathRef::Owned(path),
                         color: fill,
+                        gradient: None,
                         opacity: e.opacity,
                         rule: FillRule::Winding,
                         space: el,
@@ -517,6 +565,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 Some(StrokeShape::Line(path, stroke)) => out.push(Op::Stroke {
                     path: PathRef::Owned(path),
                     color: s.stroke,
+                    gradient: None,
                     opacity: e.opacity,
                     stroke,
                     space: el,
@@ -525,6 +574,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 Some(StrokeShape::Outline(path)) => out.push(Op::Fill {
                     path: PathRef::Owned(path),
                     color: s.stroke,
+                    gradient: None,
                     opacity: e.opacity,
                     rule: FillRule::Winding,
                     space: el,
@@ -569,7 +619,16 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                     out.push(Op::shadow(path.clone(), e.opacity));
                 }
                 let fill = s.fill.unwrap_or(STICKY_YELLOW);
-                out.push(Op::fill(PathRef::Owned(path.clone()), fill, e.opacity, el));
+                out.push(Op::Fill {
+                    path: PathRef::Owned(path.clone()),
+                    color: fill,
+                    gradient: GradientPaint::of(&s.fill_gradient, e.pivot_bounds),
+                    opacity: e.opacity,
+                    rule: FillRule::Winding,
+                    space: el,
+                    shadow: false,
+                    multiply: false,
+                });
                 if s.width > 0.0 {
                     out.push(Op::stroke(PathRef::Owned(path), s.stroke, e.opacity, StrokeStyle::of(s), el));
                 }
@@ -660,6 +719,7 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 out.push(Op::Fill {
                     path: PathRef::Owned(path),
                     color: fill,
+                    gradient: None,
                     opacity: e.opacity,
                     rule: FillRule::EvenOdd,
                     space: Space::Board,

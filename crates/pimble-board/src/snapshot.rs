@@ -1051,6 +1051,21 @@ fn fingerprint(e: &Element) -> u64 {
     for v in [s.width, s.opacity, s.font_size, s.miter, s.radius, s.inner] {
         f(&mut h, v);
     }
+    for g in [&s.fill_gradient, &s.stroke_gradient] {
+        match g {
+            None => 0u8.hash(&mut h),
+            Some(g) => {
+                g.kind.hash(&mut h);
+                for v in [g.from.x, g.from.y, g.to.x, g.to.y] {
+                    f(&mut h, v);
+                }
+                for stop in &g.stops {
+                    f(&mut h, stop.offset);
+                    stop.color.hash(&mut h);
+                }
+            }
+        }
+    }
     if let Some(pattern) = &s.dash_pattern {
         pattern.len().hash(&mut h);
         for v in pattern {

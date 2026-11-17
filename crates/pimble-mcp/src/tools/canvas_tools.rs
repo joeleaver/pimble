@@ -19,8 +19,9 @@ use base64::Engine;
 use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
     dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
-    BoardTxn, Cap, CardLabel, Color, Dash, End, Geom, Join, Kind, LayerKind, NewElement, Page, PathGeom, PathRule, Picture,
-    PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform, ViewOptions,
+    BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
+    NewElement, Page, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, SvgPlacement,
+    Transform, ViewOptions,
 };
 use pimble_board::path::{parse_d, to_d};
 use pimble_core::{node_types, BlobUrl, Node, Place, PimbleUrl};
@@ -150,6 +151,44 @@ pub struct StyleSpec {
     /// star: the inner radius as a fraction of the outer, 0 to 1 (default 0.4).
     #[serde(default)]
     pub inner: Option<f32>,
+    /// Fill with a gradient instead of one color (shapes, paths, sticky
+    /// notes, cards). It moves and stretches with the element.
+    #[serde(default)]
+    pub fill_gradient: Option<GradientSpec>,
+    /// Paint the outline or line with a gradient.
+    #[serde(default)]
+    pub stroke_gradient: Option<GradientSpec>,
+}
+
+/// A gradient. Its handles are in the element's own box: [0,0] is its
+/// top-left and [1,1] its bottom-right (before rotation), so [0,0.5] to
+/// [1,0.5] runs left to right across it.
+#[derive(Deserialize, JsonSchema, Clone, Default)]
+pub struct GradientSpec {
+    /// "linear" (the default) or "radial".
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    /// linear: where the first stop lies (default [0,0.5]); radial: the
+    /// center (default [0.5,0.5]).
+    #[serde(default)]
+    pub from: Option<Vec<f32>>,
+    /// linear: where the last stop lies (default [1,0.5]); radial: a point
+    /// on the circle of the last stop (default [1,0.5]: the box's right edge).
+    #[serde(default)]
+    pub to: Option<Vec<f32>>,
+    /// Two or more colors along it, in order: [{"offset": 0, "color":
+    /// "#ff0000"}, {"offset": 1, "color": "#0000ff80"}]. An offset left out
+    /// spreads the stops evenly.
+    pub stops: Vec<StopSpec>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Default)]
+pub struct StopSpec {
+    /// 0 to 1 along the gradient.
+    #[serde(default)]
+    pub offset: Option<f32>,
+    /// "#rrggbb" or "#rrggbbaa".
+    pub color: String,
 }
 
 /// One element to add. Coordinates are canvas units (one unit is one pixel of a
@@ -339,7 +378,8 @@ pub struct ElementChange {
     pub style: Option<StyleSpec>,
     /// Style keys to clear back to the kind's default: stroke, fill, width,
     /// opacity, font_size, align, shadow, arrow_heads, dash (a custom pattern
-    /// too), cap, join, miter, radius, sides, points, inner.
+    /// too), cap, join, miter, radius, sides, points, inner, fill_gradient,
+    /// stroke_gradient (clearing fill or stroke clears its gradient too).
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -383,6 +423,60 @@ pub struct DeleteElementsParams {
     pub canvas: Option<String>,
     /// The ids of the elements to delete.
     pub ids: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CombineElementsParams {
+    pub node: String,
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// Two or more elements (ids) with outlines: shapes, paths, lines
+    /// without arrow heads, pen strokes.
+    pub ids: Vec<String>,
+    /// "union" (everything covered), "subtract" (the bottom-most minus
+    /// everything above it), "intersect" (what all of them cover) or
+    /// "exclude" (what an odd number of them cover).
+    pub op: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FlipElementsParams {
+    pub node: String,
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// The elements (ids); they flip together about the center of all of them.
+    pub ids: Vec<String>,
+    /// "horizontal" (left becomes right) or "vertical" (top becomes bottom).
+    pub direction: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ImportSvgParams {
+    pub node: String,
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// SVG markup (a whole `<svg>` document).
+    #[serde(default)]
+    pub svg: Option<String>,
+    /// Or an .svg file on this computer.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Where the drawing's top-left corner goes, in canvas units (default 0,0).
+    #[serde(default)]
+    pub x: Option<f32>,
+    #[serde(default)]
+    pub y: Option<f32>,
+    /// x and y are where its center goes instead.
+    #[serde(default)]
+    pub center: bool,
+    /// Scale it so its longer side is this long. Left out: one SVG pixel is
+    /// one canvas unit.
+    #[serde(default)]
+    pub size: Option<f32>,
+    /// The layer it goes in (name or id). Left out: the top vector layer that
+    /// is not locked.
+    #[serde(default)]
+    pub layer: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -665,7 +759,52 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         sides: spec.sides.map(|n| n.min(1000)),
         points: spec.points.map(|n| n.min(1000)),
         inner: spec.inner.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0)),
+        fill_gradient: spec.fill_gradient.as_ref().map(|g| gradient_of(g, "fill_gradient")).transpose()?,
+        stroke_gradient: spec.stroke_gradient.as_ref().map(|g| gradient_of(g, "stroke_gradient")).transpose()?,
     })
+}
+
+/// A gradient as an agent writes it.
+fn gradient_of(spec: &GradientSpec, what: &str) -> Result<Gradient, BoardError> {
+    let kind = match spec.kind.as_deref().map(str::trim).unwrap_or("linear") {
+        "" | "linear" => GradientKind::Linear,
+        "radial" => GradientKind::Radial,
+        other => return Err(bad(format!("{what} type \"{other}\" is not linear or radial"))),
+    };
+    if spec.stops.len() < 2 {
+        return Err(bad(format!("{what} takes two stops or more, each {{\"offset\": 0 to 1, \"color\": \"#rrggbb\"}}")));
+    }
+    let last = (spec.stops.len() - 1) as f32;
+    let stops = spec
+        .stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| Ok(GradientStop::new(s.offset.filter(|o| o.is_finite()).unwrap_or(i as f32 / last).clamp(0.0, 1.0), color(&s.color, "a stop's color")?)))
+        .collect::<Result<Vec<_>, BoardError>>()?;
+    let (from0, to0) = match kind {
+        GradientKind::Linear => (Point::new(0.0, 0.5), Point::new(1.0, 0.5)),
+        GradientKind::Radial => (Point::new(0.5, 0.5), Point::new(1.0, 0.5)),
+    };
+    let from = spec.from.as_deref().map(|p| point(p, &format!("{what} from"))).transpose()?.unwrap_or(from0);
+    let to = spec.to.as_deref().map(|p| point(p, &format!("{what} to"))).transpose()?.unwrap_or(to0);
+    let g = Gradient { kind, from, to, stops }.normalized();
+    if !g.is_valid() {
+        return Err(bad(format!("{what}: a radial gradient's `to` must lie away from its center")));
+    }
+    Ok(g)
+}
+
+fn gradient_text(g: &Gradient) -> String {
+    let stops: Vec<String> = g.stops.iter().map(|s| format!("{} at {}", s.color.to_hex(), n2(s.offset))).collect();
+    format!("{} gradient from {},{} to {},{} ({})", g.kind.as_str(), n2(g.from.x), n2(g.from.y), n2(g.to.x), n2(g.to.y), stops.join(", "))
+}
+
+/// A number with up to two decimals (box units, offsets).
+fn n2(v: f32) -> String {
+    let r = (v * 100.0).round() / 100.0;
+    let s = format!("{r:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.to_string() }
 }
 
 /// A path's outline from SVG path data and a fill rule.
@@ -696,6 +835,8 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "sides" => StyleKey::Sides,
         "points" => StyleKey::Points,
         "inner" => StyleKey::Inner,
+        "fill_gradient" => StyleKey::FillGradient,
+        "stroke_gradient" => StyleKey::StrokeGradient,
         other => return Err(bad(format!("\"{other}\" is not a style key"))),
     })
 }
@@ -1159,6 +1300,13 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
         if style.dash.is_some() && raw.style.dash_pattern.is_some() {
             t.clear_style(&id, StyleKey::DashPattern)?;
         }
+        // A solid color (or "none") replaces a gradient (which would win).
+        if style.fill.is_some() && style.fill_gradient.is_none() && raw.style.fill_gradient.is_some() {
+            t.clear_style(&id, StyleKey::FillGradient)?;
+        }
+        if style.stroke.is_some() && style.stroke_gradient.is_none() && raw.style.stroke_gradient.is_some() {
+            t.clear_style(&id, StyleKey::StrokeGradient)?;
+        }
         t.set_style(&id, &style)?;
     }
     for key in &change.clear_style {
@@ -1232,11 +1380,15 @@ fn end_text(end: &End) -> String {
 
 fn style_text(style: &Style) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(c) = style.stroke {
-        out.push(format!("stroke {}", c.to_hex()));
+    match (&style.stroke_gradient, style.stroke) {
+        (Some(g), _) => out.push(format!("stroke {}", gradient_text(g))),
+        (None, Some(c)) => out.push(format!("stroke {}", c.to_hex())),
+        (None, None) => {}
     }
-    if let Some(c) = style.fill {
-        out.push(if c.a == 0 { "no fill".to_string() } else { format!("fill {}", c.to_hex()) });
+    match (&style.fill_gradient, style.fill) {
+        (Some(g), _) => out.push(format!("fill {}", gradient_text(g))),
+        (None, Some(c)) => out.push(if c.a == 0 { "no fill".to_string() } else { format!("fill {}", c.to_hex()) }),
+        (None, None) => {}
     }
     if let Some(w) = style.width {
         out.push(format!("width {}", n(w)));
@@ -2056,6 +2208,110 @@ impl Pimble {
         Ok(out)
     }
 
+    /// Combine two or more elements into one path: "union", "subtract" (the
+    /// bottom-most minus everything above it), "intersect" or "exclude".
+    /// Shapes, paths, lines without arrow heads and pen strokes combine,
+    /// through their rotation and scale. The result takes the place, style,
+    /// note and fields of the top-most one (of the bottom-most for
+    /// subtract) and keeps its id; the others are deleted. One edit.
+    #[tool(name = "combine_elements")]
+    async fn combine_elements(&self, Parameters(p): Parameters<CombineElementsParams>) -> Result<String, String> {
+        let op = CombineOp::parse(p.op.trim()).ok_or_else(|| format!("op \"{}\" is not union, subtract, intersect or exclude.", p.op.trim()))?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
+        let count = ids.len();
+        let kept = self
+            .canvas_edit(&target, Default::default(), move |t, scene, _| {
+                for id in &ids {
+                    if !scene.elements.contains_key(id) {
+                        return Err(bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")));
+                    }
+                }
+                let kept = t.combine(&ids, op)?;
+                scene.touched.push(kept.clone());
+                Ok(kept)
+            })
+            .await?;
+        Ok(format!("Combined {count} elements of {} ({}) into path {kept}; the others are gone.", target.what(), op.as_str()))
+    }
+
+    /// Flip elements horizontally or vertically, together, about the center
+    /// of all of them. Shapes, paths, lines, strokes and pictures are
+    /// mirrored; text, sticky notes, cards, steps, callouts and frames move
+    /// to their mirrored place unmirrored (their words stay readable); a
+    /// group flips what is in it.
+    #[tool(name = "flip_elements")]
+    async fn flip_elements(&self, Parameters(p): Parameters<FlipElementsParams>) -> Result<String, String> {
+        let axis = match p.direction.trim() {
+            "horizontal" => FlipAxis::Horizontal,
+            "vertical" => FlipAxis::Vertical,
+            other => return Err(format!("direction \"{other}\" is not horizontal or vertical.")),
+        };
+        if p.ids.is_empty() {
+            return Err("Name at least one element.".into());
+        }
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
+        let count = ids.len();
+        self.canvas_edit(&target, Default::default(), move |t, scene, _| {
+            for id in &ids {
+                if !scene.elements.contains_key(id) {
+                    return Err(bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")));
+                }
+            }
+            t.flip(&ids, axis)?;
+            scene.touched.extend(ids.iter().cloned());
+            Ok(())
+        })
+        .await?;
+        Ok(format!("Flipped {count} element{} of {} {}.", if count == 1 { "" } else { "s" }, target.what(), p.direction.trim()))
+    }
+
+    /// Draw an SVG on a canvas: markup (`svg`) or an .svg file (`file`)
+    /// becomes paths with their fills, strokes and gradients, groups, and
+    /// simple text, in one edit, placed at x, y (or centered there) and
+    /// optionally scaled to `size`. What could not come in (filters, masks,
+    /// clip paths, pictures, patterns) is listed in the answer.
+    #[tool(name = "import_svg")]
+    async fn import_svg(&self, Parameters(p): Parameters<ImportSvgParams>) -> Result<String, String> {
+        let markup = match (&p.svg, &p.file) {
+            (Some(svg), None) => svg.clone(),
+            (None, Some(file)) => {
+                let path = std::path::Path::new(file.trim());
+                std::fs::read_to_string(path).map_err(|e| format!("The SVG file {} could not be read: {e}", path.display()))?
+            }
+            _ => return Err("Give the SVG as markup (`svg`) or a file (`file`), one of them.".into()),
+        };
+        let place = SvgPlacement { at: Point::new(p.x.unwrap_or(0.0), p.y.unwrap_or(0.0)), center: p.center, fit: p.size.filter(|s| *s > 0.0) };
+        let import = pimble_board::svg_in::parse(&markup, &place).map_err(|e| format!("Nothing was written: {e}"))?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let layer = p.layer.clone();
+        let to_add = import.clone();
+        let ids = self
+            .canvas_edit(&target, Default::default(), move |t, scene, _| {
+                let layer = scene.named_layer(layer.as_deref(), None)?;
+                let ids = t.import_svg(&to_add, layer.as_deref())?;
+                scene.touched.extend(ids.iter().cloned());
+                Ok(ids)
+            })
+            .await?;
+        let mut out = format!("Added to {}:\n", target.what());
+        for (item, id) in import.items.iter().zip(&ids) {
+            let kind = &item.element.kind;
+            match item.group.and_then(|g| ids.get(g)) {
+                Some(g) => out.push_str(&format!("- {id} {kind} (in group {g})\n")),
+                None => out.push_str(&format!("- {id} {kind}\n")),
+            }
+        }
+        if let Some(b) = import.bounds {
+            out.push_str(&format!("Within {}.\n", rect_text(&b)));
+        }
+        for w in &import.warnings {
+            out.push_str(&format!("Left out: {w}\n"));
+        }
+        Ok(out)
+    }
+
     /// Add a layer or a group of layers to a canvas (layers organize; who made
     /// what is on each element).
     #[tool(name = "add_layer")]
@@ -2483,5 +2739,45 @@ mod tests {
         let arrow = add(&board, &[ElementSpec { points: Some(vec![vec![0.0, 0.0], vec![5.0, 5.0]]), ..spec("arrow") }]).unwrap();
         let err = change(ElementChange { id: arrow[0].clone(), d: Some("M0 0 L1 1".into()), ..Default::default() }).unwrap_err();
         assert!(err.to_string().contains("cannot take path data"), "{err}");
+    }
+
+    #[test]
+    fn gradients_go_in_read_back_and_give_way_to_a_solid_color() {
+        let board = fresh();
+        let grad = GradientSpec {
+            kind: Some("radial".into()),
+            from: None,
+            to: None,
+            stops: vec![StopSpec { offset: None, color: "#ffffff".into() }, StopSpec { offset: None, color: "#00000080".into() }],
+        };
+        let rect = ElementSpec {
+            x: Some(0.0),
+            y: Some(0.0),
+            w: Some(100.0),
+            h: Some(50.0),
+            style: Some(StyleSpec { fill_gradient: Some(grad), ..Default::default() }),
+            ..spec("rect")
+        };
+        let ids = add(&board, &[rect]).unwrap();
+        let snap = board.snapshot();
+        let text = describe(&snap, &HashMap::new());
+        assert!(text.contains("fill radial gradient from 0.5,0.5 to 1,0.5 (#ffffff at 0, #00000080 at 1)"), "{text}");
+        let e = snap.get(&ids[0]).unwrap();
+        assert_eq!(e.raw.style.fill, Some(Color::WHITE), "the fallback an older app draws");
+        // A solid fill given later replaces it.
+        let st = Stamp::new(None, "2026-10-29T00:00:00.000Z");
+        let snapshot = board.snapshot();
+        let mut scene = Scene::of(&snapshot);
+        let change = ElementChange { id: ids[0].clone(), style: Some(StyleSpec { fill: Some("#ff0000".into()), ..Default::default() }), ..Default::default() };
+        board.edit(st, |t| change_element(t, &mut scene, &snapshot, &change, 0)).result.unwrap();
+        let snap = board.snapshot();
+        let s = &snap.get(&ids[0]).unwrap().raw.style;
+        assert_eq!((s.fill, s.fill_gradient.clone()), (Some(Color::rgb(255, 0, 0)), None));
+        // Refusals.
+        let one = GradientSpec { stops: vec![StopSpec { offset: Some(0.0), color: "#fff".into() }], ..Default::default() };
+        let err = style_of(&StyleSpec { fill_gradient: Some(one), ..Default::default() }).unwrap_err();
+        assert!(err.to_string().contains("two stops or more"), "{err}");
+        let bad_kind = GradientSpec { kind: Some("conic".into()), stops: vec![StopSpec { offset: None, color: "#fff".into() }; 2], ..Default::default() };
+        assert!(style_of(&StyleSpec { fill_gradient: Some(bad_kind), ..Default::default() }).is_err());
     }
 }

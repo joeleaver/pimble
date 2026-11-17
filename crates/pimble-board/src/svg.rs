@@ -14,7 +14,7 @@ use tiny_skia::PathSegment;
 use tiny_skia::{FillRule, Path, Transform as Affine};
 
 use crate::model::*;
-use crate::paint::{element_ops, Op, Space, StrokeStyle};
+use crate::paint::{element_ops, GradientPaint, Op, Space, StrokeStyle};
 use crate::render::included;
 use crate::snapshot::{BoardSnapshot, Element, SHADOW_OFFSET};
 
@@ -84,8 +84,54 @@ fn picture_size(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
 }
 
-fn write_op(out: &mut String, op: &Op<'_>) {
+/// A gradient's definition (in `<defs>`, just before the path that uses
+/// it), in the path's own user space; answers its `url(#...)`.
+fn write_gradient(out: &mut String, g: &GradientPaint, opacity: f32, next_id: &mut usize) -> String {
+    *next_id += 1;
+    let id = format!("pimble-gradient-{next_id}");
+    let (from, to, radius) = g.points();
+    out.push_str("<defs>");
+    match g.gradient.kind {
+        GradientKind::Linear => {
+            let _ = write!(
+                out,
+                "<linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\">",
+                n(from.x),
+                n(from.y),
+                n(to.x),
+                n(to.y)
+            );
+        }
+        GradientKind::Radial => {
+            let _ = write!(out, "<radialGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" cx=\"{}\" cy=\"{}\" r=\"{}\">", n(from.x), n(from.y), n(radius));
+        }
+    }
+    for stop in &g.gradient.stops {
+        let (hex, alpha) = paint(stop.color, opacity);
+        let _ = write!(out, "<stop offset=\"{}\" stop-color=\"{}\"", n(stop.offset.clamp(0.0, 1.0)), hex);
+        if alpha < 1.0 {
+            let _ = write!(out, " stop-opacity=\"{}\"", n(alpha));
+        }
+        out.push_str("/>");
+    }
+    out.push_str(match g.gradient.kind {
+        GradientKind::Linear => "</linearGradient>",
+        GradientKind::Radial => "</radialGradient>",
+    });
+    out.push_str("</defs>");
+    format!("url(#{id})")
+}
+
+fn write_op(out: &mut String, op: &Op<'_>, next_id: &mut usize) {
     match op {
+        Op::Fill { path, gradient: Some(g), opacity, rule, .. } => {
+            let url = write_gradient(out, g, *opacity, next_id);
+            let _ = write!(out, "<path d=\"{}\" fill=\"{}\"", path_data(path.get()), url);
+            if *rule == FillRule::EvenOdd {
+                out.push_str(" fill-rule=\"evenodd\"");
+            }
+            out.push_str("/>");
+        }
         Op::Fill { path, color, opacity, rule, shadow, multiply, .. } => {
             let (hex, alpha) = paint(*color, *opacity);
             let _ = write!(out, "<path d=\"{}\" fill=\"{}\"", path_data(path.get()), hex);
@@ -103,8 +149,12 @@ fn write_op(out: &mut String, op: &Op<'_>) {
             }
             out.push_str("/>");
         }
-        Op::Stroke { path, color, opacity, stroke, multiply, .. } => {
-            let (hex, alpha) = paint(*color, *opacity);
+        Op::Stroke { path, color, gradient, opacity, stroke, multiply, .. } => {
+            let (mut hex, mut alpha) = paint(*color, *opacity);
+            if let Some(g) = gradient {
+                hex = write_gradient(out, g, *opacity, next_id);
+                alpha = 1.0;
+            }
             let width = stroke.width.max(0.01);
             let _ = write!(
                 out,
@@ -244,6 +294,7 @@ pub fn render_svg(
         out.push_str("/>");
     }
     let mask = only.map(|ids| included(snapshot, ids));
+    let mut gradients = 0usize;
     let mut open_layers: Vec<usize> = Vec::new();
     const NONE: &[usize] = &[];
     for i in snapshot.query(&rect) {
@@ -293,7 +344,7 @@ pub fn render_svg(
             }
             match op {
                 Op::Picture(p) => write_picture(&mut out, e, p, picture_bytes),
-                _ => write_op(&mut out, op),
+                _ => write_op(&mut out, op, &mut gradients),
             }
         }
         out.push_str("</g>");

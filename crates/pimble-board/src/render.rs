@@ -481,6 +481,30 @@ fn paint_of(color: Color, opacity: f32) -> Paint<'static> {
     paint
 }
 
+/// A paint of `color`, or of `gradient` (in the path's own space: the
+/// renderer's transform carries it with the path) when it has one that
+/// tiny-skia can draw.
+fn paint_with(color: Color, gradient: Option<&crate::paint::GradientPaint>, opacity: f32) -> Paint<'static> {
+    let mut paint = paint_of(color, opacity);
+    if let Some(g) = gradient {
+        if let Some(shader) = gradient_shader(g, opacity) {
+            paint.shader = shader;
+        }
+    }
+    paint
+}
+
+fn gradient_shader(g: &crate::paint::GradientPaint, opacity: f32) -> Option<tiny_skia::Shader<'static>> {
+    let stops: Vec<tiny_skia::GradientStop> =
+        g.gradient.stops.iter().map(|s| tiny_skia::GradientStop::new(s.offset.clamp(0.0, 1.0), tiny_color(s.color, opacity))).collect();
+    let (from, to, radius) = g.points();
+    let (a, b) = (tiny_skia::Point::from_xy(from.x, from.y), tiny_skia::Point::from_xy(to.x, to.y));
+    match g.gradient.kind {
+        GradientKind::Linear => tiny_skia::LinearGradient::new(a, b, stops, SpreadMode::Pad, Affine::identity()),
+        GradientKind::Radial => tiny_skia::RadialGradient::new(a, a, radius, stops, SpreadMode::Pad, Affine::identity()),
+    }
+}
+
 fn stroke_of(width: f32, dash: Dash) -> Stroke {
     StrokeStyle::plain(width, dash).tiny()
 }
@@ -502,20 +526,20 @@ fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, 
     let ts = vt.pre_concat(e.world);
     for op in element_ops(e, region, Some(ts_scale(&ts))) {
         match op {
-            Op::Fill { path, color, opacity, rule, space, shadow, multiply } => {
+            Op::Fill { path, color, gradient, opacity, rule, space, shadow, multiply } => {
                 let mut t = if space == Space::Element { ts } else { vt };
                 if shadow {
                     t = t.pre_translate(SHADOW_OFFSET, SHADOW_OFFSET);
                 }
-                let mut paint = paint_of(color, opacity);
+                let mut paint = paint_with(color, gradient.as_ref(), opacity);
                 if multiply {
                     paint.blend_mode = BlendMode::Multiply;
                 }
                 pixmap.fill_path(path.get(), &paint, rule, t, None);
             }
-            Op::Stroke { path, color, opacity, stroke, space, multiply } => {
+            Op::Stroke { path, color, gradient, opacity, stroke, space, multiply } => {
                 let t = if space == Space::Element { ts } else { vt };
-                let mut paint = paint_of(color, opacity);
+                let mut paint = paint_with(color, gradient.as_ref(), opacity);
                 if multiply {
                     paint.blend_mode = BlendMode::Multiply;
                 }

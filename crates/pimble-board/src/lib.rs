@@ -34,8 +34,16 @@
 //! - [`ViewOptions`]: a viewer's choices (color by author, show everything,
 //!   card titles), carried by the snapshot.
 //! - [`render_area`], [`render_svg`]: export of a part of a board, as pixels
-//!   (PNG, JPEG) or as SVG.
+//!   (PNG, JPEG) or as SVG (gradients as `<linearGradient>` and
+//!   `<radialGradient>`).
+//! - [`combine`]: union, subtract, intersect and exclude over paths
+//!   ([`BoardTxn::combine`] is the edit); [`BoardTxn::flip`] mirrors.
+//! - [`svg_in`]: SVG markup read into elements and groups
+//!   ([`BoardTxn::import_svg`] puts them on the board).
+//! - [`Gradient`], [`Paint`]: linear and radial gradients in fills and
+//!   strokes ([`BoardTxn::set_fill_paint`], [`BoardTxn::set_stroke_paint`]).
 
+pub mod combine;
 pub mod doc;
 mod hit;
 pub mod layer_tree;
@@ -50,11 +58,12 @@ pub mod render;
 pub mod snapshot;
 mod spatial;
 pub mod svg;
+pub mod svg_in;
 pub mod text;
 pub mod view;
 
 pub use doc::{
-    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
+    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
     TEXT_BOARD_PREFIX, BOARD_KEY,
 };
 pub use layer_tree::{LayerTree, TreeEntry};
@@ -69,7 +78,9 @@ pub use render::{
     RgbaImage, View, MAX_EXTENT_PX,
 };
 pub use snapshot::{BoardSnapshot, Element, Layer};
+pub use combine::CombineOp;
 pub use svg::render_svg;
+pub use svg_in::{SvgError, SvgImport, SvgItem, SvgPlacement};
 pub use view::{grid_color, BoardView, EditOverlay};
 
 /// The renderer's pixel types, for callers that keep a pixmap.

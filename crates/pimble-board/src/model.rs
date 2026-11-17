@@ -211,6 +211,22 @@ impl Kind {
         }
     }
 
+    /// The kind as a person names one ("a sticky note", "an arrow").
+    pub fn with_article(&self) -> String {
+        let word = match self {
+            Kind::Pen => "pen stroke",
+            Kind::Highlighter => "highlighter stroke",
+            Kind::Rect => "rectangle",
+            Kind::Text => "text",
+            Kind::Sticky => "sticky note",
+            Kind::Step => "numbered step",
+            Kind::Card => "node card",
+            other => other.as_str(),
+        };
+        let article = if word.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+        format!("{article} {word}")
+    }
+
     /// A stroke: its geometry is the appendable point array.
     pub fn is_stroke(&self) -> bool {
         matches!(self, Kind::Pen | Kind::Highlighter)
@@ -784,6 +800,11 @@ pub struct Style {
     /// A star's inner radius as a fraction of its outer one (0 to 1):
     /// absent is [`DEFAULT_STAR_INNER`].
     pub inner: Option<f32>,
+    /// A gradient fill (drawing wave 3): when set it is what fills, and
+    /// `fill` is its solid fallback (what an older app draws).
+    pub fill_gradient: Option<Gradient>,
+    /// A gradient stroke; `stroke` is its solid fallback.
+    pub stroke_gradient: Option<Gradient>,
 }
 
 /// A [`Style`] with every key decided, by the element or by its kind's
@@ -808,6 +829,11 @@ pub struct ResolvedStyle {
     pub sides: u32,
     pub points: u32,
     pub inner: f32,
+    /// The fill's gradient, when it has one (then `fill` is `Some`, its
+    /// fallback).
+    pub fill_gradient: Option<Gradient>,
+    /// The stroke's gradient, when it has one.
+    pub stroke_gradient: Option<Gradient>,
 }
 
 impl ResolvedStyle {
@@ -829,6 +855,181 @@ impl ResolvedStyle {
         }
         self.width / 2.0 * k
     }
+}
+
+// ── Gradients (docs/DRAWING_CONTRACT.md section 2, "Fill and stroke") ──
+
+/// Linear or radial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GradientKind {
+    Linear,
+    Radial,
+}
+
+impl GradientKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GradientKind::Linear => "linear",
+            GradientKind::Radial => "radial",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<GradientKind> {
+        Some(match s {
+            "linear" => GradientKind::Linear,
+            "radial" => GradientKind::Radial,
+            _ => return None,
+        })
+    }
+}
+
+/// One color of a gradient at `offset` (0 to 1 along it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Color,
+}
+
+impl GradientStop {
+    pub fn new(offset: f32, color: Color) -> Self {
+        Self { offset, color }
+    }
+}
+
+/// A gradient paint for a fill or a stroke. Its handles are in the
+/// element's **box units**: (0, 0) is the top-left of the element's own
+/// extent before its transform ([`crate::Element::pivot_bounds`]) and (1, 1)
+/// its bottom-right, as SVG's `objectBoundingBox`. So the gradient moves,
+/// turns and scales with the element, and stretches with it when it is
+/// resized. Handles may lie outside 0..1.
+///
+/// - Linear: offset 0 at `from`, offset 1 at `to`; colors pad beyond.
+/// - Radial: centered on `from`, offset 1 on the circle through `to` (the
+///   radius is `|to - from|` in box units, so an ellipse in a box that is
+///   not square).
+///
+/// Stored whole (one value, last writer wins) under the style keys
+/// `fill_gradient` and `stroke_gradient`; the solid `fill` / `stroke` beside
+/// it is the fallback an older app draws.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gradient {
+    pub kind: GradientKind,
+    pub from: Point,
+    pub to: Point,
+    pub stops: Vec<GradientStop>,
+}
+
+impl Gradient {
+    pub fn linear(from: Point, to: Point, stops: Vec<GradientStop>) -> Self {
+        Self { kind: GradientKind::Linear, from, to, stops }
+    }
+
+    pub fn radial(center: Point, edge: Point, stops: Vec<GradientStop>) -> Self {
+        Self { kind: GradientKind::Radial, from: center, to: edge, stops }
+    }
+
+    /// A new linear gradient from `color` to the same color transparent,
+    /// left to right across the element's box: what the color well starts
+    /// a gradient with.
+    pub fn default_linear(color: Color) -> Self {
+        Self::linear(Point::new(0.0, 0.5), Point::new(1.0, 0.5), Self::fade(color))
+    }
+
+    /// A new radial gradient from `color` at the center to the same color
+    /// transparent at the box's edge.
+    pub fn default_radial(color: Color) -> Self {
+        Self::radial(Point::new(0.5, 0.5), Point::new(1.0, 0.5), Self::fade(color))
+    }
+
+    fn fade(color: Color) -> Vec<GradientStop> {
+        vec![GradientStop::new(0.0, color), GradientStop::new(1.0, Color { a: 0, ..color })]
+    }
+
+    /// Something to draw: finite handles, at least one stop, finite offsets
+    /// (a radial one with some radius).
+    pub fn is_valid(&self) -> bool {
+        let finite = |p: Point| p.x.is_finite() && p.y.is_finite();
+        finite(self.from)
+            && finite(self.to)
+            && !self.stops.is_empty()
+            && self.stops.iter().all(|s| s.offset.is_finite())
+            && (self.kind == GradientKind::Linear || self.radius() > 1e-6)
+    }
+
+    /// A radial gradient's radius in box units (the length of a linear one).
+    pub fn radius(&self) -> f32 {
+        ((self.to.x - self.from.x).powi(2) + (self.to.y - self.from.y).powi(2)).sqrt()
+    }
+
+    /// Its stops clamped to 0..1 and sorted (stable, so two stops at one
+    /// offset keep their order: a hard edge).
+    pub fn normalized(mut self) -> Self {
+        for s in &mut self.stops {
+            s.offset = s.offset.clamp(0.0, 1.0);
+        }
+        self.stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        self
+    }
+
+    /// The solid color that stands for it where a gradient cannot be drawn
+    /// (an older app, a picker's swatch): its first stop's color.
+    pub fn fallback(&self) -> Color {
+        self.stops.first().map(|s| s.color).unwrap_or(Color::BLACK)
+    }
+
+    /// The color at `t` (0 to 1 along it), as the renderer interpolates.
+    pub fn color_at(&self, t: f32) -> Color {
+        let stops = &self.stops;
+        let Some(first) = stops.first() else { return Color::BLACK };
+        if t <= first.offset {
+            return first.color;
+        }
+        for w in stops.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if t <= b.offset {
+                let k = if b.offset > a.offset { (t - a.offset) / (b.offset - a.offset) } else { 1.0 };
+                let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round().clamp(0.0, 255.0) as u8;
+                return Color::rgba(mix(a.color.r, b.color.r), mix(a.color.g, b.color.g), mix(a.color.b, b.color.b), mix(a.color.a, b.color.a));
+            }
+        }
+        stops.last().map(|s| s.color).unwrap_or(first.color)
+    }
+
+    /// The gradient flipped within its box (a flip of the element by its
+    /// geometry: [`crate::BoardTxn::flip`] mirrors through the transform,
+    /// which carries the gradient along, so this is for callers that mirror
+    /// geometry themselves).
+    pub fn mirrored(&self, horizontal: bool) -> Self {
+        let m = |p: Point| if horizontal { Point::new(1.0 - p.x, p.y) } else { Point::new(p.x, 1.0 - p.y) };
+        Self { from: m(self.from), to: m(self.to), ..self.clone() }
+    }
+
+    /// The box a gradient is laid over for an element of extent `r`: `r`,
+    /// with a side of no length (a horizontal line) given the other's length
+    /// so the gradient still has room.
+    pub fn box_for(r: Rect) -> Rect {
+        let (mut b, eps) = (r.normalized(), 1e-3);
+        if b.w < eps && b.h < eps {
+            return Rect::new(b.x - 0.5, b.y - 0.5, 1.0, 1.0);
+        }
+        if b.h < eps {
+            b = Rect::new(b.x, b.y - b.w / 2.0, b.w, b.w);
+        } else if b.w < eps {
+            b = Rect::new(b.x - b.h / 2.0, b.y, b.h, b.h);
+        }
+        b
+    }
+}
+
+/// What a fill or a stroke is painted with, for the setters that change the
+/// kind of paint ([`crate::BoardTxn::set_fill_paint`],
+/// [`crate::BoardTxn::set_stroke_paint`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Paint {
+    /// No fill (a stroke cannot be none: give it width 0).
+    None,
+    Solid(Color),
+    Gradient(Gradient),
 }
 
 /// The default red of marks (Spectacle's annotation red).
@@ -857,9 +1058,11 @@ impl Style {
             Kind::Spotlight => (Color::BLACK, Some(Color::rgba(0, 0, 0, 0x99)), 0.0, 24.0, ArrowHeads::None, Align::Left, false),
             Kind::Picture | Kind::Group | Kind::Other(_) => (Color::BLACK, None, 0.0, 24.0, ArrowHeads::None, Align::Left, false),
         };
+        let fill_gradient = self.fill_gradient.clone().filter(Gradient::is_valid).map(Gradient::normalized);
+        let stroke_gradient = self.stroke_gradient.clone().filter(Gradient::is_valid).map(Gradient::normalized);
         ResolvedStyle {
-            stroke: self.stroke.unwrap_or(stroke),
-            fill: self.fill.or(fill),
+            stroke: self.stroke.or(stroke_gradient.as_ref().map(Gradient::fallback)).unwrap_or(stroke),
+            fill: self.fill.or(fill_gradient.as_ref().map(Gradient::fallback)).or(fill),
             width: self.width.unwrap_or(width).max(0.0),
             opacity: self.opacity.unwrap_or(1.0).clamp(0.0, 1.0),
             font_size: self.font_size.unwrap_or(font_size).max(1.0),
@@ -875,6 +1078,8 @@ impl Style {
             sides: self.sides.unwrap_or(DEFAULT_SIDES).clamp(3, 1000),
             points: self.points.unwrap_or(DEFAULT_STAR_POINTS).clamp(3, 1000),
             inner: self.inner.filter(|r| r.is_finite()).unwrap_or(DEFAULT_STAR_INNER).clamp(0.0, 1.0),
+            fill_gradient,
+            stroke_gradient,
         }
     }
 }
@@ -899,6 +1104,8 @@ pub enum StyleKey {
     Sides,
     Points,
     Inner,
+    FillGradient,
+    StrokeGradient,
 }
 
 impl StyleKey {
@@ -921,6 +1128,8 @@ impl StyleKey {
             StyleKey::Sides => "sides",
             StyleKey::Points => "points",
             StyleKey::Inner => "inner",
+            StyleKey::FillGradient => "fill_gradient",
+            StyleKey::StrokeGradient => "stroke_gradient",
         }
     }
 }

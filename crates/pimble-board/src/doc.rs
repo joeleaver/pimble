@@ -62,6 +62,7 @@ use yrs::{
 };
 
 use crate::layer_tree::LayerTree;
+use tiny_skia::Transform as Affine;
 use crate::locks::Deleted;
 use crate::model::*;
 use crate::order;
@@ -1403,14 +1404,73 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(())
     }
 
-    /// Clear one style key, back to the kind's default.
+    /// Clear one style key, back to the kind's default. Clearing `fill` or
+    /// `stroke` clears its gradient too (the solid key is the gradient's
+    /// fallback, so "No fill" leaves no gradient behind).
     pub fn clear_style(&mut self, id: &str, key: StyleKey) -> Result<()> {
         let map = self.editable(id)?;
         if let Some(Out::YMap(style)) = map.get(self.txn, STYLE) {
-            if style.remove(self.txn, key.as_str()).is_some() {
+            let mut changed = style.remove(self.txn, key.as_str()).is_some();
+            let partner = match key {
+                StyleKey::Fill => Some(StyleKey::FillGradient),
+                StyleKey::Stroke => Some(StyleKey::StrokeGradient),
+                _ => None,
+            };
+            if let Some(partner) = partner {
+                changed |= style.remove(self.txn, partner.as_str()).is_some();
+            }
+            if changed {
                 self.stamp_element(&map);
             }
         }
+        Ok(())
+    }
+
+    /// What fills an element: nothing (the fill and its gradient cleared),
+    /// a solid color (any gradient removed), or a gradient (its first stop's
+    /// color written as the solid fallback an older app draws). What the
+    /// color well writes; `set_style` alone would leave a gradient winning
+    /// over a solid color picked after it.
+    pub fn set_fill_paint(&mut self, id: &str, paint: &Paint) -> Result<()> {
+        self.set_paint(id, paint, StyleKey::Fill, StyleKey::FillGradient)
+    }
+
+    /// What an element's stroke is painted with: a solid color or a
+    /// gradient. A stroke is never "none" here (refused with a sentence): a
+    /// stroke goes by giving it width 0.
+    pub fn set_stroke_paint(&mut self, id: &str, paint: &Paint) -> Result<()> {
+        if *paint == Paint::None {
+            return Err(BoardError::Invalid("A stroke cannot be none; set its width to 0 instead.".into()));
+        }
+        self.set_paint(id, paint, StyleKey::Stroke, StyleKey::StrokeGradient)
+    }
+
+    fn set_paint(&mut self, id: &str, paint: &Paint, solid: StyleKey, gradient: StyleKey) -> Result<()> {
+        let map = self.editable(id)?;
+        if let Paint::Gradient(g) = paint {
+            if !g.is_valid() {
+                return Err(BoardError::Invalid("A gradient needs at least one stop and handles that are numbers (a radial one some radius).".into()));
+            }
+        }
+        let style = match map.get(self.txn, STYLE) {
+            Some(Out::YMap(m)) => m,
+            _ => map.insert(self.txn, STYLE, MapPrelim::default()),
+        };
+        match paint {
+            Paint::None => {
+                style.remove(self.txn, solid.as_str());
+                style.remove(self.txn, gradient.as_str());
+            }
+            Paint::Solid(c) => {
+                style.insert(self.txn, solid.as_str(), c.to_hex());
+                style.remove(self.txn, gradient.as_str());
+            }
+            Paint::Gradient(g) => {
+                style.insert(self.txn, gradient.as_str(), gradient_any(g));
+                style.insert(self.txn, solid.as_str(), g.fallback().to_hex());
+            }
+        }
+        self.stamp_element(&map);
         Ok(())
     }
 
@@ -1563,6 +1623,278 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
         }
         self.stamp_element(map);
+    }
+
+    // ── Combining, flipping, SVG in (drawing wave 3) ─────────────────────
+
+    /// The board as it stands in this transaction, resolved (world
+    /// transforms, extents, z-order).
+    fn snapshot_now(&self) -> Result<crate::BoardSnapshot> {
+        let board = self.board()?;
+        Ok(crate::BoardSnapshot::build(Some(read_board(self.txn, &board, true))))
+    }
+
+    /// Combine two or more elements into one `path` (docs/DRAWING_CONTRACT.md
+    /// section 2, "Combining"), in this one transaction (one undo): their
+    /// filled areas, each by its own fill rule and through its transform
+    /// (and its group's), combined by `op` ([`crate::combine::combine`]).
+    ///
+    /// The result keeps the id, layer, order, group, style, text and meaning
+    /// of the **top** operand (z-order), except for
+    /// [`CombineOp::Subtract`], which is the bottom operand minus everything
+    /// above it and keeps the **bottom** one's (Illustrator's "Minus
+    /// Front"). Its geometry is written in its group's space with no
+    /// transform of its own; the other operands are deleted. Answers the
+    /// result's id.
+    ///
+    /// Refused, before anything is written: fewer than two elements; an
+    /// element that has no outline to combine ("Only shapes, lines without
+    /// arrow heads, pen strokes and paths combine: a text and a sticky note
+    /// do not."); a locked one; a result with nothing left ("The shapes do
+    /// not overlap, so intersecting them leaves nothing.").
+    pub fn combine(&mut self, ids: &[String], op: crate::combine::CombineOp) -> Result<String> {
+        use crate::combine::CombineOp;
+        let mut seen = HashSet::new();
+        let ids: Vec<&String> = ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+        if ids.len() < 2 {
+            return Err(BoardError::Invalid("Combining takes two or more elements.".into()));
+        }
+        for id in &ids {
+            self.editable(id)?;
+        }
+        let snap = self.snapshot_now()?;
+        let mut found: Vec<(usize, crate::path::PathGeom)> = Vec::with_capacity(ids.len());
+        let mut refused: Vec<String> = Vec::new();
+        for id in &ids {
+            let at = snap.elements.iter().position(|e| e.id() == id.as_str()).ok_or_else(|| BoardError::NoElement(id.to_string()))?;
+            let e = &snap.elements[at];
+            match crate::path::to_path(&e.raw.kind, &e.raw.geom, &e.raw.style, &e.raw.points) {
+                Some(p) => {
+                    let w = e.world;
+                    found.push((at, p.map(|q| map_point(&w, q))));
+                }
+                None => {
+                    let word = e.raw.kind.with_article();
+                    if !refused.contains(&word) {
+                        refused.push(word);
+                    }
+                }
+            }
+        }
+        if !refused.is_empty() {
+            let list = match refused.as_slice() {
+                [one] => format!("{one} does not"),
+                [rest @ .., last] => format!("{} and {last} do not", rest.join(", ")),
+                [] => unreachable!(),
+            };
+            return Err(BoardError::Invalid(format!("Only shapes, lines without arrow heads, pen strokes and paths combine: {list}.")));
+        }
+        found.sort_by_key(|(at, _)| *at);
+        let operands: Vec<crate::path::PathGeom> = found.iter().map(|(_, p)| p.clone()).collect();
+        let result = crate::combine::combine(&operands, op).ok_or_else(|| {
+            BoardError::Invalid(
+                match op {
+                    CombineOp::Intersect => "The shapes do not overlap, so intersecting them leaves nothing.",
+                    CombineOp::Subtract => "Nothing is left: the shapes in front cover the one at the back.",
+                    _ => "Nothing is left of the shapes.",
+                }
+                .into(),
+            )
+        })?;
+        let keep_at = if op == CombineOp::Subtract { found[0].0 } else { found[found.len() - 1].0 };
+        let keeper = &snap.elements[keep_at];
+        let keep_id = keeper.id().to_string();
+        // Into the keeper's group's space.
+        let parent_world = keeper.parent.as_deref().and_then(|p| snap.get(p)).map(|p| p.world).unwrap_or_default();
+        let inv = parent_world.invert().unwrap_or_default();
+        let geom = result.map(|q| map_point(&inv, q));
+        let map = self.element(&keep_id)?;
+        map.insert(self.txn, KIND, Kind::Path.as_str().to_string());
+        map.insert(self.txn, GEOM, geom_any(&Geom::Path(geom)));
+        map.remove(self.txn, TRANSFORM);
+        self.stamp_element(&map);
+        let elements = self.elements()?;
+        for (at, _) in &found {
+            if *at != keep_at {
+                elements.remove(self.txn, snap.elements[*at].id());
+            }
+        }
+        Ok(keep_id)
+    }
+
+    /// Flip elements horizontally or vertically about the center of their
+    /// combined bounds, in one transaction. Judged first: a locked element
+    /// refuses the whole flip.
+    ///
+    /// - Paths, shapes without text, lines, arrows, pen and highlighter
+    ///   strokes and pictures are **mirrored** through their transform
+    ///   (its scale negated on one axis and its rotation reflected), so
+    ///   their geometry, gradients and handles are untouched and a second
+    ///   flip gives back exactly what was there.
+    /// - Text, sticky notes, cards, steps, callouts, frames, and shapes
+    ///   that hold text are **moved** to their mirrored place, keeping
+    ///   their rotation: glyphs are never mirrored. A frame's members ride
+    ///   with it.
+    /// - A group flips what is in it, each member as above (members of a
+    ///   flipped frame ride with the frame).
+    /// - A connector's free ends are mirrored; ends on elements follow
+    ///   those elements.
+    pub fn flip(&mut self, ids: &[String], axis: FlipAxis) -> Result<()> {
+        let snap = self.snapshot_now()?;
+        let index_of = |id: &str| snap.elements.iter().position(|e| e.id() == id);
+        let mut center_box: Option<Rect> = None;
+        let mut picked: Vec<usize> = Vec::new();
+        let mut groups: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for id in ids {
+            let at = index_of(id).ok_or_else(|| BoardError::NoElement(id.clone()))?;
+            let b = snap.elements[at].bounds;
+            center_box = Some(center_box.map_or(b, |c| c.union(&b)));
+            stack.push(at);
+        }
+        let Some(center_box) = center_box else { return Ok(()) };
+        let mut seen = HashSet::new();
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let e = &snap.elements[at];
+            if e.raw.kind == Kind::Group {
+                groups.push(at);
+                for (j, m) in snap.elements.iter().enumerate() {
+                    if m.parent.as_deref() == Some(e.id()) {
+                        stack.push(j);
+                    }
+                }
+            } else {
+                picked.push(at);
+            }
+        }
+        // Members of a frame that is flipped ride with it.
+        let frames: HashSet<&str> = picked.iter().map(|&i| &snap.elements[i]).filter(|e| e.raw.kind == Kind::Frame).map(|e| e.id()).collect();
+        let rides = |i: usize| -> bool {
+            let mut parent = snap.elements[i].parent.as_deref();
+            let mut hops = 0;
+            while let Some(p) = parent {
+                if frames.contains(p) {
+                    return true;
+                }
+                hops += 1;
+                if hops > snap.elements.len() {
+                    break;
+                }
+                parent = snap.get(p).and_then(|pe| pe.parent.as_deref());
+            }
+            false
+        };
+        let picked: Vec<usize> = picked.into_iter().filter(|&i| !rides(i)).collect();
+        for &at in &picked {
+            self.editable(snap.elements[at].id())?;
+        }
+        for &at in &groups {
+            self.editable(snap.elements[at].id())?;
+        }
+        let c = center_box.center();
+        let board_flip = match axis {
+            FlipAxis::Horizontal => Affine::from_row(-1.0, 0.0, 0.0, 1.0, 2.0 * c.x, 0.0),
+            FlipAxis::Vertical => Affine::from_row(1.0, 0.0, 0.0, -1.0, 0.0, 2.0 * c.y),
+        };
+        for &at in &picked {
+            let e = &snap.elements[at];
+            let map = self.element(e.id())?;
+            if let Geom::Connector { .. } = &e.raw.geom {
+                if let Some(g) = e.raw.geom.mapped(|p| map_point(&board_flip, p)) {
+                    map.insert(self.txn, GEOM, geom_any(&g));
+                    self.stamp_element(&map);
+                }
+                continue;
+            }
+            let parent = e.parent.as_deref().and_then(|p| snap.get(p)).map(|p| p.world).unwrap_or_default();
+            let Some(inv) = parent.invert() else { continue };
+            // The board's mirror, seen in the element's group's space.
+            let l = inv.pre_concat(board_flip).pre_concat(parent);
+            let t = e.raw.transform;
+            let p = e.pivot_bounds.center();
+            let moved_only = matches!(e.raw.kind, Kind::Text | Kind::Sticky | Kind::Card | Kind::Step | Kind::Callout | Kind::Frame | Kind::Spotlight)
+                || (e.raw.kind.is_shape() && e.raw.text.as_deref().is_some_and(|s| !s.trim().is_empty()));
+            let mut nt = t;
+            if moved_only {
+                // What it paints lands mirrored: its bounds' center goes to
+                // its mirror, moved in its group's space.
+                let bc = e.bounds.center();
+                let (from, to) = (map_point(&inv, bc), map_point(&inv, map_point(&board_flip, bc)));
+                nt.tx += to.x - from.x;
+                nt.ty += to.y - from.y;
+            } else {
+                let there = map_point(&l, Point::new(p.x + t.tx, p.y + t.ty));
+                nt.tx = there.x - p.x;
+                nt.ty = there.y - p.y;
+                // l's linear part is a reflection across a line at angle φ:
+                // [cos 2φ, sin 2φ; sin 2φ, -cos 2φ] = R(2φ + 180°)·diag(-1, 1),
+                // and diag(-1, 1)·R(θ)·S = R(-θ)·S(-sx, sy), so the flip is
+                // R(2φ + 180° - θ)·S(-sx, sy).
+                let two_phi = l.ky.atan2(l.sx).to_degrees();
+                nt.rot = normalize_degrees(two_phi + 180.0 - t.rot);
+                nt.sx = -t.sx;
+            }
+            if nt.is_identity() {
+                map.remove(self.txn, TRANSFORM);
+            } else {
+                map.insert(self.txn, TRANSFORM, transform_any(&nt));
+            }
+            self.stamp_element(&map);
+        }
+        // A turned or scaled group pivots on its members' extent, which the
+        // flip moved: keep it where it was, innermost groups first.
+        let depth_of = |at: usize| {
+            let mut d = 0;
+            let mut e = &snap.elements[at];
+            while let Some(p) = e.parent.as_deref().and_then(|p| snap.get(p)) {
+                d += 1;
+                e = p;
+            }
+            d
+        };
+        let mut groups: Vec<(usize, usize)> = groups.into_iter().map(|g| (depth_of(g), g)).collect();
+        groups.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, at) in groups {
+            let g = &snap.elements[at];
+            let t = g.raw.transform;
+            if t.rot == 0.0 && t.sx == 1.0 && t.sy == 1.0 {
+                continue;
+            }
+            let now = self.snapshot_now()?;
+            let Some(after) = now.get(g.id()) else { continue };
+            let nt = repivot(&t, g.pivot_bounds, after.pivot_bounds);
+            if nt != t {
+                let map = self.element(g.id())?;
+                map.insert(self.txn, TRANSFORM, transform_any(&nt));
+            }
+        }
+        Ok(())
+    }
+
+    /// Put what [`crate::svg_in::parse`] read into the board, in this one
+    /// transaction: every element in order (bottom to top), into `layer`
+    /// (`None`: where [`BoardTxn::add_element`] puts new elements; a board
+    /// with no vector layer refuses with [`BoardError::NoVectorLayer`], and
+    /// the tools make "Vector 1" first, as for any new element), and the
+    /// SVG's groups as board groups. Answers the new ids, as `import.items`.
+    pub fn import_svg(&mut self, import: &crate::svg_in::SvgImport, layer: Option<&str>) -> Result<Vec<String>> {
+        let mut ids: Vec<String> = Vec::with_capacity(import.items.len());
+        for item in &import.items {
+            let mut element = item.element.clone();
+            element.layer = layer.map(str::to_string).or(element.layer);
+            element.parent = None;
+            ids.push(self.add_element(element)?);
+        }
+        for (item, id) in import.items.iter().zip(&ids) {
+            if let Some(g) = item.group {
+                let parent = ids.get(g).cloned().ok_or_else(|| BoardError::Invalid("an SVG group names no element".into()))?;
+                self.set_parent(id, Some(&parent))?;
+            }
+        }
+        Ok(ids)
     }
 
     // ── Meaning ──────────────────────────────────────────────────────────
@@ -1921,7 +2253,56 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         sides: number_of(m.get(txn, "sides")).filter(|v| *v >= 0.0).map(|v| v.round() as u32),
         points: number_of(m.get(txn, "points")).filter(|v| *v >= 0.0).map(|v| v.round() as u32),
         inner: number_of(m.get(txn, "inner")),
+        fill_gradient: gradient_of(m.get(txn, "fill_gradient")),
+        stroke_gradient: gradient_of(m.get(txn, "stroke_gradient")),
     }
+}
+
+/// A gradient as stored: `{ type: "linear" | "radial", x1, y1, x2, y2,
+/// stops: [{ offset, color }] }`, one value written whole. `None` when it
+/// is not one (a kind this version does not know, no stops).
+fn gradient_of(out: Option<Out>) -> Option<Gradient> {
+    let Some(Out::Any(Any::Map(m))) = out else { return None };
+    let kind = GradientKind::parse(m.get("type").and_then(any_str)?)?;
+    let stops = match m.get("stops") {
+        Some(Any::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Any::Map(s) => Some(GradientStop::new(field(s, "offset")?, Color::parse(s.get("color").and_then(any_str)?)?)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        _ => return None,
+    };
+    if stops.is_empty() {
+        return None;
+    }
+    Some(Gradient {
+        kind,
+        from: Point::new(field(&m, "x1").unwrap_or(0.0), field(&m, "y1").unwrap_or(0.0)),
+        to: Point::new(field(&m, "x2").unwrap_or(1.0), field(&m, "y2").unwrap_or(0.0)),
+        stops,
+    })
+}
+
+fn gradient_any(g: &Gradient) -> Any {
+    let mut m: HashMap<String, Any> = HashMap::new();
+    m.insert("type".into(), Any::from(g.kind.as_str()));
+    for (k, v) in [("x1", g.from.x), ("y1", g.from.y), ("x2", g.to.x), ("y2", g.to.y)] {
+        m.insert(k.into(), Any::Number(v as f64));
+    }
+    let stops: Vec<Any> = g
+        .stops
+        .iter()
+        .map(|s| {
+            let mut sm: HashMap<String, Any> = HashMap::new();
+            sm.insert("offset".into(), Any::Number(s.offset as f64));
+            sm.insert("color".into(), Any::from(s.color.to_hex()));
+            Any::from(sm)
+        })
+        .collect();
+    m.insert("stops".into(), Any::from(stops));
+    Any::from(m)
 }
 
 fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
@@ -1976,6 +2357,19 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
     if let Some(v) = style.inner {
         m.insert(txn, "inner", v as f64);
     }
+    if let Some(g) = &style.fill_gradient {
+        m.insert(txn, "fill_gradient", gradient_any(g));
+        // The solid fallback an older app draws, unless a fill is given.
+        if style.fill.is_none() {
+            m.insert(txn, "fill", g.fallback().to_hex());
+        }
+    }
+    if let Some(g) = &style.stroke_gradient {
+        m.insert(txn, "stroke_gradient", gradient_any(g));
+        if style.stroke.is_none() {
+            m.insert(txn, "stroke", g.fallback().to_hex());
+        }
+    }
 }
 
 // ── Encoding helpers ─────────────────────────────────────────────────────
@@ -2012,6 +2406,36 @@ fn judge_geom(kind: &Kind, geom: &Geom) -> Result<()> {
         Ok(())
     } else {
         Err(BoardError::Invalid(format!("a {kind} does not take that geometry")))
+    }
+}
+
+/// Which way [`BoardTxn::flip`] mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlipAxis {
+    /// Left becomes right (about a vertical line).
+    Horizontal,
+    /// Top becomes bottom (about a horizontal line).
+    Vertical,
+}
+
+fn map_point(m: &Affine, p: Point) -> Point {
+    let mut q = [tiny_skia::Point::from_xy(p.x, p.y)];
+    m.map_points(&mut q);
+    Point::new(q[0].x, q[0].y)
+}
+
+/// Degrees in (-180, 180].
+fn normalize_degrees(d: f32) -> f32 {
+    let mut d = d % 360.0;
+    if d <= -180.0 {
+        d += 360.0;
+    } else if d > 180.0 {
+        d -= 360.0;
+    }
+    if d.abs() < 1e-4 {
+        0.0
+    } else {
+        d
     }
 }
 

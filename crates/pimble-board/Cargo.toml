@@ -20,6 +20,15 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 # fonts/OFL.txt), filled as tiny-skia paths so board text transforms like any shape.
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Combining paths (docs/DRAWING_CONTRACT.md, "Spike: combining"): a robust
+# sweep line over Bézier curves, MIT or Apache-2.0, pure Rust (wasm too).
+linesweeper = "0.5"
+kurbo = "0.13"
+# SVG in: usvg (MIT or Apache-2.0) resolves CSS, `use`, units, viewBox,
+# shapes and gradients into plain paths; no text shaping or system fonts
+# (text is read with svgtypes off usvg's roxmltree, as text elements).
+usvg = { version = "0.49", default-features = false }
+svgtypes = "0.16"
 
 # uuid v4 needs a randomness backend in the browser; the native build has one.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

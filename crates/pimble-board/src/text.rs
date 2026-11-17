@@ -44,6 +44,13 @@ fn font() -> &'static Font {
     })
 }
 
+/// How far below the top of a text box its first baseline sits, at
+/// `font_size` (the line's half leading plus the font's ascender).
+pub fn first_baseline(font_size: f32) -> f32 {
+    let f = font();
+    (font_size * LINE_HEIGHT - font_size) / 2.0 + f.ascender * font_size / f.units_per_em
+}
+
 /// One laid-out glyph: its id and its x offset in the line, in board units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Glyph {

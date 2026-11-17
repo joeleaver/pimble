@@ -349,6 +349,25 @@ stroke turns it into a path first (same id, style and place, `BoardTxn::convert_
 and on anything else is refused with a sentence. A preset `dash` replaces a custom pattern.
 `render_canvas` draws all of it.
 
+**Combining, gradients, flip, SVG in** (docs/DRAWING_CONTRACT.md sections 2 and 5, built
+2026-11-17): three tools and two style keys.
+
+| Tool | What it does |
+| --- | --- |
+| `combine_elements` | `ids` (two or more shapes, paths, lines without arrow heads, pen strokes) and `op` (`union`, `subtract`, `intersect`, `exclude`): one path in the top-most operand's place, style, note and fields (subtract: the bottom-most minus everything above it, in the bottom-most's), keeping its id; the others deleted; `BoardTxn::combine`. Text, sticky notes and the rest are refused with a sentence naming them; so is a result with nothing left |
+| `flip_elements` | `ids` and `direction` (`horizontal`, `vertical`), together about the center of all of them; text, sticky notes, cards, steps, callouts and frames move to their mirrored place unmirrored; a group flips what is in it; `BoardTxn::flip` |
+| `import_svg` | `svg` markup or a `file`, placed with its top-left (or with `center`, its center) at `x, y`, scaled so its longer side is `size` when given, into `layer`: paths with fills, strokes and gradients, groups as groups, simple text; the answer lists each new id (and its group) and every sentence of what was left out (filters, masks, clip paths, pictures, patterns...); `pimble_board::svg_in::parse` then `BoardTxn::import_svg`, one edit |
+
+The style takes `fill_gradient` and `stroke_gradient`: `{ "type": "linear" | "radial",
+"from": [x, y], "to": [x, y], "stops": [{ "offset": 0..1, "color": "#rrggbb(aa)" }, ...] }`,
+handles in the element's own box ([0,0] top-left, [1,1] bottom-right; defaults run left to
+right, a radial one from the center to the right edge), two stops or more (an offset left
+out spreads them evenly). A solid `fill` or `stroke` given in `update_elements` (and "none")
+replaces a gradient; `clear_style` takes `fill_gradient` and `stroke_gradient`, and clearing
+`fill` or `stroke` clears its gradient too. `get_canvas` writes a gradient in the style line
+(`fill linear gradient from 0,0.5 to 1,0.5 (#ff0000 at 0, #0000ff at 1)`) in place of the
+solid fallback; `render_canvas` draws it.
+
 **Meaning** (Joe, 2026-10-29; docs/IMAGE_MARKUP_CONTRACT.md "Meaning"): `add_elements` and
 `update_elements` take `note` and `fields` (in an update, a field given as null is removed),
 `add_layer` and `update_layer` the same for layers; `get_canvas` prints each under its

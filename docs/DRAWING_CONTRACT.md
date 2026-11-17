@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1 and 2 built (model and UI)** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1 and 2 built (model and UI), wave 3's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -664,3 +664,186 @@ cache, at a constant size on screen) and `repivot` made public.
   points; a marquee picks one); snapping or Shift constraints while dragging points;
   a miter limit or custom dash pattern control; converting arrows and connectors;
   pressure widths survive the Pencil only while it streams (the path has one width).
+
+## Built in wave 3 (model)
+
+Built 2026-11-17 in `crates/pimble-board` and `crates/pimble-mcp`, no UI: the context bar's
+combine and flip buttons, the color well's gradient editor and on-canvas gradient handles,
+and paste or drop of SVG are the UI half. `crates/pimble-app` is not touched.
+
+### Spike: combining
+
+Tried in a scratch crate on the contract's cases, release build, measuring areas against
+the exact ones: two overlapping circles (all four operations), two rectangles sharing an
+edge, the same rectangle twice, a figure eight crossing itself, a square with an even-odd
+hole, a five-point star minus a circle, and two closed curves of 200 curved anchors each.
+
+- **linesweeper** 0.5 (MIT or Apache-2.0, pure Rust over `kurbo`): every case right
+  (a shared edge disappears into one outline, identical shapes subtract to nothing, the
+  figure eight and the hole fill by their rules, the star keeps its cut-out middle); output
+  is cubic curves, not a polygon. 200 anchors against 200: 2.4 to 2.6 ms per operation.
+  Each operand can have its own fill rule (`Topology::contours` takes the inside test).
+- **flo_curves** 0.8 (Apache-2.0): the circles and rectangles right and about 0.3 ms at 200
+  anchors, but the figure eight came out at 100 square units instead of 5,100, the
+  even-odd hole was filled (12,600 instead of 7,600), the star minus the circle kept the
+  circle (14,583 instead of 8,928), and the 200-anchor subtract lost 4% of its area.
+- **i_overlay** (MIT or Apache-2.0) after flattening (0.05 units): right areas and the
+  fastest (0.23 ms), but a polygon of 400 to 800 points, to be refitted
+  (`path::fit`) into curves that would no longer meet exactly where the inputs did.
+
+Chosen: **linesweeper**, the one that was right on every case and answers curves; a few
+milliseconds is nothing for a click. It and `kurbo` build for wasm32. The spike's cases
+are `combine.rs`'s tests.
+
+### Stored keys
+
+Only new keys; everything that exists reads and draws as before.
+
+- Style keys `fill_gradient` and `stroke_gradient`, each one `Any` value written whole (last
+  writer wins, like geometry): `{ type: "linear" | "radial", x1, y1, x2, y2, stops: [{ offset,
+  color: "#rrggbb(aa)" }] }`. A missing or unknown `type`, or no stops, reads as no gradient.
+  **The solid `fill` / `stroke` key stays beside it as its fallback** (the first stop's color,
+  written with the gradient): an older app reads its solid key as it always did and draws
+  that, and ignores the gradient key. `ResolvedStyle.fill` is that fallback (so hit testing
+  and "has a fill" are unchanged), `ResolvedStyle.fill_gradient` / `stroke_gradient` the
+  gradients (stops clamped and sorted).
+- **Handles are in the element's box units** ((0, 0) the top-left of its own extent before
+  its transform, `Element::pivot_bounds`; (1, 1) its bottom-right), so a gradient moves,
+  turns and scales with its transform and stretches when the geometry is resized. The
+  paint itself is laid out in element space from the mapped handles: linear from `from` to
+  `to`, colors padding beyond; radial a **circle** centered on `from` through `to` (in
+  element space, so a circle stays one in a long box; turning or scaling the element
+  carries it). A box with no height or width (a horizontal line) is given the other side's
+  length (`Gradient::box_for`), so a line's stroke can run a gradient along it.
+- Combining, flipping and SVG in write only what exists: kind, geometry, transform,
+  parent, and new elements.
+
+### Public API
+
+- **Gradients** (`model.rs`, at the crate root): `Gradient { kind: GradientKind, from: Point,
+  to: Point, stops: Vec<GradientStop> }`, `GradientKind { Linear, Radial }` (`as_str`,
+  `parse`), `GradientStop { offset, color }` (`new`); `Gradient::linear(from, to, stops)`,
+  `radial(center, edge, stops)`, `default_linear(color)` / `default_radial(color)` (the
+  color to the same color transparent: left to right across the box; center to the right
+  edge), `is_valid()`, `radius()`, `normalized()`, `fallback() -> Color`, `color_at(t)`,
+  `mirrored(horizontal)`, `box_for(Rect)`. `Style` and `ResolvedStyle` gain
+  `fill_gradient` and `stroke_gradient`; `StyleKey` gains `FillGradient` and
+  `StrokeGradient`. `Paint { None, Solid(Color), Gradient(Gradient) }`.
+- **Setting paints** (`BoardTxn`): `set_fill_paint(id, &Paint) -> Result<()>` (None clears
+  the fill and its gradient; Solid writes the color and removes a gradient; Gradient writes
+  it with its fallback), `set_stroke_paint(id, &Paint) -> Result<()>` (`Paint::None` refused:
+  "A stroke cannot be none; set its width to 0 instead."). **The color well must use
+  these**: `set_style` only sets keys, so a solid color written with it under a gradient
+  leaves the gradient winning. `set_style` with a gradient writes the fallback too when the
+  `Style` names no solid color. `clear_style(Fill)` / `clear_style(Stroke)` now clear the
+  key's gradient as well (the app's "No fill" clears `Fill`).
+- **Combining** (`pimble_board::combine`, `CombineOp` at the root): `CombineOp { Union,
+  Subtract, Intersect, Exclude }` (`ALL`, `as_str`, `parse`, `label`); pure
+  `combine(&[PathGeom], CombineOp) -> Option<PathGeom>` (operands in one space, bottom to
+  top, each by its own rule; nonzero result; `None` when nothing is left) and
+  `area(&PathGeom) -> f32`. The edit: `BoardTxn::combine(ids: &[String], op: CombineOp) ->
+  Result<String>` answers the result's id.
+- **Flip**: `BoardTxn::flip(ids: &[String], axis: FlipAxis) -> Result<()>`, `FlipAxis {
+  Horizontal, Vertical }` at the root.
+- **SVG in** (`pimble_board::svg_in`, types at the root): `parse(svg: &str, place:
+  &SvgPlacement) -> Result<SvgImport, SvgError>`; `SvgPlacement { at: Point, center: bool,
+  fit: Option<f32> }` (`Default`: top-left at 0, 0, one SVG pixel per board unit; `fit`
+  scales the longer side to that many units); `SvgImport { items: Vec<SvgItem>, warnings:
+  Vec<String>, bounds: Option<Rect> }`; `SvgItem { element: NewElement, group: Option<usize>
+  }` (`group` indexes an earlier item, a `Kind::Group`); `SvgError { Parse(String), Empty }`.
+  The edit: `BoardTxn::import_svg(&SvgImport, layer: Option<&str>) -> Result<Vec<String>>`
+  (ids in `items` order). `text::first_baseline(font_size)` is public (where a text box's
+  first baseline sits).
+- Also new: `Kind::with_article()` ("a sticky note"), used by refusals.
+
+### What each does
+
+- **Combine**: every element is read through `path::to_path` (shapes with their radius,
+  sides and points, lines without heads, pen strokes, paths) and mapped through its
+  `world` (its transform and its group's) into board space; operands go bottom to top by
+  z-order; open subpaths fill as if closed. Union, intersect and exclude fold left to
+  right (exclude keeps what an odd number cover). **Deviation**: subtract is the
+  **bottom-most operand minus everything above it, and the result keeps the bottom one's
+  place and style** (Illustrator's "Minus Front"), where the contract says the top
+  operand's style for every operation; the other three keep the top operand's. The kept
+  element keeps its id, layer, order, group, style (gradients included), text and meaning;
+  it becomes `kind: path`, its geometry written in its group's space and its transform
+  removed; the other operands are deleted; one transaction, so one undo (tested). Locks
+  are judged on every operand first. Refusals write nothing: fewer than two elements
+  ("Combining takes two or more elements."), kinds with no outline ("Only shapes, lines
+  without arrow heads, pen strokes and paths combine: a text and a sticky note do not."),
+  nothing left ("The shapes do not overlap, so intersecting them leaves nothing.";
+  "Nothing is left: the shapes in front cover the one at the back.").
+- **Flip** about the center of the given elements' combined bounds. Paths, shapes without
+  text, lines, arrows, pen and highlighter strokes and pictures are
+  **mirrored through the transform** (one axis of its scale negated, its rotation
+  reflected, its translation mirrored, all worked in its group's space), so geometry,
+  gradient handles and anchors are untouched and flipping twice gives back the transform
+  exactly (tested through a turned, scaled path). **Decided**: text, sticky notes, cards,
+  steps, callouts, frames, spotlights and shapes that hold text are **moved only**: what
+  they paint lands at its mirrored place, with their rotation kept, so words never read
+  backwards. A group flips its members (the group entry is not written; a turned or scaled
+  group is repivoted so it stays put); members of a flipped frame ride with the frame.
+  Connectors mirror their free ends. A locked element refuses the whole flip.
+- **Gradients draw** with tiny-skia's linear and radial shaders in element space (the
+  renderer's transform carries them), on the fills of rect, ellipse, diamond, polygon,
+  star, path, card and sticky note, and the strokes of those and of lines and arrows (head
+  included). Connectors keep a solid stroke. **SVG out** writes each as `<defs><linearGradient
+  | radialGradient gradientUnits="userSpaceOnUse">` just before the path that uses it
+  (`pimble-gradient-N` ids, stop opacity times the element's), in the element's own user
+  space. Gradients are fingerprinted, so the raster cache redraws on a change.
+- **SVG in** parses with `usvg` 0.49 (no default features: no text shaping, no system
+  fonts; MIT or Apache-2.0): CSS in `<style>` and classes, `<use>`, units, `viewBox` and
+  `preserveAspectRatio` all resolved, every shape a path. Each path becomes a `path`
+  element in board units (its transforms applied to its geometry, no transform of its
+  own), with fill (color and opacity, fill rule, linear and radial gradients through
+  `<defs>` references, in its box units), stroke (color or gradient, width scaled by the
+  transform, caps, joins, a miter limit that is not 4, dashes) and the opacity of the groups
+  above it folded into its own. No fill reads as none, no stroke as width 0. A `<g>`
+  holding two or more things becomes a board `group` of them; a group holding the whole
+  drawing (usvg's `viewBox` group, a file's wrapping `<g>`) does not. `<text>` is read off
+  the markup with `svgtypes` (usvg drops text without its text feature): one text element
+  per `<text>`, tspans that set `y`/`dy` starting new lines, position from its baseline
+  (`text::first_baseline`), size (px, pt, em, % resolved up the tree), fill color,
+  `text-anchor`, the transforms above it (turned about its center so its baseline start
+  stays put). **Deviation**: text goes on top of the drawing, not between the shapes it sat
+  between. Placement maps the drawing's extent to `SvgPlacement` (box units make gradients
+  scale for free; widths and dashes scale). Warnings, once each: filters, masks, clip paths
+  (shapes come in unclipped), pictures, patterns (filled grey), blend modes, repeating
+  gradients (they pad), text on a path, text styled only by a class. `import_svg` puts the
+  items in, in order, into the named layer or where `add_element` puts new elements, and
+  sets the groups, in one transaction (one undo, tested); a board with no vector layer
+  refuses with `NoVectorLayer`, as for any new element, so the UI makes "Vector 1" first
+  (`tools::target_layer`, as wave 2's tools do).
+- **Size**: `usvg`, `svgtypes`, `roxmltree`, `simplecss`, `kurbo`, `linesweeper` and
+  `tiny-skia-path` 0.12 (usvg's; the renderer stays on tiny-skia 0.11) are new to the web
+  build.
+
+### MCP
+
+docs/MCP_CONTRACT.md "Combining, gradients, flip, SVG in": `combine_elements`,
+`flip_elements`, `import_svg`; `fill_gradient` and `stroke_gradient` in every style
+(`add_elements`, `update_elements`, where a solid color replaces a gradient), in
+`clear_style`, and in `get_canvas`'s style line; `render_canvas` draws them.
+
+### Tests
+
+`combine.rs` (the spike's cases: circles all four ways, a shared edge, the same shape twice,
+a figure eight, a hole, a star minus a circle, three operands, 200 anchors), `svg_in.rs`
+(shapes, groups with transforms and `viewBox`, gradients by reference and a CSS class, text
+and warnings, placement, refusals), `tests/wave3.rs` (combine through transforms with one
+undo, subtract keeping the back, refusals that write nothing, a combined group member,
+pens and holes; gradients stored with their fallback, replaced and cleared, drawn across an
+element and moved and stretched with it, radial and stroke gradients drawn and exported;
+flips of a turned path and back, text moved unmirrored, a group, a lock; SVG in as one undo
+with its groups, and `NoVectorLayer`), and the MCP's gradient round trip.
+
+### Not built
+
+The UI. A radial gradient's focal point and a second radius (imported focal gradients lose
+their focus), repeating and reflected gradients, gradients on pen and highlighter strokes,
+connectors and text; patterns. Combining keeps nothing of a pen stroke's pressure widths
+(it is its fitted outline's fill) and does not outline strokes (a line's stroke is not
+area: it combines as a zero-area shape). SVG in: pictures, clip paths and masks as paths,
+markers (arrow heads on SVG lines), text between shapes, multi-run text styling, fonts.
+Flip has no "flip about a point" or per-element pivot.
