@@ -22,6 +22,15 @@ canvas.
    screen at 100% zoom). Zooming far in shows pixels, as in any painting app.
 5. **The canvas tab is redesigned** with floating toolbars and panels ("overdue anyway").
 
+Wave 3 (Joe, 2026-11-17, accepting the recommendations as built):
+
+6. **Subtract keeps the back shape**: the bottom operand minus everything in front, in the
+   bottom operand's place and style; union, intersect and exclude keep the top operand's.
+7. **Flipping text moves it to its mirrored place and never mirrors the glyphs.**
+8. **A new gradient fades the current color to transparent.**
+9. **Lines count as zero area when combining**; an "Outline Stroke" that makes a stroke a
+   filled path may come later.
+
 Already settled by earlier contracts and kept: everything is co-edited through the board's
 yrs document, undo is per person, a lock is a shared guard, visibility is the node's.
 
