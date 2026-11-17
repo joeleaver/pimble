@@ -49,6 +49,7 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
     let active = with_session(pane, |s| !s.selected.is_empty() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false) || pointing;
     let selected = with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false) || points::anchors_selected(pane);
     let painting = untracked(|| store_tool()).is_some_and(Tool::paints);
+    let paint_selection = super::paint_select::active(pane);
     match key.key.as_str() {
         " " | "Shift" => true,
         // Alt breaks a handle's link while the Pen or Direct select works,
@@ -56,12 +57,12 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
         "Alt" => pointing || painting,
         // `[` and `]` resize the brush (Ctrl with them orders the selection).
         "[" | "]" if !primary && !key.alt => painting,
-        "Enter" => points::drawing(pane),
+        "Enter" => points::drawing(pane) || paint_selection,
         // Tab hides the panels (docs/DRAWING_CONTRACT.md section 4).
         "Tab" => !primary && !key.alt,
         "x" | "X" if !primary && !key.alt => true,
-        "Delete" | "Backspace" => selected,
-        "Escape" => active,
+        "Delete" | "Backspace" => selected || paint_selection,
+        "Escape" => active || paint_selection,
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => selected,
         // Ctrl+V is the board's on the desktop; in the browser it is left to
         // the page, whose `paste` brings the clipboard's files
@@ -72,7 +73,7 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
             "z" | "y" | "d" | "g" | "a" | "c" | "]" | "[" | "l"
         ),
         _ if key.alt => false,
-        k => Tool::from_key(k).is_some(),
+        k => Tool::from_chord(k, key.shift).is_some(),
     }
 }
 
@@ -362,6 +363,7 @@ pub(super) fn cancel_gesture(store: AppStore, pane: PaneId) {
     };
     let Err(gesture) = points::cancelled(store, pane, gesture) else { return };
     let Err(gesture) = super::gradient::cancelled(store, pane, gesture) else { return };
+    let Err(gesture) = super::paint_select::cancelled(store, pane, gesture) else { return };
     match gesture {
         Gesture::Paint(stroke) => super::paint::cancelled(store, pane, stroke),
         Gesture::Stroke { id, .. } => {
@@ -434,7 +436,13 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
                 if points::double_click(store, pane, px, py) {
                     return;
                 }
-            } else if double && !matches!(tool, Tool::Eraser | Tool::Pen | Tool::Brush | Tool::Highlighter | Tool::Eyedropper) && double_click(store, pane, px, py) {
+            } else if double
+                && !matches!(
+                    tool,
+                    Tool::Eraser | Tool::Pen | Tool::Brush | Tool::Highlighter | Tool::Eyedropper | Tool::Fill | Tool::Smudge | Tool::Blur | Tool::SelectRect | Tool::SelectLasso
+                )
+                && double_click(store, pane, px, py)
+            {
                 return;
             }
             press(store, pane, tool, px, py);
@@ -462,7 +470,9 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
         Tool::Pen => points::pen_press(store, pane, px, py),
         Tool::Pencil => begin_stroke(store, pane, Kind::Pen, p, true),
         // A press the paint tools did not take (they take every one).
-        Tool::Brush | Tool::Highlighter => {}
+        Tool::Brush | Tool::Highlighter | Tool::Smudge | Tool::Blur => {}
+        Tool::Fill => super::paint::fill(store, pane, p),
+        Tool::SelectRect | Tool::SelectLasso => super::paint_select::press(store, pane, tool, px, py),
         Tool::Eyedropper => {
             with_session(pane, |s| s.gesture = Gesture::Eyedrop);
             super::paint::eyedrop(store, pane, px, py);
@@ -592,7 +602,13 @@ fn handle_at(s: &Session, px: f32, py: f32, scale: f32) -> Option<Handle> {
         return None;
     }
     let b = s.selection_bounds()?;
-    let (x, y, w, h) = s.to_screen(&b);
+    handle_of_box(s.to_screen(&b), px, py, scale)
+}
+
+/// Which handle of a selection box on screen (physical pixels) is at
+/// physical pixel (`px`, `py`): the element selection's, a paint
+/// selection's.
+pub(super) fn handle_of_box((x, y, w, h): (f32, f32, f32, f32), px: f32, py: f32, scale: f32) -> Option<Handle> {
     let reach = HANDLE_REACH * scale;
     let near = |hx: f32, hy: f32| (px - hx).abs() <= reach && (py - hy).abs() <= reach;
     let (cx, cy) = (x + w / 2.0, y + h / 2.0);
@@ -737,7 +753,7 @@ enum Write {
 
 fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
     with_session(pane, |s| s.pointer = (px, py));
-    if points::moved(store, pane, px, py) || super::gradient::moved(store, pane, px, py) {
+    if points::moved(store, pane, px, py) || super::gradient::moved(store, pane, px, py) || super::paint_select::moved(store, pane, px, py) {
         return;
     }
     let writable = with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()).unwrap_or(false);
@@ -857,7 +873,13 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 Write::Paint(stroke.id.clone(), point)
             }
             Gesture::Eyedrop => Write::Eyedrop,
-            Gesture::Pinch | Gesture::PenPlace | Gesture::Points(_) | Gesture::PointMarquee { .. } | Gesture::GradientHandle(_) => Write::Nothing,
+            Gesture::Pinch
+            | Gesture::PenPlace
+            | Gesture::Points(_)
+            | Gesture::PointMarquee { .. }
+            | Gesture::GradientHandle(_)
+            | Gesture::PaintSelect { .. }
+            | Gesture::PaintSelDrag(_) => Write::Nothing,
         }
     });
     let Some(next) = next else { return };
@@ -939,6 +961,7 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
     let p = with_session(pane, |s| s.view.screen_to_board(px, py)).unwrap_or_default();
     let Err(gesture) = points::released(store, pane, gesture, px, py) else { return };
     let Err(gesture) = super::gradient::released(store, pane, gesture, px, py) else { return };
+    let Err(gesture) = super::paint_select::released(store, pane, gesture, px, py) else { return };
     match gesture {
         Gesture::Paint(stroke) => {
             let point = with_session(pane, |s| [p.x, p.y, s.paint_pressure, 0.0]).unwrap_or(stroke.last);
@@ -1231,7 +1254,7 @@ fn translated(b: &Base, dx: f32, dy: f32) -> Option<(String, Option<Geom>, Optio
 
 /// The selection box after dragging `handle` to `p` (shift on a corner keeps
 /// the proportions).
-fn resized_bounds(handle: Handle, b: &Rect, p: Point, shift: bool) -> Rect {
+pub(super) fn resized_bounds(handle: Handle, b: &Rect, p: Point, shift: bool) -> Rect {
     let (mut x0, mut y0, mut x1, mut y1) = (b.x, b.y, b.right(), b.bottom());
     match handle {
         Handle::N => y0 = p.y,
@@ -1350,7 +1373,7 @@ fn resized(b: &Base, from: &Rect, to: &Rect) -> Option<(String, Option<Geom>, Op
 }
 
 /// The angle a rotate drag has turned, degrees clockwise; shift snaps to 15°.
-fn rotation_degrees(start: f32, now: f32, shift: bool) -> f32 {
+pub(super) fn rotation_degrees(start: f32, now: f32, shift: bool) -> f32 {
     let d = (now - start).to_degrees();
     if shift {
         (d / 15.0).round() * 15.0
@@ -2632,12 +2655,22 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
         "Alt" => {
             with_session(pane, |s| s.alt = true);
         }
+        // Enter keeps a paint selection's pixels where they are.
+        "Enter" if super::paint_select::active(pane) => super::paint_select::commit(store, pane),
         "Enter" => points::finish_pen(store, pane),
         "[" | "]" if !primary && !key.alt && untracked(|| store.board_tool.get()).paints() => {
             super::paint::step_size(store, pane, key.key == "]");
         }
         "Delete" | "Backspace" if points::anchors_selected(pane) => points::delete_anchors(store, pane),
+        // Delete clears a paint selection's pixels.
+        "Delete" | "Backspace" if super::paint_select::active(pane) => super::paint_select::clear(store, pane),
         "Delete" | "Backspace" => delete_selected(store, pane),
+        "Escape" if super::paint_select::active(pane) => {
+            // Escape takes a paint selection back: its pixels go back
+            // where they were.
+            cancel_gesture(store, pane);
+            super::paint_select::cancel(store, pane);
+        }
         "Escape" if points::drawing(pane) => {
             // Escape finishes the Pen's path (a press under way is taken
             // back first).
@@ -2690,7 +2723,7 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             _ => {}
         },
         k if !key.alt => {
-            if let Some(tool) = Tool::from_key(k) {
+            if let Some(tool) = Tool::from_chord(k, key.shift) {
                 store.board_tool.set(tool);
             }
         }
@@ -2711,8 +2744,10 @@ pub(super) fn flip_key(key: &str) -> Option<FlipAxis> {
 /// collaborator's (contract section 4).
 pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) {
     let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
-    // A Pen path under way is finished first, so undo takes it back whole.
+    // A Pen path under way is finished first, so undo takes it back whole;
+    // a paint selection ends with its pixels where they are.
     points::finish_pen(store, pane);
+    super::paint_select::commit(store, pane);
     if !store.node_access(held.0, held.1).allows_write() {
         return;
     }

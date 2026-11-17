@@ -3,7 +3,9 @@
 //! highlighter preset, always into a multiply "Highlights" layer), the
 //! Eraser in paint layers, the Eyedropper (and Alt held with a brush), `[`
 //! and `]`, the brush cursor, the tile cache paint layers draw from, and the
-//! layers panel's thumbnails.
+//! layers panel's thumbnails. Wave 5 (docs/DRAWING_CONTRACT.md, "Built in
+//! wave 5 (UI)"): the Fill, and Smudge and Blur, which stream as a stroke
+//! does.
 //!
 //! A stroke follows the model's recommended flow: on the press one edit
 //! with the layer (`paint_layer_for` or `highlights_layer`) and
@@ -20,7 +22,7 @@
 use std::sync::OnceLock;
 
 use pimble_board::brush::{self, BrushPoint, BrushSettings, Preset, PRESETS};
-use pimble_board::{EditOverlay, LayerKind, NewStroke, PaintBody, PaintCache, RgbaImage};
+use pimble_board::{EditOverlay, LayerKind, NewFill, NewRetouch, NewStroke, PaintBody, PaintCache, Retouch, RgbaImage};
 use rinch::render_surface::SurfacePointerKind;
 
 use super::rail::Well;
@@ -30,6 +32,23 @@ use super::*;
 
 /// The eraser's first size, board units.
 pub const ERASER_SIZE: f32 = 24.0;
+/// Smudge's and Blur's first size.
+pub const RETOUCH_SIZE: f32 = 30.0;
+/// The Fill's tolerances (the context bar's chips): a label and the value.
+pub const TOLERANCES: [(&str, f32); 6] = [("0%", 0.0), ("5%", 0.05), ("15%", 0.15), ("30%", 0.3), ("50%", 0.5), ("80%", 0.8)];
+/// Smudge's and Blur's strengths.
+pub const STRENGTHS: [(&str, f32); 5] = [("10%", 0.1), ("25%", 0.25), ("50%", 0.5), ("75%", 0.75), ("100%", 1.0)];
+
+/// A chip's label for `value` among `choices` (the nearest one's, so a
+/// value set elsewhere still shows), as a percent when none is near.
+pub fn choice_label(choices: &[(&'static str, f32)], value: f32) -> String {
+    choices
+        .iter()
+        .find(|(_, v)| (v - value).abs() < 0.005)
+        .map(|(l, _)| l.to_string())
+        .unwrap_or_else(|| format!("{}%", (value * 100.0).round()))
+}
+
 /// The brush sizes the size picker offers, board units.
 pub const SIZE_RANGE: (f32, f32) = (1.0, 250.0);
 
@@ -81,6 +100,8 @@ pub(super) fn current_settings(store: AppStore) -> Option<BrushSettings> {
     let st = store.board_style;
     match store.board_tool.get() {
         Tool::Eraser => Some(brush::ROUND.settings.with_size(st.eraser_size.get())),
+        // Smudge and Blur work with the round brush at their own size.
+        Tool::Smudge | Tool::Blur => Some(brush::ROUND.settings.with_size(st.retouch_size.get())),
         _ => {
             let preset = current_preset(store)?;
             Some(st.brushes.get().get(index_of(preset)).copied().unwrap_or(preset.settings))
@@ -96,6 +117,12 @@ pub(super) fn change_settings(store: AppStore, f: impl FnOnce(&mut BrushSettings
         let mut s = brush::ROUND.settings.with_size(untracked(|| st.eraser_size.get()));
         f(&mut s);
         st.eraser_size.set(s.size.clamp(brush::MIN_SIZE, brush::MAX_SIZE));
+        return;
+    }
+    if matches!(tool, Tool::Smudge | Tool::Blur) {
+        let mut s = brush::ROUND.settings.with_size(untracked(|| st.retouch_size.get()));
+        f(&mut s);
+        st.retouch_size.set(s.size.clamp(brush::MIN_SIZE, brush::MAX_SIZE));
         return;
     }
     let Some(preset) = untracked(|| current_preset(store)) else { return };
@@ -279,13 +306,58 @@ fn erase_in(store: AppStore, pane: PaneId, p: Point) -> Result<EraseIn, String> 
     .unwrap_or(Ok(EraseIn::Elements))
 }
 
+/// The effect a retouching tool works.
+fn retouch_effect(tool: Tool) -> Option<Retouch> {
+    match tool {
+        Tool::Smudge => Some(Retouch::Smudge),
+        Tool::Blur => Some(Retouch::Blur),
+        _ => None,
+    }
+}
+
+/// Smudge's and Blur's sentence where there is no paint to work.
+pub const NO_PAINT_HERE: &str = "Smudge and Blur work on paint, and this canvas has no painting yet.";
+
+/// A Fill press at board point `p` (docs/DRAWING_CONTRACT.md section 3):
+/// the color well's front square poured into the paint layer the brush
+/// would paint into ("Paint N" made when needed, and picked), at the
+/// context bar's tolerance, contiguous or everywhere, clipped to what this
+/// device sees together with the layer's painting (`fill_clip`). One undo
+/// step, the layer made with it included.
+pub(super) fn fill(store: AppStore, pane: PaneId, p: Point) {
+    if !writable_or_say(store, pane) {
+        return;
+    }
+    let st = store.board_style;
+    let (color, tolerance, contiguous) = untracked(|| (brush_color(store), st.tolerance.get(), st.contiguous.get()));
+    let picked = untracked(|| store.pane(pane).board_ui.layer.get());
+    new_undo_step(pane);
+    super::points::hold_clock(pane, true);
+    let layer = local_edit_said(store, pane, |t| t.paint_layer_for(picked.as_deref()));
+    if let Some(layer) = layer {
+        let clip = with_session(pane, |s| pimble_board::fill_clip(s.snapshot(), &layer, p, Some(s.visible_rect())));
+        if let Some(clip) = clip {
+            let fill = NewFill::new(layer.clone(), p, color, clip).with_tolerance(tolerance);
+            let fill = if contiguous { fill } else { fill.everywhere() };
+            local_edit_said(store, pane, |t| t.add_fill(fill));
+        }
+        if picked.as_deref() != Some(layer.as_str()) {
+            store.pane(pane).board_ui.layer.set(Some(layer));
+        }
+    }
+    super::points::hold_clock(pane, false);
+    new_undo_step(pane);
+    with_session(pane, |s| s.selected.clear());
+    after_change(store, pane);
+}
+
 /// A press with a paint tool at board point `p`: Alt held with a brush
 /// picks a color; the eraser on a vector layer starts erasing elements
 /// (answers `false`, the caller's way); otherwise a stroke begins.
 /// Answers whether it handled the press.
 pub(super) fn press(store: AppStore, pane: PaneId, tool: Tool, p: Point, px: f32, py: f32) -> bool {
     let alt = with_session(pane, |s| s.alt).unwrap_or(false);
-    if alt && tool != Tool::Eraser {
+    if alt && matches!(tool, Tool::Brush | Tool::Highlighter) {
         with_session(pane, |s| s.gesture = Gesture::Eyedrop);
         eyedrop(store, pane, px, py);
         return true;
@@ -302,14 +374,24 @@ pub(super) fn press(store: AppStore, pane: PaneId, tool: Tool, p: Point, px: f32
                 return true;
             }
         },
+        Tool::Smudge | Tool::Blur => match super::paint_select::paint_layer_at(store, pane, p, NO_PAINT_HERE) {
+            Ok(layer) => Some(layer),
+            Err(sentence) => {
+                crate::events::show_notice(store, sentence);
+                return true;
+            }
+        },
         _ => None,
     };
     let pressure = with_session(pane, |s| s.paint_pressure).unwrap_or(1.0);
     let point: BrushPoint = [p.x, p.y, pressure, 0.0];
     let st = store.board_style;
-    let (preset, settings, color) = untracked(|| {
-        let preset = preset_for(tool, &st.brush.get());
-        (preset, current_settings(store).unwrap_or(preset.settings), brush_color(store))
+    let (preset, settings, color, strength) = untracked(|| {
+        let preset = match tool {
+            Tool::Smudge | Tool::Blur => &brush::ROUND,
+            _ => preset_for(tool, &st.brush.get()),
+        };
+        (preset, current_settings(store).unwrap_or(preset.settings), brush_color(store), st.strength.get())
     });
     let picked = untracked(|| store.pane(pane).board_ui.layer.get());
     let picture = (tool == Tool::Highlighter).then(|| with_session(pane, |s| picture_at(s, p))).flatten().flatten();
@@ -323,8 +405,12 @@ pub(super) fn press(store: AppStore, pane: PaneId, tool: Tool, p: Point, px: f32
             (None, Tool::Highlighter) => t.highlights_layer(picture.as_deref())?,
             (None, _) => t.paint_layer_for(picked.as_deref())?,
         };
+        if let Some(effect) = retouch_effect(tool) {
+            let retouch = NewRetouch::new(layer.clone(), effect, preset).with_settings(settings).with_strength(strength).with_points(vec![point]);
+            return Ok((t.begin_retouch(retouch)?, layer));
+        }
         let stroke = NewStroke::new(layer.clone(), preset, color).with_settings(settings).with_points(vec![point]);
-        let stroke = if erase.is_some() { stroke.erasing() } else { stroke };
+        let stroke = if tool == Tool::Eraser { stroke.erasing() } else { stroke };
         Ok((t.begin_stroke(stroke)?, layer))
     });
     let Some((id, layer)) = begun else {

@@ -943,6 +943,9 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
             pen_overlay(s, pen, scale)
         } else if let Some(pe) = s.points.as_ref().filter(|_| tool == Tool::DirectSelect) {
             points_overlay(s, pe, scale)
+        } else if tool.selects_paint() {
+            // A paint selection's marching ants.
+            super::paint_select::overlay(s)
         } else if super::gradient::handles_with(tool) || tool == Tool::Hand {
             // The selected element's gradient handles, while the well's
             // picker edits its gradient.
@@ -1019,6 +1022,9 @@ pub(super) fn tool_changed(store: AppStore, pane: PaneId) {
     }
     if tool != Tool::DirectSelect {
         end_points(store, pane);
+    }
+    if !tool.selects_paint() {
+        super::paint_select::commit(store, pane);
     }
     if with_session(pane, |_| ()).is_some() {
         refresh_overlay(store, pane);

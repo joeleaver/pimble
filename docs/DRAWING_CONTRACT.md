@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1, 2, 3 and 4 built (model and UI); wave 5's model built, its UI next** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; all five waves built (model and UI)** (see the end; wave 5's open questions for Joe are in its model section). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -1568,3 +1568,128 @@ moves; pasting an image into a paint layer (`add_pixels` is ready for it).
 2. Hidden layers in a merge: refuse (built) or discard as painting apps do?
 3. The fill clip: the view together with the layer's painting (built), or the view alone?
 4. Fill tolerance 0.15 and smudge/blur strength 0.5 as the defaults.
+
+## Built in wave 5 (UI)
+
+Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model above.
+`crates/pimble-board` gained only `EditOverlay.dashed` and `dash_phase` (closed outlines
+drawn as marching ants: a white line under a dashed one).
+
+- **Files**: `boards/paint_select.rs` (new: the paint selections, their drags, the ants),
+  `boards/paint.rs` (the Fill, Smudge and Blur, their sizes and pickers' data),
+  `boards/layers.rs` (Flatten Layer, the merges as pixels, the blob flow), `boards.rs`
+  (the tools and their keys, `StyleUi.tolerance`/`contiguous`/`retouch_size`/`strength`,
+  `Popup::Tolerance`/`FillMode`/`Strength`, `PaneUi.rasterizing`, `Gesture::PaintSelect`
+  and `PaintSelDrag`, the session's `paint_sel` and `ants`, `seed_picture`, the handles of
+  a paint selection), `boards/tools.rs` (routing, keys), `boards/rail.rs` (the rail, the
+  context bar), `boards/points.rs` (the overlay), `styles.rs`.
+- **The rail's Paint group**: the brush flyout (Brush, Highlighter), Eraser, a **fill
+  flyout** (Fill, Smudge, Blur), a **selection flyout** (Rectangle select, Lasso select),
+  Eyedropper. Each flyout remembers its face as the others do.
+- **Letters** (every tool still has its own key, tested): Select V, Direct select A, Hand
+  H | Pen P, Pencil N, the shapes flyout (Rectangle U, Ellipse O, Diamond D, Polygon Y,
+  Star K, **Line Shift+W**, Arrow W) | Brush B, **Highlighter Shift+B**, Eraser E, **Fill G,
+  Smudge R, Blur Shift+R**, **Rectangle select M, Lasso select L**, Eyedropper I | Text
+  T, Sticky note S, Connector C, Numbered step J, Frame F, Discussion pin Q. **Moved**: the
+  Highlighter from M and the Line from L, which the selections take as the contract says.
+  No plain letter was free but Z, so a key may now be a letter with Shift
+  (`Tool::shifted`, `Tool::from_chord`): Shift with a letter picks that letter's shifted
+  tool, a variant of the plain one (the Highlighter is the brush's preset, a line is an
+  arrow with no head), and otherwise changes nothing (Shift+N is still the Pencil; Shift+H
+  and Shift+V still flip a selection). Tooltips and flyout menus say "Shift+R".
+- **Fill**: a press fills at the point with the color well's front square (the brush's
+  color), into the paint layer the brush would paint into (`paint_layer_for` of the
+  layers panel's pick: "Paint N" made when needed, and picked), clipped by
+  `fill_clip(snapshot, layer, seed, view)` with `view` the board rectangle the pane shows.
+  The layer (when made) and the fill are two writes under the held undo clock: **one undo
+  step**. Context bar: the color disc, "Tol N%" (chips 0, 5, 15, 30, 50 and 80%; 15% the
+  model's default) and "Contiguous" / "Everywhere". The tolerance and the reach are the
+  session's, like every tool option.
+- **Smudge and Blur**: brushes on the pixels already painted. They work the picked layer
+  when it is a paint layer (a locked one refused with its sentence), else the topmost
+  shown, unlocked paint layer painting under the press, else the topmost such layer with
+  any painting; a canvas with none says "Smudge and Blur work on paint, and this canvas has
+  no painting yet." Both use the round preset at a size of their own (30 units first;
+  `[`/`]` and the size picker change it) and the strength (chips 10, 25, 50, 75 and 100%;
+  50% first). They stream exactly as the brush does (`begin_retouch` on the press, appends
+  sent merged about every 100 ms, `end_stroke` on release, the undo clock held: one undo
+  step; a cancel deletes the operation), with the brush cursor. Alt does not pick colors
+  with them (nothing to pick for).
+- **Paint selections**: M or L, then a drag (a rectangle) or a drawn loop (a lasso, a point
+  every 2 logical pixels, closed through where it was let go) over a paint layer chosen as
+  for Smudge; smaller than 3 logical pixels either way it is no selection. It shows as
+  marching ants in the edit overlay (a timer moves them every 200 ms while there is a
+  selection) and the element selection's own handles on the box of where its pixels are
+  now. A drag inside moves the pixels (Shift: along one axis), a side or corner handle
+  scales them (Shift keeps the proportions, `resized_bounds` as for elements), the rotate
+  handle turns them about the box's center (Shift: 15 degrees); each drag composes onto
+  the transform the last left (`selection_from`, `dragged`, tested). **Live**: the first
+  drag writes `add_move(layer, selection, Some(t))` (in a new undo step, the undo clock
+  held from then on), every later write is `set_move_transform`, about every 80 ms and on
+  release; between writes only the ants follow the pointer. **Enter**, a press outside the
+  selection (which starts the next one), another tool, undo and closing the pane keep the
+  pixels where they are and let the clock go: **the whole lift and place, however many
+  drags, is one undo step** (tested). **Escape** deletes the move (the pixels go back) as
+  wave 4 cancels a stroke; a cancelled pointer mid-drag puts the pixels back where that
+  drag found them (deleting the move if that drag made it). **Delete/Backspace** clears the
+  selected pixels: `set_move_transform(id, None)` when they were moved, else `add_move(...,
+  None)`, in the selection's undo step, and the selection ends. A selection is this pane's
+  own: nothing of it is written until its pixels move, so others see nothing of it until
+  then.
+- **Layers panel**: **Flatten Layer** (a stack icon, shown when the picked layer is a paint
+  layer), and **Merge Down / Merge Group through the blob flow** when
+  `merge_needs_pixels` says so (otherwise `merge_layer_down` / `merge_group` as before).
+  The flow (`layers::rasterize_layer`): `rasterize` from a plain snapshot of the board
+  (never the view's: color by author must not be baked in) with the shared tile cache and
+  the pictures `pictures_of` has, off the UI thread on the desktop (inline in the browser),
+  the PNG decoded there too; a refusal is said as a sentence (a hidden layer, a picture not
+  here yet, too large, paint onto vector); a raster with no picture is laid down at once;
+  else `PutBlob` with request ids from `1 << 41` (clear of image nodes' and text
+  pictures'), and on `BlobStored` (`boards::stored` asks `layers::raster_stored` first)
+  one `layer_edit` with `apply_raster(&raster, Some(&url))`: **one undo step**; a Merge
+  Down then picks the layer it went into. When the blob's size is the raster's (it was not
+  scaled to fit), the decoded picture and its bytes are put in this window's picture cache
+  under the URL (`seed_picture`), so the pixels show at once and are never fetched back.
+  Meanwhile the panel says "Flattening..." or "Merging...", its buttons are dimmed and take
+  no presses, and another such job is refused with a sentence. A canvas closed before the
+  blob came back changes nothing and says so.
+- **Tests**: the rail (the Paint group's flyouts and faces, every tool its own key with
+  the shifted ones, tooltips, the Fill's and the retouch tools' controls, the tolerance
+  and strength chips' data, the chrome's keys), `paint_select.rs` (a drag as a rectangle
+  or lasso and the ones too small or flat; moves, Shift on an axis, a second drag going on
+  from the first; handle scaling with and without Shift; turning about the center, Shift
+  by 15 degrees), `boards.rs`: a fill inside a painted ring (blue inside, nothing outside,
+  the clip holding the ring, the tolerance stored, Everywhere not contiguous, each fill one
+  undo step); a fill making "Paint 1" in its undo step; Smudge by R and Blur by Shift+R on
+  the layer painted there, streamed, with their size after `]` and the strength, one undo
+  each; rectangle select, two drags (one move, its transform the sum), a corner handle
+  doubling it, Enter, the whole thing one undo step, Escape removing the move, a lasso and
+  Delete clearing the pixels inside and keeping those outside, another tool keeping a
+  move, a canvas with no paint refusing; Flatten through the blob flow ("Flattening..."
+  meanwhile, nothing changed before the blob, one `pixels` operation looking the same, one
+  undo step) and Merge Down of a vector layer onto a paint layer (the rectangle now pixels,
+  the vector layer gone, the paint layer picked).
+- **Checked in the test app** (desktop, scratch store, a 1200-pixel window): a ring
+  painted in a new "Paint 2" and filled inside at 30% tolerance with a blue picked in the
+  well (`w5_2_ring.png`, `w5_4_fill.png`); the Fill's context bar and tolerance chips
+  (`w5_3_fill_bar.png`); Smudge at 100% dragged across the ring's top twice and Blur
+  across its right edge (`w5_5_smudge_bar.png`, `w5_6_smudge_blur.png`); a rectangle
+  selection's ants and handles, moved, turned about 45 degrees and kept with Enter
+  (`w5_7_rect_select.png` to `w5_10_committed.png`); a lasso and Delete
+  (`w5_11_lasso.png`, `w5_12_lasso_deleted.png`); Flatten taking "Paint 2" from 8
+  operations to 1, looking the same (`w5_14_flattened.png`); a gradient rectangle in a new
+  vector layer merged down onto "Paint 2" (the layer gone, 2 operations, the same look,
+  `w5_15_vector_above.png`, `w5_16_merged_down.png`); the bars after widening the longer
+  pickers (`w5_bars.png`). Screenshots are in the session's scratchpad.
+- **Not built**: pasting an image into a paint layer (it needs the clipboard's picture
+  routed to a paint layer instead of becoming a picture element, and a choice of where it
+  lands and how it is moved before it is placed: more than a small change; `add_pixels`
+  after `PutBlob` is ready for it). Copying or cutting a selection's pixels; a selection
+  across layers; feathered or antialiased edges (the model's); adding to or subtracting
+  from a selection (Shift/Alt with M or L); the selection's own context bar (flip, numeric
+  transforms); a progress figure for a long Flatten (only the words); IndexedDB for tiles
+  (wave 4's line stands). **Rough edges**: the smudge at full strength started off the
+  paint drags transparency in (the model's smudge carries what it first loads, as painting
+  apps do), which surprised in the check; a non-uniform scale of a turned selection shears
+  it (elements keep proportions when turned; pixels follow the handles); the ants re-present
+  the frame every 200 ms while a selection exists.

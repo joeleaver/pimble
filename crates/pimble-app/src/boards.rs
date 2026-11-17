@@ -43,6 +43,7 @@ mod gradient;
 mod layers;
 mod nav;
 mod paint;
+mod paint_select;
 mod points;
 mod rail;
 mod svg_import;
@@ -111,6 +112,15 @@ pub enum Tool {
     Eraser,
     /// Picks the color under the pointer from the composited canvas.
     Eyedropper,
+    /// Flood fill in a paint layer (docs/DRAWING_CONTRACT.md section 3).
+    Fill,
+    /// Smudge and Blur: brushes that work the pixels of a paint layer.
+    Smudge,
+    Blur,
+    /// Paint selections: a rectangle or a lasso of a paint layer's pixels,
+    /// moved, scaled, turned or cleared.
+    SelectRect,
+    SelectLasso,
     /// A discussion at a point (docs/DISCUSSIONS_CONTRACT.md section 6): a
     /// pin, which is not a board element.
     Pin,
@@ -118,7 +128,7 @@ pub enum Tool {
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 22] = [
+    pub const ALL: [Tool; 27] = [
         Tool::Select,
         Tool::DirectSelect,
         Tool::Hand,
@@ -140,17 +150,24 @@ impl Tool {
         Tool::Frame,
         Tool::Eraser,
         Tool::Eyedropper,
+        Tool::Fill,
+        Tool::Smudge,
+        Tool::Blur,
+        Tool::SelectRect,
+        Tool::SelectLasso,
         Tool::Pin,
     ];
 
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
     /// where they do not collide, docs/DRAWING_CONTRACT.md's P, A and N for
     /// the Pen, Direct select and the Pencil, B, E and I for the Brush, the
-    /// Eraser and the Eyedropper; G and R are kept free for wave 5's Fill
-    /// and Smudge, so the Rectangle is U (the shapes flyout's letter), the
-    /// Polygon Y and the numbered step J; a board only hears plain letters
-    /// while it has the keyboard, so none of them reach the app's own
-    /// keys).
+    /// Eraser and the Eyedropper, G, R and Shift+R for Fill, Smudge and
+    /// Blur, M and L for the paint selections; so the Rectangle is U (the
+    /// shapes flyout's letter), the Polygon Y, the numbered step J, and the
+    /// Highlighter and the Line are Shift+B and Shift+W, variants of the
+    /// Brush and the Arrow ([`Tool::shifted`]); a board only hears plain
+    /// letters while it has the keyboard, so none of them reach the app's
+    /// own keys).
     pub fn key(self) -> char {
         match self {
             Tool::Select => 'v',
@@ -159,8 +176,8 @@ impl Tool {
             Tool::Pen => 'p',
             Tool::Pencil => 'n',
             Tool::Brush => 'b',
-            Tool::Highlighter => 'm',
-            Tool::Line => 'l',
+            Tool::Highlighter => 'b',
+            Tool::Line => 'w',
             Tool::Arrow => 'w',
             Tool::Rect => 'u',
             Tool::Ellipse => 'o',
@@ -174,18 +191,51 @@ impl Tool {
             Tool::Frame => 'f',
             Tool::Eraser => 'e',
             Tool::Eyedropper => 'i',
+            Tool::Fill => 'g',
+            Tool::Smudge => 'r',
+            Tool::Blur => 'r',
+            Tool::SelectRect => 'm',
+            Tool::SelectLasso => 'l',
             Tool::Pin => 'q',
         }
     }
 
-    /// The tool a plain letter picks.
+    /// Whether the tool's key is its letter with Shift: a variant of the
+    /// tool the plain letter picks.
+    pub fn shifted(self) -> bool {
+        matches!(self, Tool::Highlighter | Tool::Line | Tool::Blur)
+    }
+
+    /// The key as a tooltip and a menu show it: "B", "Shift+R".
+    pub fn key_label(self) -> String {
+        let letter = self.key().to_ascii_uppercase();
+        if self.shifted() {
+            format!("Shift+{letter}")
+        } else {
+            letter.to_string()
+        }
+    }
+
+    /// The tool a plain letter picks (Shift not held).
     pub fn from_key(key: &str) -> Option<Tool> {
+        Tool::from_chord(key, false)
+    }
+
+    /// The tool a letter picks, with Shift held or not: Shift with a letter
+    /// that has a shifted tool picks that one; otherwise Shift changes
+    /// nothing (Shift+N is still the Pencil).
+    pub fn from_chord(key: &str, shift: bool) -> Option<Tool> {
         let mut chars = key.chars();
         let c = chars.next()?.to_ascii_lowercase();
         if chars.next().is_some() {
             return None;
         }
-        Tool::ALL.into_iter().find(|t| t.key() == c)
+        if shift {
+            if let Some(tool) = Tool::ALL.into_iter().find(|t| t.shifted() && t.key() == c) {
+                return Some(tool);
+            }
+        }
+        Tool::ALL.into_iter().find(|t| !t.shifted() && t.key() == c)
     }
 
     pub fn name(self) -> &'static str {
@@ -211,6 +261,11 @@ impl Tool {
             Tool::Frame => "Frame",
             Tool::Eraser => "Eraser",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Fill => "Fill",
+            Tool::Smudge => "Smudge",
+            Tool::Blur => "Blur",
+            Tool::SelectRect => "Rectangle select",
+            Tool::SelectLasso => "Lasso select",
             Tool::Pin => "Discussion pin",
         }
     }
@@ -238,6 +293,11 @@ impl Tool {
             Tool::Frame => TablerIcon::Frame,
             Tool::Eraser => TablerIcon::Eraser,
             Tool::Eyedropper => TablerIcon::ColorPicker,
+            Tool::Fill => TablerIcon::Bucket,
+            Tool::Smudge => TablerIcon::HandFinger,
+            Tool::Blur => TablerIcon::Blur,
+            Tool::SelectRect => TablerIcon::Marquee2,
+            Tool::SelectLasso => TablerIcon::Lasso,
             Tool::Pin => TablerIcon::MessagePlus,
         }
     }
@@ -268,15 +328,26 @@ impl Tool {
             | Tool::Pin
             | Tool::Brush
             | Tool::Highlighter
-            | Tool::Eyedropper => return None,
+            | Tool::Eyedropper
+            | Tool::Fill
+            | Tool::Smudge
+            | Tool::Blur
+            | Tool::SelectRect
+            | Tool::SelectLasso => return None,
         })
     }
 
-    /// The tools that paint (docs/DRAWING_CONTRACT.md section 3): the
-    /// brush cursor follows the pointer, `[` and `]` resize, Alt picks a
-    /// color (the eraser's Alt does nothing).
+    /// The tools that paint with a brush (docs/DRAWING_CONTRACT.md section
+    /// 3): the brush cursor follows the pointer, `[` and `]` resize, Alt
+    /// picks a color with the brushes that lay one down (the eraser's,
+    /// the smudge's and the blur's Alt does nothing).
     pub fn paints(self) -> bool {
-        matches!(self, Tool::Brush | Tool::Highlighter | Tool::Eraser)
+        matches!(self, Tool::Brush | Tool::Highlighter | Tool::Eraser | Tool::Smudge | Tool::Blur)
+    }
+
+    /// The paint selections (rectangle and lasso).
+    pub fn selects_paint(self) -> bool {
+        matches!(self, Tool::SelectRect | Tool::SelectLasso)
     }
 }
 
@@ -362,6 +433,13 @@ pub struct StyleUi {
     pub brushes: Signal<Vec<pimble_board::BrushSettings>>,
     /// The eraser's size in paint layers, board units.
     pub eraser_size: Signal<f32>,
+    /// The Fill's tolerance (0 to 1) and whether it fills only what
+    /// touches the seed (docs/DRAWING_CONTRACT.md, "Built in wave 5 (UI)").
+    pub tolerance: Signal<f32>,
+    pub contiguous: Signal<bool>,
+    /// Smudge's and Blur's size, board units, and their strength (0 to 1).
+    pub retouch_size: Signal<f32>,
+    pub strength: Signal<f32>,
 }
 
 impl StyleUi {
@@ -395,6 +473,10 @@ impl StyleUi {
             brush: Signal::new(pimble_board::brush::ROUND.name),
             brushes: Signal::new(paint::default_brushes()),
             eraser_size: Signal::new(paint::ERASER_SIZE),
+            tolerance: Signal::new(pimble_board::paint_ops::DEFAULT_TOLERANCE),
+            contiguous: Signal::new(true),
+            retouch_size: Signal::new(paint::RETOUCH_SIZE),
+            strength: Signal::new(pimble_board::paint_ops::DEFAULT_STRENGTH),
         }
     }
 }
@@ -472,6 +554,11 @@ pub enum Popup {
     BrushOpacity,
     Flow,
     Hardness,
+    /// The Fill's tolerance, and contiguous or everywhere.
+    Tolerance,
+    FillMode,
+    /// Smudge's and Blur's strength.
+    Strength,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -590,6 +677,9 @@ pub struct PaneUi {
     /// Each layer's thumbnail, a `data:` URL, by layer id (drawn again a
     /// moment after the layer changes, `paint::thumbs_due`).
     pub thumbs: Signal<HashMap<String, String>>,
+    /// A Flatten or a merge drawn as pixels is under way (drawn, then its
+    /// picture stored): what the layers panel says meanwhile.
+    pub rasterizing: Signal<Option<&'static str>>,
 }
 
 impl PaneUi {
@@ -629,6 +719,7 @@ impl PaneUi {
             keys: Signal::new(rail::Keys::Canvas),
             drop_at: Signal::new(None),
             thumbs: Signal::new(HashMap::new()),
+            rasterizing: Signal::new(None),
         }
     }
 }
@@ -825,6 +916,13 @@ enum Gesture {
     /// The Eyedropper (or Alt with a brush) held down: the color under the
     /// pointer is picked as it moves.
     Eyedrop,
+    /// A paint selection being drawn: a rectangle from `start` to `now`, or
+    /// a lasso through `lasso`'s points (board units), of paint layer
+    /// `layer`.
+    PaintSelect { layer: String, start: Point, now: Point, lasso: Option<Vec<Point>> },
+    /// The paint selection's pixels dragged: moved, scaled by a handle or
+    /// turned.
+    PaintSelDrag(paint_select::SelDrag),
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -905,6 +1003,11 @@ struct Session {
     version: u64,
     /// The pressure a paint tool paints with (1 for a mouse).
     paint_pressure: f32,
+    /// The paint selection (rectangle or lasso) and what was done to its
+    /// pixels so far.
+    paint_sel: Option<paint_select::PaintSel>,
+    /// How far the selection's ants have marched.
+    ants: f32,
 }
 
 /// A picture in text being marked up in a pane.
@@ -960,6 +1063,14 @@ impl Session {
         let (x0, y0) = self.view.board_to_screen(Point::new(r.x, r.y));
         let (x1, y1) = self.view.board_to_screen(Point::new(r.right(), r.bottom()));
         (x0, y0, x1 - x0, y1 - y0)
+    }
+
+    /// The board rectangle the view shows.
+    fn visible_rect(&self) -> Rect {
+        let (w, h) = self.view.size();
+        let a = self.view.screen_to_board(0.0, 0.0);
+        let b = self.view.screen_to_board(w as f32, h as f32);
+        Rect::new(a.x.min(b.x), a.y.min(b.y), (b.x - a.x).abs(), (b.y - a.y).abs())
     }
 
     /// The union of the selected elements' bounds.
@@ -1131,6 +1242,8 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         outbox_at: 0.0,
         version: 0,
         paint_pressure: 1.0,
+        paint_sel: None,
+        ants: 0.0,
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -1147,6 +1260,8 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 /// document as this pane last had it.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
+    // A paint selection's pixels stay where they were put.
+    paint_select::commit(store, pane);
     remember_camera(pane, scale_of(pane));
     // A paint stroke under way ends here, and what it held goes out.
     let painting = with_session(pane, |s| match std::mem::replace(&mut s.gesture, Gesture::Idle) {
@@ -1386,6 +1501,8 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         outbox_at: 0.0,
         version: 0,
         paint_pressure: 1.0,
+        paint_sel: None,
+        ants: 0.0,
     };
     // The watch and the undo manager start after the board was made here,
     // so undo never takes back the board itself.
@@ -1639,7 +1756,10 @@ fn after_change(store: AppStore, pane: PaneId) {
             .filter_map(|id| snapshot.get(id))
             .map(|e| logical(s.to_screen(&e.bounds)))
             .collect();
-        let handles = if pointing.is_none() && s.selected.iter().any(|id| s.editable(id)) {
+        let handles = if let Some(b) = s.paint_sel.as_ref().and_then(|sel| sel.box_now()) {
+            // A paint selection's handles, on its pixels where they are now.
+            Some(logical(s.to_screen(&b)))
+        } else if pointing.is_none() && s.selected.iter().any(|id| s.editable(id)) {
             s.selection_bounds().map(|b| logical(s.to_screen(&b)))
         } else {
             None
@@ -1899,6 +2019,17 @@ fn picture_source() -> impl Fn(&str) -> Option<Arc<Picture>> {
             }
         })
     }
+}
+
+/// A picture this window made (a flattened layer), put in the cache under
+/// the URL it was stored at, so it shows at once and is not fetched back.
+fn seed_picture(src: &str, picture: Arc<Picture>, bytes: Vec<u8>) {
+    PICTURES.with(|p| {
+        let mut p = p.borrow_mut();
+        p.decoded.insert(src.to_string(), picture);
+        p.raw.insert(src.to_string(), Arc::new(bytes));
+        p.wanted.remove(src);
+    });
 }
 
 /// A picture's bytes as stored, when this window has them.
@@ -2328,6 +2459,10 @@ fn pump(store: AppStore) {
 /// The answer to an image node's or a board picture's `PutBlob`; answers
 /// whether it was one.
 pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
+    // A flattened layer's picture (Flatten, a merge as pixels).
+    if layers::raster_stored(store, request_id, result) {
+        return true;
+    }
     let Some((_, store_id, parent_id, title, batch)) = IN_FLIGHT.with(|f| f.borrow_mut().take_if(|(id, ..)| *id == request_id)) else {
         return false;
     };
@@ -3671,6 +3806,335 @@ mod tests {
         assert_eq!(untracked(|| store.board_tool.get()), Tool::Select);
         tools::undo(store, P[0], false);
         assert_eq!(element_count(P[0]), 0, "one undo step");
+        stop(store, P[0]);
+    }
+
+    // ── Wave 5 (docs/DRAWING_CONTRACT.md, "Built in wave 5 (UI)") ──────────
+    use pimble_board::PaintBody;
+
+    /// The paint operations on pane 0's board: their kinds, in drawing order.
+    fn op_kinds() -> Vec<String> {
+        with_session(P[0], |s| s.snapshot().paint.iter().map(|op| op.raw.body.kind().to_string()).collect()).unwrap()
+    }
+
+    /// A closed ring of brush strokes around board point `c`.
+    fn paint_ring(store: AppStore, c: Point, r: f32) {
+        use rinch::render_surface::SurfacePointer;
+        let at = |i: usize| {
+            let a = i as f32 / 48.0 * std::f32::consts::TAU;
+            on_screen(Point::new(c.x + r * a.cos(), c.y + r * a.sin()))
+        };
+        let (x, y) = at(0);
+        tools::pointer_down(store, P[0], x, y, SurfaceMouseButton::Left, SurfacePointer::mouse(true));
+        for i in 1..=50 {
+            let (x, y) = at(i);
+            tools::pointer_move(store, P[0], x, y, SurfacePointer::mouse(true));
+        }
+        let (x, y) = at(50);
+        tools::pointer_up(store, P[0], x, y, SurfaceMouseButton::Left, SurfacePointer::mouse(false));
+    }
+
+    fn color_at(p: Point) -> Color {
+        with_session(P[0], |s| {
+            let (pictures, _) = pictures_of(s.snapshot());
+            pimble_board::sample_color(s.snapshot(), &pictures, p, None)
+        })
+        .unwrap()
+    }
+
+    /// The Fill (G) pours the well's front square inside a painted ring, in
+    /// the brush's layer, clipped to what is seen with the layer's painting,
+    /// at the context bar's tolerance; one undo step.
+    #[test]
+    fn the_fill_pours_inside_a_ring_in_one_undo_step() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let st = store.board_style;
+        st.stroke.set("#101010".to_string());
+        store.board_tool.set(Tool::Brush);
+        let c = Point::new(0.0, 0.0);
+        paint_ring(store, c, 80.0);
+        assert_eq!(op_kinds(), vec!["stroke"]);
+        let layer = untracked(|| store.pane(P[0]).board_ui.layer.get()).unwrap();
+
+        st.stroke.set("#20a040".to_string());
+        st.tolerance.set(0.3);
+        store.board_tool.set(Tool::Fill);
+        mouse_click(store, on_screen(c));
+        assert_eq!(op_kinds(), vec!["stroke", "fill"]);
+        let fill = with_session(P[0], |s| match &s.snapshot().paint[1].raw.body {
+            PaintBody::Fill(f) => (s.snapshot().paint[1].raw.layer.clone(), f.clone()),
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(fill.0, layer, "into the brush's layer");
+        assert_eq!(fill.1.color.to_hex(), "#20a040");
+        assert!((fill.1.tolerance - 0.3).abs() < 1e-6 && fill.1.contiguous);
+        assert!(fill.1.clip.contains(c) && fill.1.clip.contains(Point::new(80.0, 0.0)), "the ring's painting is in the clip: {:?}", fill.1.clip);
+        let inside = color_at(Point::new(10.0, 10.0));
+        assert!(inside.g > 140 && inside.r < 60 && inside.a > 250, "filled inside: {inside:?}");
+        let outside = color_at(Point::new(120.0, 0.0));
+        assert!(outside.g < 100 || outside.a < 10, "not outside the ring: {outside:?}");
+
+        // Everywhere: a second fill is not contiguous.
+        st.contiguous.set(false);
+        mouse_click(store, on_screen(Point::new(120.0, 0.0)));
+        let everywhere = with_session(P[0], |s| match &s.snapshot().paint.last().unwrap().raw.body {
+            PaintBody::Fill(f) => f.contiguous,
+            _ => true,
+        })
+        .unwrap();
+        assert!(!everywhere);
+
+        tools::undo(store, P[0], false);
+        tools::undo(store, P[0], false);
+        assert_eq!(op_kinds(), vec!["stroke"], "each fill is one undo step");
+        stop(store, P[0]);
+    }
+
+    /// A fill with no paint layer makes "Paint 1" with it, and one undo
+    /// takes both back.
+    #[test]
+    fn a_fill_makes_its_paint_layer_in_the_same_undo_step() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let layers_before = with_session(P[0], |s| s.snapshot().layers.len()).unwrap();
+        store.board_tool.set(Tool::Fill);
+        mouse_click(store, on_screen(Point::new(0.0, 0.0)));
+        assert_eq!(op_kinds(), vec!["fill"]);
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before + 1);
+        tools::undo(store, P[0], false);
+        assert!(op_kinds().is_empty());
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before);
+        stop(store, P[0]);
+    }
+
+    /// Smudge (R) and Blur (Shift+R) stream on the paint under them as a
+    /// stroke does, with their own size and the strength; nowhere painted
+    /// they say so and write nothing.
+    #[test]
+    fn smudge_and_blur_work_the_paint_under_them() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        store.board_tool.set(Tool::Brush);
+        mouse_drag(store, on_screen(Point::new(-100.0, 0.0)), on_screen(Point::new(100.0, 0.0)));
+        store.pane(P[0]).board_ui.layer.set(None);
+
+        let key = |k: &str, shift: bool| rinch::render_surface::SurfaceKeyData { key: k.into(), code: String::new(), ctrl: false, shift, alt: false, meta: false };
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(key("r", false)));
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Smudge);
+        store.board_style.strength.set(0.75);
+        paint::step_size(store, P[0], true);
+        let size = untracked(|| store.board_style.retouch_size.get());
+        assert!(size > paint::RETOUCH_SIZE, "] makes Smudge larger");
+        mouse_drag(store, on_screen(Point::new(0.0, -20.0)), on_screen(Point::new(0.0, 40.0)));
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(key("R", true)));
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Blur);
+        mouse_drag(store, on_screen(Point::new(-50.0, 0.0)), on_screen(Point::new(50.0, 0.0)));
+        let retouches: Vec<(pimble_board::Retouch, f32, f32, usize, String)> = with_session(P[0], |s| {
+            s.snapshot()
+                .paint
+                .iter()
+                .filter_map(|op| match &op.raw.body {
+                    PaintBody::Retouch(r) => Some((r.effect, r.strength, r.settings.size, r.points.len(), op.raw.layer.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap();
+        assert_eq!(retouches.len(), 2);
+        assert_eq!(retouches[0].0, pimble_board::Retouch::Smudge);
+        assert_eq!(retouches[1].0, pimble_board::Retouch::Blur);
+        assert!((retouches[0].1 - 0.75).abs() < 1e-6);
+        assert_eq!(retouches[0].2, size);
+        assert!(retouches[0].3 >= 5, "streamed: {}", retouches[0].3);
+        let stroke_layer = strokes()[0].0.clone();
+        assert!(retouches.iter().all(|r| r.4 == stroke_layer), "on the layer painted there");
+
+        // Away from the painting, the layer with painting still takes it.
+        mouse_drag(store, on_screen(Point::new(0.0, 500.0)), on_screen(Point::new(50.0, 500.0)));
+        assert_eq!(op_kinds().len(), 4);
+        tools::undo(store, P[0], false);
+
+        // One undo step each.
+        tools::undo(store, P[0], false);
+        tools::undo(store, P[0], false);
+        assert_eq!(op_kinds(), vec!["stroke"]);
+        stop(store, P[0]);
+    }
+
+    fn moves() -> Vec<pimble_board::MoveOp> {
+        with_session(P[0], |s| {
+            s.snapshot()
+                .paint
+                .iter()
+                .filter_map(|op| match &op.raw.body {
+                    PaintBody::Move(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn key_event(store: AppStore, k: &str) {
+        let key = rinch::render_surface::SurfaceKeyData { key: k.into(), code: String::new(), ctrl: false, shift: false, alt: false, meta: false };
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(key));
+    }
+
+    /// Rectangle select (M) over paint: a drag inside moves the pixels (a
+    /// move written on the first drag, changed while dragging), a handle
+    /// scales them; Enter keeps them and the whole lift and place is one
+    /// undo step. Escape takes a selection back; a lasso (L) and Delete
+    /// clear the pixels.
+    #[test]
+    fn paint_selections_move_scale_and_clear_pixels() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        store.board_tool.set(Tool::Brush);
+        mouse_drag(store, on_screen(Point::new(-100.0, 0.0)), on_screen(Point::new(100.0, 0.0)));
+
+        key_event(store, "m");
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::SelectRect);
+        mouse_drag(store, on_screen(Point::new(-50.0, -30.0)), on_screen(Point::new(50.0, 30.0)));
+        let sel = with_session(P[0], |s| s.paint_sel.clone()).unwrap().expect("a selection");
+        assert_eq!(sel.selection.bounds().map(|b| (b.w.round(), b.h.round())), Some((100.0, 60.0)));
+        assert!(moves().is_empty(), "nothing written until it is dragged");
+        assert!(untracked(|| store.pane(P[0]).board_ui.handles.get()).is_some(), "the handles show");
+        assert!(with_session(P[0], |s| paint_select::overlay(s).is_some_and(|o| o.dashed.len() == 1)).unwrap(), "the ants march");
+
+        // Dragged inside: moved 40 down, twice (one move operation).
+        mouse_drag(store, on_screen(Point::new(0.0, 0.0)), on_screen(Point::new(0.0, 20.0)));
+        mouse_drag(store, on_screen(Point::new(0.0, 20.0)), on_screen(Point::new(0.0, 40.0)));
+        let all = moves();
+        assert_eq!(all.len(), 1);
+        let t = all[0].transform.unwrap();
+        assert!((t.f - 40.0).abs() < 0.01 && t.e.abs() < 0.01, "{t:?}");
+        // The bottom right handle: twice as wide and tall.
+        let b = with_session(P[0], |s| s.paint_sel.as_ref().unwrap().box_now().unwrap()).unwrap();
+        mouse_drag(store, on_screen(Point::new(b.right(), b.bottom())), on_screen(Point::new(b.x + b.w * 2.0, b.y + b.h * 2.0)));
+        let t = moves()[0].transform.unwrap();
+        assert!((t.a - 2.0).abs() < 0.01 && (t.d - 2.0).abs() < 0.01, "{t:?}");
+        key_event(store, "Enter");
+        assert!(with_session(P[0], |s| s.paint_sel.is_none()).unwrap());
+        assert_eq!(moves().len(), 1, "kept");
+        tools::undo(store, P[0], false);
+        assert!(moves().is_empty(), "the whole lift and place is one undo step");
+        assert_eq!(op_kinds(), vec!["stroke"]);
+
+        // Escape after a drag: the move goes.
+        mouse_drag(store, on_screen(Point::new(-50.0, -30.0)), on_screen(Point::new(50.0, 30.0)));
+        mouse_drag(store, on_screen(Point::new(0.0, 0.0)), on_screen(Point::new(30.0, 0.0)));
+        assert_eq!(moves().len(), 1);
+        key_event(store, "Escape");
+        assert!(moves().is_empty() && with_session(P[0], |s| s.paint_sel.is_none()).unwrap());
+
+        // A lasso, and Delete: a move that puts nothing down.
+        key_event(store, "l");
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::SelectLasso);
+        {
+            use rinch::render_surface::SurfacePointer;
+            let pts = [(-40.0, -20.0), (40.0, -20.0), (40.0, 20.0), (-40.0, 20.0)];
+            let (x, y) = on_screen(Point::new(pts[0].0, pts[0].1));
+            tools::pointer_down(store, P[0], x, y, SurfaceMouseButton::Left, SurfacePointer::mouse(true));
+            for &(bx, by) in &pts[1..] {
+                let (x, y) = on_screen(Point::new(bx, by));
+                tools::pointer_move(store, P[0], x, y, SurfacePointer::mouse(true));
+            }
+            tools::pointer_up(store, P[0], x - 0.1, y, SurfaceMouseButton::Left, SurfacePointer::mouse(false));
+        }
+        assert!(matches!(with_session(P[0], |s| s.paint_sel.clone()).unwrap().map(|s| s.selection), Some(pimble_board::Selection::Lasso(_))));
+        key_event(store, "Delete");
+        let all = moves();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].transform.is_none(), "cleared");
+        let gone = color_at(Point::new(0.0, 0.0));
+        assert!(gone.a < 10, "the pixels inside are gone: {gone:?}");
+        let kept = color_at(Point::new(80.0, 0.0));
+        assert!(kept.a > 200, "the ones outside stay: {kept:?}");
+        tools::undo(store, P[0], false);
+        assert!(moves().is_empty());
+
+        // Another tool keeps a selection's pixels where they are.
+        key_event(store, "m");
+        mouse_drag(store, on_screen(Point::new(-50.0, -30.0)), on_screen(Point::new(50.0, 30.0)));
+        mouse_drag(store, on_screen(Point::new(0.0, 0.0)), on_screen(Point::new(10.0, 0.0)));
+        store.board_tool.set(Tool::Brush);
+        points::tool_changed(store, P[0]);
+        assert!(with_session(P[0], |s| s.paint_sel.is_none()).unwrap());
+        assert_eq!(moves().len(), 1);
+
+        stop(store, P[0]);
+
+        // A board with no painting: a sentence, and no selection.
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        store.board_tool.set(Tool::SelectRect);
+        mouse_drag(store, on_screen(Point::new(0.0, 400.0)), on_screen(Point::new(50.0, 450.0)));
+        assert!(with_session(P[0], |s| s.paint_sel.is_none()).unwrap());
+        stop(store, P[0]);
+    }
+
+    /// The next `PutBlob` of a flattened layer, answered as stored at its
+    /// own size.
+    fn answer_raster(store: AppStore, commands: &crossbeam_channel::Receiver<BackendCommand>) -> (u32, u32) {
+        let (request_id, bytes) = commands
+            .try_iter()
+            .find_map(|c| match c {
+                BackendCommand::PutBlob { request_id, bytes, .. } => Some((request_id, bytes)),
+                _ => None,
+            })
+            .expect("the picture is stored");
+        assert!(request_id >= 1 << 41, "a raster's request: {request_id}");
+        let size = Picture::decode(&bytes).map(|p| (p.width(), p.height())).unwrap();
+        let url = BlobUrl::parse(&format!("pimble-blob:00000000-0000-0000-0000-000000000001/{}a", "c".repeat(25))).unwrap();
+        assert!(stored(store, request_id, &Ok(StoredBlob { url, size: Some(size), notice: None })));
+        size
+    }
+
+    /// Flatten Layer: drawn, stored, laid down as one `pixels` operation
+    /// that looks the same, in one undo step; the panel says so meanwhile.
+    /// Merge Down of a vector layer onto a paint layer goes the same way.
+    #[test]
+    fn flatten_and_merge_down_go_through_the_blob_flow() {
+        let (store, commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        store.board_style.stroke.set("#c02020".to_string());
+        store.board_tool.set(Tool::Brush);
+        mouse_drag(store, on_screen(Point::new(-100.0, 0.0)), on_screen(Point::new(100.0, 0.0)));
+        mouse_drag(store, on_screen(Point::new(0.0, -60.0)), on_screen(Point::new(0.0, 60.0)));
+        assert_eq!(op_kinds(), vec!["stroke", "stroke"]);
+        let layer = untracked(|| store.pane(P[0]).board_ui.layer.get()).unwrap();
+        let before = color_at(Point::new(50.0, 0.0));
+        let _ = commands.try_iter().count();
+
+        layers::rasterize_layer(store, P[0], pimble_board::RasterJob::Flatten(layer.clone()));
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.rasterizing.get()), Some("Flattening..."));
+        assert_eq!(op_kinds(), vec!["stroke", "stroke"], "nothing changes until the picture is stored");
+        answer_raster(store, &commands);
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.rasterizing.get()), None);
+        assert_eq!(op_kinds(), vec!["pixels"]);
+        let after = color_at(Point::new(50.0, 0.0));
+        assert!(before.r.abs_diff(after.r) <= 4 && before.a.abs_diff(after.a) <= 4, "looks the same: {before:?} {after:?}");
+        tools::undo(store, P[0], false);
+        assert_eq!(op_kinds(), vec!["stroke", "stroke"], "one undo step");
+
+        // A vector layer above the paint layer, merged down onto it.
+        let rect = local_edit(store, P[0], |t| {
+            let vector = t.add_layer("Shapes", Placement::Above(layer.clone()))?;
+            t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(150.0, -20.0, 40.0, 40.0))).with_style(Style { fill: Color::parse("#2040c0"), stroke: Color::parse("#2040c0"), ..Style::default() }).in_layer(vector.clone()))?;
+            Ok(vector)
+        })
+        .unwrap();
+        let rows = untracked(|| store.pane(P[0]).board_ui.layers.get());
+        let row = rows.iter().find(|r| r.id == rect).unwrap().clone();
+        layers::merge(store, P[0], &row);
+        answer_raster(store, &commands);
+        let layers_now: Vec<String> = with_session(P[0], |s| s.snapshot().layers.iter().map(|l| l.id.clone()).collect()).unwrap();
+        assert!(!layers_now.contains(&rect), "the vector layer went");
+        assert_eq!(op_kinds(), vec!["stroke", "stroke", "pixels"]);
+        let blue = color_at(Point::new(170.0, 0.0));
+        assert!(blue.b > 150 && blue.r < 80, "the rectangle is pixels now: {blue:?}");
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.layer.get()), Some(layer.clone()), "the layer it went into is picked");
         stop(store, P[0]);
     }
 }

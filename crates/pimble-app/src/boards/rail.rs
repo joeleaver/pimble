@@ -33,20 +33,25 @@ pub enum Slot {
 }
 
 /// The flyouts' tools, the first of each its face until another is used.
-pub const FLYOUTS: [&[Tool]; 3] = [
+pub const FLYOUTS: [&[Tool]; 5] = [
     // Shapes (Draw).
     &[Tool::Rect, Tool::Ellipse, Tool::Diamond, Tool::Polygon, Tool::Star, Tool::Line, Tool::Arrow],
     // More diagram tools.
     &[Tool::Connector, Tool::Step, Tool::Frame],
     // The brush and its highlighter preset (Paint).
     &[Tool::Brush, Tool::Highlighter],
+    // The fill and the brushes that work pixels already there (Paint).
+    &[Tool::Fill, Tool::Smudge, Tool::Blur],
+    // The paint selections (Paint).
+    &[Tool::SelectRect, Tool::SelectLasso],
 ];
 
 /// The rail, top to bottom: Select, Direct select and Hand; Draw (the Pen,
 /// the Pencil, the shapes); Paint (the brush and the highlighter, the
-/// eraser, the eyedropper); Diagram (text, sticky notes, the other diagram
-/// tools, discussion pins); pictures.
-pub const RAIL: [Slot; 17] = [
+/// eraser, the fill with smudge and blur, the paint selections, the
+/// eyedropper); Diagram (text, sticky notes, the other diagram tools,
+/// discussion pins); pictures.
+pub const RAIL: [Slot; 19] = [
     Slot::Tool(Tool::Select),
     Slot::Tool(Tool::DirectSelect),
     Slot::Tool(Tool::Hand),
@@ -57,6 +62,8 @@ pub const RAIL: [Slot; 17] = [
     Slot::Gap,
     Slot::Flyout(2),
     Slot::Tool(Tool::Eraser),
+    Slot::Flyout(3),
+    Slot::Flyout(4),
     Slot::Tool(Tool::Eyedropper),
     Slot::Gap,
     Slot::Tool(Tool::Text),
@@ -88,7 +95,7 @@ pub fn remember_face(faces: &[Tool], tool: Tool) -> Vec<Tool> {
 
 /// The rail button's tooltip: the tool's name and letter.
 pub fn tip(tool: Tool) -> String {
-    format!("{} ({})", tool.name(), tool.key().to_ascii_uppercase())
+    format!("{} ({})", tool.name(), tool.key_label())
 }
 
 // ── The context bar's model ─────────────────────────────────────────────────
@@ -125,6 +132,11 @@ pub struct Controls {
     pub brush_opacity: bool,
     pub flow: bool,
     pub hardness: bool,
+    /// The Fill's tolerance, and contiguous or everywhere.
+    pub tolerance: bool,
+    pub contiguous: bool,
+    /// Smudge's and Blur's strength.
+    pub strength: bool,
 }
 
 impl Controls {
@@ -150,6 +162,9 @@ impl Controls {
             || self.brush_opacity
             || self.flow
             || self.hardness
+            || self.tolerance
+            || self.contiguous
+            || self.strength
     }
 
     /// Any of the pickers (everything but the two swatches).
@@ -180,6 +195,9 @@ impl Controls {
             brush_opacity: self.brush_opacity || o.brush_opacity,
             flow: self.flow || o.flow,
             hardness: self.hardness || o.hardness,
+            tolerance: self.tolerance || o.tolerance,
+            contiguous: self.contiguous || o.contiguous,
+            strength: self.strength || o.strength,
         }
     }
 }
@@ -232,6 +250,8 @@ pub fn controls_of_tool(tool: Tool) -> Controls {
             return Controls { color: true, preset: true, size: true, brush_opacity: true, flow: true, hardness: true, ..Controls::default() };
         }
         Tool::Eraser => return Controls { size: true, ..Controls::default() },
+        Tool::Fill => return Controls { color: true, tolerance: true, contiguous: true, ..Controls::default() },
+        Tool::Smudge | Tool::Blur => return Controls { size: true, strength: true, ..Controls::default() },
         _ => {}
     }
     let mut c = tool.kind().map(|k| controls_of(&k)).unwrap_or_default();
@@ -259,6 +279,8 @@ pub fn hint(tool: Tool) -> &'static str {
         Tool::Eyedropper => "Click to pick the color under the pointer (Alt with a brush does it too)",
         Tool::Pin => "Click to start a discussion there",
         Tool::Frame => "Drag out a frame; what it covers goes with it",
+        Tool::SelectRect => "Drag over paint to select it, then move, scale or turn it",
+        Tool::SelectLasso => "Draw round paint to select it, then move, scale or turn it",
         _ => "",
     }
 }
@@ -337,7 +359,7 @@ pub fn key_act(keys: Keys, key: &str, ctrl: bool, shift: bool, alt: bool) -> Opt
             "[" => Some(KeyAct::Bracket(false)),
             "]" => Some(KeyAct::Bracket(true)),
             k if shift && tools::flip_key(k).is_some() => tools::flip_key(k).map(KeyAct::Flip),
-            k => Tool::from_key(k).map(KeyAct::Tool),
+            k => Tool::from_chord(k, shift).map(KeyAct::Tool),
         },
         Keys::Layers if ctrl && !shift && !alt && key.eq_ignore_ascii_case("g") => Some(KeyAct::GroupLayers),
         _ => None,
@@ -602,7 +624,7 @@ fn render_flyout(__scope: &mut RenderScope, store: AppStore, pane: PaneId, index
                     onclick: move || pick_tool(store, pane, tool),
                     span { class: "pimble-board__menu-icon", IconGlyph { name: tool.icon().name().to_string() } }
                     span { class: "pimble-board__grow", {tool.name()} }
-                    span { class: "pimble-board__menu-key", {tool.key().to_ascii_uppercase().to_string()} }
+                    span { class: "pimble-board__menu-key", {tool.key_label()} }
                 }
             }
         })
@@ -910,6 +932,41 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let flow_row = paint_slider(__scope, store, 2, "Flow", (0.02, 1.0, 0.02), |s| s.flow as f64, |s, v| s.flow = v as f32, |s| format!("{}%", (s.flow * 100.0).round()));
     let hardness_row = paint_slider(__scope, store, 3, "Hardness", (0.0, 1.0, 0.05), |s| s.hardness as f64, |s, v| s.hardness = v as f32, |s| format!("{}%", (s.hardness * 100.0).round()));
 
+    // The Fill's tolerance and reach, Smudge's and Blur's strength.
+    let tolerances: Vec<NodeHandle> = paint::TOLERANCES
+        .iter()
+        .map(|&(label, v)| {
+            text_button(__scope, label, "Tolerance: how far a color may be from the one clicked and still fill", move || (st.tolerance.get() - v).abs() < 0.005, move || {
+                st.tolerance.set(v);
+                ui.popup.set(Popup::None);
+            })
+        })
+        .collect();
+    let fill_modes: Vec<NodeHandle> = [(true, "Contiguous", "Fill what touches the pixel clicked"), (false, "Everywhere", "Fill every matching pixel in view")]
+        .into_iter()
+        .map(|(on, label, tip)| {
+            text_button(__scope, label, tip, move || st.contiguous.get() == on, move || {
+                st.contiguous.set(on);
+                ui.popup.set(Popup::None);
+            })
+        })
+        .collect();
+    let strengths: Vec<NodeHandle> = paint::STRENGTHS
+        .iter()
+        .map(|&(label, v)| {
+            text_button(__scope, label, "Strength", move || (st.strength.get() - v).abs() < 0.005, move || {
+                st.strength.set(v);
+                ui.popup.set(Popup::None);
+            })
+        })
+        .collect();
+    let tolerance_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Tol {}", paint::choice_label(&paint::TOLERANCES, st.tolerance.get()))} } };
+    let fill_mode_face = rsx! { span { class: "pimble-board__face-text", {move || if st.contiguous.get() { "Contiguous" } else { "Everywhere" }} } };
+    let strength_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Strength {}", paint::choice_label(&paint::STRENGTHS, st.strength.get()))} } };
+    let tolerance_btn = picker_button(__scope, ui, "Tolerance", Popup::Tolerance, "pimble-board__chooser--long", tolerance_face);
+    let fill_mode_btn = picker_button(__scope, ui, "Contiguous or everywhere", Popup::FillMode, "pimble-board__chooser--long", fill_mode_face);
+    let strength_btn = picker_button(__scope, ui, "Strength", Popup::Strength, "pimble-board__chooser--long", strength_face);
+
     // The selection's arrangement.
     let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
     let duplicate = act(__scope, TablerIcon::Copy, "Duplicate (Ctrl+D)", tools::duplicate);
@@ -1049,6 +1106,9 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().brush_opacity)}, {brush_opacity_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().flow)}, {flow_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().hardness)}, {hardness_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().tolerance)}, {tolerance_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().contiguous)}, {fill_mode_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().strength)}, {strength_btn} }
                     }
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
@@ -1145,6 +1205,9 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::BrushOpacity)}, {brush_opacity_row} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Flow)}, {flow_row} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Hardness)}, {hardness_row} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Tolerance)}, {tolerances} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::FillMode)}, {fill_modes} }
+            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Strength)}, {strengths} }
         }
     }
 }
@@ -1575,20 +1638,23 @@ mod tests {
     #[test]
     fn flyouts_remember_the_tool_last_used() {
         let faces = default_faces();
-        assert_eq!(faces, vec![Tool::Rect, Tool::Connector, Tool::Brush]);
+        assert_eq!(faces, vec![Tool::Rect, Tool::Connector, Tool::Brush, Tool::Fill, Tool::SelectRect]);
         assert_eq!(flyout_of(Tool::Star), Some(0));
         assert_eq!(flyout_of(Tool::Polygon), Some(0));
         let faces = remember_face(&faces, Tool::Ellipse);
-        assert_eq!(faces, vec![Tool::Ellipse, Tool::Connector, Tool::Brush]);
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Connector, Tool::Brush, Tool::Fill, Tool::SelectRect]);
         // A tool outside every flyout changes no face.
         assert_eq!(remember_face(&faces, Tool::Pen), faces);
         let faces = remember_face(&faces, Tool::Frame);
-        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Brush]);
-        // The highlighter is the Paint flyout's other face.
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Brush, Tool::Fill, Tool::SelectRect]);
+        // The highlighter is the Paint flyout's other face; Smudge and Blur
+        // share the Fill's, the lasso the rectangle select's.
         let faces = remember_face(&faces, Tool::Highlighter);
-        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Highlighter]);
+        let faces = remember_face(&faces, Tool::Blur);
+        let faces = remember_face(&faces, Tool::SelectLasso);
+        assert_eq!(faces, vec![Tool::Ellipse, Tool::Frame, Tool::Highlighter, Tool::Blur, Tool::SelectLasso]);
         // Faces of the wrong shape start again from the defaults.
-        assert_eq!(remember_face(&[], Tool::Step), vec![Tool::Rect, Tool::Step, Tool::Brush]);
+        assert_eq!(remember_face(&[], Tool::Step), vec![Tool::Rect, Tool::Step, Tool::Brush, Tool::Fill, Tool::SelectRect]);
         assert_eq!(flyout_of(Tool::Arrow), Some(0));
         assert_eq!(flyout_of(Tool::Text), None);
         assert_eq!(flyout_of(Tool::Eraser), None);
@@ -1603,15 +1669,31 @@ mod tests {
         assert_eq!(tip(Tool::Pen), "Pen (P)");
         assert_eq!(tip(Tool::DirectSelect), "Direct select (A)");
         assert_eq!(tip(Tool::Pencil), "Pencil (N)");
+        assert_eq!(tip(Tool::Fill), "Fill (G)");
+        assert_eq!(tip(Tool::Smudge), "Smudge (R)");
+        assert_eq!(tip(Tool::Blur), "Blur (Shift+R)");
+        assert_eq!(tip(Tool::SelectRect), "Rectangle select (M)");
+        assert_eq!(tip(Tool::SelectLasso), "Lasso select (L)");
+        assert_eq!(tip(Tool::Highlighter), "Highlighter (Shift+B)");
+        assert_eq!(tip(Tool::Line), "Line (Shift+W)");
     }
 
-    /// Every tool has its own letter, and the contract's P, A and N, B, E
-    /// and I; G and R wait for wave 5's Fill and Smudge.
+    /// Every tool has its own key (a letter, or a letter with Shift for a
+    /// variant of the plain letter's tool), and the contract's P, A and N,
+    /// B, E and I, G, R and Shift+R, M and L.
     #[test]
     fn every_tool_has_its_own_letter() {
+        let mut chords = Vec::new();
         for tool in Tool::ALL {
-            assert_eq!(Tool::from_key(&tool.key().to_string()), Some(tool), "{tool:?}");
+            let chord = (tool.key(), tool.shifted());
+            assert!(!chords.contains(&chord), "{tool:?} shares {chord:?}");
+            chords.push(chord);
+            assert_eq!(Tool::from_chord(&tool.key().to_string(), tool.shifted()), Some(tool), "{tool:?}");
             assert_ne!(tool.key(), 'x', "X swaps colors");
+            // A shifted tool's plain letter is a tool of its own.
+            if tool.shifted() {
+                assert!(Tool::from_key(&tool.key().to_string()).is_some_and(|t| t != tool), "{tool:?}");
+            }
         }
         assert_eq!(Tool::from_key("P"), Some(Tool::Pen));
         assert_eq!(Tool::from_key("a"), Some(Tool::DirectSelect));
@@ -1619,11 +1701,20 @@ mod tests {
         assert_eq!(Tool::from_key("b"), Some(Tool::Brush));
         assert_eq!(Tool::from_key("e"), Some(Tool::Eraser));
         assert_eq!(Tool::from_key("I"), Some(Tool::Eyedropper));
-        assert_eq!(Tool::from_key("g"), None, "Fill, wave 5");
-        assert_eq!(Tool::from_key("r"), None, "Smudge, wave 5");
+        assert_eq!(Tool::from_key("g"), Some(Tool::Fill));
+        assert_eq!(Tool::from_key("r"), Some(Tool::Smudge));
+        assert_eq!(Tool::from_chord("R", true), Some(Tool::Blur));
+        assert_eq!(Tool::from_key("m"), Some(Tool::SelectRect));
+        assert_eq!(Tool::from_key("l"), Some(Tool::SelectLasso));
+        assert_eq!(Tool::from_chord("B", true), Some(Tool::Highlighter));
+        assert_eq!(Tool::from_chord("W", true), Some(Tool::Line));
+        assert_eq!(Tool::from_key("w"), Some(Tool::Arrow));
+        // Shift with a letter that has no shifted tool is the plain one.
+        assert_eq!(Tool::from_chord("N", true), Some(Tool::Pencil));
         assert_eq!(Tool::from_key("u"), Some(Tool::Rect));
         assert_eq!(Tool::from_key("y"), Some(Tool::Polygon));
         assert_eq!(Tool::from_key("j"), Some(Tool::Step));
+        assert_eq!(Tool::from_key("z"), None);
     }
 
     #[test]
@@ -1638,6 +1729,31 @@ mod tests {
         assert!(!hint(Tool::Eyedropper).is_empty());
         assert!(Tool::Brush.paints() && Tool::Highlighter.paints() && Tool::Eraser.paints());
         assert!(!Tool::Eyedropper.paints() && !Tool::Pencil.paints());
+        // Wave 5: the Fill pours the brush color at a tolerance; Smudge and
+        // Blur take a size and a strength; the selections have a hint.
+        let fill = controls_of_tool(Tool::Fill);
+        assert!(fill.color && fill.tolerance && fill.contiguous && !fill.size && !fill.preset);
+        for tool in [Tool::Smudge, Tool::Blur] {
+            let c = controls_of_tool(tool);
+            assert!(c.size && c.strength && !c.color && !c.preset && !c.tolerance, "{tool:?}");
+            assert!(tool.paints());
+        }
+        for tool in [Tool::SelectRect, Tool::SelectLasso] {
+            assert!(!controls_of_tool(tool).any() && !hint(tool).is_empty() && tool.selects_paint() && !tool.paints());
+        }
+        assert!(!Tool::Fill.paints());
+    }
+
+    #[test]
+    fn the_fill_and_strength_pickers_offer_their_steps() {
+        let tolerances: Vec<f32> = paint::TOLERANCES.iter().map(|(_, v)| *v).collect();
+        assert!(tolerances.windows(2).all(|w| w[0] < w[1]), "in order");
+        assert!(tolerances.contains(&pimble_board::paint_ops::DEFAULT_TOLERANCE), "the default is a chip");
+        assert!(tolerances.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(paint::STRENGTHS.iter().any(|(_, v)| *v == pimble_board::paint_ops::DEFAULT_STRENGTH));
+        assert_eq!(paint::choice_label(&paint::TOLERANCES, 0.15), "15%");
+        assert_eq!(paint::choice_label(&paint::TOLERANCES, 0.22), "22%", "a value set elsewhere still shows");
+        assert_eq!(paint::choice_label(&paint::STRENGTHS, 1.0), "100%");
     }
 
     #[test]
@@ -1698,6 +1814,11 @@ mod tests {
         assert_eq!(key_act(Keys::Chrome, "[", false, false, false), Some(KeyAct::Bracket(false)));
         assert_eq!(key_act(Keys::Chrome, "]", false, false, false), Some(KeyAct::Bracket(true)));
         assert_eq!(key_act(Keys::Chrome, "b", false, false, false), Some(KeyAct::Tool(Tool::Brush)));
+        assert_eq!(key_act(Keys::Chrome, "B", false, true, false), Some(KeyAct::Tool(Tool::Highlighter)));
+        assert_eq!(key_act(Keys::Chrome, "r", false, false, false), Some(KeyAct::Tool(Tool::Smudge)));
+        assert_eq!(key_act(Keys::Chrome, "R", false, true, false), Some(KeyAct::Tool(Tool::Blur)));
+        assert_eq!(key_act(Keys::Chrome, "g", false, false, false), Some(KeyAct::Tool(Tool::Fill)));
+        assert_eq!(key_act(Keys::Chrome, "m", false, false, false), Some(KeyAct::Tool(Tool::SelectRect)));
         // Shift+H and Shift+V flip; plain H and V are their tools.
         assert_eq!(key_act(Keys::Chrome, "H", false, true, false), Some(KeyAct::Flip(FlipAxis::Horizontal)));
         assert_eq!(key_act(Keys::Chrome, "V", false, true, false), Some(KeyAct::Flip(FlipAxis::Vertical)));

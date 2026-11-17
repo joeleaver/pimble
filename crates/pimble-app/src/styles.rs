@@ -2641,6 +2641,11 @@ pub(crate) const APP_CSS: &str = "
     min-width: 54px;
 }
 
+/* Longer words: the Fill tolerance and reach, the retouch strength. */
+.pimble-board__context .pimble-board__chooser--long {
+    min-width: 92px;
+}
+
 .pimble-board__options {
     display: flex;
     align-items: center;

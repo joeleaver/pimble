@@ -113,6 +113,11 @@ pub struct EditOverlay {
     /// An anchor drawn larger (the Pen's first anchor, when a click there
     /// closes the path).
     pub hot: Option<Point>,
+    /// Closed outlines drawn as marching ants: a white line under a dashed
+    /// one (a paint selection, docs/DRAWING_CONTRACT.md section 3).
+    pub dashed: Vec<Vec<Point>>,
+    /// How far the ants have marched, in dash lengths (a timer moves it).
+    pub dash_phase: f32,
     pub color: Color,
     pub scale: f32,
 }
@@ -126,6 +131,8 @@ impl Default for EditOverlay {
             anchors: Vec::new(),
             tips: Vec::new(),
             hot: None,
+            dashed: Vec::new(),
+            dash_phase: 0.0,
             color: Color { r: 34, g: 139, b: 230, a: 255 },
             scale: 1.0,
         }
@@ -679,6 +686,24 @@ fn draw_overlay(frame: &mut Pixmap, view: &View, o: &EditOverlay) {
         cubic(&mut pb, c);
         if let Some(path) = pb.finish() {
             let stroke = Stroke { width: 1.0 * k, dash: StrokeDash::new(vec![4.0 * k, 3.0 * k], 0.0), ..Stroke::default() };
+            frame.stroke_path(&path, &paint, &stroke, id, None);
+        }
+    }
+    if !o.dashed.is_empty() {
+        let mut pb = PathBuilder::new();
+        for outline in o.dashed.iter().filter(|l| l.len() >= 2) {
+            let first = at(outline[0]);
+            pb.move_to(first.0, first.1);
+            for p in &outline[1..] {
+                let q = at(*p);
+                pb.line_to(q.0, q.1);
+            }
+            pb.close();
+        }
+        if let Some(path) = pb.finish() {
+            frame.stroke_path(&path, &white, &Stroke { width: 1.0 * k, ..Stroke::default() }, id, None);
+            let dash = 4.0 * k;
+            let stroke = Stroke { width: 1.0 * k, dash: StrokeDash::new(vec![dash, dash], (o.dash_phase * dash).rem_euclid(dash * 2.0)), ..Stroke::default() };
             frame.stroke_path(&path, &paint, &stroke, id, None);
         }
     }

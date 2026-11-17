@@ -5,12 +5,19 @@
 //! name (renamed in place) and element count; the picked layer's blend mode
 //! and opacity are below the list; rows drag between, into and out of groups.
 //!
+//! Flatten Layer, and Merge Down or Merge Group where the result is pixels,
+//! go through the blob flow (docs/DRAWING_CONTRACT.md, "Built in wave 5
+//! (model)" and "(UI)"): the layer is drawn as a picture (off the UI thread
+//! on the desktop), the picture stored as a blob of the node's store
+//! (`PutBlob`), and one edit lays it down once its URL comes back. The
+//! panel says so meanwhile and takes no other such job.
+//!
 //! The judgements are pure and tested here: which rows show
 //! ([`visible_rows`]), where a drop lands ([`zone_at`], [`drop_move`]).
 
 use super::*;
 use crate::appearance::IconGlyph;
-use pimble_board::{Blend, LayerKind};
+use pimble_board::{Blend, LayerKind, LayerRaster, RasterJob};
 
 /// Where a dragged layer row lands on the row under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,16 +170,163 @@ fn layer_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
         })
     });
     if let Some(sentence) = refused {
-        let mut sentence = sentence;
-        if let Some(first) = sentence.get(0..1) {
-            sentence = format!("{}{}", first.to_uppercase(), &sentence[1..]);
-        }
-        if !sentence.ends_with('.') {
-            sentence.push('.');
-        }
-        crate::events::show_notice(store, sentence);
+        say(store, sentence);
     }
     result
+}
+
+/// Show a refusal as a sentence: a capital first, a full stop last.
+fn say(store: AppStore, mut sentence: String) {
+    if let Some(first) = sentence.get(0..1) {
+        sentence = format!("{}{}", first.to_uppercase(), &sentence[1..]);
+    }
+    if !sentence.ends_with('.') {
+        sentence.push('.');
+    }
+    crate::events::show_notice(store, sentence);
+}
+
+// ── Flatten, and merges as pixels ───────────────────────────────────────────
+
+/// `PutBlob` request ids of flattened layers start here, clear of the
+/// pictures' (`pictures.rs`, and image nodes' from `1 << 40`).
+const RASTER_BASE: u64 = 1 << 41;
+
+/// A drawn layer whose picture is being stored.
+struct PendingRaster {
+    pane: PaneId,
+    held: (StoreId, NodeId),
+    raster: LayerRaster,
+    /// The picture decoded already, so this window shows it at once.
+    picture: Option<Arc<Picture>>,
+}
+
+thread_local! {
+    static RASTERS: RefCell<HashMap<u64, PendingRaster>> = RefCell::new(HashMap::new());
+    static NEXT_RASTER: Cell<u64> = const { Cell::new(RASTER_BASE) };
+}
+
+/// What the panel says while `job` is under way.
+pub fn busy_words(job: &RasterJob) -> &'static str {
+    match job {
+        RasterJob::Flatten(_) => "Flattening...",
+        RasterJob::MergeDown(_) | RasterJob::MergeGroup(_) => "Merging...",
+    }
+}
+
+/// Flatten Layer, or a merge whose result is pixels: draw it (off the UI
+/// thread on the desktop), then store the picture and lay it down
+/// ([`raster_stored`]). Refusals are said as sentences (a hidden layer, a
+/// picture not here yet, too large).
+pub(super) fn rasterize_layer(store: AppStore, pane: PaneId, job: RasterJob) {
+    let ui = store.pane(pane).board_ui;
+    if untracked(|| ui.rasterizing.get()).is_some() {
+        crate::events::show_notice(store, "A flatten or merge is still being stored; try again in a moment.".to_string());
+        return;
+    }
+    if !writable_or_say(store, pane) {
+        return;
+    }
+    let Some((held, snapshot, pictures)) = with_session(pane, |s| {
+        let (pictures, _) = pictures_of(s.snapshot());
+        ((s.store_id, s.node_id), s.board.snapshot().with_paint_cache(super::paint::shared_cache()), pictures)
+    }) else {
+        return;
+    };
+    ui.rasterizing.set(Some(busy_words(&job)));
+    let work = move || -> Result<(LayerRaster, Option<Arc<Picture>>), String> {
+        let raster = pimble_board::rasterize(&snapshot, &pictures, job).map_err(|e| e.to_string())?;
+        let picture = raster.png.as_deref().and_then(|png| Picture::decode(png).ok()).map(Arc::new);
+        Ok((raster, picture))
+    };
+    #[cfg(all(feature = "native", not(test)))]
+    std::thread::spawn(move || {
+        let result = work();
+        run_on_main_thread(move || rasterized(store, pane, held, result));
+    });
+    #[cfg(any(not(feature = "native"), test))]
+    rasterized(store, pane, held, work());
+}
+
+/// The layer was drawn: a picture goes to be stored, nothing drawn is laid
+/// down at once.
+fn rasterized(store: AppStore, pane: PaneId, held: (StoreId, NodeId), result: Result<(LayerRaster, Option<Arc<Picture>>), String>) {
+    let ui = store.pane(pane).board_ui;
+    let (raster, picture) = match result {
+        Ok(drawn) => drawn,
+        Err(sentence) => {
+            ui.rasterizing.set(None);
+            say(store, sentence);
+            return;
+        }
+    };
+    if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) {
+        ui.rasterizing.set(None);
+        return;
+    }
+    match raster.png.clone() {
+        None => {
+            ui.rasterizing.set(None);
+            lay_down(store, pane, &raster, None);
+        }
+        Some(png) => {
+            let request_id = NEXT_RASTER.with(|n| n.replace(n.get() + 1));
+            RASTERS.with(|r| r.borrow_mut().insert(request_id, PendingRaster { pane, held, raster, picture }));
+            store.send(BackendCommand::PutBlob { store_id: held.0, node_id: held.1, bytes: png, request_id });
+        }
+    }
+}
+
+/// The answer to a flattened layer's `PutBlob`; answers whether it was one.
+/// The pixels are laid down in one edit (one undo step); this window's
+/// picture cache gets the picture already decoded when it was stored as it
+/// was drawn.
+pub(super) fn raster_stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
+    let Some(pending) = RASTERS.with(|r| r.borrow_mut().remove(&request_id)) else { return false };
+    let PendingRaster { pane, held, raster, picture } = pending;
+    store.pane(pane).board_ui.rasterizing.set(None);
+    match result {
+        Err(sentence) => say(store, sentence.clone()),
+        Ok(_) if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) => {
+            crate::events::show_notice(store, "The canvas was closed before its flattened picture was stored, so nothing changed.".to_string());
+        }
+        Ok(blob) => {
+            let src = blob.url.to_string();
+            if let (Some(picture), Some(png)) = (picture, raster.png.as_ref()) {
+                if blob.size == Some(raster.pixel_size) {
+                    super::seed_picture(&src, picture, png.clone());
+                }
+            }
+            lay_down(store, pane, &raster, Some(&src));
+        }
+    }
+    true
+}
+
+/// One edit laying the drawn pixels down (`apply_raster`): a Merge Down
+/// picks the layer it went into.
+fn lay_down(store: AppStore, pane: PaneId, raster: &LayerRaster, src: Option<&str>) {
+    let laid = layer_edit(store, pane, |t| t.apply_raster(raster, src));
+    if laid.is_some() && matches!(raster.job, RasterJob::MergeDown(_)) {
+        store.pane(pane).board_ui.layer.set(raster.onto.clone());
+    }
+}
+
+/// Merge Down (a group: Merge Group), as pixels when the result is pixels
+/// (`merge_needs_pixels`), else as before.
+pub(super) fn merge(store: AppStore, pane: PaneId, row: &LayerRow) {
+    let pixels = with_session(pane, |s| pimble_board::merge_needs_pixels(s.snapshot(), &row.id)).unwrap_or(false);
+    match (row.is_group(), pixels) {
+        (true, true) => rasterize_layer(store, pane, RasterJob::MergeGroup(row.id.clone())),
+        (false, true) => rasterize_layer(store, pane, RasterJob::MergeDown(row.id.clone())),
+        (true, false) => {
+            layer_edit(store, pane, |t| t.merge_group(&row.id));
+        }
+        (false, false) => {
+            layer_edit(store, pane, |t| t.merge_layer_down(&row.id));
+            store.pane(pane).board_ui.layer.set(None);
+        }
+    }
 }
 
 /// "Group Layers" (Ctrl+G while the layers panel has the focus): the picked
@@ -305,13 +459,25 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
     });
     let merge_btn = small_button(__scope, TablerIcon::ArrowMerge, "Merge Down (into the layer below; a group into one layer)", move || {
         let Some(row) = untracked(|| picked_row()) else { return };
-        if row.is_group() {
-            layer_edit(store, pane, |t| t.merge_group(&row.id));
-        } else {
-            layer_edit(store, pane, |t| t.merge_layer_down(&row.id));
-            ui.layer.set(None);
-        }
+        merge(store, pane, &row);
     });
+    // Flatten Layer: shown for a paint layer.
+    let flatten_btn = rsx! {
+        div {
+            title: "Flatten Layer (its whole history as one picture)",
+            class: "pimble-board-tool pimble-board-tool--small",
+            style: {move || if picked_row().is_some_and(|r| r.kind == LayerKind::Paint) { "" } else { "display: none;" }},
+            onclick: move || {
+                let Some(row) = untracked(|| picked_row()) else { return };
+                if row.kind != LayerKind::Paint {
+                    crate::events::show_notice(store, "Pick a paint layer to flatten.".to_string());
+                    return;
+                }
+                rasterize_layer(store, pane, RasterJob::Flatten(row.id.clone()));
+            },
+            IconGlyph { name: TablerIcon::Stack2.name().to_string() }
+        }
+    };
     let move_here = small_button(__scope, TablerIcon::TransferIn, "Move Selection to Layer (the picked one)", move || {
         let Some(id) = untracked(|| picked()) else { return };
         let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
@@ -515,13 +681,20 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                 }
             }
             div {
+                class: "pimble-board__row pimble-board__label",
+                style: {move || if ui.rasterizing.get().is_some() { "" } else { "display: none;" }},
+                {move || ui.rasterizing.get().unwrap_or("")}
+            }
+            div {
                 class: "pimble-board__row pimble-board__row--wrap",
+                style: {move || if ui.rasterizing.get().is_some() { "opacity: 0.45; pointer-events: none;" } else { "" }},
                 {new_layer}
                 {new_paint}
                 {new_group}
                 {group_btn}
                 {ungroup_btn}
                 {merge_btn}
+                {flatten_btn}
                 {move_here}
                 {delete_btn}
             }
