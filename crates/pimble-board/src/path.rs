@@ -520,6 +520,53 @@ impl PathGeom {
         pb.finish()
     }
 
+    /// A tiny-skia path as anchors: lines are corners with no handles,
+    /// quadratic curves become the cubics they equal, a closing segment back
+    /// onto the first point closes the subpath without a doubled anchor.
+    /// Every anchor is a corner (the handles say what they say). Nonzero.
+    pub fn from_tiny(path: &tiny_skia::Path) -> PathGeom {
+        use tiny_skia::PathSegment as S;
+        let mut subpaths: Vec<Subpath> = Vec::new();
+        let mut cur: Vec<Anchor> = Vec::new();
+        let finish = |cur: &mut Vec<Anchor>, closed: bool, out: &mut Vec<Subpath>| {
+            if closed && cur.len() > 1 {
+                let (first, last) = (cur[0].p, cur[cur.len() - 1].p);
+                if dist(first, last) < 1e-4 {
+                    let last = cur.pop().unwrap();
+                    cur[0].h_in = last.h_in;
+                }
+            }
+            if !cur.is_empty() {
+                out.push(Subpath::new(std::mem::take(cur), closed));
+            }
+        };
+        let pt = |p: tiny_skia::Point| Point::new(p.x, p.y);
+        for seg in path.segments() {
+            match seg {
+                S::MoveTo(p) => {
+                    finish(&mut cur, false, &mut subpaths);
+                    cur.push(Anchor::corner(pt(p)));
+                }
+                S::LineTo(p) => cur.push(Anchor::corner(pt(p))),
+                S::QuadTo(c, p) => {
+                    let Some(prev) = cur.last_mut() else { continue };
+                    let (p0, c, p) = (prev.p, pt(c), pt(p));
+                    prev.h_out = Point::new((c.x - p0.x) * 2.0 / 3.0, (c.y - p0.y) * 2.0 / 3.0);
+                    cur.push(Anchor::new(p, Point::new((c.x - p.x) * 2.0 / 3.0, (c.y - p.y) * 2.0 / 3.0), Point::default(), AnchorMode::Corner));
+                }
+                S::CubicTo(c1, c2, p) => {
+                    let Some(prev) = cur.last_mut() else { continue };
+                    let (c1, c2, p) = (pt(c1), pt(c2), pt(p));
+                    prev.h_out = sub(c1, prev.p);
+                    cur.push(Anchor::new(p, sub(c2, p), Point::default(), AnchorMode::Corner));
+                }
+                S::Close => finish(&mut cur, true, &mut subpaths),
+            }
+        }
+        finish(&mut cur, false, &mut subpaths);
+        PathGeom { subpaths, rule: PathRule::NonZero }
+    }
+
     /// Every point mapped by `f` (an affine map), handles as `f(p + h) - f(p)`.
     pub fn map(&self, f: impl Fn(Point) -> Point) -> PathGeom {
         PathGeom {
@@ -1041,6 +1088,24 @@ fn bez_d2(b: &Bez, t: f64) -> V {
     let mt = 1.0 - t;
     b[2].sub(b[1].mul(2.0)).add(b[0]).mul(6.0 * mt).add(b[3].sub(b[2].mul(2.0)).add(b[1]).mul(6.0 * t))
 }
+
+/// The outline of `path` stroked with `stroke` (its dashes first), as a
+/// path to fill nonzero (Outline Stroke). `None` when it outlines nothing.
+pub fn outline_stroke(path: &PathGeom, stroke: &tiny_skia::Stroke) -> Option<PathGeom> {
+    let tiny = path.to_tiny()?;
+    let mut stroke = stroke.clone();
+    let tiny = match stroke.dash.take() {
+        Some(dash) => tiny.dash(&dash, OUTLINE_RES)?,
+        None => tiny,
+    };
+    let outline = tiny.stroke(&stroke, OUTLINE_RES)?;
+    let geom = PathGeom::from_tiny(&outline);
+    (!geom.is_empty()).then_some(geom)
+}
+
+/// The stroker's resolution scale for Outline Stroke: curves are split as
+/// finely as for drawing at 4 pixels per unit.
+const OUTLINE_RES: f32 = 4.0;
 
 /// Freehand points fitted to cubic Béziers (Schneider, "An Algorithm for
 /// Automatically Fitting Digitized Curves", Graphics Gems 1990): every

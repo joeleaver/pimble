@@ -85,6 +85,14 @@ pub struct BoardView {
     grid: Option<f32>,
     /// What point editing draws over the frame (never into the cache).
     overlay: Option<EditOverlay>,
+    /// Only the overlay changed since the last frame: the next one redraws
+    /// just where the old and new overlays are ([`BoardView::frame`]).
+    overlay_dirty: bool,
+    /// The frame is the cache copied whole-pixel at this offset (not a
+    /// resample), so a patch can restore pixels from the cache.
+    frame_offset: Option<(i64, i64)>,
+    /// The frame pixels the overlay was last drawn into (x0, y0, x1, y1).
+    overlay_box: Option<(i64, i64, i64, i64)>,
     /// Per paint operation (by a hash of its id), as last seen.
     seen_paint: HashMap<u64, PaintMark>,
     /// The tiles paint layers are drawn from; every snapshot shown here
@@ -159,6 +167,9 @@ impl BoardView {
             seen: HashMap::new(),
             grid: None,
             overlay: None,
+            overlay_dirty: false,
+            frame_offset: None,
+            overlay_box: None,
             seen_paint: HashMap::new(),
             paint_cache: PaintCache::new(),
         }
@@ -425,7 +436,7 @@ impl BoardView {
     pub fn set_overlay(&mut self, overlay: Option<EditOverlay>) {
         if self.overlay != overlay {
             self.overlay = overlay;
-            self.frame_dirty = true;
+            self.overlay_dirty = true;
         }
     }
 
@@ -489,22 +500,64 @@ impl BoardView {
 
     /// The next frame, `width * height * 4` bytes of opaque RGBA, or `None`
     /// when nothing changed since the last one.
+    ///
+    /// When only the overlay changed (a paint selection's ants marching, a
+    /// handle dragged ahead of its writes), only the pixels under the old and
+    /// the new overlay are redrawn: restored from the cache, the overlay
+    /// drawn over them.
     pub fn frame(&mut self, pictures: &dyn PictureSource) -> Option<&[u8]> {
-        if !self.frame_dirty {
+        if !self.frame_dirty && !self.overlay_dirty {
             return None;
         }
-        self.frame_dirty = false;
-        self.compose(pictures);
+        self.refresh(pictures);
         Some(self.frame.data())
     }
 
     /// The current frame's bytes, whether or not anything changed.
     pub fn current_frame(&mut self, pictures: &dyn PictureSource) -> &[u8] {
-        if self.frame_dirty {
-            self.frame_dirty = false;
-            self.compose(pictures);
+        if self.frame_dirty || self.overlay_dirty {
+            self.refresh(pictures);
         }
         self.frame.data()
+    }
+
+    fn refresh(&mut self, pictures: &dyn PictureSource) {
+        let patched = !self.frame_dirty && self.patch_overlay();
+        if !patched {
+            self.compose(pictures);
+        }
+        self.frame_dirty = false;
+        self.overlay_dirty = false;
+    }
+
+    /// Redraw only where the overlay was and is (see [`BoardView::frame`]);
+    /// false when the frame is not a plain copy of the cache to restore from.
+    fn patch_overlay(&mut self) -> bool {
+        let Some((ox, oy)) = self.frame_offset else { return false };
+        if !self.dirty.is_empty() {
+            return false;
+        }
+        let Some(cache) = self.cache.as_ref() else { return false };
+        if cache.zoom != self.zoom {
+            return false;
+        }
+        let view = self.view();
+        let new_box = self.overlay.as_ref().and_then(|o| overlay_box(&view, o));
+        let region = match (self.overlay_box, new_box) {
+            (Some(a), Some(b)) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return true,
+        };
+        let (w, h) = (self.frame.width() as i64, self.frame.height() as i64);
+        let (x0, y0, x1, y1) = (region.0.max(0), region.1.max(0), region.2.min(w), region.3.min(h));
+        if x1 > x0 && y1 > y0 {
+            copy_region(&cache.pixmap, ox, oy, &mut self.frame, (x0, y0, x1, y1), self.background);
+        }
+        if let Some(overlay) = &self.overlay {
+            draw_overlay(&mut self.frame, &view, overlay);
+        }
+        self.overlay_box = new_box;
+        true
     }
 
     fn cache_rect_for_view(&self) -> (Point, u32, u32) {
@@ -641,7 +694,9 @@ impl BoardView {
             let ox = ((view.x - cache.origin.x) * cache.zoom).round() as i64;
             let oy = ((view.y - cache.origin.y) * cache.zoom).round() as i64;
             copy_rows(&cache.pixmap, ox, oy, &mut self.frame, self.background);
+            self.frame_offset = Some((ox, oy));
         } else {
+            self.frame_offset = None;
             // A zoom not settled: the cache, scaled (nearest, as paint's
             // view resample does).
             let k = cache.zoom / self.zoom;
@@ -651,6 +706,65 @@ impl BoardView {
         }
         if let Some(overlay) = &self.overlay {
             draw_overlay(&mut self.frame, &view, overlay);
+        }
+        self.overlay_box = self.overlay.as_ref().and_then(|o| overlay_box(&view, o));
+    }
+}
+
+/// The frame pixels `o` can touch drawn over `view`: every point it names,
+/// grown by the largest mark (an anchor, a tip, a line's width) and its
+/// anti-aliasing. `None` when it draws nothing.
+fn overlay_box(view: &View, o: &EditOverlay) -> Option<(i64, i64, i64, i64)> {
+    let mut pts: Vec<Point> = Vec::new();
+    for c in &o.curves {
+        pts.extend_from_slice(c);
+    }
+    if let Some(c) = &o.pending {
+        pts.extend_from_slice(c);
+    }
+    for (a, b) in &o.arms {
+        pts.push(*a);
+        pts.push(*b);
+    }
+    pts.extend(o.anchors.iter().map(|(p, _)| *p));
+    pts.extend(o.tips.iter().copied());
+    pts.extend(o.hot);
+    for d in &o.dashed {
+        pts.extend_from_slice(d);
+    }
+    let mut it = pts.into_iter().filter(|p| p.x.is_finite() && p.y.is_finite()).map(|p| ((p.x - view.x) * view.scale, (p.y - view.y) * view.scale));
+    let first = it.next()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (first.0, first.1, first.0, first.1);
+    for (x, y) in it {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let grow = 12.0 * o.scale.max(1.0) + 2.0;
+    Some(((x0 - grow).floor() as i64, (y0 - grow).floor() as i64, (x1 + grow).ceil() as i64, (y1 + grow).ceil() as i64))
+}
+
+/// Copy the frame pixels `(x0, y0, x1, y1)` from `src` at offset (`ox`,
+/// `oy`), the background where the source has none.
+fn copy_region(src: &Pixmap, ox: i64, oy: i64, dst: &mut Pixmap, (x0, y0, x1, y1): (i64, i64, i64, i64), background: Color) {
+    let (sw, sh) = (src.width() as i64, src.height() as i64);
+    let dw = dst.width() as i64;
+    let bg = tiny_color(background, 1.0).premultiply().to_color_u8();
+    let bg = [bg.red(), bg.green(), bg.blue(), bg.alpha()];
+    let s = src.data();
+    let d = dst.data_mut();
+    for y in y0..y1 {
+        let sy = oy + y;
+        for x in x0..x1 {
+            let sx = ox + x;
+            let di = ((y * dw + x) * 4) as usize;
+            if sx >= 0 && sy >= 0 && sx < sw && sy < sh {
+                let si = ((sy * sw + sx) * 4) as usize;
+                d[di..di + 4].copy_from_slice(&s[si..si + 4]);
+            } else {
+                d[di..di + 4].copy_from_slice(&bg);
+            }
         }
     }
 }

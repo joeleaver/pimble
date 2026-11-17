@@ -440,6 +440,16 @@ pub struct CombineElementsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct OutlineStrokeParams {
+    pub node: String,
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// The stroked elements (ids): shapes, paths, lines without arrow heads,
+    /// pen strokes.
+    pub ids: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct FlipElementsParams {
     pub node: String,
     #[serde(default)]
@@ -2487,6 +2497,42 @@ impl Pimble {
             })
             .await?;
         Ok(format!("Combined {count} elements of {} ({}) into path {kept}; the others are gone.", target.what(), op.as_str()))
+    }
+
+    /// Outline the strokes of elements: each stroke (its width, ends,
+    /// corners and dashes) becomes a filled path of its outline, filled
+    /// with the stroke's color or gradient, with no stroke of its own. An
+    /// element with no fill or text becomes the outline (keeping its id);
+    /// one with a fill or text keeps them, loses its stroke, and gets the
+    /// outline as a new path right above it. Shapes, paths, lines without
+    /// arrow heads and pen strokes; one edit.
+    #[tool(name = "outline_stroke")]
+    async fn outline_stroke(&self, Parameters(p): Parameters<OutlineStrokeParams>) -> Result<String, String> {
+        if p.ids.is_empty() {
+            return Err("Name at least one element.".into());
+        }
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
+        let asked = ids.clone();
+        let out = self
+            .canvas_edit(&target, Default::default(), move |t, scene, _| {
+                for id in &ids {
+                    if !scene.elements.contains_key(id) {
+                        return Err(bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")));
+                    }
+                }
+                let out = t.outline_stroke(&ids)?;
+                scene.touched.extend(ids.iter().cloned());
+                scene.touched.extend(out.iter().filter(|o| !ids.contains(o)).cloned());
+                Ok(out)
+            })
+            .await?;
+        let said: Vec<String> = asked
+            .iter()
+            .zip(&out)
+            .map(|(a, o)| if a == o { format!("{a} is now its outline") } else { format!("{a} kept its fill; its outline is the new path {o}") })
+            .collect();
+        Ok(format!("Outlined {} stroke{} of {}: {}.", out.len(), if out.len() == 1 { "" } else { "s" }, target.what(), said.join("; ")))
     }
 
     /// Flip elements horizontally or vertically, together, about the center

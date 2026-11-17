@@ -189,3 +189,35 @@ fn a_highlighter_keeps_its_color_over_a_dark_background_and_multiplies_what_is_u
     let f = render(&board.snapshot(), &NoPictures, &view.view(), w, h, Some(dark)).unwrap().take();
     assert_eq!(differing(&frame, &f), 0);
 }
+
+/// Only the overlay changed (the ants marched, a handle moved): the frame
+/// redraws just under the old and new overlay and is exactly what a whole
+/// compose of the same view gives.
+#[test]
+fn an_overlay_change_patches_the_frame_and_matches_a_whole_compose() {
+    let board = board_with_things();
+    let ants = |phase: f32, dx: f32| EditOverlay {
+        dashed: vec![vec![Point::new(-200.0 + dx, -150.0), Point::new(60.0 + dx, -150.0), Point::new(60.0 + dx, 40.0), Point::new(-200.0 + dx, 40.0)]],
+        dash_phase: phase,
+        anchors: vec![(Point::new(-200.0 + dx, -150.0), true)],
+        ..EditOverlay::default()
+    };
+    let mut view = BoardView::new(640, 480, BG);
+    view.set_snapshot(board.snapshot());
+    view.set_overlay(Some(ants(0.0, 0.0)));
+    view.frame(&NoPictures).unwrap();
+    for (phase, dx) in [(1.0, 0.0), (2.0, 0.0), (3.0, 35.0), (4.0, -80.0)] {
+        view.set_overlay(Some(ants(phase, dx)));
+        let patched = view.frame(&NoPictures).expect("the overlay changed").to_vec();
+        let mut fresh = BoardView::new(640, 480, BG);
+        fresh.set_snapshot(board.snapshot());
+        fresh.set_overlay(Some(ants(phase, dx)));
+        let whole = fresh.frame(&NoPictures).unwrap().to_vec();
+        assert_eq!(differing(&patched, &whole), 0, "phase {phase}, moved {dx}");
+    }
+    // The overlay gone: the board as it is.
+    view.set_overlay(None);
+    let patched = view.frame(&NoPictures).unwrap().to_vec();
+    assert_eq!(differing(&patched, &full(&view, &board.snapshot())), 0);
+    assert!(view.frame(&NoPictures).is_none(), "nothing changed since");
+}

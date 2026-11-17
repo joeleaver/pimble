@@ -257,6 +257,10 @@ pub(crate) fn retouch(buf: &mut [f32], w: usize, h: usize, ox: i64, oy: i64, op:
     }
 }
 
+/// How opaque (0 to 255) a pixel must be for a spot of the smudge brush to
+/// load from it.
+const LOAD_ALPHA: f32 = 8.0;
+
 #[allow(clippy::too_many_arguments)]
 fn smudge(buf: &mut [f32], w: usize, h: usize, ox: i64, oy: i64, dabs: &[brush::Dab], hardness: f32, strength: f32) {
     let reach = dabs.iter().map(|d| d.radius * PX_PER_UNIT).fold(0.0f32, f32::max).ceil() as i64 + 1;
@@ -264,7 +268,13 @@ fn smudge(buf: &mut [f32], w: usize, h: usize, ox: i64, oy: i64, dabs: &[brush::
     // The paint the brush carries, by offset from the dab's pixel.
     let mut carried = vec![0.0f32; side * side * 4];
     let pick = 1.0 - strength;
-    for (n, dab) in dabs.iter().enumerate() {
+    // Each spot of the brush is loaded with the paint under it the first
+    // time it passes over some (at least `LOAD_ALPHA` opaque) and lays
+    // nothing down before: a smudge started off the paint does nothing
+    // until it reaches some, and never drags in the transparency it
+    // started on.
+    let mut loaded = vec![false; side * side];
+    for dab in dabs {
         let cx = dab.x * PX_PER_UNIT - ox as f32;
         let cy = dab.y * PX_PER_UNIT - oy as f32;
         let r = dab.radius * PX_PER_UNIT;
@@ -279,14 +289,17 @@ fn smudge(buf: &mut [f32], w: usize, h: usize, ox: i64, oy: i64, dabs: &[brush::
                 let ci = (((v + reach) as usize) * side + (u + reach) as usize) * 4;
                 let inside = x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h;
                 let pi = if inside { (y as usize * w + x as usize) * 4 } else { 0 };
-                if n == 0 {
-                    // The first dab loads the brush with what is under it.
-                    for c in 0..4 {
-                        carried[ci + c] = if inside { buf[pi + c] } else { 0.0 };
-                    }
+                if !inside {
                     continue;
                 }
-                if !inside {
+                let spot = ci / 4;
+                if !loaded[spot] {
+                    if buf[pi + 3] < LOAD_ALPHA {
+                        continue;
+                    }
+                    // This spot of the brush takes up what is under it.
+                    carried[ci..ci + 4].copy_from_slice(&buf[pi..pi + 4]);
+                    loaded[spot] = true;
                     continue;
                 }
                 let dx = x as f32 + 0.5 - cx;
@@ -477,5 +490,37 @@ mod tests {
         let op = RetouchOp { effect: Retouch::Smudge, points: vec![[8.0, 5.0, 1.0, 0.0], [16.0, 5.0, 1.0, 0.0]], ..op };
         retouch(&mut buf, w, h, 0, 0, &op, 7);
         assert!(a(&buf, 25, 10) > 20.0, "{}", a(&buf, 25, 10));
+    }
+
+    #[test]
+    fn a_smudge_started_off_the_paint_loads_only_once_it_reaches_some() {
+        let (w, h) = (60usize, 20usize);
+        let mut buf = vec![0.0f32; w * h * 4];
+        // Red on the right half (board x 15 to 30 at 2 pixels a unit).
+        for y in 0..h {
+            for x in 30..w {
+                buf[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[255.0, 0.0, 0.0, 255.0]);
+            }
+        }
+        let before = buf.clone();
+        let a = |b: &[f32], x: usize, y: usize| b[(y * w + x) * 4 + 3];
+        // From the empty left into the red and on through it, at full
+        // strength.
+        let op = RetouchOp {
+            effect: Retouch::Smudge,
+            preset: "round".into(),
+            settings: brush::ROUND.settings.with_size(6.0),
+            strength: 1.0,
+            points: vec![[2.0, 5.0, 1.0, 0.0], [26.0, 5.0, 1.0, 0.0]],
+        };
+        retouch(&mut buf, w, h, 0, 0, &op, 7);
+        assert_eq!(a(&buf, 4, 10), 0.0, "nothing happens off the paint");
+        // Inside the red, nothing transparent was dragged in.
+        for x in 36..52 {
+            assert!(a(&buf, x, 10) > 250.0, "x {x}: {}", a(&buf, x, 10));
+        }
+        let mut again = before.clone();
+        retouch(&mut again, w, h, 0, 0, &op, 7);
+        assert_eq!(again, buf, "deterministic");
     }
 }

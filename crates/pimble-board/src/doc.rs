@@ -1784,6 +1784,114 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(keep_id)
     }
 
+    /// Outline Stroke (docs/DRAWING_CONTRACT.md decision 9): each element's
+    /// stroke becomes a filled path of the stroke's outline (its width,
+    /// ends, corners, miter limit and dashes), in this one transaction (one
+    /// undo). The outline is filled with the stroke's color (or its
+    /// gradient) and has no stroke of its own; it is in the element's own
+    /// space under a transform that keeps it exactly where the stroke was
+    /// drawn.
+    ///
+    /// An element with nothing else to show (no fill, no text) **becomes**
+    /// the outline, keeping its id, layer, order, group and meaning. One
+    /// that has a fill or text keeps them and loses its stroke, and the
+    /// outline is a new path right above it, in its group. Answers the
+    /// outlines' ids, in the order asked.
+    ///
+    /// Refused, before anything is written: an element that has no outline
+    /// ("Only shapes, lines without arrow heads, pen strokes and paths have
+    /// a stroke to outline: a text does not."), one with no stroke ("... has
+    /// no stroke to outline."), a locked one.
+    pub fn outline_stroke(&mut self, ids: &[String]) -> Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        let ids: Vec<&String> = ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+        if ids.is_empty() {
+            return Err(BoardError::Invalid("Select a stroked shape, line or path to outline its stroke.".into()));
+        }
+        for id in &ids {
+            self.editable(id)?;
+        }
+        let snap = self.snapshot_now()?;
+        struct Plan {
+            id: String,
+            raw: RawElement,
+            outline: crate::path::PathGeom,
+            transform: Transform,
+            keep: bool,
+            style: Style,
+        }
+        let mut plans: Vec<Plan> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for id in &ids {
+            let e = snap.get(id).ok_or_else(|| BoardError::NoElement(id.to_string()))?;
+            let Some(path) = crate::path::to_path(&e.raw.kind, &e.raw.geom, &e.raw.style, &e.raw.points) else {
+                let word = e.raw.kind.with_article();
+                if !refused.contains(&word) {
+                    refused.push(word);
+                }
+                continue;
+            };
+            let s = &e.style;
+            if s.width <= 0.0 {
+                return Err(BoardError::Invalid(format!("{} has no stroke to outline.", capitalized(&e.raw.kind.with_article()))));
+            }
+            let outline = crate::path::outline_stroke(&path, &crate::paint::StrokeStyle::of(s).tiny())
+                .ok_or_else(|| BoardError::Invalid(format!("{} has no stroke to outline.", capitalized(&e.raw.kind.with_article()))))?;
+            let Some(new_pivot) = outline.bounds() else { continue };
+            let old_pivot = crate::snapshot::pivot_of(&e.raw, s).unwrap_or(new_pivot);
+            let transform = repivot(&e.raw.transform, old_pivot, new_pivot);
+            let has_text = e.raw.text.as_ref().is_some_and(|t| !t.trim().is_empty());
+            let keep = s.fill.is_some() || has_text;
+            let style = Style {
+                fill: Some(s.stroke),
+                fill_gradient: s.stroke_gradient.clone(),
+                width: Some(0.0),
+                opacity: e.raw.style.opacity,
+                ..Style::default()
+            };
+            plans.push(Plan { id: id.to_string(), raw: e.raw.clone(), outline, transform, keep, style });
+        }
+        if !refused.is_empty() {
+            let list = match refused.as_slice() {
+                [one] => format!("{one} does not"),
+                [rest @ .., last] => format!("{} and {last} do not", rest.join(", ")),
+                [] => unreachable!(),
+            };
+            return Err(BoardError::Invalid(format!("Only shapes, lines without arrow heads, pen strokes and paths have a stroke to outline: {list}.")));
+        }
+        let mut out = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if plan.keep {
+                // The fill (and text) stay; the stroke goes to a new path above.
+                let map = self.element(&plan.id)?;
+                let layer = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
+                let mut element = NewElement::new(Kind::Path, Geom::Path(plan.outline)).with_style(plan.style);
+                element.layer = Some(layer);
+                element.parent = plan.raw.parent.clone();
+                element.placement = Some(Placement::Above(plan.id.clone()));
+                element.transform = Some(plan.transform);
+                let new = self.add_element(element)?;
+                self.set_style(&plan.id, &Style { width: Some(0.0), ..Style::default() })?;
+                out.push(new);
+            } else {
+                let map = self.element(&plan.id)?;
+                map.insert(self.txn, KIND, Kind::Path.as_str().to_string());
+                map.insert(self.txn, GEOM, geom_any(&Geom::Path(plan.outline)));
+                if plan.transform.is_identity() {
+                    map.remove(self.txn, TRANSFORM);
+                } else {
+                    map.insert(self.txn, TRANSFORM, transform_any(&plan.transform));
+                }
+                // The stroke's detail means nothing on a fill.
+                let style_map: MapRef = map.insert(self.txn, STYLE, MapPrelim::default());
+                write_style(self.txn, &style_map, &plan.style);
+                self.stamp_element(&map);
+                out.push(plan.id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Flip elements horizontally or vertically about the center of their
     /// combined bounds, in one transaction. Judged first: a locked element
     /// refuses the whole flip.
@@ -3242,6 +3350,15 @@ fn normalize_degrees(d: f32) -> f32 {
         0.0
     } else {
         d
+    }
+}
+
+/// `s` with its first letter in capitals (a sentence's start).
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
     }
 }
 

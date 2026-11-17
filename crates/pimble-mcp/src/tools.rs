@@ -105,7 +105,7 @@ a canvas node (empty or from a picture file); insert_canvas puts one into a note
 draws sticky notes, text, shapes, frames, lines, arrows, connectors that follow the elements they join, \
 pen strokes, numbered steps, callouts, node cards, pictures and groups in one edit; update_elements and \
 delete_elements change them; combine_elements unites, subtracts, intersects or excludes shapes into one \
-path; flip_elements mirrors; import_svg draws SVG markup or an .svg file; fills and strokes take linear \
+path; flip_elements mirrors; outline_stroke turns strokes into filled outlines; import_svg draws SVG markup or an .svg file; fills and strokes take linear \
 and radial gradients (fill_gradient, stroke_gradient); paint paints brush strokes (round, pencil, ink, \
 airbrush, marker, charcoal, watercolor, highlighter; with pressure; erasing) into paint layers, and \
 highlights a picture; add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
