@@ -308,7 +308,7 @@ fn reach(s: &Session, scale: f32) -> f32 {
 
 /// Hold pane `pane`'s undo clock (`Some(true)`), or let it go: what is
 /// written while it is held is one undo step.
-fn hold_clock(pane: PaneId, hold: bool) {
+pub(super) fn hold_clock(pane: PaneId, hold: bool) {
     with_session(pane, |s| s.clock.store(if hold { now_ms().max(1.0) as u64 } else { 0 }, Ordering::Relaxed));
 }
 
@@ -942,6 +942,10 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
             pen_overlay(s, pen, scale)
         } else if let Some(pe) = s.points.as_ref().filter(|_| tool == Tool::DirectSelect) {
             points_overlay(s, pe, scale)
+        } else if super::gradient::handles_with(tool) || tool == Tool::Hand {
+            // The selected element's gradient handles, while the well's
+            // picker edits its gradient.
+            super::gradient::shown(store, pane, s).map(|sh| super::gradient::overlay(&sh))
         } else {
             None
         };

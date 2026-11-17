@@ -2838,6 +2838,63 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__ctx-color--stroke {
     border-width: 4px;
+    position: relative;
+}
+
+/* A gradient stroke: the swatch is painted whole, and a hole in the
+   panel's color leaves its ring (border-image is not drawn). */
+.pimble-board__ctx-hole {
+    position: absolute;
+    left: 4px;
+    top: 4px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--rinch-color-body);
+    pointer-events: none;
+}
+
+.pimble-board__well-hole {
+    position: absolute;
+    left: 7px;
+    top: 7px;
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    background: var(--rinch-color-body);
+    pointer-events: none;
+}
+
+.pimble-board__well-kinds {
+    margin: 4px 0 6px 0;
+}
+
+/* The gradient's stops: a bar of the gradient, a mark per stop. */
+.pimble-board__stop-bar {
+    position: relative;
+    flex-grow: 1;
+    height: 16px;
+    margin: 4px 6px 8px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--rinch-color-border);
+    cursor: pointer;
+}
+
+.pimble-board__stop {
+    position: absolute;
+    top: -3px;
+    width: 10px;
+    height: 20px;
+    margin-left: -6px;
+    border-radius: 3px;
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+}
+
+.pimble-board__stop--picked {
+    border-color: var(--rinch-primary-color-5);
+    box-shadow: 0 0 0 1px var(--rinch-primary-color-7);
 }
 
 .pimble-board__well-wrap {

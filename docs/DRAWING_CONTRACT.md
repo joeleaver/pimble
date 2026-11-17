@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1 and 2 built (model and UI), wave 3's model built** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1, 2 and 3 built (model and UI)** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -847,3 +847,100 @@ connectors and text; patterns. Combining keeps nothing of a pen stroke's pressur
 area: it combines as a zero-area shape). SVG in: pictures, clip paths and masks as paths,
 markers (arrow heads on SVG lines), text between shapes, multi-run text styling, fonts.
 Flip has no "flip about a point" or per-element pivot.
+
+## Built in wave 3 (UI)
+
+Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model above;
+`crates/pimble-board` is not touched (the gradient handles are drawn with wave 2's
+`EditOverlay`).
+
+- **Files**: `boards/gradient.rs` (new: the well's gradients, the stop bar's pure math,
+  the CSS swatches show a gradient with, the handles on the canvas and their drag),
+  `boards/svg_import.rs` (new: SVG in from a paste, a drop and "Import SVG..."),
+  `boards/tools.rs` (`apply_paint`, `takes_gradient`, `combine`, `flip`, the keys, the
+  well's gradients in `new_style` and `load_selection_style`), `boards/rail.rs` (the
+  Combine picker, the flips in the "more" menu, the well's switch, stop bar and second
+  picker, gradient swatches), `boards.rs` (`StyleUi.fill_gradient`, `stroke_gradient`,
+  `stop`; `Popup::Combine`; `Gesture::GradientHandle`; `local_edit_said`, which says every
+  refusal), `boards/points.rs` (the overlay shows the handles), `boards/ui.rs` (an effect
+  per pane redraws the overlay when the picker opens or the gradient changes), `styles.rs`.
+- **Combine**: with two or more selected, the context bar shows a Combine picker (Tabler's
+  `layers-union`, `layers-subtract`, `layers-intersect`, `layers-difference`): Union,
+  Subtract ("the back one minus the rest", the model's rule), Intersect, Exclude. The
+  result is selected; one undo brings the operands back. Refusals (a text, a sticky note,
+  nothing left, a lock) are the board's sentences in the notice line
+  (`local_edit_said`), never only logged.
+- **Flip**: "Flip Horizontal (Shift+H)" and "Flip Vertical (Shift+V)" in the selection's
+  "more" menu, after the arrange items. **Keys**: Shift+H and Shift+V flip the selection
+  on the canvas and from the chrome (`rail::key_act`'s `KeyAct::Flip`); with nothing
+  selected they are still the Hand and Select letters. They were taken only with Shift,
+  which no tool letter uses (letters ignore case), so plain H and V are unchanged.
+- **The color well's gradients**: the picker popup has a Solid / Linear / Radial switch for
+  the front square. A new gradient is `Gradient::default_linear` / `default_radial` of
+  the square's color; switching kind keeps the stops (and the picked stop) and takes the
+  kind's default handles. With a gradient the popup shows the stop bar (the gradient left
+  to right, a mark per stop, the picked one outlined): a press picks the stop within 4%
+  of it and drags it along the bar, a press elsewhere adds a stop there in the color the
+  gradient has there and drags it; a stop dragged past others is kept in order; the x
+  removes the picked stop (at least two stay, else a sentence). The picker below edits
+  the picked stop's color **with alpha** (a second `ColorPicker` with `alpha`, `hexa`);
+  the solid picker shows only for Solid. A stop drag writes about every 80 ms and on
+  release, one undo step (the held undo clock). Recent colors pick into the stop too.
+- **Writing paints**: everything the well writes goes through `tools::apply_paint`, which
+  calls `set_fill_paint` / `set_stroke_paint` for every selected element that has that
+  paint (a sticky note's color is its fill), never `set_style` of the solid key alone: a
+  solid color picked over a gradient takes the gradient away (tested), "No fill" is
+  `Paint::None`, and X swaps the gradients with their colors. Where the model draws no
+  gradient (pen and highlighter strokes, connectors, text) a gradient is written as its
+  first color. **With nothing selected**, the well's gradients are the tool's style: new
+  rectangles, ellipses, diamonds, polygons, stars and paths take the fill gradient (when
+  there is a fill) and the stroke gradient, lines and arrows the stroke gradient; selecting
+  an element loads its gradients into the well, as its colors are.
+- **Swatches**: the well's squares and the context bar's two swatches show a gradient as a
+  CSS `linear-gradient` (its handles' direction) or `radial-gradient(circle, ...)`; a
+  gradient stroke paints its swatch whole with a hole in the panel's color over the middle
+  (rinch draws no `border-image`).
+- **Handles on the canvas**: while the well's picker is open on a square whose gradient the
+  one selected element has, the overlay shows an arm from `from` (drawn as an anchor) to
+  `to` (a handle tip), mapped from box units through `Gradient::box_for(pivot_bounds)` and
+  the element's world transform. A press near either (9 logical pixels, the end first)
+  with any tool but the Pen, Direct select, the Hand and the eraser drags it and keeps the
+  picker open (a press elsewhere closes it, as every popup); the start drags the whole
+  gradient along, the end alone moves the end. The overlay follows at once, the document
+  about every 80 ms and on release, one undo step; Escape or a cancelled pointer puts the
+  gradient back.
+- **SVG in**: SVG markup pasted while a canvas has the keyboard (desktop: Ctrl+V reads
+  the clipboard's text first, then its picture; browser: the page's `paste` reads
+  `text/plain` first, then files), an `.svg` file dropped on a canvas (desktop: by
+  extension or content, beside pictures in the same drop; browser: by name or
+  `image/svg+xml`), and "Import SVG..." at the end of the zoom corner's export menu
+  (desktop: the file dialog, `PIMBLE_DEBUG_SVG` names a file instead for driving the app;
+  browser: a hidden file input) all go through `svg_in::parse` and `import_svg`: centered
+  at the drop point or the view's middle, scaled down (`fit`) when larger than 90% of the
+  view, into `tools::target_layer` (a new "Vector 1" when the model would say
+  `NoVectorLayer`), one undo step, the drawing's top level selected and the Select tool
+  picked. What the model warns about is one notice: "Imported 4 shapes; skipped: masks."
+  (things not imported under "skipped", things changed under "simplified"). Paste
+  detection: text that starts with `<svg`, or with `<?xml`, a doctype or a comment and
+  holds `<svg`.
+- **Tests**: stop bar math (offsets, picking, adding in order with the color there, moving
+  past others, removing down to two), the switch, CSS, the handle mapping
+  (`gradient.rs`); paste and file detection and the notice (`svg_import.rs`); Shift+H/V
+  from the chrome (`rail.rs`); combining with the result selected, one undo and a refusal
+  said; the well writing gradients, stops and the radial switch, new shapes taking the
+  gradient, a solid color replacing it; a handle dragged by pointer events in one undo
+  step; flips there and back; SVG pasted onto a board with no vector layer, centered,
+  grouped, selected, its notice, one undo (`boards.rs`).
+- **Checked in the test app** (desktop, scratch store): two overlapping circles combined
+  each of the four ways and undone, the crescent flipped from the menu and a star with
+  Shift+V, a rectangle given a linear then radial gradient of three stops with each stop's
+  color picked and a handle dragged (both kinds), the test SVG (a gradient rectangle, a
+  turned group of a path and a circle, a masked line) imported from the menu and dropped
+  at a point, with its notice.
+- **Not built**: deleting a stop with the Delete key (the popup's keys are its fields';
+  the x does it); handles for a gradient on several selected elements at once; the focal
+  point of a radial gradient; gradients on sticky notes from the well (they take the
+  first color); a visual check of SVG pasted on the desktop (it would overwrite the
+  clipboard; the import path is the one the drop and the menu use, and it is tested) and
+  of the browser build (it compiles from the same code).
+

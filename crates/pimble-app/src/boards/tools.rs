@@ -12,8 +12,9 @@ use pimble_board::recipe::{CARD_SIZE, STICKY_SIZE};
 use pimble_board::{End, Side};
 use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
 
-use super::rail::controls_of;
+use super::rail::{controls_of, Well};
 use super::*;
+use pimble_board::{CombineOp, FlipAxis, Paint};
 
 /// Two presses closer than this are a double-click.
 const DOUBLE_CLICK_MS: f64 = 450.0;
@@ -344,6 +345,7 @@ pub(super) fn cancel_gesture(store: AppStore, pane: PaneId) {
         return;
     };
     let Err(gesture) = points::cancelled(store, pane, gesture) else { return };
+    let Err(gesture) = super::gradient::cancelled(store, pane, gesture) else { return };
     match gesture {
         Gesture::Stroke { id, .. } => {
             with_session(pane, |s| s.view.cancel_stroke());
@@ -385,6 +387,14 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
     end_text(store, pane);
     let ui = store.pane(pane).board_ui;
     ui.tip.set(None);
+    // A press on a gradient handle (they show while the well's picker is
+    // open) drags it and leaves the picker open.
+    let chosen = tool.unwrap_or_else(|| untracked(|| store.board_tool.get()));
+    let spaced = with_session(pane, |s| s.space).unwrap_or(false);
+    if button == SurfaceMouseButton::Left && super::gradient::handles_with(chosen) && !spaced && super::gradient::press(store, pane, px, py) {
+        after_change(store, pane);
+        return;
+    }
     // A press on the canvas closes the chrome's popup, and the keys are the
     // canvas's again (Ctrl+G groups elements, not layers).
     ui.popup.set_if_changed(Popup::None);
@@ -696,7 +706,7 @@ enum Write {
 
 fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
     with_session(pane, |s| s.pointer = (px, py));
-    if points::moved(store, pane, px, py) {
+    if points::moved(store, pane, px, py) || super::gradient::moved(store, pane, px, py) {
         return;
     }
     let writable = with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()).unwrap_or(false);
@@ -807,7 +817,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 Write::Redraw
             }
             Gesture::Erase => Write::Erase(p),
-            Gesture::Pinch | Gesture::PenPlace | Gesture::Points(_) | Gesture::PointMarquee { .. } => Write::Nothing,
+            Gesture::Pinch | Gesture::PenPlace | Gesture::Points(_) | Gesture::PointMarquee { .. } | Gesture::GradientHandle(_) => Write::Nothing,
         }
     });
     let Some(next) = next else { return };
@@ -881,6 +891,7 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
     let shift = with_session(pane, |s| s.shift).unwrap_or(false);
     let p = with_session(pane, |s| s.view.screen_to_board(px, py)).unwrap_or_default();
     let Err(gesture) = points::released(store, pane, gesture, px, py) else { return };
+    let Err(gesture) = super::gradient::released(store, pane, gesture, px, py) else { return };
     match gesture {
         Gesture::Stroke { id, kind, style, layer, mut pending, pencil, .. } => {
             let (points, min_gap) = with_session(pane, |s| {
@@ -1920,9 +1931,13 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     let dash = (dash != Dash::Solid).then_some(dash);
     let (cap, join, radius, sides, points, inner) =
         untracked(|| (st.cap.get(), st.join.get(), st.radius.get(), st.sides.get(), st.points.get(), st.inner.get()));
+    // The well's gradients (a fill's only when there is a fill).
+    let (fill_gradient, stroke_gradient) = untracked(|| (st.fill_gradient.get().filter(|_| fill.is_some()), st.stroke_gradient.get()));
     let shape = |kind_extra: Style| Style {
         stroke,
         fill,
+        fill_gradient: fill_gradient.clone(),
+        stroke_gradient: stroke_gradient.clone(),
         width: Some(width),
         opacity,
         dash,
@@ -1940,14 +1955,14 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
             let stroke = stroke.filter(|c| c.to_hex() != DEFAULT_COLOR);
             Style { stroke, width: Some(width * 5.0), opacity, ..Style::default() }
         }
-        Kind::Line => Style { stroke, width: Some(width), opacity, dash, cap, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
-        Kind::Arrow => Style { stroke, width: Some(width), opacity, dash, cap, arrow_heads: Some(heads), ..Style::default() },
+        Kind::Line => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, cap, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
+        Kind::Arrow => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, cap, arrow_heads: Some(heads), ..Style::default() },
         Kind::Connector => Style { stroke, width: Some((width / 2.0).max(1.0)), opacity, dash, arrow_heads: Some(heads), ..Style::default() },
         Kind::Rect => shape(Style { radius: (radius > 0.0).then_some(radius), ..Style::default() }),
         Kind::Ellipse | Kind::Diamond => shape(Style::default()),
         Kind::Polygon => shape(Style { sides: Some(sides), ..Style::default() }),
         Kind::Star => shape(Style { points: Some(points), inner: Some(inner), ..Style::default() }),
-        Kind::Path => Style { stroke, fill, width: Some(width), opacity, dash, cap, join, ..Style::default() },
+        Kind::Path => Style { stroke, fill, fill_gradient, stroke_gradient, width: Some(width), opacity, dash, cap, join, ..Style::default() },
         Kind::Text => Style { stroke, fill, opacity, font_size: Some(font_size), align: Some(align), ..Style::default() },
         Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..Style::default() },
         Kind::Step => Style { stroke, opacity, font_size: Some(font_size), ..Style::default() },
@@ -1989,6 +2004,21 @@ pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
     }
     if let Some(rule) = rule {
         st.rule.set_if_changed(rule);
+    }
+    // The well shows the element's gradients where its kind takes them.
+    let before = untracked(|| (st.fill_gradient.get(), st.stroke_gradient.get()));
+    if takes_gradient(&kind, Well::Fill) {
+        st.fill_gradient.set_if_changed(s.fill_gradient.clone());
+    } else if controls_of(&kind).fill {
+        st.fill_gradient.set_if_changed(None);
+    }
+    if takes_gradient(&kind, Well::Stroke) {
+        st.stroke_gradient.set_if_changed(s.stroke_gradient.clone());
+    } else if controls_of(&kind).stroke {
+        st.stroke_gradient.set_if_changed(None);
+    }
+    if untracked(|| (st.fill_gradient.get(), st.stroke_gradient.get())) != before {
+        st.stop.set(0);
     }
     match kind {
         // A sticky note's color is its own: shapes drawn next do not take it.
@@ -2084,6 +2114,88 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
         }
         Ok(())
     });
+}
+
+/// Whether an element of `kind` draws a gradient on square `well` (what
+/// `pimble-board` paints with one: closed shapes' fills, their strokes and
+/// lines' and arrows'; connectors, pen strokes and text keep a solid color).
+pub(super) fn takes_gradient(kind: &Kind, well: Well) -> bool {
+    let shape = matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Path);
+    match well {
+        Well::Fill => shape,
+        Well::Stroke => shape || matches!(kind, Kind::Line | Kind::Arrow),
+    }
+}
+
+/// A color or gradient picked for the well's square `well`: written to every
+/// selected element that has that paint, as one undo step. The color well
+/// writes through here, never `set_style` of the solid key alone, so a
+/// gradient under a color picked does not keep showing.
+pub(super) fn apply_paint(store: AppStore, pane: PaneId, well: Well, paint: &Paint) {
+    new_undo_step(pane);
+    apply_paint_quietly(store, pane, well, paint);
+}
+
+/// [`apply_paint`] joining the undo step under way (a stop dragged).
+pub(super) fn apply_paint_quietly(store: AppStore, pane: PaneId, well: Well, paint: &Paint) {
+    let targets: Vec<(String, Kind)> = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        s.selected.iter().filter(|id| s.editable(id)).filter_map(|id| snapshot.get(id).map(|e| (id.clone(), e.raw.kind.clone()))).collect()
+    })
+    .unwrap_or_default();
+    if targets.is_empty() {
+        return;
+    }
+    local_edit(store, pane, |t| {
+        for (id, kind) in &targets {
+            let c = controls_of(kind);
+            // A sticky note's color is its fill.
+            let (well, taken) = match (well, kind) {
+                (Well::Stroke, Kind::Sticky) => (Well::Fill, true),
+                (Well::Fill, _) => (Well::Fill, c.fill),
+                (Well::Stroke, _) => (Well::Stroke, c.stroke),
+            };
+            if !taken {
+                continue;
+            }
+            // A gradient where none can be drawn is its first color.
+            let paint = match paint {
+                Paint::Gradient(g) if !takes_gradient(kind, well) => Paint::Solid(g.fallback()),
+                Paint::None if *kind == Kind::Sticky => continue,
+                p => p.clone(),
+            };
+            match well {
+                Well::Fill => t.set_fill_paint(id, &paint)?,
+                Well::Stroke => t.set_stroke_paint(id, &paint)?,
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Combine the selection (docs/DRAWING_CONTRACT.md section 2, "Combining"):
+/// one path in its place, selected; a refusal is said.
+pub(super) fn combine(store: AppStore, pane: PaneId, op: CombineOp) {
+    let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
+    if ids.len() < 2 {
+        crate::events::show_notice(store, "Combining takes two or more elements.".to_string());
+        return;
+    }
+    new_undo_step(pane);
+    if let Some(id) = local_edit_said(store, pane, |t| t.combine(&ids, op)) {
+        select(store, pane, vec![id]);
+    }
+}
+
+/// Flip the selection about its middle (docs/DRAWING_CONTRACT.md section 2,
+/// "Arranging"); a lock refuses it with a sentence.
+pub(super) fn flip(store: AppStore, pane: PaneId, axis: FlipAxis) {
+    let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    local_edit_said(store, pane, |t| t.flip(&ids, axis));
 }
 
 /// The selected paths fill by `rule` (holes: nonzero or even-odd).
@@ -2455,6 +2567,13 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             store.pane(pane).board_ui.panels_hidden.update(|h| *h = !*h);
         }
         "x" | "X" if !primary && !key.alt => super::rail::swap_colors(store, pane),
+        // Shift+H and Shift+V flip the selection (plain H and V are the
+        // Hand and Select).
+        k if key.shift && !primary && !key.alt && flip_key(k).is_some() && with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false) => {
+            if let Some(axis) = flip_key(k) {
+                flip(store, pane, axis);
+            }
+        }
         "Alt" => {
             with_session(pane, |s| s.alt = true);
         }
@@ -2506,7 +2625,7 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             "a" => select_all(store, pane),
             "c" => export::copy_picture(store, pane),
             #[cfg(feature = "native")]
-            "v" => crate::boards::paste_image(store, Dest::Board(pane, None)),
+            "v" => super::svg_import::paste(store, pane),
             "l" => toggle_lock(store, pane),
             "]" => reorder(store, pane, if key.shift { Order::Front } else { Order::Forward }),
             "[" => reorder(store, pane, if key.shift { Order::Back } else { Order::Backward }),
@@ -2518,6 +2637,15 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             }
         }
         _ => {}
+    }
+}
+
+/// The flip Shift and a letter asks for: H horizontally, V vertically.
+pub(super) fn flip_key(key: &str) -> Option<FlipAxis> {
+    match key {
+        "h" | "H" => Some(FlipAxis::Horizontal),
+        "v" | "V" => Some(FlipAxis::Vertical),
+        _ => None,
     }
 }
 

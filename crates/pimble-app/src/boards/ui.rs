@@ -260,6 +260,17 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         run_on_main_thread(move || super::points::tool_changed(store, pane));
     });
 
+    // The selected element's gradient handles show while the well's picker
+    // edits its gradient.
+    let _ = rinch::Effect::new(move || {
+        let st = store.board_style;
+        let _ = (ui.popup.get(), st.front.get(), st.fill_gradient.get(), st.stroke_gradient.get());
+        run_on_main_thread(move || {
+            super::points::refresh_overlay(store, pane);
+            super::present(pane);
+        });
+    });
+
     // Node cards show their node's title and color live (contract section
     // 4): read from the node cache, tracked, so a rename shows at once.
     let _ = rinch::Effect::new(move || {

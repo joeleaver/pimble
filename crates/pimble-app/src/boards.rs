@@ -39,10 +39,12 @@
 //! (`GetBlob`/`BlobLoaded`), decoded off the UI thread on the desktop.
 
 mod export;
+mod gradient;
 mod layers;
 mod nav;
 mod points;
 mod rail;
+mod svg_import;
 mod tools;
 mod ui;
 
@@ -309,6 +311,13 @@ pub struct StyleUi {
     /// The Pencil's fitting tolerance, logical pixels at the zoom it is
     /// drawn at (`rail::SMOOTHING`).
     pub smoothing: Signal<f32>,
+    /// The fill's and the stroke's gradient (`None`: a solid color, the
+    /// `fill`/`stroke` above), what new elements take and the selection
+    /// shows (docs/DRAWING_CONTRACT.md, "Built in wave 3 (UI)").
+    pub fill_gradient: Signal<Option<pimble_board::Gradient>>,
+    pub stroke_gradient: Signal<Option<pimble_board::Gradient>>,
+    /// The stop picked on the well's stop bar.
+    pub stop: Signal<usize>,
 }
 
 impl StyleUi {
@@ -336,6 +345,9 @@ impl StyleUi {
             inner: Signal::new(pimble_board::DEFAULT_STAR_INNER),
             rule: Signal::new(pimble_board::PathRule::NonZero),
             smoothing: Signal::new(rail::DEFAULT_SMOOTHING),
+            fill_gradient: Signal::new(None),
+            stroke_gradient: Signal::new(None),
+            stop: Signal::new(0),
         }
     }
 }
@@ -405,6 +417,8 @@ pub enum Popup {
     Detail,
     /// The Pencil's smoothing.
     Smoothing,
+    /// Combining two or more elements: union, subtract, intersect, exclude.
+    Combine,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -746,6 +760,8 @@ enum Gesture {
     /// Direct select's marquee over anchors, from `start` (physical
     /// pixels); `base` is the anchor selection it adds to.
     PointMarquee { start: (f32, f32), now: (f32, f32), base: Vec<pimble_board::AnchorRef> },
+    /// Dragging a handle of the selected element's gradient.
+    GradientHandle(gradient::HandleDrag),
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -1339,6 +1355,16 @@ fn writable_or_say(store: AppStore, pane: PaneId) -> bool {
 /// (with the sentence) when this device may only read the node. Answers the
 /// closure's result.
 fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
+    local_edit_saying(store, pane, false, f)
+}
+
+/// [`local_edit`] that says every refusal (combining, flipping, SVG in:
+/// `pimble-board`'s refusals are sentences), not only a lock's.
+fn local_edit_said<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
+    local_edit_saying(store, pane, true, f)
+}
+
+fn local_edit_saying<R>(store: AppStore, pane: PaneId, say: bool, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
     let held = with_session(pane, |s| (s.store_id, s.node_id))?;
     if !writable_or_say(store, pane) {
         return None;
@@ -1359,7 +1385,7 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
         Ok(r) => Some(r),
         // The tools check locks before they write; a lock that arrived from
         // someone else in between is said the way the board says it.
-        Err(e) if e.is_lock() => {
+        Err(e) if say || e.is_lock() => {
             crate::events::show_notice(store, e.to_string());
             None
         }
@@ -2331,9 +2357,14 @@ pub(crate) fn pick_images(store: AppStore, dest: Dest) {
 #[cfg(feature = "native")]
 pub(crate) fn add_image_files(store: AppStore, dest: Dest, paths: Vec<std::path::PathBuf>) {
     let mut pictures = Vec::new();
+    let mut svgs = Vec::new();
     let mut skipped = 0;
     for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string());
         match std::fs::read(&path) {
+            // SVG dropped on a board is drawn in (docs/DRAWING_CONTRACT.md,
+            // "SVG in").
+            Ok(bytes) if matches!(dest, Dest::Board(..)) && svg_import::is_svg_file(name.as_deref(), &bytes) => svgs.push((name, bytes)),
             Ok(bytes) if pimble_core::ImageMime::sniff(&bytes).is_some() => {
                 pictures.push((path.file_name().map(|n| n.to_string_lossy().to_string()), bytes));
             }
@@ -2343,6 +2374,9 @@ pub(crate) fn add_image_files(store: AppStore, dest: Dest, paths: Vec<std::path:
     }
     if skipped > 0 {
         crate::events::show_notice(store, NOT_A_PICTURE.to_string());
+    }
+    if let (Dest::Board(pane, at), false) = (dest, svgs.is_empty()) {
+        svg_import::import_files(store, pane, at, svgs);
     }
     if !pictures.is_empty() {
         add_pictures(store, dest, pictures);
@@ -2425,7 +2459,13 @@ fn pick_in_browser(store: AppStore, dest: Dest) {
 /// an image node is called "Picture" instead.
 #[cfg(not(feature = "native"))]
 fn read_files(store: AppStore, dest: Dest, files: web_sys::FileList, pasted: bool) {
-    let files: Vec<web_sys::File> = (0..files.length()).filter_map(|i| files.get(i)).collect();
+    let mut files: Vec<web_sys::File> = (0..files.length()).filter_map(|i| files.get(i)).collect();
+    // SVG put on a board is drawn in (docs/DRAWING_CONTRACT.md, "SVG in").
+    if let Dest::Board(pane, at) = dest {
+        let (svgs, rest): (Vec<_>, Vec<_>) = files.into_iter().partition(svg_import::is_svg_web_file);
+        svg_import::read_files(store, pane, at, svgs);
+        files = rest;
+    }
     if files.is_empty() {
         return;
     }
@@ -2522,6 +2562,12 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
         // A board with the keyboard (and no text being typed on it) takes
         // the picture.
         if let Some(pane) = keyboard_board() {
+            // SVG markup pasted as text is drawn in.
+            if let Some(text) = event.clipboard_data().and_then(|dt| dt.get_data("text/plain").ok()).filter(|t| svg_import::is_svg_markup(t)) {
+                event.prevent_default();
+                svg_import::import_text(store, pane, &text, None);
+                return;
+            }
             let Some(files) = event.clipboard_data().and_then(|dt| dt.files()) else { return };
             if files.length() == 0 {
                 return;
@@ -3185,6 +3231,168 @@ mod tests {
         .unwrap();
         assert_eq!(name, "Vector 1");
         assert!(vector);
+        stop(store, P[0]);
+    }
+
+    fn ellipse_element(x: f32) -> NewElement {
+        NewElement::new(Kind::Ellipse, Geom::Rect(Rect::new(x, 0.0, 100.0, 100.0)))
+    }
+
+    /// Combining (docs/DRAWING_CONTRACT.md section 2): two overlapping
+    /// circles become one path, selected; a text refuses with the board's
+    /// sentence and nothing changes.
+    #[test]
+    fn combining_selects_the_result_and_says_a_refusal() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let a = local_edit(store, P[0], |t| t.add_element(ellipse_element(0.0))).unwrap();
+        let b = local_edit(store, P[0], |t| t.add_element(ellipse_element(50.0))).unwrap();
+        tools::select(store, P[0], vec![a.clone(), b.clone()]);
+        tools::combine(store, P[0], pimble_board::CombineOp::Union);
+        let e = only_element();
+        assert_eq!(e.raw.kind, Kind::Path);
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![e.raw.id.clone()]);
+        // One undo brings both circles back.
+        tools::undo(store, P[0], false);
+        assert_eq!(element_count(P[0]), 2);
+
+        let text = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Text, Geom::Rect(Rect::new(0.0, 200.0, 80.0, 30.0))).with_text("Hi"))).unwrap();
+        tools::select(store, P[0], vec![a.clone(), text.clone()]);
+        tools::combine(store, P[0], pimble_board::CombineOp::Subtract);
+        assert_eq!(element_count(P[0]), 3, "nothing written");
+        assert!(untracked(|| store.notice.get()).contains("combine"), "{}", untracked(|| store.notice.get()));
+        stop(store, P[0]);
+    }
+
+    /// The color well writes paints: a gradient picked replaces the solid
+    /// fill, a solid color picked after it takes the gradient away (never
+    /// the solid key alone), and new shapes take the well's gradient.
+    #[test]
+    fn the_well_writes_gradients_and_solid_colors_replace_them() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let rect = local_edit(store, P[0], |t| t.add_element(rect_element(0.0))).unwrap();
+        tools::select(store, P[0], vec![rect.clone()]);
+        let st = store.board_style;
+        st.front.set(rail::Well::Fill);
+        gradient::switch_to(store, P[0], Some(pimble_board::GradientKind::Linear));
+        let fill = |id: &str| with_session(P[0], |s| s.snapshot().get(id).unwrap().style.fill_gradient.clone()).unwrap();
+        let g = fill(&rect).expect("a gradient fill");
+        assert_eq!(g.kind, pimble_board::GradientKind::Linear);
+        // A stop added, and the radial switch keeps the stops.
+        gradient::press_bar(store, P[0], 0.5);
+        assert_eq!(untracked(|| st.stop.get()), 1);
+        assert_eq!(fill(&rect).unwrap().stops.len(), 3);
+        gradient::switch_to(store, P[0], Some(pimble_board::GradientKind::Radial));
+        let radial = fill(&rect).unwrap();
+        assert_eq!((radial.kind, radial.stops.len()), (pimble_board::GradientKind::Radial, 3));
+        // The picked stop takes a picked color.
+        assert!(gradient::color_picked(store, P[0], "#00ff00"));
+        assert_eq!(fill(&rect).unwrap().stops[1].color, Color::rgb(0, 255, 0));
+        // New shapes take the well's gradient.
+        let style = tools::new_style(store, &Kind::Rect);
+        assert_eq!(style.fill_gradient.map(|g| g.kind), Some(pimble_board::GradientKind::Radial));
+        // A solid color replaces it.
+        rail::set_color(store, P[0], rail::Well::Fill, Some("#123456"));
+        assert_eq!(fill(&rect), None);
+        let solid = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().style.fill).unwrap();
+        assert_eq!(solid, Color::parse("#123456"));
+        assert_eq!(untracked(|| st.fill_gradient.get()), None);
+        stop(store, P[0]);
+    }
+
+    /// The gradient's end handle shows while the well's picker is open and
+    /// drags with the Select tool, as one undo step.
+    #[test]
+    fn a_gradient_handle_drags_on_the_canvas() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let rect = local_edit(store, P[0], |t| {
+            let id = t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, 200.0, 100.0))))?;
+            t.set_fill_paint(&id, &pimble_board::Paint::Gradient(pimble_board::Gradient::default_linear(Color::rgb(255, 0, 0))))?;
+            Ok(id)
+        })
+        .unwrap();
+        tools::select(store, P[0], vec![rect.clone()]);
+        let st = store.board_style;
+        st.front.set(rail::Well::Fill);
+        store.pane(P[0]).board_ui.popup.set(Popup::Well);
+        store.board_tool.set(Tool::Select);
+        // The end handle sits at the box's right middle; dragged to its
+        // bottom right.
+        mouse_drag(store, on_screen(Point::new(200.0, 50.0)), on_screen(Point::new(200.0, 100.0)));
+        let (g, bounds) = with_session(P[0], |s| {
+            let e = s.snapshot().get(&rect).unwrap();
+            (e.style.fill_gradient.clone().unwrap(), e.bounds)
+        })
+        .unwrap();
+        assert!((g.to.x - 1.0).abs() < 0.03 && (g.to.y - 1.0).abs() < 0.03, "{:?}", g.to);
+        assert_eq!(g.from, Point::new(0.0, 0.5));
+        assert!(bounds.x < 1.0, "the rectangle did not move: {bounds:?}");
+        tools::undo(store, P[0], false);
+        let back = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().style.fill_gradient.clone().unwrap()).unwrap();
+        assert_eq!(back.to, Point::new(1.0, 0.5), "one undo step");
+        stop(store, P[0]);
+    }
+
+    /// Flipping a selection mirrors it through its transform.
+    #[test]
+    fn flipping_mirrors_the_selection() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let star = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Star, Geom::Rect(Rect::new(0.0, 0.0, 100.0, 100.0))))).unwrap();
+        tools::select(store, P[0], vec![star.clone()]);
+        tools::flip(store, P[0], pimble_board::FlipAxis::Vertical);
+        let t = with_session(P[0], |s| s.snapshot().get(&star).unwrap().raw.transform).unwrap();
+        assert!(t.sy < 0.0 || t.sx < 0.0 || t.rot.abs() > 1.0, "{t:?}");
+        tools::flip(store, P[0], pimble_board::FlipAxis::Vertical);
+        let t = with_session(P[0], |s| s.snapshot().get(&star).unwrap().raw.transform).unwrap();
+        assert!(t.tx.abs() < 1e-3 && t.ty.abs() < 1e-3 && t.rot.abs() < 1e-3 && (t.sx - 1.0).abs() < 1e-4 && (t.sy - 1.0).abs() < 1e-4, "flipped twice: {t:?}");
+        assert_eq!(tools::flip_key("H"), Some(pimble_board::FlipAxis::Horizontal));
+        assert_eq!(tools::flip_key("v"), Some(pimble_board::FlipAxis::Vertical));
+        assert_eq!(tools::flip_key("x"), None);
+        stop(store, P[0]);
+    }
+
+    /// SVG in: pasted markup lands centered in the view, its group as a
+    /// group, selected, in a new "Vector 1" when the board has no vector
+    /// layer, in one undo step; what was left out is said.
+    #[test]
+    fn svg_markup_is_drawn_in() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let vector = with_session(P[0], |s| s.snapshot().layers[0].id.clone()).unwrap();
+        local_edit(store, P[0], |t| {
+            t.add_layer_in("Paint 1", pimble_board::LayerKind::Paint, None, Placement::Top)?;
+            t.delete_layer(&vector)
+        })
+        .unwrap();
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <defs><linearGradient id="g"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient>
+            <mask id="m"><rect width="10" height="10" fill="white"/></mask></defs>
+            <g transform="translate(10 10)"><rect width="40" height="40" fill="url(#g)"/><circle cx="60" cy="60" r="20" fill="green"/></g>
+            <path d="M0 90 L100 90" stroke="black" mask="url(#m)"/>
+        </svg>"##;
+        assert!(svg_import::is_svg_markup(svg));
+        svg_import::import_text(store, P[0], svg, None);
+        let (count, selected, layer, center) = with_session(P[0], |s| {
+            let snap = s.snapshot();
+            let top: Vec<_> = s.selected.clone();
+            let layer = snap.layer(&snap.get(&top[0]).unwrap().layer).unwrap().name.clone();
+            (snap.elements.len(), top, layer, s.selection_bounds().unwrap().center())
+        })
+        .unwrap();
+        assert_eq!(count, 4, "a group of two and a path");
+        assert_eq!(selected.len(), 2, "the group and the path");
+        assert_eq!(layer, "Vector 1");
+        let view = with_session(P[0], |s| s.view.center()).unwrap();
+        assert!((center.x - view.x).abs() < 15.0 && (center.y - view.y).abs() < 15.0, "{center:?} {view:?}");
+        assert!(untracked(|| store.notice.get()).contains("skipped: masks"), "{}", untracked(|| store.notice.get()));
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Select);
+        tools::undo(store, P[0], false);
+        assert_eq!(element_count(P[0]), 0, "one undo step");
         stop(store, P[0]);
     }
 }

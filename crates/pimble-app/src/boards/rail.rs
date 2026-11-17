@@ -10,8 +10,10 @@
 //! colors and the recent colors.
 
 use super::export::Format;
+use super::gradient;
 use super::tools::{Align2, Order};
 use super::*;
+use pimble_board::{CombineOp, FlipAxis, GradientKind, Paint};
 use crate::appearance::IconGlyph;
 
 // ── The rail's model ────────────────────────────────────────────────────────
@@ -284,6 +286,9 @@ pub enum KeyAct {
     Swap,
     TogglePanels,
     GroupLayers,
+    /// Shift+H or Shift+V: flip the selection (with nothing selected, the
+    /// letter's tool).
+    Flip(FlipAxis),
 }
 
 /// The chrome's key judgement, pure: plain letters, X and Tab from the
@@ -293,6 +298,7 @@ pub fn key_act(keys: Keys, key: &str, ctrl: bool, shift: bool, alt: bool) -> Opt
         Keys::Chrome if !ctrl && !alt => match key {
             "Tab" => Some(KeyAct::TogglePanels),
             "x" | "X" => Some(KeyAct::Swap),
+            k if shift && tools::flip_key(k).is_some() => tools::flip_key(k).map(KeyAct::Flip),
             k => Tool::from_key(k).map(KeyAct::Tool),
         },
         Keys::Layers if ctrl && !shift && !alt && key.eq_ignore_ascii_case("g") => Some(KeyAct::GroupLayers),
@@ -327,6 +333,9 @@ pub(super) fn keys_to(store: AppStore, pane: PaneId, keys: Keys) {
             KeyAct::Swap => swap_colors(store, pane),
             KeyAct::TogglePanels => ui.panels_hidden.update(|h| *h = !*h),
             KeyAct::GroupLayers => super::layers::group_picked(store, pane),
+            KeyAct::Flip(axis) if untracked(|| ui.selected.get()) > 0 => tools::flip(store, pane, axis),
+            KeyAct::Flip(FlipAxis::Horizontal) => pick_tool(store, pane, Tool::Hand),
+            KeyAct::Flip(FlipAxis::Vertical) => pick_tool(store, pane, Tool::Select),
         });
         true
     });
@@ -348,41 +357,78 @@ fn toggle(ui: PaneUi, popup: Popup) {
 
 /// A color picked for the well's `well` square: new elements take it, the
 /// selection gets it, it joins the recent colors.
+///
+/// A solid color replaces a gradient: it is written as a paint
+/// (`tools::apply_paint`), never as the solid key alone, which would leave
+/// the gradient beside it showing.
 pub(super) fn set_color(store: AppStore, pane: PaneId, well: Well, hex: Option<&str>) {
     let st = store.board_style;
     match (well, hex) {
         (Well::Stroke, Some(hex)) => {
             let Some(c) = Color::parse(hex) else { return };
             st.stroke.set(c.to_hex());
-            tools::apply_style(store, pane, Style { stroke: Some(c), ..Style::default() });
+            st.stroke_gradient.set(None);
+            tools::apply_paint(store, pane, Well::Stroke, &Paint::Solid(c));
             st.recent.update(|r| *r = remember_recent(r, &c.to_hex()));
         }
         (Well::Stroke, None) => {}
         (Well::Fill, Some(hex)) => {
             let Some(c) = Color::parse(hex) else { return };
             st.fill.set(Some(c.to_hex()));
-            tools::apply_style(store, pane, Style { fill: Some(c), ..Style::default() });
+            st.fill_gradient.set(None);
+            tools::apply_paint(store, pane, Well::Fill, &Paint::Solid(c));
             st.recent.update(|r| *r = remember_recent(r, &c.to_hex()));
         }
         (Well::Fill, None) => {
             st.fill.set(None);
-            // An empty style is "clear the fill" (`tools::apply_style`).
-            tools::apply_style(store, pane, Style::default());
+            st.fill_gradient.set(None);
+            tools::apply_paint(store, pane, Well::Fill, &Paint::None);
         }
+    }
+}
+
+/// A color picked in the well's picker or its recent colors: the picked
+/// stop's when the front square is a gradient, else the square's.
+fn pick_color(store: AppStore, pane: PaneId, hex: &str) {
+    if !gradient::color_picked(store, pane, hex) {
+        set_color(store, pane, untracked(|| store.board_style.front.get()), Some(hex));
+    }
+}
+
+/// A square's paint: its gradient, or its color.
+fn paint_of(color: Option<&str>, gradient: Option<pimble_board::Gradient>) -> Paint {
+    match (gradient, color.and_then(Color::parse)) {
+        (Some(g), _) => Paint::Gradient(g),
+        (None, Some(c)) => Paint::Solid(c),
+        (None, None) => Paint::None,
+    }
+}
+
+/// What a square shows as a CSS background: its gradient, or its color.
+fn square_css(color: Option<String>, gradient: Option<pimble_board::Gradient>) -> String {
+    match (gradient, color) {
+        (Some(g), _) => format!("background: {};", gradient::css(&g)),
+        (None, Some(c)) => format!("background: {c};"),
+        (None, None) => String::new(),
     }
 }
 
 /// X: swap the stroke and fill colors, of new elements and the selection.
 pub(super) fn swap_colors(store: AppStore, pane: PaneId) {
     let st = store.board_style;
+    let had_fill = untracked(|| st.fill.get()).is_some();
     let (stroke, fill) = untracked(|| swapped(&st.stroke.get(), st.fill.get().as_deref()));
+    // Gradients go with their colors.
+    let (sg, fg) = untracked(|| (st.stroke_gradient.get(), st.fill_gradient.get()));
+    let stroke_gradient = if had_fill { fg } else { sg.clone() };
+    let fill_gradient = sg;
     st.stroke.set(stroke.clone());
     st.fill.set(fill.clone());
-    tools::apply_style(
-        store,
-        pane,
-        Style { stroke: Color::parse(&stroke), fill: fill.as_deref().and_then(Color::parse), ..Style::default() },
-    );
+    st.stroke_gradient.set(stroke_gradient.clone());
+    st.fill_gradient.set(fill_gradient.clone());
+    st.stop.set(0);
+    tools::apply_paint(store, pane, Well::Stroke, &paint_of(Some(&stroke), stroke_gradient));
+    tools::apply_paint_quietly(store, pane, Well::Fill, &paint_of(fill.as_deref(), fill_gradient));
 }
 
 /// Zoom pane `pane`'s board in or out about its middle.
@@ -593,18 +639,22 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         div {
             title: "Stroke color",
             class: "pimble-board__ctx-color pimble-board__ctx-color--stroke",
-            style: {move || format!("border-color: {};", st.stroke.get())},
+            style: {move || match st.stroke_gradient.get() {
+                Some(g) => format!("border-color: transparent; background: {};", gradient::css(&g)),
+                None => format!("border-color: {};", st.stroke.get()),
+            }},
             onclick: move || {
                 st.front.set(Well::Stroke);
                 ui.popup.set(Popup::Well);
             },
+            div { class: "pimble-board__ctx-hole", style: {move || if st.stroke_gradient.get().is_some() { "" } else { "display: none;" }} }
         }
     };
     let fill_swatch = rsx! {
         div {
             title: "Fill color",
             class: {move || if st.fill.get().is_some() { "pimble-board__ctx-color" } else { "pimble-board__ctx-color pimble-board-swatch--none" }},
-            style: {move || st.fill.get().map(|f| format!("background: {f};")).unwrap_or_default()},
+            style: {move || square_css(st.fill.get(), st.fill_gradient.get())},
             onclick: move || {
                 st.front.set(Well::Fill);
                 ui.popup.set(Popup::Well);
@@ -786,7 +836,18 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let ungroup = act(__scope, TablerIcon::Package, "Ungroup (Ctrl+Shift+G)", tools::ungroup);
     let lock = act(__scope, TablerIcon::Lock, "Lock / Unlock (Ctrl+L)", tools::toggle_lock);
     let delete = act(__scope, TablerIcon::Trash, "Delete (Delete)", delete_selected);
-    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
+    let combine_items: Vec<NodeHandle> = [
+        (CombineOp::Union, TablerIcon::LayersUnion, "Union"),
+        (CombineOp::Subtract, TablerIcon::LayersSubtract, "Subtract (the back one minus the rest)"),
+        (CombineOp::Intersect, TablerIcon::LayersIntersect, "Intersect"),
+        (CombineOp::Exclude, TablerIcon::LayersDifference, "Exclude"),
+    ]
+    .into_iter()
+    .map(|(op, icon, label)| menu_item(__scope, store, pane, icon, label, Box::new(move |s, p| tools::combine(s, p, op))))
+    .collect();
+    let combine_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: TablerIcon::LayersUnion.name().to_string() } } };
+    let combine_btn = picker_button(__scope, ui, "Combine: union, subtract, intersect, exclude", Popup::Combine, "", combine_face);
+    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back, flip".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
     let align_btn = icon_button(__scope, TablerIcon::LayoutAlignCenter, "Align and distribute".to_string(), move || ui.popup.get() == Popup::Align, move || toggle(ui, Popup::Align));
     let undo_btn = act(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |s, p| tools::undo(s, p, false));
     let redo_btn = act(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |s, p| tools::undo(s, p, true));
@@ -845,6 +906,8 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", Box::new(|s, p| tools::reorder(s, p, Order::Backward))),
         menu_item(__scope, store, pane, TablerIcon::StackPush, "Bring to Front (Ctrl+Shift+])", Box::new(|s, p| tools::reorder(s, p, Order::Front))),
         menu_item(__scope, store, pane, TablerIcon::StackPop, "Send to Back (Ctrl+Shift+[)", Box::new(|s, p| tools::reorder(s, p, Order::Back))),
+        menu_item(__scope, store, pane, TablerIcon::FlipVertical, "Flip Horizontal (Shift+H)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Horizontal))),
+        menu_item(__scope, store, pane, TablerIcon::FlipHorizontal, "Flip Vertical (Shift+V)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Vertical))),
     ];
     let writable = move || {
         state
@@ -904,7 +967,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
                         style: {move || shown(ui.selected.get() > 0)},
                         {duplicate}
-                        div { class: "pimble-board__ctx-group", style: {move || shown(ui.selected.get() > 1)}, {align_btn} {group} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(ui.selected.get() > 1)}, {combine_btn} {align_btn} {group} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(ui.selected_kinds.get().contains(&Kind::Group))}, {ungroup} }
                         {lock}
                         {delete}
@@ -945,6 +1008,11 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                 class: "pimble-float pimble-board__menu",
                 style: {move || shown(ui.popup.get() == Popup::Align)},
                 {align_items}
+            }
+            div {
+                class: "pimble-float pimble-board__menu",
+                style: {move || shown(ui.popup.get() == Popup::Combine)},
+                {combine_items}
             }
             div {
                 class: "pimble-float pimble-board__options pimble-board__options--rows",
@@ -1069,6 +1137,26 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
             st.front.set(well);
         }
     };
+    // The front square's gradient, tracked.
+    let front_gradient = move || gradient::of_well(st, st.front.get());
+    let kinds: Vec<NodeHandle> = [(None, "Solid", "One color"), (Some(GradientKind::Linear), "Linear", "A linear gradient"), (Some(GradientKind::Radial), "Radial", "A radial gradient")]
+        .into_iter()
+        .map(|(kind, label, tip)| {
+            text_button(__scope, label, tip, move || front_gradient().map(|g| g.kind) == kind, move || gradient::switch_to(store, pane, kind))
+        })
+        .collect();
+    let stop_marks = move || {
+        let picked = st.stop.get();
+        front_gradient()
+            .map(|g| {
+                g.stops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, format!("{:.2}", s.offset * 100.0), gradient::css_color(s.color), i == picked))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
     rsx! {
         div {
             class: "pimble-board__well-wrap",
@@ -1088,13 +1176,66 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
                         "No fill"
                     }
                 }
-                ColorPicker {
-                    value_fn: move || if st.front.get() == Well::Fill { st.fill.get().unwrap_or_else(|| st.stroke.get()) } else { st.stroke.get() },
-                    swatches: palette(),
-                    swatches_per_row: 7,
-                    size: "sm",
-                    with_input: true,
-                    onchange: move |hex: String| set_color(store, pane, untracked(|| st.front.get()), Some(&hex)),
+                // Solid, linear or radial (docs/DRAWING_CONTRACT.md, "Built
+                // in wave 3 (UI)").
+                div { class: "pimble-board__row pimble-board__well-kinds", {kinds} }
+                // A gradient's stops: a press picks the stop under it (or adds
+                // one there) and drags it along.
+                div {
+                    class: "pimble-board__row",
+                    style: {move || if front_gradient().is_some() { "" } else { "display: none;" }},
+                    div {
+                        class: "pimble-board__stop-bar",
+                        title: "Click to add a color, drag a color to move it",
+                        style: {move || front_gradient().map(|g| format!("background: {};", gradient::bar_css(&g))).unwrap_or_default()},
+                        onmousedown: move || {
+                            let ctx = rinch::core::get_click_context();
+                            gradient::press_bar(store, pane, gradient::offset_at(ctx.mouse_x - ctx.element_x, ctx.element_width));
+                        },
+                        for (i, left, color, picked) in stop_marks() {
+                            div {
+                                key: format!("{i}-{left}-{color}-{picked}"),
+                                class: if picked { "pimble-board__stop pimble-board__stop--picked" } else { "pimble-board__stop" },
+                                style: format!("left: {left}%; background: {color};"),
+                            }
+                        }
+                    }
+                    div {
+                        class: "pimble-board-tool pimble-board-tool--small",
+                        title: "Remove the picked color",
+                        onclick: move || gradient::remove_picked(store, pane),
+                        IconGlyph { name: TablerIcon::X.name().to_string() }
+                    }
+                }
+                div {
+                    style: {move || if front_gradient().is_some() { "display: none;" } else { "" }},
+                    ColorPicker {
+                        value_fn: move || if st.front.get() == Well::Fill { st.fill.get().unwrap_or_else(|| st.stroke.get()) } else { st.stroke.get() },
+                        swatches: palette(),
+                        swatches_per_row: 7,
+                        size: "sm",
+                        with_input: true,
+                        onchange: move |hex: String| set_color(store, pane, untracked(|| st.front.get()), Some(&hex)),
+                    }
+                }
+                // The picked stop's color, with its transparency.
+                div {
+                    style: {move || if front_gradient().is_some() { "" } else { "display: none;" }},
+                    ColorPicker {
+                        value_fn: move || {
+                            let i = st.stop.get();
+                            front_gradient().and_then(|g| g.stops.get(i).or(g.stops.first()).map(|s| s.color.to_hex())).unwrap_or_else(|| st.stroke.get())
+                        },
+                        swatches: palette(),
+                        swatches_per_row: 7,
+                        size: "sm",
+                        with_input: true,
+                        alpha: true,
+                        format: "hexa",
+                        onchange: move |hex: String| {
+                            gradient::color_picked(store, pane, &hex);
+                        },
+                    }
                 }
                 div {
                     class: "pimble-board__label",
@@ -1111,7 +1252,7 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
                             style: background,
                             onclick: {
                                 let color = color.clone();
-                                move || set_color(store, pane, untracked(|| st.front.get()), Some(&color))
+                                move || pick_color(store, pane, &color)
                             },
                         }
                     }
@@ -1127,7 +1268,7 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
                         class: {move || if st.fill.get().is_some() { "pimble-board__well-fill" } else { "pimble-board__well-fill pimble-board-swatch--none" }},
                         style: {move || format!(
                             "{} z-index: {};",
-                            st.fill.get().map(|f| format!("background: {f};")).unwrap_or_default(),
+                            square_css(st.fill.get(), st.fill_gradient.get()),
                             if st.front.get() == Well::Fill { 2 } else { 1 }
                         )},
                         onclick: move || press(Well::Fill),
@@ -1135,8 +1276,15 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
                     div {
                         title: "Stroke (click again for the picker)",
                         class: "pimble-board__well-stroke",
-                        style: {move || format!("border-color: {}; z-index: {};", st.stroke.get(), if st.front.get() == Well::Stroke { 2 } else { 1 })},
+                        style: {move || {
+                            let z = if st.front.get() == Well::Stroke { 2 } else { 1 };
+                            match st.stroke_gradient.get() {
+                                Some(g) => format!("border-color: transparent; background: {}; z-index: {z};", gradient::css(&g)),
+                                None => format!("border-color: {}; z-index: {z};", st.stroke.get()),
+                            }
+                        }},
                         onclick: move || press(Well::Stroke),
+                        div { class: "pimble-board__well-hole", style: {move || if st.stroke_gradient.get().is_some() { "" } else { "display: none;" }} }
                     }
                 }
                 div {
@@ -1171,7 +1319,7 @@ pub(super) fn render_zoom_corner(__scope: &mut RenderScope, store: AppStore, pan
         let on = !untracked(|| ui.by_author.get());
         set_color_by_author(store, pane, on);
     });
-    let export_btn = icon_button(__scope, TablerIcon::Download, "Copy and save the canvas as a picture".to_string(), move || ui.popup.get() == Popup::Export, move || toggle(ui, Popup::Export));
+    let export_btn = icon_button(__scope, TablerIcon::Download, "Copy and save the canvas as a picture, or import SVG".to_string(), move || ui.popup.get() == Popup::Export, move || toggle(ui, Popup::Export));
     let export_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::ClipboardCopy, "Copy Picture (Ctrl+C)", Box::new(export::copy_picture)),
         menu_item(__scope, store, pane, TablerIcon::Photo, "Save as PNG...", Box::new(|s, p| export::save_picture(s, p, Format::Png, false))),
@@ -1180,6 +1328,7 @@ pub(super) fn render_zoom_corner(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::Eye, "Save with All Markup (PNG)...", Box::new(|s, p| export::save_picture(s, p, Format::Png, true))),
         menu_item(__scope, store, pane, TablerIcon::PhotoDown, "Save Original As...", Box::new(export::save_original)),
         menu_item(__scope, store, pane, TablerIcon::Stack2, "Flatten into New Canvas", Box::new(export::flatten)),
+        menu_item(__scope, store, pane, TablerIcon::FileVector, "Import SVG...", Box::new(super::svg_import::pick)),
     ];
     rsx! {
         div {
@@ -1332,6 +1481,11 @@ mod tests {
         assert_eq!(key_act(Keys::Chrome, "N", false, true, false), Some(KeyAct::Tool(Tool::Pencil)));
         assert_eq!(key_act(Keys::Chrome, "X", false, true, false), Some(KeyAct::Swap));
         assert_eq!(key_act(Keys::Chrome, "Tab", false, false, false), Some(KeyAct::TogglePanels));
+        // Shift+H and Shift+V flip; plain H and V are their tools.
+        assert_eq!(key_act(Keys::Chrome, "H", false, true, false), Some(KeyAct::Flip(FlipAxis::Horizontal)));
+        assert_eq!(key_act(Keys::Chrome, "V", false, true, false), Some(KeyAct::Flip(FlipAxis::Vertical)));
+        assert_eq!(key_act(Keys::Chrome, "h", false, false, false), Some(KeyAct::Tool(Tool::Hand)));
+        assert_eq!(key_act(Keys::Chrome, "v", false, false, false), Some(KeyAct::Tool(Tool::Select)));
         // The app's own shortcuts win: nothing with Ctrl or Alt.
         assert_eq!(key_act(Keys::Chrome, "r", true, false, false), None);
         assert_eq!(key_act(Keys::Chrome, "r", false, false, true), None);
