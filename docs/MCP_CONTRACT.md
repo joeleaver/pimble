@@ -329,8 +329,9 @@ holds no elements (it holds brush strokes, the `paint` tool's), so elements name
 refused with a sentence, and with no layer named they go to the top vector layer that is not
 locked and not inside a hidden or locked group. `update_layer` with `parent` moves a layer
 into a group (on top unless `order` says where); a group is never moved into itself or a
-group it holds. Merging a group that holds a paint layer, and merging down across kinds,
-wait for wave 5 (docs/DRAWING_CONTRACT.md).
+group it holds. Merging down onto a paint layer, and merging a group that holds a paint
+layer, draw what merges as pixels (wave 5, "Painting" below); a paint layer merging down onto
+a vector layer is refused with a sentence.
 
 **Paths, live shapes and stroke detail** (docs/DRAWING_CONTRACT.md sections 2 and 5, built
 2026-11-16): `add_elements` takes kind `path` with its outline as SVG path data (`d`: `M L H
@@ -375,11 +376,23 @@ tool, and paint layers in the two that read.
 | --- | --- |
 | `paint` | `strokes`, each `preset` (`round`, the default, `pencil`, `ink`, `airbrush`, `marker`, `charcoal`, `watercolor`, `highlighter`), `color` (the brush's own when left out), `size` (canvas units at full pressure), `opacity`, `erase` (an eraser stroke) and `points` (`[[x, y], ...]`, each optionally `[x, y, pressure]`, pressure 1 when left out); into `layer` (a paint layer's name or id), or with `highlight_picture` (a picture's id) into the multiply "Highlights" layer above it (`BoardTxn::highlights_layer`), or with neither into the paint layer a person's brush would take (`BoardTxn::paint_layer_for(None)`: the topmost shown, unlocked one, else a new "Paint 1" on top); every stroke in one edit (`BoardTxn::add_stroke`); the answer names the layer and each stroke's id. A layer that is not a paint layer, an unknown brush and a malformed point are refused with a sentence, nothing written |
 
+Wave 5 (built 2026-11-17):
+
+| Tool | What it does |
+| --- | --- |
+| `paint` | also `fills` (after the strokes, in order), each `at` (`[x, y]`), `color`, `tolerance` (0 to 1, default 0.15: how far a pixel's channels may be from the one at `at`), `contiguous` (default true; false fills every matching pixel in the area) and `area` (`{x, y, w, h}`, at most 2048 on a side, containing `at`); without `area` the fill may cover what the canvas shows and what this call's strokes reach, grown by 64 units, with the layer's painting (`pimble_board::fill_clip`, the area the app's Fill computes from the view), so a fill outside every shape ends. `strokes` may be left out when `fills` are given. `BoardTxn::add_fill`; the answer names each fill's id too |
+| `flatten_layer` | `layer` (a paint layer): its whole history becomes one picture, stored as a blob of the canvas's store, in one edit (`pimble_board::rasterize` with `RasterJob::Flatten`, `put_blob`, `BoardTxn::apply_raster`). Refused with a sentence when a picture it draws cannot be fetched, or it paints more than 4,096 units across |
+| `delete_layer` with `merge_down` | onto a paint layer (a vector layer's shapes, or a paint layer, with its opacity in the pixels and its blend on the `pixels` operation), or a group holding a paint layer (one paint layer of the group's pixels, keeping the group's name, opacity and blend): drawn as pixels the same way (`RasterJob::MergeDown`, `RasterJob::MergeGroup`). A hidden layer is refused (it would merge as nothing); a paint layer onto a vector layer is refused |
+
+Smudge, blur and moves of paint selections have no tool: an agent paints and fills; the
+summary counts them when a person made them.
+
 `get_canvas` gives a paint layer one line under its heading, never the points: how many
-brush strokes, eraser strokes, pictures and operations of a later version it holds, the
-brushes (`watercolor x3`), up to eight colors, the area it paints, and who painted (`1 brush
-stroke, 1 eraser stroke · brushes watercolor x1 · colors #228be6 · paints the area at -9,-9
-size 118x34 · by Claude`). `render_canvas` draws paint layers in their place among
+brush strokes, eraser strokes, pictures (pasted, flattened or merged), fills, smudges,
+blurs, selections moved and selections cleared, and operations of a later version it
+holds, the brushes (`watercolor x3`), up to eight colors (strokes' and fills'), the area it
+paints, and who painted (`1 brush stroke, 1 eraser stroke · brushes watercolor x1 · colors
+#228be6 · paints the area at -9,-9 size 118x34 · by Claude`). `render_canvas` draws paint layers in their place among
 the layers with their blend and opacity, and fetches the pictures `pixels` operations name
 (`BoardSnapshot::picture_srcs`). `add_layer` with `kind` `"paint"` makes an empty one.
 

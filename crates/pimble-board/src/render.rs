@@ -365,7 +365,7 @@ pub fn render_area(
 
 /// `pixmap` cut down to the pixels that are not fully transparent, and where
 /// the cut starts in it. `None` when every pixel is transparent.
-fn trim_transparent(pixmap: Pixmap) -> Option<(Pixmap, (u32, u32))> {
+pub(crate) fn trim_transparent(pixmap: Pixmap) -> Option<(Pixmap, (u32, u32))> {
     let (w, h) = (pixmap.width(), pixmap.height());
     let data = pixmap.data();
     let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
@@ -579,7 +579,7 @@ pub(crate) fn stroke_paint(kind: &Kind, color: Color, opacity: f32) -> Paint<'st
     paint
 }
 
-fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
+pub(crate) fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
     let ts = vt.pre_concat(e.world);
     for op in element_ops(e, region, Some(ts_scale(&ts))) {
         match op {

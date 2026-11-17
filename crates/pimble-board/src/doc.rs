@@ -159,6 +159,15 @@ pub enum BoardError {
     /// Nothing named a layer and the board has no vector layer.
     #[error("{}", crate::locks::NO_VECTOR_LAYER)]
     NoVectorLayer,
+    /// A merge onto or into a paint layer draws the merged layers as pixels
+    /// first (docs/DRAWING_CONTRACT.md "Built in wave 5 (model)"):
+    /// [`crate::raster::rasterize`], put the picture as a blob, then
+    /// [`BoardTxn::apply_raster`] with its URL.
+    #[error("{0}")]
+    NeedsPixels(String),
+    /// Pictures the pixels would show have not been loaded yet (how many).
+    #[error("{0} picture(s) this needs have not arrived yet; try again once they show.")]
+    PicturesNotLoaded(usize),
     #[error("{0}")]
     Invalid(String),
 }
@@ -1152,9 +1161,8 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
         match (kind.is_vector(), below_kind.is_vector()) {
             (true, true) => {}
-            (true, false) => return Err(BoardError::Invalid("Merging a vector layer onto a paint layer is not built yet.".into())),
-            (false, true) => return Err(BoardError::Invalid("A paint layer cannot merge onto a vector layer.".into())),
-            (false, false) => return Err(BoardError::Invalid("Merging paint layers is not built yet.".into())),
+            (false, true) => return Err(BoardError::Invalid(PAINT_ONTO_VECTOR.into())),
+            (_, false) => return Err(BoardError::NeedsPixels("Merging onto a paint layer draws the layer as pixels first.".into())),
         }
         if let Some(locked) = ls.locked(at) {
             return Err(BoardError::LayerLockedAgainstRemoval(locked));
@@ -1191,8 +1199,8 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if let Some(inner) = inside.iter().find(|d| ls.raw_of(**d).locked) {
             return Err(BoardError::LayerLockedAgainstRemoval(ls.locked_layer(*inner)));
         }
-        if inside.iter().any(|d| !ls.tree.entries[*d].kind.is_vector() && !ls.tree.entries[*d].kind.is_group()) {
-            return Err(BoardError::Invalid("That group holds a paint layer, and merging paint is not built yet.".into()));
+        if inside.iter().any(|d| ls.tree.entries[*d].kind == LayerKind::Paint) {
+            return Err(BoardError::NeedsPixels("That group holds a paint layer, so merging it draws it as pixels first.".into()));
         }
         let rank: HashMap<String, usize> = inside.iter().map(|d| (ls.id(*d).to_string(), *d)).collect();
         let elements = self.elements()?;
@@ -2095,8 +2103,16 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     }
 
     fn insert_paint_op(&mut self, layer: &str, body: crate::paint_ops::PaintBody) -> Result<String> {
+        self.insert_paint_op_at(layer, body, None)
+    }
+
+    /// [`BoardTxn::insert_paint_op`] at `order` (on top when `None`).
+    fn insert_paint_op_at(&mut self, layer: &str, body: crate::paint_ops::PaintBody, order: Option<String>) -> Result<String> {
         self.judge_paint_into(layer)?;
-        let order = self.next_paint_order(layer)?;
+        let order = match order {
+            Some(o) => o,
+            None => self.next_paint_order(layer)?,
+        };
         let id = new_id();
         let op = crate::paint_ops::RawPaintOp {
             id: id.clone(),
@@ -2171,7 +2187,238 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
             return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
         }
-        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect }))
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend: Blend::Normal }))
+    }
+
+    /// [`BoardTxn::add_pixels`] laid on with `blend` (pass-through reads
+    /// as normal).
+    pub fn add_pixels_blended(&mut self, layer: &str, src: &str, rect: Rect, blend: Blend) -> Result<String> {
+        let rect = rect.normalized();
+        if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
+            return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
+        }
+        let blend = if blend == Blend::PassThrough { Blend::Normal } else { blend };
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend }))
+    }
+
+    /// A flood fill on top of its paint layer (docs/DRAWING_CONTRACT.md
+    /// section 3): `fill.clip` is what the filler's device computed
+    /// ([`crate::raster::fill_clip`]). Refused when the seed is outside the
+    /// clip, the clip is larger than [`crate::raster::MAX_FILL_UNITS`] on
+    /// a side, or the layer is not a paint layer or is locked.
+    pub fn add_fill(&mut self, fill: crate::paint_ops::NewFill) -> Result<String> {
+        let crate::paint_ops::NewFill { layer, seed, color, tolerance, clip, contiguous } = fill;
+        let clip = clip.normalized();
+        if !(clip.is_finite() && clip.w > 0.0 && clip.h > 0.0 && seed.x.is_finite() && seed.y.is_finite()) {
+            return Err(BoardError::Invalid("A fill needs a seed point and an area with a size.".into()));
+        }
+        if !clip.contains(seed) {
+            return Err(BoardError::Invalid("A fill starts inside the area it may fill.".into()));
+        }
+        let max = crate::raster::MAX_FILL_UNITS;
+        if clip.w > max + 1.0 || clip.h > max + 1.0 {
+            return Err(BoardError::Invalid(format!("A fill covers at most {max} units on a side.")));
+        }
+        let tolerance = if tolerance.is_finite() { tolerance.clamp(0.0, 1.0) } else { crate::paint_ops::DEFAULT_TOLERANCE };
+        self.insert_paint_op(&layer, crate::paint_ops::PaintBody::Fill(crate::paint_ops::FillOp { seed, color, tolerance, clip, contiguous }))
+    }
+
+    /// Start a smudge or blur stroke on top of its paint layer, with its
+    /// first points if it has any; answers the op id. It streams as a
+    /// stroke does: [`BoardTxn::append_stroke`] and
+    /// [`BoardTxn::end_stroke`] take it too.
+    pub fn begin_retouch(&mut self, retouch: crate::paint_ops::NewRetouch) -> Result<String> {
+        let crate::paint_ops::NewRetouch { layer, effect, preset, settings, strength, points } = retouch;
+        let strength = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { crate::paint_ops::DEFAULT_STRENGTH };
+        let body = crate::paint_ops::PaintBody::Retouch(Arc::new(crate::paint_ops::RetouchOp { effect, preset, settings: settings.sanitized(), strength, points }));
+        self.insert_paint_op(&layer, body)
+    }
+
+    /// A whole smudge or blur at once (the MCP's). Refused with no points.
+    pub fn add_retouch(&mut self, retouch: crate::paint_ops::NewRetouch) -> Result<String> {
+        if !retouch.points.iter().any(|p| p[0].is_finite() && p[1].is_finite()) {
+            return Err(BoardError::Invalid("A smudge or blur needs at least one point.".into()));
+        }
+        self.begin_retouch(retouch)
+    }
+
+    /// Move a paint selection (docs/DRAWING_CONTRACT.md section 3, "Select"):
+    /// the pixels of `layer` inside `selection` are lifted and put down
+    /// through `transform`; `None` puts nothing down (Delete clears the
+    /// selection). On top of the layer; answers the op id.
+    pub fn add_move(&mut self, layer: &str, selection: crate::paint_ops::Selection, transform: Option<crate::paint_ops::PixelTransform>) -> Result<String> {
+        if !selection.is_valid() {
+            return Err(BoardError::Invalid("A selection needs an area: a rectangle with a size, or a lasso of three or more points.".into()));
+        }
+        if transform.is_some_and(|t| !t.is_finite() || t.inverse().is_none()) {
+            return Err(BoardError::Invalid("That transform flattens the selection to nothing.".into()));
+        }
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Move(crate::paint_ops::MoveOp { selection, transform }))
+    }
+
+    /// Change where a move puts its pixels down (the selection dragged on,
+    /// scaled or turned after it was first moved): one value, last writer
+    /// wins. `None` makes it a Delete.
+    pub fn set_move_transform(&mut self, id: &str, transform: Option<crate::paint_ops::PixelTransform>) -> Result<()> {
+        let map = self.paint_op_map(id)?;
+        let layer = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
+        self.judge_paint_into(&layer)?;
+        if string_of(map.get(self.txn, KIND)).as_deref() != Some("move") {
+            return Err(BoardError::Invalid(format!("paint operation {id} is not a move")));
+        }
+        match transform {
+            Some(t) if !t.is_finite() || t.inverse().is_none() => Err(BoardError::Invalid("That transform flattens the selection to nothing.".into())),
+            Some(t) => {
+                map.insert(self.txn, paint_keys::TRANSFORM, pixel_transform_any(&t));
+                Ok(())
+            }
+            None => {
+                map.remove(self.txn, paint_keys::TRANSFORM);
+                Ok(())
+            }
+        }
+    }
+
+    /// Lay down what [`crate::raster::rasterize`] drew, `src` its picture's
+    /// `pimble-blob:` URL (`None` when it drew nothing), in one transaction
+    /// (one undo):
+    ///
+    /// - **Flatten**: the operations it drew are deleted and one `pixels`
+    ///   operation takes the lowest one's place; operations painted since it
+    ///   was drawn stay, above it.
+    /// - **Merge Down** onto a paint layer: the pixels go on top of the
+    ///   layer below with the merged layer's blend, and the merged layer
+    ///   goes with its elements or operations. Refused when the layer below
+    ///   is no longer the one it was drawn for.
+    /// - **Merge Group** holding a paint layer: the group becomes one paint
+    ///   layer (its id, name, visibility, opacity and blend; pass-through
+    ///   reads as normal) holding the pixels; what was in it goes.
+    ///
+    /// Locks are judged as for the merges and deleting operations; a
+    /// refusal writes nothing. Answers the `pixels` operation's id.
+    pub fn apply_raster(&mut self, raster: &crate::raster::LayerRaster, src: Option<&str>) -> Result<Option<String>> {
+        use crate::raster::RasterJob;
+        if raster.png.is_some() && src.is_none() {
+            return Err(BoardError::Invalid("The pixels need their picture's blob URL.".into()));
+        }
+        let src = if raster.png.is_some() { src } else { None };
+        match &raster.job {
+            RasterJob::Flatten(layer) => {
+                self.judge_paint_into(layer)?;
+                let board = self.board()?;
+                let mut lowest: Option<String> = None;
+                let mut doomed = Vec::new();
+                for id in &raster.ops {
+                    let Ok(map) = self.paint_op_map(id) else { continue };
+                    if string_of(map.get(self.txn, LAYER)).as_deref() != Some(layer.as_str()) {
+                        continue;
+                    }
+                    let o = string_of(map.get(self.txn, ORDER)).unwrap_or_default();
+                    if lowest.as_ref().is_none_or(|l| o < *l) {
+                        lowest = Some(o);
+                    }
+                    doomed.push(crate::paint_ops::paint_key(id));
+                }
+                for key in doomed {
+                    board.remove(self.txn, &key);
+                }
+                let Some(src) = src else { return Ok(None) };
+                let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: Blend::Normal });
+                self.insert_paint_op_at(layer, body, lowest).map(Some)
+            }
+            RasterJob::MergeDown(id) => {
+                let ls = self.tree()?;
+                let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+                if ls.tree.entries[at].kind.is_group() {
+                    return Err(BoardError::Invalid("That is a group. Merge it with Merge Group.".into()));
+                }
+                let siblings = ls.tree.siblings(at);
+                let pos = siblings.iter().position(|s| *s == at).unwrap_or(0);
+                let below = pos.checked_sub(1).map(|p| siblings[p]).ok_or_else(|| BoardError::Invalid("the bottom layer has nothing below it".into()))?;
+                if ls.tree.entries[below].kind != LayerKind::Paint {
+                    return Err(BoardError::Invalid("The layer below is not a paint layer.".into()));
+                }
+                if raster.onto.as_deref() != Some(ls.id(below)) {
+                    return Err(BoardError::Invalid("The layers changed while the layer was being drawn as pixels; merge it again.".into()));
+                }
+                if let Some(locked) = ls.locked(at) {
+                    return Err(BoardError::LayerLockedAgainstRemoval(locked));
+                }
+                if let Some(locked) = ls.locked(below) {
+                    return Err(BoardError::LayerLocked(locked));
+                }
+                let below = ls.id(below).to_string();
+                let out = match src {
+                    Some(src) => {
+                        let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: raster.blend });
+                        Some(self.insert_paint_op(&below, body)?)
+                    }
+                    None => None,
+                };
+                self.remove_layers_with_contents(&[id.to_string()].into_iter().collect())?;
+                self.layers_changed();
+                self.stamp_board();
+                Ok(out)
+            }
+            RasterJob::MergeGroup(id) => {
+                let ls = self.tree()?;
+                let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+                if !ls.tree.entries[at].kind.is_group() {
+                    return Err(BoardError::Invalid("That layer is not a group.".into()));
+                }
+                if let Some(locked) = ls.locked(at) {
+                    return Err(BoardError::LayerLockedAgainstRemoval(locked));
+                }
+                let inside = ls.tree.descendants(at);
+                if let Some(inner) = inside.iter().find(|d| ls.raw_of(**d).locked) {
+                    return Err(BoardError::LayerLockedAgainstRemoval(ls.locked_layer(*inner)));
+                }
+                let doomed: HashSet<String> = inside.iter().map(|d| ls.id(*d).to_string()).collect();
+                let pass_through = ls.tree.entries[at].blend == Blend::PassThrough;
+                self.remove_layers_with_contents(&doomed)?;
+                let group = self.layer_map(id)?;
+                group.insert(self.txn, KIND, LayerKind::Paint.as_str().to_string());
+                if pass_through {
+                    group.remove(self.txn, BLEND);
+                }
+                self.layers_changed();
+                let out = match src {
+                    Some(src) => {
+                        let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: Blend::Normal });
+                        Some(self.insert_paint_op(id, body)?)
+                    }
+                    None => None,
+                };
+                self.stamp_board();
+                Ok(out)
+            }
+        }
+    }
+
+    /// Remove the layers `ids` with their elements and paint operations
+    /// (no lock judged: the caller has).
+    fn remove_layers_with_contents(&mut self, ids: &HashSet<String>) -> Result<()> {
+        let elements = self.elements()?;
+        let gone: Vec<String> = elements
+            .iter(self.txn)
+            .filter_map(|(eid, out)| match out {
+                Out::YMap(map) if string_of(map.get(self.txn, LAYER)).is_some_and(|l| ids.contains(&l)) => Some(eid.to_string()),
+                _ => None,
+            })
+            .collect();
+        for eid in gone {
+            elements.remove(self.txn, &eid);
+        }
+        let board = self.board()?;
+        for key in self.paint_keys_in(ids) {
+            board.remove(self.txn, &key);
+        }
+        let layers = self.layers()?;
+        for d in ids {
+            layers.remove(self.txn, d);
+            self.tops.remove(d);
+        }
+        Ok(())
     }
 
     /// Remove one paint operation (a tool's cancel). Refused when its layer
@@ -2272,6 +2519,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(id)
     }
 }
+
+/// The refusal of Merge Down from a paint layer onto a vector layer.
+pub const PAINT_ONTO_VECTOR: &str = "A paint layer cannot merge onto a vector layer: pixels do not become shapes.";
 
 /// The name of the paint layer the highlighter makes on a picture.
 pub const HIGHLIGHTS_LAYER_NAME: &str = "Highlights";
@@ -2491,38 +2741,18 @@ fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
 
 /// A paint operation as stored (see [`crate::paint_ops`]).
 pub(crate) fn read_paint_op<T: ReadTxn>(txn: &T, id: &str, map: &MapRef) -> crate::paint_ops::RawPaintOp {
-    use crate::paint_ops::{settings_from, unpack_brush_points, PaintBody, PixelsOp, StrokeOp};
+    use crate::paint_ops::{FillOp, MoveOp, PaintBody, PixelTransform, PixelsOp, Retouch, RetouchOp, Selection, StrokeOp};
     let kind = string_of(map.get(txn, KIND)).unwrap_or_default();
     let body = match kind.as_str() {
         "stroke" => {
-            let preset = string_of(map.get(txn, paint_keys::PRESET)).unwrap_or_default();
-            let named = crate::brush::preset(&preset);
-            let base = named.map(|p| p.settings).unwrap_or_default();
-            let brush = match map.get(txn, paint_keys::BRUSH) {
-                Some(Out::Any(Any::Map(m))) => Some(m),
-                _ => None,
-            };
-            let settings = settings_from(base, |k| {
-                let v = brush.as_ref()?.get(k)?;
-                match v {
-                    Any::Array(items) => Some(items.iter().filter_map(number).map(|n| n as f32).collect()),
-                    other => number(other).map(|n| vec![n as f32]),
-                }
-            });
+            let (preset, settings, named) = read_brush(txn, map);
             let color = string_of(map.get(txn, paint_keys::COLOR))
                 .as_deref()
                 .and_then(Color::parse)
                 .or(named.map(|p| p.color))
                 .unwrap_or(Color::BLACK);
             let blend = crate::brush::StrokeBlend::parse(&string_of(map.get(txn, BLEND)).unwrap_or_default());
-            let mut points = Vec::new();
-            if let Some(Out::YArray(array)) = map.get(txn, paint_keys::POINTS) {
-                for chunk in array.iter(txn) {
-                    if let Out::Any(Any::Buffer(bytes)) = chunk {
-                        unpack_brush_points(&bytes, &mut points);
-                    }
-                }
-            }
+            let points = read_brush_points(txn, map);
             PaintBody::Stroke(Arc::new(StrokeOp { preset, settings, color, blend, points }))
         }
         "pixels" => {
@@ -2530,9 +2760,67 @@ pub(crate) fn read_paint_op<T: ReadTxn>(txn: &T, id: &str, map: &MapRef) -> crat
                 Some(Out::Any(Any::Map(m))) => rect_of(&m),
                 _ => None,
             };
+            let blend = string_of(map.get(txn, BLEND)).as_deref().and_then(Blend::parse).filter(|b| *b != Blend::PassThrough).unwrap_or(Blend::Normal);
             match (string_of(map.get(txn, paint_keys::SRC)), rect) {
-                (Some(src), Some(rect)) => PaintBody::Pixels(PixelsOp { src, rect }),
+                (Some(src), Some(rect)) => PaintBody::Pixels(PixelsOp { src, rect, blend }),
                 _ => PaintBody::Other(kind.clone()),
+            }
+        }
+        "fill" => {
+            let seed = match map.get(txn, paint_keys::SEED) {
+                Some(Out::Any(Any::Map(m))) => field(&m, "x").zip(field(&m, "y")).map(|(x, y)| Point::new(x, y)),
+                _ => None,
+            };
+            let clip = match map.get(txn, paint_keys::CLIP) {
+                Some(Out::Any(Any::Map(m))) => rect_of(&m),
+                _ => None,
+            };
+            let color = string_of(map.get(txn, paint_keys::COLOR)).as_deref().and_then(Color::parse);
+            match (seed, clip, color) {
+                (Some(seed), Some(clip), Some(color)) => PaintBody::Fill(FillOp {
+                    seed,
+                    color,
+                    tolerance: number_of(map.get(txn, paint_keys::TOLERANCE)).unwrap_or(0.0).clamp(0.0, 1.0),
+                    clip,
+                    contiguous: bool_of(map.get(txn, paint_keys::CONTIGUOUS)).unwrap_or(true),
+                }),
+                _ => PaintBody::Other(kind.clone()),
+            }
+        }
+        "smudge" | "blur" => {
+            let effect = Retouch::parse(&kind).unwrap_or(Retouch::Smudge);
+            let (preset, settings, _) = read_brush(txn, map);
+            let strength = number_of(map.get(txn, paint_keys::STRENGTH)).unwrap_or(crate::paint_ops::DEFAULT_STRENGTH).clamp(0.0, 1.0);
+            let points = read_brush_points(txn, map);
+            PaintBody::Retouch(Arc::new(RetouchOp { effect, preset, settings, strength, points }))
+        }
+        "move" => {
+            let selection = match map.get(txn, paint_keys::SELECTION) {
+                Some(Out::Any(Any::Map(m))) => match m.get("kind").and_then(any_str) {
+                    Some("rect") => rect_of(&m).map(Selection::Rect),
+                    Some("lasso") => match m.get("points") {
+                        Some(Any::Array(items)) => {
+                            let n: Vec<f32> = items.iter().filter_map(number).map(|v| v as f32).collect();
+                            Some(Selection::Lasso(n.chunks_exact(2).map(|c| Point::new(c[0], c[1])).collect()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let transform = match map.get(txn, paint_keys::TRANSFORM) {
+                Some(Out::Any(Any::Array(items))) => {
+                    let n: Vec<f32> = items.iter().filter_map(number).map(|v| v as f32).collect();
+                    // A malformed transform puts nothing down rather than
+                    // something somewhere unknown.
+                    (n.len() == 6).then(|| PixelTransform::from_array([n[0], n[1], n[2], n[3], n[4], n[5]])).filter(|t| t.is_finite())
+                }
+                _ => None,
+            };
+            match selection {
+                Some(selection) => PaintBody::Move(MoveOp { selection, transform }),
+                None => PaintBody::Other(kind.clone()),
             }
         }
         _ => PaintBody::Other(kind.clone()),
@@ -2547,34 +2835,117 @@ pub(crate) fn read_paint_op<T: ReadTxn>(txn: &T, id: &str, map: &MapRef) -> crat
     }
 }
 
+/// A stroke's (or smudge's, blur's) preset name and brush settings, read
+/// over the named preset's, and that preset when this version has it.
+fn read_brush<T: ReadTxn>(txn: &T, map: &MapRef) -> (String, crate::brush::BrushSettings, Option<&'static crate::brush::Preset>) {
+    let preset = string_of(map.get(txn, paint_keys::PRESET)).unwrap_or_default();
+    let named = crate::brush::preset(&preset);
+    let base = named.map(|p| p.settings).unwrap_or_default();
+    let brush = match map.get(txn, paint_keys::BRUSH) {
+        Some(Out::Any(Any::Map(m))) => Some(m),
+        _ => None,
+    };
+    let settings = crate::paint_ops::settings_from(base, |k| {
+        let v = brush.as_ref()?.get(k)?;
+        match v {
+            Any::Array(items) => Some(items.iter().filter_map(number).map(|n| n as f32).collect()),
+            other => number(other).map(|n| vec![n as f32]),
+        }
+    });
+    (preset, settings, named)
+}
+
+fn read_brush_points<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<crate::brush::BrushPoint> {
+    let mut points = Vec::new();
+    if let Some(Out::YArray(array)) = map.get(txn, paint_keys::POINTS) {
+        for chunk in array.iter(txn) {
+            if let Out::Any(Any::Buffer(bytes)) = chunk {
+                crate::paint_ops::unpack_brush_points(&bytes, &mut points);
+            }
+        }
+    }
+    points
+}
+
+fn write_brush(txn: &mut TransactionMut, map: &MapRef, preset: &str, settings: &crate::brush::BrushSettings, points: &[crate::brush::BrushPoint]) {
+    use crate::paint_ops::{pack_brush_points, settings_fields, SettingValue};
+    map.insert(txn, paint_keys::PRESET, preset.to_string());
+    let mut brush = HashMap::new();
+    for (k, v) in settings_fields(settings) {
+        let any = match v {
+            SettingValue::N(n) => Any::Number(n as f64),
+            SettingValue::Curve(c) => Any::Array(vec![Any::Number(c.at0 as f64), Any::Number(c.at1 as f64), Any::Number(c.gamma as f64)].into()),
+        };
+        brush.insert(k.to_string(), any);
+    }
+    map.insert(txn, paint_keys::BRUSH, Any::Map(Arc::new(brush)));
+    let array: ArrayRef = map.insert(txn, paint_keys::POINTS, ArrayPrelim::default());
+    if !points.is_empty() {
+        array.push_back(txn, Any::Buffer(pack_brush_points(points).into()));
+    }
+}
+
+/// A selection as stored.
+fn selection_any(s: &crate::paint_ops::Selection) -> Any {
+    use crate::paint_ops::Selection;
+    let mut m = HashMap::new();
+    match s {
+        Selection::Rect(r) => {
+            m = rect_fields(&r.normalized());
+            m.insert("kind".to_string(), Any::String("rect".into()));
+        }
+        Selection::Lasso(points) => {
+            m.insert("kind".to_string(), Any::String("lasso".into()));
+            let n: Vec<Any> = points.iter().flat_map(|p| [Any::Number(p.x as f64), Any::Number(p.y as f64)]).collect();
+            m.insert("points".to_string(), Any::Array(n.into()));
+        }
+    }
+    Any::Map(Arc::new(m))
+}
+
+fn pixel_transform_any(t: &crate::paint_ops::PixelTransform) -> Any {
+    Any::Array(t.to_array().iter().map(|v| Any::Number(*v as f64)).collect::<Vec<_>>().into())
+}
+
 /// Write a paint operation's own keys into its (new) map.
 fn write_paint_op(txn: &mut TransactionMut, map: &MapRef, op: &crate::paint_ops::RawPaintOp) {
-    use crate::paint_ops::{pack_brush_points, settings_fields, PaintBody, SettingValue};
+    use crate::paint_ops::PaintBody;
     map.insert(txn, LAYER, op.layer.clone());
     map.insert(txn, ORDER, op.order.clone());
     map.insert(txn, KIND, op.kind().to_string());
     match &op.body {
         PaintBody::Stroke(s) => {
-            map.insert(txn, paint_keys::PRESET, s.preset.clone());
             map.insert(txn, paint_keys::COLOR, s.color.to_hex());
             map.insert(txn, BLEND, s.blend.as_str());
-            let mut brush = HashMap::new();
-            for (k, v) in settings_fields(&s.settings) {
-                let any = match v {
-                    SettingValue::N(n) => Any::Number(n as f64),
-                    SettingValue::Curve(c) => Any::Array(vec![Any::Number(c.at0 as f64), Any::Number(c.at1 as f64), Any::Number(c.gamma as f64)].into()),
-                };
-                brush.insert(k.to_string(), any);
-            }
-            map.insert(txn, paint_keys::BRUSH, Any::Map(Arc::new(brush)));
-            let array: ArrayRef = map.insert(txn, paint_keys::POINTS, ArrayPrelim::default());
-            if !s.points.is_empty() {
-                array.push_back(txn, Any::Buffer(pack_brush_points(&s.points).into()));
-            }
+            write_brush(txn, map, &s.preset, &s.settings, &s.points);
         }
         PaintBody::Pixels(p) => {
             map.insert(txn, paint_keys::SRC, p.src.clone());
             map.insert(txn, paint_keys::RECT, Any::Map(Arc::new(rect_fields(&p.rect))));
+            if p.blend != Blend::Normal {
+                map.insert(txn, BLEND, p.blend.as_str());
+            }
+        }
+        PaintBody::Fill(f) => {
+            let mut seed = HashMap::new();
+            point_fields(&mut seed, "x", "y", f.seed);
+            map.insert(txn, paint_keys::SEED, Any::Map(Arc::new(seed)));
+            map.insert(txn, paint_keys::COLOR, f.color.to_hex());
+            map.insert(txn, paint_keys::TOLERANCE, Any::Number(f.tolerance as f64));
+            map.insert(txn, paint_keys::CLIP, Any::Map(Arc::new(rect_fields(&f.clip.normalized()))));
+            if !f.contiguous {
+                map.insert(txn, paint_keys::CONTIGUOUS, false);
+            }
+        }
+        PaintBody::Retouch(r) => {
+            map.insert(txn, paint_keys::STRENGTH, Any::Number(r.strength as f64));
+            write_brush(txn, map, &r.preset, &r.settings, &r.points);
+        }
+        PaintBody::Move(m) => {
+            map.insert(txn, paint_keys::SELECTION, selection_any(&m.selection));
+            if let Some(t) = &m.transform {
+                map.insert(txn, paint_keys::TRANSFORM, pixel_transform_any(t));
+            }
         }
         PaintBody::Other(_) => {}
     }
@@ -2593,6 +2964,13 @@ pub(crate) mod paint_keys {
     pub const POINTS: &str = "points";
     pub const SRC: &str = "src";
     pub const RECT: &str = "rect";
+    pub const SEED: &str = "seed";
+    pub const TOLERANCE: &str = "tolerance";
+    pub const CLIP: &str = "clip";
+    pub const CONTIGUOUS: &str = "contiguous";
+    pub const STRENGTH: &str = "strength";
+    pub const SELECTION: &str = "selection";
+    pub const TRANSFORM: &str = "transform";
 }
 
 fn read_note<T: ReadTxn>(txn: &T, map: &MapRef) -> Option<String> {

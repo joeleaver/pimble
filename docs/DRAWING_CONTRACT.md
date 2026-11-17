@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1, 2, 3 and 4 built (model and UI); wave 5 next** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1, 2, 3 and 4 built (model and UI); wave 5's model built, its UI next** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -1338,3 +1338,233 @@ Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not
   pressure's size. **Rough edges**: the cursor can stay drawn where the pointer left the
   canvas for the floating chrome (the surface hears no leave there); deep layer groups
   squeeze a row's name now that a thumbnail sits beside it.
+
+## Built in wave 5 (model)
+
+Built 2026-11-17 in `crates/pimble-board` and `crates/pimble-mcp`, no UI: the Fill (G),
+Smudge (R) and Blur (Shift+R) tools, paint selections (rectangle and lasso, their handles,
+Delete), Flatten Layer in the layers panel and the blob flow for it and the merges are the
+UI half. `crates/pimble-app` is not touched (it compiles as it was: its matches on
+`PaintBody` have a fallback arm).
+
+### Stored keys
+
+Only new keys and new values of `kind`, on the `paint:<op id>` maps wave 4 made; an older
+app reads every new kind as an operation of a later version and skips it (the rest of the
+layer draws).
+
+- **fill**: `seed` (`Any { x, y }`), `color` (`#rrggbb(aa)`), `tolerance` (a number, 0 to 1),
+  `clip` (`Any { x, y, w, h }`), `contiguous` (`false` only when it is off; absent reads
+  true). A fill missing its seed, clip or color reads as a kind this version cannot draw.
+- **smudge** and **blur** (`kind` is the effect): `preset` and `brush` exactly as a stroke's,
+  `points` (the same `Array` of `Buffer` chunks, appended while drawing), `strength` (0 to
+  1, absent 0.5).
+- **move**: `selection` (`Any { kind: "rect", x, y, w, h }` or `Any { kind: "lasso", points:
+  [x0, y0, x1, y1, ...] }`, board units) and `transform` (`Any [a, b, c, d, e, f]`, board
+  units, SVG's matrix order: x' = a x + c y + e, y' = b x + d y + f). **No `transform` is a
+  Delete**: the selection's pixels are lifted and nothing is put down. The transform is one
+  value, last writer wins, like an element's geometry.
+- **pixels** gain `blend` (written only when not normal): how the picture is laid onto the
+  layer's own pixels. Merge Down of a layer that blends keeps its blend here. An older app
+  draws such pixels normally.
+
+### How they draw
+
+- **Fill**: the layer's pixels as they are at the fill's place in the order (the layer's
+  own pixels, not the composited canvas: see "Not built"), premultiplied RGBA at 2 pixels
+  per unit; a pixel fills when each of its four channels is within `tolerance × 255` of the
+  seed pixel's; contiguous fills are 4-connected (a scanline flood), the rest take every
+  matching pixel in the clip; the coverage is then **grown by one pixel** (0.5 units) so the
+  fill reaches under a soft brush edge instead of leaving a light halo; the fill color is
+  laid over the covered pixels as a stroke is (source-over). Nothing outside the clip
+  fills, so a fill on the infinite canvas ends. The flood reads only the tiles it reaches.
+- **The clip** (`raster::fill_clip(snapshot, layer, seed, view)`), what the filler's device
+  computes: what the filler sees (`view`, the visible board rectangle; with none, the
+  canvas's visible extent grown by `FILL_MARGIN`, 64 units, or 1,024 units around the seed
+  on an empty canvas) together with the layer's painting grown by 64 units (fills aside,
+  so fills do not grow each other's areas), so an enclosed shape partly off screen fills
+  whole; at most `MAX_FILL_UNITS` (2,048 units, 4,096 pixels) on a side, the window placed
+  around the seed; on whole paint pixels. `add_fill` refuses a clip larger than that, a
+  seed outside it, and anything but an unlocked paint layer.
+- **Smudge**: the brush's dabs (as a stroke's: spacing, pressure, jitter seeded by the op
+  id) over the layer's pixels below it: the first dab loads the brush with the pixels under
+  it; each later dab mixes the pixels under it toward what the brush carries by `strength ×
+  coverage` (coverage: the brush's falloff and hardness times the dab's alpha), and the
+  brush picks up what was there by `(1 − strength) × coverage`. Worked in f32, laid back as
+  premultiplied bytes.
+- **Blur**: each dab replaces the pixels under it with a box blur of them (radius a quarter
+  of the dab's, 1 to 8 pixels) by `strength × coverage`; dabs overlapping blur again, so a
+  slower, denser stroke blurs more.
+- **Move**: the pixels whose centers are inside the selection (a lasso by the nonzero rule;
+  a rectangle's right and bottom edges outside) are lifted from the layer as it is below the
+  move, cleared, and drawn back through the transform (nearest when it is a shift by whole
+  pixels, else bilinear) over what is left. With no transform, only cleared.
+- Every one is deterministic on one device (no randomness but the op id's seed); the
+  contract's accepted difference between the desktop and the browser stands.
+
+### Tiles and the cache
+
+- A fill, smudge, blur or move crosses tiles, so the cache works each out **once over its
+  whole area** and lays the result into each tile it touches: a fill's coverage per tile,
+  a smudge's or blur's finished pixels over its box (the box's pixels replace the tile's
+  there), a move's lifted pixels. These "derived" results are kept in the memory cache with
+  the tiles (counted in its budget, least recently used out first).
+- They read **the layer below them**: tiles replayed from the operations below the one
+  that reads (kept apart from the layer's own tiles, keyed by the reading operation, never
+  saved to disk), which in turn may need what an earlier fill or smudge made of the
+  pixels below it (worked out first, recursively).
+- **Effective fingerprints**: `PaintOp.effective` is an operation's fingerprint and, for one
+  that reads the pixels below it, the effective fingerprints of every operation below it in
+  its layer that reaches where it reads (`RawPaintOp::read_bounds`: a fill's clip, a
+  smudge's box, a blur's box grown by its widest kernel, a move's selection box). Tiles (in
+  memory and on disk, `TileKey`) and the view's `PaintMark`s are keyed by effective
+  fingerprints, so **a change below a fill (a wall of its area taken away, an undone
+  stroke) replays every tile the fill touches, and the view redraws its whole area**, not
+  only the changed stroke's (tested). A move's lifted pixels depend only on its selection
+  and what is below, so dragging a move on (`set_move_transform`) re-lays its tiles without
+  lifting again.
+- **Bounds**: a fill touches its clip, a smudge or blur its points grown by the brush's
+  reach and a unit, a move its selection's box together with where the transform puts it.
+- **Streaming**: a smudge or blur appended re-works its whole box (not only the new dabs:
+  not built) and the tiles under it replay; the view redraws only where the new points
+  reach (unless something below changed). The incremental stamping of wave 4 stays for
+  strokes.
+- A derived result that needed a `pixels` picture not loaded yet is worked out again next
+  time, as a tile is.
+- **Limit**: a smudge, blur or move whose box passes 4,096 × 4,096 pixels (2,048 units on a
+  side) draws nothing (`MAX_WORK_PX`). Working out what is below nests as deep as the
+  fills, smudges, blurs and moves stacked over one another (each level a call deeper).
+
+### Public API (`pimble_board`)
+
+- **Types** (`paint_ops`, at the root): `PaintBody` gains `Fill(FillOp)`,
+  `Retouch(Arc<RetouchOp>)`, `Move(MoveOp)` (`kind()` names them; `is_local()` is false for
+  the three). `FillOp { seed: Point, color, tolerance, clip: Rect, contiguous }`; `Retouch {
+  Smudge, Blur }` (`as_str`, `parse`); `RetouchOp { effect, preset, settings, strength,
+  points }`; `MoveOp { selection: Selection, transform: Option<PixelTransform> }`;
+  `PixelsOp` gains `blend: Blend`. `RawPaintOp::read_bounds() -> Option<Rect>`. `PaintOp`
+  gains `effective: u64`. Constants `paint_ops::DEFAULT_TOLERANCE` (0.15),
+  `paint_ops::DEFAULT_STRENGTH` (0.5).
+- **Selections, pure** (for the UI's marquee, lasso and handles): `Selection { Rect(Rect),
+  Lasso(Vec<Point>) }` with `bounds() -> Option<Rect>`, `is_valid()`, `contains(Point) ->
+  bool` (what a pixel center is tested with), `outline() -> Vec<Point>`,
+  `outline_through(&PixelTransform) -> Vec<Point>` (where the moved selection lands).
+  `PixelTransform { a, b, c, d, e, f }` with `IDENTITY`, `translate(dx, dy)`, `scale(sx, sy,
+  about)`, `rotate(degrees, about)` (clockwise, the y axis down), `then(&next)` (this, then
+  `next`), `apply(Point)`, `inverse() -> Option<_>`, `map_rect(&Rect) -> Rect`,
+  `is_finite()`, `is_identity()`, `to_array()`, `from_array([f32; 6])`.
+- **New operations** (`NewFill { layer, seed, color, tolerance, clip, contiguous }` with
+  `NewFill::new(layer, seed, color, clip)`, `.with_tolerance(f32)`, `.everywhere()`;
+  `NewRetouch { layer, effect, preset, settings, strength, points }` with
+  `NewRetouch::new(layer, Retouch, &Preset)`, `.with_size`, `.with_settings`,
+  `.with_strength`, `.with_points`). `BoardTxn`, each judged by locks, refusals writing
+  nothing:
+  - `add_fill(NewFill) -> Result<String>`.
+  - `begin_retouch(NewRetouch) -> Result<String>`; `append_stroke(id, &[BrushPoint])` and
+    `end_stroke(id)` take a smudge or blur as they take a stroke (stream it the same way,
+    the undo clock held from press to release); `add_retouch(NewRetouch)` (a whole one,
+    refused with no points).
+  - `add_move(layer, Selection, Option<PixelTransform>) -> Result<String>` (refused with a
+    selection that encloses nothing or a transform that flattens it);
+    `set_move_transform(id, Option<PixelTransform>) -> Result<()>` (the UI's drag, scale and
+    turn after the first write; `None` makes it a Delete).
+  - `add_pixels_blended(layer, src, Rect, Blend) -> Result<String>`.
+  - `apply_raster(&LayerRaster, src: Option<&str>) -> Result<Option<String>>` (below).
+- **Flatten and merges as pixels** (`raster`, at the root): `RasterJob { Flatten(layer),
+  MergeDown(layer), MergeGroup(group) }`; `rasterize(&snapshot, &dyn PictureSource,
+  RasterJob) -> Result<LayerRaster, BoardError>`; `LayerRaster { job, png: Option<Vec<u8>>,
+  rect: Rect, pixel_size: (u32, u32), blend: Blend, ops: Vec<String>, onto: Option<String>
+  }`; `merge_needs_pixels(&snapshot, layer) -> bool` (Merge Down onto a paint layer, or a
+  group holding one); `fill_clip(&snapshot, layer, seed, view: Option<Rect>) -> Rect`;
+  constants `raster::MAX_FILL_UNITS`, `raster::FILL_MARGIN`, `raster::MAX_RASTER_PX`
+  (8,192 pixels). New errors: `BoardError::NeedsPixels(sentence)` (what `merge_layer_down`
+  and `merge_group` now answer where pixels are needed), `BoardError::PicturesNotLoaded(n)`;
+  `PAINT_ONTO_VECTOR` is the refusal of a paint layer merged onto a vector layer.
+
+### The blob flow, for the UI (and what the MCP does)
+
+The model cannot store a blob, so Flatten Layer, Merge Down onto a paint layer and Merge
+Group with a paint layer in it are two steps:
+
+1. With the board's current snapshot and the pictures it draws loaded (the app's
+   `pictures_of`, which reads `picture_srcs()`), call `rasterize(&snapshot, &pictures, job)`.
+   A refusal is a sentence to show (paint onto vector, a hidden layer merged, a picture not
+   loaded yet, more than 4,096 units across). For a merge, call it only when
+   `merge_needs_pixels` says so; otherwise call `merge_layer_down` / `merge_group` as before
+   (they answer `NeedsPixels` if called anyway).
+2. When `png` is `Some`, put it as a blob of the node's store as a picture is put
+   (`BackendCommand::PutBlob`; `pimble_image::fit` leaves a PNG under 20 MiB as it is, and
+   one it shrinks is drawn stretched over `rect`, so the result is only softer). When the
+   blob's URL comes back (`BlobStored`), make one `Board::edit` with `apply_raster(&raster,
+   Some(&url))`; with no `png`, `apply_raster(&raster, None)` at once. One undo step.
+
+What `apply_raster` writes: **Flatten** deletes the operations the raster drew (`ops`) and
+puts one `pixels` operation at the lowest one's order, so operations painted while the
+blob was stored stay above it (tested); the layer keeps its own opacity and blend.
+**Merge Down** puts the pixels on top of the paint layer below with the merged layer's
+blend (its opacity is in the pixels), then deletes the merged layer with its elements or
+operations; it is refused when the layer below is no longer `onto`. **Merge Group** deletes
+everything inside the group and makes the group entry a paint layer (keeping its id, name,
+visibility, opacity and blend; pass-through reads as normal) holding the pixels.
+
+### Deviations
+
+- **Merge Group rasterizes everything in the group into one `pixels` operation**, paint
+  layers included, where the contract says the vector layers are rasterized into the paint
+  one: moving a paint child's operations would lose that child's opacity and blend, and a
+  fill or smudge moved under another child's pixels would read different pixels. The
+  result looks as the group did.
+- **A hidden layer is not merged**: Merge Down of a hidden layer, or Merge Group with a
+  hidden layer inside, is refused with a sentence (it would merge as nothing and its
+  content would go). Painting apps often discard hidden layers here; asking first was the
+  safe default.
+- **Merge Down onto a paint layer works from a paint layer too** (the same flow), which the
+  contract did not list; a paint layer onto a vector layer is refused, as it says.
+- A fill reads its own layer only (see "Not built"), and grows by one pixel.
+- Merge Down bakes the merged layer's opacity into the pixels and keeps its blend on the
+  `pixels` operation, so the blend now applies against the paint layer's own pixels rather
+  than everything below (as painting apps do); an older app draws those pixels normal.
+- The PNG round trip (premultiplied to straight alpha and back) moves faint pixels by a few
+  levels (at most 4 of 255 over white in the tests).
+
+### Measured (under load)
+
+Release build, `tests/wave5.rs` probe, the machine shared with other builds (load average
+53 to 60 on 24 cores): a 1,920 × 1,080-unit view of 200 hard strokes and two fills whose
+clips were that view, cold: 1.26 s (every tile, the tiles below each fill, two floods over
+8 million pixels); Flatten of that layer from warm tiles, PNG included: 223 ms (4,046 ×
+2,256 pixels, 194 KB); a 30-unit smudge streamed four points at a time through a 1,920 ×
+1,080 `BoardView`: median 11.7 ms per append, p95 17.9 ms. Re-measure idle before tuning.
+
+### Tests
+
+`retouch.rs` (a fill inside a ring, grown a pixel, ended by its clip, not contiguous;
+across tiles reading each once; blur and smudge, deterministic), `tests/wave5.rs`: a fill
+stored and refused; a fill in a ring and, the ring deleted, the same fill redrawn over its
+whole clip by a `BoardView` and matching a cold render; a fill and a concurrent stroke
+below it the same on two devices, and through the disk cache; a smudge streamed through a
+view matching a cold render; a blur softening an edge; moves (shift, dragged on, Delete, a
+lasso turned 90 degrees) and refusals; transforms composed and inverted; Flatten in one
+undo, matching the history's pixels, refused for a missing picture, keeping what was
+painted meanwhile; Merge Down of a vector layer with opacity and multiply matching before,
+paint onto vector refused, `NeedsPixels`; hidden layers and a changed layer below refused;
+Merge Group of a paint and a vector layer matching before; a broken fill skipped. The
+older layer tests now expect `NeedsPixels`. The MCP: fill specs and the summary's new kinds.
+
+### Not built
+
+The UI. **"Sample all layers"** for a fill (filling against the composited canvas): it
+would make a fill depend on every layer below it, so its tiles would replay on any change
+anywhere beneath; the cheap way is the filler's device computing the fill against the
+canvas and storing the result as a `pixels` operation (frozen, not live): Joe to choose.
+Incremental smudge and blur while streaming (each append re-works the whole stroke's box);
+a smudge, blur or move larger than 2,048 units; soft (antialiased) selection edges and
+feathering; a fill's own "grow" or "gap closing" settings; an MCP tool for smudge, blur or
+moves; pasting an image into a paint layer (`add_pixels` is ready for it).
+
+### Open questions for Joe
+
+1. Sample all layers for fills: not at all, frozen as pixels, or live?
+2. Hidden layers in a merge: refuse (built) or discard as painting apps do?
+3. The fill clip: the view together with the layer's painting (built), or the view alone?
+4. Fill tolerance 0.15 and smudge/blur strength 0.5 as the defaults.

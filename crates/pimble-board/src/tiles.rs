@@ -23,16 +23,26 @@
 //! - A tile that needed a picture not yet loaded (a `pixels` operation) is
 //!   drawn without it and not kept, so it is drawn again once the picture is
 //!   there.
+//! - **Operations that read the pixels below them** (fill, smudge, blur,
+//!   move: wave 5) cross tiles, so each is worked out once over its whole
+//!   area from the layer's tiles as they are just below it (kept apart from
+//!   the layer's own tiles, keyed by the operation) and the result is laid
+//!   into each tile it touches: a fill's coverage, a smudge's or blur's
+//!   pixels, a move's lifted pixels. Such an operation's effective
+//!   fingerprint ([`PaintOp::effective`]) folds in the operations below it
+//!   that reach where it reads, so a change there replays every tile it
+//!   touches, here and on disk.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-use tiny_skia::{Pixmap, Transform as Affine};
+use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform as Affine};
 
-use crate::brush::{self, Dab, DabWalker, Lay, PxRect, PX_PER_UNIT};
-use crate::model::Rect;
+use crate::brush::{self, Dab, DabWalker, Lay, PxRect, StrokeBlend, PX_PER_UNIT};
+use crate::model::{Blend, Rect};
 use crate::paint_ops::{settings_hash, PaintBody, PaintOp, StrokeOp};
+use crate::retouch::{self, PxBox};
 use crate::render::{draw_picture_rect, Picture, PictureSource, View};
 use crate::snapshot::{id_hash, BoardSnapshot, Fx};
 
@@ -238,38 +248,42 @@ impl PaintCache {
     pub fn clear(&self) {
         *self.inner.lock().unwrap() = Inner::default();
     }
-
     /// Draw paint layer `layer` (an index into the snapshot's layers) into
     /// `target` over `region` of `view`.
     pub(crate) fn draw_layer(&self, target: &mut Pixmap, snapshot: &BoardSnapshot, layer: usize, view: &View, region: &Rect, pictures: &dyn PictureSource) {
-        let Some(l) = snapshot.layers.get(layer) else { return };
+        self.draw_layer_checked(target, snapshot, layer, view, region, pictures);
+    }
+
+    /// [`PaintCache::draw_layer`], answering whether everything it drew was
+    /// complete (every picture it needed was there).
+    pub(crate) fn draw_layer_checked(&self, target: &mut Pixmap, snapshot: &BoardSnapshot, layer: usize, view: &View, region: &Rect, pictures: &dyn PictureSource) -> bool {
+        let Some(l) = snapshot.layers.get(layer) else { return true };
         let ops = snapshot.paint_ops(&l.id);
-        let Some(bounds) = snapshot.paint_bounds(&l.id) else { return };
-        let Some(area) = region.intersect(&bounds) else { return };
-        let Some((x0, y0, x1, y1)) = tiles_of(&area) else { return };
+        let Some(bounds) = snapshot.paint_bounds(&l.id) else { return true };
+        let Some(area) = region.intersect(&bounds) else { return true };
+        let Some((x0, y0, x1, y1)) = tiles_of(&area) else { return true };
         let vt = view.transform();
         let recent_from = ops.len().saturating_sub(KEEP_OPEN);
+        let ctx = Ctx { layer: &l.id, ops, store: self.store.as_deref(), pictures };
         let mut inner = self.inner.lock().unwrap();
         inner.clock += 1;
-        let mut touching: Vec<(&PaintOp, bool)> = Vec::new();
+        let mut complete = true;
+        let mut touching: Vec<(usize, bool)> = Vec::new();
         for ty in y0..=y1 {
             for tx in x0..=x1 {
                 let rect = tile_rect(tx, ty);
                 touching.clear();
-                touching.extend(
-                    ops.iter()
-                        .enumerate()
-                        .filter(|(_, o)| o.bounds.is_some_and(|b| b.intersects(&rect)) && !matches!(o.raw.body, PaintBody::Other(_)))
-                        .map(|(i, o)| (o, i >= recent_from)),
-                );
+                touching.extend(ops.iter().enumerate().filter(|(_, o)| o.touches(&rect)).map(|(i, _)| (i, i >= recent_from)));
                 if touching.is_empty() {
                     continue;
                 }
-                let picture = inner.tile(self.store.as_deref(), &l.id, tx, ty, &touching, pictures);
-                draw_picture_rect(target, picture, rect, None, vt, 1.0, false, view.scale >= PX_PER_UNIT);
+                let entry = inner.tile(&ctx, None, tx, ty, &touching);
+                complete &= entry.complete;
+                draw_picture_rect(target, &entry.picture, rect, None, vt, 1.0, false, view.scale >= PX_PER_UNIT);
             }
         }
         inner.evict(self.budget);
+        complete
     }
 
     /// The pixels of tile (`tx`, `ty`) of paint layer `layer`, as
@@ -279,28 +293,36 @@ impl PaintCache {
         let ops = snapshot.paint_ops(layer);
         let rect = tile_rect(tx, ty);
         let recent_from = ops.len().saturating_sub(KEEP_OPEN);
-        let touching: Vec<(&PaintOp, bool)> = ops
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| o.bounds.is_some_and(|b| b.intersects(&rect)) && !matches!(o.raw.body, PaintBody::Other(_)))
-            .map(|(i, o)| (o, i >= recent_from))
-            .collect();
+        let touching: Vec<(usize, bool)> = ops.iter().enumerate().filter(|(_, o)| o.touches(&rect)).map(|(i, _)| (i, i >= recent_from)).collect();
         if touching.is_empty() {
             return None;
         }
+        let ctx = Ctx { layer, ops, store: self.store.as_deref(), pictures };
         let mut inner = self.inner.lock().unwrap();
         inner.clock += 1;
-        let out = inner.tile(self.store.as_deref(), layer, tx, ty, &touching, pictures).pixmap().data().to_vec();
+        let out = inner.tile(&ctx, None, tx, ty, &touching).picture.pixmap().data().to_vec();
         inner.evict(self.budget);
         Some(out)
     }
 }
 
+/// One layer's operations being drawn, and where from.
+struct Ctx<'a> {
+    layer: &'a str,
+    /// Its operations, bottom to top.
+    ops: &'a [PaintOp],
+    store: Option<&'a dyn TileStore>,
+    pictures: &'a dyn PictureSource,
+}
+
 struct TileEntry {
-    /// (op id hash, fingerprint) of the operations it was drawn from.
+    /// (op id hash, effective fingerprint) of the operations it was drawn
+    /// from.
     ops: Vec<(u64, u64)>,
     picture: Picture,
     open: Option<Box<Open>>,
+    /// Every picture it needed was there.
+    complete: bool,
     used: u64,
 }
 
@@ -326,10 +348,49 @@ struct DabEntry {
     used: u64,
 }
 
+/// What an operation that reads the pixels below it made of them, worked
+/// out once over its whole area (it crosses tiles) and laid into each tile
+/// it touches.
+enum Derived {
+    /// A fill's coverage per tile ([`retouch::flood`]).
+    Fill(HashMap<(i32, i32), Vec<u8>>),
+    /// A smudge's or blur's pixels over its area: every pixel of the layer
+    /// there once it is done (premultiplied).
+    Patch { area: PxBox, data: Vec<u8> },
+    /// A move's lifted pixels: the layer under its selection's box, with
+    /// what is outside the selection cleared (`None`: nothing there).
+    Lifted { area: PxBox, pixmap: Option<Pixmap> },
+    /// Nothing to lay down (an area too large to work over).
+    Nothing,
+}
+
+impl Derived {
+    fn bytes(&self) -> usize {
+        match self {
+            Derived::Fill(m) => m.len() * MASK_LEN,
+            Derived::Patch { data, .. } => data.len(),
+            Derived::Lifted { pixmap, .. } => pixmap.as_ref().map_or(0, |p| p.data().len()),
+            Derived::Nothing => 0,
+        }
+    }
+}
+
+struct DerivedEntry {
+    value: Arc<Derived>,
+    complete: bool,
+    used: u64,
+}
+
+/// The most pixels a smudge, blur or move works over at once (4096²): one
+/// reaching further draws nothing (docs/DRAWING_CONTRACT.md, "Built in
+/// wave 5 (model)").
+const MAX_WORK_PX: usize = 4096 * 4096;
+
 #[derive(Default)]
 struct Inner {
     tiles: HashMap<(String, i32, i32), TileEntry>,
     dabs: HashMap<String, DabEntry>,
+    derived: HashMap<u64, DerivedEntry>,
     clock: u64,
     lineage: u64,
     scratch: Vec<f32>,
@@ -340,7 +401,8 @@ impl Inner {
     fn bytes(&self) -> usize {
         let tiles: usize = self.tiles.values().map(|t| TILE_BYTES + t.open.as_ref().map_or(0, |_| TILE_BYTES + MASK_LEN * 4)).sum();
         let dabs: usize = self.dabs.values().map(|d| d.dabs.len() * std::mem::size_of::<Dab>()).sum();
-        tiles + dabs
+        let derived: usize = self.derived.values().map(|d| d.value.bytes()).sum();
+        tiles + dabs + derived
     }
 
     /// Bring stroke `id`'s dabs up to date with `stroke`.
@@ -366,90 +428,237 @@ impl Inner {
         self.dabs.insert(id.to_string(), DabEntry { stroke: stroke.clone(), look, walker, dabs, lineage: self.lineage, used: clock });
     }
 
-    fn tile(&mut self, store: Option<&dyn TileStore>, layer: &str, tx: i32, ty: i32, ops: &[(&PaintOp, bool)], pictures: &dyn PictureSource) -> &Picture {
-        let want: Vec<(u64, u64)> = ops.iter().map(|(o, _)| (id_hash(&o.raw.id), o.fingerprint)).collect();
-        for (o, _) in ops {
+    /// Tile (`tx`, `ty`) of the layer drawn from `touching` (indices into
+    /// `ctx.ops` of the operations that reach it, with whether each is one
+    /// of the layer's last few), as the layer is (`upto` `None`) or as it is
+    /// just below operation `upto` (what a fill, smudge, blur or move reads).
+    fn tile(&mut self, ctx: &Ctx<'_>, upto: Option<usize>, tx: i32, ty: i32, touching: &[(usize, bool)]) -> &TileEntry {
+        let ops: Vec<(&PaintOp, bool)> = touching.iter().map(|(i, r)| (&ctx.ops[*i], *r)).collect();
+        let want: Vec<(u64, u64)> = ops.iter().map(|(o, _)| (id_hash(&o.raw.id), o.effective)).collect();
+        for (o, _) in &ops {
             if let PaintBody::Stroke(s) = &o.raw.body {
                 self.update_dabs(&o.raw.id, s);
             }
         }
-        let key = (layer.to_string(), tx, ty);
+        let key_layer = match upto {
+            None => ctx.layer.to_string(),
+            // Below an operation: kept apart from the layer's own tiles.
+            Some(k) => format!("{}\u{1}{}", ctx.layer, ctx.ops[k].raw.id),
+        };
+        let store = if upto.is_none() { ctx.store } else { None };
+        let key = (key_layer, tx, ty);
         let clock = self.clock;
         let (ox, oy) = (tx as i64 * TILE_PX as i64, ty as i64 * TILE_PX as i64);
         let rect = tile_rect(tx, ty);
-        let Inner { tiles, dabs, stats, .. } = self;
         // In memory: unchanged, or a stroke grew or was laid on top.
         let mut fresh = true;
-        if let Some(entry) = tiles.get_mut(&key) {
-            entry.used = clock;
-            if entry.ops == want {
-                stats.hits += 1;
-                fresh = false;
-            } else if let Some(done) = advance(entry, &want, ops, dabs, ox, oy, &rect) {
-                match done {
-                    Advanced::Appended => stats.appended += 1,
-                    Advanced::Stacked => stats.stacked += 1,
+        {
+            let Inner { tiles, dabs, stats, .. } = &mut *self;
+            if let Some(entry) = tiles.get_mut(&key) {
+                entry.used = clock;
+                if entry.ops == want {
+                    stats.hits += 1;
+                    fresh = false;
+                } else if let Some(done) = advance(entry, &want, &ops, dabs, ox, oy, &rect) {
+                    match done {
+                        Advanced::Appended => stats.appended += 1,
+                        Advanced::Stacked => stats.stacked += 1,
+                    }
+                    entry.ops = want.clone();
+                    fresh = false;
                 }
-                entry.ops = want.clone();
-                fresh = false;
             }
         }
-        if fresh {
-            let disk_key = TileKey::of(layer, tx, ty, &want);
-            let loaded = store.and_then(|s| s.load(&disk_key)).filter(|px| px.len() == TILE_BYTES);
-            let entry = match loaded {
-                Some(px) => {
-                    stats.loaded += 1;
-                    let picture = Picture::from_premultiplied(TILE_PX, TILE_PX, px).expect("a tile's size");
-                    TileEntry { ops: want.clone(), picture, open: None, used: clock }
-                }
-                None => {
-                    stats.replayed += 1;
-                    let (entry, complete) = replay(&want, ops, dabs, &mut self.scratch, ox, oy, &rect, pictures, clock);
-                    if complete {
-                        if let Some(s) = store {
-                            s.save(&disk_key, entry.picture.pixmap().data());
-                        }
-                    } else {
-                        // Drawn without a picture that is not here yet: shown
-                        // now, drawn again next time.
-                        let mut entry = entry;
-                        entry.ops.push((0, 0));
-                        tiles.insert(key.clone(), entry);
-                        return &tiles[&key].picture;
-                    }
-                    entry
-                }
-            };
-            tiles.insert(key.clone(), entry);
+        if !fresh {
+            return &self.tiles[&key];
         }
-        &tiles[&key].picture
+        let disk_key = TileKey::of(&key.0, tx, ty, &want);
+        if let Some(px) = store.and_then(|s| s.load(&disk_key)).filter(|px| px.len() == TILE_BYTES) {
+            self.stats.loaded += 1;
+            let picture = Picture::from_premultiplied(TILE_PX, TILE_PX, px).expect("a tile's size");
+            self.tiles.insert(key.clone(), TileEntry { ops: want, picture, open: None, complete: true, used: clock });
+            return &self.tiles[&key];
+        }
+        // Replay: first what the operations that read the pixels below them
+        // made of those pixels.
+        let mut derived: Vec<Option<Arc<Derived>>> = Vec::with_capacity(ops.len());
+        let mut complete = true;
+        for (i, _) in touching {
+            if ctx.ops[*i].raw.body.is_local() {
+                derived.push(None);
+            } else {
+                let (d, c) = self.ensure_derived(ctx, *i);
+                complete &= c;
+                derived.push(Some(d));
+            }
+        }
+        self.stats.replayed += 1;
+        let Inner { tiles, dabs, scratch, .. } = &mut *self;
+        let (mut entry, drawn) = replay(&want, &ops, &derived, dabs, scratch, tx, ty, &rect, ctx.pictures, clock);
+        complete &= drawn;
+        if complete {
+            if let Some(s) = store {
+                s.save(&disk_key, entry.picture.pixmap().data());
+            }
+        } else {
+            // Drawn without a picture that is not here yet: shown now,
+            // drawn again next time.
+            entry.ops.push((0, 0));
+            entry.complete = false;
+        }
+        tiles.insert(key.clone(), entry);
+        &tiles[&key]
     }
 
-    /// Drop the least recently used tiles and dabs until under `budget`.
+    /// The tiles of the layer below operation `k` that `touching` reach,
+    /// or `None` when nothing reaches tile (`tx`, `ty`).
+    fn below_tile(&mut self, ctx: &Ctx<'_>, k: usize, tx: i32, ty: i32) -> Option<&TileEntry> {
+        let rect = tile_rect(tx, ty);
+        let touching: Vec<(usize, bool)> = ctx.ops[..k].iter().enumerate().filter(|(_, o)| o.touches(&rect)).map(|(i, _)| (i, false)).collect();
+        if touching.is_empty() {
+            return None;
+        }
+        Some(self.tile(ctx, Some(k), tx, ty, &touching))
+    }
+
+    /// The layer's pixels below operation `k` over `area`, premultiplied,
+    /// and whether they are complete.
+    fn region(&mut self, ctx: &Ctx<'_>, k: usize, area: PxBox) -> (Vec<u8>, bool) {
+        let mut out = vec![0u8; area.w * area.h * 4];
+        let mut complete = true;
+        let (tx0, ty0, tx1, ty1) = area.tiles();
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                let Some(((x0, y0, x1, y1), (bx, by))) = area.in_tile(tx, ty) else { continue };
+                let Some(entry) = self.below_tile(ctx, k, tx, ty) else { continue };
+                complete &= entry.complete;
+                let src = entry.picture.pixmap().data();
+                let n = (x1 - x0) * 4;
+                for row in 0..(y1 - y0) {
+                    let s = ((y0 + row) * TILE_PX as usize + x0) * 4;
+                    let d = ((by + row) * area.w + bx) * 4;
+                    out[d..d + n].copy_from_slice(&src[s..s + n]);
+                }
+            }
+        }
+        (out, complete)
+    }
+
+    /// What operation `k` (a fill, smudge, blur or move) makes of the
+    /// pixels below it, worked out once per [`PaintOp::derived`] key, and
+    /// whether it is complete.
+    fn ensure_derived(&mut self, ctx: &Ctx<'_>, k: usize) -> (Arc<Derived>, bool) {
+        let op = &ctx.ops[k];
+        let clock = self.clock;
+        if let Some(e) = self.derived.get_mut(&op.derived) {
+            e.used = clock;
+            if e.complete {
+                return (e.value.clone(), true);
+            }
+        }
+        let mut complete = true;
+        let value = match &op.raw.body {
+            PaintBody::Fill(f) => match PxBox::of_rect(&f.clip) {
+                Some(clip) => {
+                    let seed = ((f.seed.x * PX_PER_UNIT).floor() as i64, (f.seed.y * PX_PER_UNIT).floor() as i64);
+                    let mut fetch = |tx: i32, ty: i32| match self.below_tile(ctx, k, tx, ty) {
+                        Some(entry) => {
+                            complete &= entry.complete;
+                            Some(entry.picture.pixmap().data().to_vec())
+                        }
+                        None => None,
+                    };
+                    Derived::Fill(retouch::flood(clip, seed, f.tolerance, f.contiguous, &mut fetch))
+                }
+                None => Derived::Nothing,
+            },
+            PaintBody::Retouch(r) => match op.bounds.and_then(|b| PxBox::of_rect(&b)) {
+                Some(area) if area.w * area.h <= MAX_WORK_PX => {
+                    let margin = retouch::read_margin(r.effect);
+                    let read = area.grown(margin);
+                    let (bytes, c) = self.region(ctx, k, read);
+                    complete &= c;
+                    let mut buf: Vec<f32> = bytes.iter().map(|b| *b as f32).collect();
+                    retouch::retouch(&mut buf, read.w, read.h, read.x0, read.y0, r, brush::seed_of(&op.raw.id));
+                    let m = margin as usize;
+                    let mut cut = Vec::with_capacity(area.w * area.h * 4);
+                    for row in 0..area.h {
+                        let s = ((row + m) * read.w + m) * 4;
+                        cut.extend_from_slice(&buf[s..s + area.w * 4]);
+                    }
+                    Derived::Patch { area, data: retouch::to_bytes(&cut) }
+                }
+                _ => Derived::Nothing,
+            },
+            PaintBody::Move(mv) => match mv.selection.bounds().and_then(|b| PxBox::of_rect(&b)) {
+                Some(area) if area.w * area.h <= MAX_WORK_PX => {
+                    let (mut bytes, c) = self.region(ctx, k, area);
+                    complete &= c;
+                    let mut any = false;
+                    for y in 0..area.h {
+                        let by = ((area.y0 + y as i64) as f32 + 0.5) / PX_PER_UNIT;
+                        for x in 0..area.w {
+                            let i = (y * area.w + x) * 4;
+                            if bytes[i + 3] == 0 && bytes[i..i + 3] == [0, 0, 0] {
+                                continue;
+                            }
+                            let bx = ((area.x0 + x as i64) as f32 + 0.5) / PX_PER_UNIT;
+                            if mv.selection.contains(crate::model::Point::new(bx, by)) {
+                                any = true;
+                            } else {
+                                bytes[i..i + 4].fill(0);
+                            }
+                        }
+                    }
+                    let pixmap = if any { tiny_skia::IntSize::from_wh(area.w as u32, area.h as u32).and_then(|s| Pixmap::from_vec(bytes, s)) } else { None };
+                    Derived::Lifted { area, pixmap }
+                }
+                _ => Derived::Nothing,
+            },
+            _ => Derived::Nothing,
+        };
+        let value = Arc::new(value);
+        self.derived.insert(op.derived, DerivedEntry { value: value.clone(), complete, used: clock });
+        (value, complete)
+    }
+
+    /// Drop the least recently used tiles, dabs and derived results until
+    /// under `budget`.
     fn evict(&mut self, budget: usize) {
         let mut bytes = self.bytes();
         if bytes <= budget {
             return;
         }
         let target = budget / 10 * 8;
-        let mut by_age: Vec<(u64, bool, String, i32, i32)> = self
+        // (used, what: 0 tile, 1 dabs, 2 derived, id, x, y, derived key)
+        let mut by_age: Vec<(u64, u8, String, i32, i32, u64)> = self
             .tiles
             .iter()
-            .map(|((l, x, y), t)| (t.used, true, l.clone(), *x, *y))
-            .chain(self.dabs.iter().map(|(id, d)| (d.used, false, id.clone(), 0, 0)))
+            .map(|((l, x, y), t)| (t.used, 0, l.clone(), *x, *y, 0))
+            .chain(self.dabs.iter().map(|(id, d)| (d.used, 1, id.clone(), 0, 0, 0)))
+            .chain(self.derived.iter().map(|(k, d)| (d.used, 2, String::new(), 0, 0, *k)))
             .collect();
         by_age.sort_by_key(|a| a.0);
-        for (used, tile, id, x, y) in by_age {
+        for (used, what, id, x, y, dk) in by_age {
             if bytes <= target || used == self.clock {
                 break;
             }
-            if tile {
-                if let Some(t) = self.tiles.remove(&(id, x, y)) {
-                    bytes = bytes.saturating_sub(TILE_BYTES + t.open.as_ref().map_or(0, |_| TILE_BYTES + MASK_LEN * 4));
+            match what {
+                0 => {
+                    if let Some(t) = self.tiles.remove(&(id, x, y)) {
+                        bytes = bytes.saturating_sub(TILE_BYTES + t.open.as_ref().map_or(0, |_| TILE_BYTES + MASK_LEN * 4));
+                    }
                 }
-            } else if let Some(d) = self.dabs.remove(&id) {
-                bytes = bytes.saturating_sub(d.dabs.len() * std::mem::size_of::<Dab>());
+                1 => {
+                    if let Some(d) = self.dabs.remove(&id) {
+                        bytes = bytes.saturating_sub(d.dabs.len() * std::mem::size_of::<Dab>());
+                    }
+                }
+                _ => {
+                    if let Some(d) = self.derived.remove(&dk) {
+                        bytes = bytes.saturating_sub(d.value.bytes());
+                    }
+                }
             }
         }
     }
@@ -486,7 +695,7 @@ fn advance(entry: &mut TileEntry, want: &[(u64, u64)], ops: &[(&PaintOp, bool)],
         brush::lay(pixels, Some(&open.base), &open.mask, TILE_PX, ox, oy, dirty, &how);
         return Some(Advanced::Appended);
     }
-    if n == m + 1 && recent && entry.ops[..] == want[..m] {
+    if n == m + 1 && recent && entry.complete && entry.ops[..] == want[..m] {
         let base = entry.picture.pixmap().data().to_vec();
         let mut mask = vec![0.0f32; MASK_LEN];
         let mut dirty = PxRect::EMPTY;
@@ -503,26 +712,31 @@ fn advance(entry: &mut TileEntry, want: &[(u64, u64)], ops: &[(&PaintOp, bool)],
     None
 }
 
-/// Replay a tile from its operations. Answers it and whether it is
-/// complete (every picture it needed was there).
+/// Replay a tile from its operations (`derived` beside them: what each
+/// that reads the pixels below it made of them). Answers it and whether it
+/// is complete (every picture it needed was there).
 #[allow(clippy::too_many_arguments)]
 fn replay(
     want: &[(u64, u64)],
     ops: &[(&PaintOp, bool)],
+    derived: &[Option<Arc<Derived>>],
     dabs: &HashMap<String, DabEntry>,
     scratch: &mut Vec<f32>,
-    ox: i64,
-    oy: i64,
+    tx: i32,
+    ty: i32,
     rect: &Rect,
     pictures: &dyn PictureSource,
     clock: u64,
 ) -> (TileEntry, bool) {
+    let (ox, oy) = (tx as i64 * TILE_PX as i64, ty as i64 * TILE_PX as i64);
     let mut picture = Picture::from_premultiplied(TILE_PX, TILE_PX, vec![0u8; TILE_BYTES]).expect("a tile's size");
     let mut open = None;
     let mut complete = true;
     if scratch.len() != MASK_LEN {
         *scratch = vec![0.0; MASK_LEN];
     }
+    // Board units to tile pixels.
+    let to_tile = Affine::from_row(PX_PER_UNIT, 0.0, 0.0, PX_PER_UNIT, -rect.x * PX_PER_UNIT, -rect.y * PX_PER_UNIT);
     let last = ops.len().saturating_sub(1);
     for (i, (op, recent)) in ops.iter().enumerate() {
         match &op.raw.body {
@@ -550,16 +764,69 @@ fn replay(
             }
             PaintBody::Pixels(p) => match pictures.picture(&p.src) {
                 Some(pic) => {
-                    // Board units to tile pixels.
-                    let ts = Affine::from_row(PX_PER_UNIT, 0.0, 0.0, PX_PER_UNIT, -rect.x * PX_PER_UNIT, -rect.y * PX_PER_UNIT);
-                    draw_picture_rect(picture.pixmap_mut(), &pic, p.rect.normalized(), None, ts, 1.0, true, false);
+                    if p.blend == Blend::Normal {
+                        draw_picture_rect(picture.pixmap_mut(), &pic, p.rect.normalized(), None, to_tile, 1.0, true, false);
+                    } else {
+                        // Drawn on its own, then blended onto what is there.
+                        let mut alone = Pixmap::new(TILE_PX, TILE_PX).expect("a tile's size");
+                        draw_picture_rect(&mut alone, &pic, p.rect.normalized(), None, to_tile, 1.0, true, false);
+                        let paint = PixmapPaint { opacity: 1.0, blend_mode: p.blend.to_tiny(), quality: FilterQuality::Nearest };
+                        picture.pixmap_mut().draw_pixmap(0, 0, alone.as_ref(), &paint, Affine::identity(), None);
+                    }
                 }
                 None => complete = false,
             },
+            PaintBody::Fill(f) => {
+                let Some(Derived::Fill(masks)) = derived[i].as_deref() else { continue };
+                let Some(mask) = masks.get(&(tx, ty)) else { continue };
+                for (m, v) in scratch.iter_mut().zip(mask) {
+                    *m = *v as f32 / 255.0;
+                }
+                let all = PxRect { x0: 0, y0: 0, x1: TILE_PX, y1: TILE_PX };
+                let how = Lay { color: f.color, blend: StrokeBlend::Normal, opacity: 1.0, grain: 0.0, wet_edge: 0.0 };
+                brush::lay(picture.pixmap_mut().data_mut(), None, scratch, TILE_PX, ox, oy, all, &how);
+                scratch.fill(0.0);
+            }
+            PaintBody::Retouch(_) => {
+                let Some(Derived::Patch { area, data }) = derived[i].as_deref() else { continue };
+                let Some(((x0, y0, x1, y1), (bx, by))) = area.in_tile(tx, ty) else { continue };
+                let dst = picture.pixmap_mut().data_mut();
+                let n = (x1 - x0) * 4;
+                for row in 0..(y1 - y0) {
+                    let s = ((by + row) * area.w + bx) * 4;
+                    let d = ((y0 + row) * TILE_PX as usize + x0) * 4;
+                    dst[d..d + n].copy_from_slice(&data[s..s + n]);
+                }
+            }
+            PaintBody::Move(mv) => {
+                let Some(Derived::Lifted { area, pixmap }) = derived[i].as_deref() else { continue };
+                // Lift: the selection's pixels go.
+                if let Some(((x0, y0, x1, y1), _)) = area.in_tile(tx, ty) {
+                    let dst = picture.pixmap_mut().data_mut();
+                    for y in y0..y1 {
+                        let by = ((oy + y as i64) as f32 + 0.5) / PX_PER_UNIT;
+                        for x in x0..x1 {
+                            let bx = ((ox + x as i64) as f32 + 0.5) / PX_PER_UNIT;
+                            if mv.selection.contains(crate::model::Point::new(bx, by)) {
+                                let i = (y * TILE_PX as usize + x) * 4;
+                                dst[i..i + 4].fill(0);
+                            }
+                        }
+                    }
+                }
+                // Put down, through the transform.
+                let (Some(t), Some(lifted)) = (mv.transform, pixmap) else { continue };
+                let from_lifted = Affine::from_row(1.0 / PX_PER_UNIT, 0.0, 0.0, 1.0 / PX_PER_UNIT, area.x0 as f32 / PX_PER_UNIT, area.y0 as f32 / PX_PER_UNIT);
+                let move_ts = Affine::from_row(t.a, t.b, t.c, t.d, t.e, t.f);
+                let ts = to_tile.pre_concat(move_ts).pre_concat(from_lifted);
+                let quality = if t.whole_pixel_shift().is_some() { FilterQuality::Nearest } else { FilterQuality::Bilinear };
+                let paint = PixmapPaint { opacity: 1.0, blend_mode: tiny_skia::BlendMode::SourceOver, quality };
+                picture.pixmap_mut().draw_pixmap(0, 0, lifted.as_ref(), &paint, ts, None);
+            }
             PaintBody::Other(_) => {}
         }
     }
-    (TileEntry { ops: want.to_vec(), picture, open, used: clock }, complete)
+    (TileEntry { ops: want.to_vec(), picture, open, complete, used: clock }, complete)
 }
 
 fn clear(mask: &mut [f32], r: PxRect) {

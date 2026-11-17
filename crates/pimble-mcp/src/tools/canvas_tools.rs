@@ -20,7 +20,7 @@ use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICK
 use pimble_board::{
     dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
     BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
-    NewElement, NewStroke, Page, PaintBody, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
+    fill_clip, merge_needs_pixels, rasterize, NewElement, NewFill, NewStroke, Page, PaintBody, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
     StyleKey, SvgPlacement, Transform, ViewOptions,
 };
 use pimble_board::path::{parse_d, to_d};
@@ -498,7 +498,44 @@ pub struct PaintParams {
     #[serde(default)]
     pub highlight_picture: Option<String>,
     /// The strokes, painted in this order (later ones on top).
+    #[serde(default)]
     pub strokes: Vec<StrokeSpec>,
+    /// Flood fills, made after the strokes, in this order: each fills the
+    /// area of the layer's pixels around its point that match the color
+    /// there (within the tolerance), as a person's Fill tool does.
+    #[serde(default)]
+    pub fills: Vec<FillSpec>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone)]
+pub struct FillSpec {
+    /// Where to fill, [x, y] in canvas units.
+    pub at: Vec<f32>,
+    /// "#rrggbb" or "#rrggbbaa".
+    pub color: String,
+    /// 0 to 1: how different a pixel may be from the one at `at` and still
+    /// fill (default 0.15). 0 fills only the exact color; 1 everything.
+    #[serde(default)]
+    pub tolerance: Option<f32>,
+    /// False: fill every matching pixel in the area, not only those
+    /// connected to `at`. Default true.
+    #[serde(default)]
+    pub contiguous: Option<bool>,
+    /// The most the fill may cover, {x, y, w, h} in canvas units (at most
+    /// 2048 on a side). Left out: what the canvas shows and the layer's
+    /// painting, grown a little, so a fill outside every shape ends.
+    #[serde(default)]
+    pub area: Option<AreaSpec>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FlattenLayerParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// The paint layer: its name or id.
+    pub layer: String,
 }
 
 #[derive(Deserialize, JsonSchema, Clone)]
@@ -608,8 +645,10 @@ pub struct DeleteLayerParams {
     pub layer: String,
     /// Keep its elements: they go on top of the layer below in its group
     /// ("Merge Down"); for a group, every layer in it becomes one layer
-    /// ("Merge Group"). Left out, they are deleted with it (a group with
-    /// every layer in it).
+    /// ("Merge Group"). Onto a paint layer, or a group holding one, what
+    /// merges is drawn as pixels (a vector layer's shapes stop being
+    /// shapes); a paint layer does not merge onto a vector layer. Left out,
+    /// they are deleted with it (a group with every layer in it).
     #[serde(default)]
     pub merge_down: bool,
 }
@@ -794,6 +833,28 @@ fn stroke_of(spec: &StrokeSpec, index: usize) -> Result<NewStroke, BoardError> {
     }
     let stroke = NewStroke::new(String::new(), preset, color).with_settings(settings).with_points(points);
     Ok(if spec.erase { stroke.erasing() } else { stroke })
+}
+
+/// A fill spec read: (seed, color, tolerance, contiguous, the area given).
+fn fill_of(spec: &FillSpec, index: usize) -> Result<(Point, Color, f32, bool, Option<Rect>), BoardError> {
+    let what = format!("fill {}", index + 1);
+    let seed = point(&spec.at, &format!("{what}'s `at`"))?;
+    let color = color(&spec.color, &what)?;
+    let tolerance = spec.tolerance.unwrap_or(pimble_board::paint_ops::DEFAULT_TOLERANCE);
+    if !(0.0..=1.0).contains(&tolerance) {
+        return Err(bad(format!("{what}: the tolerance is from 0 to 1")));
+    }
+    let area = spec.area.map(|a| Rect::new(a.x, a.y, a.w, a.h).normalized());
+    if let Some(a) = area {
+        let max = pimble_board::raster::MAX_FILL_UNITS;
+        if !(a.w > 0.0 && a.h > 0.0 && a.w <= max && a.h <= max) {
+            return Err(bad(format!("{what}: the area has a size, at most {max} on a side")));
+        }
+        if !a.contains(seed) {
+            return Err(bad(format!("{what}: `at` is inside the area")));
+        }
+    }
+    Ok((seed, color, tolerance, spec.contiguous.unwrap_or(true), area))
 }
 
 fn point(v: &[f32], what: &str) -> Result<Point, BoardError> {
@@ -1585,6 +1646,7 @@ fn paint_summary(snapshot: &BoardSnapshot, layer: &str) -> String {
         return "nothing painted yet\n".to_string();
     }
     let (mut strokes, mut erasing, mut pictures, mut other) = (0, 0, 0, 0);
+    let (mut fills, mut smudges, mut blurs, mut moves, mut cleared) = (0, 0, 0, 0, 0);
     let mut brushes: BTreeMap<String, usize> = BTreeMap::new();
     let mut colors: Vec<String> = Vec::new();
     let mut authors: Vec<String> = Vec::new();
@@ -1600,6 +1662,17 @@ fn paint_summary(snapshot: &BoardSnapshot, layer: &str) -> String {
                 }
             }
             PaintBody::Pixels(_) => pictures += 1,
+            PaintBody::Fill(f) => {
+                fills += 1;
+                let hex = f.color.to_hex();
+                if !colors.contains(&hex) {
+                    colors.push(hex);
+                }
+            }
+            PaintBody::Retouch(r) if r.effect == pimble_board::Retouch::Smudge => smudges += 1,
+            PaintBody::Retouch(_) => blurs += 1,
+            PaintBody::Move(m) if m.transform.is_none() => cleared += 1,
+            PaintBody::Move(_) => moves += 1,
             PaintBody::Other(_) => other += 1,
         }
         if let Some(a) = &op.raw.author {
@@ -1613,7 +1686,18 @@ fn paint_summary(snapshot: &BoardSnapshot, layer: &str) -> String {
         parts.push(format!("{erasing} eraser stroke{}", if erasing == 1 { "" } else { "s" }));
     }
     if pictures > 0 {
-        parts.push(format!("{pictures} picture{}", if pictures == 1 { "" } else { "s" }));
+        parts.push(format!("{pictures} picture{} (pasted, flattened or merged)", if pictures == 1 { "" } else { "s" }));
+    }
+    for (n, one, many) in [
+        (fills, "fill", "fills"),
+        (smudges, "smudge", "smudges"),
+        (blurs, "blur", "blurs"),
+        (moves, "selection moved", "selections moved"),
+        (cleared, "selection cleared", "selections cleared"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{n} {}", if n == 1 { one } else { many }));
+        }
     }
     if other > 0 {
         parts.push(format!("{other} operation{} of a later version", if other == 1 { "" } else { "s" }));
@@ -1882,6 +1966,35 @@ impl Pimble {
         let picture = Picture::decode(&fitted.bytes).map_err(|e| format!("{} is not a picture Pimble can show: {e}", path.display()))?;
         let url = self.api.put_blob(addr, fitted.mime.as_str(), &fitted.bytes).await?;
         Ok((url.to_string(), picture.width(), picture.height()))
+    }
+
+    /// The pictures a snapshot draws (pictures and paint layers' pixels),
+    /// fetched through the server as the app's loader does.
+    async fn pictures_of(&self, snapshot: &BoardSnapshot) -> HashMap<String, Arc<Picture>> {
+        let mut pictures = HashMap::new();
+        for src in snapshot.picture_srcs() {
+            if let Some(url) = BlobUrl::parse(&src) {
+                if let Ok((_, bytes)) = self.api.get_blob(url.store, url.blob).await {
+                    if let Ok(picture) = Picture::decode(&bytes) {
+                        pictures.insert(src.clone(), Arc::new(picture));
+                    }
+                }
+            }
+        }
+        pictures
+    }
+
+    /// Flatten or merge as pixels (docs/DRAWING_CONTRACT.md, wave 5): draw
+    /// `job` from `snapshot`, store the picture as a blob of the canvas's
+    /// store, and lay it down in one edit.
+    async fn lay_raster(&self, target: &Target, snapshot: &BoardSnapshot, job: RasterJob) -> Result<(), String> {
+        let pictures = self.pictures_of(snapshot).await;
+        let raster = rasterize(snapshot, &pictures, job).map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
+        let src = match &raster.png {
+            Some(png) => Some(self.api.put_blob(target.addr, "image/png", png).await?.to_string()),
+            None => None,
+        };
+        self.canvas_edit(target, Default::default(), move |t, _, _| t.apply_raster(&raster, src.as_deref()).map(|_| ())).await
     }
 
     /// A picture already in Pimble: its URL and pixel size.
@@ -2453,31 +2566,39 @@ impl Pimble {
         Ok(out)
     }
 
-    /// Paint brush strokes on a canvas, as a person paints with the brush:
-    /// each stroke is a brush (round, pencil, ink, airbrush, marker,
-    /// charcoal, watercolor, highlighter), a color, a size and its points
-    /// (optionally with pressure), into a paint layer (the one named, or the
-    /// topmost shown and unlocked one, or a new "Paint 1"). `erase` makes an
-    /// eraser stroke. With `highlight_picture` the strokes go into the
-    /// multiply "Highlights" layer above that picture. render_canvas shows
-    /// the result; get_canvas summarizes paint layers. One edit: a person
-    /// undoes it with their own undo only when it is theirs, so nothing here
-    /// is undone for them.
+    /// Paint brush strokes and flood fills on a canvas, as a person paints
+    /// with the brush and the fill: each stroke is a brush (round, pencil,
+    /// ink, airbrush, marker, charcoal, watercolor, highlighter), a color, a
+    /// size and its points (optionally with pressure); each fill a point, a
+    /// color and a tolerance (it fills the matching pixels of the layer
+    /// around the point, stopping at what is painted there, within an area
+    /// that ends it). Into a paint layer (the one named, or the topmost
+    /// shown and unlocked one, or a new "Paint 1"). `erase` makes an eraser
+    /// stroke. With `highlight_picture` the strokes go into the multiply
+    /// "Highlights" layer above that picture. render_canvas shows the
+    /// result; get_canvas summarizes paint layers; flatten_layer turns a
+    /// long history into one picture. One edit: a person undoes it with
+    /// their own undo only when it is theirs, so nothing here is undone for
+    /// them.
     #[tool(name = "paint")]
     async fn paint(&self, Parameters(p): Parameters<PaintParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
-        if p.strokes.is_empty() {
-            return Err("Give at least one stroke to paint.".into());
+        if p.strokes.is_empty() && p.fills.is_empty() {
+            return Err("Give at least one stroke or fill to paint.".into());
         }
         let mut strokes = Vec::with_capacity(p.strokes.len());
         for (i, spec) in p.strokes.iter().enumerate() {
             strokes.push(stroke_of(spec, i).map_err(|e| format!("Nothing was written: {}.", said(&e)))?);
         }
+        let mut fills = Vec::with_capacity(p.fills.len());
+        for (i, spec) in p.fills.iter().enumerate() {
+            fills.push(fill_of(spec, i).map_err(|e| format!("Nothing was written: {}.", said(&e)))?);
+        }
         let (layer, picture) = (p.layer.clone(), p.highlight_picture.clone());
         if layer.is_some() && picture.is_some() {
             return Err("Give `layer` or `highlight_picture`, not both.".into());
         }
-        let (layer_id, ids) = self
+        let (layer_id, ids, filled) = self
             .canvas_edit(&target, Default::default(), move |t, scene, snapshot| {
                 let layer_id = match (layer.as_deref().map(str::trim).filter(|l| !l.is_empty()), picture.as_deref().map(str::trim)) {
                     (Some(l), _) => scene.layer(l)?.id.clone(),
@@ -2490,24 +2611,62 @@ impl Pimble {
                     }
                     (None, None) => t.paint_layer_for(None)?,
                 };
+                // What the strokes of this call reach, for the fills' areas.
+                let mut reach: Option<Rect> = None;
                 let mut ids = Vec::with_capacity(strokes.len());
                 for stroke in strokes {
                     let mut stroke = stroke;
                     stroke.layer = layer_id.clone();
+                    for pt in &stroke.points {
+                        let r = Rect::new(pt[0], pt[1], 0.0, 0.0).inflate(stroke.settings.size);
+                        reach = Some(reach.map_or(r, |a| a.union(&r)));
+                    }
                     ids.push(t.add_stroke(stroke)?);
                 }
-                Ok((layer_id, ids))
+                let mut filled = Vec::with_capacity(fills.len());
+                for (seed, color, tolerance, contiguous, area) in fills {
+                    let clip = match area {
+                        Some(a) => a,
+                        None => {
+                            let seen = snapshot.visible_extent().map(|e| e.inflate(pimble_board::raster::FILL_MARGIN));
+                            let view = match (seen, reach) {
+                                (Some(a), Some(b)) => Some(a.union(&b.inflate(pimble_board::raster::FILL_MARGIN))),
+                                (a, b) => a.or(b.map(|b| b.inflate(pimble_board::raster::FILL_MARGIN))),
+                            };
+                            fill_clip(snapshot, &layer_id, seed, view)
+                        }
+                    };
+                    let fill = NewFill { layer: layer_id.clone(), seed, color, tolerance, clip, contiguous };
+                    filled.push(t.add_fill(fill)?);
+                }
+                Ok((layer_id, ids, filled))
             })
             .await?;
         let doc = doc_of(&self.api.node(target.addr).await?)?;
         let name = target.board(&doc).snapshot().layer(&layer_id).map(|l| l.name.clone()).unwrap_or_default();
-        Ok(format!(
-            "Painted {} stroke{} in the paint layer \"{name}\" ({layer_id}) of {}: {}.",
-            ids.len(),
-            if ids.len() == 1 { "" } else { "s" },
-            target.what(),
-            ids.join(", ")
-        ))
+        let mut what = Vec::new();
+        if !ids.is_empty() {
+            what.push(format!("{} stroke{} ({})", ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")));
+        }
+        if !filled.is_empty() {
+            what.push(format!("{} fill{} ({})", filled.len(), if filled.len() == 1 { "" } else { "s" }, filled.join(", ")));
+        }
+        Ok(format!("Painted {} in the paint layer \"{name}\" ({layer_id}) of {}.", what.join(" and "), target.what()))
+    }
+
+    /// Flatten a paint layer: its whole history of strokes, fills and the
+    /// rest becomes one picture in the layer, which looks the same and opens
+    /// faster. A person undoes it with their own undo only when it is
+    /// theirs, so it cannot be undone for them: use it when they ask.
+    #[tool(name = "flatten_layer")]
+    async fn flatten_layer(&self, Parameters(p): Parameters<FlattenLayerParams>) -> Result<String, String> {
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let doc = doc_of(&self.api.node(target.addr).await?)?;
+        let snapshot = target.board(&doc).snapshot();
+        let id = Scene::of(&snapshot).layer(p.layer.trim()).map_err(|e| said(&e))?.id.clone();
+        let count = snapshot.paint_ops(&id).len();
+        self.lay_raster(&target, &snapshot, RasterJob::Flatten(id)).await?;
+        Ok(format!("Flattened {count} operation{} of the paint layer \"{}\" of {} into one picture.", if count == 1 { "" } else { "s" }, p.layer.trim(), target.what()))
     }
 
     /// Add a layer or a group of layers to a canvas (layers organize; who made
@@ -2604,6 +2763,17 @@ impl Pimble {
     #[tool(name = "delete_layer")]
     async fn delete_layer(&self, Parameters(p): Parameters<DeleteLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        if p.merge_down {
+            let doc = doc_of(&self.api.node(target.addr).await?)?;
+            let snapshot = target.board(&doc).snapshot();
+            let scene = Scene::of(&snapshot);
+            let id = scene.layer(p.layer.trim()).map_err(|e| said(&e))?.id.clone();
+            if merge_needs_pixels(&snapshot, &id) {
+                let job = if scene.is_group(&id) { RasterJob::MergeGroup(id) } else { RasterJob::MergeDown(id) };
+                self.lay_raster(&target, &snapshot, job).await?;
+                return Ok(format!("Merged down layer \"{}\" of {}, drawn as pixels.", p.layer.trim(), target.what()));
+            }
+        }
         let (layer, merge) = (p.layer.clone(), p.merge_down);
         self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
@@ -2922,6 +3092,38 @@ mod tests {
         let vector = board.snapshot().layers[0].id.clone();
         let refused = board.edit(st, |t| t.add_stroke(NewStroke::new(vector, &pimble_board::brush::ROUND, Color::BLACK).with_points(vec![[0.0, 0.0, 1.0, 0.0]])));
         assert!(said(&refused.result.unwrap_err()).contains("strokes go in a paint layer"));
+    }
+
+    #[test]
+    fn fills_are_read_from_specs_and_get_canvas_counts_the_new_kinds() {
+        let board = fresh();
+        let st = Stamp::new(None, "2026-11-17T00:00:00.000Z");
+        let spec = |at: Vec<f32>, tolerance: Option<f32>, area: Option<AreaSpec>| FillSpec { at, color: "#e03131".into(), tolerance, contiguous: None, area };
+        let (seed, color, tolerance, contiguous, area) = fill_of(&spec(vec![10.0, 20.0], None, None), 0).unwrap();
+        assert_eq!((seed, color.to_hex(), contiguous, area), (Point::new(10.0, 20.0), "#e03131".to_string(), true, None));
+        assert_eq!(tolerance, pimble_board::paint_ops::DEFAULT_TOLERANCE);
+        assert!(fill_of(&spec(vec![10.0], None, None), 1).is_err());
+        assert!(fill_of(&spec(vec![10.0, 20.0], Some(2.0), None), 1).is_err());
+        assert!(said(&fill_of(&spec(vec![500.0, 20.0], None, Some(AreaSpec { x: 0.0, y: 0.0, w: 100.0, h: 100.0 })), 2).unwrap_err()).contains("inside the area"));
+        let snapshot = board.snapshot();
+        board
+            .edit(st, |t| {
+                let layer = t.paint_layer_for(None)?;
+                let ring: Vec<[f32; 4]> = (0..=36).map(|i| {
+                    let a = i as f32 / 36.0 * std::f32::consts::TAU;
+                    [50.0 + 30.0 * a.cos(), 50.0 + 30.0 * a.sin(), 1.0, 0.0]
+                }).collect();
+                t.add_stroke(NewStroke::new(layer.clone(), &pimble_board::brush::INK, Color::BLACK).with_size(4.0).with_points(ring))?;
+                let clip = fill_clip(&snapshot, &layer, seed, Some(Rect::new(0.0, 0.0, 100.0, 100.0)));
+                t.add_fill(NewFill { layer: layer.clone(), seed: Point::new(50.0, 50.0), color, tolerance, clip, contiguous })?;
+                t.add_retouch(pimble_board::NewRetouch::new(layer.clone(), pimble_board::Retouch::Smudge, &pimble_board::brush::ROUND).with_points(vec![[40.0, 50.0, 1.0, 0.0], [60.0, 50.0, 1.0, 0.0]]))?;
+                t.add_move(&layer, pimble_board::Selection::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)), None)?;
+                Ok(layer)
+            })
+            .into_result()
+            .unwrap();
+        let text = describe(&board.snapshot(), &HashMap::new());
+        assert!(text.contains("1 brush stroke, 1 fill, 1 smudge, 1 selection cleared · brushes ink x1 · colors #000000, #e03131"), "{text}");
     }
 
     #[test]

@@ -389,14 +389,23 @@ impl BoardSnapshot {
                         settings_hash(&s.settings, s.color, s.blend).hash(&mut h);
                         (h.finish(), s.points.len())
                     }
+                    // A smudge or blur that only grew changes only where its
+                    // new points reach, unless what is below it changed.
+                    PaintBody::Retouch(r) => {
+                        settings_hash(&r.settings, Color::TRANSPARENT, crate::brush::StrokeBlend::Normal).hash(&mut h);
+                        r.effect.hash(&mut h);
+                        r.strength.to_bits().hash(&mut h);
+                        op.below.hash(&mut h);
+                        (h.finish(), r.points.len())
+                    }
                     _ => {
-                        op.fingerprint.hash(&mut h);
+                        op.effective.hash(&mut h);
                         (h.finish(), 0)
                     }
                 };
                 let mut f = Fx::default();
                 look.hash(&mut f);
-                op.fingerprint.hash(&mut f);
+                op.effective.hash(&mut f);
                 Some(PaintMark { key: id_hash(&op.raw.id), fingerprint: f.finish(), look, points, bounds, index })
             })
             .collect()
@@ -408,6 +417,8 @@ impl BoardSnapshot {
         let op = self.paint.get(index)?;
         match &op.raw.body {
             PaintBody::Stroke(s) => points_bounds(&s.points[from.saturating_sub(1).min(s.points.len())..]).map(|r| r.inflate(s.settings.reach())),
+            PaintBody::Retouch(r) => points_bounds(&r.points[from.saturating_sub(1).min(r.points.len())..])
+                .map(|b| b.inflate(r.settings.reach() + crate::paint_ops::RETOUCH_MARGIN + crate::paint_ops::BLUR_MAX_KERNEL_PX as f32 / crate::brush::PX_PER_UNIT)),
             _ => op.bounds,
         }
     }
@@ -1294,6 +1305,7 @@ fn index_paint(mut ops: Vec<PaintOp>) -> (Vec<PaintOp>, HashMap<String, (std::op
             }
             end += 1;
         }
+        crate::paint_ops::settle_layer(&mut ops[start..end]);
         index.insert(layer, (start..end, bounds));
         start = end;
     }

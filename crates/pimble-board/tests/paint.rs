@@ -342,11 +342,11 @@ fn kinds_this_version_does_not_know_are_skipped() {
         let op: yrs::MapRef = map.insert(&mut txn, "paint:later", MapPrelim::default());
         op.insert(&mut txn, "layer", paint.clone());
         op.insert(&mut txn, "order", "zz");
-        op.insert(&mut txn, "kind", "smudge");
+        op.insert(&mut txn, "kind", "sparkle");
     }
     let snap = board.snapshot();
     assert_eq!(snap.paint_ops(&paint).len(), 2);
-    assert!(matches!(snap.paint_op("later").unwrap().raw.body, PaintBody::Other(ref k) if k == "smudge"));
+    assert!(matches!(snap.paint_op("later").unwrap().raw.body, PaintBody::Other(ref k) if k == "sparkle"));
     assert!(inked(at(&pixels(&snap, View::new(0.0, 0.0, 1.0), 100, 100), 100, 50, 50)));
 }
 

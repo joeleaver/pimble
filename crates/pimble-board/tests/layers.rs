@@ -272,10 +272,10 @@ fn merge_group_makes_one_vector_layer_and_waits_for_painting_with_paint() {
     assert_eq!((merged.kind.clone(), merged.blend, merged.opacity, merged.count), (LayerKind::Vector, Blend::Normal, 0.5, 2));
     let order: Vec<&str> = snap.elements.iter().map(|e| e.id()).collect();
     assert_eq!(order, [ea.as_str(), eb.as_str()], "A's elements stay under B's");
-    // A paint layer inside: refused for now.
+    // A paint layer inside: it merges as pixels (tests/wave5.rs), never here.
     let (board, _, g, ..) = grouped();
     ok(&board, |t| t.add_layer_in("Paint", LayerKind::Paint, Some(&g), Placement::Top));
-    assert!(matches!(refused(&board, |t| t.merge_group(&g)), BoardError::Invalid(s) if s.contains("paint")));
+    assert!(matches!(refused(&board, |t| t.merge_group(&g)), BoardError::NeedsPixels(s) if s.contains("paint")));
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn merge_down_stays_among_siblings_and_leaves_paint_for_later() {
     assert!(matches!(refused(&board, |t| t.merge_layer_down(&g)), BoardError::Invalid(_)));
     let paint = ok(&board, |t| t.add_layer_in("Paint", LayerKind::Paint, None, Placement::Above(l1.clone())));
     let onto_paint = ok(&board, |t| t.add_layer("V", Placement::Above(paint.clone())));
-    assert!(matches!(refused(&board, |t| t.merge_layer_down(&onto_paint)), BoardError::Invalid(s) if s.contains("paint")));
+    assert!(matches!(refused(&board, |t| t.merge_layer_down(&onto_paint)), BoardError::NeedsPixels(s) if s.contains("paint")));
     assert!(matches!(refused(&board, |t| t.merge_layer_down(&paint)), BoardError::Invalid(_)));
 }
 

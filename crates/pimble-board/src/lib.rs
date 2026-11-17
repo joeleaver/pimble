@@ -46,12 +46,17 @@
 //!   operations as stored), [`brush`] (presets, dabs, the engine), [`tiles`]
 //!   (the tile renderer and its cache, [`PaintCache`], a disk hook
 //!   [`TileStore`]); [`BoardTxn::begin_stroke`] and friends write them,
-//!   [`sample_color`] is the eyedropper.
+//!   [`sample_color`] is the eyedropper. Wave 5: fills, smudges, blurs and
+//!   moves of paint selections ([`BoardTxn::add_fill`],
+//!   [`BoardTxn::begin_retouch`], [`BoardTxn::add_move`]), and [`raster`]:
+//!   Flatten Layer and merges onto paint layers drawn as one picture.
 
 pub mod brush;
 pub mod combine;
 pub mod doc;
 pub mod paint_ops;
+pub mod raster;
+mod retouch;
 pub mod tiles;
 mod hit;
 pub mod layer_tree;
@@ -71,11 +76,14 @@ pub mod text;
 pub mod view;
 
 pub use doc::{
-    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
+    PAINT_ONTO_VECTOR, Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
     free_layer_name, HIGHLIGHTS_LAYER_NAME, TEXT_BOARD_PREFIX, BOARD_KEY,
 };
 pub use brush::{BrushPoint, BrushSettings, Curve, Jitter, Preset, StrokeBlend, PRESETS, PX_PER_UNIT};
-pub use paint_ops::{NewStroke, PaintBody, PaintOp, PixelsOp, RawPaintOp, StrokeOp};
+pub use paint_ops::{
+    FillOp, MoveOp, NewFill, NewRetouch, NewStroke, PaintBody, PaintOp, PixelTransform, PixelsOp, RawPaintOp, Retouch, RetouchOp, Selection, StrokeOp,
+};
+pub use raster::{fill_clip, merge_needs_pixels, rasterize, LayerRaster, RasterJob};
 pub use tiles::{CacheStats, PaintCache, TileKey, TileStore, TILE_PX, TILE_UNITS};
 #[cfg(not(target_arch = "wasm32"))]
 pub use tiles::DirTileStore;
