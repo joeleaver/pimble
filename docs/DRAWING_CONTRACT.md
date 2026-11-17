@@ -1780,3 +1780,17 @@ pixels, selections across layers, feathered edges, adding to or subtracting from
 selection, the selection's own context bar, IndexedDB tiles, tilt, the focal point of a
 radial gradient, Pencil pressure (item 4), handles drawn along a turned selection's own
 sides.
+
+## Paint spikes re-measured on a quiet machine (2026-11-17)
+
+`cargo run -p pimble-board --release --example paint_bench` at load average about 5 on 24
+cores (the wave 4 numbers were taken at 25 to 63). Native only; wasm was not re-measured.
+
+- Dabs: 0.3 us (4 px), 0.9 us (16 px), 4.8 us (48 px), 37 us (120 px), 108 us (240 px).
+- A long pressure stroke across a 4K view, four points per append: median 3.2 ms (round),
+  4.4 ms (airbrush), 3.7 ms (charcoal); p95 5.5 to 7.0 ms; worst 9.5 ms.
+- 5,000 strokes: cold, every tile 1.28 s; the view at 100% cold 1.16 s; from memory 137 ms
+  (the view 37 ms); from the disk cache 258 ms.
+
+Cold replay stays just over a second, so the design's lean on the tile caches and on
+Flatten holds; drawing is comfortably inside a frame.
