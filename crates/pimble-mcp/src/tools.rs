@@ -106,7 +106,9 @@ draws sticky notes, text, shapes, frames, lines, arrows, connectors that follow 
 pen strokes, numbered steps, callouts, node cards, pictures and groups in one edit; update_elements and \
 delete_elements change them; combine_elements unites, subtracts, intersects or excludes shapes into one \
 path; flip_elements mirrors; import_svg draws SVG markup or an .svg file; fills and strokes take linear \
-and radial gradients (fill_gradient, stroke_gradient); add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
+and radial gradients (fill_gradient, stroke_gradient); paint paints brush strokes (round, pencil, ink, \
+airbrush, marker, charcoal, watercolor, highlighter; with pressure; erasing) into paint layers, and \
+highlights a picture; add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
 page and shows or hides the markup. Coordinates are canvas units, x right and y down; a picture at 100% \
 is one unit per pixel; strokes take smooth and closed, and a pen with a fill is a filled shape. Say what \
 things mean: every element and layer takes a note and named fields (role=door, elevation=60 m), which \

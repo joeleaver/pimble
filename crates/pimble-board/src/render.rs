@@ -54,6 +54,24 @@ impl Picture {
         Some(Picture { base, levels: OnceLock::new(), opaque })
     }
 
+    /// From premultiplied RGBA bytes (a paint tile's).
+    pub(crate) fn from_premultiplied(width: u32, height: u32, rgba: Vec<u8>) -> Option<Picture> {
+        let base = Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?;
+        Some(Picture { base, levels: OnceLock::new(), opaque: false })
+    }
+
+    /// The pixels, premultiplied.
+    pub(crate) fn pixmap(&self) -> &Pixmap {
+        &self.base
+    }
+
+    /// The pixels to change: the smaller copies are made again on next need.
+    pub(crate) fn pixmap_mut(&mut self) -> &mut Pixmap {
+        self.levels = OnceLock::new();
+        self.opaque = false;
+        &mut self.base
+    }
+
     /// Decode PNG, JPEG, GIF or WebP bytes (a blob's).
     pub fn decode(bytes: &[u8]) -> Result<Picture, image::ImageError> {
         let img = image::load_from_memory(bytes)?.into_rgba8();
@@ -433,22 +451,35 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
     let vt = view.transform();
     let (w, h) = (pixmap.width(), pixmap.height());
     let mut stack: Vec<(usize, Pixmap)> = Vec::new();
+    // Paint layers draw at their place in the layer order, between the
+    // elements of the layers below and above them (none when only some
+    // elements are drawn: paint belongs to no element).
+    let paint: Vec<usize> = if mask.is_some() { Vec::new() } else { snapshot.paint_layers_in(&region) };
+    let mut next_paint = 0;
     const NONE: &[usize] = &[];
+    let chain_of = |layer: usize| snapshot.chains.get(layer).map_or(NONE, |c| c.as_slice());
     for i in snapshot.query(&region) {
         if mask.is_some_and(|m| !m[i]) {
             continue;
         }
         let e = &snapshot.elements[i];
-        let chain = e.layer_index.and_then(|l| snapshot.chains.get(l)).map_or(NONE, |c| c.as_slice());
-        let common = stack.iter().zip(chain).take_while(|((open, _), want)| open == *want).count();
-        while stack.len() > common {
-            close_buffer(pixmap, &mut stack, snapshot);
-        }
-        for layer in &chain[stack.len()..] {
-            match Pixmap::new(w, h) {
-                Some(buffer) => stack.push((*layer, buffer)),
-                None => return,
+        if let Some(l) = e.layer_index {
+            while next_paint < paint.len() && paint[next_paint] < l {
+                let layer = paint[next_paint];
+                next_paint += 1;
+                if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h) {
+                    return;
+                }
+                let target = match stack.last_mut() {
+                    Some((_, buffer)) => buffer,
+                    None => &mut *pixmap,
+                };
+                snapshot.paint_cache().draw_layer(target, snapshot, layer, view, &region, pictures);
             }
+        }
+        let chain = e.layer_index.map_or(NONE, chain_of);
+        if !enter(pixmap, &mut stack, chain, snapshot, w, h) {
+            return;
         }
         let target = match stack.last_mut() {
             Some((_, buffer)) => buffer,
@@ -456,9 +487,35 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
         };
         draw_element(target, e, pictures, vt, &region);
     }
+    for &layer in &paint[next_paint..] {
+        if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h) {
+            return;
+        }
+        let target = match stack.last_mut() {
+            Some((_, buffer)) => buffer,
+            None => &mut *pixmap,
+        };
+        snapshot.paint_cache().draw_layer(target, snapshot, layer, view, &region, pictures);
+    }
     while !stack.is_empty() {
         close_buffer(pixmap, &mut stack, snapshot);
     }
+}
+
+/// Make the open buffers `chain` (close the ones it leaves, open the ones
+/// it enters). False when a buffer could not be made.
+fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize], snapshot: &BoardSnapshot, w: u32, h: u32) -> bool {
+    let common = stack.iter().zip(chain).take_while(|((open, _), want)| open == *want).count();
+    while stack.len() > common {
+        close_buffer(pixmap, stack, snapshot);
+    }
+    for layer in &chain[stack.len()..] {
+        match Pixmap::new(w, h) {
+            Some(buffer) => stack.push((*layer, buffer)),
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Blend the innermost open buffer into the one below it (or `pixmap`) with
@@ -559,15 +616,24 @@ fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dy
         pixmap.stroke_path(&rect_path, &paint_of(Color::rgb(0x9e, 0x9e, 0x9e), e.opacity), &stroke_of(1.0 / ts_scale(&ts).max(1e-3), Dash::Solid), ts, None);
         return;
     };
-    let crop = p
-        .crop
-        .map(|c| c.normalized())
-        .filter(|c| c.w > 0.0 && c.h > 0.0)
-        .unwrap_or(Rect::new(0.0, 0.0, picture.width() as f32, picture.height() as f32));
+    draw_picture_rect(pixmap, &picture, r, p.crop, ts, e.opacity, true, false);
+}
+
+/// Draw `picture` (its `crop` in picture pixels; all of it when `None`)
+/// stretched over `r`, a rectangle in the space `ts` maps to `pixmap`'s
+/// pixels. Exactly one pixel per pixel on whole pixels is a copy; else it is
+/// sampled from the nearest smaller copy, bilinear (nearest when `nearest`,
+/// as a paint layer shows its pixels zoomed in). `anti_alias` off fills the
+/// pixels whose centers are inside, so tiles side by side never leave a seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_picture_rect(pixmap: &mut Pixmap, picture: &Picture, r: Rect, crop: Option<Rect>, ts: Affine, opacity: f32, anti_alias: bool, nearest: bool) {
+    let Some(rect_path) = rect_path(&r) else { return };
+    let cropped = crop.map(|c| c.normalized()).filter(|c| c.w > 0.0 && c.h > 0.0);
+    let crop = cropped.unwrap_or(Rect::new(0.0, 0.0, picture.width() as f32, picture.height() as f32));
     // Picture pixels to element space.
     let (kx, ky) = (r.w / crop.w, r.h / crop.h);
     let out_scale = ts_scale(&ts) * (kx * ky).abs().sqrt();
-    let (level, factor) = picture.level_for(out_scale);
+    let (level, factor) = if nearest { (&picture.base, 1.0) } else { picture.level_for(out_scale) };
     let image_ts = Affine::from_row(kx * factor, 0.0, 0.0, ky * factor, r.x - crop.x * kx, r.y - crop.y * ky);
     let full = ts.pre_concat(image_ts);
     // Exactly one pixel per pixel, unrotated, on whole pixels: no sampling.
@@ -577,7 +643,7 @@ fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dy
         && full.ky == 0.0
         && (full.tx - full.tx.round()).abs() < 1e-3
         && (full.ty - full.ty.round()).abs() < 1e-3;
-    if exact && p.crop.is_none() && e.opacity >= 1.0 {
+    if exact && cropped.is_none() && opacity >= 1.0 {
         if picture.opaque && factor == 1.0 {
             copy_opaque(pixmap, level, full.tx.round() as i64, full.ty.round() as i64);
             return;
@@ -586,9 +652,9 @@ fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dy
         pixmap.draw_pixmap(full.tx.round() as i32, full.ty.round() as i32, level.as_ref(), &paint, Affine::identity(), None);
         return;
     }
-    let quality = if exact { FilterQuality::Nearest } else { FilterQuality::Bilinear };
-    let shader = Pattern::new(level.as_ref(), SpreadMode::Pad, quality, e.opacity, image_ts);
-    let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+    let quality = if exact || nearest { FilterQuality::Nearest } else { FilterQuality::Bilinear };
+    let shader = Pattern::new(level.as_ref(), SpreadMode::Pad, quality, opacity, image_ts);
+    let paint = Paint { shader, anti_alias, ..Paint::default() };
     pixmap.fill_path(&rect_path, &paint, FillRule::Winding, ts, None);
 }
 
@@ -611,4 +677,44 @@ fn copy_opaque(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
         let n = ((x1 - x0) * 4) as usize;
         d[di..di + n].copy_from_slice(&s[si..si + n]);
     }
+}
+
+// ── Paint layers ────────────────────────────────────────────────────────
+
+/// One paint layer alone (`layer` its id) as a picture at `scale` pixels per
+/// board unit (lowered so no side passes [`MAX_EXTENT_PX`]): its
+/// operations' extent, trimmed to the pixels that are not fully
+/// transparent. For a layer's thumbnail, and SVG export's embedded paint.
+/// `None` when it paints nothing.
+pub fn render_paint_layer(snapshot: &BoardSnapshot, layer: &str, pictures: &dyn PictureSource, scale: f32, within: Option<Rect>) -> Option<Rendered> {
+    let at = snapshot.layers.iter().position(|l| l.id == layer)?;
+    let mut rect = snapshot.paint_bounds(layer)?;
+    if let Some(w) = within {
+        rect = rect.intersect(&w.normalized())?;
+    }
+    let scale = scale.min(MAX_EXTENT_PX / rect.w.max(rect.h)).max(1e-4);
+    let x0 = (rect.x * scale).floor();
+    let y0 = (rect.y * scale).floor();
+    let w = ((rect.right() * scale).ceil() - x0).max(1.0) as u32;
+    let h = ((rect.bottom() * scale).ceil() - y0).max(1.0) as u32;
+    let view = View::new(x0 / scale, y0 / scale, scale);
+    let mut pixmap = Pixmap::new(w, h)?;
+    let region = view.board_rect(w, h);
+    snapshot.paint_cache().draw_layer(&mut pixmap, snapshot, at, &view, &region, pictures);
+    let (pixmap, (minx, miny)) = trim_transparent(pixmap)?;
+    let rect = Rect::new(view.x + minx as f32 / scale, view.y + miny as f32 / scale, pixmap.width() as f32 / scale, pixmap.height() as f32 / scale);
+    Some(Rendered { rect, image: RgbaImage::from_pixmap(pixmap) })
+}
+
+/// The eyedropper (docs/DRAWING_CONTRACT.md section 3, "Tools"): the color
+/// of the composited canvas at board point `at`, sampled at the paint
+/// layers' density (a pixel of half a board unit), straight alpha. Laid over
+/// `background` when given (what the person sees), else transparent where
+/// nothing is drawn.
+pub fn sample_color(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, at: Point, background: Option<Color>) -> Color {
+    let half = 0.5 / crate::brush::PX_PER_UNIT;
+    let view = View::new(at.x - half, at.y - half, crate::brush::PX_PER_UNIT);
+    let Some(pixmap) = render(snapshot, pictures, &view, 1, 1, background) else { return Color::TRANSPARENT };
+    let image = RgbaImage::from_pixmap(pixmap);
+    Color::rgba(image.data[0], image.data[1], image.data[2], image.data[3])
 }

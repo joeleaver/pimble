@@ -325,12 +325,12 @@ gives text and grown sticky notes the size their text takes.
 "Name" (id)`) before the layers it holds, each level one `#` deeper; a layer's line says its
 group, a blend that is not its kind's default, and "hidden by its group" or "locked by its
 group" when a group's flag is what hides or locks it; a paint layer reads `Paint layer` and
-holds no elements until painting is built (wave 4), so elements named into it or a group are
+holds no elements (it holds brush strokes, the `paint` tool's), so elements named into it or a group are
 refused with a sentence, and with no layer named they go to the top vector layer that is not
 locked and not inside a hidden or locked group. `update_layer` with `parent` moves a layer
 into a group (on top unless `order` says where); a group is never moved into itself or a
 group it holds. Merging a group that holds a paint layer, and merging down across kinds,
-wait for painting.
+wait for wave 5 (docs/DRAWING_CONTRACT.md).
 
 **Paths, live shapes and stroke detail** (docs/DRAWING_CONTRACT.md sections 2 and 5, built
 2026-11-16): `add_elements` takes kind `path` with its outline as SVG path data (`d`: `M L H
@@ -367,6 +367,21 @@ replaces a gradient; `clear_style` takes `fill_gradient` and `stroke_gradient`, 
 `fill` or `stroke` clears its gradient too. `get_canvas` writes a gradient in the style line
 (`fill linear gradient from 0,0.5 to 1,0.5 (#ff0000 at 0, #0000ff at 1)`) in place of the
 solid fallback; `render_canvas` draws it.
+
+**Painting** (docs/DRAWING_CONTRACT.md sections 3 and 5, built 2026-11-17, wave 4): one
+tool, and paint layers in the two that read.
+
+| Tool | What it does |
+| --- | --- |
+| `paint` | `strokes`, each `preset` (`round`, the default, `pencil`, `ink`, `airbrush`, `marker`, `charcoal`, `watercolor`, `highlighter`), `color` (the brush's own when left out), `size` (canvas units at full pressure), `opacity`, `erase` (an eraser stroke) and `points` (`[[x, y], ...]`, each optionally `[x, y, pressure]`, pressure 1 when left out); into `layer` (a paint layer's name or id), or with `highlight_picture` (a picture's id) into the multiply "Highlights" layer above it (`BoardTxn::highlights_layer`), or with neither into the paint layer a person's brush would take (`BoardTxn::paint_layer_for(None)`: the topmost shown, unlocked one, else a new "Paint 1" on top); every stroke in one edit (`BoardTxn::add_stroke`); the answer names the layer and each stroke's id. A layer that is not a paint layer, an unknown brush and a malformed point are refused with a sentence, nothing written |
+
+`get_canvas` gives a paint layer one line under its heading, never the points: how many
+brush strokes, eraser strokes, pictures and operations of a later version it holds, the
+brushes (`watercolor x3`), up to eight colors, the area it paints, and who painted (`1 brush
+stroke, 1 eraser stroke · brushes watercolor x1 · colors #228be6 · paints the area at -9,-9
+size 118x34 · by Claude`). `render_canvas` draws paint layers in their place among
+the layers with their blend and opacity, and fetches the pictures `pixels` operations name
+(`BoardSnapshot::picture_srcs`). `add_layer` with `kind` `"paint"` makes an empty one.
 
 **Meaning** (Joe, 2026-10-29; docs/IMAGE_MARKUP_CONTRACT.md "Meaning"): `add_elements` and
 `update_elements` take `note` and `fields` (in an update, a field given as null is removed),

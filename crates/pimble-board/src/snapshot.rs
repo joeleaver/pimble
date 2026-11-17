@@ -11,6 +11,8 @@ use std::sync::{Arc, OnceLock};
 use tiny_skia::{Path, Transform as Affine};
 
 use crate::doc::{Board, Changes, RawBoard, RawElement};
+use crate::paint_ops::{points_bounds, settings_hash, PaintBody, PaintOp, RawPaintOp};
+use crate::tiles::PaintCache;
 use crate::layer_tree::LayerTree;
 use crate::model::*;
 use crate::options::{author_color, CardLabel, ViewOptions, UNAUTHORED_COLOR};
@@ -39,7 +41,8 @@ pub struct Layer {
     /// Its own flag; [`Layer::effective_locked`] says whether it is locked.
     pub locked: bool,
     pub opacity: f32,
-    /// How many elements it holds (none for a group or a paint layer).
+    /// How many elements it holds (none for a group); a paint layer: how
+    /// many paint operations.
     pub count: usize,
     /// What it is for (`doc` module, "Meaning").
     pub note: Option<String>,
@@ -165,6 +168,33 @@ pub struct BoardSnapshot {
     /// Per layer (as `layers`), the isolated layers it draws through,
     /// outermost first: the buffers the renderer opens.
     pub(crate) chains: Vec<Vec<usize>>,
+    /// Per layer (as `layers`), a hash of how it is composited and where it
+    /// is in the draw order.
+    pub(crate) composite: Vec<u64>,
+    /// Every paint operation, by layer id, then order, then id
+    /// (docs/DRAWING_CONTRACT.md section 3).
+    pub paint: Vec<PaintOp>,
+    /// Per paint layer id: its operations' range in `paint` and the union of
+    /// their bounds.
+    paint_index: HashMap<String, (std::ops::Range<usize>, Option<Rect>)>,
+    /// The tiles paint layers are drawn from: kept by every snapshot this
+    /// one is brought up to date into.
+    paint_cache: Arc<PaintCache>,
+}
+
+/// One paint operation as a raster cache follows it ([`crate::BoardView`]):
+/// a key, a fingerprint of everything that changes its pixels (its layer's
+/// compositing and visibility included), the same without its points, how
+/// many points it has, and where it reaches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaintMark {
+    pub key: u64,
+    pub fingerprint: u64,
+    pub look: u64,
+    pub points: usize,
+    pub bounds: Rect,
+    /// Its index in [`BoardSnapshot::paint`].
+    pub index: usize,
 }
 
 impl BoardSnapshot {
@@ -194,9 +224,13 @@ impl BoardSnapshot {
                 options,
                 tree: LayerTree::default(),
                 chains: Vec::new(),
+                composite: Vec::new(),
+                paint: Vec::new(),
+                paint_index: HashMap::new(),
+                paint_cache: PaintCache::new(),
             };
         };
-        Resolver::run(raw, HashMap::new(), options)
+        Resolver::run(raw, HashMap::new(), None, options)
     }
 
     /// The viewer's choices this snapshot is drawn with.
@@ -208,7 +242,8 @@ impl BoardSnapshot {
     /// is reused (options change rarely, and a card's title may change with
     /// them).
     pub fn with_options(self, options: ViewOptions, board: &Board) -> Self {
-        Self::build_with(board.read(), options)
+        let cache = self.paint_cache;
+        Self::build_with(board.read(), options).with_paint_cache(cache)
     }
 
     /// [`BoardSnapshot::build`], keeping what this snapshot already worked
@@ -216,7 +251,8 @@ impl BoardSnapshot {
     /// changed.
     pub fn rebuild(self, raw: Option<RawBoard>) -> Self {
         let options = self.options;
-        let Some(raw) = raw else { return Self::build_with(None, options) };
+        let cache = self.paint_cache.clone();
+        let Some(raw) = raw else { return Self::build_with(None, options).with_paint_cache(cache) };
         let mut prev: HashMap<String, Element> = self.elements.into_iter().map(|e| (e.raw.id.clone(), e)).collect();
         let mut reuse = HashMap::new();
         for e in &raw.elements {
@@ -226,7 +262,7 @@ impl BoardSnapshot {
                 }
             }
         }
-        Resolver::run(raw, reuse, options)
+        Resolver::run(raw, reuse, None, options).with_paint_cache(cache)
     }
 
     /// Bring this snapshot up to date with `board` given what changed
@@ -241,8 +277,19 @@ impl BoardSnapshot {
         if changes.all || !self.exists {
             return self.rebuild(board.read());
         }
+        let paint = if changes.paint.is_empty() { None } else { Some(board.read_paint_some(&changes.paint)) };
+        if !changes.board && changes.elements.is_empty() {
+            // Only paint changed (a stroke being drawn): nothing about the
+            // elements needs resolving again.
+            let mut next = self;
+            let ops = merge_paint(std::mem::take(&mut next.paint), paint.unwrap_or_default());
+            next.set_paint(ops);
+            return next;
+        }
         let options = self.options;
-        let Some((mut raw, changed)) = board.read_some(&changes.elements) else { return Self::build_with(None, options) };
+        let cache = self.paint_cache.clone();
+        let old_paint = self.paint;
+        let Some((mut raw, changed)) = board.read_some(&changes.elements) else { return Self::build_with(None, options).with_paint_cache(cache) };
         let mut reuse = HashMap::new();
         let mut fresh: HashMap<String, Option<RawElement>> = changed.into_iter().collect();
         let mut elements = Vec::with_capacity(self.elements.len() + fresh.len());
@@ -267,7 +314,136 @@ impl BoardSnapshot {
         // Elements this snapshot did not have.
         elements.extend(fresh.into_values().flatten());
         raw.elements = elements;
-        Resolver::run(raw, reuse, options)
+        let ops = merge_paint(old_paint, paint.unwrap_or_default());
+        Resolver::run(raw, reuse, Some(ops), options).with_paint_cache(cache)
+    }
+
+    // ── Paint ────────────────────────────────────────────────────────────
+
+    /// This snapshot drawing its paint layers from `cache` (the app's, with
+    /// a disk store; or the cache of the view it is shown in).
+    pub fn with_paint_cache(mut self, cache: Arc<PaintCache>) -> Self {
+        self.paint_cache = cache;
+        self
+    }
+
+    /// The cache its paint layers are drawn from.
+    pub fn paint_cache(&self) -> &Arc<PaintCache> {
+        &self.paint_cache
+    }
+
+    pub(crate) fn set_paint_cache(&mut self, cache: Arc<PaintCache>) {
+        self.paint_cache = cache;
+    }
+
+    /// The operations of paint layer `layer`, bottom to top.
+    pub fn paint_ops(&self, layer: &str) -> &[PaintOp] {
+        match self.paint_index.get(layer) {
+            Some((range, _)) => &self.paint[range.clone()],
+            None => &[],
+        }
+    }
+
+    /// The union of where the operations of paint layer `layer` reach.
+    pub fn paint_bounds(&self, layer: &str) -> Option<Rect> {
+        self.paint_index.get(layer).and_then(|(_, b)| *b)
+    }
+
+    /// Paint operation `id`.
+    pub fn paint_op(&self, id: &str) -> Option<&PaintOp> {
+        self.paint.iter().find(|o| o.raw.id == id)
+    }
+
+    /// Whether layer `at` (an index into `layers`) is a paint layer that
+    /// shows: it and its groups shown and the markup shown, or the viewer
+    /// showing everything.
+    pub fn paint_shown(&self, at: usize) -> bool {
+        let Some(l) = self.layers.get(at) else { return false };
+        let show_all = self.options.show_all;
+        l.kind == LayerKind::Paint && (l.effective_visible || show_all) && (self.markup_visible || show_all)
+    }
+
+    /// The paint layers that show and reach `region`, as indices into
+    /// `layers`, in draw order.
+    pub fn paint_layers_in(&self, region: &Rect) -> Vec<usize> {
+        (0..self.layers.len())
+            .filter(|at| self.paint_shown(*at) && self.paint_bounds(&self.layers[*at].id).is_some_and(|b| b.intersects(region)))
+            .collect()
+    }
+
+    /// Every paint operation as a raster cache follows it (see [`PaintMark`]).
+    pub fn paint_marks(&self) -> Vec<PaintMark> {
+        let at_of: HashMap<&str, usize> = self.layers.iter().enumerate().map(|(i, l)| (l.id.as_str(), i)).collect();
+        self.paint
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| {
+                let bounds = op.bounds?;
+                let at = *at_of.get(op.raw.layer.as_str())?;
+                let mut h = Fx::default();
+                self.composite.get(at).hash(&mut h);
+                self.paint_shown(at).hash(&mut h);
+                op.raw.order.hash(&mut h);
+                let (look, points) = match &op.raw.body {
+                    PaintBody::Stroke(s) => {
+                        settings_hash(&s.settings, s.color, s.blend).hash(&mut h);
+                        (h.finish(), s.points.len())
+                    }
+                    _ => {
+                        op.fingerprint.hash(&mut h);
+                        (h.finish(), 0)
+                    }
+                };
+                let mut f = Fx::default();
+                look.hash(&mut f);
+                op.fingerprint.hash(&mut f);
+                Some(PaintMark { key: id_hash(&op.raw.id), fingerprint: f.finish(), look, points, bounds, index })
+            })
+            .collect()
+    }
+
+    /// Where the points of stroke `index` (in `paint`) from point `from` on
+    /// reach: what an appended stroke changed.
+    pub fn paint_tail_bounds(&self, index: usize, from: usize) -> Option<Rect> {
+        let op = self.paint.get(index)?;
+        match &op.raw.body {
+            PaintBody::Stroke(s) => points_bounds(&s.points[from.saturating_sub(1).min(s.points.len())..]).map(|r| r.inflate(s.settings.reach())),
+            _ => op.bounds,
+        }
+    }
+
+    /// The `pimble-blob:` URLs the board draws: its pictures' and its paint
+    /// layers' pixels.
+    pub fn picture_srcs(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let elements = self.elements.iter().filter_map(|e| match &e.raw.geom {
+            Geom::Picture(p) => Some(p.src.clone()),
+            _ => None,
+        });
+        let paint = self.paint.iter().filter_map(|o| match &o.raw.body {
+            PaintBody::Pixels(p) => Some(p.src.clone()),
+            _ => None,
+        });
+        for src in elements.chain(paint) {
+            if seen.insert(src.clone()) {
+                out.push(src);
+            }
+        }
+        out
+    }
+
+    /// Take `ops` as this snapshot's paint operations: sorted, indexed, and
+    /// the paint layers' counts set.
+    fn set_paint(&mut self, ops: Vec<PaintOp>) {
+        let (ops, index) = index_paint(ops);
+        self.paint = ops;
+        self.paint_index = index;
+        for l in &mut self.layers {
+            if l.kind == LayerKind::Paint {
+                l.count = self.paint_index.get(&l.id).map_or(0, |(r, _)| r.len());
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&Element> {
@@ -334,10 +510,12 @@ impl BoardSnapshot {
     /// included; `None` when nothing shows. Not yet trimmed to pixels: that
     /// is [`crate::render_extent`].
     pub fn visible_extent(&self) -> Option<Rect> {
+        let paint = (0..self.layers.len()).filter(|at| self.paint_shown(*at)).filter_map(|at| self.paint_bounds(&self.layers[at].id));
         self.elements
             .iter()
             .filter(|e| e.visible && e.has_extent && !matches!(e.raw.kind, Kind::Group))
             .map(|e| e.bounds)
+            .chain(paint)
             .filter(|b| b.is_finite())
             .reduce(|a, b| a.union(&b))
     }
@@ -413,8 +591,9 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn run(raw: RawBoard, reuse: HashMap<String, Reuse>, options: ViewOptions) -> BoardSnapshot {
-        let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements } = raw;
+    fn run(raw: RawBoard, reuse: HashMap<String, Reuse>, paint: Option<Vec<PaintOp>>, options: ViewOptions) -> BoardSnapshot {
+        let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements, paint: raw_paint } = raw;
+        let paint = paint.unwrap_or_else(|| raw_paint.into_iter().map(PaintOp::of).collect());
         let tree = crate::layer_tree::resolve(&raw_layers);
         let layers: Vec<Layer> = tree
             .entries
@@ -470,7 +649,8 @@ impl Resolver {
         let snapshot_elements = r.resolve(markup_visible);
         let index = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
         let grid = Grid::build(&snapshot_elements);
-        BoardSnapshot {
+        let composite = std::mem::take(&mut r.composite);
+        let mut snapshot = BoardSnapshot {
             exists: true,
             version,
             page,
@@ -484,7 +664,13 @@ impl Resolver {
             options: r.options,
             tree,
             chains,
-        }
+            composite,
+            paint: Vec::new(),
+            paint_index: HashMap::new(),
+            paint_cache: PaintCache::new(),
+        };
+        snapshot.set_paint(paint);
+        snapshot
     }
 
     /// The index of the element `id` names.
@@ -961,7 +1147,7 @@ pub(crate) fn id_hash(id: &str) -> u64 {
 /// every stroke on every snapshot, and nothing here faces untrusted keys
 /// that could be chosen to collide.
 #[derive(Default)]
-struct Fx(u64);
+pub(crate) struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
@@ -1090,4 +1276,45 @@ fn fingerprint(e: &Element) -> u64 {
         }
     }
     h.finish()
+}
+
+/// The paint operations sorted (by layer, order, id) and indexed by layer.
+#[allow(clippy::type_complexity)]
+fn index_paint(mut ops: Vec<PaintOp>) -> (Vec<PaintOp>, HashMap<String, (std::ops::Range<usize>, Option<Rect>)>) {
+    ops.sort_by(|a, b| a.raw.layer.cmp(&b.raw.layer).then_with(|| a.raw.order.cmp(&b.raw.order)).then_with(|| a.raw.id.cmp(&b.raw.id)));
+    let mut index: HashMap<String, (std::ops::Range<usize>, Option<Rect>)> = HashMap::new();
+    let mut start = 0;
+    while start < ops.len() {
+        let layer = ops[start].raw.layer.clone();
+        let mut end = start;
+        let mut bounds: Option<Rect> = None;
+        while end < ops.len() && ops[end].raw.layer == layer {
+            if let Some(b) = ops[end].bounds {
+                bounds = Some(bounds.map_or(b, |a| a.union(&b)));
+            }
+            end += 1;
+        }
+        index.insert(layer, (start..end, bounds));
+        start = end;
+    }
+    (ops, index)
+}
+
+/// `old` with the operations re-read in `changed` put in (or taken out).
+fn merge_paint(old: Vec<PaintOp>, changed: Vec<(String, Option<RawPaintOp>)>) -> Vec<PaintOp> {
+    if changed.is_empty() {
+        return old;
+    }
+    let mut fresh: HashMap<String, Option<RawPaintOp>> = changed.into_iter().collect();
+    let mut out = Vec::with_capacity(old.len() + fresh.len());
+    for op in old {
+        match fresh.remove(&op.raw.id) {
+            None => out.push(op),
+            Some(Some(raw)) if raw == op.raw => out.push(op),
+            Some(Some(raw)) => out.push(PaintOp::of(raw)),
+            Some(None) => {}
+        }
+    }
+    out.extend(fresh.into_values().flatten().map(PaintOp::of));
+    out
 }

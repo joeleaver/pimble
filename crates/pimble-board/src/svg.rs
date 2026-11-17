@@ -297,33 +297,31 @@ pub fn render_svg(
     let mut gradients = 0usize;
     let mut open_layers: Vec<usize> = Vec::new();
     const NONE: &[usize] = &[];
+    let chain_of = |layer: usize| snapshot.chains.get(layer).map_or(NONE, |c| c.as_slice());
+    // Paint layers go in at their place in the layer order, each as one
+    // picture (none when only some elements are written).
+    let paint: Vec<usize> = if only.is_none() { snapshot.paint_layers_in(&rect) } else { Vec::new() };
+    let mut next_paint = 0;
+    let decoded = |src: &str| picture_bytes(src).and_then(|b| crate::render::Picture::decode(&b).ok()).map(std::sync::Arc::new);
     for i in snapshot.query(&rect) {
         if mask.as_ref().is_some_and(|m| !m[i]) {
             continue;
         }
         let e = &snapshot.elements[i];
+        if let Some(l) = e.layer_index {
+            while next_paint < paint.len() && paint[next_paint] < l {
+                let layer = paint[next_paint];
+                next_paint += 1;
+                sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot);
+                write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
+            }
+        }
         let ops = element_ops(e, &rect, None);
         if ops.is_empty() {
             continue;
         }
-        let chain = e.layer_index.and_then(|l| snapshot.chains.get(l)).map_or(NONE, |c| c.as_slice());
-        let common = open_layers.iter().zip(chain).take_while(|(a, b)| a == b).count();
-        while open_layers.len() > common {
-            open_layers.pop();
-            out.push_str("</g>");
-        }
-        for layer in &chain[open_layers.len()..] {
-            let l = &snapshot.layers[*layer];
-            out.push_str("<g");
-            if l.opacity < 1.0 {
-                let _ = write!(out, " opacity=\"{}\"", n(l.opacity));
-            }
-            if let Some(mode) = l.blend.css() {
-                let _ = write!(out, " style=\"mix-blend-mode:{mode}\"");
-            }
-            out.push('>');
-            open_layers.push(*layer);
-        }
+        let chain = e.layer_index.map_or(NONE, chain_of);
+        sync_chain(&mut out, &mut open_layers, chain, snapshot);
         // Consecutive ops in one space share a group.
         let mut open: Option<Space> = None;
         for op in &ops {
@@ -349,9 +347,54 @@ pub fn render_svg(
         }
         out.push_str("</g>");
     }
+    for &layer in &paint[next_paint..] {
+        sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot);
+        write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
+    }
     for _ in open_layers {
         out.push_str("</g>");
     }
     out.push_str("</svg>");
     out
+}
+
+/// Close the layer groups `chain` leaves and open the ones it enters (a
+/// layer or group with a buffer of its own is a `<g>` with its opacity and
+/// blend).
+fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], snapshot: &BoardSnapshot) {
+    let common = open_layers.iter().zip(chain).take_while(|(a, b)| a == b).count();
+    while open_layers.len() > common {
+        open_layers.pop();
+        out.push_str("</g>");
+    }
+    for layer in &chain[open_layers.len()..] {
+        let l = &snapshot.layers[*layer];
+        out.push_str("<g");
+        if l.opacity < 1.0 {
+            let _ = write!(out, " opacity=\"{}\"", n(l.opacity));
+        }
+        if let Some(mode) = l.blend.css() {
+            let _ = write!(out, " style=\"mix-blend-mode:{mode}\"");
+        }
+        out.push('>');
+        open_layers.push(*layer);
+    }
+}
+
+/// A paint layer as one embedded PNG over what it paints within `rect`, at
+/// its own density (two pixels per board unit).
+fn write_paint_layer(out: &mut String, snapshot: &BoardSnapshot, layer: usize, rect: &Rect, pictures: &dyn crate::render::PictureSource) {
+    let id = &snapshot.layers[layer].id;
+    let Some(rendered) = crate::render::render_paint_layer(snapshot, id, pictures, crate::brush::PX_PER_UNIT, Some(*rect)) else { return };
+    let Ok(png) = rendered.image.encode_png() else { return };
+    let r = rendered.rect;
+    let _ = write!(
+        out,
+        "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,{}\"/>",
+        n(r.x),
+        n(r.y),
+        n(r.w),
+        n(r.h),
+        base64::engine::general_purpose::STANDARD.encode(png)
+    );
 }

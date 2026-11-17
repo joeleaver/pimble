@@ -29,7 +29,9 @@ use crate::options::ViewOptions;
 use crate::paint::{stroke_max_width, stroke_shape, StrokeShape};
 use crate::render::{draw_region, stroke_paint, stroke_path, tiny_color, PictureSource, View};
 use crate::doc::{Board, Changes};
-use crate::snapshot::{id_hash, BoardSnapshot};
+use crate::snapshot::{id_hash, BoardSnapshot, PaintMark};
+use crate::tiles::PaintCache;
+use std::sync::Arc;
 
 /// The cache's margin around the view, as a fraction of the view's size.
 const MARGIN: f32 = 0.25;
@@ -83,6 +85,11 @@ pub struct BoardView {
     grid: Option<f32>,
     /// What point editing draws over the frame (never into the cache).
     overlay: Option<EditOverlay>,
+    /// Per paint operation (by a hash of its id), as last seen.
+    seen_paint: HashMap<u64, PaintMark>,
+    /// The tiles paint layers are drawn from; every snapshot shown here
+    /// draws from it.
+    paint_cache: Arc<PaintCache>,
 }
 
 /// What the Pen and Direct select draw over the board while they work
@@ -145,7 +152,38 @@ impl BoardView {
             seen: HashMap::new(),
             grid: None,
             overlay: None,
+            seen_paint: HashMap::new(),
+            paint_cache: PaintCache::new(),
         }
+    }
+
+    /// Draw paint layers from `cache` (one with a disk store, the app's):
+    /// what is in memory is the cache's.
+    pub fn set_paint_cache(&mut self, cache: Arc<PaintCache>) {
+        self.paint_cache = cache.clone();
+        self.snapshot.set_paint_cache(cache);
+        self.invalidate_all();
+    }
+
+    pub fn paint_cache(&self) -> &Arc<PaintCache> {
+        &self.paint_cache
+    }
+
+    /// The color the view shows at physical pixel (`sx`, `sy`), from the
+    /// cache (background, grid and everything drawn; not the edit overlay):
+    /// the eyedropper over what the person sees. `None` before the first
+    /// frame, outside the cache, or while a zoom has not settled
+    /// ([`crate::sample_color`] reads the document instead).
+    pub fn color_at(&self, sx: f32, sy: f32) -> Option<Color> {
+        let cache = self.cache.as_ref().filter(|c| c.zoom == self.zoom)?;
+        let p = self.screen_to_board(sx, sy);
+        let x = ((p.x - cache.origin.x) * cache.zoom).floor();
+        let y = ((p.y - cache.origin.y) * cache.zoom).floor();
+        if x < 0.0 || y < 0.0 || x >= cache.pixmap.width() as f32 || y >= cache.pixmap.height() as f32 {
+            return None;
+        }
+        let px = cache.pixmap.pixel(x as u32, y as u32)?.demultiply();
+        Some(Color::rgba(px.red(), px.green(), px.blue(), px.alpha()))
     }
 
     pub fn snapshot(&self) -> &BoardSnapshot {
@@ -282,7 +320,8 @@ impl BoardView {
     /// A new snapshot of the board (after a local or remote edit). Only
     /// what changed is re-rendered: the old and new bounds of every element
     /// whose fingerprint changed, appeared or went.
-    pub fn set_snapshot(&mut self, snapshot: BoardSnapshot) {
+    pub fn set_snapshot(&mut self, mut snapshot: BoardSnapshot) {
+        snapshot.set_paint_cache(self.paint_cache.clone());
         let mut next: HashMap<u64, (u64, Rect, bool)> = HashMap::with_capacity(snapshot.elements.len());
         let mut dirty: Vec<Rect> = Vec::new();
         let mut everything = snapshot.markup_visible != self.snapshot.markup_visible || snapshot.page != self.snapshot.page;
@@ -310,6 +349,31 @@ impl BoardView {
             }
         }
         self.seen = next;
+        // Paint: an operation changed, came or went; a stroke that only grew
+        // dirties where its new points reach.
+        let mut next_paint: HashMap<u64, PaintMark> = HashMap::with_capacity(snapshot.paint.len());
+        for m in snapshot.paint_marks() {
+            match self.seen_paint.get(&m.key) {
+                Some(old) if old.fingerprint == m.fingerprint => {}
+                Some(old) if old.look == m.look && m.points > old.points && old.points > 0 => {
+                    if let Some(r) = snapshot.paint_tail_bounds(m.index, old.points) {
+                        dirty.push(r);
+                    }
+                }
+                Some(old) => {
+                    dirty.push(old.bounds);
+                    dirty.push(m.bounds);
+                }
+                None => dirty.push(m.bounds),
+            }
+            next_paint.insert(m.key, m);
+        }
+        for (key, old) in &self.seen_paint {
+            if !next_paint.contains_key(key) {
+                dirty.push(old.bounds);
+            }
+        }
+        self.seen_paint = next_paint;
         self.snapshot = snapshot;
         if everything {
             self.invalidate_all();

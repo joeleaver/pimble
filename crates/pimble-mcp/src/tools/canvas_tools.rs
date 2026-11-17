@@ -20,8 +20,8 @@ use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICK
 use pimble_board::{
     dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
     BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
-    NewElement, Page, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, SvgPlacement,
-    Transform, ViewOptions,
+    NewElement, NewStroke, Page, PaintBody, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
+    StyleKey, SvgPlacement, Transform, ViewOptions,
 };
 use pimble_board::path::{parse_d, to_d};
 use pimble_core::{node_types, BlobUrl, Node, Place, PimbleUrl};
@@ -480,14 +480,62 @@ pub struct ImportSvgParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct PaintParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// The paint layer (its name or id). Left out: the paint layer a person's
+    /// brush would take (the topmost one that is shown and not locked), or a
+    /// new "Paint 1" on top when there is none.
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Highlight a picture: its element id. The strokes go into the
+    /// "Highlights" paint layer just above the picture's layer (made, blended
+    /// multiply, when missing), as the app's highlighter does. Leave `layer`
+    /// out with it.
+    #[serde(default)]
+    pub highlight_picture: Option<String>,
+    /// The strokes, painted in this order (later ones on top).
+    pub strokes: Vec<StrokeSpec>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone)]
+pub struct StrokeSpec {
+    /// The brush: "round" (the default), "pencil", "ink", "airbrush", "marker",
+    /// "charcoal", "watercolor" or "highlighter".
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// "#rrggbb" or "#rrggbbaa". Left out: the brush's own color.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// The brush's diameter in canvas units at full pressure (each brush has
+    /// its own default: round 8, pencil 2, airbrush 60...).
+    #[serde(default)]
+    pub size: Option<f32>,
+    /// 0 to 1: the stroke's opacity where it is fully painted.
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    /// True: an eraser stroke, removing what this layer has painted under it.
+    #[serde(default)]
+    pub erase: bool,
+    /// The points in canvas units, [[x, y], ...], each optionally with a
+    /// pressure from 0 to 1 ([x, y, pressure]; left out it is 1, the
+    /// brush's full size). Points about a brush's width apart or closer draw
+    /// a smooth line; one point is a dab.
+    pub points: Vec<Vec<f32>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct AddLayerParams {
     pub node: String,
     #[serde(default)]
     pub canvas: Option<String>,
     pub name: String,
-    /// What it holds: "vector" (the default: elements), "paint" (painting,
-    /// which comes later: a paint layer holds no elements) or "group" (other
-    /// layers).
+    /// What it holds: "vector" (the default: elements), "paint" (brush
+    /// strokes, added with the paint tool; a paint layer holds no elements)
+    /// or "group" (other layers).
     #[serde(default)]
     pub kind: Option<String>,
     /// The group it goes in (a group's name or id). Left out: the top level,
@@ -704,8 +752,48 @@ fn said(e: &BoardError) -> String {
         BoardError::NoVectorLayer => "this canvas has no vector layer for elements; add_layer adds one".into(),
         BoardError::NotAVectorLayer { kind, .. } if kind.is_group() => "that layer is a group, which holds layers, not elements; name a layer inside it".into(),
         BoardError::NotAVectorLayer { kind, .. } => format!("that is a {kind} layer, which holds no elements; name a vector layer"),
+        BoardError::NotAPaintLayer { kind, .. } => {
+            format!("that is a {kind} layer; strokes go in a paint layer (name one, add one with add_layer kind \"paint\", or leave `layer` out)")
+        }
         other => other.to_string(),
     }
+}
+
+/// A stroke spec as a stroke to paint (its layer filled in by the caller).
+fn stroke_of(spec: &StrokeSpec, index: usize) -> Result<NewStroke, BoardError> {
+    let what = format!("stroke {}", index + 1);
+    let name = spec.preset.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("round");
+    let preset = pimble_board::brush::preset(name).ok_or_else(|| {
+        let names: Vec<&str> = pimble_board::PRESETS.iter().map(|p| p.name).collect();
+        bad(format!("{what}: there is no brush \"{name}\"; the brushes are {}", names.join(", ")))
+    })?;
+    let color = match &spec.color {
+        Some(c) => color(c, &what)?,
+        None => preset.color,
+    };
+    let mut settings = preset.settings;
+    if let Some(size) = spec.size {
+        if !(size.is_finite() && size > 0.0) {
+            return Err(bad(format!("{what}: the size is a number of canvas units above 0")));
+        }
+        settings.size = size;
+    }
+    if let Some(o) = spec.opacity {
+        settings.opacity = o;
+    }
+    if spec.points.is_empty() {
+        return Err(bad(format!("{what} has no points")));
+    }
+    let mut points = Vec::with_capacity(spec.points.len());
+    for (k, pt) in spec.points.iter().enumerate() {
+        let ok = matches!(pt.len(), 2 | 3) && pt.iter().all(|v| v.is_finite());
+        if !ok {
+            return Err(bad(format!("{what}, point {}: a point is [x, y] or [x, y, pressure]", k + 1)));
+        }
+        points.push([pt[0], pt[1], pt.get(2).copied().unwrap_or(1.0).clamp(0.0, 1.0), 0.0]);
+    }
+    let stroke = NewStroke::new(String::new(), preset, color).with_settings(settings).with_points(points);
+    Ok(if spec.erase { stroke.erasing() } else { stroke })
 }
 
 fn point(v: &[f32], what: &str) -> Result<Point, BoardError> {
@@ -1488,6 +1576,66 @@ fn has_field(fields: &[(String, String)], wanted: &str) -> bool {
         .any(|(n, v)| n.trim().eq_ignore_ascii_case(name) && value.is_none_or(|want| v.trim().eq_ignore_ascii_case(want)))
 }
 
+/// What a paint layer holds, in a line or two: how many operations of each
+/// kind, the brushes and colors, who painted, and where it paints. Never the
+/// points.
+fn paint_summary(snapshot: &BoardSnapshot, layer: &str) -> String {
+    let ops = snapshot.paint_ops(layer);
+    if ops.is_empty() {
+        return "nothing painted yet\n".to_string();
+    }
+    let (mut strokes, mut erasing, mut pictures, mut other) = (0, 0, 0, 0);
+    let mut brushes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut colors: Vec<String> = Vec::new();
+    let mut authors: Vec<String> = Vec::new();
+    for op in ops {
+        match &op.raw.body {
+            PaintBody::Stroke(s) if s.blend == StrokeBlend::Erase => erasing += 1,
+            PaintBody::Stroke(s) => {
+                strokes += 1;
+                *brushes.entry(s.preset.clone()).or_default() += 1;
+                let hex = s.color.to_hex();
+                if !colors.contains(&hex) {
+                    colors.push(hex);
+                }
+            }
+            PaintBody::Pixels(_) => pictures += 1,
+            PaintBody::Other(_) => other += 1,
+        }
+        if let Some(a) = &op.raw.author {
+            if !authors.contains(&a.name) {
+                authors.push(a.name.clone());
+            }
+        }
+    }
+    let mut parts = vec![format!("{strokes} brush stroke{}", if strokes == 1 { "" } else { "s" })];
+    if erasing > 0 {
+        parts.push(format!("{erasing} eraser stroke{}", if erasing == 1 { "" } else { "s" }));
+    }
+    if pictures > 0 {
+        parts.push(format!("{pictures} picture{}", if pictures == 1 { "" } else { "s" }));
+    }
+    if other > 0 {
+        parts.push(format!("{other} operation{} of a later version", if other == 1 { "" } else { "s" }));
+    }
+    let mut line = parts.join(", ");
+    if !brushes.is_empty() {
+        line.push_str(&format!(" · brushes {}", brushes.iter().map(|(b, n)| format!("{b} x{n}")).collect::<Vec<_>>().join(", ")));
+    }
+    if !colors.is_empty() {
+        let shown: Vec<&str> = colors.iter().take(8).map(String::as_str).collect();
+        line.push_str(&format!(" · colors {}{}", shown.join(", "), if colors.len() > 8 { ", ..." } else { "" }));
+    }
+    if let Some(b) = snapshot.paint_bounds(layer) {
+        line.push_str(&format!(" · paints the area {}", rect_text(&b)));
+    }
+    if !authors.is_empty() {
+        line.push_str(&format!(" · by {}", authors.join(", ")));
+    }
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String {
     describe_where(snapshot, cards, None)
@@ -1554,6 +1702,10 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
                 layer.count,
                 if layer.count == 1 { "" } else { "s" }
             )),
+            LayerKind::Paint => {
+                out.push_str(&format!("\n{heading} Paint layer \"{}\" ({}){flags}\n", layer.name, layer.id));
+                out.push_str(&paint_summary(snapshot, &layer.id));
+            }
             other => out.push_str(&format!("\n{heading} {} layer \"{}\" ({}){flags}\n", capitalized(other.as_str()), layer.name, layer.id)),
         }
         out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
@@ -1934,17 +2086,13 @@ impl Pimble {
         let options = ViewOptions { show_all: p.show_all, card_labels: Arc::new(labels), ..ViewOptions::default() };
         let snapshot = BoardSnapshot::build_with(board.read(), options);
         // The pictures it shows, through the server like the app's loader.
+        // Pictures and paint layers' pixels alike.
         let mut pictures: HashMap<String, Arc<Picture>> = HashMap::new();
-        for e in &snapshot.elements {
-            if let Geom::Picture(pg) = &e.raw.geom {
-                if pictures.contains_key(&pg.src) {
-                    continue;
-                }
-                if let Some(url) = BlobUrl::parse(&pg.src) {
-                    if let Ok((_, bytes)) = self.api.get_blob(url.store, url.blob).await {
-                        if let Ok(picture) = Picture::decode(&bytes) {
-                            pictures.insert(pg.src.clone(), Arc::new(picture));
-                        }
+        for src in snapshot.picture_srcs() {
+            if let Some(url) = BlobUrl::parse(&src) {
+                if let Ok((_, bytes)) = self.api.get_blob(url.store, url.blob).await {
+                    if let Ok(picture) = Picture::decode(&bytes) {
+                        pictures.insert(src.clone(), Arc::new(picture));
                     }
                 }
             }
@@ -1987,14 +2135,7 @@ impl Pimble {
         let (w, h) = (image.width, image.height);
         let s = w as f32 / rendered.rect.w.max(1e-3);
         self.on_canvas(&target, only.into_iter().collect()).await;
-        let missing = snapshot
-            .elements
-            .iter()
-            .filter_map(|e| match &e.raw.geom {
-                Geom::Picture(pg) if !pictures.contains_key(&pg.src) => Some(pg.src.clone()),
-                _ => None,
-            })
-            .count();
+        let missing = snapshot.picture_srcs().iter().filter(|src| !pictures.contains_key(*src)).count();
         let mut note = format!(
             "{}: the image ({w}x{h} px) shows the area {} at {} px per canvas unit; pixel (px, py) is canvas ({} + px/{}, {} + py/{}).",
             target.what(),
@@ -2310,6 +2451,63 @@ impl Pimble {
             out.push_str(&format!("Left out: {w}\n"));
         }
         Ok(out)
+    }
+
+    /// Paint brush strokes on a canvas, as a person paints with the brush:
+    /// each stroke is a brush (round, pencil, ink, airbrush, marker,
+    /// charcoal, watercolor, highlighter), a color, a size and its points
+    /// (optionally with pressure), into a paint layer (the one named, or the
+    /// topmost shown and unlocked one, or a new "Paint 1"). `erase` makes an
+    /// eraser stroke. With `highlight_picture` the strokes go into the
+    /// multiply "Highlights" layer above that picture. render_canvas shows
+    /// the result; get_canvas summarizes paint layers. One edit: a person
+    /// undoes it with their own undo only when it is theirs, so nothing here
+    /// is undone for them.
+    #[tool(name = "paint")]
+    async fn paint(&self, Parameters(p): Parameters<PaintParams>) -> Result<String, String> {
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        if p.strokes.is_empty() {
+            return Err("Give at least one stroke to paint.".into());
+        }
+        let mut strokes = Vec::with_capacity(p.strokes.len());
+        for (i, spec) in p.strokes.iter().enumerate() {
+            strokes.push(stroke_of(spec, i).map_err(|e| format!("Nothing was written: {}.", said(&e)))?);
+        }
+        let (layer, picture) = (p.layer.clone(), p.highlight_picture.clone());
+        if layer.is_some() && picture.is_some() {
+            return Err("Give `layer` or `highlight_picture`, not both.".into());
+        }
+        let (layer_id, ids) = self
+            .canvas_edit(&target, Default::default(), move |t, scene, snapshot| {
+                let layer_id = match (layer.as_deref().map(str::trim).filter(|l| !l.is_empty()), picture.as_deref().map(str::trim)) {
+                    (Some(l), _) => scene.layer(l)?.id.clone(),
+                    (None, Some(pic)) => {
+                        let id = scene.id(pic)?;
+                        if !snapshot.get(&id).is_some_and(|e| e.raw.kind == Kind::Picture) {
+                            return Err(bad(format!("{pic} is not a picture on this canvas")));
+                        }
+                        t.highlights_layer(Some(&id))?
+                    }
+                    (None, None) => t.paint_layer_for(None)?,
+                };
+                let mut ids = Vec::with_capacity(strokes.len());
+                for stroke in strokes {
+                    let mut stroke = stroke;
+                    stroke.layer = layer_id.clone();
+                    ids.push(t.add_stroke(stroke)?);
+                }
+                Ok((layer_id, ids))
+            })
+            .await?;
+        let doc = doc_of(&self.api.node(target.addr).await?)?;
+        let name = target.board(&doc).snapshot().layer(&layer_id).map(|l| l.name.clone()).unwrap_or_default();
+        Ok(format!(
+            "Painted {} stroke{} in the paint layer \"{name}\" ({layer_id}) of {}: {}.",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" },
+            target.what(),
+            ids.join(", ")
+        ))
     }
 
     /// Add a layer or a group of layers to a canvas (layers organize; who made
@@ -2681,6 +2879,49 @@ mod tests {
         assert!(text.find("Group \"Shading\"").unwrap() < text.find("Layer \"Shadows\"").unwrap(), "a group before what it holds");
         assert!(layer_kind(Some("sketch")).is_err());
         assert!(blend_mode("burn").is_err());
+    }
+
+    #[test]
+    fn strokes_go_into_a_paint_layer_and_get_canvas_summarizes_it() {
+        let board = fresh();
+        let agent = Author { id: "agent".into(), name: "Claude".into() };
+        let st = Stamp::new(Some(&agent), "2026-11-17T00:00:00.000Z");
+        let spec = |preset: Option<&str>, erase: bool, points: Vec<Vec<f32>>| StrokeSpec {
+            preset: preset.map(str::to_string),
+            color: Some("#228be6".into()),
+            size: Some(12.0),
+            opacity: None,
+            erase,
+            points,
+        };
+        let a = stroke_of(&spec(Some("watercolor"), false, vec![vec![0.0, 0.0], vec![50.0, 10.0, 0.4], vec![100.0, 0.0]]), 0).unwrap();
+        assert_eq!(a.points[1], [50.0, 10.0, 0.4, 0.0]);
+        assert_eq!(a.points[0][2], 1.0, "no pressure reads as full");
+        assert_eq!(a.settings.size, 12.0);
+        let b = stroke_of(&spec(None, true, vec![vec![40.0, 0.0]]), 1).unwrap();
+        assert_eq!((b.preset.as_str(), b.blend), ("round", StrokeBlend::Erase));
+        assert!(said(&stroke_of(&spec(Some("crayon"), false, vec![vec![0.0, 0.0]]), 2).unwrap_err()).contains("the brushes are round, pencil"));
+        assert!(stroke_of(&spec(None, false, vec![vec![0.0]]), 3).is_err());
+        assert!(stroke_of(&spec(None, false, vec![]), 3).is_err());
+        let layer = board
+            .edit(st, |t| {
+                let layer = t.paint_layer_for(None)?;
+                for mut s in [a, b] {
+                    s.layer = layer.clone();
+                    t.add_stroke(s)?;
+                }
+                Ok(layer)
+            })
+            .into_result()
+            .unwrap()
+            .0;
+        let text = describe(&board.snapshot(), &HashMap::new());
+        assert!(text.contains(&format!("## Paint layer \"Paint 1\" ({layer})")), "{text}");
+        assert!(text.contains("1 brush stroke, 1 eraser stroke · brushes watercolor x1 · colors #228be6 · paints the area at"), "{text}");
+        assert!(text.contains("by Claude"), "{text}");
+        let vector = board.snapshot().layers[0].id.clone();
+        let refused = board.edit(st, |t| t.add_stroke(NewStroke::new(vector, &pimble_board::brush::ROUND, Color::BLACK).with_points(vec![[0.0, 0.0, 1.0, 0.0]])));
+        assert!(said(&refused.result.unwrap_err()).contains("strokes go in a paint layer"));
     }
 
     #[test]

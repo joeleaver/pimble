@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; waves 1, 2 and 3 built (model and UI)** (see the end). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; waves 1, 2 and 3 built (model and UI); wave 4 model built, its UI next** (see the end). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -953,3 +953,249 @@ Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model
   clipboard; the import path is the one the drop and the menu use, and it is tested) and
   of the browser build (it compiles from the same code).
 
+## Built in wave 4 (model)
+
+Built 2026-11-17 in `crates/pimble-board` and `crates/pimble-mcp`, no UI: the Brush,
+Eraser and Eyedropper tools, the context bar's preset, size, opacity, flow and hardness, `[`
+and `]`, Alt picking colors, layer thumbnails and the browser's IndexedDB tile store are the
+UI half. `crates/pimble-app` is not touched (it compiles as it was: `Changes` gained a field,
+read through `Default` there).
+
+### Spike: brush engine
+
+`examples/paint_bench.rs` (native: `cargo run -p pimble-board --release --example
+paint_bench`; the browser's estimate: the same code built for `wasm32-wasip1` and run under
+`wasmtime`, which runs scalar Rust about as a browser does, so those are measurements of
+wasm, not of a browser). **Measured under heavy load**: the machine was shared with other
+builds (`uptime` load average 25.0 / 26.1 / 28.4 on 24 cores at 09:57 while measuring, 63.4 /
+48.4 / 40.6 at 10:15 just after), so every number here is pessimistic, the spread between
+runs is mostly the load, and single slow appends are noise. **Re-measure on an idle machine**
+before tuning anything on these numbers.
+
+- **Per dab**, stamped into one 256-pixel tile's f32 mask (falloff, flow) and laid down:
+  0.3 to 0.5 µs for a 4-pixel pencil dab, 1.0 to 1.4 µs at 16 px, 6 to 7 µs at 48 px, 60 µs at
+  120 px, 210 µs at 240 px (an airbrush that wide). wasm: 0.5, 2.4, 18, 38 and 211 µs. Cost
+  follows the dab's area, as expected.
+- **A long pressure stroke across a 4K view** (a `BoardView` of 3840 × 2160 pixels at 2 px
+  per board unit, a wandering stroke of 4,000 points over 1,900 × 1,060 units, appended four
+  points at a time as pointer events arrive, each append taken through `Board::append_stroke`,
+  `BoardView::update` and `frame()`, so the per-append time includes the snapshot update,
+  the tiles, the view's dirty re-render and copying a 33 MB 4K frame): round 24 units, 11,208
+  dabs: median 5.2 to 5.7 ms per append, p95 about 10 ms; airbrush 80 units: median 6.8 ms,
+  p95 11 ms; charcoal 16 units (grain and jitter): median 5.8 to 6.4 ms, p95 11 to 13 ms.
+  wasm: 6.1, 19.6 and 9.1 ms medians, p95 13.5, 42 and 17 ms. Single appends of 20 to 95 ms
+  showed up in both, not where tiles were first touched, and moved between runs: the busy
+  machine. The cache stamped only new dabs (1,235 to 4,312 tile updates, one replay per tile
+  the stroke first reaches, never a replay of a tile it already painted).
+- **Chosen**: dabs go into a **per-stroke f32 coverage mask** and the stroke is laid onto the
+  layer's **premultiplied RGBA8** tile once per change: the mask keeps a low-flow soft brush
+  (the airbrush's 0.06 per dab) from banding as u8 accumulation would and lets a stroke cap
+  its own opacity (crossing itself never darkens past what its pressure asks for); the tile
+  stays u8 premultiplied because that is what tiny-skia composites with the layer's blend
+  and opacity, what a tile costs in memory (256 KiB), and what goes to disk. A tile topped by
+  one of the layer's last four strokes keeps that stroke's mask and the pixels under it
+  (another 512 KiB), so appending stamps only the new dabs and lays down only the pixels they
+  touched.
+
+### Spike: replay cost
+
+5,000 strokes of 30 points (all brushes but the highlighter, sizes 4 to 30 units, random
+colors) over 1,920 × 1,080 units, 205 tiles at 2 px per unit:
+
+| | native | wasm |
+| --- | --- | --- |
+| read the board (snapshot) | 31 to 39 ms | 95 ms |
+| every tile replayed, cold | 1.86 to 2.27 s | 5.6 s |
+| the whole 1920 × 1080 view at 100%, cold | 1.6 to 2.6 s | 4.2 s |
+| every tile again, from memory | 146 to 197 ms (composing a 3840 × 2160 picture) | 918 ms |
+| the view at 100% from memory | 50 to 76 ms | 545 ms |
+| a new memory cache, tiles from the disk cache (17.8 MB, PNG) | 312 to 370 ms | (no disk in the test) |
+| cold, saving every tile to disk | 2.0 to 2.6 s | |
+
+A profile of the cold replay: 42% stamping dabs, 25% laying strokes down, the rest
+compositing. **Cold replay is over a second**, so the design leans on the caches: the view
+replays only the tiles it shows (a painting seen at 100% on a laptop is a fraction of these
+205 tiles), every tile is kept in memory once replayed (256 MB budget by default, least
+recently used out first), the disk cache brings a reopened painting back in about a fifth
+of a cold replay, and Flatten (wave 5) is the answer for a history that has grown long. The
+stamp loop already only visits each row's span inside the circle; a falloff table and SIMD
+are what is left to try if real paintings show it is needed. **Margin**: the cold numbers
+are about twice the one-second threshold under a load average of 25 on 24 cores; unloaded
+they may come near it on the desktop (not in wasm, at 5.6 s). The choice does not hang on
+it, since the caches are wanted for 10,000 strokes or a slower laptop either way, but
+"cold replay is too slow on the desktop" should be re-measured idle before Flatten's
+priority is argued from it.
+
+### Stored keys
+
+Only new keys; a board made before painting needs nothing, and an older app ignores them.
+
+- **Each paint operation is its own key of the board map**, `paint:<op id>`, a `Map { layer,
+  order, kind, author?, created_at, ... }`. **Deviation**: the contract drew one `paint` map
+  holding the operations; a map made on first use would be made by two devices painting
+  their first strokes while apart, and yrs keeps one of the two maps and drops the other's
+  strokes (the rule node fields and `board:<id>` keys already follow). `order` is a
+  fractional index among the operations of its layer; the replay order is (order, id).
+- **stroke**: `preset` (the name), `color` (`#rrggbb(aa)`), `blend` (`normal` | `erase`),
+  `brush` (one `Any` map, written once: `size`, `hardness`, `spacing`, `flow`, `opacity`,
+  `pressure_size`, `pressure_opacity`, `tilt_size`, `tilt_opacity` (each `[at0, at1,
+  gamma]`), `jitter_size`, `jitter_opacity`, `jitter_position`, `grain`, `wet_edge`) and
+  `points`, an `Array` of `Buffer` chunks of little-endian f32 quadruples (x, y, pressure,
+  tilt), appended while drawing as a pen's points are. The settings are stored whole so a
+  preset changed later never redraws an old painting differently; a setting missing reads
+  as the named preset's (or Round's).
+- **pixels**: `src` (a `pimble-blob:` URL) and `rect` (`Any { x, y, w, h }`). Stored and
+  drawn now; nothing makes one yet but `add_pixels` (wave 5's Flatten, Merge Down, paste).
+- Any other `kind` (fill, smudge, blur, move) reads as `PaintBody::Other` and is skipped:
+  the rest of the layer draws.
+- Pressure is 0 to 1, **1 for an input without pressure** (a brush's size is its size at
+  full pressure; a mouse sends 1, not the pen tool's 0.5). Tilt is 0 upright to 1 flat, 0
+  without tilt.
+
+### Public API (`pimble_board`)
+
+- **Brush engine** (`brush`): `BrushSettings { size, hardness, spacing, flow, opacity,
+  pressure_size, pressure_opacity, tilt_size, tilt_opacity, jitter, grain, wet_edge }`
+  (`sanitized()`, `reach()`, `with_size(f32)`), `Curve { at0, at1, gamma }` (`at(t)`, `FLAT`),
+  `Jitter { size, opacity, position }`, `StrokeBlend { Normal, Erase }`, `Preset { name,
+  label, settings, color, layer_blend }`, `PRESETS: [Preset; 8]` (round, pencil, ink,
+  airbrush, marker, charcoal, watercolor, highlighter, in menu order; consts `brush::ROUND`
+  ... `brush::HIGHLIGHTER`), `brush::preset(name) -> Option<&'static Preset>` (name or
+  label, any case), `BrushPoint = [f32; 4]`, `PX_PER_UNIT = 2.0`; `brush::dabs(settings,
+  seed, points)`, `DabWalker`, `brush::seed_of(op_id)` (jitter is seeded from the op id and
+  the dab's index, so appending never changes a dab already made).
+- **Operations** (`paint_ops`): `RawPaintOp { id, layer, order, body: PaintBody, author,
+  created_at }` (`kind()`, `bounds()`), `PaintBody { Stroke(Arc<StrokeOp>),
+  Pixels(PixelsOp), Other(String) }`, `StrokeOp { preset, settings, color, blend, points }`,
+  `PixelsOp { src, rect }`, `PaintOp { raw, bounds, fingerprint }`, `NewStroke { layer,
+  preset, settings, color, blend, points }` with `NewStroke::new(layer, &Preset, Color)`,
+  `.erasing()`, `.with_size(f32)`, `.with_settings(BrushSettings)`, `.with_points(Vec<BrushPoint>)`;
+  `paint_ops::PAINT_PREFIX`, `paint_key(id)`. `RawBoard.paint: Vec<RawPaintOp>`;
+  `Changes.paint: HashSet<String>` (op ids; `Board::watch` reports them, so an append is
+  neither `board` nor `elements`); `Board::read_paint_some(&ids)`.
+- **Writing** (`BoardTxn`; each judged by locks; refusals write nothing):
+  - `paint_layer_for(picked: Option<&str>) -> Result<String>`: the contract's rule (the
+    picked layer when it is a paint layer not locked and not in a hidden or locked group;
+    else the nearest such paint layer above it that shows; else a new "Paint N", the first
+    free number, just above the pick in its group, or above the top-level layer holding it
+    when that group is hidden or locked; nothing picked: the topmost such paint layer that
+    shows, else a new one on top). **The model makes "Paint N"**, unlike wave 2's "Vector 1"
+    (which the UI makes): call it in the same `Board::edit` as `begin_stroke` and the layer
+    and the first stroke are one undo step; then pick the answered layer in the panel.
+  - `highlights_layer(picture: Option<&str>) -> Result<String>`: the paint layer named
+    "Highlights" (`HIGHLIGHTS_LAYER_NAME`) just above the picture's layer (its next sibling),
+    else one made there, blend multiply (`Preset::layer_blend`); with `None` the bottom of
+    the canvas (reused when the bottom layer is one). Refused (`LayerLocked`) when that
+    Highlights layer is locked. The UI calls it for the highlighter preset when the press
+    lands on a picture (a canvas's picture element, which a picture in text also is).
+  - `begin_stroke(NewStroke) -> Result<String>` (on top of its layer; answers the op id),
+    `append_stroke(id, &[BrushPoint]) -> Result<()>` (one chunk; `Board::append_stroke(stamp,
+    id, points)` too), `end_stroke(id) -> Result<bool>` (removes a stroke that never got a
+    point; answers whether it stays), `add_stroke(NewStroke) -> Result<String>` (a whole
+    stroke, refused with no points), `add_pixels(layer, src, Rect) -> Result<String>`,
+    `delete_paint_op(id) -> Result<()>`. New errors: `BoardError::NotAPaintLayer { id, kind
+    }` (`locks::not_a_paint_layer(kind)` is its sentence), `BoardError::NoPaintOp(id)`.
+  - **The eraser** is a stroke with `blend: Erase` (`NewStroke::erasing()`), in a paint
+    layer; in a vector layer the eraser tool still deletes elements.
+  - **Undo** needs nothing new: the board's per-person `UndoManager` tracks the board map,
+    so undo removes the person's own last operation, never a collaborator's (tested). Hold
+    the undo clock across a stroke's begin, appends and end (wave 2's `undo_options`), so a
+    stroke is one step.
+  - `delete_layer` deletes the layer's operations with it; `copy_from` copies them. Merge
+    Down and Merge Group across kinds are still refused, now "is not built yet" (wave 5).
+- **Reading** (`BoardSnapshot`): `paint: Vec<PaintOp>` (by layer, order, id),
+  `paint_ops(layer) -> &[PaintOp]`, `paint_bounds(layer) -> Option<Rect>`, `paint_op(id)`,
+  `paint_shown(layer index) -> bool` (the layer and its groups shown and the markup shown,
+  or `show_all`), `paint_layers_in(&Rect) -> Vec<usize>`, `paint_marks() -> Vec<PaintMark>`
+  and `paint_tail_bounds(index, from) -> Option<Rect>` (what a raster cache follows),
+  `picture_srcs() -> Vec<String>` (pictures and `pixels` sources: **the app's
+  `boards::pictures_of` should use it** so `pixels` operations load), `paint_cache()`,
+  `with_paint_cache(Arc<PaintCache>)`. `Layer::count` is a paint layer's operation count.
+  `visible_extent()` includes shown paint; `markup_visible` off hides paint layers (as it
+  hides every element that is not a picture).
+- **Tiles and cache** (`tiles`): `TILE_PX = 256`, `TILE_UNITS = 128.0`, `tile_rect(tx, ty)`,
+  `tiles_of(&Rect)`; `PaintCache::new() -> Arc<PaintCache>` (memory, 256 MB),
+  `PaintCache::with_store(Option<Arc<dyn TileStore>>, budget_bytes)`, `stats() ->
+  CacheStats { replayed, appended, stacked, loaded, hits }`, `memory_bytes()`, `clear()`,
+  `tile_pixels(&snapshot, layer, tx, ty, &pictures) -> Option<Vec<u8>>`. **The disk hook**:
+  `trait TileStore: Send + Sync { fn load(&self, &TileKey) -> Option<Vec<u8>>; fn
+  save(&self, &TileKey, &[u8]); }`, pixels 256 × 256 × 4 premultiplied; `TileKey(u128)`
+  (`hex()`) hashes the layer, the tile's place and every (operation, fingerprint) touching
+  it, so a stale tile is never found. **Desktop**: `DirTileStore::new(dir)` (not on wasm),
+  one PNG per tile under two-hex-digit folders, `prune(max_bytes)` removes the oldest; the
+  app wires `<cache dir>/pimble/tiles`. **Browser**: an IndexedDB `TileStore` is the app's
+  (IndexedDB is async; `load` must answer at once, so it would answer from what it has
+  prefetched, or the browser stays on memory alone). A tile that needed a picture not yet
+  loaded is drawn without it and drawn again next time.
+- **Rendering**: paint layers composite at their place in the layer order through wave 1's
+  buffers (blend, opacity, groups) in `draw_region`, so `BoardView`, `render`,
+  `render_area`, `render_extent`, the navigator, export, pictures in text and embedded
+  canvases (`text_boards.rs` draws through `render_area`/`render_extent`) all draw them.
+  Zoomed in to 2 screen pixels per board unit or more a paint layer shows its pixels
+  (nearest); below, it is sampled bilinear from half-size copies. Tiles are drawn without
+  antialiased edges, so they meet with no seam at any zoom (tested). `render_paint_layer(&
+  snapshot, layer, &pictures, scale, within: Option<Rect>) -> Option<Rendered>` is one layer
+  alone (a layers-panel thumbnail). **SVG export** embeds each paint layer as one PNG
+  `<image>` at 2 px per unit over what it paints, inside its layer's `<g opacity
+  mix-blend-mode>`.
+- **BoardView**: owns a `PaintCache` every snapshot it shows draws from
+  (`set_paint_cache(Arc<PaintCache>)` hands it a disk-backed one, `paint_cache()`); a
+  stroke that only grew re-renders only where its new points reach (`PaintMark::look` and
+  `points`); `color_at(sx, sy) -> Option<Color>` reads the view's cache (what the person
+  sees, background included).
+- **Eyedropper**: `sample_color(&snapshot, &pictures, at: Point, background: Option<Color>)
+  -> Color`, the composited canvas at a board point at the paint density, straight alpha
+  (over `background` when given). The UI uses `BoardView::color_at` while the pointer is on
+  the view, `sample_color` elsewhere.
+- **Drawing a stroke, for the UI**: on press, one `Board::edit` with `paint_layer_for` (or
+  `highlights_layer`) and `begin_stroke` with the first point; on each pointer event
+  `append_stroke` (the tile work per append is only the new dabs); send the updates batched
+  (about every 100 ms, `yrs::merge_updates_v1`) as the pen does; on release `end_stroke`.
+  Between appends nothing else is needed: `BoardView::update` with the watch's `Changes`
+  takes only the paint path (no element is resolved again).
+
+### MCP
+
+docs/MCP_CONTRACT.md "Painting": the `paint` tool (strokes with `preset`, `color`, `size`,
+`opacity`, `erase`, `points` with optional pressure; `layer`, or `highlight_picture`, or
+the brush's own rule making "Paint 1"); `get_canvas` summarizes each paint layer in a line
+(kinds and counts, brushes, colors, where it paints, who painted), never its points;
+`render_canvas` draws paint layers and fetches `pixels` pictures.
+
+### Tests
+
+`brush.rs` (appending never changes dabs already made, for every preset; spacing; jitter
+seeded by the op id; pressure and tilt through the curves; a stroke crossing itself does not
+darken; presets by name). `tests/paint.rs`: storage as `paint:<id>` keys with brush and
+points, an empty stroke ended goes; a stroke draws and the eraser takes it away; hidden
+layer, hidden markup and `show_all`; paint between vector layers, normal and multiply; a
+stroke appended through a `BoardView` stamps only new dabs and matches a cold replay byte
+for byte; tiles unchanged are hits, a stroke on top is laid over, a change under it
+replays; no seams at five zooms; two people painting at once converge in one order; undo
+takes my stroke, not yours; the layer rule ("Paint 1" with the first stroke, a locked one
+passed over, "Paint 2"), refusals, a deleted layer takes its paint; the highlighter's
+"Highlights" layer above a picture, multiplying it, reused; the eyedropper; `pixels` drawn
+and redrawn once their picture arrives; an unknown kind skipped; extent, PNG, SVG,
+thumbnail and Convert to Node carry paint; disk tiles come back the same; a snapshot
+brought up to date keeps its cache. The MCP: strokes from specs, refusals, the summary.
+
+### Deviations
+
+- Operations are board-map keys `paint:<id>`, not entries of a `paint` map (above).
+- `markup_visible` off hides paint layers whole, the highlighter's "Highlights" included
+  (the contract: every element that is not a picture).
+- A paint layer is not drawn when only some elements are rendered (`render_area` with
+  `only`, a frame's export): paint belongs to no element.
+- The highlighter on a canvas with no picture is the UI's choice: `highlights_layer(None)`
+  gives a bottom multiply layer, `paint_layer_for` a normal one (the preset still paints
+  its yellow at full opacity there).
+
+### Not built
+
+The UI (tools, context bar, keys, thumbnails, the IndexedDB store, wiring `DirTileStore`
+and `picture_srcs` into the app). Fill, smudge, blur, move, paint selections, Flatten,
+Merge Down across kinds and Merge Group with paint (wave 5). Dab shapes other than round
+(no angle or roundness from tilt), textures beyond the board-fixed grain, a stroke's own
+smoothing, a live preview of the stroke between appends (each append goes through the
+document). Pictures in text replay their paint on every render (each render builds its
+snapshot, so its cache is new); a cache shared per board on that thread would keep it.

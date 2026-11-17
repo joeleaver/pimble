@@ -22,6 +22,8 @@
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
 //!     note: Text?, "field:<name>": String...,   // what it means (below)
 //!   }>,
+//!   "paint:<op id>": Map { layer, order, kind, ... },   // paint operations,
+//!                                   // one key each (crate::paint_ops)
 //! }
 //! ```
 //!
@@ -147,6 +149,13 @@ pub enum BoardError {
     /// group (docs/DRAWING_CONTRACT.md section 1).
     #[error("{}", crate::locks::not_a_vector_layer(kind))]
     NotAVectorLayer { id: String, kind: LayerKind },
+    /// Paint went to a layer that is not a paint layer
+    /// (docs/DRAWING_CONTRACT.md section 3).
+    #[error("{}", crate::locks::not_a_paint_layer(kind))]
+    NotAPaintLayer { id: String, kind: LayerKind },
+    /// No paint operation has this id.
+    #[error("the canvas has no paint operation {0}")]
+    NoPaintOp(String),
     /// Nothing named a layer and the board has no vector layer.
     #[error("{}", crate::locks::NO_VECTOR_LAYER)]
     NoVectorLayer,
@@ -334,6 +343,30 @@ impl Board {
         Some((raw, found))
     }
 
+    /// The paint operations named in `ids` (each `None` when it is gone):
+    /// what [`crate::BoardSnapshot::update`] re-reads after a stroke grows.
+    pub fn read_paint_some(&self, ids: &HashSet<String>) -> Vec<(String, Option<crate::paint_ops::RawPaintOp>)> {
+        let txn = self.doc.transact();
+        let Some(board) = self.board_map(&txn) else {
+            return ids.iter().map(|id| (id.clone(), None)).collect();
+        };
+        ids.iter()
+            .map(|id| {
+                let op = match board.get(&txn, &crate::paint_ops::paint_key(id)) {
+                    Some(Out::YMap(map)) => Some(read_paint_op(&txn, id, &map)),
+                    _ => None,
+                };
+                (id.clone(), op)
+            })
+            .collect()
+    }
+
+    /// Append points to a brush stroke being drawn (see
+    /// [`BoardTxn::append_stroke`]).
+    pub fn append_stroke(&self, stamp: Stamp<'_>, id: &str, points: &[crate::brush::BrushPoint]) -> Result<Option<Vec<u8>>> {
+        self.edit(stamp, |t| t.append_stroke(id, points)).into_result().map(|(_, u)| u)
+    }
+
     /// Watch the board for changes, local and remote, so a snapshot can be
     /// brought up to date by re-reading only what changed
     /// ([`crate::BoardSnapshot::update`]). `None` until the board exists.
@@ -355,7 +388,12 @@ impl Board {
                             for key in e.keys(txn).keys() {
                                 match &**key {
                                     ELEMENTS | LAYERS => c.all = true,
-                                    _ => c.board = true,
+                                    k => match k.strip_prefix(crate::paint_ops::PAINT_PREFIX) {
+                                        Some(op) => {
+                                            c.paint.insert(op.to_string());
+                                        }
+                                        None => c.board = true,
+                                    },
                                 }
                             }
                         } else {
@@ -363,6 +401,9 @@ impl Board {
                         }
                     }
                     Some(PathSegment::Key(k)) if &**k == LAYERS => c.board = true,
+                    Some(PathSegment::Key(k)) if k.starts_with(crate::paint_ops::PAINT_PREFIX) => {
+                        c.paint.insert(k[crate::paint_ops::PAINT_PREFIX.len()..].to_string());
+                    }
                     Some(PathSegment::Key(k)) if &**k == ELEMENTS => match path.get(1) {
                         Some(PathSegment::Key(id)) => {
                             c.elements.insert(id.to_string());
@@ -433,11 +474,14 @@ pub struct Changes {
     pub board: bool,
     /// Elements added, changed or removed.
     pub elements: HashSet<String>,
+    /// Paint operations added, changed (a stroke's points appended) or
+    /// removed, by op id.
+    pub paint: HashSet<String>,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        !self.all && !self.board && self.elements.is_empty()
+        !self.all && !self.board && self.elements.is_empty() && self.paint.is_empty()
     }
 }
 
@@ -686,6 +730,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 map.insert(self.txn, EDITED_AT, at.clone());
             }
             copy_meaning(self.txn, &map, e.note.as_deref(), &e.fields);
+        }
+        if let Some(board) = self.board.clone() {
+            for op in &raw.paint {
+                let map: MapRef = board.insert(self.txn, crate::paint_ops::paint_key(&op.id), MapPrelim::default());
+                write_paint_op(self.txn, &map, op);
+            }
         }
         if let (Some(by), Some(at)) = (&raw.edited_by, &raw.edited_at) {
             if let Some(board) = self.board.clone() {
@@ -1064,6 +1114,10 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         for eid in gone {
             elements.remove(self.txn, &eid);
         }
+        let board = self.board()?;
+        for key in self.paint_keys_in(&doomed_ids) {
+            board.remove(self.txn, &key);
+        }
         let layers = self.layers()?;
         for d in &doomed_ids {
             layers.remove(self.txn, d);
@@ -1098,9 +1152,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
         match (kind.is_vector(), below_kind.is_vector()) {
             (true, true) => {}
-            (true, false) => return Err(BoardError::Invalid("Merging a vector layer onto a paint layer comes with painting.".into())),
+            (true, false) => return Err(BoardError::Invalid("Merging a vector layer onto a paint layer is not built yet.".into())),
             (false, true) => return Err(BoardError::Invalid("A paint layer cannot merge onto a vector layer.".into())),
-            (false, false) => return Err(BoardError::Invalid("Merging paint layers comes with painting.".into())),
+            (false, false) => return Err(BoardError::Invalid("Merging paint layers is not built yet.".into())),
         }
         if let Some(locked) = ls.locked(at) {
             return Err(BoardError::LayerLockedAgainstRemoval(locked));
@@ -1138,7 +1192,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             return Err(BoardError::LayerLockedAgainstRemoval(ls.locked_layer(*inner)));
         }
         if inside.iter().any(|d| !ls.tree.entries[*d].kind.is_vector() && !ls.tree.entries[*d].kind.is_group()) {
-            return Err(BoardError::Invalid("That group holds a paint layer. Merging it comes with painting.".into()));
+            return Err(BoardError::Invalid("That group holds a paint layer, and merging paint is not built yet.".into()));
         }
         let rank: HashMap<String, usize> = inside.iter().map(|d| (ls.id(*d).to_string(), *d)).collect();
         let elements = self.elements()?;
@@ -1977,6 +2031,265 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
         Ok(out)
     }
+
+    // ── Paint (docs/DRAWING_CONTRACT.md section 3) ───────────────────────
+
+    /// The board-map keys of the paint operations in `layers`.
+    fn paint_keys_in(&self, layers: &HashSet<String>) -> Vec<String> {
+        let Some(board) = self.board.clone() else { return Vec::new() };
+        board
+            .iter(self.txn)
+            .filter_map(|(key, out)| match out {
+                Out::YMap(map) if key.starts_with(crate::paint_ops::PAINT_PREFIX) => {
+                    string_of(map.get(self.txn, LAYER)).filter(|l| layers.contains(l)).map(|_| key.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The map of paint operation `id`.
+    fn paint_op_map(&self, id: &str) -> Result<MapRef> {
+        match self.board()?.get(self.txn, &crate::paint_ops::paint_key(id)) {
+            Some(Out::YMap(map)) => Ok(map),
+            _ => Err(BoardError::NoPaintOp(id.to_string())),
+        }
+    }
+
+    /// Whether paint may go into layer `id`: a paint layer, not locked
+    /// (itself or by a group).
+    fn judge_paint_into(&self, id: &str) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        let kind = &ls.tree.entries[at].kind;
+        if *kind != LayerKind::Paint {
+            return Err(BoardError::NotAPaintLayer { id: id.to_string(), kind: kind.clone() });
+        }
+        match ls.locked(at) {
+            Some(locked) => Err(BoardError::LayerLocked(locked)),
+            None => Ok(()),
+        }
+    }
+
+    /// The order key just above every operation of paint layer `layer`.
+    fn next_paint_order(&mut self, layer: &str) -> Result<String> {
+        let cache_key = format!("\u{0}paint:{layer}");
+        let top = match self.tops.get(&cache_key) {
+            Some(top) => top.clone(),
+            None => {
+                let board = self.board()?;
+                board
+                    .iter(self.txn)
+                    .filter_map(|(key, out)| match out {
+                        Out::YMap(map) if key.starts_with(crate::paint_ops::PAINT_PREFIX) && string_of(map.get(self.txn, LAYER)).as_deref() == Some(layer) => {
+                            string_of(map.get(self.txn, ORDER))
+                        }
+                        _ => None,
+                    })
+                    .max()
+            }
+        };
+        let key = order::after(top.as_deref());
+        self.tops.insert(cache_key, Some(key.clone()));
+        Ok(key)
+    }
+
+    fn insert_paint_op(&mut self, layer: &str, body: crate::paint_ops::PaintBody) -> Result<String> {
+        self.judge_paint_into(layer)?;
+        let order = self.next_paint_order(layer)?;
+        let id = new_id();
+        let op = crate::paint_ops::RawPaintOp {
+            id: id.clone(),
+            layer: layer.to_string(),
+            order,
+            body,
+            author: self.stamp.author.cloned(),
+            created_at: self.stamp.now.to_string(),
+        };
+        let board = self.board()?;
+        let map: MapRef = board.insert(self.txn, crate::paint_ops::paint_key(&id), MapPrelim::default());
+        write_paint_op(self.txn, &map, &op);
+        Ok(id)
+    }
+
+    /// Start a brush stroke (or an eraser's, `blend` erase) on top of its
+    /// paint layer, with its first points if it has any; answers the op id.
+    /// More points come with [`BoardTxn::append_stroke`] while it is drawn,
+    /// so others watch it drawn; [`BoardTxn::end_stroke`] when it is done.
+    /// Refused when the layer is not a paint layer or is locked.
+    pub fn begin_stroke(&mut self, stroke: crate::paint_ops::NewStroke) -> Result<String> {
+        let crate::paint_ops::NewStroke { layer, preset, settings, color, blend, points } = stroke;
+        let body = crate::paint_ops::PaintBody::Stroke(Arc::new(crate::paint_ops::StrokeOp { preset, settings: settings.sanitized(), color, blend, points }));
+        self.insert_paint_op(&layer, body)
+    }
+
+    /// A whole stroke at once (the MCP's): [`BoardTxn::begin_stroke`] with
+    /// every point. Refused when it has no points.
+    pub fn add_stroke(&mut self, stroke: crate::paint_ops::NewStroke) -> Result<String> {
+        if !stroke.points.iter().any(|p| p[0].is_finite() && p[1].is_finite()) {
+            return Err(BoardError::Invalid("A stroke needs at least one point.".into()));
+        }
+        self.begin_stroke(stroke)
+    }
+
+    /// Append points (x, y, pressure, tilt) to a stroke being drawn: one
+    /// chunk, as a pen's points are appended. Refused when its layer is
+    /// locked.
+    pub fn append_stroke(&mut self, id: &str, points: &[crate::brush::BrushPoint]) -> Result<()> {
+        let map = self.paint_op_map(id)?;
+        let layer = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
+        self.judge_paint_into(&layer)?;
+        let array = match map.get(self.txn, paint_keys::POINTS) {
+            Some(Out::YArray(array)) => array,
+            _ => return Err(BoardError::Invalid(format!("paint operation {id} is not a stroke"))),
+        };
+        if !points.is_empty() {
+            array.push_back(self.txn, Any::Buffer(crate::paint_ops::pack_brush_points(points).into()));
+        }
+        Ok(())
+    }
+
+    /// The stroke is done. A stroke that never got a point is removed (it
+    /// draws nothing); answers whether the stroke stays.
+    pub fn end_stroke(&mut self, id: &str) -> Result<bool> {
+        let map = self.paint_op_map(id)?;
+        let empty = match map.get(self.txn, paint_keys::POINTS) {
+            Some(Out::YArray(array)) => array.iter(self.txn).all(|c| !matches!(c, Out::Any(Any::Buffer(b)) if b.len() >= 16)),
+            _ => false,
+        };
+        if empty {
+            self.board()?.remove(self.txn, &crate::paint_ops::paint_key(id));
+        }
+        Ok(!empty)
+    }
+
+    /// A picture (`src`, a `pimble-blob:` URL) laid over `rect` on top of
+    /// paint layer `layer`: what Flatten, Merge Down and pasting into a paint
+    /// layer make (wave 5). Answers the op id.
+    pub fn add_pixels(&mut self, layer: &str, src: &str, rect: Rect) -> Result<String> {
+        let rect = rect.normalized();
+        if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
+            return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
+        }
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect }))
+    }
+
+    /// Remove one paint operation (a tool's cancel). Refused when its layer
+    /// is locked. Undo takes back a person's own last operation through the
+    /// board's undo manager, as it does for elements.
+    pub fn delete_paint_op(&mut self, id: &str) -> Result<()> {
+        let map = self.paint_op_map(id)?;
+        let layer = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
+        let ls = self.tree()?;
+        if let Some(at) = ls.entry(&layer) {
+            if let Some(locked) = ls.locked(at) {
+                return Err(BoardError::LayerLocked(locked));
+            }
+        }
+        self.board()?.remove(self.txn, &crate::paint_ops::paint_key(id));
+        Ok(())
+    }
+
+    /// The paint layer a paint tool draws into (docs/DRAWING_CONTRACT.md
+    /// section 1, "Tools pick their layer"): `picked` when it is a paint
+    /// layer that is not locked and not in a hidden or locked group; else the
+    /// nearest such paint layer above it that shows; else a new paint layer
+    /// "Paint N" (the first free number) made just above `picked`, in its
+    /// group (above the top-level layer holding it when that group is hidden
+    /// or locked). With nothing picked: the topmost such paint layer that
+    /// shows, else a new one on top. **The model makes the layer**, in the
+    /// same transaction as whatever the caller does next (one undo with the
+    /// first stroke); answers its id, and the UI picks it.
+    pub fn paint_layer_for(&mut self, picked: Option<&str>) -> Result<String> {
+        let ls = self.tree()?;
+        let entries = &ls.tree.entries;
+        let takes = |at: usize| {
+            let e = &entries[at];
+            e.kind == LayerKind::Paint && !e.effective_locked && e.parent.is_none_or(|p| entries[p].effective_visible)
+        };
+        let picked = picked.and_then(|id| ls.entry(id));
+        if let Some(at) = picked {
+            if takes(at) {
+                return Ok(ls.id(at).to_string());
+            }
+            if let Some(found) = (at + 1..entries.len()).find(|j| takes(*j) && entries[*j].effective_visible) {
+                return Ok(ls.id(found).to_string());
+            }
+        } else if let Some(found) = (0..entries.len()).rev().find(|j| takes(*j) && entries[*j].effective_visible) {
+            return Ok(ls.id(found).to_string());
+        }
+        let name = free_layer_name(&ls.raw, "Paint");
+        let (parent, placement) = match picked {
+            Some(at) => {
+                let group = entries[at].parent;
+                let open = group.is_none_or(|g| entries[g].effective_visible && !entries[g].effective_locked);
+                if open {
+                    (group.map(|g| ls.id(g).to_string()), Placement::Above(ls.id(at).to_string()))
+                } else {
+                    // Above the top-level layer that holds the pick.
+                    let top = ls.tree.ancestors(at).last().unwrap_or(at);
+                    (None, Placement::Above(ls.id(top).to_string()))
+                }
+            }
+            None => (None, Placement::Top),
+        };
+        self.add_layer_in(&name, LayerKind::Paint, parent.as_deref(), placement)
+    }
+
+    /// The paint layer the highlighter preset draws into on a picture
+    /// (docs/DRAWING_CONTRACT.md section 1): the paint layer named
+    /// "Highlights" just above the picture's layer when there is one, else a
+    /// new one made there, blended multiply. With no picture (a canvas whose
+    /// picture is under everything) it is the bottom layer of the canvas.
+    /// Refused when that "Highlights" layer is locked.
+    pub fn highlights_layer(&mut self, picture: Option<&str>) -> Result<String> {
+        let ls = self.tree()?;
+        let (parent, placement) = match picture {
+            Some(id) => {
+                let map = self.element(id)?;
+                let layer = self.drawn_in(&map)?;
+                let at = ls.entry(&layer).ok_or_else(|| BoardError::NoLayer(layer.clone()))?;
+                let siblings = ls.tree.siblings(at);
+                let pos = siblings.iter().position(|s| *s == at).unwrap_or(0);
+                if let Some(&above) = siblings.get(pos + 1) {
+                    if is_highlights(&ls, above) {
+                        return reuse_highlights(&ls, above);
+                    }
+                }
+                (ls.tree.entries[at].parent.map(|p| ls.id(p).to_string()), Placement::Above(layer))
+            }
+            None => {
+                if let Some(&bottom) = ls.tree.roots.first() {
+                    if is_highlights(&ls, bottom) {
+                        return reuse_highlights(&ls, bottom);
+                    }
+                }
+                (None, Placement::Bottom)
+            }
+        };
+        let id = self.add_layer_in(HIGHLIGHTS_LAYER_NAME, LayerKind::Paint, parent.as_deref(), placement)?;
+        self.set_layer_blend(&id, crate::brush::HIGHLIGHTER.layer_blend)?;
+        Ok(id)
+    }
+}
+
+/// The name of the paint layer the highlighter makes on a picture.
+pub const HIGHLIGHTS_LAYER_NAME: &str = "Highlights";
+
+fn is_highlights(ls: &Layers, at: usize) -> bool {
+    ls.tree.entries[at].kind == LayerKind::Paint && ls.raw_of(at).name == HIGHLIGHTS_LAYER_NAME
+}
+
+fn reuse_highlights(ls: &Layers, at: usize) -> Result<String> {
+    match ls.locked(at) {
+        Some(locked) => Err(BoardError::LayerLocked(locked)),
+        None => Ok(ls.id(at).to_string()),
+    }
+}
+
+/// "`stem` N" with the smallest N no layer is named.
+pub fn free_layer_name(layers: &[RawLayer], stem: &str) -> String {
+    (1..).map(|n| format!("{stem} {n}")).find(|name| !layers.iter().any(|l| &l.name == name)).expect("a free number")
 }
 
 // ── Reading ─────────────────────────────────────────────────────────────
@@ -2040,6 +2353,9 @@ pub struct RawBoard {
     pub edited_at: Option<String>,
     pub layers: Vec<RawLayer>,
     pub elements: Vec<RawElement>,
+    /// Paint operations, in no particular order (docs/DRAWING_CONTRACT.md
+    /// section 3); read with the elements.
+    pub paint: Vec<crate::paint_ops::RawPaintOp>,
 }
 
 /// The board's values; its elements too when `with_elements`.
@@ -2061,6 +2377,7 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         _ => Vec::new(),
     };
     let mut elements = Vec::new();
+    let mut paint = Vec::new();
     if with_elements {
         if let Some(Out::YMap(map)) = board.get(txn, ELEMENTS) {
             elements.reserve(map.len(txn) as usize);
@@ -2068,6 +2385,10 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
                 let Out::YMap(el) = out else { continue };
                 elements.push(read_element(txn, id, &el));
             }
+        }
+        for (key, out) in board.iter(txn) {
+            let (Some(id), Out::YMap(op)) = (key.strip_prefix(crate::paint_ops::PAINT_PREFIX), out) else { continue };
+            paint.push(read_paint_op(txn, id, &op));
         }
     }
     RawBoard {
@@ -2078,6 +2399,7 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         edited_at: string_of(board.get(txn, EDITED_AT)),
         layers,
         elements,
+        paint,
     }
 }
 
@@ -2165,6 +2487,112 @@ fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
         note: read_note(txn, el),
         fields: read_fields(txn, el),
     }
+}
+
+/// A paint operation as stored (see [`crate::paint_ops`]).
+pub(crate) fn read_paint_op<T: ReadTxn>(txn: &T, id: &str, map: &MapRef) -> crate::paint_ops::RawPaintOp {
+    use crate::paint_ops::{settings_from, unpack_brush_points, PaintBody, PixelsOp, StrokeOp};
+    let kind = string_of(map.get(txn, KIND)).unwrap_or_default();
+    let body = match kind.as_str() {
+        "stroke" => {
+            let preset = string_of(map.get(txn, paint_keys::PRESET)).unwrap_or_default();
+            let named = crate::brush::preset(&preset);
+            let base = named.map(|p| p.settings).unwrap_or_default();
+            let brush = match map.get(txn, paint_keys::BRUSH) {
+                Some(Out::Any(Any::Map(m))) => Some(m),
+                _ => None,
+            };
+            let settings = settings_from(base, |k| {
+                let v = brush.as_ref()?.get(k)?;
+                match v {
+                    Any::Array(items) => Some(items.iter().filter_map(number).map(|n| n as f32).collect()),
+                    other => number(other).map(|n| vec![n as f32]),
+                }
+            });
+            let color = string_of(map.get(txn, paint_keys::COLOR))
+                .as_deref()
+                .and_then(Color::parse)
+                .or(named.map(|p| p.color))
+                .unwrap_or(Color::BLACK);
+            let blend = crate::brush::StrokeBlend::parse(&string_of(map.get(txn, BLEND)).unwrap_or_default());
+            let mut points = Vec::new();
+            if let Some(Out::YArray(array)) = map.get(txn, paint_keys::POINTS) {
+                for chunk in array.iter(txn) {
+                    if let Out::Any(Any::Buffer(bytes)) = chunk {
+                        unpack_brush_points(&bytes, &mut points);
+                    }
+                }
+            }
+            PaintBody::Stroke(Arc::new(StrokeOp { preset, settings, color, blend, points }))
+        }
+        "pixels" => {
+            let rect = match map.get(txn, paint_keys::RECT) {
+                Some(Out::Any(Any::Map(m))) => rect_of(&m),
+                _ => None,
+            };
+            match (string_of(map.get(txn, paint_keys::SRC)), rect) {
+                (Some(src), Some(rect)) => PaintBody::Pixels(PixelsOp { src, rect }),
+                _ => PaintBody::Other(kind.clone()),
+            }
+        }
+        _ => PaintBody::Other(kind.clone()),
+    };
+    crate::paint_ops::RawPaintOp {
+        id: id.to_string(),
+        layer: string_of(map.get(txn, LAYER)).unwrap_or_default(),
+        order: string_of(map.get(txn, ORDER)).unwrap_or_default(),
+        body,
+        author: author_of(map.get(txn, AUTHOR)),
+        created_at: string_of(map.get(txn, CREATED_AT)).unwrap_or_default(),
+    }
+}
+
+/// Write a paint operation's own keys into its (new) map.
+fn write_paint_op(txn: &mut TransactionMut, map: &MapRef, op: &crate::paint_ops::RawPaintOp) {
+    use crate::paint_ops::{pack_brush_points, settings_fields, PaintBody, SettingValue};
+    map.insert(txn, LAYER, op.layer.clone());
+    map.insert(txn, ORDER, op.order.clone());
+    map.insert(txn, KIND, op.kind().to_string());
+    match &op.body {
+        PaintBody::Stroke(s) => {
+            map.insert(txn, paint_keys::PRESET, s.preset.clone());
+            map.insert(txn, paint_keys::COLOR, s.color.to_hex());
+            map.insert(txn, BLEND, s.blend.as_str());
+            let mut brush = HashMap::new();
+            for (k, v) in settings_fields(&s.settings) {
+                let any = match v {
+                    SettingValue::N(n) => Any::Number(n as f64),
+                    SettingValue::Curve(c) => Any::Array(vec![Any::Number(c.at0 as f64), Any::Number(c.at1 as f64), Any::Number(c.gamma as f64)].into()),
+                };
+                brush.insert(k.to_string(), any);
+            }
+            map.insert(txn, paint_keys::BRUSH, Any::Map(Arc::new(brush)));
+            let array: ArrayRef = map.insert(txn, paint_keys::POINTS, ArrayPrelim::default());
+            if !s.points.is_empty() {
+                array.push_back(txn, Any::Buffer(pack_brush_points(&s.points).into()));
+            }
+        }
+        PaintBody::Pixels(p) => {
+            map.insert(txn, paint_keys::SRC, p.src.clone());
+            map.insert(txn, paint_keys::RECT, Any::Map(Arc::new(rect_fields(&p.rect))));
+        }
+        PaintBody::Other(_) => {}
+    }
+    if let Some(author) = &op.author {
+        map.insert(txn, AUTHOR, author_any(author));
+    }
+    map.insert(txn, CREATED_AT, op.created_at.clone());
+}
+
+/// The keys of a paint operation's map besides the element keys it shares
+/// (`layer`, `order`, `kind`, `blend`, `author`, `created_at`).
+pub(crate) mod paint_keys {
+    pub const PRESET: &str = "preset";
+    pub const COLOR: &str = "color";
+    pub const BRUSH: &str = "brush";
+    pub const POINTS: &str = "points";
+    pub const SRC: &str = "src";
+    pub const RECT: &str = "rect";
 }
 
 fn read_note<T: ReadTxn>(txn: &T, map: &MapRef) -> Option<String> {

@@ -42,9 +42,17 @@
 //!   ([`BoardTxn::import_svg`] puts them on the board).
 //! - [`Gradient`], [`Paint`]: linear and radial gradients in fills and
 //!   strokes ([`BoardTxn::set_fill_paint`], [`BoardTxn::set_stroke_paint`]).
+//! - Paint layers (docs/DRAWING_CONTRACT.md section 3): [`paint_ops`] (the
+//!   operations as stored), [`brush`] (presets, dabs, the engine), [`tiles`]
+//!   (the tile renderer and its cache, [`PaintCache`], a disk hook
+//!   [`TileStore`]); [`BoardTxn::begin_stroke`] and friends write them,
+//!   [`sample_color`] is the eyedropper.
 
+pub mod brush;
 pub mod combine;
 pub mod doc;
+pub mod paint_ops;
+pub mod tiles;
 mod hit;
 pub mod layer_tree;
 pub mod locks;
@@ -64,8 +72,13 @@ pub mod view;
 
 pub use doc::{
     Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
-    TEXT_BOARD_PREFIX, BOARD_KEY,
+    free_layer_name, HIGHLIGHTS_LAYER_NAME, TEXT_BOARD_PREFIX, BOARD_KEY,
 };
+pub use brush::{BrushPoint, BrushSettings, Curve, Jitter, Preset, StrokeBlend, PRESETS, PX_PER_UNIT};
+pub use paint_ops::{NewStroke, PaintBody, PaintOp, PixelsOp, RawPaintOp, StrokeOp};
+pub use tiles::{CacheStats, PaintCache, TileKey, TileStore, TILE_PX, TILE_UNITS};
+#[cfg(not(target_arch = "wasm32"))]
+pub use tiles::DirTileStore;
 pub use layer_tree::{LayerTree, TreeEntry};
 pub use locks::Deleted;
 pub use recipe::{NewCanvas, StartingPicture};
@@ -74,10 +87,10 @@ pub use paint::pressure_width;
 pub use path::{Anchor, AnchorMode, AnchorRef, HandleRef, HandleSide, PathError, PathGeom, PathRule, SegmentHit, Subpath};
 pub use options::{author_color, author_color_index, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 pub use render::{
-    draw_region, render, render_area, render_extent, selection_bounds, NoPictures, Picture, PictureSource, Rendered,
-    RgbaImage, View, MAX_EXTENT_PX,
+    draw_region, render, render_area, render_extent, render_paint_layer, sample_color, selection_bounds, NoPictures, Picture, PictureSource,
+    Rendered, RgbaImage, View, MAX_EXTENT_PX,
 };
-pub use snapshot::{BoardSnapshot, Element, Layer};
+pub use snapshot::{BoardSnapshot, Element, Layer, PaintMark};
 pub use combine::CombineOp;
 pub use svg::render_svg;
 pub use svg_in::{SvgError, SvgImport, SvgItem, SvgPlacement};

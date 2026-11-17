@@ -27,6 +27,15 @@ pub fn not_a_vector_layer(kind: &LayerKind) -> String {
     }
 }
 
+/// The sentence for paint sent to a layer of `kind` that is not a paint layer.
+pub fn not_a_paint_layer(kind: &LayerKind) -> String {
+    match kind {
+        LayerKind::Group => "That is a group. Pick a paint layer inside it, or another layer.".to_string(),
+        LayerKind::Vector => "That is a vector layer. Brushes paint in a paint layer.".to_string(),
+        other => format!("That is a {other} layer. Brushes paint in a paint layer."),
+    }
+}
+
 /// The one judgement of an element edit: refused when the element is locked
 /// or the layer it is drawn in is (`layer`, when that layer is locked). The
 /// layer's lock is named first: unlocking the element would not help.
