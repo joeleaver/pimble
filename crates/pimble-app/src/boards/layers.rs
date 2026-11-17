@@ -534,7 +534,7 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                             ui.folded_groups.get().contains(&row.id),
                         ),
                         class: {|| row_class(ui, &class_id)},
-                        style: format!("padding-left: {}px;", 4 + row.depth * 14),
+                        style: format!("padding-left: {}px;", indent_px(row.depth)),
                         draggable: "true",
                         ondragstart: {
                             let id = row.id.clone();
@@ -811,9 +811,27 @@ fn name_cell(__scope: &mut RenderScope, pane: PaneId, ui: PaneUi, row: &LayerRow
     }
 }
 
+/// A row's indent at `depth`, pixels: 14 a level for the first three, 6 a
+/// level after, never more than 64, so a deep group's names keep their
+/// room beside the icons and the thumbnail.
+pub(super) fn indent_px(depth: usize) -> usize {
+    let deep = depth.saturating_sub(3);
+    (4 + depth.min(3) * 14 + deep * 6).min(64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_rows_indent_less_and_never_past_a_bound() {
+        assert_eq!(indent_px(0), 4);
+        assert_eq!(indent_px(1), 18);
+        assert_eq!(indent_px(3), 46);
+        assert_eq!(indent_px(4), 52);
+        assert_eq!(indent_px(9), 64);
+        assert_eq!(indent_px(30), 64);
+    }
 
     fn row(id: &str, parent: Option<&str>, kind: LayerKind, depth: usize) -> LayerRow {
         LayerRow {

@@ -267,6 +267,8 @@ pub const SMOOTHING: [(&str, f32); 3] = [("Low", 0.75), ("Medium", 2.0), ("High"
 pub const DEFAULT_SMOOTHING: f32 = 2.0;
 /// The polygon sides and star points the context bar offers.
 pub const SIDES: [u32; 7] = [3, 4, 5, 6, 8, 10, 12];
+/// The miter limits offered while corners are mitered (4 is the default).
+pub const MITERS: [f32; 5] = [1.0, 2.0, 4.0, 8.0, 10.0];
 pub const STAR_POINTS: [u32; 6] = [4, 5, 6, 7, 8, 12];
 
 /// What the context bar says when the tool has nothing to set.
@@ -333,6 +335,16 @@ pub enum Keys {
     /// Somewhere with inputs (the meaning panel, the picker's hex box):
     /// every key is theirs.
     Typing,
+    /// The well's stop bar: Delete or Backspace removes the picked stop
+    /// (a field that holds the focus keeps its keys, as everywhere).
+    Stops,
+}
+
+thread_local! {
+    /// When the stop bar was last pressed (ms): the well popup's own press
+    /// handler, which the browser runs after the bar's, leaves the keys with
+    /// the bar.
+    static STOP_PRESS: std::cell::Cell<f64> = const { std::cell::Cell::new(f64::NEG_INFINITY) };
 }
 
 /// What a key does while `keys` has the board's keys (`None`: not ours).
@@ -347,6 +359,8 @@ pub enum KeyAct {
     Flip(FlipAxis),
     /// `[` (false) or `]` (true): a paint tool's size.
     Bracket(bool),
+    /// Delete on the stop bar: the picked stop goes.
+    RemoveStop,
 }
 
 /// The chrome's key judgement, pure: plain letters, X and Tab from the
@@ -362,6 +376,7 @@ pub fn key_act(keys: Keys, key: &str, ctrl: bool, shift: bool, alt: bool) -> Opt
             k => Tool::from_chord(k, shift).map(KeyAct::Tool),
         },
         Keys::Layers if ctrl && !shift && !alt && key.eq_ignore_ascii_case("g") => Some(KeyAct::GroupLayers),
+        Keys::Stops if !ctrl && !alt && matches!(key, "Delete" | "Backspace") => Some(KeyAct::RemoveStop),
         _ => None,
     }
 }
@@ -373,7 +388,7 @@ pub fn key_act(keys: Keys, key: &str, ctrl: bool, shift: bool, alt: bool) -> Opt
 pub(super) fn keys_to(store: AppStore, pane: PaneId, keys: Keys) {
     let ui = store.pane(pane).board_ui;
     ui.keys.set_if_changed(keys);
-    if !matches!(keys, Keys::Chrome | Keys::Layers) || untracked(|| ui.renaming.get()).is_some() {
+    if !matches!(keys, Keys::Chrome | Keys::Layers | Keys::Stops) || untracked(|| ui.renaming.get()).is_some() {
         return;
     }
     rinch::core::set_keyboard_interceptor(move |data| {
@@ -396,6 +411,7 @@ pub(super) fn keys_to(store: AppStore, pane: PaneId, keys: Keys) {
             KeyAct::Flip(axis) if untracked(|| ui.selected.get()) > 0 => tools::flip(store, pane, axis),
             KeyAct::Flip(FlipAxis::Horizontal) => pick_tool(store, pane, Tool::Hand),
             KeyAct::Flip(FlipAxis::Vertical) => pick_tool(store, pane, Tool::Select),
+            KeyAct::RemoveStop => gradient::remove_picked(store, pane),
             KeyAct::Bracket(larger) => {
                 if untracked(|| store.board_tool.get()).paints() {
                     super::paint::step_size(store, pane, larger);
@@ -750,6 +766,8 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         .map(|(dash, icon, tip)| {
             icon_button(__scope, icon, tip.to_string(), move || st.dash.get() == dash, move || {
                 st.dash.set(dash);
+                // A preset picked: the custom pattern goes (it would win).
+                st.dash_text.set(String::new());
                 ui.popup.set(Popup::None);
                 apply(Style { dash: Some(dash), ..Style::default() });
             })
@@ -861,6 +879,36 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             })
         })
         .collect();
+    // The miter limit, shown while corners are mitered.
+    let miters: Vec<NodeHandle> = MITERS
+        .iter()
+        .map(|&m| {
+            text_button(__scope, number_label(m as u32), "Miter limit: how far a sharp corner may reach before it is cut", move || (st.miter.get() - m).abs() < 1e-3, move || {
+                st.miter.set(m);
+                apply(Style { miter: Some(m), ..Style::default() });
+            })
+        })
+        .collect();
+    let mitered = move || st.join.get() == Some(pimble_board::Join::Miter);
+    // A custom dash pattern, typed: applied as soon as it reads as one,
+    // cleared (the preset draws) when emptied.
+    let pattern_input = rsx! {
+        input {
+            r#type: "text",
+            class: {move || if !st.dash_text.get().trim().is_empty() && pimble_board::parse_dash_pattern(&st.dash_text.get()).is_none() { "pimble-board__pattern pimble-board__pattern--bad" } else { "pimble-board__pattern" }},
+            placeholder: "e.g. 6 3 1 3",
+            title: "A dash pattern: lengths on and off in turn, board units",
+            value: move || st.dash_text.get(),
+            oninput: move |v: String| {
+                st.dash_text.set(v.clone());
+                if v.trim().is_empty() {
+                    tools::clear_dash_pattern(store, pane);
+                } else if let Some(p) = pimble_board::parse_dash_pattern(&v) {
+                    apply(Style { dash_pattern: Some(p), ..Style::default() });
+                }
+            },
+        }
+    };
     let rules: Vec<NodeHandle> = [(pimble_board::PathRule::NonZero, "Nonzero", "Overlaps fill"), (pimble_board::PathRule::EvenOdd, "Even-odd", "Overlaps make holes")]
         .into_iter()
         .map(|(rule, label, tip)| {
@@ -891,7 +939,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         span { class: "pimble-board__face-text", {move || { let v = st.smoothing.get(); SMOOTHING.iter().find(|(_, s)| *s == v).map(|(l, _)| l.to_string()).unwrap_or_default() }} }
     };
     let shape_btn = picker_button(__scope, ui, "Shape: corner radius, sides, points", Popup::Shape, "pimble-board__chooser--words", shape_face);
-    let detail_btn = picker_button(__scope, ui, "Stroke ends and corners, fill rule", Popup::Detail, "", detail_face);
+    let detail_btn = picker_button(__scope, ui, "Stroke ends, corners and dashes, fill rule", Popup::Detail, "", detail_face);
     let smoothing_btn = picker_button(__scope, ui, "Smoothing", Popup::Smoothing, "pimble-board__chooser--words", smoothing_face);
 
     // A paint tool's: the color it paints with (the color well's front
@@ -985,7 +1033,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     .collect();
     let combine_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: TablerIcon::LayersUnion.name().to_string() } } };
     let combine_btn = picker_button(__scope, ui, "Combine: union, subtract, intersect, exclude", Popup::Combine, "", combine_face);
-    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back, flip".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
+    let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back, flip, outline stroke".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
     let align_btn = icon_button(__scope, TablerIcon::LayoutAlignCenter, "Align and distribute".to_string(), move || ui.popup.get() == Popup::Align, move || toggle(ui, Popup::Align));
     let undo_btn = act(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |s, p| tools::undo(s, p, false));
     let redo_btn = act(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |s, p| tools::undo(s, p, true));
@@ -1046,6 +1094,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::StackPop, "Send to Back (Ctrl+Shift+[)", Box::new(|s, p| tools::reorder(s, p, Order::Back))),
         menu_item(__scope, store, pane, TablerIcon::FlipVertical, "Flip Horizontal (Shift+H)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Horizontal))),
         menu_item(__scope, store, pane, TablerIcon::FlipHorizontal, "Flip Vertical (Shift+V)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Vertical))),
+        menu_item(__scope, store, pane, TablerIcon::BorderOuter, "Outline Stroke", Box::new(tools::outline_stroke)),
     ];
     let writable = move || {
         state
@@ -1064,6 +1113,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             }},
             div {
                 class: "pimble-float pimble-board__context",
+                onmouseenter: move || tools::pointer_off(store, pane),
                 onmousedown: move || {
                     crate::pane_view::press_in_view();
                     keys_to(store, pane, Keys::Chrome);
@@ -1193,6 +1243,14 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                 div { class: "pimble-board__row", style: {move || shown(controls().join)},
                     span { class: "pimble-board__ctx-label", "Corners" }
                     {joins}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().join && mitered())},
+                    span { class: "pimble-board__ctx-label", "Miter" }
+                    {miters}
+                }
+                div { class: "pimble-board__row", style: {move || shown(controls().dash)},
+                    span { class: "pimble-board__ctx-label", "Dashes" }
+                    {pattern_input}
                 }
                 div { class: "pimble-board__row", style: {move || shown(controls().rule && ui.selected.get() > 0)},
                     span { class: "pimble-board__ctx-label", "Fill" }
@@ -1399,7 +1457,14 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
             div {
                 class: "pimble-float pimble-board__well-pop",
                 style: {move || if ui.popup.get() == Popup::Well { "" } else { "display: none;" }},
-                onmousedown: move || keys_to(store, pane, Keys::Typing),
+                // The popup's inputs hear their own keys; a press on the stop
+                // bar (which the browser bubbles here after it) leaves the
+                // keys with the bar.
+                onmousedown: move || {
+                    if now_ms() - STOP_PRESS.with(|t| t.get()) > 100.0 {
+                        keys_to(store, pane, Keys::Typing);
+                    }
+                },
                 div {
                     class: "pimble-board__row",
                     span { class: "pimble-board__ctx-label pimble-board__grow", {move || if st.front.get() == Well::Fill { "Fill" } else { "Stroke" }} }
@@ -1425,6 +1490,8 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
                         style: {move || front_gradient().map(|g| format!("background: {};", gradient::bar_css(&g))).unwrap_or_default()},
                         onmousedown: move || {
                             let ctx = rinch::core::get_click_context();
+                            STOP_PRESS.with(|t| t.set(now_ms()));
+                            keys_to(store, pane, Keys::Stops);
                             gradient::press_bar(store, pane, gradient::offset_at(ctx.mouse_x - ctx.element_x, ctx.element_width));
                         },
                         for (i, left, color, picked) in stop_marks() {
@@ -1568,6 +1635,7 @@ pub(super) fn render_zoom_corner(__scope: &mut RenderScope, store: AppStore, pan
     rsx! {
         div {
             class: "pimble-board__corner",
+            onmouseenter: move || tools::pointer_off(store, pane),
             onmousedown: move || {
                 crate::pane_view::press_in_view();
                 keys_to(store, pane, Keys::Chrome);
@@ -1813,6 +1881,10 @@ mod tests {
         assert_eq!(key_act(Keys::Chrome, "Tab", false, false, false), Some(KeyAct::TogglePanels));
         assert_eq!(key_act(Keys::Chrome, "[", false, false, false), Some(KeyAct::Bracket(false)));
         assert_eq!(key_act(Keys::Chrome, "]", false, false, false), Some(KeyAct::Bracket(true)));
+        assert_eq!(key_act(Keys::Stops, "Delete", false, false, false), Some(KeyAct::RemoveStop));
+        assert_eq!(key_act(Keys::Stops, "Backspace", false, false, false), Some(KeyAct::RemoveStop));
+        assert_eq!(key_act(Keys::Stops, "b", false, false, false), None, "letters on the stop bar pick no tool");
+        assert_eq!(key_act(Keys::Chrome, "Delete", false, false, false), None);
         assert_eq!(key_act(Keys::Chrome, "b", false, false, false), Some(KeyAct::Tool(Tool::Brush)));
         assert_eq!(key_act(Keys::Chrome, "B", false, true, false), Some(KeyAct::Tool(Tool::Highlighter)));
         assert_eq!(key_act(Keys::Chrome, "r", false, false, false), Some(KeyAct::Tool(Tool::Smudge)));

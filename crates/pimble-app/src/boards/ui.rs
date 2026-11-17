@@ -453,6 +453,7 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                 class: "pimble-board__left",
                 div {
                     style: {move || dim()},
+                    onmouseenter: move || tools::pointer_off(store, pane),
                     onmousedown: move || {
                         crate::pane_view::press_in_view();
                         super::rail::keys_to(store, pane, super::rail::Keys::Chrome);
@@ -460,7 +461,7 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                     {rail}
                 }
                 div { class: "pimble-board__grow" }
-                div { style: {move || dim()}, {well} }
+                div { style: {move || dim()}, onmouseenter: move || tools::pointer_off(store, pane), {well} }
             }
             {context}
             div {
@@ -540,40 +541,53 @@ fn render_panels(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
             }
         }
     };
-    let boxes: Vec<NodeHandle> = [("Layers", layers), ("Meaning", meaning), ("Frames", frames)]
+    let boxes: Vec<NodeHandle> = [("Layers", TablerIcon::Stack2, layers), ("Meaning", TablerIcon::Tags, meaning), ("Frames", TablerIcon::Frame, frames)]
         .into_iter()
         .enumerate()
-        .map(|(i, (title, body))| panel_box(__scope, ui, i, title, body))
+        .map(|(i, (title, icon, body))| panel_box(__scope, ui, i, title, icon, body))
         .collect();
+    // The layers' thumbnails are not drawn while the panel is folded or
+    // hidden: opening it draws what changed meanwhile.
+    let _ = rinch::Effect::new(move || {
+        let open = !ui.panels_hidden.get() && !ui.folded.get()[0];
+        if open {
+            untracked(|| super::paint::thumbs_due(store, pane));
+        }
+    });
     rsx! {
         div {
             class: "pimble-board__panels",
             style: {move || if ui.panels_hidden.get() { "display: none;" } else { "" }},
+            onmouseenter: move || super::tools::pointer_off(store, pane),
             onmousedown: move || crate::pane_view::press_in_view(),
             {boxes}
         }
     }
 }
 
-/// One floating panel: a title row that folds it, and its body.
-fn panel_box(__scope: &mut RenderScope, ui: PaneUi, index: usize, title: &'static str, body: NodeHandle) -> NodeHandle {
+/// One floating panel: a title row that folds it, and its body. Folded,
+/// it is its icon alone (the contract's "each folds to its icon"), so the
+/// folded panels make a small column of icons.
+fn panel_box(__scope: &mut RenderScope, ui: PaneUi, index: usize, title: &'static str, icon: TablerIcon, body: NodeHandle) -> NodeHandle {
     let folded = move || ui.folded.get()[index];
     rsx! {
         div {
-            class: "pimble-float pimble-board__panel-box",
+            class: {move || if folded() { "pimble-float pimble-board__panel-box pimble-board__panel-box--icon" } else { "pimble-float pimble-board__panel-box" }},
+            div {
+                class: "pimble-board__panel-icon",
+                title: format!("{title}: click to unfold (Tab hides every panel)"),
+                style: {move || if folded() { "" } else { "display: none;" }},
+                onclick: move || ui.folded.update(|f| f[index] = false),
+                IconGlyph { name: icon.name().to_string() }
+            }
             div {
                 class: "pimble-board__panel-title",
-                title: "Fold or unfold (Tab hides every panel)",
-                onclick: move || ui.folded.update(|f| f[index] = !f[index]),
-                span {
-                    class: "pimble-board__layer-icon",
-                    if ui.folded.get()[index] {
-                        IconGlyph { name: TablerIcon::ChevronRight.name().to_string() }
-                    } else {
-                        IconGlyph { name: TablerIcon::ChevronDown.name().to_string() }
-                    }
-                }
-                span { {title} }
+                title: "Fold to an icon (Tab hides every panel)",
+                style: {move || if folded() { "display: none;" } else { "" }},
+                onclick: move || ui.folded.update(|f| f[index] = true),
+                span { class: "pimble-board__layer-icon", IconGlyph { name: icon.name().to_string() } }
+                span { class: "pimble-board__grow", {title} }
+                span { class: "pimble-board__layer-icon", IconGlyph { name: TablerIcon::ChevronUp.name().to_string() } }
             }
             div {
                 class: "pimble-board__panel-body",

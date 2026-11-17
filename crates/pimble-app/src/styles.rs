@@ -2396,7 +2396,9 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__layer-name {
     flex: 1;
+    min-width: 48px;
     overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
 }
 
@@ -2420,7 +2422,8 @@ pub(crate) const APP_CSS: &str = "
    the rest of the floating chrome. */
 .pimble-board__note,
 .pimble-board__field-name-input,
-.pimble-board__field-value {
+.pimble-board__field-value,
+.pimble-board__pattern {
     border: 1px solid var(--rinch-color-border);
     border-radius: var(--rinch-radius-sm);
     background: var(--rinch-color-body);
@@ -2432,8 +2435,20 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__note:focus,
 .pimble-board__field-name-input:focus,
-.pimble-board__field-value:focus {
+.pimble-board__field-value:focus,
+.pimble-board__pattern:focus {
     border-color: var(--rinch-primary-color);
+}
+
+/* The context bar's custom dash pattern; red while it does not read as one. */
+.pimble-board__pattern {
+    width: 110px;
+    font-size: 12px;
+}
+
+.pimble-board__pattern--bad,
+.pimble-board__pattern--bad:focus {
+    border-color: var(--rinch-color-red-6, #e03131);
 }
 
 .pimble-board__fields {
@@ -3017,6 +3032,25 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__panel-box {
     flex-shrink: 0;
+}
+
+/* A folded panel is its icon alone, at the right edge of the column. */
+.pimble-board__panel-box--icon {
+    align-self: flex-end;
+}
+
+.pimble-board__panel-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    cursor: pointer;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__panel-icon:hover {
+    color: var(--rinch-color-text);
 }
 
 .pimble-board__panel-body {

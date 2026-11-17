@@ -1,6 +1,6 @@
 # Drawing contract: vector and paint tools, and the canvas redesigned around them
 
-Status: **decided; all five waves built (model and UI)** (see the end; wave 5's open questions for Joe are in its model section). Written 2026-11-14 from Joe's answers of that day
+Status: **decided; all five waves built (model and UI), loose ends closed 2026-11-17** (see "Loose ends closed" at the end for what remains; wave 5's open questions for Joe are in its model section). Written 2026-11-14 from Joe's answers of that day
 ("Decisions" below). Builds on docs/IMAGE_MARKUP_CONTRACT.md (the board document, layers,
 locks, undo, attribution) and docs/CANVAS_CONTRACT.md (every picture is a canvas). Where this
 contract and those disagree, this one wins.
@@ -1693,3 +1693,90 @@ drawn as marching ants: a white line under a dashed one).
   apps do), which surprised in the check; a non-uniform scale of a turned selection shears
   it (elements keep proportions when turned; pixels follow the handles); the ants re-present
   the frame every 200 ms while a selection exists.
+
+## Loose ends closed
+
+Done 2026-11-17 on `master`, from the "Not built" and "Rough edges" lines above. Desktop and
+browser share the code; checked in the desktop test app (screenshots `le_*.png` in the
+session's scratchpad).
+
+1. **Direct select: done.** Shift keeps a dragged anchor at a multiple of 45° from where it
+   was, and a handle tip at a multiple of 45° from its anchor; with snapping on, the anchor
+   pressed (a segment's first end) or the handle tip lands on the grid (both: the grid
+   point projected onto the 45° direction; `points::constrained`, tested). **Anchors of
+   several elements**: a marquee picks the anchors of every shown, editable element inside
+   it (Shift adds to what was picked), and Shift-click on another element's anchor adds it;
+   `PointEdit.others` holds the other elements' selected anchors, drawn as outlines and
+   anchors (handles show on the element pressed last only). A drag of anchors moves all of
+   them by the same board offset (each element through its own transform; live shapes turn
+   into paths in the same edit), Delete removes them from every element, each one undo step
+   (tested: `direct_select_constrains_and_snaps_points`,
+   `direct_select_moves_anchors_of_several_elements`; `le_2_marquee_two.png`,
+   `le_3_moved_two.png`). A plain press on an anchor not selected, or on a segment, keeps
+   only that element's.
+2. **Stroke controls: done.** The ends and corners picker has a **Miter** row (1, 2, 4, 8,
+   10; shown while corners are mitered) and a **Dashes** text field ("e.g. 6 3 1 3", outlined
+   red while it does not read as a pattern) applied as soon as it parses
+   (`parse_dash_pattern`), cleared from the selection when emptied, and emptied when a dash
+   preset is picked. New elements take both (the miter only with mitered corners and not
+   the default); selecting shows them (`StyleUi.miter`, `dash_text`; tested;
+   `le_4_detail.png`, `le_5_dashes_miter.png`).
+3. **Outline Stroke (decision 9): done.** `BoardTxn::outline_stroke(ids)`: the stroke
+   (width, ends, corners, miter limit, dashes) is outlined with tiny-skia's stroker (dashes
+   first) at 4 pixels a unit and read back as anchors (`PathGeom::from_tiny`: quadratics
+   become their cubics), filled nonzero with the stroke's color or gradient, width 0, under
+   a transform that keeps it in place. An element with no fill and no text **becomes** its
+   outline (its id, layer, order, group, meaning kept); one with a fill or text keeps them,
+   loses its stroke, and the outline is a new path right above it. One transaction;
+   refusals are sentences (no outline, no stroke, locked). In the selection's "more" menu
+   ("Outline Stroke"), and the MCP's `outline_stroke` tool (docs/MCP_CONTRACT.md). Tested
+   (`tests/loose_ends.rs`: a butt-capped line's area and look, a turned filled rectangle
+   looking the same, five dashes, refusals; the app's one undo step; `le_6_more_menu.png`,
+   `le_7_outlined.png`). Deviation: a stroke gradient moves to the fill with the same
+   handles, laid over the outline's box, which is wider than the path's by half the stroke,
+   so it shifts slightly.
+4. **Pencil pressure: left.** The fitted path is a centerline with one width; carrying
+   pressure means turning a pressure-varied Pencil stroke into a filled outline (the union
+   of the discs and bands the pen draws, cleaned up by a boolean union and refitted). That
+   is not cheap (the union of hundreds of circles through linesweeper, then fitting each
+   contour) and it changes what the Pencil makes for tablet users: a blob whose anchors are
+   the outline's, no longer an editable centerline. That trade is Joe's call; Outline Stroke
+   now gives a filled outline of a constant-width path on request.
+5. **Gradients: done (Delete); focal handles skipped.** A press on the well's stop bar gives
+   it the keys (`Keys::Stops`); Delete or Backspace then removes the picked stop (at least
+   two stay, as the x button). A focused field (the hex box) keeps its own keys, as
+   everywhere (tested in `key_act`; not driven in the test app). The radial focal point has
+   no model, so it has no handles.
+6. **Layers panel: done.** Thumbnails are not drawn while the panel is folded or hidden by
+   Tab; unfolding it draws what changed meanwhile. A row's indent is 14 pixels a level for
+   three levels, 6 after, never more than 64 (`layers::indent_px`, tested), and a name keeps
+   at least 48 pixels with an ellipsis (`le_0.png`). **Each panel folds to its icon**
+   (Layers a stack, Meaning tags, Frames a frame): folded panels make a small column of
+   icons at the right edge, a click unfolds (`le_1_folded.png`, `le_14_unfolded_thumbs.png`).
+7. **Brush cursor: done.** The rail, the well, the context bar, the panels and the zoom
+   corner hear the pointer coming onto them (`onmouseenter`) and take it off the board
+   (`tools::pointer_off`, also what the surface's own leave does): the cursor, the Pen's
+   segment to the pointer and this person's pointer for others go (`le_8`, `le_9`).
+8. **Selections: done.** `BoardView` redraws only under the old and the new overlay when
+   nothing but the overlay changed (pixels restored from the cache, the overlay drawn over
+   them; a test checks the patched frame equals a whole compose exactly); the ants still
+   march every 200 ms, but only while their pane has the focus. The frame is still handed
+   to the surface whole (rinch has no partial submit; a rinch mechanism to propose if it
+   shows). **A turned selection scales in its own frame**: a side or corner handle of the
+   box is mapped to the selection's own side facing the same way, the drag is read in the
+   selection's own space, and the scale is applied before its turn, so it never shears
+   (`paint_select::scaled_in_own_frame`, tested; `le_11_turned.png`,
+   `le_12_scaled_turned.png`). An unturned selection scales as before. The handles still sit
+   on the box around the turned pixels.
+9. **Smudge off the paint: done.** Each spot of the smudge brush loads the first time it
+   passes over paint (at least 8/255 opaque) and lays nothing down before; a smudge started
+   off the paint does nothing until it reaches some, and drags in no transparency
+   (deterministic; tested). This changes how smudge operations replay: tiles cached on disk
+   by an earlier build of wave 5 keep the old look until their operations change (the tile
+   key has no renderer version; nothing before wave 5 had smudges).
+
+**Still open** (as before): pasting an image into a paint layer, copying a selection's
+pixels, selections across layers, feathered edges, adding to or subtracting from a
+selection, the selection's own context bar, IndexedDB tiles, tilt, the focal point of a
+radial gradient, Pencil pressure (item 4), handles drawn along a turned selection's own
+sides.

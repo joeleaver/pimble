@@ -70,6 +70,9 @@ pub(super) struct SelDrag {
     /// The transform when it began, and the box then.
     pub base: PixelTransform,
     pub bounds: Rect,
+    /// The selection's own box, before any transform (a turned selection
+    /// scales in its own frame).
+    pub own: Rect,
     pub written_at: f64,
     /// This drag made the move operation (a cancel takes it away again).
     pub lifted: bool,
@@ -95,8 +98,16 @@ pub fn selection_from(start: Point, now: Point, lasso: Option<&[Point]>, min: f3
 
 /// The transform a drag to `p` puts the selection's pixels through: the
 /// one it began with, then the move, scale or turn (Shift: along one axis,
-/// keeping the proportions, by 15 degrees).
-pub fn dragged(kind: &DragKind, base: &PixelTransform, bounds: &Rect, start: Point, p: Point, shift: bool) -> PixelTransform {
+/// keeping the proportions, by 15 degrees). `bounds` is the handles' box
+/// (where the pixels are now), `own` the selection's box before any
+/// transform: a turned selection scales in its own frame, along its own
+/// sides, so it never shears.
+pub fn dragged(kind: &DragKind, base: &PixelTransform, bounds: &Rect, own: &Rect, start: Point, p: Point, shift: bool) -> PixelTransform {
+    if let DragKind::Scale(handle) = kind {
+        if is_turned(base) {
+            return scaled_in_own_frame(*handle, base, own, start, p, shift);
+        }
+    }
     match kind {
         DragKind::Move => {
             let (mut dx, mut dy) = (p.x - start.x, p.y - start.y);
@@ -122,6 +133,63 @@ pub fn dragged(kind: &DragKind, base: &PixelTransform, bounds: &Rect, start: Poi
             base.then(&PixelTransform::rotate(super::tools::rotation_degrees(*start_angle, a, shift), *center))
         }
     }
+}
+
+/// Whether `t` turns (or shears) what it maps: its axes are no longer the
+/// board's.
+fn is_turned(t: &PixelTransform) -> bool {
+    t.b.abs() > 1e-4 || t.c.abs() > 1e-4
+}
+
+/// A handle's direction from its box's center (y down); none for the
+/// rotate handle.
+fn handle_dir(h: Handle) -> Option<(f32, f32)> {
+    Some(match h {
+        Handle::N => (0.0, -1.0),
+        Handle::NE => (1.0, -1.0),
+        Handle::E => (1.0, 0.0),
+        Handle::SE => (1.0, 1.0),
+        Handle::S => (0.0, 1.0),
+        Handle::SW => (-1.0, 1.0),
+        Handle::W => (-1.0, 0.0),
+        Handle::NW => (-1.0, -1.0),
+        Handle::Rotate => return None,
+    })
+}
+
+/// The handle nearest direction (`dx`, `dy`).
+fn handle_toward(dx: f32, dy: f32) -> Handle {
+    const ALL: [Handle; 8] = [Handle::E, Handle::SE, Handle::S, Handle::SW, Handle::W, Handle::NW, Handle::N, Handle::NE];
+    let a = dy.atan2(dx);
+    let i = ((a / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as usize;
+    ALL[i]
+}
+
+/// Where handle `h` sits on box `b`.
+fn handle_point(h: Handle, b: &Rect) -> Point {
+    let (dx, dy) = handle_dir(h).unwrap_or((0.0, 0.0));
+    let c = b.center();
+    Point::new(c.x + dx * b.w / 2.0, c.y + dy * b.h / 2.0)
+}
+
+/// A scale handle of a turned selection dragged from `start` to `p`: the
+/// handle of the selection's own box that faces the way the pressed one
+/// does, moved by the drag as seen in the selection's own frame, its
+/// opposite side staying; then the transform it had.
+fn scaled_in_own_frame(handle: Handle, base: &PixelTransform, own: &Rect, start: Point, p: Point, shift: bool) -> PixelTransform {
+    let Some(inv) = base.inverse() else { return *base };
+    let Some((dx, dy)) = handle_dir(handle) else { return *base };
+    if own.w <= 0.0 || own.h <= 0.0 {
+        return *base;
+    }
+    // The pressed handle's direction, in the selection's own frame.
+    let local = PixelTransform { e: 0.0, f: 0.0, ..inv }.apply(Point::new(dx, dy));
+    let h = handle_toward(local.x, local.y);
+    let (q0, q) = (inv.apply(start), inv.apply(p));
+    let at = handle_point(h, own);
+    let to = super::tools::resized_bounds(h, own, Point::new(at.x + q.x - q0.x, at.y + q.y - q0.y), shift);
+    let (sx, sy) = (to.w / own.w, to.h / own.h);
+    PixelTransform { a: sx, b: 0.0, c: 0.0, d: sy, e: to.x - own.x * sx, f: to.y - own.y * sy }.then(base)
 }
 
 /// Whether pane `pane` has a paint selection (or is drawing one).
@@ -177,7 +245,8 @@ pub(super) fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32)
             None if bounds.contains(p) => DragKind::Move,
             None => return None,
         };
-        let drag = SelDrag { kind, start: p, base: sel.transform, bounds, written_at: 0.0, lifted: false };
+        let own = sel.selection.bounds().unwrap_or(bounds);
+        let drag = SelDrag { kind, start: p, base: sel.transform, bounds, own, written_at: 0.0, lifted: false };
         s.gesture = Gesture::PaintSelDrag(drag);
         Some(())
     })
@@ -229,7 +298,7 @@ pub(super) fn moved(store: AppStore, pane: PaneId, px: f32, py: f32) -> bool {
                 Some(Next::Redraw)
             }
             Gesture::PaintSelDrag(d) => {
-                let t = dragged(&d.kind, &d.base, &d.bounds, d.start, p, shift);
+                let t = dragged(&d.kind, &d.base, &d.bounds, &d.own, d.start, p, shift);
                 let due = now_ms() - d.written_at >= DRAG_WRITE_EVERY_MS;
                 if due {
                     d.written_at = now_ms();
@@ -316,7 +385,7 @@ pub(super) fn released(store: AppStore, pane: PaneId, gesture: Gesture, px: f32,
         Gesture::PaintSelDrag(d) => {
             let next = with_session(pane, |s| {
                 let p = s.view.screen_to_board(px, py);
-                let t = dragged(&d.kind, &d.base, &d.bounds, d.start, p, s.shift);
+                let t = dragged(&d.kind, &d.base, &d.bounds, &d.own, d.start, p, s.shift);
                 let sel = s.paint_sel.as_mut()?;
                 sel.transform = t;
                 if t == d.base {
@@ -477,9 +546,12 @@ fn march(store: AppStore, pane: PaneId) {
 }
 
 fn step(store: AppStore, pane: PaneId) {
+    // Another pane has the person's attention: the ants stand still (and
+    // nothing is drawn) until this one has it again.
+    let focused = untracked(|| store.focused_pane.get()) == pane;
     let go = with_session(pane, |s| {
         let on = s.paint_sel.is_some() || matches!(s.gesture, Gesture::PaintSelect { .. });
-        if on {
+        if on && focused {
             s.ants = (s.ants + 1.0) % 64.0;
         }
         on
@@ -493,8 +565,12 @@ fn step(store: AppStore, pane: PaneId) {
         });
         return;
     }
-    super::points::refresh_overlay(store, pane);
-    present(pane);
+    if focused {
+        // Only the overlay changed: the view redraws just under the ants
+        // (`BoardView::frame`), not the whole frame.
+        super::points::refresh_overlay(store, pane);
+        present(pane);
+    }
     let _ = set_timeout(MARCH_MS, move || step(store, pane));
 }
 
@@ -527,13 +603,13 @@ mod tests {
     #[test]
     fn a_drag_inside_moves_the_pixels() {
         let bounds = Rect::new(0.0, 0.0, 100.0, 50.0);
-        let t = dragged(&DragKind::Move, &PixelTransform::IDENTITY, &bounds, p(10.0, 10.0), p(40.0, 15.0), false);
+        let t = dragged(&DragKind::Move, &PixelTransform::IDENTITY, &bounds, &bounds, p(10.0, 10.0), p(40.0, 15.0), false);
         assert!(near(t.apply(p(0.0, 0.0)), p(30.0, 5.0)));
         // Shift: along the axis it moved most.
-        let t = dragged(&DragKind::Move, &PixelTransform::IDENTITY, &bounds, p(10.0, 10.0), p(40.0, 15.0), true);
+        let t = dragged(&DragKind::Move, &PixelTransform::IDENTITY, &bounds, &bounds, p(10.0, 10.0), p(40.0, 15.0), true);
         assert!(near(t.apply(p(0.0, 0.0)), p(30.0, 0.0)));
         // A second drag goes on from where the first left it.
-        let t2 = dragged(&DragKind::Move, &t, &t.map_rect(&bounds), p(0.0, 0.0), p(0.0, 7.0), false);
+        let t2 = dragged(&DragKind::Move, &t, &t.map_rect(&bounds), &bounds, p(0.0, 0.0), p(0.0, 7.0), false);
         assert!(near(t2.apply(p(0.0, 0.0)), p(30.0, 7.0)));
     }
 
@@ -542,20 +618,43 @@ mod tests {
         let bounds = Rect::new(0.0, 0.0, 100.0, 50.0);
         // The bottom right corner to (200, 150): twice as wide, three times
         // as tall, the top left staying.
-        let t = dragged(&DragKind::Scale(Handle::SE), &PixelTransform::IDENTITY, &bounds, p(100.0, 50.0), p(200.0, 150.0), false);
+        let t = dragged(&DragKind::Scale(Handle::SE), &PixelTransform::IDENTITY, &bounds, &bounds, p(100.0, 50.0), p(200.0, 150.0), false);
         assert!(near(t.apply(p(0.0, 0.0)), p(0.0, 0.0)));
         assert!(near(t.apply(p(100.0, 50.0)), p(200.0, 150.0)));
         // With Shift, one factor for both.
-        let t = dragged(&DragKind::Scale(Handle::SE), &PixelTransform::IDENTITY, &bounds, p(100.0, 50.0), p(200.0, 150.0), true);
+        let t = dragged(&DragKind::Scale(Handle::SE), &PixelTransform::IDENTITY, &bounds, &bounds, p(100.0, 50.0), p(200.0, 150.0), true);
         let b = t.map_rect(&bounds);
         assert!((b.w / b.h - 2.0).abs() < 1e-3, "{b:?}");
         // The left side: the right side stays.
-        let t = dragged(&DragKind::Scale(Handle::W), &PixelTransform::IDENTITY, &bounds, p(0.0, 25.0), p(50.0, 25.0), false);
+        let t = dragged(&DragKind::Scale(Handle::W), &PixelTransform::IDENTITY, &bounds, &bounds, p(0.0, 25.0), p(50.0, 25.0), false);
         assert!(near(t.apply(p(100.0, 0.0)), p(100.0, 0.0)));
         assert!(near(t.apply(p(0.0, 0.0)), p(50.0, 0.0)));
         // A press on a handle that does not move changes nothing.
-        let t = dragged(&DragKind::Scale(Handle::NE), &PixelTransform::IDENTITY, &bounds, p(100.0, 0.0), p(100.0, 0.0), false);
+        let t = dragged(&DragKind::Scale(Handle::NE), &PixelTransform::IDENTITY, &bounds, &bounds, p(100.0, 0.0), p(100.0, 0.0), false);
         assert!(near(t.apply(p(37.0, 12.0)), p(37.0, 12.0)));
+    }
+
+    #[test]
+    fn a_turned_selection_scales_along_its_own_sides_without_shearing() {
+        let own = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let turned = PixelTransform::rotate(30.0, own.center());
+        let bounds = turned.map_rect(&own);
+        // The box's right handle, dragged 40 units along the selection's own
+        // x axis (30 degrees down the board).
+        let (c, s) = (30.0f32.to_radians().cos(), 30.0f32.to_radians().sin());
+        let start = p(bounds.right(), bounds.center().y);
+        let to = p(start.x + 40.0 * c, start.y + 40.0 * s);
+        let t = dragged(&DragKind::Scale(Handle::E), &turned, &bounds, &own, start, to, false);
+        // Still a turn and a scale: the mapped sides stay at right angles.
+        let (ex, ey) = (t.apply(p(1.0, 0.0)), t.apply(p(0.0, 1.0)));
+        let o = t.apply(p(0.0, 0.0));
+        let (ux, uy) = ((ex.x - o.x, ex.y - o.y), (ey.x - o.x, ey.y - o.y));
+        assert!((ux.0 * uy.0 + ux.1 * uy.1).abs() < 1e-3, "no shear: {ux:?} {uy:?}");
+        // Wider along its own side by the drag, as tall as before.
+        assert!(((ux.0.hypot(ux.1)) - 1.4).abs() < 1e-3, "{ux:?}");
+        assert!(((uy.0.hypot(uy.1)) - 1.0).abs() < 1e-3, "{uy:?}");
+        // Its left side stays where it was.
+        assert!(near(t.apply(p(0.0, 25.0)), turned.apply(p(0.0, 25.0))));
     }
 
     #[test]
@@ -565,13 +664,13 @@ mod tests {
         // From above the center to its right: a quarter turn clockwise.
         let start = p(50.0, -20.0);
         let kind = DragKind::Rotate { center, start_angle: (start.y - center.y).atan2(start.x - center.x) };
-        let t = dragged(&kind, &PixelTransform::IDENTITY, &bounds, start, p(150.0, 50.0), false);
+        let t = dragged(&kind, &PixelTransform::IDENTITY, &bounds, &bounds, start, p(150.0, 50.0), false);
         assert!(near(t.apply(center), center));
         assert!(near(t.apply(p(50.0, 0.0)), p(100.0, 50.0)), "{:?}", t.apply(p(50.0, 0.0)));
         // Shift snaps to 15 degrees: 40 degrees turns 45.
         let a = (-50.0f32).to_radians() - std::f32::consts::FRAC_PI_2 + 50.0f32.to_radians() + 40.0f32.to_radians();
         let to = p(center.x + 70.0 * a.cos(), center.y + 70.0 * a.sin());
-        let t = dragged(&kind, &PixelTransform::IDENTITY, &bounds, start, to, true);
+        let t = dragged(&kind, &PixelTransform::IDENTITY, &bounds, &bounds, start, to, true);
         let top = t.apply(p(50.0, 0.0));
         let turned = (top.y - center.y).atan2(top.x - center.x).to_degrees() + 90.0;
         assert!((turned - 45.0).abs() < 1e-2, "{turned}");

@@ -405,6 +405,11 @@ pub struct StyleUi {
     /// Stroke ends and corners (`None`: the kind's own, round).
     pub cap: Signal<Option<pimble_board::Cap>>,
     pub join: Signal<Option<pimble_board::Join>>,
+    /// The miter limit, for mitered corners.
+    pub miter: Signal<f32>,
+    /// A custom dash pattern as typed (`"6 3 1 3"`, board units); empty for
+    /// the dash preset.
+    pub dash_text: Signal<String>,
     /// A rectangle's corner radius, board units.
     pub radius: Signal<f32>,
     /// A polygon's sides.
@@ -461,6 +466,8 @@ impl StyleUi {
             recent: Signal::new(Vec::new()),
             cap: Signal::new(None),
             join: Signal::new(None),
+            miter: Signal::new(pimble_board::DEFAULT_MITER),
+            dash_text: Signal::new(String::new()),
             radius: Signal::new(0.0),
             sides: Signal::new(pimble_board::DEFAULT_SIDES),
             points: Signal::new(pimble_board::DEFAULT_STAR_POINTS),
@@ -907,7 +914,7 @@ enum Gesture {
     Points(points::Drag),
     /// Direct select's marquee over anchors, from `start` (physical
     /// pixels); `base` is the anchor selection it adds to.
-    PointMarquee { start: (f32, f32), now: (f32, f32), base: Vec<pimble_board::AnchorRef> },
+    PointMarquee { start: (f32, f32), now: (f32, f32), base: Vec<(String, Vec<pimble_board::AnchorRef>)> },
     /// Dragging a handle of the selected element's gradient.
     GradientHandle(gradient::HandleDrag),
     /// A paint stroke (the Brush, the Highlighter, the Eraser in a paint
@@ -1748,11 +1755,11 @@ fn after_change(store: AppStore, pane: PaneId) {
         let marks = (snapshot.markup_count(), snapshot.markup_visible);
         let logical = |r: (f32, f32, f32, f32)| (r.0 / scale, r.1 / scale, r.2 / scale, r.3 / scale);
         // Direct select shows the points of what it edits, not its box.
-        let pointing = s.points.as_ref().map(|p| p.id.clone());
+        let pointing: Option<Vec<String>> = s.points.as_ref().map(|p| p.ids().cloned().collect());
         let outlines: Vec<(f32, f32, f32, f32)> = s
             .selected
             .iter()
-            .filter(|id| pointing.as_ref() != Some(*id))
+            .filter(|id| !pointing.as_ref().is_some_and(|ids| ids.contains(*id)))
             .filter_map(|id| snapshot.get(id))
             .map(|e| logical(s.to_screen(&e.bounds)))
             .collect();
@@ -3595,6 +3602,72 @@ mod tests {
         stop(store, P[0]);
     }
 
+    /// Direct select: Shift keeps a dragged anchor at a multiple of 45°
+    /// from where it was, and with snapping on it lands on the grid.
+    #[test]
+    fn direct_select_constrains_and_snaps_points() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(100.0, 100.0, 200.0, 100.0)))));
+        store.board_tool.set(Tool::DirectSelect);
+        let corner = on_screen(Point::new(100.0, 100.0));
+        with_session(P[0], |s| s.shift = true);
+        mouse_drag(store, corner, (corner.0 + 50.0, corner.1 + 38.0));
+        with_session(P[0], |s| s.shift = false);
+        let moved = path_of(&only_element()).subpaths[0].anchors.iter().map(|a| a.p).find(|p| p.x > 101.0 && p.y > 101.0 && p.x < 200.0).unwrap();
+        assert!(((moved.x - 100.0) - (moved.y - 100.0)).abs() < 0.01, "on the diagonal: {moved:?}");
+
+        // Snapping: the pressed anchor lands on the grid.
+        store.board_style.snap.set(true);
+        let from = on_screen(moved);
+        mouse_drag(store, from, (from.0 + 33.0, from.1 + 7.0));
+        let anchors: Vec<Point> = path_of(&only_element()).subpaths[0].anchors.iter().map(|a| a.p).collect();
+        let on_grid = |v: f32| ((v / GRID).round() * GRID - v).abs() < 0.01;
+        assert!(anchors.iter().any(|p| on_grid(p.x) && on_grid(p.y) && p.x > 100.0 && p.x < 300.0 && p.y > 100.0), "{anchors:?}");
+        stop(store, P[0]);
+    }
+
+    /// Direct select across elements: a marquee picks anchors of two
+    /// rectangles, a drag of one of them moves them all, and Delete takes
+    /// them from both in one undo step.
+    #[test]
+    fn direct_select_moves_anchors_of_several_elements() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let a = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(100.0, 100.0, 100.0, 100.0))))).unwrap();
+        let b = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(300.0, 100.0, 100.0, 100.0))))).unwrap();
+        store.board_tool.set(Tool::DirectSelect);
+        mouse_drag(store, on_screen(Point::new(50.0, 50.0)), on_screen(Point::new(450.0, 150.0)));
+        let (shown, others) = with_session(P[0], |s| {
+            let pe = s.points.as_ref().unwrap();
+            (pe.anchors.len(), pe.others.iter().map(|o| o.anchors.len()).collect::<Vec<_>>())
+        })
+        .unwrap();
+        assert_eq!((shown, others), (2, vec![2]), "the top corners of both");
+        let geom_of = |id: &str| with_session(P[0], |s| s.snapshot().get(id).unwrap().raw.geom.clone()).unwrap();
+        let tops = |id: &str| match geom_of(id) {
+            Geom::Path(p) => p.subpaths[0].anchors.iter().filter(|a| a.p.y < 99.0).count(),
+            _ => 0,
+        };
+        let from = on_screen(Point::new(100.0, 100.0));
+        mouse_drag(store, from, (from.0, from.1 - 30.0));
+        assert_eq!((tops(&a), tops(&b)), (2, 2), "both rectangles' top corners moved up");
+
+        points::delete_anchors(store, P[0]);
+        let count = |id: &str| match geom_of(id) {
+            Geom::Path(p) => p.anchor_count(),
+            _ => 4,
+        };
+        assert_eq!((count(&a), count(&b)), (2, 2));
+        tools::undo(store, P[0], false);
+        assert_eq!((count(&a), count(&b)), (4, 4), "one undo puts the anchors back on both");
+        tools::undo(store, P[0], false);
+        assert!(matches!(geom_of(&a), Geom::Rect(_)) && matches!(geom_of(&b), Geom::Rect(_)), "one undo for the drag of both");
+        stop(store, P[0]);
+    }
+
     /// Shapes stay live: a star's points and a rectangle's radius change
     /// from the context bar, each only on the kinds that have them.
     #[test]
@@ -3617,6 +3690,64 @@ mod tests {
         tools::apply_style(store, P[0], Style { dash: Some(Dash::Dashed), ..Style::default() });
         let pattern = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().raw.style.dash_pattern.clone()).unwrap();
         assert_eq!(pattern, None);
+        stop(store, P[0]);
+    }
+
+    /// The miter limit and a custom dash pattern: new paths take them, the
+    /// miter only while corners are mitered, and the selection is written.
+    #[test]
+    fn miter_limit_and_dash_pattern_reach_new_and_selected_elements() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let st = store.board_style;
+        st.miter.set(10.0);
+        st.dash_text.set("6 3 1 3".into());
+        let round = tools::new_style(store, &Kind::Path);
+        assert_eq!(round.miter, None, "no miter limit without mitered corners");
+        assert_eq!(round.dash_pattern, Some(vec![6.0, 3.0, 1.0, 3.0]));
+        st.join.set(Some(pimble_board::Join::Miter));
+        assert_eq!(tools::new_style(store, &Kind::Path).miter, Some(10.0));
+        assert_eq!(tools::new_style(store, &Kind::Line).miter, None, "a line has no corners");
+        st.dash_text.set("6 x".into());
+        assert_eq!(tools::new_style(store, &Kind::Rect).dash_pattern, None, "an unreadable pattern is none");
+
+        let rect = local_edit(store, P[0], |t| t.add_element(rect_element(0.0))).unwrap();
+        tools::select(store, P[0], vec![rect.clone()]);
+        tools::apply_style(store, P[0], Style { miter: Some(8.0), dash_pattern: Some(vec![4.0, 2.0]), ..Style::default() });
+        let raw = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().raw.style.clone()).unwrap();
+        assert_eq!((raw.miter, raw.dash_pattern.clone()), (Some(8.0), Some(vec![4.0, 2.0])));
+        // Selecting it shows them in the bar.
+        tools::load_selection_style(store, P[0]);
+        assert_eq!((st.miter.get(), st.dash_text.get()), (8.0, "4 2".to_string()));
+        tools::clear_dash_pattern(store, P[0]);
+        let raw = with_session(P[0], |s| s.snapshot().get(&rect).unwrap().raw.style.clone()).unwrap();
+        assert_eq!(raw.dash_pattern, None);
+        stop(store, P[0]);
+    }
+
+    /// Outline Stroke from the selection's "more" menu: the line becomes a
+    /// filled path, selected, in one undo step; a text is refused with a
+    /// sentence and nothing changes.
+    #[test]
+    fn outline_stroke_turns_the_selection_into_filled_outlines() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let line = local_edit(store, P[0], |t| {
+            t.add_element(NewElement::new(Kind::Line, Geom::Segment { a: Point::new(0.0, 0.0), b: Point::new(100.0, 0.0) }).with_style(Style {
+                width: Some(6.0),
+                arrow_heads: Some(ArrowHeads::None),
+                ..Style::default()
+            }))
+        })
+        .unwrap();
+        tools::select(store, P[0], vec![line.clone()]);
+        tools::outline_stroke(store, P[0]);
+        let e = only_element();
+        assert_eq!(e.raw.kind, Kind::Path);
+        assert!(e.raw.style.fill.is_some());
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![line.clone()]);
+        tools::undo(store, P[0], false);
+        assert_eq!(only_element().raw.kind, Kind::Line, "one undo");
         stop(store, P[0]);
     }
 

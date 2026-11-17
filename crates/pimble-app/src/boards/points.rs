@@ -250,6 +250,33 @@ pub(super) struct PointEdit {
     /// The path as a drag has it now (drawn over the board ahead of the
     /// writes, which come about every 80 ms).
     pub working: Option<PathGeom>,
+    /// Other elements with anchors selected too (a marquee across several,
+    /// Shift-clicks on another's anchors): they move with a drag of the
+    /// anchors and go with Delete; only the element above shows handles.
+    pub others: Vec<OtherPoints>,
+}
+
+impl PointEdit {
+    pub fn new(id: String, anchors: Vec<AnchorRef>) -> PointEdit {
+        PointEdit { id, anchors, working: None, others: Vec::new() }
+    }
+
+    /// Every element whose points show.
+    pub fn ids(&self) -> impl Iterator<Item = &String> + '_ {
+        std::iter::once(&self.id).chain(self.others.iter().map(|o| &o.id))
+    }
+
+    /// Whether any anchor is selected, on any element.
+    pub fn any_selected(&self) -> bool {
+        !self.anchors.is_empty() || self.others.iter().any(|o| !o.anchors.is_empty())
+    }
+}
+
+/// Another element's selected anchors (see [`PointEdit::others`]).
+pub(super) struct OtherPoints {
+    pub id: String,
+    pub anchors: Vec<AnchorRef>,
+    pub working: Option<PathGeom>,
 }
 
 /// What a Direct select drag holds.
@@ -258,8 +285,24 @@ pub(super) enum Grab {
     Handle(HandleRef),
 }
 
+/// Another element's anchors moving with a drag, as it was when pressed.
+pub(super) struct Part {
+    id: String,
+    base: PathGeom,
+    live: bool,
+    transform: Transform,
+    pivot: Rect,
+    inv: Affine,
+    refs: Vec<AnchorRef>,
+}
+
 /// A Direct select drag: the element as it was when pressed.
 pub(super) struct Drag {
+    /// The anchor pressed (a segment's first end): the one snapped to the
+    /// grid.
+    lead: Option<AnchorRef>,
+    /// Other elements' selected anchors, moving with these.
+    parts: Vec<Part>,
     id: String,
     base: PathGeom,
     /// Still a live shape: the first write turns it into a path.
@@ -440,7 +483,7 @@ pub(super) fn drawing(pane: PaneId) -> bool {
 
 /// Whether pane `pane` shows points with anchors selected.
 pub(super) fn anchors_selected(pane: PaneId) -> bool {
-    with_session(pane, |s| s.points.as_ref().is_some_and(|p| !p.anchors.is_empty())).unwrap_or(false)
+    with_session(pane, |s| s.points.as_ref().is_some_and(|p| p.any_selected())).unwrap_or(false)
 }
 
 /// Whether pane `pane` shows an element's points.
@@ -452,6 +495,63 @@ pub(super) fn editing(pane: PaneId) -> bool {
 pub(super) fn end_points(store: AppStore, pane: PaneId) {
     if with_session(pane, |s| s.points.take().is_some()) == Some(true) {
         after_change(store, pane);
+    }
+}
+
+/// Make element `id` the one whose handles show, keeping the element shown
+/// before among the others when `keep` (Shift) and it has anchors selected;
+/// answers its selected anchors (none when it was not shown).
+fn promote(s: &mut Session, id: &str, keep: bool) -> Vec<AnchorRef> {
+    let Some(mut pe) = s.points.take() else {
+        s.points = Some(PointEdit::new(id.to_string(), Vec::new()));
+        return Vec::new();
+    };
+    if pe.id == id {
+        let anchors = pe.anchors.clone();
+        s.points = Some(pe);
+        return anchors;
+    }
+    let mine = pe.others.iter().position(|o| o.id == id).map(|i| pe.others.remove(i)).map(|o| o.anchors).unwrap_or_default();
+    let before = OtherPoints { id: std::mem::replace(&mut pe.id, id.to_string()), anchors: std::mem::take(&mut pe.anchors), working: None };
+    pe.working = None;
+    if keep {
+        if !before.anchors.is_empty() {
+            pe.others.push(before);
+        }
+        pe.anchors = mine.clone();
+        s.points = Some(pe);
+        mine
+    } else {
+        s.points = Some(PointEdit::new(id.to_string(), Vec::new()));
+        Vec::new()
+    }
+}
+
+/// The other elements' selected anchors, read for a drag.
+fn parts_of(s: &Session) -> Vec<Part> {
+    let Some(pe) = s.points.as_ref() else { return Vec::new() };
+    pe.others
+        .iter()
+        .filter(|o| !o.anchors.is_empty() && s.editable(&o.id))
+        .filter_map(|o| {
+            let t = target_of(s, &o.id)?;
+            Some(Part { id: o.id.clone(), base: t.path, live: t.live, transform: t.transform, pivot: t.pivot, inv: t.inv, refs: o.anchors.clone() })
+        })
+        .collect()
+}
+
+/// The elements shown keep only the shown one's anchors (a plain press on
+/// one anchor, a segment).
+fn drop_others(s: &mut Session) {
+    if let Some(pe) = s.points.as_mut() {
+        pe.others.clear();
+    }
+}
+
+/// `s.selected` follows the elements whose points show.
+fn select_shown(s: &mut Session) {
+    if let Some(pe) = s.points.as_ref() {
+        s.selected = pe.ids().cloned().collect();
     }
 }
 
@@ -473,35 +573,44 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 let selected = s.points.as_ref().map(|pe| pe.anchors.clone()).unwrap_or_default();
                 let picked = pick(&t.path, &selected, q, tol_e);
                 let grab = match picked {
-                    Pick::Handle(h) => Some((Grab::Handle(h), None)),
+                    Pick::Handle(h) => Some((Grab::Handle(h), None, None)),
                     Pick::Anchor(a) => {
                         let was_in = selected.contains(&a);
                         let (now, drag) = press_anchor(&selected, a, shift);
+                        if !shift && !was_in {
+                            drop_others(s);
+                        }
                         if let Some(pe) = s.points.as_mut() {
                             pe.anchors = now.clone();
                         }
-                        drag.then(|| (Grab::Anchors(now), (was_in && !shift).then_some(a)))
+                        drag.then(|| (Grab::Anchors(now), (was_in && !shift).then_some(a), Some(a)))
                     }
                     Pick::Segment(hit) => {
                         let ends = segment_ends(&t.path, hit.subpath, hit.segment);
+                        let lead = ends.first().copied();
                         let now = if shift {
                             let mut all = selected.clone();
                             all.extend(ends.iter().filter(|a| !selected.contains(a)));
                             all
                         } else {
+                            drop_others(s);
                             ends
                         };
                         if let Some(pe) = s.points.as_mut() {
                             pe.anchors = now.clone();
                         }
-                        Some((Grab::Anchors(now), None))
+                        Some((Grab::Anchors(now), None, lead))
                     }
                     Pick::Nothing => None,
                 };
                 // Off the element, another may be picked below.
                 if picked != Pick::Nothing {
-                    if let (Some((grab, clicked)), true) = (grab, writable) {
+                    select_shown(s);
+                    if let (Some((grab, clicked, lead)), true) = (grab, writable) {
+                        let parts = if matches!(grab, Grab::Anchors(_)) { parts_of(s) } else { Vec::new() };
                         s.gesture = Gesture::Points(Drag {
+                            lead,
+                            parts,
                             id,
                             base: t.path,
                             live: t.live,
@@ -521,6 +630,7 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
             }
         }
         // Another element: show its points (and take the anchor pressed).
+        // With Shift the anchors already selected elsewhere stay selected.
         let hit = super::tools::hit_at(s, p).map(|e| e.raw.id.clone());
         if let Some(id) = hit {
             if let Some(t) = target_of(s, &id) {
@@ -531,10 +641,20 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 let q = apply(&t.inv, p);
                 let tol_e = tol / scale_of_affine(&t.world);
                 let anchor = t.path.hit_anchor(q, tol_e);
-                s.selected = vec![id.clone()];
-                s.points = Some(PointEdit { id: id.clone(), anchors: anchor.into_iter().collect(), working: None });
-                if let (Some(a), true) = (anchor, writable) {
+                let had = promote(s, &id, shift);
+                let (now, drag) = match anchor {
+                    Some(a) => press_anchor(&had, a, shift),
+                    None => (had, false),
+                };
+                if let Some(pe) = s.points.as_mut() {
+                    pe.anchors = now.clone();
+                }
+                select_shown(s);
+                if let (Some(a), true, true) = (anchor, drag, writable) {
+                    let parts = parts_of(s);
                     s.gesture = Gesture::Points(Drag {
+                        lead: Some(a),
+                        parts,
                         id,
                         base: t.path,
                         live: t.live,
@@ -542,7 +662,7 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
                         pivot: t.pivot,
                         world: t.world,
                         inv: t.inv,
-                        grab: Grab::Anchors(vec![a]),
+                        grab: Grab::Anchors(now),
                         start: q,
                         written_at: 0.0,
                         moved: false,
@@ -552,10 +672,13 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 return;
             }
         }
-        // Empty board: a marquee over anchors.
-        let base = if shift { s.points.as_ref().map(|pe| pe.anchors.clone()).unwrap_or_default() } else { Vec::new() };
-        if let Some(pe) = s.points.as_mut() {
-            pe.anchors = base.clone();
+        // Empty board: a marquee over anchors (of every element in it).
+        let base = if shift { selected_anchors(s) } else { Vec::new() };
+        if !shift {
+            if let Some(pe) = s.points.as_mut() {
+                pe.anchors.clear();
+                pe.others.clear();
+            }
         }
         s.gesture = Gesture::PointMarquee { start: (px, py), now: (px, py), base };
     });
@@ -568,6 +691,72 @@ pub(super) fn press(store: AppStore, pane: PaneId, px: f32, py: f32) {
     }
     tools::load_selection_style(store, pane);
     after_change(store, pane);
+}
+
+/// Every selected anchor, by element: the shown one's first.
+fn selected_anchors(s: &Session) -> Vec<(String, Vec<AnchorRef>)> {
+    let Some(pe) = s.points.as_ref() else { return Vec::new() };
+    std::iter::once((pe.id.clone(), pe.anchors.clone())).chain(pe.others.iter().map(|o| (o.id.clone(), o.anchors.clone()))).collect()
+}
+
+/// The anchors a marquee over board rectangle `rect` selects, added to
+/// `base` (Shift): every shown, editable element's anchors inside it, by
+/// element, topmost first. The element shown before stays the one whose
+/// handles show when it is still among them (or had none selected).
+fn marquee_pick(s: &mut Session, rect: &Rect, base: &[(String, Vec<AnchorRef>)]) {
+    let snapshot = s.snapshot();
+    let ids: Vec<String> = snapshot
+        .query(rect)
+        .into_iter()
+        .rev()
+        .map(|i| &snapshot.elements[i])
+        .filter(|e| e.visible && !snapshot.in_locked_layer(e) && snapshot.editable(&e.raw.id))
+        .map(|e| e.raw.id.clone())
+        .collect();
+    let mut chosen: Vec<(String, Vec<AnchorRef>)> = base.to_vec();
+    for id in ids {
+        let Some(t) = target_of(s, &id) else { continue };
+        let inside = anchors_in(&t.path, &t.world, rect);
+        if inside.is_empty() {
+            continue;
+        }
+        match chosen.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, have)) => {
+                for r in inside {
+                    if !have.contains(&r) {
+                        have.push(r);
+                    }
+                }
+            }
+            None => chosen.push((id, inside)),
+        }
+    }
+    set_chosen(s, chosen);
+}
+
+/// Show the anchors `chosen`, by element (see [`marquee_pick`]).
+fn set_chosen(s: &mut Session, chosen: Vec<(String, Vec<AnchorRef>)>) {
+    let shown = s.points.as_ref().map(|pe| pe.id.clone());
+    let lead = shown.filter(|id| chosen.iter().any(|(i, a)| i == id && !a.is_empty())).or_else(|| chosen.iter().find(|(_, a)| !a.is_empty()).map(|(i, _)| i.clone()));
+    let Some(lead) = lead else {
+        // Nothing inside: the element shown stays shown, with nothing
+        // selected.
+        if let Some(pe) = s.points.as_mut() {
+            pe.anchors.clear();
+            pe.others.clear();
+        }
+        return;
+    };
+    let mut pe = PointEdit::new(lead.clone(), Vec::new());
+    for (id, anchors) in chosen {
+        if id == lead {
+            pe.anchors = anchors;
+        } else if !anchors.is_empty() {
+            pe.others.push(OtherPoints { id, anchors, working: None });
+        }
+    }
+    s.points = Some(pe);
+    select_shown(s);
 }
 
 /// Anchors of path `path` (element space, drawn through `world`) inside
@@ -600,17 +789,7 @@ pub(super) fn moved(store: AppStore, pane: PaneId, px: f32, py: f32) -> bool {
                 let b = s.view.screen_to_board(start.0.max(px), start.1.max(py));
                 let rect = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
                 let base = base.clone();
-                let Some(id) = s.points.as_ref().map(|pe| pe.id.clone()) else { return };
-                let Some(t) = target_of(s, &id) else { return };
-                let mut chosen = base;
-                for r in anchors_in(&t.path, &t.world, &rect) {
-                    if !chosen.contains(&r) {
-                        chosen.push(r);
-                    }
-                }
-                if let Some(pe) = s.points.as_mut() {
-                    pe.anchors = chosen;
-                }
+                marquee_pick(s, &rect, &base);
             });
             after_change(store, pane);
         }
@@ -619,15 +798,90 @@ pub(super) fn moved(store: AppStore, pane: PaneId, px: f32, py: f32) -> bool {
     true
 }
 
-/// The path a drag makes of its base with the pointer at board point `p`.
-fn dragged(d: &Drag, p: Point, alt: bool) -> PathGeom {
-    let q = apply(&d.inv, p);
-    let mut geom = d.base.clone();
-    match &d.grab {
-        Grab::Anchors(refs) => geom.move_anchors(refs, q.x - d.start.x, q.y - d.start.y),
-        Grab::Handle(h) => geom.move_handle(*h, q, alt),
+/// Shift's constraint on a drag from board point `from` to `to`: the
+/// nearest multiple of 45°.
+pub(super) fn constrain_45(from: Point, to: Point) -> Point {
+    let (dx, dy) = (to.x - from.x, to.y - from.y);
+    let len = dx.hypot(dy);
+    if len < 1e-6 {
+        return to;
     }
-    geom
+    let step = std::f32::consts::FRAC_PI_4;
+    let a = (dy.atan2(dx) / step).round() * step;
+    Point::new(from.x + len * a.cos(), from.y + len * a.sin())
+}
+
+/// Where a point dragged from board point `from` lands with the pointer
+/// asking for `to`: on the grid when snapping is on (`grid`), at a multiple
+/// of 45° from `from` with Shift (both: the grid point projected onto that
+/// direction).
+pub(super) fn constrained(from: Point, to: Point, shift: bool, grid: Option<f32>) -> Point {
+    let mut p = if shift { constrain_45(from, to) } else { to };
+    if let Some(g) = grid {
+        let snapped = Point::new((p.x / g).round() * g, (p.y / g).round() * g);
+        p = if shift {
+            let (ux, uy) = (p.x - from.x, p.y - from.y);
+            let len = ux.hypot(uy);
+            if len < 1e-6 {
+                snapped
+            } else {
+                let (ux, uy) = (ux / len, uy / len);
+                let along = (snapped.x - from.x) * ux + (snapped.y - from.y) * uy;
+                Point::new(from.x + ux * along, from.y + uy * along)
+            }
+        } else {
+            snapped
+        };
+    }
+    p
+}
+
+/// A board-space offset through affine `w`'s linear part.
+fn apply_vec(w: &Affine, d: Point) -> Point {
+    Point::new(w.sx * d.x + w.kx * d.y, w.ky * d.x + w.sy * d.y)
+}
+
+/// The paths a drag makes of its bases with the pointer at board point
+/// `p`: the pressed element's, and each other element's moving with it.
+/// The pressed anchor (or handle tip) is what Shift constrains and the grid
+/// snaps.
+fn dragged(d: &Drag, p: Point, alt: bool, shift: bool, grid: Option<f32>) -> (PathGeom, Vec<PathGeom>) {
+    let mut geom = d.base.clone();
+    let mut parts = Vec::new();
+    match &d.grab {
+        Grab::Anchors(refs) => {
+            // The board offset: the pointer's, or the lead anchor's to where
+            // it lands.
+            let start = apply(&d.world, d.start);
+            let lead = d.lead.and_then(|a| d.base.anchor(a)).map(|a| apply(&d.world, a.p));
+            let delta = match lead {
+                Some(l) => {
+                    let to = constrained(l, Point::new(l.x + p.x - start.x, l.y + p.y - start.y), shift, grid);
+                    Point::new(to.x - l.x, to.y - l.y)
+                }
+                None => {
+                    let to = constrained(start, p, shift, None);
+                    Point::new(to.x - start.x, to.y - start.y)
+                }
+            };
+            let e = apply_vec(&d.inv, delta);
+            geom.move_anchors(refs, e.x, e.y);
+            for part in &d.parts {
+                let mut g = part.base.clone();
+                let e = apply_vec(&part.inv, delta);
+                g.move_anchors(&part.refs, e.x, e.y);
+                parts.push(g);
+            }
+        }
+        Grab::Handle(h) => {
+            let to = match d.base.anchor(h.anchor) {
+                Some(a) => constrained(apply(&d.world, a.p), p, shift, grid),
+                None => p,
+            };
+            geom.move_handle(*h, apply(&d.inv, to), alt);
+        }
+    }
+    (geom, parts)
 }
 
 /// What writing `geom` over a drag's element takes.
@@ -662,9 +916,10 @@ fn write_points(store: AppStore, pane: PaneId, w: &PointWrite) -> bool {
 /// once, the document about every 80 ms (and always when `last`).
 fn drag_to(store: AppStore, pane: PaneId, px: f32, py: f32, last: bool) {
     let scale = scale_of(pane);
+    let grid = untracked(|| store.board_style.snap.get()).then_some(GRID);
     let write = with_session(pane, |s| {
         let p = s.view.screen_to_board(px, py);
-        let alt = s.alt;
+        let (alt, shift) = (s.alt, s.shift);
         let slop = CLICK_SLOP_PX * scale / s.view.zoom().max(1e-3);
         let Gesture::Points(d) = &mut s.gesture else { return None };
         let q = apply(&d.inv, p);
@@ -672,27 +927,49 @@ fn drag_to(store: AppStore, pane: PaneId, px: f32, py: f32, last: bool) {
             return None;
         }
         d.moved = true;
-        let geom = dragged(d, p, alt);
+        let (geom, parts) = dragged(d, p, alt, shift, grid);
         let due = last || now_ms() - d.written_at >= DRAG_WRITE_EVERY_MS;
         if due {
             d.written_at = now_ms();
         }
-        let w = due.then(|| PointWrite { id: d.id.clone(), live: d.live, transform: d.transform, pivot: d.pivot, geom: geom.clone() });
+        let writes: Vec<PointWrite> = if due {
+            std::iter::once(PointWrite { id: d.id.clone(), live: d.live, transform: d.transform, pivot: d.pivot, geom: geom.clone() })
+                .chain(d.parts.iter().zip(&parts).map(|(part, g)| PointWrite { id: part.id.clone(), live: part.live, transform: part.transform, pivot: part.pivot, geom: g.clone() }))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if let Some(pe) = s.points.as_mut() {
             pe.working = Some(geom);
+            for (part, g) in d.parts.iter().zip(parts) {
+                if let Some(o) = pe.others.iter_mut().find(|o| o.id == part.id) {
+                    o.working = Some(g);
+                }
+            }
         }
-        Some(w)
+        Some(due.then_some(writes))
     })
     .flatten();
     match write {
-        Some(Some(w)) => {
-            if write_points(store, pane, &w) {
-                with_session(pane, |s| {
-                    if let Gesture::Points(d) = &mut s.gesture {
+        Some(Some(writes)) => {
+            let mut done = Vec::new();
+            for w in &writes {
+                if write_points(store, pane, w) {
+                    done.push(w.id.clone());
+                }
+            }
+            with_session(pane, |s| {
+                if let Gesture::Points(d) = &mut s.gesture {
+                    if done.contains(&d.id) {
                         d.live = false;
                     }
-                });
-            }
+                    for part in d.parts.iter_mut() {
+                        if done.contains(&part.id) {
+                            part.live = false;
+                        }
+                    }
+                }
+            });
         }
         Some(None) => {
             refresh_overlay(store, pane);
@@ -722,16 +999,21 @@ pub(super) fn released(store: AppStore, pane: PaneId, gesture: Gesture, px: f32,
                 s.gesture = Gesture::Idle;
                 if let Some(pe) = s.points.as_mut() {
                     pe.working = None;
+                    for o in pe.others.iter_mut() {
+                        o.working = None;
+                    }
                     if let (false, Some(a)) = (moved, clicked) {
                         pe.anchors = vec![a];
+                        pe.others.clear();
                     }
                 }
+                select_shown(s);
             });
             hold_clock(pane, false);
             new_undo_step(pane);
             after_change(store, pane);
         }
-        Gesture::PointMarquee { start, now, .. } => {
+        Gesture::PointMarquee { start, now, base } => {
             let scale = scale_of(pane);
             let click = (start.0 - now.0).abs() <= CLICK_SLOP_PX * scale && (start.1 - now.1).abs() <= CLICK_SLOP_PX * scale;
             with_session(pane, |s| {
@@ -744,32 +1026,10 @@ pub(super) fn released(store: AppStore, pane: PaneId, gesture: Gesture, px: f32,
                     }
                     return;
                 }
-                if s.points.is_some() {
-                    return;
-                }
-                // Nothing shown yet: the topmost element with anchors inside
-                // the marquee shows them.
-                let a = s.view.screen_to_board(start.0.min(now.0), start.1.min(now.1));
-                let b = s.view.screen_to_board(start.0.max(now.0), start.1.max(now.1));
+                let a = s.view.screen_to_board(start.0.min(px), start.1.min(py));
+                let b = s.view.screen_to_board(start.0.max(px), start.1.max(py));
                 let rect = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
-                let snapshot = s.snapshot();
-                let ids: Vec<String> = snapshot
-                    .query(&rect)
-                    .into_iter()
-                    .rev()
-                    .map(|i| &snapshot.elements[i])
-                    .filter(|e| e.visible && !snapshot.in_locked_layer(e) && snapshot.editable(&e.raw.id))
-                    .map(|e| e.raw.id.clone())
-                    .collect();
-                for id in ids {
-                    let Some(t) = target_of(s, &id) else { continue };
-                    let inside = anchors_in(&t.path, &t.world, &rect);
-                    if !inside.is_empty() {
-                        s.selected = vec![id.clone()];
-                        s.points = Some(PointEdit { id, anchors: inside, working: None });
-                        break;
-                    }
-                }
+                marquee_pick(s, &rect, &base);
             });
             tools::load_selection_style(store, pane);
             after_change(store, pane);
@@ -804,20 +1064,23 @@ pub(super) fn cancelled(store: AppStore, pane: PaneId, gesture: Gesture) -> Resu
                 let w = PointWrite { id: d.id.clone(), live: false, transform: d.transform, pivot: d.pivot, geom: d.base.clone() };
                 write_points(store, pane, &w);
             }
+            for part in d.parts.iter().filter(|p| d.moved && !p.live) {
+                let w = PointWrite { id: part.id.clone(), live: false, transform: part.transform, pivot: part.pivot, geom: part.base.clone() };
+                write_points(store, pane, &w);
+            }
             with_session(pane, |s| {
                 if let Some(pe) = s.points.as_mut() {
                     pe.working = None;
+                    for o in pe.others.iter_mut() {
+                        o.working = None;
+                    }
                 }
             });
             hold_clock(pane, false);
             after_change(store, pane);
         }
         Gesture::PointMarquee { base, .. } => {
-            with_session(pane, |s| {
-                if let Some(pe) = s.points.as_mut() {
-                    pe.anchors = base;
-                }
-            });
+            with_session(pane, |s| set_chosen(s, base));
             after_change(store, pane);
         }
         other => return Err(other),
@@ -864,17 +1127,49 @@ fn pe_id(s: &Session) -> String {
     s.points.as_ref().map(|p| p.id.clone()).unwrap_or_default()
 }
 
-/// Delete or Backspace: the selected anchors go (an emptied path deletes
-/// its element).
+/// Delete or Backspace: the selected anchors go, on every element they are
+/// on (an emptied path deletes its element), in one undo step.
 pub(super) fn delete_anchors(store: AppStore, pane: PaneId) {
-    edit_points(store, pane, |geom, anchors| {
-        if anchors.is_empty() {
-            return false;
+    let writes = with_session(pane, |s| {
+        let chosen = selected_anchors(s);
+        let writes: Vec<PointWrite> = chosen
+            .into_iter()
+            .filter(|(id, anchors)| !anchors.is_empty() && s.editable(id))
+            .filter_map(|(id, anchors)| {
+                let t = target_of(s, &id)?;
+                let mut geom = t.path.clone();
+                geom.delete_anchors(&anchors);
+                Some(PointWrite { id, live: t.live, transform: t.transform, pivot: t.pivot, geom })
+            })
+            .collect();
+        if let Some(pe) = s.points.as_mut() {
+            pe.anchors.clear();
+            pe.others.clear();
         }
-        geom.delete_anchors(anchors);
-        anchors.clear();
-        true
+        writes
+    })
+    .unwrap_or_default();
+    if writes.is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    let mut emptied = Vec::new();
+    for w in &writes {
+        if w.geom.is_empty() {
+            local_edit(store, pane, |t| t.delete_element(&w.id));
+            emptied.push(w.id.clone());
+        } else {
+            write_points(store, pane, w);
+        }
+    }
+    new_undo_step(pane);
+    with_session(pane, |s| {
+        if s.points.as_ref().is_some_and(|pe| emptied.contains(&pe.id)) {
+            s.points = None;
+        }
+        s.selected.retain(|id| !emptied.contains(id));
     });
+    after_change(store, pane);
 }
 
 /// A Direct select double-click at physical pixel (`px`, `py`): on an anchor
@@ -939,6 +1234,10 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
         if s.points.as_ref().is_some_and(|pe| s.snapshot().get(&pe.id).is_none()) {
             s.points = None;
         }
+        let gone: Vec<String> = s.points.as_ref().map(|pe| pe.others.iter().filter(|o| s.snapshot().get(&o.id).is_none()).map(|o| o.id.clone()).collect()).unwrap_or_default();
+        if let Some(pe) = s.points.as_mut() {
+            pe.others.retain(|o| !gone.contains(&o.id));
+        }
         let overlay = if let Some(pen) = s.pen.as_ref().filter(|_| tool == Tool::Pen) {
             pen_overlay(s, pen, scale)
         } else if let Some(pe) = s.points.as_ref().filter(|_| tool == Tool::DirectSelect) {
@@ -995,7 +1294,18 @@ fn points_overlay(s: &Session, pe: &PointEdit, _scale: f32) -> Option<EditOverla
     let path = pe.working.as_ref().unwrap_or(&t.path);
     let w = |p: Point| apply(&t.world, p);
     let mut o = EditOverlay::default();
-    o.curves = path.segments().map(|(_, _, c)| [w(c[0]), w(c[1]), w(c[2]), w(c[3])]).collect();
+    // The other elements with anchors selected: outlines and anchors only.
+    for other in &pe.others {
+        let Some(ot) = target_of(s, &other.id) else { continue };
+        let path = other.working.as_ref().unwrap_or(&ot.path);
+        let w = |p: Point| apply(&ot.world, p);
+        o.curves.extend(path.segments().map(|(_, _, c)| [w(c[0]), w(c[1]), w(c[2]), w(c[3])]));
+        for r in path.anchor_refs() {
+            let Some(a) = path.anchor(r) else { continue };
+            o.anchors.push((w(a.p), other.anchors.contains(&r)));
+        }
+    }
+    o.curves.extend(path.segments().map(|(_, _, c)| [w(c[0]), w(c[1]), w(c[2]), w(c[3])]));
     for r in path.anchor_refs() {
         let Some(a) = path.anchor(r) else { continue };
         let selected = pe.anchors.contains(&r);
@@ -1151,6 +1461,19 @@ mod tests {
         assert_eq!(press_anchor(&[a, b], b, false), (vec![a, b], true), "several drag together");
         assert_eq!(press_anchor(&[a, b], a, true), (vec![b], false), "shift takes it back out");
         assert_eq!(press_anchor(&[a], b, false), (vec![b], true));
+    }
+
+    #[test]
+    fn shift_keeps_45_degree_steps_and_snapping_lands_on_the_grid() {
+        let from = p(0.0, 0.0);
+        let q = constrained(from, p(50.0, 38.0), true, None);
+        assert!((q.x - q.y).abs() < 1e-3, "{q:?}");
+        let q = constrained(from, p(50.0, 8.0), true, None);
+        assert!(q.y.abs() < 1e-3 && (q.x - 50.6).abs() < 0.1, "{q:?}");
+        assert_eq!(constrained(from, p(33.0, 7.0), false, Some(20.0)), p(40.0, 0.0));
+        // Both: the grid point projected onto the 45° direction.
+        let q = constrained(p(0.0, 0.0), p(41.0, 39.0), true, Some(20.0));
+        assert!((q.x - 40.0).abs() < 1e-3 && (q.y - 40.0).abs() < 1e-3, "{q:?}");
     }
 
     #[test]

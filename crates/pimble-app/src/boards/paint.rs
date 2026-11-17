@@ -736,7 +736,18 @@ fn thumbs_timer(store: AppStore, pane: PaneId) {
         return;
     }
     with_thumbs(pane, |t| t.waiting = None);
+    // Nobody sees them while the layers panel is folded or hidden: they are
+    // drawn when it opens (`ui::render_panels`).
+    if !thumbs_shown(store, pane) {
+        return;
+    }
     draw_thumbs(store, pane);
+}
+
+/// Whether pane `pane`'s layers panel shows (unfolded, not hidden by Tab).
+pub(super) fn thumbs_shown(store: AppStore, pane: PaneId) -> bool {
+    let ui = store.pane(pane).board_ui;
+    untracked(|| !ui.panels_hidden.get() && !ui.folded.get()[0])
 }
 
 /// Draw the thumbnails of the layers that changed since they were drawn.

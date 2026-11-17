@@ -113,6 +113,21 @@ fn two_finger_center(touches: &[(u64, (f32, f32))]) -> Option<(f32, f32)> {
     Some(((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
 }
 
+/// The pointer is no longer over the board: it left the surface, or went
+/// onto the chrome floating over it (where the surface hears no leave):
+/// the brush cursor and the Pen's segment to the pointer go, and so does
+/// this person's pointer for everyone else.
+pub(super) fn pointer_off(store: AppStore, pane: PaneId) {
+    let was = with_session(pane, |s| std::mem::replace(&mut s.over, false)).unwrap_or(false);
+    if !was {
+        return;
+    }
+    points::refresh_overlay(store, pane);
+    present(pane);
+    crate::presence::moved(store, pane);
+    store.pane(pane).board_ui.tip.set_if_changed(None);
+}
+
 pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
     if with_session(pane, |_| ()).is_none() {
         return;
@@ -166,15 +181,8 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
         }
         SurfaceEvent::MouseEnter { .. } => ui.hover.set_if_changed(true),
         SurfaceEvent::MouseLeave => {
-            with_session(pane, |s| {
-                s.space = false;
-                s.over = false;
-            });
-            // The brush cursor goes with the pointer.
-            points::refresh_overlay(store, pane);
-            present(pane);
-            crate::presence::moved(store, pane);
-            ui.tip.set_if_changed(None);
+            with_session(pane, |s| s.space = false);
+            pointer_off(store, pane);
             // A moment's grace, so the pointer can reach the markup control.
             let _ = set_timeout(600, move || ui.hover.set_if_changed(false));
         }
@@ -2009,6 +2017,10 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     let dash = (dash != Dash::Solid).then_some(dash);
     let (cap, join, radius, sides, points, inner) =
         untracked(|| (st.cap.get(), st.join.get(), st.radius.get(), st.sides.get(), st.points.get(), st.inner.get()));
+    // The miter limit only where corners are mitered and it is not the
+    // default; a custom dash pattern wins over the preset.
+    let (miter, dash_pattern) = untracked(|| (st.miter.get(), pimble_board::parse_dash_pattern(&st.dash_text.get())));
+    let miter = (join == Some(pimble_board::Join::Miter) && (miter - pimble_board::DEFAULT_MITER).abs() > 1e-3).then_some(miter);
     // The well's gradients (a fill's only when there is a fill).
     let (fill_gradient, stroke_gradient) = untracked(|| (st.fill_gradient.get().filter(|_| fill.is_some()), st.stroke_gradient.get()));
     let shape = |kind_extra: Style| Style {
@@ -2019,28 +2031,30 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
         width: Some(width),
         opacity,
         dash,
+        dash_pattern: dash_pattern.clone(),
         cap,
         join,
+        miter,
         font_size: Some(font_size),
         align: Some(align),
         ..kind_extra
     };
     match kind {
-        Kind::Pen => Style { stroke, width: Some(width), opacity, dash, ..Style::default() },
+        Kind::Pen => Style { stroke, width: Some(width), opacity, dash, dash_pattern, ..Style::default() },
         // The marks' red multiplied over a picture reads as a dark smear: a
         // highlighter left on the first color is the highlighter's yellow.
         Kind::Highlighter => {
             let stroke = stroke.filter(|c| c.to_hex() != DEFAULT_COLOR);
             Style { stroke, width: Some(width * 5.0), opacity, ..Style::default() }
         }
-        Kind::Line => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, cap, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
-        Kind::Arrow => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, cap, arrow_heads: Some(heads), ..Style::default() },
-        Kind::Connector => Style { stroke, width: Some((width / 2.0).max(1.0)), opacity, dash, arrow_heads: Some(heads), ..Style::default() },
+        Kind::Line => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, dash_pattern, cap, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
+        Kind::Arrow => Style { stroke, stroke_gradient, width: Some(width), opacity, dash, dash_pattern, cap, arrow_heads: Some(heads), ..Style::default() },
+        Kind::Connector => Style { stroke, width: Some((width / 2.0).max(1.0)), opacity, dash, dash_pattern, arrow_heads: Some(heads), ..Style::default() },
         Kind::Rect => shape(Style { radius: (radius > 0.0).then_some(radius), ..Style::default() }),
         Kind::Ellipse | Kind::Diamond => shape(Style::default()),
         Kind::Polygon => shape(Style { sides: Some(sides), ..Style::default() }),
         Kind::Star => shape(Style { points: Some(points), inner: Some(inner), ..Style::default() }),
-        Kind::Path => Style { stroke, fill, fill_gradient, stroke_gradient, width: Some(width), opacity, dash, cap, join, ..Style::default() },
+        Kind::Path => Style { stroke, fill, fill_gradient, stroke_gradient, width: Some(width), opacity, dash, dash_pattern, cap, join, miter, ..Style::default() },
         Kind::Text => Style { stroke, fill, opacity, font_size: Some(font_size), align: Some(align), ..Style::default() },
         Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..Style::default() },
         Kind::Step => Style { stroke, opacity, font_size: Some(font_size), ..Style::default() },
@@ -2070,6 +2084,10 @@ pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
     }
     if controls_of(&kind).join {
         st.join.set_if_changed(raw.join);
+        st.miter.set_if_changed(raw.miter.unwrap_or(pimble_board::DEFAULT_MITER));
+    }
+    if controls_of(&kind).dash {
+        st.dash_text.set_if_changed(raw.dash_pattern.as_deref().map(pimble_board::dash_pattern_text).unwrap_or_default());
     }
     match kind {
         Kind::Rect => st.radius.set_if_changed(s.radius),
@@ -2164,6 +2182,10 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
             }
             if !controls_of(kind).join {
                 s.join = None;
+                s.miter = None;
+            }
+            if !controls_of(kind).dash {
+                s.dash_pattern = None;
             }
             if s == Style::default() && style != Style::default() {
                 continue;
@@ -2189,6 +2211,25 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
                 // A dash preset picked: a custom pattern would still win.
                 t.clear_style(id, pimble_board::StyleKey::DashPattern)?;
             }
+        }
+        Ok(())
+    });
+}
+
+/// The custom dash pattern cleared on the selection (its text emptied):
+/// the dash preset draws again.
+pub(super) fn clear_dash_pattern(store: AppStore, pane: PaneId) {
+    let ids = with_session(pane, |s| {
+        s.selected.iter().filter(|id| s.editable(id) && s.snapshot().get(id).is_some_and(|e| e.raw.style.dash_pattern.is_some())).cloned().collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    local_edit(store, pane, |t| {
+        for id in &ids {
+            t.clear_style(id, pimble_board::StyleKey::DashPattern)?;
         }
         Ok(())
     });
@@ -2262,6 +2303,22 @@ pub(super) fn combine(store: AppStore, pane: PaneId, op: CombineOp) {
     new_undo_step(pane);
     if let Some(id) = local_edit_said(store, pane, |t| t.combine(&ids, op)) {
         select(store, pane, vec![id]);
+    }
+}
+
+/// Outline Stroke (docs/DRAWING_CONTRACT.md decision 9): each selected
+/// stroke becomes a filled path of its outline, one undo step; the outlines
+/// are selected (a filled shape keeps its fill below its outline); a
+/// refusal is said.
+pub(super) fn outline_stroke(store: AppStore, pane: PaneId) {
+    let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    if let Some(out) = local_edit_said(store, pane, |t| t.outline_stroke(&ids)) {
+        new_undo_step(pane);
+        select(store, pane, out);
     }
 }
 
