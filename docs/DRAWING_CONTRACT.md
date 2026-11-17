@@ -1205,7 +1205,7 @@ snapshot, so its cache is new); a cache shared per board on that thread would ke
 Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model above;
 `crates/pimble-board` is not touched.
 
-Wave 4 (Joe, 2026-11-17, accepting the defaults offered):
+Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not confirmed them yet):
 
 10. **The highlighter always paints into a multiply "Highlights" layer**
     (`highlights_layer`), over a picture or not.
