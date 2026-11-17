@@ -31,6 +31,10 @@ Wave 3 (Joe, 2026-11-17, accepting the recommendations as built):
 9. **Lines count as zero area when combining**; an "Outline Stroke" that makes a stroke a
    filled path may come later.
 
+Out of scope for now (Joe, 2026-11-17): **pen tilt** (rinch's pointer events carry none) and
+**pressure widths on Pencil paths** (a fitted path keeps one width). The Brush's pressure
+stays as built.
+
 Already settled by earlier contracts and kept: everything is co-edited through the board's
 yrs document, undo is per person, a lock is a shared guard, visibility is the node's.
 
