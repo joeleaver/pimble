@@ -3234,10 +3234,13 @@ mod tests {
         let pressures: Vec<f32> = all[0].1.points.iter().map(|p| p[2]).collect();
         assert!(pressures.first().unwrap() < &0.35 && pressures.last().unwrap() > &0.8, "{pressures:?}");
         assert_eq!(all[0].1.preset, "highlighter");
-        // Into "Highlights", multiplied (no picture here: the bottom layer).
+        // Into "Highlights" (no picture here: the bottom layer, a
+        // translucent normal layer, since multiply on bare canvas smears on
+        // a dark theme).
         let layer = with_session(P[0], |s| s.snapshot().layer(&all[0].0).cloned()).flatten().unwrap();
         assert_eq!(layer.name, pimble_board::doc::HIGHLIGHTS_LAYER_NAME);
-        assert_eq!(layer.blend, pimble_board::Blend::Multiply);
+        assert_eq!(layer.blend, pimble_board::Blend::Normal);
+        assert!((layer.opacity - pimble_board::BARE_HIGHLIGHTS_OPACITY).abs() < 1e-6);
         assert_eq!(layer.kind, pimble_board::LayerKind::Paint);
         // Begun on the press, the appends sent together about every 100 ms
         // (here, mostly on release), never one per point.

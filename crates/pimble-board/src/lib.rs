@@ -77,7 +77,7 @@ pub mod view;
 
 pub use doc::{
     PAINT_ONTO_VECTOR, Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
-    free_layer_name, HIGHLIGHTS_LAYER_NAME, TEXT_BOARD_PREFIX, BOARD_KEY,
+    free_layer_name, HIGHLIGHTS_LAYER_NAME, BARE_HIGHLIGHTS_OPACITY, TEXT_BOARD_PREFIX, BOARD_KEY,
 };
 pub use brush::{BrushPoint, BrushSettings, Curve, Jitter, Preset, StrokeBlend, PRESETS, PX_PER_UNIT};
 pub use paint_ops::{

@@ -2623,7 +2623,15 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
         };
         let id = self.add_layer_in(HIGHLIGHTS_LAYER_NAME, LayerKind::Paint, parent.as_deref(), placement)?;
-        self.set_layer_blend(&id, crate::brush::HIGHLIGHTER.layer_blend)?;
+        if picture.is_some() {
+            // Over a picture the highlighter filters it, as ink on paper.
+            self.set_layer_blend(&id, crate::brush::HIGHLIGHTER.layer_blend)?;
+        } else {
+            // On bare canvas there is nothing to filter, and multiply over a
+            // dark theme's background reads as a dark smear (Joe,
+            // 2026-11-17): a translucent normal layer reads as a band on both.
+            self.set_layer_opacity(&id, BARE_HIGHLIGHTS_OPACITY)?;
+        }
         Ok(id)
     }
 }
@@ -2633,6 +2641,9 @@ pub const PAINT_ONTO_VECTOR: &str = "A paint layer cannot merge onto a vector la
 
 /// The name of the paint layer the highlighter makes on a picture.
 pub const HIGHLIGHTS_LAYER_NAME: &str = "Highlights";
+
+/// The opacity of a Highlights layer made on bare canvas (normal blend).
+pub const BARE_HIGHLIGHTS_OPACITY: f32 = 0.4;
 
 fn is_highlights(ls: &Layers, at: usize) -> bool {
     ls.tree.entries[at].kind == LayerKind::Paint && ls.raw_of(at).name == HIGHLIGHTS_LAYER_NAME

@@ -1211,8 +1211,11 @@ Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model
 
 Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not confirmed them yet):
 
-10. **The highlighter always paints into a multiply "Highlights" layer**
-    (`highlights_layer`), over a picture or not.
+10. **The highlighter paints into a "Highlights" layer**: over a picture, multiply, right
+    above the picture's layer; on bare canvas, a normal layer at 40% opacity at the bottom
+    (`BARE_HIGHLIGHTS_OPACITY`), because multiply over a dark theme's background reads as
+    a dark smear and the blend is shared by viewers on either theme (Joe, 2026-11-17,
+    replacing "multiply over a picture or not").
 11. **Hiding markup hides the Highlights layer too** (the model's rule for every paint
     layer).
 12. **The tile cache**: 256 MB in memory; on the desktop a disk cache under the user's

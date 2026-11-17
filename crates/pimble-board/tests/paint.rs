@@ -289,6 +289,18 @@ fn picture_canvas() -> (Board, String, String, String) {
 }
 
 #[test]
+fn the_highlighter_on_bare_canvas_paints_a_translucent_normal_layer() {
+    let board = Board::standalone();
+    ok(&board, |t| t.start_canvas(None));
+    let h = ok(&board, |t| t.highlights_layer(None));
+    let snap = board.snapshot();
+    let layer = snap.layer(&h).unwrap();
+    assert_eq!((layer.kind.clone(), layer.blend, layer.name.as_str()), (LayerKind::Paint, Blend::Normal, "Highlights"));
+    assert!((layer.opacity - pimble_board::BARE_HIGHLIGHTS_OPACITY).abs() < 1e-6, "{}", layer.opacity);
+    assert_eq!(ok(&board, |t| t.highlights_layer(None)), h, "reused");
+}
+
+#[test]
 fn the_highlighter_on_a_picture_paints_a_multiply_layer_above_it() {
     let (board, draw, picture_layer, picture) = picture_canvas();
     let h = ok(&board, |t| t.highlights_layer(Some(&picture)));
