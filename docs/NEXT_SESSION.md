@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-17 (session 78e7f30f): v0.25.0 released from `master`: the drawing plan is finished.**
+docs/DRAWING_CONTRACT.md waves 3-5 and "Loose ends closed": combining (linesweeper), gradients,
+flip, SVG in; paint layers (ops as `paint:<id>` keys, brush engine and presets, 256 px tiles
+with memory and disk caches), Brush, Highlighter, Eraser, Eyedropper; Fill, Smudge, Blur,
+rectangle and lasso paint selections, Flatten, Merge Down across kinds; Outline Stroke,
+multi-element Direct select, miter and dash controls. Letters: Rectangle U, Polygon Y, Line
+Shift+W, Numbered step J, Highlighter Shift+B, Blur Shift+R. Hand-tested in the browser on the
+local stack (encrypted store). Open for Joe: wave 4 defaults (highlighter always multiply,
+markup hides Highlights, caches 256 MB / 512 MB), wave 5 questions (sample all layers, merging
+hidden layers, fill reach, defaults), Pencil pressure widths. Tilt needs a rinch pointer field.
+
 **2026-11-16 (session 78e7f30f): v0.24.0 released from `master`: drawing wave 2, paths.**
 docs/DRAWING_CONTRACT.md "Built in wave 2 (model)" and "(UI)": the `path` element (SVG `d`
 in and out of the MCP), Bezier fitting, live shapes (rect radius, polygon, star) that turn
