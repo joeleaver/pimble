@@ -1,5 +1,9 @@
 # Next session: start here
 
+**2026-11-17 (session 78e7f30f): v0.25.1**: the highlighter on bare canvas paints into a
+normal "Highlights" layer at 40% opacity (multiply smeared dark on the dark theme); over a
+picture it stays multiply (docs/DRAWING_CONTRACT.md decision 10).
+
 **2026-11-17 (session 78e7f30f): v0.25.0 released from `master`: the drawing plan is finished.**
 docs/DRAWING_CONTRACT.md waves 3-5 and "Loose ends closed": combining (linesweeper), gradients,
 flip, SVG in; paint layers (ops as `paint:<id>` keys, brush engine and presets, 256 px tiles
