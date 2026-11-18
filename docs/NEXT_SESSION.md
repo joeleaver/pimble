@@ -1,5 +1,17 @@
 # Next session: start here
 
+**2026-11-18 (session 78e7f30f): v0.26.0: the MCP for large notes, from the Braynard sessions'
+feedback.** `get_node` takes `section` (a heading or heading path), `outline: true` and
+`blocks`, and warns over 15,000 characters; search hits carry `in: <heading path>`, exact
+title and heading matches rank first (the index schema changed: every store's index rebuilds
+once at open), and an unscoped search puts the store the MCP process last worked in first
+(Joe's option a); `split_note`. The probe no longer calls a server that drops mid-handover
+"from before 0.12.2" (only "method not found" is), and retries. Next: Batch 1 of the map
+session's list (a 25,000-stroke canvas made a store unloadable for new clients: the 10 MB RPC
+cap; tiled Flatten; `get_canvas` by layer and paging; full geometry reads; copying layers
+across canvases; size readouts; the 3 GB memory peak), then a wave 6 contract for Joe (clip
+masks, stamp brushes and symbols, soft edges, map lettering, pictures into paint layers).
+
 **2026-11-17 (session 78e7f30f): v0.25.1**: the highlighter on bare canvas paints into a
 normal "Highlights" layer at 40% opacity (multiply smeared dark on the dark theme); over a
 picture it stays multiply (docs/DRAWING_CONTRACT.md decision 10).
