@@ -86,7 +86,7 @@ async fn children_of(handler: &RpcHandler, store_id: StoreId, node_id: NodeId) -
 /// fresh `syncNodes`.
 async fn peer_tree(handler: &RpcHandler, store_id: StoreId, root_id: NodeId) -> Tree {
     let listing = handler
-        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true })
+        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true, max_bytes: None })
         .await
         .unwrap();
     let empty_sv = b64(&pimble_crdt::empty_state_vector());
@@ -95,6 +95,7 @@ async fn peer_tree(handler: &RpcHandler, store_id: StoreId, root_id: NodeId) -> 
             store_id,
             nodes: listing.unknown_ids.iter().map(|id| NodeStateVector { node_id: *id, state_vector: empty_sv.clone() }).collect(),
             list_unknown: false,
+            max_bytes: None,
         })
         .await
         .unwrap();
@@ -256,7 +257,7 @@ async fn a_tombstoned_node_is_gone_and_comes_back_on_undelete() {
     }
     assert_eq!(children_of(&handler, store_id, root_id).await, vec![other]);
     let listing = handler
-        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true })
+        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true, max_bytes: None })
         .await
         .unwrap();
     assert!(listing.unknown_ids.contains(&folder) && listing.unknown_ids.contains(&inner), "tombstones are documents sync names");

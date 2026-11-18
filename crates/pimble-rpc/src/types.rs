@@ -843,6 +843,19 @@ pub struct HaveBlobsResponse {
 /// more; `PimbleClient::sync_nodes` splits a longer list.
 pub const MAX_SYNC_NODE_CONTENTS: usize = 100;
 
+/// The largest JSON-RPC message (request, answer or notification) a Pimble
+/// server and a native client take: 256 MiB, set on the server's
+/// `Server::builder()` and on `WsClientBuilder` both. jsonrpsee's default
+/// (10 MB) let one large canvas make its whole store unloadable for a fresh
+/// client (docs/DRAWING_CONTRACT.md "Large canvases"). The browser's
+/// `WebSocket` has no such limit to set.
+pub const MAX_MESSAGE_BYTES: u32 = 256 * 1024 * 1024;
+
+/// The most bytes of diffs `PimbleClient::sync_nodes` asks one `syncNodes`
+/// answer to carry ([`SyncNodesRequest::max_bytes`]); a document larger
+/// than this still comes, alone.
+pub const SYNC_ANSWER_BYTES: u64 = 8 * 1024 * 1024;
+
 /// One node's state vector in a [`SyncNodesRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStateVector {
@@ -879,6 +892,14 @@ pub struct SyncNodesRequest {
     pub nodes: Vec<NodeStateVector>,
     #[serde(default)]
     pub list_unknown: bool,
+    /// The most bytes of (base64) diffs the caller wants in this answer.
+    /// The server answers the named documents in order until the next one
+    /// would pass it (always at least one) and lists the rest in
+    /// [`SyncNodesResponse::deferred`], for the caller to name again. Left
+    /// out (an older client), every named document is answered. Stateless:
+    /// the server keeps nothing between the two calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 /// One entry per requested node the server has, in request order (a node the
@@ -890,6 +911,12 @@ pub struct SyncNodesResponse {
     pub nodes: Vec<NodeContentDiff>,
     #[serde(default)]
     pub unknown_ids: Vec<NodeId>,
+    /// Named documents left out of this answer because of
+    /// [`SyncNodesRequest::max_bytes`], in request order: ask again for
+    /// them (with the same state vectors). Never set when `max_bytes` was
+    /// not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<NodeId>,
 }
 
 // ============================================================================

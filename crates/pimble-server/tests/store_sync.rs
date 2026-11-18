@@ -52,7 +52,7 @@ fn unb64(s: &str) -> Vec<u8> {
 /// asked for, then the unknown ids fetched with empty state vectors.
 async fn pull_everything(handler: &RpcHandler, store_id: StoreId) -> Vec<(NodeId, Vec<u8>)> {
     let listing = handler
-        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true })
+        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes: Vec::new(), list_unknown: true, max_bytes: None })
         .await
         .unwrap();
     assert!(listing.nodes.is_empty(), "nothing was named, so nothing is answered");
@@ -65,6 +65,7 @@ async fn pull_everything(handler: &RpcHandler, store_id: StoreId) -> Vec<(NodeId
                 store_id,
                 nodes: chunk.iter().map(|id| NodeStateVector { node_id: *id, state_vector: empty_sv.clone() }).collect(),
                 list_unknown: false,
+                max_bytes: None,
             })
             .await
             .unwrap();
@@ -156,6 +157,7 @@ async fn sync_nodes_answers_only_what_the_server_holds() {
                 NodeStateVector { node_id: unknown, state_vector: b64(&pimble_crdt::empty_state_vector()) },
             ],
             list_unknown: true,
+            max_bytes: None,
         })
         .await
         .unwrap();
@@ -176,7 +178,7 @@ async fn sync_nodes_refuses_more_than_the_batch_limit() {
         .map(|_| NodeStateVector { node_id: NodeId::new(), state_vector: b64(&pimble_crdt::empty_state_vector()) })
         .collect();
     let err = handler
-        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes, list_unknown: false })
+        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest { store_id, nodes, list_unknown: false, max_bytes: None })
         .await
         .expect_err("over the limit");
     assert!(err.message().contains("at most"), "{}", err.message());

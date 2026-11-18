@@ -76,6 +76,7 @@ async fn sync_node_content_hands_new_client_the_full_document() {
             store_id,
             nodes: vec![NodeStateVector { node_id, state_vector: empty_sv_b64 }],
             list_unknown: false,
+            max_bytes: None,
         })
         .await
         .unwrap();

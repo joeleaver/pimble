@@ -172,7 +172,9 @@ impl PimbleClient {
     /// Open the WebSocket to `ws_url`, carrying `auth` in a request header.
     #[cfg(not(target_arch = "wasm32"))]
     async fn build_transport(ws_url: &Url, auth: &AuthMethod) -> Result<RpcClient> {
-        let mut builder = WsClientBuilder::default();
+        let mut builder = WsClientBuilder::default()
+            .max_request_size(pimble_rpc::MAX_MESSAGE_BYTES)
+            .max_response_size(pimble_rpc::MAX_MESSAGE_BYTES);
         match auth {
             AuthMethod::None => {}
             AuthMethod::Bearer { token } => {
@@ -960,19 +962,21 @@ impl PimbleClient {
     /// vector)` back, in request order, for every node the server has; and,
     /// with `list_unknown`, the ids of every document the server holds that
     /// `nodes` did not name (tombstones included). Splits the list into
-    /// requests of at most `MAX_SYNC_NODE_CONTENTS` nodes; the unknown ids
-    /// are asked for once and every named id is taken out of the answer, so
-    /// the split is invisible to the caller. `nodes` may be empty: with
-    /// `list_unknown` that asks for every id the store holds.
+    /// requests of at most `MAX_SYNC_NODE_CONTENTS` nodes, each asking for
+    /// at most `SYNC_ANSWER_BYTES` of diffs: what the server defers is asked
+    /// for again, so a large document travels alone. A request that still
+    /// fails as too big (a server from before `max_bytes`) is asked again a
+    /// document at a time, and one document over the limit is an error that
+    /// names it (`too_big_sentence`). The unknown ids are asked for once
+    /// and every named id is taken out of the answer, so the split is
+    /// invisible to the caller. `nodes` may be empty: with `list_unknown`
+    /// that asks for every id the store holds.
     pub async fn sync_nodes(
         &self,
         store_id: StoreId,
         nodes: &[(NodeId, Vec<u8>)],
         list_unknown: bool,
     ) -> Result<(Vec<(NodeId, Vec<u8>, Vec<u8>)>, Vec<NodeId>)> {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
-
         let mut answers = Vec::with_capacity(nodes.len());
         let mut unknown = Vec::new();
         // One request even for an empty list, so `list_unknown` on nothing
@@ -983,31 +987,46 @@ impl PimbleClient {
             nodes.chunks(MAX_SYNC_NODE_CONTENTS).collect()
         };
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let request = SyncNodesRequest {
-                store_id,
-                nodes: chunk
-                    .iter()
-                    .map(|(node_id, sv)| NodeStateVector { node_id: *node_id, state_vector: b64.encode(sv) })
-                    .collect(),
-                list_unknown: list_unknown && i == 0,
-            };
-
-            let response = self
-                .client
-                .sync_nodes(request)
-                .await
-                .map_err(rpc_error)?;
-
-            for entry in response.nodes {
-                let diff = b64
-                    .decode(&entry.diff)
-                    .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
-                let server_sv = b64
-                    .decode(&entry.state_vector)
-                    .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
-                answers.push((entry.node_id, diff, server_sv));
+            let mut pending: Vec<(NodeId, Vec<u8>)> = chunk.to_vec();
+            let mut list = list_unknown && i == 0;
+            loop {
+                let (got, deferred, listed) = match self.sync_nodes_once(store_id, &pending, list).await {
+                    Ok(answer) => answer,
+                    Err(e) if e.is_too_big() => {
+                        // Asked again one document at a time: the one too
+                        // large is named.
+                        let mut got = Vec::new();
+                        let mut listed = Vec::new();
+                        if list {
+                            listed = self.sync_nodes_once(store_id, &[], true).await?.2;
+                        }
+                        for one in &pending {
+                            match self.sync_nodes_once(store_id, std::slice::from_ref(one), false).await {
+                                Ok((mut g, _, _)) => got.append(&mut g),
+                                Err(e) if e.is_too_big() => {
+                                    return Err(ClientError::Server { code: crate::error::TOO_BIG_RESPONSE, message: crate::error::too_big_sentence(store_id, one.0) })
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        (got, Vec::new(), listed)
+                    }
+                    Err(e) => return Err(e),
+                };
+                answers.extend(got);
+                unknown.extend(listed);
+                list = false;
+                if deferred.is_empty() {
+                    break;
+                }
+                let deferred: std::collections::HashSet<NodeId> = deferred.into_iter().collect();
+                let before = pending.len();
+                pending.retain(|(id, _)| deferred.contains(id));
+                if pending.is_empty() || pending.len() == before {
+                    // A server deferring everything would never finish.
+                    return Err(ClientError::Rpc("the server deferred every document of a syncNodes request".into()));
+                }
             }
-            unknown.extend(response.unknown_ids);
         }
 
         if list_unknown {
@@ -1018,6 +1037,32 @@ impl PimbleClient {
         }
 
         Ok((answers, unknown))
+    }
+
+    /// One `syncNodes` call: the answers, the ids deferred, the unknown ids.
+    #[allow(clippy::type_complexity)]
+    async fn sync_nodes_once(
+        &self,
+        store_id: StoreId,
+        nodes: &[(NodeId, Vec<u8>)],
+        list_unknown: bool,
+    ) -> Result<(Vec<(NodeId, Vec<u8>, Vec<u8>)>, Vec<NodeId>, Vec<NodeId>)> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let request = SyncNodesRequest {
+            store_id,
+            nodes: nodes.iter().map(|(node_id, sv)| NodeStateVector { node_id: *node_id, state_vector: b64.encode(sv) }).collect(),
+            list_unknown,
+            max_bytes: Some(pimble_rpc::SYNC_ANSWER_BYTES),
+        };
+        let response = self.client.sync_nodes(request).await.map_err(rpc_error)?;
+        let mut answers = Vec::with_capacity(response.nodes.len());
+        for entry in response.nodes {
+            let diff = b64.decode(&entry.diff).map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
+            let server_sv = b64.decode(&entry.state_vector).map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
+            answers.push((entry.node_id, diff, server_sv));
+        }
+        Ok((answers, response.deferred, response.unknown_ids))
     }
 
     // ========================================================================

@@ -127,6 +127,17 @@ repair touched. `applyStoreUpdate` and `syncStoreDocument` go away.
   and derives the notifications. `createNode`, `moveNode`, `deleteNode`,
   `updateNodeMetadata` stay as the thin clients' way of making tree edits; the server makes
   the document edits and broadcasts them as `applyEdit` would have.
+- **Answers sized by bytes** (2026-11-18, docs/DRAWING_CONTRACT.md "Large canvases"): a
+  `syncNodes` request names at most `MAX_SYNC_NODE_CONTENTS` (100) documents and may give
+  `max_bytes`; the server then answers the named documents in order until the next diff
+  would take the answer past it (always answering one) and names the rest in `deferred`,
+  for the caller to name again with the same state vectors. Still stateless: nothing is
+  kept between the calls, and a request without `max_bytes` (an older client) is answered
+  whole, as before. `PimbleClient::sync_nodes` asks with `SYNC_ANSWER_BYTES` (8 MiB) and
+  re-asks what is deferred, so a large canvas travels alone; a request that still fails as
+  too big (a server from before `max_bytes`) is asked again a document at a time, and a
+  single document past `MAX_MESSAGE_BYTES` (256 MiB, the limit on every message both
+  ways) is an error naming it (`pimble_client::too_big_sentence`).
 - **Vault**: `VaultDocId` is a node id; the `tree` document is gone. The vault link and the
   web vault client hold node documents and build the tree from them (the manifest's root
   id is where the tree starts). `vault_log.rs` is unchanged.

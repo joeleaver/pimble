@@ -5072,11 +5072,23 @@ impl PimbleApiServer for RpcHandler {
         // A scoped member reconciles its scope: a document outside it is
         // left out exactly as one this store does not hold, and is never
         // listed as unknown.
+        //
+        // With `max_bytes` the answer stops before the document that would
+        // take it past that many bytes of diffs (always answering one), and
+        // the documents not answered are listed as `deferred` for the
+        // caller to name again: one large canvas then travels alone instead
+        // of pushing a batch past what one message carries.
         let reach = Reach::of(&manager, &principal, request.store_id);
         let mut named: HashSet<NodeId> = HashSet::with_capacity(request.nodes.len());
         let mut nodes = Vec::with_capacity(request.nodes.len());
+        let mut deferred = Vec::new();
+        let mut answered_bytes: u64 = 0;
         for entry in request.nodes {
             named.insert(entry.node_id);
+            if !deferred.is_empty() {
+                deferred.push(entry.node_id);
+                continue;
+            }
             if require_in_scope(&reach, entry.node_id, Access::Read).is_err() {
                 continue;
             }
@@ -5089,9 +5101,16 @@ impl PimbleApiServer for RpcHandler {
                 Err(e) => return Err(to_rpc_error(e)),
             };
             let state_vector = manager.node_state_vector(request.store_id, entry.node_id).map_err(to_rpc_error)?;
+            let diff = b64.encode(&diff);
+            let size = diff.len() as u64;
+            if request.max_bytes.is_some_and(|max| !nodes.is_empty() && answered_bytes + size > max) {
+                deferred.push(entry.node_id);
+                continue;
+            }
+            answered_bytes += size;
             nodes.push(NodeContentDiff {
                 node_id: entry.node_id,
-                diff: b64.encode(&diff),
+                diff,
                 state_vector: b64.encode(&state_vector),
             });
         }
@@ -5110,7 +5129,7 @@ impl PimbleApiServer for RpcHandler {
             Vec::new()
         };
 
-        Ok(SyncNodesResponse { nodes, unknown_ids })
+        Ok(SyncNodesResponse { nodes, unknown_ids, deferred })
     }
 
     async fn apply_edit(

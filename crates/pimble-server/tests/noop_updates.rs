@@ -153,6 +153,7 @@ async fn resending_an_applied_structure_update_produces_no_notification_or_modif
                 store_id,
                 nodes: vec![NodeStateVector { node_id: root_id, state_vector: base64::engine::general_purpose::STANDARD.encode(pimble_crdt::empty_state_vector()) }],
                 list_unknown: false,
+                max_bytes: None,
             })
             .await
             .unwrap();

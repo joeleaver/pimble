@@ -68,6 +68,15 @@ fn err(client: &PimbleClient, e: pimble_client::ClientError) -> ApiError {
     }
 }
 
+/// A client error about one document: a message too big to send names the
+/// document and says what to do (docs/DRAWING_CONTRACT.md "Large canvases").
+fn err_at(client: &PimbleClient, e: pimble_client::ClientError, store: StoreId, node: NodeId) -> ApiError {
+    if e.is_too_big() && !e.to_string().contains("pimble:") {
+        return ApiError::Failed { sentence: pimble_client::too_big_sentence(store, node) };
+    }
+    err(client, e)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Backend for RpcBackend {
@@ -78,7 +87,7 @@ impl Backend for RpcBackend {
 
     async fn fetch_one(&self, store: StoreId, node: NodeId) -> Result<Node, ApiError> {
         let c = self.client().await?;
-        c.get_node(store, node).await.map_err(|e| err(&c, e))
+        c.get_node(store, node).await.map_err(|e| err_at(&c, e, store, node))
     }
 
     async fn fetch(&self, store: StoreId, nodes: Vec<NodeId>) -> Result<Vec<Node>, ApiError> {
@@ -88,7 +97,16 @@ impl Backend for RpcBackend {
 
     async fn children(&self, store: StoreId, node: NodeId) -> Result<(StoreId, Vec<Node>), ApiError> {
         let c = self.client().await?;
-        c.get_children(store, node).await.map_err(|e| err(&c, e))
+        c.get_children(store, node).await.map_err(|e| match e.is_too_big() {
+            true => ApiError::Failed {
+                sentence: format!(
+                    "The children of pimble:{store}/{node} are larger together than Pimble sends in one message ({} MB): one of them is likely a canvas that large. \
+                     Flatten its paint layers (Flatten in the layers panel, or flatten_layer) or split it into several canvases.",
+                    pimble_rpc::MAX_MESSAGE_BYTES / (1024 * 1024)
+                ),
+            },
+            false => err(&c, e),
+        })
     }
 
     async fn sync(&self, store: StoreId, have: Vec<(NodeId, Vec<u8>)>, list_unknown: bool) -> Result<(Vec<SyncedDoc>, Vec<NodeId>), ApiError> {
@@ -100,7 +118,7 @@ impl Backend for RpcBackend {
     async fn apply(&self, store: StoreId, node: NodeId, update: Vec<u8>, client_id: &str) -> Result<(), ApiError> {
         let c = self.client().await?;
         let changes = base64::engine::general_purpose::STANDARD.encode(update);
-        c.apply_edit(store, node, client_id, EditOperation::IncrementalChanges { changes }).await.map_err(|e| err(&c, e))
+        c.apply_edit(store, node, client_id, EditOperation::IncrementalChanges { changes }).await.map_err(|e| err_at(&c, e, store, node))
     }
 
     async fn create_node(&self, store: StoreId, parent: NodeId, init: NodeInit, place: Place) -> Result<NodeId, ApiError> {
