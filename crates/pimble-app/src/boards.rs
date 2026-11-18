@@ -2003,6 +2003,69 @@ struct Pictures {
     asked: HashSet<String>,
     /// Answered "not here": asked again by [`retry_missing_pictures`].
     missing: HashSet<String>,
+    /// When each decoded picture was last drawn from (ms).
+    used: HashMap<String, f64>,
+    /// A trim is due ([`trim_pictures`]).
+    trim_armed: bool,
+}
+
+/// The decoded pictures boards keep (docs/DRAWING_CONTRACT.md "Large
+/// canvases"): past this, those not drawn from for [`PICTURE_IDLE_MS`] go
+/// (asked for again, from their bytes kept here, when a render needs them).
+/// A county-sized layer flattened at full density is about 130 pictures of
+/// 16 MB, which every one were held for good before.
+const PICTURE_BUDGET: usize = 512 << 20;
+const PICTURE_IDLE_MS: f64 = 4000.0;
+
+/// A decoded picture's bytes: its pixels and its smaller levels.
+fn picture_bytes_held(picture: &Picture) -> usize {
+    picture.width() as usize * picture.height() as usize * 4 * 4 / 3
+}
+
+/// Drop the decoded pictures not drawn from lately while the cache is past
+/// its budget; checked again a moment later while anything is held that
+/// may go then. Never one drawn from in the last few seconds, so a view
+/// that needs more than the budget at once keeps what it shows.
+fn trim_pictures() {
+    let now = crate::text_boards::now_ms();
+    let again = PICTURES.with(|p| {
+        let mut p = p.borrow_mut();
+        p.trim_armed = false;
+        let mut total: usize = p.decoded.values().map(|pic| picture_bytes_held(pic)).sum();
+        if total <= PICTURE_BUDGET {
+            return false;
+        }
+        let mut by_age: Vec<(f64, String)> = p.decoded.keys().map(|k| (p.used.get(k).copied().unwrap_or(0.0), k.clone())).collect();
+        by_age.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut kept_recent = false;
+        for (used, src) in by_age {
+            if total <= PICTURE_BUDGET / 10 * 8 {
+                break;
+            }
+            if now - used < PICTURE_IDLE_MS {
+                kept_recent = true;
+                break;
+            }
+            if let Some(pic) = p.decoded.remove(&src) {
+                total = total.saturating_sub(picture_bytes_held(&pic));
+            }
+            p.used.remove(&src);
+            p.asked.remove(&src);
+        }
+        tracing::debug!("board pictures: {} decoded, {} MB held after a trim", p.decoded.len(), total >> 20);
+        kept_recent && total > PICTURE_BUDGET
+    });
+    if again {
+        trim_pictures_soon();
+    }
+}
+
+/// [`trim_pictures`] in a moment, once.
+fn trim_pictures_soon() {
+    let arm = PICTURES.with(|p| !std::mem::replace(&mut p.borrow_mut().trim_armed, true));
+    if arm {
+        let _ = set_timeout(PICTURE_IDLE_MS as u32 + 500, trim_pictures);
+    }
 }
 
 thread_local! {
@@ -2015,8 +2078,11 @@ fn picture_source() -> impl Fn(&str) -> Option<Arc<Picture>> {
     |src: &str| {
         PICTURES.with(|p| {
             let mut p = p.borrow_mut();
-            match p.decoded.get(src) {
-                Some(picture) => Some(picture.clone()),
+            match p.decoded.get(src).cloned() {
+                Some(picture) => {
+                    p.used.insert(src.to_string(), crate::text_boards::now_ms());
+                    Some(picture)
+                }
                 None => {
                     if !p.asked.contains(src) {
                         p.wanted.insert(src.to_string());
@@ -2034,6 +2100,7 @@ fn seed_picture(src: &str, picture: Arc<Picture>, bytes: Vec<u8>) {
     PICTURES.with(|p| {
         let mut p = p.borrow_mut();
         p.decoded.insert(src.to_string(), picture);
+        p.used.insert(src.to_string(), crate::text_boards::now_ms());
         p.raw.insert(src.to_string(), Arc::new(bytes));
         p.wanted.remove(src);
     });
@@ -2126,8 +2193,11 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
     match picture {
         Ok(picture) => {
             PICTURES.with(|p| {
-                p.borrow_mut().decoded.insert(src.clone(), picture);
+                let mut p = p.borrow_mut();
+                p.decoded.insert(src.clone(), picture);
+                p.used.insert(src.clone(), crate::text_boards::now_ms());
             });
+            trim_pictures_soon();
             crate::text_boards::picture_arrived();
         }
         Err(e) => {
@@ -4269,6 +4339,54 @@ mod tests {
         let blue = color_at(Point::new(170.0, 0.0));
         assert!(blue.b > 150 && blue.r < 80, "the rectangle is pixels now: {blue:?}");
         assert_eq!(untracked(|| store.pane(P[0]).board_ui.layer.get()), Some(layer.clone()), "the layer it went into is picked");
+        stop(store, P[0]);
+    }
+
+    /// A paint layer wider than one tile (docs/DRAWING_CONTRACT.md "Large
+    /// canvases"): Flatten stores a picture per tile and lays them all down
+    /// in one edit once the last is stored (one undo step); nothing changes
+    /// before, and a tile that fails to store writes nothing.
+    #[test]
+    fn a_wide_layer_flattens_in_tiles_in_one_edit() {
+        let (store, commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let layer = local_edit(store, P[0], |t| {
+            let paint = t.paint_layer_for(None)?;
+            let points: Vec<pimble_board::BrushPoint> = (0..120).map(|i| [-1500.0 + i as f32 * 25.0, 0.0, 1.0, 0.0]).collect();
+            t.add_stroke(pimble_board::NewStroke::new(&paint, &pimble_board::brush::ROUND, Color::rgb(200, 30, 30)).with_size(10.0).with_points(points))?;
+            Ok(paint)
+        })
+        .unwrap();
+        let _ = commands.try_iter().count();
+        let blobs = |commands: &crossbeam_channel::Receiver<BackendCommand>| -> Vec<u64> {
+            commands.try_iter().filter_map(|c| match c {
+                BackendCommand::PutBlob { request_id, .. } => Some(request_id),
+                _ => None,
+            }).collect()
+        };
+        let url = |i: u64| {
+            let blob = pimble_core::BlobId::from_bytes([i as u8 + 1; 16]);
+            BlobUrl::parse(&format!("pimble-blob:00000000-0000-0000-0000-000000000001/{blob}")).unwrap()
+        };
+        // A tile that fails: nothing written, the panel free again.
+        layers::rasterize_layer(store, P[0], pimble_board::RasterJob::Flatten(layer.clone()));
+        let ids = blobs(&commands);
+        assert!(ids.len() >= 3, "a picture per tile: {}", ids.len());
+        assert!(stored(store, ids[0], &Ok(StoredBlob { url: url(0), size: None, notice: None })));
+        assert!(stored(store, ids[1], &Err("The disk is full.".into())));
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.rasterizing.get()), None);
+        assert!(!stored(store, ids[2], &Ok(StoredBlob { url: url(2), size: None, notice: None })), "the job is gone");
+        assert_eq!(op_kinds(), vec!["stroke"]);
+        // Every tile stored: one edit, one undo.
+        layers::rasterize_layer(store, P[0], pimble_board::RasterJob::Flatten(layer.clone()));
+        let ids = blobs(&commands);
+        for (k, id) in ids.iter().enumerate() {
+            assert_eq!(op_kinds(), vec!["stroke"], "nothing changes until the last picture is stored");
+            assert!(stored(store, *id, &Ok(StoredBlob { url: url(k as u64), size: None, notice: None })));
+        }
+        assert_eq!(op_kinds(), vec!["pixels"; ids.len()]);
+        tools::undo(store, P[0], false);
+        assert_eq!(op_kinds(), vec!["stroke"], "one undo step");
         stop(store, P[0]);
     }
 }

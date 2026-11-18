@@ -20,7 +20,7 @@ use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICK
 use pimble_board::{
     dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
     BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
-    fill_clip, merge_needs_pixels, rasterize, NewElement, NewFill, NewStroke, Page, PaintBody, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
+    fill_clip, merge_needs_pixels, rasterize_at, NewElement, NewFill, NewStroke, Page, PaintBody, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
     StyleKey, SvgPlacement, Transform, ViewOptions,
 };
 use pimble_board::path::{parse_d, to_d};
@@ -37,14 +37,24 @@ use pimble_api::{label, recipes, Addr};
 
 use super::{type_name, Pimble};
 
+#[path = "canvas_copy.rs"]
+mod canvas_copy;
+use canvas_copy::{copy_layer_tree, element_json, of_layers, paint_json, picture_srcs, with_members, write_copy, CopyPlan};
+
 /// Board writes are stamped with RFC 3339 UTC with milliseconds: step numbers
 /// sort by it as a string, so every writer uses the app's shape.
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// How many elements get_canvas lists before it stops.
+/// How many elements get_canvas lists before it stops, unless asked for
+/// more (at most [`MAX_LIST_LIMIT`]).
 const LIST_LIMIT: usize = 400;
+const MAX_LIST_LIMIT: usize = 2000;
+/// How many elements get_elements gives at once, unless asked (at most
+/// [`MAX_ELEMENTS_LIMIT`]).
+const ELEMENTS_LIMIT: usize = 200;
+const MAX_ELEMENTS_LIMIT: usize = 1000;
 /// The longest path data get_canvas writes out for one path.
 const PATH_TEXT_LIMIT: usize = 4000;
 
@@ -66,6 +76,112 @@ pub struct GetCanvasParams {
     /// it ("role=door"); names and values match without regard to case.
     #[serde(default)]
     pub with_field: Option<String>,
+    /// List only this layer's elements (its name or id); a group: the
+    /// elements of every layer in it. The other layers are left out.
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Skip this many of the elements listed (top first), for the next page.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// List at most this many elements (default 400, at most 2000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetElementsParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// These elements (ids, as get_canvas lists them), with the members of
+    /// any group or frame among them.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// Or every element of this layer (name or id; a group: of every layer
+    /// in it); a paint layer gives its strokes and fills as paint takes them.
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Skip this many (bottom to top), for the next page.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// At most this many (default 200, at most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ExportCanvasParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// Only this layer's elements (name or id; a group: every layer in it).
+    /// Paint layers are left out then.
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Only this area, in canvas units. Left out: everything that shows.
+    #[serde(default)]
+    pub area: Option<AreaSpec>,
+    /// Write the SVG to this file on this computer instead of answering it
+    /// (an answer is at most 1 MB).
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CopyElementsParams {
+    /// The canvas they come from (a canvas node, or the note holding it).
+    pub from: String,
+    /// A picture's canvas in `from`'s text: its id after `#canvas=`.
+    #[serde(default)]
+    pub from_canvas: Option<String>,
+    /// These elements (ids), with the members of any group or frame among
+    /// them.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// Or every element of this layer (name or id; a group: of every layer
+    /// in it). A paint layer's operations are copied too (into `layer`,
+    /// which must then be a paint layer); copy_layer copies a whole layer.
+    #[serde(default)]
+    pub from_layer: Option<String>,
+    /// The canvas they go to (may be the same canvas).
+    pub to: String,
+    /// A picture's canvas in `to`'s text.
+    #[serde(default)]
+    pub to_canvas: Option<String>,
+    /// The layer they go in (name or id), made when missing (a vector layer,
+    /// or a paint layer for paint). Left out: a layer of the source layer's
+    /// name, made when missing.
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Moved by [dx, dy] canvas units.
+    #[serde(default)]
+    pub offset: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CopyLayerParams {
+    /// The canvas it comes from.
+    pub from: String,
+    #[serde(default)]
+    pub from_canvas: Option<String>,
+    /// The layer (name or id): a vector layer with its elements, a paint
+    /// layer with its whole history, or a group with every layer in it.
+    pub layer: String,
+    /// The canvas it goes to (may be the same canvas).
+    pub to: String,
+    #[serde(default)]
+    pub to_canvas: Option<String>,
+    /// The new layer's name. Left out: the layer's own (with " copy" on the
+    /// same canvas).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Moved by [dx, dy] canvas units.
+    #[serde(default)]
+    pub offset: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -88,6 +204,22 @@ pub struct RenderCanvasParams {
     /// Show hidden layers and hidden markup too (the canvas is not changed).
     #[serde(default)]
     pub show_all: bool,
+}
+
+/// An element's transform. Unset keys are the identity's.
+#[derive(Deserialize, JsonSchema, Clone, Copy, Default)]
+pub struct TransformSpec {
+    #[serde(default)]
+    pub tx: Option<f32>,
+    #[serde(default)]
+    pub ty: Option<f32>,
+    /// Degrees clockwise.
+    #[serde(default)]
+    pub rot: Option<f32>,
+    #[serde(default)]
+    pub sx: Option<f32>,
+    #[serde(default)]
+    pub sy: Option<f32>,
 }
 
 #[derive(Deserialize, JsonSchema, Clone, Copy)]
@@ -218,7 +350,8 @@ pub struct ElementSpec {
     #[serde(default)]
     pub h: Option<f32>,
     /// line and arrow: two points [[x1,y1],[x2,y2]]. pen and highlighter: the
-    /// stroke's points in order, [[x,y],...].
+    /// stroke's points in order, [[x,y],...], each optionally with its
+    /// pressure ([x,y,pressure], 0 to 1; left out 0.5, the stroke's width).
     #[serde(default)]
     pub points: Option<Vec<Vec<f32>>>,
     /// pen and highlighter: draw a smooth curve through the points (a few
@@ -282,6 +415,14 @@ pub struct ElementSpec {
     /// Degrees clockwise about its center.
     #[serde(default)]
     pub rotation: Option<f32>,
+    /// Its whole transform, as get_elements gives it: moved by tx, ty,
+    /// rotated rot degrees and scaled sx, sy about its own center (over
+    /// `rotation` when both are given).
+    #[serde(default)]
+    pub transform: Option<TransformSpec>,
+    /// picture: the part of the picture shown, in its own pixels.
+    #[serde(default)]
+    pub crop: Option<AreaSpec>,
     /// The layer it goes in (name or id). Left out: the call's `layer`, else the
     /// top layer that is not locked.
     #[serde(default)]
@@ -546,6 +687,11 @@ pub struct FlattenLayerParams {
     pub canvas: Option<String>,
     /// The paint layer: its name or id.
     pub layer: String,
+    /// Pixels per canvas unit to draw it at, from 0.125 to 2 (the default,
+    /// a paint layer's own density). Less makes a very large layer's
+    /// pictures smaller and softer.
+    #[serde(default)]
+    pub scale: Option<f32>,
 }
 
 #[derive(Deserialize, JsonSchema, Clone)]
@@ -1156,7 +1302,18 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
             if pts.len() < 2 {
                 return Err(bad(format!("a {kind} stroke takes at least two points")));
             }
-            return Ok((kind, Geom::Stroke, stroke_points(&pts, spec.smooth == Some(true), spec.closed == Some(true))));
+            let smooth = spec.smooth == Some(true);
+            let mut out = stroke_points(&pts, smooth, spec.closed == Some(true));
+            // Pressures given with the points (as get_elements gives them)
+            // are kept; a smooth curve has its own points, at the stroke's width.
+            if !smooth {
+                for (o, given) in out.iter_mut().zip(spec.points.iter().flatten()) {
+                    if let Some(p) = given.get(2).filter(|p| p.is_finite()) {
+                        o[2] = p.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            return Ok((kind, Geom::Stroke, out));
         }
         Kind::Step => {
             let (x, y) = xy("step")?;
@@ -1184,7 +1341,8 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
                 (None, Some(h)) => (h * pw_f / ph_f.max(1.0), h),
                 (None, None) => (pw_f, ph_f),
             };
-            Geom::Picture(PictureGeom { rect: Rect::new(x, y, w, h), src: src.clone(), px_w: *pw, px_h: *ph, crop: None })
+            let crop = spec.crop.map(|c| Rect::new(c.x, c.y, c.w, c.h).normalized()).filter(|c| c.w > 0.0 && c.h > 0.0);
+            Geom::Picture(PictureGeom { rect: Rect::new(x, y, w, h), src: src.clone(), px_w: *pw, px_h: *ph, crop })
         }
         Kind::Group => Geom::None,
         Kind::Other(k) => {
@@ -1252,6 +1410,25 @@ fn rect_of_geom(geom: &Geom, points: &[[f32; 3]]) -> Rect {
     }
 }
 
+/// The transform a spec gives (its `transform`, else its `rotation`);
+/// `None` for none.
+fn transform_of(spec: &ElementSpec) -> Result<Option<Transform>, BoardError> {
+    let t = match spec.transform {
+        Some(ts) => Transform {
+            tx: ts.tx.unwrap_or(0.0),
+            ty: ts.ty.unwrap_or(0.0),
+            rot: ts.rot.or(spec.rotation).unwrap_or(0.0),
+            sx: ts.sx.unwrap_or(1.0),
+            sy: ts.sy.unwrap_or(1.0),
+        },
+        None => Transform { rot: spec.rotation.unwrap_or(0.0), ..Transform::IDENTITY },
+    };
+    if ![t.tx, t.ty, t.rot, t.sx, t.sy].iter().all(|v| v.is_finite()) || t.sx == 0.0 || t.sy == 0.0 {
+        return Err(bad("a transform's numbers are finite and its scales not 0"));
+    }
+    Ok((!t.is_identity()).then_some(t))
+}
+
 /// Add every spec, bottom to top. Connectors go in after the elements they
 /// join, so a connector may name an element later in the list; membership and
 /// locks are written last.
@@ -1288,8 +1465,8 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
         if let Some(style) = &spec.style {
             element = element.with_style(style_of(style)?);
         }
-        if let Some(rot) = spec.rotation.filter(|r| *r != 0.0) {
-            element = element.with_transform(Transform { rot, ..Transform::IDENTITY });
+        if let Some(transform) = transform_of(spec)? {
+            element = element.with_transform(transform);
         }
         let id = t.add_element(element)?;
         scene.elements.insert(id.clone(), rect_of_geom(&geom, &points));
@@ -1732,10 +1909,137 @@ fn paint_summary(snapshot: &BoardSnapshot, layer: &str) -> String {
 
 #[cfg(test)]
 fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String {
-    describe_where(snapshot, cards, None)
+    describe_where(snapshot, cards, &Listing::default())
 }
 
-fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, with_field: Option<&str>) -> String {
+/// What get_canvas lists: the elements with a field, of some layers, a
+/// page of them; and the document's size when it is known.
+struct Listing<'a> {
+    with_field: Option<&'a str>,
+    /// Only these layers (ids), when given.
+    layers: Option<HashSet<String>>,
+    offset: usize,
+    limit: usize,
+    /// The canvas's document as stored, in bytes, when known (a canvas
+    /// node's: the layers' shares of it are scaled to it).
+    doc_bytes: Option<usize>,
+    /// The document is the canvas's alone (a canvas node, not a note's text).
+    whole_doc: bool,
+}
+
+impl Default for Listing<'_> {
+    fn default() -> Self {
+        Listing { with_field: None, layers: None, offset: 0, limit: LIST_LIMIT, doc_bytes: None, whole_doc: false }
+    }
+}
+
+/// A size in words: "1.2 MB", "340 KB", "900 bytes".
+fn bytes_text(n: usize) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1 << 10 => format!("{} KB", (n as f64 / 1024.0).round()),
+        n => format!("{n} bytes"),
+    }
+}
+
+/// About how many bytes of the stored document an element takes: its map's
+/// keys and values, its points and texts (measured: a single-point brush
+/// dab about 600 bytes, a 49-point pen stroke about 1.1 KB).
+fn element_weight(e: &pimble_board::RawElement) -> usize {
+    let text = e.text.as_ref().map_or(0, String::len) + e.note.as_ref().map_or(0, String::len);
+    let fields: usize = e.fields.iter().map(|(n, v)| n.len() + v.len() + 8).sum();
+    let geom = match &e.geom {
+        Geom::Path(p) => p.anchor_count() * 28,
+        Geom::Picture(p) => p.src.len() + 60,
+        Geom::Card { link, .. } => link.len() + 40,
+        Geom::Connector { .. } => 120,
+        _ => 0,
+    };
+    420 + e.points.len() * 14 + text + fields + geom
+}
+
+/// About how many bytes of the stored document a paint operation takes.
+fn op_weight(op: &pimble_board::PaintOp) -> usize {
+    560 + match &op.raw.body {
+        PaintBody::Stroke(s) => s.points.len() * 18,
+        PaintBody::Retouch(r) => r.points.len() * 18,
+        PaintBody::Move(m) => match &m.selection {
+            pimble_board::Selection::Lasso(points) => points.len() * 8,
+            _ => 32,
+        },
+        PaintBody::Pixels(p) => p.src.len(),
+        _ => 64,
+    }
+}
+
+/// About how many bytes of the document each layer takes (a group: what is
+/// in it), by layer id; scaled to the document's own size when the
+/// document is the canvas's alone.
+fn layer_sizes(snapshot: &BoardSnapshot, doc_bytes: Option<usize>, whole_doc: bool) -> HashMap<String, usize> {
+    let mut sizes: HashMap<String, usize> = HashMap::new();
+    for e in &snapshot.elements {
+        *sizes.entry(e.layer.clone()).or_default() += element_weight(&e.raw);
+    }
+    for l in &snapshot.layers {
+        if l.kind == LayerKind::Paint {
+            let w: usize = snapshot.paint_ops(&l.id).iter().map(op_weight).sum();
+            *sizes.entry(l.id.clone()).or_default() += w + 200;
+        } else {
+            *sizes.entry(l.id.clone()).or_default() += 200;
+        }
+    }
+    if let (Some(total), true) = (doc_bytes, whole_doc) {
+        let estimated: usize = sizes.values().sum();
+        if estimated > 0 && total > 0 {
+            let k = total as f64 / estimated as f64;
+            for v in sizes.values_mut() {
+                *v = (*v as f64 * k) as usize;
+            }
+        }
+    }
+    // A group holds what its layers hold.
+    let tree = snapshot.layer_tree();
+    let mut out = sizes.clone();
+    for (i, l) in snapshot.layers.iter().enumerate() {
+        if l.kind.is_group() {
+            let inside: usize = tree.descendants(i).iter().map(|d| sizes.get(&snapshot.layers[*d].id).copied().unwrap_or(0)).sum();
+            out.insert(l.id.clone(), inside + sizes.get(&l.id).copied().unwrap_or(0));
+        }
+    }
+    out
+}
+
+/// The layers `name` names: it, and every layer inside it when it is a
+/// group (ids).
+fn layer_and_inside(snapshot: &BoardSnapshot, scene: &Scene, name: &str) -> Result<HashSet<String>, BoardError> {
+    let id = scene.layer(name)?.id.clone();
+    let mut out: HashSet<String> = [id.clone()].into();
+    if let Some(at) = snapshot.layers.iter().position(|l| l.id == id) {
+        for d in snapshot.layer_tree().descendants(at) {
+            out.insert(snapshot.layers[d].id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// The document's size past which the paint and element tools warn.
+const WARN_DOC_BYTES: usize = 8 << 20;
+
+/// The line a write's answer ends with when the canvas's document has
+/// grown past [`WARN_DOC_BYTES`].
+fn size_warning(doc_bytes: usize) -> String {
+    if doc_bytes < WARN_DOC_BYTES {
+        return String::new();
+    }
+    format!(
+        "\nThis canvas's document is now about {}: it loads slowly everywhere, and Pimble versions before 0.27 cannot load one past 10 MB at all. \
+         flatten_layer turns a paint layer's history into pictures (much smaller); or split the drawing across several canvases (copy_layer, copy_elements).",
+        bytes_text(doc_bytes)
+    )
+}
+
+fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, listing: &Listing<'_>) -> String {
+    let with_field = listing.with_field;
     let mut out = String::new();
     match &snapshot.page {
         Some(page) => out.push_str(&format!(
@@ -1753,8 +2057,21 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
         out.push_str("markup: hidden (only pictures show; set_canvas markup_visible shows it)\n");
     }
     out.push_str(&format!("elements: {}\n", snapshot.elements.len()));
+    let sizes = layer_sizes(snapshot, listing.doc_bytes, listing.whole_doc);
+    if let Some(bytes) = listing.doc_bytes {
+        out.push_str(&format!(
+            "document: {} as stored{}\n",
+            bytes_text(bytes),
+            if bytes >= WARN_DOC_BYTES { " (large: flatten_layer makes a paint layer's history small; or split the canvas)" } else { "" }
+        ));
+    }
+    let wanted = |layer: &str| listing.layers.as_ref().is_none_or(|set| set.contains(layer));
+    let matches = |e: &pimble_board::Element| wanted(&e.layer) && with_field.is_none_or(|w| has_field(&e.raw.fields, w));
+    let total = snapshot.elements.iter().filter(|e| matches(e)).count();
+    let mut seen = 0usize;
     let mut listed = 0;
-    for layer in snapshot.layers.iter().rev() {
+    for layer in snapshot.layers.iter().rev().filter(|l| wanted(&l.id)) {
+        let size = sizes.get(&layer.id).copied().unwrap_or(0);
         let mut flags = Vec::new();
         if let Some(group) = layer.parent.as_deref().and_then(|p| snapshot.layer(p)) {
             flags.push(format!("in group \"{}\"", group.name));
@@ -1781,33 +2098,52 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
             LayerKind::Group => {
                 let held = snapshot.children_of(Some(&layer.id)).len();
                 out.push_str(&format!(
-                    "\n{heading} Group \"{}\" ({}){flags}, {held} layer{}, top first\n",
+                    "\n{heading} Group \"{}\" ({}){flags}, {held} layer{}, ~{}, top first\n",
                     layer.name,
                     layer.id,
-                    if held == 1 { "" } else { "s" }
+                    if held == 1 { "" } else { "s" },
+                    bytes_text(size)
                 ));
                 out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
                 continue;
             }
             LayerKind::Vector => out.push_str(&format!(
-                "\n{heading} Layer \"{}\" ({}){flags}, {} element{}, top first\n",
+                "\n{heading} Layer \"{}\" ({}){flags}, {} element{}, ~{}, top first\n",
                 layer.name,
                 layer.id,
                 layer.count,
-                if layer.count == 1 { "" } else { "s" }
+                if layer.count == 1 { "" } else { "s" },
+                bytes_text(size)
             )),
             LayerKind::Paint => {
-                out.push_str(&format!("\n{heading} Paint layer \"{}\" ({}){flags}\n", layer.name, layer.id));
+                out.push_str(&format!(
+                    "\n{heading} Paint layer \"{}\" ({}){flags}, {} operation{}, ~{}\n",
+                    layer.name,
+                    layer.id,
+                    layer.count,
+                    if layer.count == 1 { "" } else { "s" },
+                    bytes_text(size)
+                ));
                 out.push_str(&paint_summary(snapshot, &layer.id));
             }
             other => out.push_str(&format!("\n{heading} {} layer \"{}\" ({}){flags}\n", capitalized(other.as_str()), layer.name, layer.id)),
         }
         out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
-        for e in snapshot.elements.iter().rev().filter(|e| e.layer == layer.id && with_field.is_none_or(|w| has_field(&e.raw.fields, w))) {
-            if listed == LIST_LIMIT {
-                out.push_str(&format!("... and more; render_canvas shows the whole canvas, and these {LIST_LIMIT} are the topmost.\n"));
+        for e in snapshot.elements.iter().rev().filter(|e| e.layer == layer.id && matches(e)) {
+            if seen < listing.offset {
+                seen += 1;
+                continue;
+            }
+            if listed == listing.limit {
+                let (from, to) = (listing.offset + 1, listing.offset + listed);
+                out.push_str(&format!(
+                    "... and more: these are elements {from} to {to} of the {total} listed (top first). get_canvas with offset {to} lists the next {}; \
+                     `layer` lists one layer's, get_elements gives their full geometry, render_canvas shows the whole canvas.\n",
+                    listing.limit
+                ));
                 return out;
             }
+            seen += 1;
             listed += 1;
             let raw = &e.raw;
             let mut line = format!("- {} {}", raw.id, raw.kind);
@@ -1898,6 +2234,11 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
             out.push('\n');
             out.push_str(&meaning_text(raw.note.as_deref(), &raw.fields));
         }
+    }
+    if listing.offset > 0 && listed == 0 {
+        out.push_str(&format!("\nNo elements from offset {}: {total} are listed in all.\n", listing.offset));
+    } else if listing.offset > 0 {
+        out.push_str(&format!("\n(elements {} to {} of {total})\n", listing.offset + 1, listing.offset + listed));
     }
     out
 }
@@ -1997,14 +2338,19 @@ impl Pimble {
     /// Flatten or merge as pixels (docs/DRAWING_CONTRACT.md, wave 5): draw
     /// `job` from `snapshot`, store the picture as a blob of the canvas's
     /// store, and lay it down in one edit.
-    async fn lay_raster(&self, target: &Target, snapshot: &BoardSnapshot, job: RasterJob) -> Result<(), String> {
+    /// Answers how many tiles (pictures) it laid down.
+    async fn lay_raster(&self, target: &Target, snapshot: &BoardSnapshot, job: RasterJob, scale: f32) -> Result<usize, String> {
         let pictures = self.pictures_of(snapshot).await;
-        let raster = rasterize(snapshot, &pictures, job).map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
-        let src = match &raster.png {
-            Some(png) => Some(self.api.put_blob(target.addr, "image/png", png).await?.to_string()),
-            None => None,
-        };
-        self.canvas_edit(target, Default::default(), move |t, _, _| t.apply_raster(&raster, src.as_deref()).map(|_| ())).await
+        let raster = rasterize_at(snapshot, &pictures, job, scale).map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
+        drop(pictures);
+        // One blob per tile, then one edit laying them all down.
+        let mut srcs = Vec::with_capacity(raster.tiles.len());
+        for tile in &raster.tiles {
+            srcs.push(self.api.put_blob(target.addr, "image/png", &tile.png).await?.to_string());
+        }
+        let tiles = raster.tiles.len();
+        self.canvas_edit(target, Default::default(), move |t, _, _| t.apply_raster(&raster, &srcs).map(|_| ())).await?;
+        Ok(tiles)
     }
 
     /// A picture already in Pimble: its URL and pixel size.
@@ -2060,28 +2406,52 @@ impl Pimble {
         prepared: Prepared,
         write: impl FnOnce(&mut BoardTxn<'_, '_>, &mut Scene, &BoardSnapshot) -> Result<R, BoardError> + Send,
     ) -> Result<R, String> {
+        self.canvas_edit_sized(target, prepared, write).await.map(|(r, _)| r)
+    }
+
+    /// [`Pimble::canvas_edit`], answering too about how large the canvas's
+    /// document is now (as fetched, plus what this write sent), for the
+    /// answer's warning ([`size_warning`]).
+    async fn canvas_edit_sized<R: Send + 'static>(
+        &self,
+        target: &Target,
+        prepared: Prepared,
+        write: impl FnOnce(&mut BoardTxn<'_, '_>, &mut Scene, &BoardSnapshot) -> Result<R, BoardError> + Send,
+    ) -> Result<(R, usize), String> {
         let author = self.board_author().await;
         let now = now();
-        let mut answer: Option<(R, Vec<String>)> = None;
+        let mut answer: Option<(R, Vec<String>, Option<Rect>)> = None;
         let answer_ref = &mut answer;
         let board_of = target.clone();
-        self.edit_doc(target.addr, move |doc| {
-            let board = board_of.board(doc);
-            if !board.exists() {
-                return Err("This canvas has not arrived on this computer yet, so nothing was written.".into());
-            }
-            let snapshot = board.snapshot();
-            let mut scene = Scene::of(&snapshot);
-            (scene.pictures, scene.cards) = prepared;
-            let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| write(t, &mut scene, &snapshot));
-            let result = edited.result.map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
-            *answer_ref = Some((result, scene.touched));
-            Ok(())
-        })
-        .await?;
-        let (result, touched) = answer.expect("the edit ran");
-        self.on_canvas(target, touched).await;
-        Ok(result)
+        let edited = self
+            .edit_doc(target.addr, move |doc| {
+                let board = board_of.board(doc);
+                if !board.exists() {
+                    return Err("This canvas has not arrived on this computer yet, so nothing was written.".into());
+                }
+                let snapshot = board.snapshot();
+                let mut scene = Scene::of(&snapshot);
+                (scene.pictures, scene.cards) = prepared;
+                let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| write(t, &mut scene, &snapshot));
+                let result = edited.result.map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
+                // Where the agent's pointer goes: what it touched (the
+                // elements it made are in the scene), else what shows. Read
+                // here, so the canvas is not fetched again to say so.
+                let area = scene
+                    .touched
+                    .iter()
+                    .filter_map(|id| scene.elements.get(id).copied().or_else(|| snapshot.get(id).filter(|e| e.has_extent).map(|e| e.bounds)))
+                    .filter(|r| r.is_finite())
+                    .reduce(|a, b| a.union(&b))
+                    .or_else(|| snapshot.visible_extent());
+                *answer_ref = Some((result, scene.touched, area));
+                Ok(())
+            })
+            .await?;
+        let (result, touched, area) = answer.expect("the edit ran");
+        self.on_canvas_at(target, touched, area).await;
+        let size = target.node.content.len() + edited.delta.as_ref().map_or(0, Vec::len);
+        Ok((result, size))
     }
 
     /// Say this agent is on the canvas, with `selection` selected and its
@@ -2091,6 +2461,11 @@ impl Pimble {
         let Ok(doc) = doc_of(&node) else { return };
         let snapshot = target.board(&doc).snapshot();
         let area = selection_bounds(&snapshot, &selection).or_else(|| snapshot.visible_extent());
+        self.on_canvas_at(target, selection, area).await;
+    }
+
+    /// [`Pimble::on_canvas`] with its pointer's area known.
+    async fn on_canvas_at(&self, target: &Target, selection: Vec<String>, area: Option<Rect>) {
         let presence = BoardPresence {
             pointer: area.map(|r| BoardPoint { x: r.center().x, y: r.center().y }),
             selection,
@@ -2105,27 +2480,98 @@ impl Pimble {
         self.api.say_on_board(target.addr, presence).await;
     }
 
-    /// The canvas description get_node and get_canvas show.
-    pub(super) async fn canvas_body(&self, node: &Node, text_canvas: Option<&str>) -> String {
-        self.canvas_body_where(node, text_canvas, None).await
+    /// The canvas as it is now, read from its node as fetched.
+    fn snapshot_of(&self, target: &Target) -> Result<BoardSnapshot, String> {
+        let doc = doc_of(&target.node)?;
+        let board = target.board(&doc);
+        if !board.exists() {
+            return Err(format!("{} has not arrived on this computer yet.", target.what()));
+        }
+        Ok(board.snapshot())
     }
 
-    async fn canvas_body_where(&self, node: &Node, text_canvas: Option<&str>, with_field: Option<&str>) -> String {
-        let doc = match doc_of(node) {
-            Ok(doc) => doc,
-            Err(e) => return e,
-        };
+    /// The pictures copied elements and paint layers show, stored again in
+    /// `to`'s store where they are another store's (a blob belongs to its
+    /// store): old URL to new.
+    async fn restored_pictures(&self, snapshot: &BoardSnapshot, elements: &[usize], paint_layers: &[String], to: Addr) -> Result<HashMap<String, String>, String> {
+        let mut out = HashMap::new();
+        for src in picture_srcs(snapshot, elements, paint_layers) {
+            let Some(url) = BlobUrl::parse(&src) else { continue };
+            if url.store == to.store {
+                continue;
+            }
+            let (mime, bytes) = self.api.get_blob(url.store, url.blob).await.map_err(|e| format!("Nothing was written: the picture {src} could not be read: {e}"))?;
+            let stored = self.api.put_blob(to, &mime, &bytes).await?;
+            out.insert(src, stored.to_string());
+        }
+        Ok(out)
+    }
+
+    /// The canvas description get_node and get_canvas show.
+    pub(super) async fn canvas_body(&self, node: &Node, text_canvas: Option<&str>) -> String {
+        self.canvas_body_where(node, text_canvas, None, None, 0, LIST_LIMIT).await.unwrap_or_else(|e| e)
+    }
+
+    /// The canvas description, listing only the elements with a field, of
+    /// a layer (and what is in it, for a group), a page of them.
+    async fn canvas_body_where(
+        &self,
+        node: &Node,
+        text_canvas: Option<&str>,
+        with_field: Option<&str>,
+        layer: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        let doc = doc_of(node)?;
         let board = match text_canvas {
             Some(id) => Board::in_text(&doc, id),
             None => Board::of_node(&doc),
         };
         if !board.exists() {
-            return "(this canvas has not arrived on this computer yet)\n".to_string();
+            return Ok("(this canvas has not arrived on this computer yet)\n".to_string());
         }
         let snapshot = board.snapshot();
+        drop(doc);
+        let layers = match layer {
+            Some(name) => Some(layer_and_inside(&snapshot, &Scene::of(&snapshot), name).map_err(|e| said(&e))?),
+            None => None,
+        };
         let cards = self.card_titles(&snapshot).await;
-        describe_where(&snapshot, &cards, with_field)
+        let listing = Listing { with_field, layers, offset, limit, doc_bytes: Some(node.content.len()), whole_doc: text_canvas.is_none() };
+        Ok(describe_where(&snapshot, &cards, &listing))
     }
+}
+
+/// An `offset` argument, [dx, dy].
+fn offset_of(given: &Option<Vec<f32>>) -> Result<Point, String> {
+    match given.as_deref() {
+        None => Ok(Point::new(0.0, 0.0)),
+        Some([dx, dy]) if dx.is_finite() && dy.is_finite() => Ok(Point::new(*dx, *dy)),
+        Some(_) => Err("`offset` is [dx, dy] in canvas units.".into()),
+    }
+}
+
+/// What a copy says it made: the layers, and old ids to new (the first 50).
+fn copy_report(copied: &canvas_copy::Copied, into: &[String], what: &str) -> String {
+    let mut out = format!(
+        "Copied {} element{}{} into {what}, layer{} {}.\n",
+        copied.elements.len(),
+        if copied.elements.len() == 1 { "" } else { "s" },
+        if copied.ops > 0 { format!(" and {} paint operation{}", copied.ops, if copied.ops == 1 { "" } else { "s" }) } else { String::new() },
+        if into.len() == 1 { "" } else { "s" },
+        into.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+    );
+    for (old, new) in copied.elements.iter().take(50) {
+        out.push_str(&format!("- {old} -> {new}\n"));
+    }
+    if copied.elements.len() > 50 {
+        out.push_str(&format!("... and {} more.\n", copied.elements.len() - 50));
+    }
+    if copied.skipped > 0 {
+        out.push_str(&format!("{} operation(s) of a later Pimble version were left out.\n", copied.skipped));
+    }
+    out
 }
 
 fn sorted(set: &HashSet<String>) -> Vec<String> {
@@ -2185,10 +2631,289 @@ impl Pimble {
     #[tool(name = "get_canvas")]
     async fn get_canvas(&self, Parameters(p): Parameters<GetCanvasParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
-        self.on_canvas(&target, Vec::new()).await;
         let with_field = p.with_field.as_deref().map(str::trim).filter(|w| !w.is_empty());
-        let body = self.canvas_body_where(&target.node, target.text_canvas.as_deref(), with_field).await;
+        let layer = p.layer.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        let limit = p.limit.unwrap_or(LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+        let body = self.canvas_body_where(&target.node, target.text_canvas.as_deref(), with_field, layer, p.offset.unwrap_or(0), limit).await?;
+        self.on_canvas(&target, Vec::new()).await;
         Ok(format!("{}\nCoordinates are canvas units; x grows right, y grows down.\n{body}", target.what()))
+    }
+
+    /// Read elements of a canvas whole, to write them elsewhere: each with
+    /// its complete geometry (a pen stroke's points with their pressure, a
+    /// path's `d`, a line's points, a box, a connector's ends), its
+    /// transform and its full style, as JSON in the shape add_elements takes
+    /// (each also has its `id`, a `ref` that is its id, and its layer's
+    /// name), bottom to top. Name `ids` (a group's or frame's members come
+    /// with it) or a `layer`; a paint layer gives its strokes and fills in
+    /// the shape paint takes. Paged with offset and limit. copy_elements and
+    /// copy_layer copy without passing through here.
+    #[tool(name = "get_elements")]
+    async fn get_elements(&self, Parameters(p): Parameters<GetElementsParams>) -> Result<String, String> {
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let snapshot = {
+            let doc = doc_of(&target.node)?;
+            let board = target.board(&doc);
+            if !board.exists() {
+                return Err("This canvas has not arrived on this computer yet.".into());
+            }
+            board.snapshot()
+        };
+        let offset = p.offset.unwrap_or(0);
+        let limit = p.limit.unwrap_or(ELEMENTS_LIMIT).clamp(1, MAX_ELEMENTS_LIMIT);
+        let scene = Scene::of(&snapshot);
+        let names: HashMap<&str, &str> = snapshot.layers.iter().map(|l| (l.id.as_str(), l.name.as_str())).collect();
+        let layer = p.layer.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        let (indices, paint_layer) = match (layer, p.ids.is_empty()) {
+            (Some(_), false) => return Err("Give `ids` or `layer`, not both.".into()),
+            (None, true) => return Err("Name the elements (`ids`) or a `layer`.".into()),
+            (None, false) => (with_members(&snapshot, &p.ids).map_err(|e| format!("{}.", said(&e)))?, None),
+            (Some(name), true) => {
+                let info = scene.layer(name).map_err(|e| format!("{}.", said(&e)))?;
+                let is_paint = snapshot.layer(&info.id).is_some_and(|l| l.kind == LayerKind::Paint);
+                let set = layer_and_inside(&snapshot, &scene, name).map_err(|e| said(&e))?;
+                (of_layers(&snapshot, &set), is_paint.then(|| (info.id.clone(), info.name.clone())))
+            }
+        };
+        if let Some((id, name)) = paint_layer {
+            let ops = snapshot.paint_ops(&id);
+            let page: Vec<&pimble_board::PaintOp> = ops.iter().skip(offset).take(limit).collect();
+            let (mut strokes, mut fills, mut other) = (Vec::new(), Vec::new(), 0);
+            for op in &page {
+                match paint_json(op) {
+                    Some(("stroke", v)) => strokes.push(v),
+                    Some((_, v)) => fills.push(v),
+                    None => other += 1,
+                }
+            }
+            let mut out = format!(
+                "{}: paint layer \"{name}\" ({id}), operations {} to {} of {}, bottom to top.\n",
+                target.what(),
+                (offset + 1).min(ops.len()),
+                offset + page.len(),
+                ops.len()
+            );
+            if other > 0 {
+                out.push_str(&format!("{other} of them (pictures, smudges, blurs, moves) are not strokes or fills and are not listed; copy_layer copies every kind.\n"));
+            }
+            if fills.iter().any(|_| true) && !strokes.is_empty() {
+                out.push_str("paint makes its fills after its strokes: to keep their order, paint them in the order the ids run, or use copy_layer.\n");
+            }
+            if offset + page.len() < ops.len() {
+                out.push_str(&format!("More: get_elements with offset {}.\n", offset + page.len()));
+            }
+            out.push_str(&serde_json::to_string(&serde_json::json!({ "strokes": strokes, "fills": fills })).unwrap_or_default());
+            return Ok(out);
+        }
+        let total = indices.len();
+        let page: Vec<serde_json::Value> = indices
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|i| {
+                let e = &snapshot.elements[*i];
+                element_json(e, names.get(e.layer.as_str()).copied().unwrap_or(""))
+            })
+            .collect();
+        let shown = page.len();
+        let mut out = format!(
+            "{}: elements {} to {} of {total}, bottom to top, as add_elements takes them (drop `layer` or change it when the canvas you write to has no layer of that name).\n",
+            target.what(),
+            (offset + 1).min(total),
+            offset + shown
+        );
+        if offset + shown < total {
+            out.push_str(&format!("More: get_elements with offset {}.\n", offset + shown));
+        }
+        out.push_str("[\n");
+        for (k, v) in page.iter().enumerate() {
+            out.push_str(&serde_json::to_string(v).unwrap_or_default());
+            out.push_str(if k + 1 < shown { ",\n" } else { "\n" });
+        }
+        out.push(']');
+        Ok(out)
+    }
+
+    /// A canvas, a layer of it or an area as an SVG document (vector
+    /// shapes as SVG paths, text as outlines, pictures and paint layers
+    /// embedded as PNG; with `layer`, only that layer's elements), for
+    /// reuse elsewhere. Answered as text (at most 1 MB) or written to `file`.
+    #[tool(name = "export_canvas")]
+    async fn export_canvas(&self, Parameters(p): Parameters<ExportCanvasParams>) -> Result<String, String> {
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let snapshot = {
+            let doc = doc_of(&target.node)?;
+            let board = target.board(&doc);
+            if !board.exists() {
+                return Err("This canvas has not arrived on this computer yet.".into());
+            }
+            board.snapshot()
+        };
+        let only: Option<HashSet<String>> = match p.layer.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            Some(name) => {
+                let set = layer_and_inside(&snapshot, &Scene::of(&snapshot), name).map_err(|e| format!("{}.", said(&e)))?;
+                Some(snapshot.elements.iter().filter(|e| set.contains(&e.layer)).map(|e| e.raw.id.clone()).collect())
+            }
+            None => None,
+        };
+        let rect = match (&p.area, &only) {
+            (Some(a), _) => Some(Rect::new(a.x, a.y, a.w, a.h).normalized()),
+            (None, Some(ids)) => selection_bounds(&snapshot, &ids.iter().cloned().collect::<Vec<_>>()),
+            (None, None) => snapshot.render_rect(),
+        };
+        let Some(rect) = rect.filter(|r| r.w > 0.0 && r.h > 0.0) else {
+            return Ok(format!("{}: nothing on it shows there.", target.what()));
+        };
+        let mut bytes: HashMap<String, Vec<u8>> = HashMap::new();
+        for src in snapshot.picture_srcs() {
+            if let Some(url) = BlobUrl::parse(&src) {
+                if let Ok((_, b)) = self.api.get_blob(url.store, url.blob).await {
+                    bytes.insert(src.clone(), b);
+                }
+            }
+        }
+        let svg = pimble_board::render_svg(&snapshot, rect, only.as_ref(), &|src| bytes.get(src).cloned());
+        drop(bytes);
+        let what = format!("{} as SVG, the area {}", target.what(), rect_text(&rect));
+        match p.file.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            Some(file) => {
+                std::fs::write(file, svg.as_bytes()).map_err(|e| format!("{file} could not be written: {e}"))?;
+                Ok(format!("Wrote {what} to {file} ({}).", bytes_text(svg.len())))
+            }
+            None if svg.len() > 1 << 20 => Err(format!(
+                "{what} is {}, more than an answer carries (1 MB): give `file` to write it to a file, or `layer` or `area` for less.",
+                bytes_text(svg.len())
+            )),
+            None => Ok(format!("{what}:\n{svg}")),
+        }
+    }
+
+    /// Copy elements from one canvas to another (or within one), in one
+    /// edit of the target: `ids` (with their groups' and frames' members)
+    /// or a whole `from_layer`'s elements, into `layer` (made when missing;
+    /// left out, a layer of the source layer's name), moved by `offset`.
+    /// The copies get new ids; groups, frames and connectors between copied
+    /// elements are kept; pictures from another store are stored again in
+    /// the target's. A paint layer's operations (strokes, fills, pictures,
+    /// smudges, blurs, moves) are copied too. copy_layer copies a whole
+    /// layer with its settings.
+    #[tool(name = "copy_elements")]
+    async fn copy_elements(&self, Parameters(p): Parameters<CopyElementsParams>) -> Result<String, String> {
+        let source = self.canvas(&p.from, p.from_canvas.as_deref()).await?;
+        let target = self.canvas(&p.to, p.to_canvas.as_deref()).await?;
+        let snapshot = self.snapshot_of(&source)?;
+        let offset = offset_of(&p.offset)?;
+        let scene = Scene::of(&snapshot);
+        let from_layer = p.from_layer.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        // What is copied: elements by index with the name of the layer each
+        // came from, and paint layers by id.
+        let (indices, paint): (Vec<usize>, Vec<(String, String)>) = match (from_layer, p.ids.is_empty()) {
+            (Some(_), false) => return Err("Give `ids` or `from_layer`, not both.".into()),
+            (None, true) => return Err("Name the elements (`ids`) or a `from_layer`.".into()),
+            (None, false) => (with_members(&snapshot, &p.ids).map_err(|e| format!("Nothing was written: {}.", said(&e)))?, Vec::new()),
+            (Some(name), true) => {
+                let set = layer_and_inside(&snapshot, &scene, name).map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
+                let paint = snapshot.layers.iter().filter(|l| set.contains(&l.id) && l.kind == LayerKind::Paint).map(|l| (l.id.clone(), l.name.clone())).collect();
+                (of_layers(&snapshot, &set), paint)
+            }
+        };
+        if indices.is_empty() && paint.iter().all(|(id, _)| snapshot.paint_ops(id).is_empty()) {
+            return Err("Nothing was written: there is nothing there to copy.".into());
+        }
+        let srcs = self.restored_pictures(&snapshot, &indices, &paint.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), target.addr).await?;
+        let names: HashMap<String, String> = snapshot.layers.iter().map(|l| (l.id.clone(), l.name.clone())).collect();
+        let wanted = p.layer.clone();
+        let source_snapshot = snapshot;
+        let ((copied, into), doc_bytes) = self
+            .canvas_edit_sized(&target, Default::default(), move |t, scene, _| {
+                let mut plan = CopyPlan { elements: Vec::new(), paint: Vec::new(), offset, srcs };
+                let mut made: HashMap<(String, bool), String> = HashMap::new();
+                let mut into: Vec<String> = Vec::new();
+                // The target layer for elements (vector) or paint: the one
+                // named, else one of the source layer's name; made when missing.
+                let mut layer_for = |t: &mut BoardTxn<'_, '_>, scene: &mut Scene, source_name: &str, paint: bool| -> Result<String, BoardError> {
+                    let name = wanted.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(source_name).to_string();
+                    if let Some(id) = made.get(&(name.clone(), paint)) {
+                        return Ok(id.clone());
+                    }
+                    let id = match scene.layer(&name) {
+                        Ok(l) => l.id.clone(),
+                        Err(_) => {
+                            let id = t.add_layer_in(&name, if paint { LayerKind::Paint } else { LayerKind::Vector }, None, Placement::Top)?;
+                            scene.layers.push(LayerInfo { id: id.clone(), name: name.clone(), group: false });
+                            id
+                        }
+                    };
+                    if !into.contains(&name) {
+                        into.push(name.clone());
+                    }
+                    made.insert((name, paint), id.clone());
+                    Ok(id)
+                };
+                for i in &indices {
+                    let source_name = names.get(&source_snapshot.elements[*i].layer).cloned().unwrap_or_default();
+                    let id = layer_for(t, scene, &source_name, false)?;
+                    plan.elements.push((*i, id));
+                }
+                for (id, name) in &paint {
+                    let to = layer_for(t, scene, name, true)?;
+                    plan.paint.push((id.clone(), to));
+                }
+                let copied = write_copy(t, scene, &source_snapshot, &plan)?;
+                Ok((copied, into))
+            })
+            .await?;
+        Ok(format!("{}{}", copy_report(&copied, &into, &target.what()), size_warning(doc_bytes)))
+    }
+
+    /// Copy a whole layer to another canvas (or within one), in one edit:
+    /// a vector layer with its elements, a paint layer with its whole
+    /// history, or a group with every layer in it (nested as it is), with
+    /// its blend, opacity, visibility, lock, note and fields, on top of the
+    /// target's layers, moved by `offset`. New ids throughout.
+    #[tool(name = "copy_layer")]
+    async fn copy_layer(&self, Parameters(p): Parameters<CopyLayerParams>) -> Result<String, String> {
+        let source = self.canvas(&p.from, p.from_canvas.as_deref()).await?;
+        let target = self.canvas(&p.to, p.to_canvas.as_deref()).await?;
+        let snapshot = self.snapshot_of(&source)?;
+        let offset = offset_of(&p.offset)?;
+        let info = Scene::of(&snapshot).layer(p.layer.trim()).map_err(|e| format!("Nothing was written: {}.", said(&e)))?.id.clone();
+        let at = snapshot.layers.iter().position(|l| l.id == info).ok_or("Nothing was written: that layer is gone.")?;
+        let inside = layer_and_inside(&snapshot, &Scene::of(&snapshot), &info).map_err(|e| said(&e))?;
+        let paint_ids: Vec<String> = snapshot.layers.iter().filter(|l| inside.contains(&l.id) && l.kind == LayerKind::Paint).map(|l| l.id.clone()).collect();
+        let indices = of_layers(&snapshot, &inside);
+        let srcs = self.restored_pictures(&snapshot, &indices, &paint_ids, target.addr).await?;
+        let same = source.addr == target.addr && source.text_canvas == target.text_canvas;
+        let name = match p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None if same => format!("{} copy", snapshot.layers[at].name),
+            None => snapshot.layers[at].name.clone(),
+        };
+        let source_snapshot = snapshot;
+        let layer_name = name.clone();
+        let ((copied, id), doc_bytes) = self
+            .canvas_edit_sized(&target, Default::default(), move |t, scene, _| {
+                let mut plan = CopyPlan { elements: Vec::new(), paint: Vec::new(), offset, srcs };
+                let mut locks = Vec::new();
+                let id = copy_layer_tree(t, &source_snapshot, at, &layer_name, None, &mut plan, &mut locks)?;
+                let copied = write_copy(t, scene, &source_snapshot, &plan)?;
+                for l in locks {
+                    t.set_layer_locked(&l, true)?;
+                }
+                Ok((copied, id))
+            })
+            .await?;
+        let mut out = format!("Copied layer \"{}\" as \"{name}\" ({id}) into {}", p.layer.trim(), target.what());
+        out.push_str(&format!(": {} element{}", copied.elements.len(), if copied.elements.len() == 1 { "" } else { "s" }));
+        if copied.ops > 0 {
+            out.push_str(&format!(", {} paint operation{}", copied.ops, if copied.ops == 1 { "" } else { "s" }));
+        }
+        out.push('.');
+        if copied.skipped > 0 {
+            out.push_str(&format!(" {} operation(s) of a later Pimble version were left out.", copied.skipped));
+        }
+        out.push_str(&size_warning(doc_bytes));
+        Ok(out)
     }
 
     /// See a canvas: it rendered as a PNG image, all of it, an area, or some
@@ -2397,10 +3122,10 @@ impl Pimble {
         let prepared = self.prepare(target.addr, &p.elements).await?;
         let specs = p.elements.clone();
         let layer = p.layer.clone();
-        let ids = self
-            .canvas_edit(&target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
+        let (ids, doc_bytes) = self
+            .canvas_edit_sized(&target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
             .await?;
-        Ok(format!("Added to {}:\n{}", target.what(), made(&p.elements, &ids)))
+        Ok(format!("Added to {}:\n{}{}", target.what(), made(&p.elements, &ids), size_warning(doc_bytes)))
     }
 
     /// Change elements of a canvas: position, size, points, a path's outline
@@ -2587,8 +3312,8 @@ impl Pimble {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let layer = p.layer.clone();
         let to_add = import.clone();
-        let ids = self
-            .canvas_edit(&target, Default::default(), move |t, scene, _| {
+        let (ids, doc_bytes) = self
+            .canvas_edit_sized(&target, Default::default(), move |t, scene, _| {
                 let layer = scene.named_layer(layer.as_deref(), None)?;
                 let ids = t.import_svg(&to_add, layer.as_deref())?;
                 scene.touched.extend(ids.iter().cloned());
@@ -2609,6 +3334,7 @@ impl Pimble {
         for w in &import.warnings {
             out.push_str(&format!("Left out: {w}\n"));
         }
+        out.push_str(&size_warning(doc_bytes));
         Ok(out)
     }
 
@@ -2644,8 +3370,8 @@ impl Pimble {
         if layer.is_some() && picture.is_some() {
             return Err("Give `layer` or `highlight_picture`, not both.".into());
         }
-        let (layer_id, ids, filled) = self
-            .canvas_edit(&target, Default::default(), move |t, scene, snapshot| {
+        let ((layer_id, ids, filled, known_name), doc_bytes) = self
+            .canvas_edit_sized(&target, Default::default(), move |t, scene, snapshot| {
                 let layer_id = match (layer.as_deref().map(str::trim).filter(|l| !l.is_empty()), picture.as_deref().map(str::trim)) {
                     (Some(l), _) => scene.layer(l)?.id.clone(),
                     (None, Some(pic)) => {
@@ -2685,11 +3411,18 @@ impl Pimble {
                     let fill = NewFill { layer: layer_id.clone(), seed, color, tolerance, clip, contiguous };
                     filled.push(t.add_fill(fill)?);
                 }
-                Ok((layer_id, ids, filled))
+                let known_name = scene.layers.iter().find(|l| l.id == layer_id).map(|l| l.name.clone());
+                Ok((layer_id, ids, filled, known_name))
             })
             .await?;
-        let doc = doc_of(&self.api.node(target.addr).await?)?;
-        let name = target.board(&doc).snapshot().layer(&layer_id).map(|l| l.name.clone()).unwrap_or_default();
+        // A layer this call made is read back for its name.
+        let name = match known_name {
+            Some(name) => name,
+            None => {
+                let doc = doc_of(&self.api.node(target.addr).await?)?;
+                target.board(&doc).snapshot().layer(&layer_id).map(|l| l.name.clone()).unwrap_or_default()
+            }
+        };
         let mut what = Vec::new();
         if !ids.is_empty() {
             what.push(format!("{} stroke{} ({})", ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")));
@@ -2697,7 +3430,7 @@ impl Pimble {
         if !filled.is_empty() {
             what.push(format!("{} fill{} ({})", filled.len(), if filled.len() == 1 { "" } else { "s" }, filled.join(", ")));
         }
-        Ok(format!("Painted {} in the paint layer \"{name}\" ({layer_id}) of {}.", what.join(" and "), target.what()))
+        Ok(format!("Painted {} in the paint layer \"{name}\" ({layer_id}) of {}.{}", what.join(" and "), target.what(), size_warning(doc_bytes)))
     }
 
     /// Flatten a paint layer: its whole history of strokes, fills and the
@@ -2711,8 +3444,13 @@ impl Pimble {
         let snapshot = target.board(&doc).snapshot();
         let id = Scene::of(&snapshot).layer(p.layer.trim()).map_err(|e| said(&e))?.id.clone();
         let count = snapshot.paint_ops(&id).len();
-        self.lay_raster(&target, &snapshot, RasterJob::Flatten(id)).await?;
-        Ok(format!("Flattened {count} operation{} of the paint layer \"{}\" of {} into one picture.", if count == 1 { "" } else { "s" }, p.layer.trim(), target.what()))
+        let tiles = self.lay_raster(&target, &snapshot, RasterJob::Flatten(id), p.scale.unwrap_or(pimble_board::brush::PX_PER_UNIT)).await?;
+        let into = match tiles {
+            0 => "nothing (nothing in it showed)".to_string(),
+            1 => "one picture".to_string(),
+            n => format!("{n} pictures in a grid of tiles"),
+        };
+        Ok(format!("Flattened {count} operation{} of the paint layer \"{}\" of {} into {into}.", if count == 1 { "" } else { "s" }, p.layer.trim(), target.what()))
     }
 
     /// Add a layer or a group of layers to a canvas (layers organize; who made
@@ -2816,7 +3554,7 @@ impl Pimble {
             let id = scene.layer(p.layer.trim()).map_err(|e| said(&e))?.id.clone();
             if merge_needs_pixels(&snapshot, &id) {
                 let job = if scene.is_group(&id) { RasterJob::MergeGroup(id) } else { RasterJob::MergeDown(id) };
-                self.lay_raster(&target, &snapshot, job).await?;
+                self.lay_raster(&target, &snapshot, job, pimble_board::brush::PX_PER_UNIT).await?;
                 return Ok(format!("Merged down layer \"{}\" of {}, drawn as pixels.", p.layer.trim(), target.what()));
             }
         }
@@ -3047,7 +3785,7 @@ mod tests {
         )
         .unwrap();
         let snap = board.snapshot();
-        let text = describe_where(&snap, &HashMap::new(), Some("ROLE=Door"));
+        let text = describe_where(&snap, &HashMap::new(), &Listing { with_field: Some("ROLE=Door"), ..Listing::default() });
         assert!(text.contains(&ids[0]) && !text.contains(&ids[1]), "{text}");
         assert!(text.contains("note: Front door") && text.contains("fields: role = door; swing = in"), "{text}");
         // A locked element can still be described, and a field removed.
@@ -3095,6 +3833,199 @@ mod tests {
         assert!(text.find("Group \"Shading\"").unwrap() < text.find("Layer \"Shadows\"").unwrap(), "a group before what it holds");
         assert!(layer_kind(Some("sketch")).is_err());
         assert!(blend_mode("burn").is_err());
+    }
+
+    /// get_canvas pages (offset, limit, an "and more" line that says how to
+    /// ask for the next page), lists one layer (a group: what is in it),
+    /// and says how large each layer and the document are.
+    #[test]
+    fn get_canvas_pages_lists_a_layer_and_says_sizes() {
+        let board = fresh();
+        let specs: Vec<ElementSpec> = (0..30).map(|i| ElementSpec { x: Some(i as f32 * 10.0), y: Some(0.0), w: Some(5.0), h: Some(5.0), ..spec("rect") }).collect();
+        let ids = add(&board, &specs).unwrap();
+        let st = Stamp::new(None, "2026-11-18T00:00:00.000Z");
+        let roads = board.edit(st, |t| t.add_layer("Roads", Placement::Top)).into_result().unwrap().0;
+        let road = board
+            .edit(st, |t| t.add_element(NewElement::new(Kind::Line, Geom::Segment { a: Point::new(0.0, 0.0), b: Point::new(99.0, 9.0) }).in_layer(roads.clone())))
+            .into_result()
+            .unwrap()
+            .0;
+        let snap = board.snapshot();
+        let page = |offset, limit, layer: Option<HashSet<String>>| {
+            describe_where(&snap, &HashMap::new(), &Listing { offset, limit, layers: layer, doc_bytes: Some(9 << 20), whole_doc: true, ..Listing::default() })
+        };
+        let first = page(0, 10, None);
+        assert!(first.contains(&road), "the top layer's element comes first: {first}");
+        assert!(first.contains("these are elements 1 to 10 of the 31 listed"), "{first}");
+        assert!(first.contains("get_canvas with offset 10 lists the next 10"), "{first}");
+        assert!(first.contains("document: 9.0 MB as stored (large"), "{first}");
+        assert!(first.contains("1 element, ~"), "a size per layer: {first}");
+        let second = page(10, 10, None);
+        assert!(second.contains(&ids[29 - 9]) && !second.contains(&format!("- {} ", ids[29])), "the next ten, top first: {second}");
+        let last = page(30, 10, None);
+        assert!(last.contains(&ids[0]) && last.contains("(elements 31 to 31 of 31)"), "{last}");
+        assert!(page(40, 10, None).contains("No elements from offset 40: 31 are listed in all."));
+        let only = page(0, 400, Some(layer_and_inside(&snap, &Scene::of(&snap), "Roads").unwrap()));
+        assert!(only.contains(&road) && !only.contains(&ids[0]) && !only.contains("Layer 1"), "{only}");
+        // Scaled to the document: the shares add up to it.
+        let sizes = layer_sizes(&snap, Some(1_000_000), true);
+        let total: usize = snap.layers.iter().map(|l| sizes[&l.id]).sum();
+        assert!((990_000..=1_000_000).contains(&total), "{total}");
+        assert!(sizes[&snap.layers[0].id] > sizes[&roads] * 20, "thirty elements weigh more than one");
+        assert_eq!(size_warning(1 << 20), "");
+        assert!(size_warning(9 << 20).contains("flatten_layer"));
+    }
+
+    /// get_elements gives each element in the shape add_elements takes: read
+    /// and written back verbatim (into another canvas), every geometry,
+    /// transform, style, group, connector, note and field comes back the same.
+    #[test]
+    fn elements_read_whole_write_back_verbatim() {
+        let board = fresh();
+        let mut pen = spec("pen");
+        pen.points = Some(vec![vec![0.0, 0.0, 0.2], vec![30.0, 10.0, 0.9], vec![60.0, 0.0]]);
+        let specs = vec![
+            ElementSpec {
+                name: Some("box".into()),
+                x: Some(10.0),
+                y: Some(20.0),
+                w: Some(100.0),
+                h: Some(50.0),
+                text: Some("Mill".into()),
+                transform: Some(TransformSpec { tx: Some(5.0), ty: Some(-3.0), rot: Some(15.0), sx: Some(1.5), sy: None }),
+                style: Some(StyleSpec { fill: Some("#ffcc00".into()), dash: Some("6 3".into()), radius: Some(4.0), ..Default::default() }),
+                note: Some("The old mill".into()),
+                fields: Some([("kind".to_string(), "building".to_string())].into()),
+                ..spec("rect")
+            },
+            ElementSpec { name: Some("road".into()), d: Some("M0 0 C50 0 50 80 100 80".into()), style: Some(StyleSpec { width: Some(3.0), ..Default::default() }), ..spec("path") },
+            ElementSpec { name: Some("pen".into()), ..pen },
+            ElementSpec { name: Some("g".into()), members: Some(vec!["box".into(), "pen".into()]), ..spec("group") },
+            ElementSpec { from: Some("box".into()), to_point: Some(vec![300.0, 300.0]), text: Some("to town".into()), ..spec("connector") },
+            ElementSpec { points: Some(vec![vec![0.0, 100.0], vec![80.0, 140.0]]), locked: Some(true), ..spec("arrow") },
+        ];
+        add(&board, &specs).unwrap();
+        let snap = board.snapshot();
+        let json: Vec<serde_json::Value> = snap.elements.iter().map(|e| canvas_copy::element_json(e, "Layer 1")).collect();
+        // What an agent passes back: the JSON as add_elements reads it.
+        let back: Vec<ElementSpec> = json.iter().map(|v| serde_json::from_value(v.clone()).expect("add_elements takes it")).collect();
+        let other = fresh();
+        add(&other, &back).unwrap();
+        let copy = other.snapshot();
+        assert_eq!(copy.elements.len(), snap.elements.len());
+        let same = |a: &pimble_board::Element, b: &pimble_board::Element| {
+            assert_eq!(a.raw.kind, b.raw.kind);
+            assert_eq!(a.raw.text, b.raw.text);
+            assert_eq!(a.raw.style, b.raw.style, "{:?}", a.raw.kind);
+            assert_eq!(a.raw.transform, b.raw.transform);
+            assert_eq!(a.raw.locked, b.raw.locked);
+            assert_eq!((&a.raw.note, &a.raw.fields), (&b.raw.note, &b.raw.fields));
+            assert_eq!(a.raw.points.len(), b.raw.points.len());
+            for (p, q) in a.raw.points.iter().zip(&b.raw.points) {
+                assert!((p[0] - q[0]).abs() < 1e-3 && (p[1] - q[1]).abs() < 1e-3 && (p[2] - q[2]).abs() < 1e-3, "{p:?} {q:?}");
+            }
+            assert!((a.bounds.x - b.bounds.x).abs() < 0.01 && (a.bounds.w - b.bounds.w).abs() < 0.01, "{:?}: {:?} {:?}", a.raw.kind, a.bounds, b.bounds);
+        };
+        for (a, b) in snap.elements.iter().zip(&copy.elements) {
+            same(a, b);
+            assert_eq!(a.parent.is_some(), b.parent.is_some(), "the group holds the same members");
+        }
+        let connector = copy.elements.iter().find(|e| e.raw.kind == Kind::Connector).unwrap();
+        assert!(matches!(&connector.raw.geom, Geom::Connector { from: End::Element { id, .. }, .. } if copy.get(id).is_some_and(|e| e.raw.kind == Kind::Rect)));
+        assert_eq!(copy.elements.iter().find(|e| e.raw.kind == Kind::Pen).unwrap().raw.points[1][2], 0.9, "pressure kept");
+    }
+
+    /// copy_elements and copy_layer's model: new ids, moved by the offset (a
+    /// member with its group), groups and connectors among the copies kept,
+    /// an end on an element not copied made a point; a paint layer's
+    /// operations of every kind copied and moved; a group of layers copied
+    /// nested with its settings; one transaction.
+    #[test]
+    fn copies_get_new_ids_move_by_the_offset_and_keep_paint() {
+        let board = fresh();
+        let specs = vec![
+            ElementSpec { name: Some("a".into()), x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") },
+            ElementSpec { name: Some("b".into()), x: Some(50.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("ellipse") },
+            ElementSpec { name: Some("g".into()), members: Some(vec!["a".into()]), ..spec("group") },
+            ElementSpec { from: Some("a".into()), to: Some("b".into()), ..spec("connector") },
+        ];
+        let ids = add(&board, &specs).unwrap();
+        let st = Stamp::new(None, "2026-11-18T00:00:00.000Z");
+        let (group, paint) = board
+            .edit(st, |t| {
+                let group = t.add_layer_in("Terrain", LayerKind::Group, None, Placement::Top)?;
+                let paint = t.add_layer_in("Hills", LayerKind::Paint, Some(&group), Placement::Top)?;
+                t.set_layer_opacity(&paint, 0.5)?;
+                t.add_stroke(NewStroke::new(&paint, &pimble_board::brush::ROUND, Color::BLACK).with_size(6.0).with_points(vec![[10.0, 10.0, 1.0, 0.0], [40.0, 10.0, 1.0, 0.0]]))?;
+                t.add_fill(NewFill::new(&paint, Point::new(20.0, 30.0), Color::rgb(200, 0, 0), Rect::new(0.0, 0.0, 64.0, 64.0)))?;
+                t.add_move(&paint, pimble_board::Selection::Rect(Rect::new(0.0, 0.0, 20.0, 20.0)), Some(pimble_board::PixelTransform::translate(5.0, 0.0)))?;
+                Ok((group, paint))
+            })
+            .into_result()
+            .unwrap()
+            .0;
+        let source = board.snapshot();
+        let target = fresh();
+        let layer = target.snapshot().layers[0].id.clone();
+        let d = Point::new(1000.0, 500.0);
+        // The rect (with its group) and the connector, not the ellipse.
+        let picked = canvas_copy::with_members(&source, &[ids[2].clone(), ids[3].clone()]).unwrap();
+        assert_eq!(picked.len(), 3, "the group brings its member");
+        let plan = CopyPlan { elements: picked.iter().map(|i| (*i, layer.clone())).collect(), paint: Vec::new(), offset: d, srcs: HashMap::new() };
+        let before = target.snapshot();
+        let mut scene = Scene::of(&before);
+        let copied = target
+            .edit(st, |t| write_copy(t, &mut scene, &source, &plan))
+            .into_result()
+            .unwrap()
+            .0;
+        let snap = target.snapshot();
+        assert_eq!(snap.elements.len(), 3);
+        let new_of = |old: &str| copied.elements.iter().find(|(o, _)| o == old).map(|(_, n)| n.clone()).unwrap();
+        let rect = snap.get(&new_of(&ids[0])).unwrap();
+        assert_ne!(rect.raw.id, ids[0], "a new id");
+        assert_eq!(rect.parent.as_deref(), Some(new_of(&ids[2]).as_str()), "still in its group");
+        let was = source.get(&ids[0]).unwrap().bounds;
+        assert!((rect.bounds.x - was.x - d.x).abs() < 0.01 && (rect.bounds.y - was.y - d.y).abs() < 0.01, "moved once, with its group: {:?} {:?}", was, rect.bounds);
+        match &snap.get(&new_of(&ids[3])).unwrap().raw.geom {
+            Geom::Connector { from: End::Element { id, .. }, to: End::Point(p) } => {
+                assert_eq!(id, &rect.raw.id);
+                assert!((p.x - (55.0 + d.x)).abs() < 6.0, "the end on the ellipse left behind is a point where it was, moved: {p:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A whole group of layers, paint and all, onto another canvas.
+        let at = source.layers.iter().position(|l| l.id == group).unwrap();
+        let mut plan = CopyPlan { elements: Vec::new(), paint: Vec::new(), offset: d, srcs: HashMap::new() };
+        let before = target.snapshot();
+        let mut scene = Scene::of(&before);
+        let (new_group, copied) = target
+            .edit(st, |t| {
+                let mut locks = Vec::new();
+                let id = copy_layer_tree(t, &source, at, "Terrain", None, &mut plan, &mut locks)?;
+                Ok((id, write_copy(t, &mut scene, &source, &plan)?))
+            })
+            .into_result()
+            .unwrap()
+            .0;
+        assert_eq!(copied.ops, 3);
+        let snap = target.snapshot();
+        let hills = snap.children_of(Some(&new_group));
+        assert_eq!(hills.len(), 1);
+        assert_eq!((hills[0].name.as_str(), hills[0].kind.clone(), hills[0].opacity), ("Hills", LayerKind::Paint, 0.5));
+        let ops = snap.paint_ops(&hills[0].id);
+        let before = source.paint_ops(&paint);
+        assert_eq!(ops.iter().map(|o| o.raw.body.kind()).collect::<Vec<_>>(), before.iter().map(|o| o.raw.body.kind()).collect::<Vec<_>>());
+        match (&ops[0].raw.body, &ops[1].raw.body, &ops[2].raw.body) {
+            (PaintBody::Stroke(s), PaintBody::Fill(f), PaintBody::Move(m)) => {
+                assert_eq!(s.points[0][0], 1010.0);
+                assert_eq!((f.seed, f.clip.x), (Point::new(1020.0, 530.0), 1000.0));
+                assert_eq!(m.selection.bounds().unwrap().x, 1000.0);
+                let moved = m.transform.unwrap().apply(Point::new(1000.0, 500.0));
+                assert!((moved.x - 1005.0).abs() < 1e-3 && (moved.y - 500.0).abs() < 1e-3, "the same shift where it now is: {moved:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

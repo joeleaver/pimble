@@ -5384,6 +5384,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonrpsee",
+ "libc",
  "pimble-board",
  "pimble-client",
  "pimble-core",

@@ -123,7 +123,13 @@ path; flip_elements mirrors; outline_stroke turns strokes into filled outlines; 
 and radial gradients (fill_gradient, stroke_gradient); paint paints brush strokes (round, pencil, ink, \
 airbrush, marker, charcoal, watercolor, highlighter; with pressure; erasing) into paint layers, and \
 highlights a picture; add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
-page and shows or hides the markup. Coordinates are canvas units, x right and y down; a picture at 100% \
+page and shows or hides the markup. Large canvases: get_canvas pages (offset, limit) and lists one layer \
+(layer), and says each layer's size and the document's; get_elements gives elements whole (every point, \
+path data, transform and style, as add_elements takes them; a paint layer's strokes and fills as paint \
+takes them), export_canvas gives a canvas or layer as SVG, and copy_elements and copy_layer copy between \
+canvases without passing the geometry through you. A paint layer of thousands of strokes makes the \
+document large and slow everywhere: flatten_layer turns its history into pictures (in tiles, any size; \
+scale sets the density), and painting answers say when a canvas passes 8 MB. Coordinates are canvas units, x right and y down; a picture at 100% \
 is one unit per pixel; strokes take smooth and closed, and a pen with a fill is a filled shape. Say what \
 things mean: every element and layer takes a note and named fields (role=door, elevation=60 m), which \
 get_canvas shows (with_field lists only the elements with one) and search finds; read them before \

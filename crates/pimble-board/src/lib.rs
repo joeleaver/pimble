@@ -83,7 +83,7 @@ pub use brush::{BrushPoint, BrushSettings, Curve, Jitter, Preset, StrokeBlend, P
 pub use paint_ops::{
     FillOp, MoveOp, NewFill, NewRetouch, NewStroke, PaintBody, PaintOp, PixelTransform, PixelsOp, RawPaintOp, Retouch, RetouchOp, Selection, StrokeOp,
 };
-pub use raster::{fill_clip, merge_needs_pixels, rasterize, LayerRaster, RasterJob};
+pub use raster::{fill_clip, merge_needs_pixels, rasterize, rasterize_at, LayerRaster, RasterJob, RasterTile};
 pub use tiles::{CacheStats, PaintCache, TileKey, TileStore, TILE_PX, TILE_UNITS};
 #[cfg(not(target_arch = "wasm32"))]
 pub use tiles::DirTileStore;

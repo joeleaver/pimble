@@ -68,7 +68,16 @@ depends on pimble-client), and both binaries call them:
 3. Otherwise `pimble-mcp` starts the embedded server itself and opens the stores in the
    app's saved list (`<config dir>/pimble/state.json`, `open_stores`), so the LLM sees
    what the person sees in the explorer.
-4. When the server goes away (the app that owned it quit), `pimble-mcp` reconnects by the
+4. Every connection takes messages up to `pimble_rpc::MAX_MESSAGE_BYTES` (256 MiB) both
+   ways, the server's `Server::builder()` and the native `WsClientBuilder` alike (the
+   browser's `WebSocket` has no limit to set); before 2026-11-18 jsonrpsee's 10 MB default
+   applied, and one canvas past it made its store unloadable for every new connection
+   ("Response is too big", docs/DRAWING_CONTRACT.md "Large canvases"). The hosted path
+   adds no limit of its own: jkbase's proxy splices the upgraded WebSocket's bytes
+   (`jkbase-wsproxy`, a 600 s idle timeout only). The relay keeps its own 16 MB message
+   limit (`RelayLimits`), which `syncNodes` never meets there (relayed stores are vaults,
+   4 MiB per blob).
+5. When the server goes away (the app that owned it quit), `pimble-mcp` reconnects by the
    same rule: it joins another server or starts one, and opens the saved list again. A
    tool call made during the gap waits for the reconnect, up to 10 s, then fails with a
    sentence.
@@ -318,7 +327,7 @@ what it touched and that selected (`Presence::say_on_board`).
 
 | Tool | What it does |
 | --- | --- |
-| `get_canvas` | page, what shows, layers top first, and every element: id, kind, text, geometry in canvas units, transform, set style keys, frame or group, lock, author (at most 400 lines). `get_node` on a canvas node shows the same |
+| `get_canvas` | page, what shows, layers top first, and every element: id, kind, text, geometry in canvas units, transform, set style keys, frame or group, lock, author (400 elements a page; `offset` and `limit`, at most 2000, page through them, and the "and more" line names the next offset; `layer` lists one layer's, a group's every layer's; each layer heading gives its element or operation count and its approximate size, and the canvas its document's size, "Large canvases" below). `get_node` on a canvas node shows the same |
 | `render_canvas` | the canvas as a PNG (all of it, an `area`, or `elements` with their members), flattened onto white, longest side `max_size` (1024, at most 2048), with a sentence mapping pixels back to canvas units; pictures fetched through `getBlob`, card titles live; `show_all` shows hidden layers and markup |
 | `create_canvas` | a canvas node under a parent, empty ("Canvas", chalkboard icon) or from a picture file (its name, photo icon, the picture locked in a layer "Picture" under "Layer 1"), with first elements, written in the `createNode` that makes it, as the app does |
 | `insert_canvas` | a canvas into a note's text after a quoted block (or at the end): a picture file, a `pimble-blob:` picture, or empty; the canvas and the picture naming it in one edit (the app needs two, since its picture lives in the editor) |
@@ -397,7 +406,7 @@ Wave 5 (built 2026-11-17):
 | Tool | What it does |
 | --- | --- |
 | `paint` | also `fills` (after the strokes, in order), each `at` (`[x, y]`), `color`, `tolerance` (0 to 1, default 0.15: how far a pixel's channels may be from the one at `at`), `contiguous` (default true; false fills every matching pixel in the area) and `area` (`{x, y, w, h}`, at most 2048 on a side, containing `at`); without `area` the fill may cover what the canvas shows and what this call's strokes reach, grown by 64 units, with the layer's painting (`pimble_board::fill_clip`, the area the app's Fill computes from the view), so a fill outside every shape ends. `strokes` may be left out when `fills` are given. `BoardTxn::add_fill`; the answer names each fill's id too |
-| `flatten_layer` | `layer` (a paint layer): its whole history becomes one picture, stored as a blob of the canvas's store, in one edit (`pimble_board::rasterize` with `RasterJob::Flatten`, `put_blob`, `BoardTxn::apply_raster`). Refused with a sentence when a picture it draws cannot be fetched, or it paints more than 4,096 units across |
+| `flatten_layer` | `layer` (a paint layer): its whole history becomes pictures, one per tile of at most 1,024 units on a side (2,048 pixels; empty tiles left out), each stored as a blob of the canvas's store, laid down in one edit (`pimble_board::rasterize_at` with `RasterJob::Flatten`, `put_blob` per tile, `BoardTxn::apply_raster`). `scale` (pixels per unit, 0.125 to 2, default 2) draws a very large layer at fewer pixels. Refused with a sentence when a picture it draws cannot be fetched, or it needs more than 256 tiles at that density (since 2026-11-18; before, anything past 4,096 units across was refused) |
 | `delete_layer` with `merge_down` | onto a paint layer (a vector layer's shapes, or a paint layer, with its opacity in the pixels and its blend on the `pixels` operation), or a group holding a paint layer (one paint layer of the group's pixels, keeping the group's name, opacity and blend): drawn as pixels the same way (`RasterJob::MergeDown`, `RasterJob::MergeGroup`). A hidden layer is refused (it would merge as nothing); a paint layer onto a vector layer is refused |
 
 Smudge, blur and moves of paint selections have no tool: an agent paints and fills; the
@@ -428,9 +437,35 @@ neither deleted nor merged down, and with every layer locked a new element has n
 `delete_elements` deletes what it can and keeps the locked ones, and its answer names them
 (open decision 5). Search already indexes canvas text, so `search` finds sticky notes and labels.
 
-Not built: cropping a picture and its spotlight/crop tools beyond what `add_elements` writes
-(`crop` is not settable), "Convert to Node" and "Flatten into New Canvas", SVG export
-through the MCP, and moving a picture's canvas between notes.
+**Large canvases** (built 2026-11-18, after an agent drew an illustrated county map, about
+11.8 × 11 km in canvas units, with 1,347 vector elements and a paint layer of 25,000
+single-point dabs; docs/DRAWING_CONTRACT.md "Large canvases"):
+
+| Tool | What it does |
+| --- | --- |
+| `get_elements` | `ids` (a group's or frame's members come with it) or a `layer` (a group: every layer in it), paged with `offset` and `limit` (200, at most 1000): each element complete as JSON in the shape `add_elements` takes, bottom to top: `kind`, geometry (`x, y, w, h`; a line's or pen stroke's `points`, a pen's with `[x, y, pressure]`; a path's `d` and `rule`; a callout's `tip`; a connector's `from`/`to` or `from_point`/`to_point` and sides; a card's `node`; a picture's `src` and `crop`), `text`, the whole `style`, `transform` (`tx, ty, rot, sx, sy`, when not the identity), `layer` (its name), `parent`, `locked`, `note`, `fields`, plus `id` and a `ref` equal to it, so a list passed back to `add_elements` keeps its groups and connectors. A paint layer answers `{ "strokes": [...], "fills": [...] }` in the shape `paint` takes (preset, color, size, opacity, erase, points with pressure; at, color, tolerance, contiguous, area), and counts the operations `paint` cannot take (pictures, smudges, blurs, moves) |
+| `export_canvas` | the canvas, one `layer` (its elements only) or an `area` as an SVG document (`pimble_board::render_svg`: shapes as paths, text as outlines, pictures and, without `layer`, paint layers embedded as PNG), answered as text up to 1 MB or written to `file` |
+| `copy_elements` | `from` (and `from_canvas`) `ids` (with their members) or a `from_layer`'s elements, `to` (and `to_canvas`, the same canvas allowed) into `layer` (made when missing; left out, a layer of each source layer's name), moved by `offset` `[dx, dy]`: new ids; parents, groups and connectors among the copies mapped to the copies, an end on an element left behind made a point where it was; notes, fields and locks kept; pictures of another store stored again in the target's (a blob belongs to its store); a paint layer's operations of every kind copied too (moved by the offset; a move's transform conjugated so it moves the same pixels); one edit of the target |
+| `copy_layer` | `layer` (a vector layer with its elements, a paint layer with its whole history, a group with every layer in it, nested) from `from` to `to`, on top of the target's layers, as `name` (left out: its own, with " copy" on the same canvas), with blend, opacity, visibility, lock, note and fields, moved by `offset`; one edit |
+
+`add_elements` takes `transform` (`{tx, ty, rot, sx, sy}`, over `rotation`), a picture's
+`crop`, and a pen's points with their pressure (`[x, y, pressure]`), so what `get_elements`
+gives goes back unchanged (tested: every kind read, written to another canvas and compared).
+`paint`, `add_elements`, `import_svg`, `copy_elements` and `copy_layer` end their answer with
+one more sentence when the canvas's document passes 8 MB (its size as fetched plus what the
+write sent): it loads slowly everywhere, versions before 0.27 cannot load one past 10 MB,
+and `flatten_layer` (or splitting the canvas with the copy tools) is the way out. The layer
+sizes `get_canvas` prints are each layer's share of the document, estimated from what it
+holds (a single-point brush dab measured at about 600 bytes stored) and scaled to the
+document's real size for a canvas node. `list_stores` does not give a store's size (the
+server does not keep one; adding it would read every document).
+
+A message too large for the connection (a single document past 256 MB, now that the limit
+is not 10 MB) is a sentence naming the document and the way out (`flatten_layer`, or
+splitting), never jsonrpsee's "Response is too big" (`pimble_client::too_big_sentence`).
+
+Not built: the spotlight/crop tools beyond what `add_elements` writes, "Convert to Node"
+and "Flatten into New Canvas", and moving a picture's canvas between notes.
 
 Not exposed, on purpose: hosting a store (`cloudHostStore`), sharing, relaying, linking to
 a remote, closing or removing stores, signing in or out. Nothing is hosted unless the

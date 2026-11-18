@@ -5,12 +5,15 @@
 //! caller:
 //!
 //! 1. [`rasterize`] a [`RasterJob`] from a snapshot and the pictures it
-//!    shows: a [`LayerRaster`] with the PNG (when anything shows) and where
-//!    it lies;
-//! 2. put the PNG as a blob of the node's store (the app's `PutBlob`, the
-//!    MCP's `put_blob`) and hand its `pimble-blob:` URL to
-//!    [`crate::BoardTxn::apply_raster`], which writes the merge or the
-//!    flatten in one transaction (one undo).
+//!    shows: a [`LayerRaster`] holding a grid of tiles, each a PNG at most
+//!    [`RASTER_TILE_PX`] on a side with where it lies (a layer of any size
+//!    is drawn tile by tile, so memory stays bounded; empty tiles are left
+//!    out);
+//! 2. put each tile's PNG as a blob of the node's store (the app's
+//!    `PutBlob`, the MCP's `put_blob`) and hand their `pimble-blob:` URLs,
+//!    in tile order, to [`crate::BoardTxn::apply_raster`], which writes the
+//!    merge or the flatten, one `pixels` operation per tile, in one
+//!    transaction (one undo).
 //!
 //! Also here: [`fill_clip`], the area a fill may fill, worked out by the
 //! filler's device.
@@ -29,9 +32,19 @@ use crate::snapshot::BoardSnapshot;
 pub const MAX_FILL_UNITS: f32 = 2048.0;
 /// How far past a paint layer's painting a fill may reach.
 pub const FILL_MARGIN: f32 = 64.0;
-/// The most paint pixels a layer drawn as pixels has on a side (4,096
-/// board units).
-pub const MAX_RASTER_PX: usize = 8192;
+/// The most pixels one tile of a layer drawn as pixels has on a side
+/// (1,024 board units at the paint grid's 2 pixels per unit): 16 MB of
+/// pixels while it is drawn, and a PNG under the 20 MiB a blob keeps as it
+/// is.
+pub const RASTER_TILE_PX: usize = 2048;
+/// The most tiles one flatten or merge makes (at 2 pixels per unit, about
+/// 16,000 units on a side).
+pub const MAX_RASTER_TILES: usize = 256;
+/// The least and the most pixels per board unit a layer is drawn as pixels
+/// at ([`rasterize_at`]); [`rasterize`] draws at the paint grid's
+/// [`PX_PER_UNIT`], the most a paint layer keeps.
+pub const MIN_RASTER_SCALE: f32 = 0.125;
+pub const MAX_RASTER_SCALE: f32 = PX_PER_UNIT;
 
 /// The area a fill at `seed` in paint layer `layer` may fill, as the
 /// filler's device works it out (docs/DRAWING_CONTRACT.md section 3: stored
@@ -88,19 +101,27 @@ pub enum RasterJob {
     MergeGroup(String),
 }
 
-/// A layer (or group) drawn as one picture, ready for its blob
+/// One tile of a layer drawn as pixels: one blob, one `pixels` operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterTile {
+    /// The picture as PNG (straight alpha).
+    pub png: Vec<u8>,
+    /// Where it lies, board units, on the pixel grid it was drawn at (at
+    /// [`rasterize`]'s density its pixels are exactly [`PX_PER_UNIT`] per
+    /// unit).
+    pub rect: Rect,
+    /// Its size in pixels.
+    pub pixel_size: (u32, u32),
+}
+
+/// A layer (or group) drawn as pixels, ready for its blobs
 /// ([`crate::BoardTxn::apply_raster`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerRaster {
     pub job: RasterJob,
-    /// The picture as PNG (straight alpha); `None` when nothing shows (the
-    /// merge or flatten then writes no `pixels` operation).
-    pub png: Option<Vec<u8>>,
-    /// Where it lies, board units, on the paint pixel grid (its pixels are
-    /// exactly [`PX_PER_UNIT`] per unit).
-    pub rect: Rect,
-    /// Its size in pixels.
-    pub pixel_size: (u32, u32),
+    /// The tiles that show anything, row by row; none when nothing shows
+    /// (the merge or flatten then writes no `pixels` operation).
+    pub tiles: Vec<RasterTile>,
     /// How the `pixels` operation lays it down: Merge Down keeps the merged
     /// layer's blend here (its opacity is in the picture's alpha).
     pub blend: Blend,
@@ -109,6 +130,18 @@ pub struct LayerRaster {
     pub ops: Vec<String>,
     /// Merge Down: the paint layer below, as it was when drawn.
     pub onto: Option<String>,
+}
+
+impl LayerRaster {
+    /// The area every tile together covers.
+    pub fn rect(&self) -> Option<Rect> {
+        self.tiles.iter().map(|t| t.rect).reduce(|a, b| a.union(&b))
+    }
+
+    /// The bytes of every tile's PNG.
+    pub fn png_bytes(&self) -> usize {
+        self.tiles.iter().map(|t| t.png.len()).sum()
+    }
 }
 
 /// Whether merging `layer` (Merge Down of a layer, Merge Group of a group)
@@ -124,19 +157,31 @@ pub fn merge_needs_pixels(snapshot: &BoardSnapshot, layer: &str) -> bool {
     pos > 0 && tree.entries[siblings[pos - 1]].kind == LayerKind::Paint
 }
 
-/// Draw what `job` lays down as a picture, from `snapshot` and the
-/// `pictures` it shows (every picture it draws must be loaded:
-/// [`BoardError::PicturesNotLoaded`] otherwise). Refusals are sentences: a
-/// paint layer onto a vector layer, a hidden layer merged (it would merge as
-/// nothing), an area larger than [`MAX_RASTER_PX`] pixels on a side.
+/// Draw what `job` lays down as pixels, from `snapshot` and the `pictures`
+/// it shows (every picture it draws must be loaded:
+/// [`BoardError::PicturesNotLoaded`] otherwise), at the paint grid's
+/// [`PX_PER_UNIT`]. Refusals are sentences: a paint layer onto a vector
+/// layer, a hidden layer merged (it would merge as nothing), an area of
+/// more than [`MAX_RASTER_TILES`] tiles.
 pub fn rasterize(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job: RasterJob) -> Result<LayerRaster, BoardError> {
+    rasterize_at(snapshot, pictures, job, PX_PER_UNIT)
+}
+
+/// [`rasterize`] at `scale` pixels per board unit (from
+/// [`MIN_RASTER_SCALE`] to [`MAX_RASTER_SCALE`]): fewer pixels for a very
+/// large layer, drawn stretched over the same area (softer). Tile by tile:
+/// at most one tile's pixels (and its PNG) are held at a time.
+pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job: RasterJob, scale: f32) -> Result<LayerRaster, BoardError> {
+    if !(scale.is_finite() && (MIN_RASTER_SCALE..=MAX_RASTER_SCALE).contains(&scale)) {
+        return Err(BoardError::Invalid(format!("the density is from {MIN_RASTER_SCALE} to {MAX_RASTER_SCALE} pixels per unit")));
+    }
     let id = match &job {
         RasterJob::Flatten(id) | RasterJob::MergeDown(id) | RasterJob::MergeGroup(id) => id.clone(),
     };
     let at = snapshot.layers.iter().position(|l| l.id == id).ok_or_else(|| BoardError::NoLayer(id.clone()))?;
     let tree = snapshot.layer_tree();
     let layer = &snapshot.layers[at];
-    let mut out = LayerRaster { job: job.clone(), png: None, rect: Rect::default(), pixel_size: (0, 0), blend: Blend::Normal, ops: Vec::new(), onto: None };
+    let mut out = LayerRaster { job: job.clone(), tiles: Vec::new(), blend: Blend::Normal, ops: Vec::new(), onto: None };
     // The entries drawn, and how.
     let (drawn, alone): (Vec<usize>, bool) = match &job {
         RasterJob::Flatten(_) => {
@@ -229,44 +274,70 @@ pub fn rasterize(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job: Ra
     if missing > 0 {
         return Err(BoardError::PicturesNotLoaded(missing));
     }
-    let Some(area) = bounds.and_then(|b| PxBox::of_rect(&b)) else { return Ok(out) };
-    if area.w > MAX_RASTER_PX || area.h > MAX_RASTER_PX {
+    let Some(bounds) = bounds.filter(|b| b.is_finite()) else { return Ok(out) };
+    // The area in pixels at `scale` (at the paint grid's density exactly the
+    // paint pixels it touches), cut into tiles.
+    let area = if scale == PX_PER_UNIT {
+        let Some(px) = PxBox::of_rect(&bounds) else { return Ok(out) };
+        (px.x0, px.y0, px.x1(), px.y1())
+    } else {
+        let clamp = |v: f32| v.clamp(-1e9, 1e9) as i64;
+        let (x0, y0) = (clamp((bounds.x * scale).floor()), clamp((bounds.y * scale).floor()));
+        (x0, y0, clamp((bounds.right() * scale).ceil()).max(x0 + 1), clamp((bounds.bottom() * scale).ceil()).max(y0 + 1))
+    };
+    let t = RASTER_TILE_PX as i64;
+    let (cols, rows) = (((area.2 - area.0) + t - 1) / t, ((area.3 - area.1) + t - 1) / t);
+    if (cols * rows) as usize > MAX_RASTER_TILES {
         return Err(BoardError::Invalid(format!(
-            "That reaches more than {} units across, too large to draw as pixels.",
-            MAX_RASTER_PX as f32 / PX_PER_UNIT
+            "That reaches {} by {} units, more than one flatten or merge draws ({MAX_RASTER_TILES} tiles of {} units at {} pixels per unit); \
+             draw it at fewer pixels per unit, or split it into several layers",
+            (bounds.w).round(),
+            (bounds.h).round(),
+            RASTER_TILE_PX as f32 / scale,
+            scale
         )));
     }
-    let view = View::new(area.x0 as f32 / PX_PER_UNIT, area.y0 as f32 / PX_PER_UNIT, PX_PER_UNIT);
-    let mut pixmap = Pixmap::new(area.w as u32, area.h as u32).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
-    let region = view.board_rect(area.w as u32, area.h as u32);
-    let mut complete = true;
-    if alone {
-        // One layer: its own pixels, its opacity baked in for a merge (its
-        // blend goes on the operation), none for a flatten (the layer keeps
-        // its opacity).
-        let mut buffer = Pixmap::new(area.w as u32, area.h as u32).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
-        draw_entry(&mut buffer, snapshot, pictures, at, &view, &region, &mut complete);
-        let opacity = if matches!(job, RasterJob::Flatten(_)) { 1.0 } else { layer.opacity };
-        let paint = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
-        pixmap.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
-    } else {
-        for child in &drawn {
-            draw_composited(&mut pixmap, snapshot, pictures, *child, &view, &region, &mut complete);
+    let opacity = if matches!(job, RasterJob::Flatten(_)) || !alone { 1.0 } else { layer.opacity };
+    for row in 0..rows {
+        for col in 0..cols {
+            let (px0, py0) = (area.0 + col * t, area.1 + row * t);
+            let (w, h) = ((area.2 - px0).min(t) as u32, (area.3 - py0).min(t) as u32);
+            let view = View::new(px0 as f32 / scale, py0 as f32 / scale, scale);
+            let region = view.board_rect(w, h);
+            let mut pixmap = Pixmap::new(w, h).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
+            let mut complete = true;
+            if alone {
+                // One layer: its own pixels, its opacity baked in for a merge
+                // (its blend goes on the operation), none for a flatten (the
+                // layer keeps its opacity).
+                if opacity >= 1.0 {
+                    draw_entry(&mut pixmap, snapshot, pictures, at, &view, &region, &mut complete);
+                } else {
+                    let mut buffer = Pixmap::new(w, h).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
+                    draw_entry(&mut buffer, snapshot, pictures, at, &view, &region, &mut complete);
+                    let paint = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
+                    pixmap.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
+                }
+            } else {
+                for child in &drawn {
+                    draw_composited(&mut pixmap, snapshot, pictures, *child, &view, &region, &mut complete);
+                }
+            }
+            if !complete {
+                return Err(BoardError::PicturesNotLoaded(1));
+            }
+            let Some((pixmap, (minx, miny))) = trim_transparent(pixmap) else { continue };
+            let rect = Rect::new(
+                (px0 + minx as i64) as f32 / scale,
+                (py0 + miny as i64) as f32 / scale,
+                pixmap.width() as f32 / scale,
+                pixmap.height() as f32 / scale,
+            );
+            let pixel_size = (pixmap.width(), pixmap.height());
+            let png = RgbaImage::from_pixmap(pixmap).encode_png().map_err(|e| BoardError::Invalid(format!("the pixels could not be encoded: {e}")))?;
+            out.tiles.push(RasterTile { png, rect, pixel_size });
         }
     }
-    if !complete {
-        return Err(BoardError::PicturesNotLoaded(1));
-    }
-    let Some((pixmap, (minx, miny))) = trim_transparent(pixmap) else { return Ok(out) };
-    out.rect = Rect::new(
-        (area.x0 + minx as i64) as f32 / PX_PER_UNIT,
-        (area.y0 + miny as i64) as f32 / PX_PER_UNIT,
-        pixmap.width() as f32 / PX_PER_UNIT,
-        pixmap.height() as f32 / PX_PER_UNIT,
-    );
-    out.pixel_size = (pixmap.width(), pixmap.height());
-    let png = RgbaImage::from_pixmap(pixmap).encode_png().map_err(|e| BoardError::Invalid(format!("the pixels could not be encoded: {e}")))?;
-    out.png = Some(png);
     Ok(out)
 }
 

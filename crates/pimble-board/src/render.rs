@@ -648,14 +648,31 @@ pub(crate) fn draw_picture_rect(pixmap: &mut Pixmap, picture: &Picture, r: Rect,
             copy_opaque(pixmap, level, full.tx.round() as i64, full.ty.round() as i64);
             return;
         }
-        let paint = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
-        pixmap.draw_pixmap(full.tx.round() as i32, full.ty.round() as i32, level.as_ref(), &paint, Affine::identity(), None);
+        draw_exact(pixmap, level, full.tx.round() as i64, full.ty.round() as i64);
         return;
     }
     let quality = if exact || nearest { FilterQuality::Nearest } else { FilterQuality::Bilinear };
     let shader = Pattern::new(level.as_ref(), SpreadMode::Pad, quality, opacity, image_ts);
     let paint = Paint { shader, anti_alias, ..Paint::default() };
     pixmap.fill_path(&rect_path, &paint, FillRule::Winding, ts, None);
+}
+
+/// A picture drawn one pixel per pixel at (`x`, `y`), source-over, over
+/// only the part of `dst` it covers (whole pixels). tiny-skia's
+/// `draw_pixmap` of a picture lying far outside on the left or top could
+/// paint one column or row past its other edge (a flattened layer's tiles
+/// met with a doubled seam: docs/DRAWING_CONTRACT.md "Large canvases").
+fn draw_exact(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
+    let (x0, y0) = (x.max(0), y.max(0));
+    let x1 = (x + src.width() as i64).min(dst.width() as i64);
+    let y1 = (y + src.height() as i64).min(dst.height() as i64);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let Some(rect) = tiny_skia::Rect::from_ltrb(x0 as f32, y0 as f32, x1 as f32, y1 as f32) else { return };
+    let shader = Pattern::new(src.as_ref(), SpreadMode::Pad, FilterQuality::Nearest, 1.0, Affine::from_translate(x as f32, y as f32));
+    let paint = Paint { shader, anti_alias: false, ..Paint::default() };
+    dst.fill_rect(rect, &paint, Affine::identity(), None);
 }
 
 /// An opaque picture drawn one pixel per pixel at (`x`, `y`): rows copied,

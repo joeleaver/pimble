@@ -26,6 +26,9 @@ async fn main() {
         )
         .init();
 
+    // Large canvases are decoded and copied per call; hand freed room back.
+    pimble_server::memory::spawn_memory_trimmer(std::time::Duration::from_secs(5));
+
     let conn = Arc::new(connection::Connection::new());
     // Connect (or start the server) at once, so the first tool call does not wait
     // for the search model to warm up.

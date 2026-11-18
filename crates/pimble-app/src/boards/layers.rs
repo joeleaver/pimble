@@ -192,17 +192,23 @@ fn say(store: AppStore, mut sentence: String) {
 /// pictures' (`pictures.rs`, and image nodes' from `1 << 40`).
 const RASTER_BASE: u64 = 1 << 41;
 
-/// A drawn layer whose picture is being stored.
+/// A drawn layer whose pictures (one per tile) are being stored. Its tiles'
+/// `PutBlob` request ids are `first .. first + tiles`.
 struct PendingRaster {
     pane: PaneId,
     held: (StoreId, NodeId),
     raster: LayerRaster,
-    /// The picture decoded already, so this window shows it at once.
+    first: u64,
+    /// Each tile's URL once stored.
+    srcs: Vec<Option<String>>,
+    /// A single tile's picture decoded already, so this window shows it at
+    /// once (a grid of tiles is fetched as any picture is: decoding every
+    /// tile here would hold them all at once).
     picture: Option<Arc<Picture>>,
 }
 
 thread_local! {
-    static RASTERS: RefCell<HashMap<u64, PendingRaster>> = RefCell::new(HashMap::new());
+    static RASTERS: RefCell<Vec<PendingRaster>> = const { RefCell::new(Vec::new()) };
     static NEXT_RASTER: Cell<u64> = const { Cell::new(RASTER_BASE) };
 }
 
@@ -215,9 +221,9 @@ pub fn busy_words(job: &RasterJob) -> &'static str {
 }
 
 /// Flatten Layer, or a merge whose result is pixels: draw it (off the UI
-/// thread on the desktop), then store the picture and lay it down
-/// ([`raster_stored`]). Refusals are said as sentences (a hidden layer, a
-/// picture not here yet, too large).
+/// thread on the desktop), tile by tile, then store each tile's picture and
+/// lay them all down in one edit ([`raster_stored`]). Refusals are said as
+/// sentences (a hidden layer, a picture not here yet, too large).
 pub(super) fn rasterize_layer(store: AppStore, pane: PaneId, job: RasterJob) {
     let ui = store.pane(pane).board_ui;
     if untracked(|| ui.rasterizing.get()).is_some() {
@@ -236,7 +242,10 @@ pub(super) fn rasterize_layer(store: AppStore, pane: PaneId, job: RasterJob) {
     ui.rasterizing.set(Some(busy_words(&job)));
     let work = move || -> Result<(LayerRaster, Option<Arc<Picture>>), String> {
         let raster = pimble_board::rasterize(&snapshot, &pictures, job).map_err(|e| e.to_string())?;
-        let picture = raster.png.as_deref().and_then(|png| Picture::decode(png).ok()).map(Arc::new);
+        let picture = match raster.tiles.as_slice() {
+            [one] => Picture::decode(&one.png).ok().map(Arc::new),
+            _ => None,
+        };
         Ok((raster, picture))
     };
     #[cfg(all(feature = "native", not(test)))]
@@ -248,7 +257,7 @@ pub(super) fn rasterize_layer(store: AppStore, pane: PaneId, job: RasterJob) {
     rasterized(store, pane, held, work());
 }
 
-/// The layer was drawn: a picture goes to be stored, nothing drawn is laid
+/// The layer was drawn: its tiles go to be stored, nothing drawn is laid
 /// down at once.
 fn rasterized(store: AppStore, pane: PaneId, held: (StoreId, NodeId), result: Result<(LayerRaster, Option<Arc<Picture>>), String>) {
     let ui = store.pane(pane).board_ui;
@@ -264,49 +273,66 @@ fn rasterized(store: AppStore, pane: PaneId, held: (StoreId, NodeId), result: Re
         ui.rasterizing.set(None);
         return;
     }
-    match raster.png.clone() {
-        None => {
-            ui.rasterizing.set(None);
-            lay_down(store, pane, &raster, None);
-        }
-        Some(png) => {
-            let request_id = NEXT_RASTER.with(|n| n.replace(n.get() + 1));
-            RASTERS.with(|r| r.borrow_mut().insert(request_id, PendingRaster { pane, held, raster, picture }));
-            store.send(BackendCommand::PutBlob { store_id: held.0, node_id: held.1, bytes: png, request_id });
-        }
+    if raster.tiles.is_empty() {
+        ui.rasterizing.set(None);
+        lay_down(store, pane, &raster, &[]);
+        return;
+    }
+    let tiles = raster.tiles.len() as u64;
+    let first = NEXT_RASTER.with(|n| n.replace(n.get() + tiles));
+    let pngs: Vec<Vec<u8>> = raster.tiles.iter().map(|t| t.png.clone()).collect();
+    RASTERS.with(|r| r.borrow_mut().push(PendingRaster { pane, held, srcs: vec![None; pngs.len()], raster, first, picture }));
+    for (i, png) in pngs.into_iter().enumerate() {
+        store.send(BackendCommand::PutBlob { store_id: held.0, node_id: held.1, bytes: png, request_id: first + i as u64 });
     }
 }
 
-/// The answer to a flattened layer's `PutBlob`; answers whether it was one.
-/// The pixels are laid down in one edit (one undo step); this window's
-/// picture cache gets the picture already decoded when it was stored as it
-/// was drawn.
+/// The answer to a flattened layer's tile's `PutBlob`; answers whether it
+/// was one. Once every tile is stored the pixels are laid down in one edit
+/// (one undo step); a tile that could not be stored ends the job with its
+/// sentence and nothing written. This window's picture cache gets a single
+/// tile's picture already decoded when it was stored as it was drawn.
 pub(super) fn raster_stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
-    let Some(pending) = RASTERS.with(|r| r.borrow_mut().remove(&request_id)) else { return false };
-    let PendingRaster { pane, held, raster, picture } = pending;
-    store.pane(pane).board_ui.rasterizing.set(None);
-    match result {
-        Err(sentence) => say(store, sentence.clone()),
-        Ok(_) if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) => {
-            crate::events::show_notice(store, "The canvas was closed before its flattened picture was stored, so nothing changed.".to_string());
+    let at = RASTERS.with(|r| r.borrow().iter().position(|p| (p.first..p.first + p.srcs.len() as u64).contains(&request_id)));
+    let Some(at) = at else { return false };
+    let index = RASTERS.with(|r| (request_id - r.borrow()[at].first) as usize);
+    let blob = match result {
+        Err(sentence) => {
+            let pending = RASTERS.with(|r| r.borrow_mut().remove(at));
+            store.pane(pending.pane).board_ui.rasterizing.set(None);
+            say(store, sentence.clone());
+            return true;
         }
-        Ok(blob) => {
-            let src = blob.url.to_string();
-            if let (Some(picture), Some(png)) = (picture, raster.png.as_ref()) {
-                if blob.size == Some(raster.pixel_size) {
-                    super::seed_picture(&src, picture, png.clone());
-                }
-            }
-            lay_down(store, pane, &raster, Some(&src));
+        Ok(blob) => blob,
+    };
+    let done = RASTERS.with(|r| {
+        let mut r = r.borrow_mut();
+        r[at].srcs[index] = Some(blob.url.to_string());
+        r[at].srcs.iter().all(Option::is_some)
+    });
+    if !done {
+        return true;
+    }
+    let PendingRaster { pane, held, raster, srcs, picture, .. } = RASTERS.with(|r| r.borrow_mut().remove(at));
+    store.pane(pane).board_ui.rasterizing.set(None);
+    if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) {
+        crate::events::show_notice(store, "The canvas was closed before its flattened pictures were stored, so nothing changed.".to_string());
+        return true;
+    }
+    let srcs: Vec<String> = srcs.into_iter().flatten().collect();
+    if let (Some(picture), [tile], [src]) = (picture, raster.tiles.as_slice(), srcs.as_slice()) {
+        if blob.size == Some(tile.pixel_size) {
+            super::seed_picture(src, picture, tile.png.clone());
         }
     }
+    lay_down(store, pane, &raster, &srcs);
     true
 }
 
 /// One edit laying the drawn pixels down (`apply_raster`): a Merge Down
 /// picks the layer it went into.
-fn lay_down(store: AppStore, pane: PaneId, raster: &LayerRaster, src: Option<&str>) {
-    let laid = layer_edit(store, pane, |t| t.apply_raster(raster, src));
+fn lay_down(store: AppStore, pane: PaneId, raster: &LayerRaster, srcs: &[String]) {
+    let laid = layer_edit(store, pane, |t| t.apply_raster(raster, srcs));
     if laid.is_some() && matches!(raster.job, RasterJob::MergeDown(_)) {
         store.pane(pane).board_ui.layer.set(raster.onto.clone());
     }

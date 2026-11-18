@@ -93,6 +93,9 @@ fn main() {
         return;
     }
     pimble_app::update::at_start();
+    // docs/DRAWING_CONTRACT.md "Large canvases", "Memory": freed room in the
+    // heap (a large canvas's copies, a whole-area render) goes back.
+    pimble_server::memory::spawn_memory_trimmer(std::time::Duration::from_secs(10));
 
     // A `pimble:` link (the operating system starts `pimble <link>` for a
     // click in a browser or a mail app) goes to the Pimble already open, if

@@ -64,6 +64,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# memory.rs: malloc_trim, to give a large canvas's freed copies back.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # tests/search.rs makes a board node the way the app does (its board written

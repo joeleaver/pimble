@@ -257,12 +257,29 @@ fn pixel_transforms_compose_and_invert() {
     assert_eq!(sel.outline_through(&PixelTransform::translate(1.0, 1.0))[2], Point::new(5.0, 3.0));
 }
 
-/// The pictures a raster becomes, under `src`.
+/// The pictures a raster's tiles become, under `src` (`src`, `src-1`, ...
+/// for several), and those URLs in tile order.
 fn decoded(raster: &LayerRaster, src: &str) -> HashMap<String, Arc<Picture>> {
-    let png = raster.png.as_ref().expect("a picture");
-    let pic = Picture::decode(png).unwrap();
-    assert_eq!((pic.width(), pic.height()), raster.pixel_size);
-    [(src.to_string(), Arc::new(pic))].into()
+    decoded_all(raster, src).0
+}
+
+fn decoded_all(raster: &LayerRaster, src: &str) -> (HashMap<String, Arc<Picture>>, Vec<String>) {
+    assert!(!raster.tiles.is_empty(), "a picture");
+    let mut out = HashMap::new();
+    let mut srcs = Vec::new();
+    for (i, tile) in raster.tiles.iter().enumerate() {
+        let pic = Picture::decode(&tile.png).unwrap();
+        assert_eq!((pic.width(), pic.height()), tile.pixel_size);
+        let name = if i == 0 { src.to_string() } else { format!("{src}-{i}") };
+        out.insert(name.clone(), Arc::new(pic));
+        srcs.push(name);
+    }
+    (out, srcs)
+}
+
+/// The URLs a raster's tiles are stored under in these tests.
+fn srcs_of(raster: &LayerRaster, src: &str) -> Vec<String> {
+    (0..raster.tiles.len()).map(|i| if i == 0 { src.to_string() } else { format!("{src}-{i}") }).collect()
 }
 
 #[test]
@@ -284,11 +301,11 @@ fn flatten_replaces_a_history_with_one_picture_in_one_undo() {
     let src = "pimble-blob:s/flat";
     let pictures = decoded(&raster, src);
     manager.reset();
-    ok(&board, |t| t.apply_raster(&raster, Some(src)));
+    ok(&board, |t| t.apply_raster(&raster, &srcs_of(&raster, src)));
     let snap = board.snapshot();
     let ops = snap.paint_ops(&paint);
     assert_eq!(ops.len(), 1);
-    assert!(matches!(&ops[0].raw.body, PaintBody::Pixels(p) if p.src == src && p.rect == raster.rect));
+    assert!(matches!(&ops[0].raw.body, PaintBody::Pixels(p) if p.src == src && Some(p.rect) == raster.rect()));
     let after = pixels(&snap, &pictures, view, 240, 240);
     // Straight-alpha PNG and back rounds faint pixels by a few levels.
     assert!(max_diff(&before, &after) <= 6, "the same picture: {}", max_diff(&before, &after));
@@ -300,13 +317,78 @@ fn flatten_replaces_a_history_with_one_picture_in_one_undo() {
     assert!(matches!(rasterize(&board.snapshot(), &NoPictures, RasterJob::Flatten(paint.clone())), Err(BoardError::PicturesNotLoaded(1))));
 }
 
+/// A layer wider than one tile (docs/DRAWING_CONTRACT.md "Large
+/// canvases") flattens into a grid of tiles, each within the limit, empty
+/// tiles left out, laid down in one edit (one undo) and looking as before;
+/// a lower density makes fewer, smaller pictures over the same area.
+#[test]
+fn a_layer_wider_than_a_tile_flattens_into_tiles_in_one_undo() {
+    use pimble_board::raster::{rasterize_at, MAX_RASTER_TILES, RASTER_TILE_PX};
+    let board = Board::standalone().with_origin("me");
+    board.create(st()).unwrap();
+    let paint = ok(&board, |t| t.paint_layer_for(None));
+    let mut manager = board.undo_manager(yrs::undo::Options::default()).unwrap();
+    // A line 2,500 units long across three tiles, and a dab far below it:
+    // the tiles between them hold nothing.
+    ok(&board, |t| t.add_stroke(hard(&paint, INK, 8.0).with_points(line(0.0, 2500.0, 40.0, 60))));
+    ok(&board, |t| t.add_stroke(hard(&paint, RED, 20.0).with_points(vec![[2400.0, 2400.0, 1.0, 0.0]])));
+    manager.reset();
+    let snap = board.snapshot();
+    let raster = rasterize(&snap, &NoPictures, RasterJob::Flatten(paint.clone())).unwrap();
+    let tile_units = RASTER_TILE_PX as f32 / 2.0;
+    assert!(raster.tiles.len() >= 4, "three along the line and one for the dab: {}", raster.tiles.len());
+    assert!(raster.tiles.len() < 9, "the empty tiles between are left out: {}", raster.tiles.len());
+    for tile in &raster.tiles {
+        assert!(tile.pixel_size.0 as usize <= RASTER_TILE_PX && tile.pixel_size.1 as usize <= RASTER_TILE_PX);
+        assert!(tile.rect.w <= tile_units && tile.rect.h <= tile_units);
+    }
+    for (i, a) in raster.tiles.iter().enumerate() {
+        for b in &raster.tiles[i + 1..] {
+            assert!(a.rect.intersect(&b.rect).is_none_or(|r| r.w * r.h < 1e-3), "tiles do not overlap");
+        }
+    }
+    let views = [View::new(980.0, 0.0, 2.0), View::new(2350.0, 2350.0, 2.0)];
+    let before: Vec<_> = views.iter().map(|v| pixels(&snap, &NoPictures, *v, 160, 120)).collect();
+    let (pictures, srcs) = decoded_all(&raster, "pimble-blob:s/tile");
+    ok(&board, |t| t.apply_raster(&raster, &srcs));
+    let snap = board.snapshot();
+    let ops = snap.paint_ops(&paint);
+    assert_eq!(ops.len(), raster.tiles.len(), "one pixels operation per tile");
+    assert!(ops.iter().all(|o| matches!(o.raw.body, PaintBody::Pixels(_))));
+    for (v, b) in views.iter().zip(&before) {
+        let after = pixels(&snap, &pictures, *v, 160, 120);
+        assert!(max_diff(b, &after) <= 6, "the same picture across the seam: {}", max_diff(b, &after));
+    }
+    board.undo(&mut manager, false).expect("an undo");
+    assert_eq!(board.snapshot().paint_ops(&paint).len(), 2, "one undo brings the strokes back");
+    // Fewer pixels per unit: fewer, smaller tiles over the same area.
+    let soft = rasterize_at(&board.snapshot(), &NoPictures, RasterJob::Flatten(paint.clone()), 0.5).unwrap();
+    assert!(soft.tiles.len() < raster.tiles.len());
+    // One tile covers 4,096 units at half a pixel per unit: the whole layer,
+    // at a quarter of the full density's pixels per unit of area.
+    assert_eq!(soft.tiles.len(), 1);
+    let (w, h) = soft.tiles[0].pixel_size;
+    assert!(w <= 1260 && h <= 1200, "{w}x{h}");
+    let (a, b) = (soft.rect().unwrap(), raster.rect().unwrap());
+    assert!((a.x - b.x).abs() < 3.0 && (a.right() - b.right()).abs() < 3.0, "{a:?} {b:?}");
+    assert!(rasterize_at(&board.snapshot(), &NoPictures, RasterJob::Flatten(paint.clone()), 4.0).is_err());
+    // More tiles than one flatten makes: a sentence.
+    let side = (MAX_RASTER_TILES as f32).sqrt().ceil() + 1.0;
+    let far = side * tile_units;
+    ok(&board, |t| t.add_stroke(hard(&paint, RED, 4.0).with_points(vec![[far, far, 1.0, 0.0]])));
+    let err = rasterize(&board.snapshot(), &NoPictures, RasterJob::Flatten(paint.clone())).unwrap_err();
+    assert!(err.to_string().contains("fewer pixels per unit"), "{err}");
+    // A URL missing: refused, nothing written.
+    assert!(matches!(refused(&board, |t| t.apply_raster(&raster, &srcs[1..])), BoardError::Invalid(_)));
+}
+
 #[test]
 fn flatten_keeps_what_was_painted_while_its_picture_was_stored() {
     let (board, _, paint) = painted();
     ok(&board, |t| t.add_stroke(hard(&paint, INK, 6.0).with_points(line(10.0, 90.0, 30.0, 6))));
     let raster = rasterize(&board.snapshot(), &NoPictures, RasterJob::Flatten(paint.clone())).unwrap();
     let late = ok(&board, |t| t.add_stroke(hard(&paint, RED, 6.0).with_points(line(10.0, 90.0, 60.0, 6))));
-    let id = ok(&board, |t| t.apply_raster(&raster, Some("pimble-blob:s/f"))).unwrap();
+    let id = ok(&board, |t| t.apply_raster(&raster, &srcs_of(&raster, "pimble-blob:s/f"))).remove(0);
     let ids: Vec<String> = board.snapshot().paint_ops(&paint).iter().map(|o| o.raw.id.clone()).collect();
     assert_eq!(ids, vec![id, late], "the picture under the stroke painted since");
 }
@@ -331,7 +413,7 @@ fn a_vector_layer_merges_down_onto_a_paint_layer_as_pixels() {
     assert_eq!((raster.onto.as_deref(), raster.blend), (Some(paint.as_str()), Blend::Multiply));
     let src = "pimble-blob:s/merged";
     let pictures = decoded(&raster, src);
-    ok(&board, |t| t.apply_raster(&raster, Some(src)));
+    ok(&board, |t| t.apply_raster(&raster, &srcs_of(&raster, src)));
     let snap = board.snapshot();
     assert!(snap.layer(&top).is_none(), "the merged layer goes");
     assert!(snap.elements.is_empty(), "with its elements");
@@ -357,9 +439,9 @@ fn merging_refuses_hidden_layers_and_a_changed_layer_below() {
     ok(&board, |t| t.set_layer_visible(&top, true));
     // Drawn for one layer below, then another paint layer slipped between.
     let raster = rasterize(&board.snapshot(), &NoPictures, RasterJob::MergeDown(top.clone())).unwrap();
-    assert!(raster.png.is_none(), "an empty layer draws nothing");
+    assert!(raster.tiles.is_empty(), "an empty layer draws nothing");
     ok(&board, |t| t.add_layer_in("Paint 9", LayerKind::Paint, None, Placement::Below(top.clone())));
-    assert!(matches!(refused(&board, |t| t.apply_raster(&raster, None)), BoardError::Invalid(_)));
+    assert!(matches!(refused(&board, |t| t.apply_raster(&raster, &[])), BoardError::Invalid(_)));
     let _ = paint;
 }
 
@@ -384,7 +466,7 @@ fn a_group_with_a_paint_layer_merges_into_one_paint_layer() {
     let raster = rasterize(&snap, &NoPictures, RasterJob::MergeGroup(group.clone())).unwrap();
     let src = "pimble-blob:s/group";
     let pictures = decoded(&raster, src);
-    ok(&board, |t| t.apply_raster(&raster, Some(src)));
+    ok(&board, |t| t.apply_raster(&raster, &srcs_of(&raster, src)));
     let snap = board.snapshot();
     let merged = snap.layer(&group).unwrap();
     assert_eq!((merged.kind.clone(), merged.opacity, merged.name.as_str()), (LayerKind::Paint, 0.8, "Group"));

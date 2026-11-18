@@ -1483,7 +1483,8 @@ layer draws).
   rect: Rect, pixel_size: (u32, u32), blend: Blend, ops: Vec<String>, onto: Option<String>
   }`; `merge_needs_pixels(&snapshot, layer) -> bool` (Merge Down onto a paint layer, or a
   group holding one); `fill_clip(&snapshot, layer, seed, view: Option<Rect>) -> Rect`;
-  constants `raster::MAX_FILL_UNITS`, `raster::FILL_MARGIN`, `raster::MAX_RASTER_PX`
+  constants `raster::MAX_FILL_UNITS`, `raster::FILL_MARGIN`, `raster::MAX_RASTER_PX` (replaced
+  by tiles on 2026-11-18: `RASTER_TILE_PX`, `MAX_RASTER_TILES`, "Large canvases")
   (8,192 pixels). New errors: `BoardError::NeedsPixels(sentence)` (what `merge_layer_down`
   and `merge_group` now answer where pixels are needed), `BoardError::PicturesNotLoaded(n)`;
   `PAINT_ONTO_VECTOR` is the refusal of a paint layer merged onto a vector layer.
@@ -1496,7 +1497,8 @@ Group with a paint layer in it are two steps:
 1. With the board's current snapshot and the pictures it draws loaded (the app's
    `pictures_of`, which reads `picture_srcs()`), call `rasterize(&snapshot, &pictures, job)`.
    A refusal is a sentence to show (paint onto vector, a hidden layer merged, a picture not
-   loaded yet, more than 4,096 units across). For a merge, call it only when
+   loaded yet; until 2026-11-18, more than 4,096 units across: see "Large canvases" for the
+   tiles that replaced that limit). For a merge, call it only when
    `merge_needs_pixels` says so; otherwise call `merge_layer_down` / `merge_group` as before
    (they answer `NeedsPixels` if called anyway).
 2. When `png` is `Some`, put it as a blob of the node's store as a picture is put
@@ -1801,3 +1803,133 @@ cores (the wave 4 numbers were taken at 25 to 63). Native only; wasm was not re-
 
 Cold replay stays just over a second, so the design's lean on the tile caches and on
 Flatten holds; drawing is comfortably inside a frame.
+
+## Large canvases
+
+Built 2026-11-18 on `master`, from a long map-drawing session through the MCP: an agent drew
+an illustrated county map, about 11.8 × 11 km in canvas units, with 1,347 vector elements
+and a paint layer of about 25,000 single-point dabs, on a canvas in the Personal store.
+
+### What went wrong, confirmed
+
+- **One canvas locked its store.** The 25,000-dab layer made the canvas document about
+  15 MB (single-point dabs measured at about 600 bytes stored each); its `syncNodes` answer,
+  base64, about 20 MB. Neither the server's `Server::builder()` nor the clients' builders
+  set jsonrpsee's limits, so its 10 MB default applied, and the server refused the answer
+  with "Response is too big" (jsonrpsee's `-32008`). Every call of a fresh `pimble-mcp`
+  that touched the store failed (a fresh client holds a store by syncing all its documents
+  first); `list_stores` worked; an already-connected one kept working, because it had held
+  the document from before it grew and received only the live updates; deleting the layer
+  fixed it. Reproduced in a test app with the 0.26.0 binaries: `list_children`,
+  `get_canvas`, `render_canvas` and `flatten_layer` from a fresh `pimble-mcp` all answered
+  "Response is too big".
+- **Flatten refused** anything past 4,096 units across (one picture of at most 8,192
+  pixels on a side).
+- **get_canvas** listed the top 400 elements, with no paging and no layer filter, and gave a
+  pen stroke as "49 points within ..." with nothing that returned the points.
+- **Memory** (below).
+
+### Limits
+
+- Every JSON-RPC message, both ways, up to `pimble_rpc::MAX_MESSAGE_BYTES` (256 MiB): the
+  server (`max_request_body_size`, `max_response_body_size`) and the native client
+  (`WsClientBuilder::max_request_size`/`max_response_size`); the browser's `WebSocket` has
+  no limit to set. The hosted path adds none: jkbase's proxy splices the upgraded socket's
+  bytes (`jkbase-wsproxy`, idle timeout only). The relay keeps its 16 MB per message
+  (`RelayLimits`), which `syncNodes` does not cross (relayed stores are vaults).
+- `syncNodes` answers sized by bytes (`max_bytes`, `deferred`; docs/NODE_DOCUMENT_CONTRACT.md
+  section 4): `PimbleClient::sync_nodes` asks for 8 MiB answers and re-asks what is
+  deferred, so a large document travels alone; a request a server from before `max_bytes`
+  still refuses as too big is asked again a document at a time; one document past the
+  limit is an error naming it, with Flatten and splitting as the way out.
+- The MCP warns past 8 MB of canvas document (`paint`, `add_elements`, `import_svg`, the copy
+  tools), and `get_canvas` gives the document's size and each layer's share.
+
+### Flatten in tiles
+
+`raster::rasterize` (and `rasterize_at`, any density from `MIN_RASTER_SCALE` 0.125 to
+`MAX_RASTER_SCALE` 2 pixels per unit) draws a layer of any size **tile by tile**: a grid of
+tiles of at most `RASTER_TILE_PX` (2,048) pixels on a side, 1,024 units at the paint grid's
+density, aligned to the paint pixel grid; each drawn into its own pixmap, trimmed, encoded,
+and dropped before the next, so at most one tile's pixels (16 MB) and its PNG are held at a
+time. Empty tiles are left out. `LayerRaster.tiles: Vec<RasterTile { png, rect, pixel_size
+}>` replaces the single `png`/`rect`/`pixel_size`; `rect()` and `png_bytes()` sum them. At
+most `MAX_RASTER_TILES` (256) tiles, about 16,000 units on a side at full density; past that
+the refusal suggests fewer pixels per unit. Every tile is stored as its own blob through the
+same blob flow (the app sends one `PutBlob` per tile, request ids in a block, and lays down
+when the last answers; a tile that fails to store ends the job with its sentence and writes
+nothing; a single tile's picture is still seeded into the window's cache, a grid's are
+fetched as any picture is), and `BoardTxn::apply_raster(&raster, &srcs)` (one URL per tile,
+in tile order; a count that does not match is refused) writes one `pixels` operation per
+tile **in one transaction, one undo**: a Flatten's tiles all take the lowest flattened
+operation's place in the order (they do not overlap; ties break by id), a Merge Down's go on
+top of the layer below with the merged layer's blend, a Merge Group's into the group made a
+paint layer. The PNG under 2,048 pixels on a side is at most 16 MB raw, so `pimble_image::fit`
+keeps it as it is. The MCP's `flatten_layer` takes `scale`. Tested: a 2,500-unit line and a
+far dab flatten into four tiles (the empty ones between left out), each within the limit, not
+overlapping, looking the same across the seams, one undo; half the density makes fewer and
+smaller pictures over the same area; past 256 tiles a sentence; a missing URL refused; in the
+app, a wide layer's tiles stored one by one and laid down in one edit, one undo.
+
+### MCP
+
+`get_canvas` pages (`offset`, `limit`) and lists one `layer`; `get_elements` reads elements
+whole in the shape `add_elements` takes (which now takes `transform`, `crop` and pen
+pressures, so the round trip is exact); `export_canvas` gives SVG; `copy_elements` and
+`copy_layer` copy between canvases in one edit, paint operations of every kind included
+(`BoardTxn::add_paint_body`, new: any operation laid on top of a paint layer as it is,
+judged as every paint operation is). docs/MCP_CONTRACT.md "Large canvases".
+
+### Memory
+
+Measured 2026-11-18 in a test app on its own port and scratch data (the machine shared with
+other builds, load average 40 to 200), driving `pimble-mcp` over stdio: a fresh store, a
+canvas open in the pane (fitted to the whole map), a frame rectangle 11,800 × 11,000 units,
+then 25,000 single-point dabs through `paint` in calls of 500; RSS from `/proc`, live and
+free heap from glibc's `mallinfo2` (an `LD_PRELOAD` probe; heaptrack is not installed).
+
+| | 0.26.0 | now |
+| --- | --- | --- |
+| app RSS while painting (peak) | 3,892 MB | 1,756 MB |
+| app RSS idle after painting | 2.2 to 3.7 GB | 1.29 GB |
+| app live heap after 10,000 dabs | 2,518 MB (229 MB with the canvas not open) | about 600 MB |
+| `pimble-mcp` RSS after painting | 1,378 MB (77 MB of it live at 10,000) | 219 MB |
+| a fresh `pimble-mcp` on the store | "Response is too big" for every call | works |
+| Flatten of the layer | refused (over 4,096 units) | 132 tiles in 22 to 45 s; the document 14.8 MB to 955 KB |
+| app after the flatten | (not reachable) | 3.3 GB at the peak while the fitted view decodes every tile, trimmed to 1.57 GB RSS (644 MB live) within 20 s |
+| `pimble-mcp` after renders and flatten | (not reachable) | 85 to 190 MB (9 to 21 MB live) |
+
+What held it, and the fixes:
+
+1. **The tile cache never let go during a draw** (`PaintCache::draw_layer_checked`): it
+   evicted once, at the end of a draw, and never anything used in that draw. A draw over
+   the whole layer (the pane fitted to the map, a layer thumbnail, `render_canvas` of
+   everything) replays every 256-pixel tile at full density: about 7,900 tiles of 256 KB
+   (512 KB more for the few still open) were all held, about 2.5 GB, far past the 256 MB
+   budget. It now keeps to the budget as it goes (every 32 tiles, with what is already
+   drawn allowed to go). `crates/pimble-board/examples/large_canvas_memory.rs` replays the
+   session headless (a 1,920 × 1,080 view, 50 remote edits of 500 dabs, a thumbnail): live
+   heap 623 MB at the end, the cache at its budget (230 MB), the rest two copies of the
+   document (the example's painter and the view's) and their snapshots.
+2. **The canvases' picture cache had no limit** (`boards.rs` `Pictures`): a flattened
+   county is 131 pictures of up to 2,048 × 2,048, about 20 MB each decoded with their
+   levels, 2.6 GB, kept for good. It now keeps 512 MB: past that, pictures not drawn from
+   for 4 s go (their bytes stay, so drawing one again decodes it without a fetch); one
+   drawn from within 4 s stays, so a view that needs more at once keeps what it shows and
+   nothing thrashes.
+3. **Freed room stayed in glibc's heap.** A 15 MB document is encoded, decoded and copied a
+   few times per call (the MCP's canvas tools now fetch it one time fewer per write and
+   reuse the edit's own snapshot for presence and the answer), and glibc keeps the room:
+   `pimble-mcp` held 430 MB free for 77 MB live. Both binaries now call `malloc_trim` on a
+   timer (`pimble_server::memory`, every 5 s in `pimble-mcp`, every 10 s in the app; glibc
+   only).
+4. **A seam bug found on the way**: tiny-skia's `draw_pixmap` of a picture lying far off a
+   tile's left edge painted one column past its right edge, so two flattened tiles meeting
+   inside a paint tile doubled that column; `render::draw_exact` now fills only the covered
+   whole pixels.
+
+Not done: a view zoomed far out over a large paint layer still replays its tiles at full
+density (bounded now, but CPU-heavy, and after a flatten it decodes every tile's picture
+once); a coarser level of paint tiles for small zooms is the real fix. The document copies
+(the server's, the app's, each client's) are as large as the document: Flatten is what
+makes a big painting small.

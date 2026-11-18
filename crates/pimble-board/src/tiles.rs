@@ -53,6 +53,8 @@ pub const TILE_UNITS: f32 = TILE_PX as f32 / PX_PER_UNIT;
 /// How many of a layer's last operations keep their mask in the tiles they
 /// top, so appending to them stamps only the new dabs.
 const KEEP_OPEN: usize = 4;
+/// How many tiles one draw lays down between checks of the budget.
+const EVICT_EVERY: usize = 32;
 /// The memory cache's budget when none is given.
 pub const DEFAULT_BUDGET: usize = 256 << 20;
 const TILE_BYTES: usize = (TILE_PX * TILE_PX * 4) as usize;
@@ -269,6 +271,7 @@ impl PaintCache {
         inner.clock += 1;
         let mut complete = true;
         let mut touching: Vec<(usize, bool)> = Vec::new();
+        let mut drawn = 0usize;
         for ty in y0..=y1 {
             for tx in x0..=x1 {
                 let rect = tile_rect(tx, ty);
@@ -280,6 +283,17 @@ impl PaintCache {
                 let entry = inner.tile(&ctx, None, tx, ty, &touching);
                 complete &= entry.complete;
                 draw_picture_rect(target, &entry.picture, rect, None, vt, 1.0, false, view.scale >= PX_PER_UNIT);
+                // A draw over more tiles than the budget holds (a large
+                // layer zoomed out, its thumbnail, a whole-canvas render)
+                // keeps to the budget as it goes: the tiles already drawn
+                // into `target` may go, instead of every tile of the area
+                // being held until the end (docs/DRAWING_CONTRACT.md "Large
+                // canvases": 25,000 dabs over 12 km held 2.5 GB).
+                drawn += 1;
+                if drawn % EVICT_EVERY == 0 {
+                    inner.clock += 1;
+                    inner.evict(self.budget);
+                }
             }
         }
         inner.evict(self.budget);

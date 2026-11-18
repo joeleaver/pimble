@@ -161,8 +161,8 @@ pub enum BoardError {
     NoVectorLayer,
     /// A merge onto or into a paint layer draws the merged layers as pixels
     /// first (docs/DRAWING_CONTRACT.md "Built in wave 5 (model)"):
-    /// [`crate::raster::rasterize`], put the picture as a blob, then
-    /// [`BoardTxn::apply_raster`] with its URL.
+    /// [`crate::raster::rasterize`], put each tile as a blob, then
+    /// [`BoardTxn::apply_raster`] with their URLs.
     #[error("{0}")]
     NeedsPixels(String),
     /// Pictures the pixels would show have not been loaded yet (how many).
@@ -2298,6 +2298,34 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend: Blend::Normal }))
     }
 
+    /// Any operation laid on top of paint layer `layer` as it is (copying a
+    /// layer's history to another layer or canvas: docs/DRAWING_CONTRACT.md
+    /// "Large canvases"). A stroke's settings are sanitized as a new
+    /// stroke's are; an operation of a later version (`PaintBody::Other`)
+    /// and one that does not hold up (a stroke or retouch with no points,
+    /// a fill or pixels with no area, a move with no selection) are
+    /// refused. Judged as every paint operation is (a paint layer, not
+    /// locked).
+    pub fn add_paint_body(&mut self, layer: &str, body: crate::paint_ops::PaintBody) -> Result<String> {
+        use crate::paint_ops::PaintBody;
+        let sized = |r: &Rect| r.is_finite() && r.w > 0.0 && r.h > 0.0;
+        let body = match body {
+            PaintBody::Other(_) => return Err(BoardError::Invalid("an operation of a later version cannot be copied".into())),
+            PaintBody::Stroke(s) if s.points.is_empty() => return Err(BoardError::Invalid("a stroke needs at least one point".into())),
+            PaintBody::Stroke(s) => {
+                let mut s = (*s).clone();
+                s.settings = s.settings.sanitized();
+                PaintBody::Stroke(Arc::new(s))
+            }
+            PaintBody::Retouch(r) if r.points.is_empty() => return Err(BoardError::Invalid("a smudge or blur needs at least one point".into())),
+            PaintBody::Pixels(p) if !sized(&p.rect.normalized()) => return Err(BoardError::Invalid("pixels need a rectangle with a size".into())),
+            PaintBody::Fill(f) if !sized(&f.clip.normalized()) => return Err(BoardError::Invalid("a fill needs an area".into())),
+            PaintBody::Move(m) if !m.selection.is_valid() => return Err(BoardError::Invalid("a move needs a selection".into())),
+            other => other,
+        };
+        self.insert_paint_op(layer, body)
+    }
+
     /// [`BoardTxn::add_pixels`] laid on with `blend` (pass-through reads
     /// as normal).
     pub fn add_pixels_blended(&mut self, layer: &str, src: &str, rect: Rect, blend: Blend) -> Result<String> {
@@ -2387,13 +2415,13 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
     }
 
-    /// Lay down what [`crate::raster::rasterize`] drew, `src` its picture's
-    /// `pimble-blob:` URL (`None` when it drew nothing), in one transaction
-    /// (one undo):
+    /// Lay down what [`crate::raster::rasterize`] drew, `srcs` its tiles'
+    /// `pimble-blob:` URLs in tile order (none when it drew nothing), in one
+    /// transaction (one undo), one `pixels` operation per tile:
     ///
-    /// - **Flatten**: the operations it drew are deleted and one `pixels`
-    ///   operation takes the lowest one's place; operations painted since it
-    ///   was drawn stay, above it.
+    /// - **Flatten**: the operations it drew are deleted and the tiles'
+    ///   `pixels` operations take the lowest one's place; operations painted
+    ///   since it was drawn stay, above them.
     /// - **Merge Down** onto a paint layer: the pixels go on top of the
     ///   layer below with the merged layer's blend, and the merged layer
     ///   goes with its elements or operations. Refused when the layer below
@@ -2403,13 +2431,24 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     ///   reads as normal) holding the pixels; what was in it goes.
     ///
     /// Locks are judged as for the merges and deleting operations; a
-    /// refusal writes nothing. Answers the `pixels` operation's id.
-    pub fn apply_raster(&mut self, raster: &crate::raster::LayerRaster, src: Option<&str>) -> Result<Option<String>> {
+    /// refusal writes nothing. Answers the `pixels` operations' ids.
+    pub fn apply_raster(&mut self, raster: &crate::raster::LayerRaster, srcs: &[String]) -> Result<Vec<String>> {
         use crate::raster::RasterJob;
-        if raster.png.is_some() && src.is_none() {
-            return Err(BoardError::Invalid("The pixels need their picture's blob URL.".into()));
+        if srcs.len() != raster.tiles.len() {
+            return Err(BoardError::Invalid(format!(
+                "The pixels need one blob URL per tile: {} tiles, {} URLs.",
+                raster.tiles.len(),
+                srcs.len()
+            )));
         }
-        let src = if raster.png.is_some() { src } else { None };
+        let pixels = |blend: Blend| -> Vec<crate::paint_ops::PaintBody> {
+            raster
+                .tiles
+                .iter()
+                .zip(srcs)
+                .map(|(tile, src)| crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.clone(), rect: tile.rect, blend }))
+                .collect()
+        };
         match &raster.job {
             RasterJob::Flatten(layer) => {
                 self.judge_paint_into(layer)?;
@@ -2430,9 +2469,14 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 for key in doomed {
                     board.remove(self.txn, &key);
                 }
-                let Some(src) = src else { return Ok(None) };
-                let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: Blend::Normal });
-                self.insert_paint_op_at(layer, body, lowest).map(Some)
+                // The tiles do not overlap, so they share the lowest one's
+                // place in the order (ties break by id, the same on every
+                // device).
+                let mut out = Vec::with_capacity(srcs.len());
+                for body in pixels(Blend::Normal) {
+                    out.push(self.insert_paint_op_at(layer, body, lowest.clone())?);
+                }
+                Ok(out)
             }
             RasterJob::MergeDown(id) => {
                 let ls = self.tree()?;
@@ -2456,13 +2500,10 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                     return Err(BoardError::LayerLocked(locked));
                 }
                 let below = ls.id(below).to_string();
-                let out = match src {
-                    Some(src) => {
-                        let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: raster.blend });
-                        Some(self.insert_paint_op(&below, body)?)
-                    }
-                    None => None,
-                };
+                let mut out = Vec::with_capacity(srcs.len());
+                for body in pixels(raster.blend) {
+                    out.push(self.insert_paint_op(&below, body)?);
+                }
                 self.remove_layers_with_contents(&[id.to_string()].into_iter().collect())?;
                 self.layers_changed();
                 self.stamp_board();
@@ -2490,13 +2531,10 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                     group.remove(self.txn, BLEND);
                 }
                 self.layers_changed();
-                let out = match src {
-                    Some(src) => {
-                        let body = crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect: raster.rect, blend: Blend::Normal });
-                        Some(self.insert_paint_op(id, body)?)
-                    }
-                    None => None,
-                };
+                let mut out = Vec::with_capacity(srcs.len());
+                for body in pixels(Blend::Normal) {
+                    out.push(self.insert_paint_op(id, body)?);
+                }
                 self.stamp_board();
                 Ok(out)
             }
