@@ -1,6 +1,6 @@
 # Drawing wave 6: clipping, stamps and symbols, soft edges, map lettering, pictures in paint
 
-Status: **proposed, waiting on Joe's decisions** (the questions at the end). Written
+Status: **decided** (Joe, 2026-11-18: "Let's take all your recommendations for the first pass"; see "Decisions" at the end). Written
 2026-11-18 from the Braynard map session's list: an agent drew an 11.8 × 11 km illustrated
 county map with waves 1–5 and clipped, stamped and lettered around what the canvas could not
 do. Builds on docs/DRAWING_CONTRACT.md (layers, paths, paint ops, tiles); where they
@@ -103,3 +103,15 @@ both kept.
 4. **Soft edges**: is feather on elements and blur on layers worth it now, or later after
    the rest?
 5. **Order**: is the order above right?
+
+## Decisions (Joe, 2026-11-18)
+
+All five recommendations, for the first pass:
+
+1. Clip masks on **layers and groups** (not single elements yet).
+2. **Editable vector symbols** with a `scatter` element (not paint-only stamp brushes).
+3. **A small bundled font set**: Noto Serif and Noto Sans with bold and italic, and a condensed
+   face; the same on every device.
+4. **Soft edges last** in this wave.
+5. The order in section 6: clip masks, pictures in paint layers, map lettering, symbols and
+   scatter, soft edges.
