@@ -1,5 +1,17 @@
 # Next session: start here
 
+**2026-11-18 (session 78e7f30f): v0.27.0: no size stops a store from syncing**
+(docs/SYNC_LIMITS_CONTRACT.md, built). Vault logs compact by size (past twice the last
+snapshot, at least 1 MiB) besides every 200 appends; anything over 8 MiB of plaintext goes in
+sealed parts (`VaultPart`, servers that say `parts: true`); fetches are paged under the relay's
+16 MiB message; a document held back is listed (`waiting`) on the store row ("1 note waiting"),
+in Properties and in the MCP. An old reader stops at parts and misapplies nothing. Open: Will's
+edits to "Shared Pimble Notes" (Personal, share "Shared with Will") never reached Joe's twin;
+ask Will for Help > About, the store row's badge and his "Vault link" log lines. Joe's own link
+re-sends the same 369-byte update after restarts (look into it). Next: drawing wave 6 (Joe
+decided all recommendations: docs/DRAWING_WAVE6_CONTRACT.md), clip masks first; tray mode
+offered to Joe.
+
 **2026-11-18 (session 78e7f30f): v0.26.2: large canvases.** `syncNodes` answers by bytes
 (`max_bytes`, `deferred`), so no document locks a store for new clients; a single document too
 big for one message is named with a sentence. Flatten, Merge Down and Merge Group work in tiles
