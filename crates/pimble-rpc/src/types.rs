@@ -79,6 +79,47 @@ impl VaultDocId {
 pub struct VaultEntry {
     pub seq: u64,
     pub blob: String,
+    /// Which part of a blob sealed in parts this is (docs/SYNC_LIMITS_CONTRACT.md,
+    /// "Snapshots and appends in parts"); `None` for a whole blob. Missing
+    /// from an older server, which never stores parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<VaultPart>,
+}
+
+impl VaultEntry {
+    /// A whole blob, numbered.
+    pub fn whole(seq: u64, blob: String) -> Self {
+        Self { seq, blob, part: None }
+    }
+}
+
+/// One part of a snapshot or an append too large to go as one blob
+/// (docs/SYNC_LIMITS_CONTRACT.md): each part is a blob of its own, sealed
+/// with associated data that names its index, the count and the group
+/// (`pimble_crypto::blob_part_aad`), so it never opens as a whole blob or as
+/// another part. The parts of one group arrive in order, `index` 0 first; a
+/// part 0 starts the group over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VaultPart {
+    pub index: u32,
+    pub count: u32,
+    pub group: uuid::Uuid,
+}
+
+impl VaultPart {
+    /// The most parts one group may have: 4096 parts of 8 MiB is 32 GiB,
+    /// far beyond anything a person makes (a runaway guard only).
+    pub const MAX_COUNT: u32 = 4096;
+
+    pub fn is_last(&self) -> bool {
+        self.index + 1 == self.count
+    }
+
+    /// Whether the numbers make sense: at least one part, the index below
+    /// the count, and the count under [`VaultPart::MAX_COUNT`].
+    pub fn is_valid(&self) -> bool {
+        self.count >= 1 && self.index < self.count && self.count <= Self::MAX_COUNT
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,12 +153,38 @@ pub struct VaultAppendRequest {
     /// What lets a commenter create it; it joins the store's discussion set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discussion: bool,
+    /// This blob is one part of an append sealed in parts. The server keeps
+    /// the parts aside and, when the last arrives, appends them all as
+    /// consecutive log entries of one group. Only sent to a server whose
+    /// `vaultListDocs` says it takes parts (`VaultListDocsResponse::parts`):
+    /// an older one would store a part as a whole blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<VaultPart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAppendResponse {
+    /// The blob's sequence number; for the last part of a group, the last
+    /// part's (the group is `first_seq..=seq`); 0 for a part before the
+    /// last, which is held aside and not numbered yet.
     pub seq: u64,
+    /// For the last part of a group: the first part's sequence number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<u64>,
+    /// How large the document's log is now, in bytes, and its snapshot
+    /// (every part of it). What a client snapshots by when the log has grown
+    /// past twice the snapshot (`pimble_rpc::vault::snapshot_due_by`).
+    /// Missing from an older server: the count rule applies alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_bytes: Option<u64>,
 }
+
+/// How many bytes of blobs (base64) a paged `vaultFetch` asks for at a time:
+/// one part of 8 MiB (about 11 MiB as base64) and a little more, under the
+/// 16 MiB a message through Pimble Cloud's relay may be.
+pub const VAULT_FETCH_PAGE_BYTES: u64 = 12 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFetchRequest {
@@ -126,6 +193,21 @@ pub struct VaultFetchRequest {
     /// Everything after this sequence number (0 = from the beginning).
     #[serde(default)]
     pub after_seq: u64,
+    /// Answer at most about this many bytes of blobs (base64), at least one
+    /// entry, and say `more` when there is more (docs/SYNC_LIMITS_CONTRACT.md):
+    /// a document of several parts is fetched a part or so at a time, so no
+    /// answer outgrows a message a relay between the two ends takes. `None`:
+    /// everything at once, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Leave out this many entries of the answer (the snapshot's parts first,
+    /// then the updates): where the next page of a paged fetch starts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skip: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,7 +215,16 @@ pub struct VaultFetchResponse {
     /// The snapshot, when its seq is greater than `after_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<VaultEntry>,
-    /// Every update after `max(after_seq, snapshot.seq)`, ascending.
+    /// A snapshot stored in parts: `snapshot` is its first part and these
+    /// are the rest, in order (each entry's `part` says which). An older
+    /// reader, which knows nothing of parts, finds a first part it cannot
+    /// decrypt and applies nothing of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshot_parts: Vec<VaultEntry>,
+    /// Every update after `max(after_seq, snapshot.seq)`, ascending. The
+    /// parts of an append sealed in parts are consecutive entries of one
+    /// group; a fetch that would start inside a group starts at its first
+    /// part.
     pub updates: Vec<VaultEntry>,
     /// The document's latest sequence number (0 when empty).
     pub head: u64,
@@ -142,6 +233,42 @@ pub struct VaultFetchResponse {
     /// document from before data keys, whose blobs name a scope key directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<VaultDocKeys>,
+    /// The answer stopped at `max_bytes`: ask again with `skip` advanced by
+    /// the entries this one carried. Missing from an older server, which
+    /// answers everything at once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+}
+
+impl VaultFetchResponse {
+    /// How many entries this answer carries (the snapshot's parts and the
+    /// updates): how far a paged fetch's `skip` advances.
+    pub fn entry_count(&self) -> u32 {
+        (self.snapshot.is_some() as usize + self.snapshot_parts.len() + self.updates.len()) as u32
+    }
+
+    /// Take the next page of the same fetch into this one.
+    pub fn extend(&mut self, page: VaultFetchResponse) {
+        // The snapshot's entries come first in the answer's order: a page
+        // that carries some continues this one's.
+        match (&self.snapshot, page.snapshot) {
+            (Some(_), Some(first)) => {
+                self.snapshot_parts.push(first);
+                self.snapshot_parts.extend(page.snapshot_parts);
+            }
+            (None, Some(first)) => {
+                self.snapshot = Some(first);
+                self.snapshot_parts.extend(page.snapshot_parts);
+            }
+            (_, None) => {}
+        }
+        self.updates.extend(page.updates);
+        self.head = page.head;
+        if page.keys.is_some() {
+            self.keys = page.keys;
+        }
+        self.more = page.more;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +287,12 @@ pub struct VaultSnapshotRequest {
     /// ignored.
     #[serde(default)]
     pub covers_prefix: bool,
+    /// This blob is one part of a snapshot sealed in parts. The server keeps
+    /// the parts aside and replaces the document's snapshot only when the
+    /// last one arrives, so a half-uploaded snapshot never replaces a whole
+    /// one. Every part names the same `upto_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<VaultPart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +327,11 @@ pub struct VaultListDocsResponse {
     /// Missing from a server from before it: nothing is concluded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<String>,
+    /// The server takes snapshots and appends in parts
+    /// (docs/SYNC_LIMITS_CONTRACT.md). Missing from an older server, which
+    /// would store a part as a whole blob: a client sends it none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parts: bool,
 }
 
 /// Response after creating a store
@@ -614,6 +752,12 @@ pub struct GetStoreSyncResponse {
     /// that nobody is told somebody else's computer is off when it is not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_offline: bool,
+    /// The documents the store's link is holding back, each with the
+    /// sentence that says why (docs/SYNC_LIMITS_CONTRACT.md, "Saying what
+    /// waits"), mirroring `Store::waiting`. Missing from an older server:
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<pimble_core::WaitingDoc>,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
@@ -970,7 +1114,15 @@ pub enum StoreChangeKind {
     /// A blob was appended to a vault store's document (`vaultAppend`,
     /// docs/CRYPTO_CONTRACT.md); the notification's `update` carries the blob
     /// (base64url) so a live subscriber never re-fetches.
-    VaultAppended { doc_id: VaultDocId, seq: u64 },
+    VaultAppended {
+        doc_id: VaultDocId,
+        seq: u64,
+        /// Which part of an append sealed in parts the blob is: a reader
+        /// applies the group once it holds every part. An older reader
+        /// ignores the field, and the part does not decrypt as a whole blob.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<VaultPart>,
+    },
     /// The share rooted at `node_id` in this store changed state on this
     /// device (its key handover, its scope publishing, docs/NODE_DOCUMENT_CONTRACT.md
     /// section 5). Derived state: links never forward it.

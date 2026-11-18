@@ -366,7 +366,7 @@ async fn subscription_delivers_vault_appended_with_the_blob() {
         .expect("the notification should deserialize");
 
     match notif.change_kind {
-        StoreChangeKind::VaultAppended { doc_id, seq: notified_seq } => {
+        StoreChangeKind::VaultAppended { doc_id, seq: notified_seq, .. } => {
             assert_eq!(doc_id, VaultDocId::Tree);
             assert_eq!(notified_seq, seq);
         }
@@ -401,7 +401,7 @@ async fn vault_append_with_a_client_id_names_it_in_the_notification() {
 
         assert_eq!(notif.source_client_id.as_deref(), Some("client-a"), "source_client_id should name the appending client");
         match notif.change_kind {
-            StoreChangeKind::VaultAppended { doc_id, seq: notified_seq } => {
+            StoreChangeKind::VaultAppended { doc_id, seq: notified_seq, .. } => {
                 assert_eq!(doc_id, VaultDocId::Tree);
                 assert_eq!(notified_seq, seq);
             }

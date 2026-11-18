@@ -833,6 +833,12 @@ pub struct AppStore {
     /// `owner offline`.
     pub owner_offline: Signal<HashSet<StoreId>>,
 
+    /// The documents each store's link is holding back, with the sentence
+    /// that says why (`StoreSyncChanged::waiting`,
+    /// docs/SYNC_LIMITS_CONTRACT.md): the row's badge adds "· N notes
+    /// waiting", and a waiting node's Properties panel shows its reason.
+    pub waiting: Signal<HashMap<StoreId, Vec<pimble_core::WaitingDoc>>>,
+
     /// A sentence the server sent back refusing a command (`Forbidden`, e.g.
     /// a store shared read-only), shown in the status bar. Not an error
     /// state: the connection is fine, the command was simply not allowed
@@ -1154,6 +1160,7 @@ impl AppStore {
             stop_relay_modal_busy: Signal::new(false),
             stop_relay_modal_error: Signal::new(String::new()),
             owner_offline: Signal::new(HashSet::new()),
+            waiting: Signal::new(HashMap::new()),
             notice: Signal::new(String::new()),
             update_ready: Signal::new(None),
             about_open: Signal::new(false),
@@ -1491,6 +1498,26 @@ impl AppStore {
         }
     }
 
+    /// Record what a store's link is holding back. A no-op when nothing
+    /// changed, so the badges do not re-run on every `GetStoreSync`.
+    pub fn set_waiting(&self, store_id: StoreId, waiting: Vec<pimble_core::WaitingDoc>) {
+        let held = untracked(|| self.waiting.with(|map| map.get(&store_id).cloned().unwrap_or_default()));
+        if held != waiting {
+            self.waiting.update(|map| {
+                if waiting.is_empty() {
+                    map.remove(&store_id);
+                } else {
+                    map.insert(store_id, waiting);
+                }
+            });
+        }
+    }
+
+    /// Why a node waits to sync, when its store's link is holding it back.
+    pub fn waiting_reason(&self, store_id: StoreId, node_id: NodeId) -> Option<String> {
+        self.waiting.with(|map| map.get(&store_id).and_then(|docs| docs.iter().find(|w| w.node_id == node_id)).map(|w| w.reason.clone()))
+    }
+
     /// Bump the tree structure version to trigger a tree rebuild.
     pub fn bump_tree_structure(&self) {
         self.tree_structure_version.update(|v| *v += 1);
@@ -1575,6 +1602,7 @@ impl AppStore {
         untracked(|| self.live_label.update(|map| { map.retain(|(sid, _), _| *sid != store_id); }));
         self.sync_data.update(|map| { map.remove(&store_id); });
         self.set_owner_offline(store_id, false);
+        self.set_waiting(store_id, Vec::new());
     }
 
     /// Remove a node and its per-entity signals (node_data, mount_data, children_of).

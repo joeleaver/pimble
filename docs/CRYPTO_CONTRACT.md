@@ -57,6 +57,16 @@ document. The plaintext of a content blob is a yrs update (`encode_update_v1`) o
 snapshot, a full state update (`encode_state_as_update_v1` against an empty state vector).
 The tree document's blobs are the same for the store document.
 
+**Parts** (added 2026-11-18, docs/SYNC_LIMITS_CONTRACT.md): a snapshot or an update larger
+than 8 MiB of plaintext (`pimble_rpc::vault::PART_BYTES`) is cut into parts of at most
+that, each sealed as a blob of its own under the same key with the associated data
+`"{store_id}/{doc_id}#{index}/{count}/{group}"` (`pimble_crypto::blob_part_aad`; `group`
+is a UUID per snapshot or append). The blob layout and its version byte are unchanged: a
+part never opens under a document's whole-blob associated data, so a reader from before
+parts fails to decrypt it (it logs and skips the entry, its cursor stops in front of it,
+and it never applies or snapshots past a fragment), and a part never opens as another
+index of its group or as a part of another group.
+
 **Client-derived login.** The server never sees the password. Signup sends
 `auth_key` (base64url) which the server hashes again with argon2id at rest, exactly as it
 hashes passwords today; login sends `auth_key`. `GET /api/v1/kdf?email=…` returns the
@@ -84,7 +94,11 @@ search index. Only the vault RPCs below apply; every other store-scoped RPC answ
 error `-32005 encrypted_store` ("this store is encrypted; use the vault API"). On disk:
 `<store>/vault/{doc_id}/log` (append-only, length-prefixed `seq u64 | len u32 | blob`) and
 `<store>/vault/{doc_id}/snapshot` (`seq u64 | blob`), with an in-memory index of offsets
-built at open. `doc_id` is a node id, or the literal `tree`.
+built at open. `doc_id` is a node id, or the literal `tree`. Since 2026-11-18 a log record
+that is one part of a group sets the high bit of `len` and carries `index u32 | count u32 |
+group (16)` before its blob, and a snapshot stored in parts is `seq u64 | "PP" | count u32 |
+group (16) | (len u32 | blob)*` (a whole one's blob starts `PB`). A group whose tail never
+reached the disk is cut off at open, as a truncated record is.
 
 **Pimble server, the desktop side** (`sync.json` gains `mode: "vault"` and a per-document
 `last_seq` map; the local store itself stays `plain` on disk): the local keystore is
@@ -97,15 +111,33 @@ material to the OS keychain is a follow-up, not this phase.
 | Method | Auth | Behaviour |
 | --- | --- | --- |
 | `createStore { path, name, kind?, store_id? }` | Service | `kind` defaults to `plain`; `store_id` lets the accounts service create the hosted twin of a local store under the same id (refused if that id is already open) |
-| `vaultAppend { store_id, doc_id, blob }` | editor | appends, answers `{ seq }`; notifies subscribers with `StoreChangeKind::VaultAppended { doc_id, seq }` and the blob in `update` |
-| `vaultFetch { store_id, doc_id, after_seq }` | reader | `{ snapshot: Option<{ seq, blob }>, updates: [{ seq, blob }], head }`: the snapshot if its seq is greater than `after_seq`, then every update after `max(after_seq, snapshot.seq)` |
-| `vaultSnapshot { store_id, doc_id, upto_seq, blob }` | editor | stores the snapshot; the server may drop updates with seq ≤ `upto_seq`; refused if `upto_seq` > head |
-| `vaultListDocs { store_id }` | reader | `[{ doc_id, head, snapshot_seq }]` |
+| `vaultAppend { store_id, doc_id, blob, part? }` | editor | appends, answers `{ seq, first_seq?, log_bytes?, snapshot_bytes? }`; notifies subscribers with `StoreChangeKind::VaultAppended { doc_id, seq, part? }` and the blob in `update` |
+| `vaultFetch { store_id, doc_id, after_seq }` | reader | `{ snapshot: Option<{ seq, blob, part? }>, snapshot_parts: [...], updates: [{ seq, blob, part? }], head }`: the snapshot if its seq is greater than `after_seq`, then every update after `max(after_seq, snapshot.seq)` |
+| `vaultSnapshot { store_id, doc_id, upto_seq, blob, covers_prefix, part? }` | editor | stores the snapshot; the server may drop updates with seq ≤ `upto_seq`; refused if `upto_seq` > head |
+| `vaultListDocs { store_id }` | reader | `{ docs: [{ doc_id, head, snapshot_seq }], epoch?, parts }` |
 
 `subscribeStoreChanges` on a vault store delivers `VaultAppended` notifications with the
-blob so a live client never re-fetches. Blobs travel base64url in JSON. Limits: one blob
-at most 4 MiB; a document's log at most 64 MiB before a snapshot is required (append
-answers `-32006 snapshot_required`).
+blob so a live client never re-fetches. Blobs travel base64url in JSON. Limits (runaway
+guards only since 0.26.1): one blob at most 256 MiB; a document's log at most 1 GiB before
+a snapshot is required (append answers `-32006 snapshot_required`, and the link snapshots
+and sends again). Every limit applies per part.
+
+**Sizes and parts (added 2026-11-18, docs/SYNC_LIMITS_CONTRACT.md).** `vaultAppend`
+answers `log_bytes` and `snapshot_bytes`, and a client snapshots a document when its log
+has grown past twice its snapshot and at least 1 MiB, besides every 200 appends
+(`pimble_rpc::vault::snapshot_due_by`; the same `applied_through` rule). `vaultListDocs`
+answers `parts: true` from a server that takes parts; a client sends parts only to one
+that says so. `part: { index, count, group }` on `vaultAppend`/`vaultSnapshot` sends one
+part, in order (part 0 starts or restarts the group). The server holds parts aside in
+memory: an append's land, when the last arrives, as consecutive log entries each marked
+with its part (the answer's `seq` is the last, `first_seq` the first, and a part before
+the last answers `seq: 0`), announced one notification a part; a snapshot's replace the
+held snapshot only when the last arrives. A part of a group the server does not hold
+(it restarted, or a part came out of order) is refused with "send the group again from
+its first part". `vaultFetch` returns a snapshot in parts as its first part in `snapshot`
+and the rest in `snapshot_parts`, and starts a range that would begin inside a group at
+the group's first part. A reader applies a group only once it holds every part
+(`pimble_rpc::vault::fetched_units`, `PartBuffer`).
 
 ## Accounts service endpoints (C)
 
@@ -149,8 +181,10 @@ at start `vaultListDocs`, then `vaultFetch` per document from its `last_seq`, de
 apply through `apply_edit`/`apply_store_update` with `client_id = "vault-link:<uuid>"`;
 subscribe and apply `VaultAppended` blobs live; encrypt and `vaultAppend` every local update
 whose source is not this link, remembering its own seqs to drop echoes; upload a snapshot
-per document every 200 appended updates. Keys come from the keystore; a blob with an
-unknown key id is logged and skipped, never fatal.
+per document every 200 appended updates, or once its log outgrows twice its snapshot
+(docs/SYNC_LIMITS_CONTRACT.md). Keys come from the keystore; a blob with an unknown key id
+is logged and skipped, never fatal, and the document is listed as waiting with its reason
+(`GetStoreSyncResponse::waiting`).
 
 The app: "Account" in the menu with Sign in (URL, email, password), Sign out, status in the
 status bar; store row menu "Host on Pimble Cloud…" and "Add hosted store…"; the sync badge

@@ -332,6 +332,9 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
     let node = move || node_values(store, shown(store));
     let writable = move || shown(store).is_some_and(|(s, n)| store.node_access_tracked(s, n).allows_write());
     let note = move || shown(store).map(|(s, n)| crate::state::access_note(store.node_access_tracked(s, n))).unwrap_or("");
+    // Why the node is not syncing, while its store's link holds it back
+    // (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits").
+    let waiting = move || shown(store).and_then(|(s, n)| store.waiting_reason(s, n)).map(|reason| format!("Waiting to sync. {reason}")).unwrap_or_default();
     let context = move || {
         let here = shown(store)?;
         store.properties_context.with(|c| c.clone().filter(|c| (c.store_id, c.node_id) == here))
@@ -714,6 +717,11 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                         class: "pimble-properties__note",
                         style: {move || if note().is_empty() { "display: none;" } else { "" }},
                         {move || note().to_string()}
+                    }
+                    div {
+                        class: "pimble-properties__note pimble-properties__waiting",
+                        style: {move || if waiting().is_empty() { "display: none;" } else { "" }},
+                        {move || waiting()}
                     }
                     {tags}
                     {fields}

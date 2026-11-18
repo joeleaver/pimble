@@ -1324,7 +1324,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode, access, read_only_roots, ended_roots, relay, owner_offline } => {
+            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode, access, read_only_roots, ended_roots, relay, owner_offline, waiting } => {
                 tracing::info!("Sync state for store {:?}: {:?} ({:?}, {:?}, relay {:?})", store_id, state, sync_mode, access, relay);
                 let was_linked = store.is_linked(*store_id);
                 store.set_sync(*store_id, remote.clone(), state.clone());
@@ -1338,6 +1338,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.bump_tree_structure();
                 }
                 store.set_owner_offline(*store_id, *owner_offline);
+                // What the link is holding back, for the badge's "· N notes
+                // waiting" and each waiting node's Properties panel.
+                store.set_waiting(*store_id, waiting.clone());
                 // What this device may change here, as the server has it now
                 // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). When it
                 // differs from what was held, so may the server's judgement
@@ -2296,6 +2299,7 @@ mod tests {
             ended_roots: Vec::new(),
             relay: pimble_core::RelaySide::None,
             owner_offline: false,
+            waiting: Vec::new(),
         }
     }
 

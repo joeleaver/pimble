@@ -37,7 +37,12 @@ whose remote is the face's loopback URL, authenticated as it is against the host
 (a JWT minted from the signed-in account, which carries the owner's grant). Share upkeep
 rides that link as it does for a hosted store. Members' connections arrive at the face
 through the tunnel below and are ordinary authenticated connections with scoped
-principals. The twin is derived and disposable, like the search index: deleted, it is
+principals. Sizes and parts (docs/SYNC_LIMITS_CONTRACT.md, 2026-11-18) are the face's as
+they are the hosted server's: it answers `vaultListDocs` with `parts: true`, takes and
+serves snapshots and appends in parts, and answers each append with the log's sizes; the
+tunnel pipes the larger messages unchanged. A member's link to an owner on an older
+Pimble (a face that does not say `parts`) sends whole blobs only, and a document too
+large for that face waits with a sentence. The twin is derived and disposable, like the search index: deleted, it is
 pushed again by the link's reconcile.
 
 Departure from 5b: the twin holds every document of the store as ciphertext, not only the

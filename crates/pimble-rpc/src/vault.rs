@@ -19,21 +19,28 @@
 //!   together, so no blob is ever there under a key it has no wrap of.
 //! - **Snapshots** ([`snapshot_due`]): one rule, one number.
 //! - **Echoes** ([`should_apply`]): authorship decides, never a number.
-//! - **Reading a fetch** ([`fetched_entries`], [`Mark`]): snapshot first, then
+//! - **Reading a fetch** ([`fetched_units`], [`Mark`]): snapshot first, then
 //!   updates, and what each one vouches for in the [`VaultCursor`].
+//! - **Sizes and parts** (docs/SYNC_LIMITS_CONTRACT.md): a document is
+//!   compacted when its log outgrows its snapshot ([`snapshot_due_by`]), and a
+//!   snapshot or an append larger than [`PART_BYTES`] goes as parts
+//!   ([`seal_parts`]), each its own blob, applied only once every part of its
+//!   group is here ([`fetched_units`], [`PartBuffer`]).
 //!
 //! The scope keys themselves come from wherever the caller keeps them (the
 //! desktop's keystore, the page's keyring) through [`ScopeKeys`].
 
 use std::collections::HashMap;
 
+use uuid::Uuid;
+
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use pimble_core::{custom_keys, node_types, BlobId, NodeId, ShareMarker, StoreId};
 use pimble_crdt::{NodeFields, Tree};
-use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
+use pimble_crypto::{blob_aad, blob_part_aad, dek_aad, unwrap_dek, wrap_dek, Blob, CryptoError, KeyId, SymmetricKey, WrappedDek};
 
-use crate::{VaultCursor, VaultDocId, VaultDocKeys, VaultFetchResponse};
+use crate::{VaultAppendResponse, VaultCursor, VaultDocId, VaultDocKeys, VaultFetchResponse, VaultPart};
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
@@ -58,7 +65,45 @@ pub const SNAPSHOT_EVERY: u64 = 200;
 /// nothing about another client's `appended - 1`, which may still be on its
 /// way here; until it lands the snapshot waits for a later append.
 pub fn snapshot_due(appended: u64, snapshot_seq: u64, cursor: &VaultCursor) -> bool {
-    appended.saturating_sub(snapshot_seq) >= SNAPSHOT_EVERY && cursor.applied_through() == appended
+    snapshot_due_by(appended, snapshot_seq, cursor, None)
+}
+
+/// The least a log grows past its snapshot before its size alone makes a
+/// snapshot due (docs/SYNC_LIMITS_CONTRACT.md, "Compaction by size").
+pub const COMPACT_FLOOR: u64 = 1024 * 1024;
+
+/// How large a document's log and its snapshot are on the remote, as its
+/// `vaultAppend` answered (`log_bytes`, `snapshot_bytes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogSizes {
+    pub log_bytes: u64,
+    pub snapshot_bytes: u64,
+}
+
+impl LogSizes {
+    /// What an append's answer says, when it says it: an older server does
+    /// not, and the count rule applies alone.
+    pub fn of(answer: &VaultAppendResponse) -> Option<Self> {
+        Some(Self { log_bytes: answer.log_bytes?, snapshot_bytes: answer.snapshot_bytes.unwrap_or(0) })
+    }
+
+    /// The log has grown, since the last snapshot (a snapshot empties the log
+    /// of what it covers), past twice that snapshot's size and past
+    /// [`COMPACT_FLOOR`]: a few hundred large appends (paint batches) fill a
+    /// log long before two hundred of them.
+    pub fn compaction_due(&self) -> bool {
+        self.log_bytes > (2 * self.snapshot_bytes).max(COMPACT_FLOOR)
+    }
+}
+
+/// [`snapshot_due`] with the remote's sizes when it gave them: due by the
+/// count rule or by size ([`LogSizes::compaction_due`]), and in either case
+/// only when `cursor` has read through `appended` (the same `applied_through`
+/// rule: a snapshot deletes every entry at or below its number).
+pub fn snapshot_due_by(appended: u64, snapshot_seq: u64, cursor: &VaultCursor, sizes: Option<LogSizes>) -> bool {
+    let by_count = appended.saturating_sub(snapshot_seq) >= SNAPSHOT_EVERY;
+    let by_size = sizes.is_some_and(|sizes| sizes.compaction_due());
+    (by_count || by_size) && cursor.applied_through() == appended
 }
 
 // ── Echoes ──────────────────────────────────────────────────────────────────
@@ -95,6 +140,9 @@ pub fn should_apply(source_client_id: Option<&str>, my_client_id: &str) -> bool 
 pub enum Mark {
     Through(u64),
     One(u64),
+    /// The consecutive entries of one append sent in parts, first to last:
+    /// applied together, so marked together.
+    Span(u64, u64),
 }
 
 impl Mark {
@@ -104,6 +152,11 @@ impl Mark {
         match self {
             Mark::Through(seq) => cursor.mark_through(seq),
             Mark::One(seq) => cursor.mark(seq),
+            Mark::Span(first, last) => {
+                for seq in first..=last {
+                    cursor.mark(seq);
+                }
+            }
         }
     }
 
@@ -111,13 +164,177 @@ impl Mark {
     pub fn snapshot(self) -> Option<u64> {
         match self {
             Mark::Through(seq) => Some(seq),
-            Mark::One(_) => None,
+            Mark::One(_) | Mark::Span(..) => None,
         }
     }
 }
 
+// ── Parts (docs/SYNC_LIMITS_CONTRACT.md, "Snapshots and appends in parts") ───
+
+/// The most plaintext one blob carries. A snapshot or an append larger than
+/// this goes as parts of at most this much each, every part a blob of its
+/// own: no vault limit on one blob is ever what stops a document syncing.
+pub const PART_BYTES: usize = 8 * 1024 * 1024;
+
+/// One blob ready to go: whole, or one part of a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    pub blob: String,
+    pub part: Option<VaultPart>,
+}
+
+/// Encrypt `plaintext` of `node_id` under `key` as the wire carries it: one
+/// whole blob when it fits in [`PART_BYTES`] or `in_parts` is false (the
+/// remote does not take parts, `VaultListDocsResponse::parts`), and
+/// otherwise parts of one new group, each sealed with associated data naming
+/// it ([`pimble_crypto::blob_part_aad`]).
+pub fn seal_parts(store_id: StoreId, node_id: NodeId, key_id: KeyId, key: &SymmetricKey, plaintext: &[u8], in_parts: bool) -> Vec<Sealed> {
+    if !in_parts || plaintext.len() <= PART_BYTES {
+        return vec![Sealed { blob: seal(store_id, node_id, key_id, key, plaintext), part: None }];
+    }
+    let group = Uuid::new_v4();
+    let chunks: Vec<&[u8]> = plaintext.chunks(PART_BYTES).collect();
+    let count = chunks.len() as u32;
+    let doc = VaultDocId::Node(node_id).as_str();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let part = VaultPart { index: index as u32, count, group };
+            let aad = blob_part_aad(&store_id.to_string(), &doc, part.index, part.count, &group.to_string());
+            Sealed { blob: URL_SAFE_NO_PAD.encode(Blob::encrypt(key, key_id, &aad, chunk)), part: Some(part) }
+        })
+        .collect()
+}
+
+/// What a fetched document's log is to a reader, in the order it applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unit<'a> {
+    /// A whole blob.
+    Whole { mark: Mark, blob: &'a str },
+    /// Every part of one group, in order: applied as one.
+    Parts { mark: Mark, parts: Vec<(VaultPart, &'a str)> },
+    /// Parts of a group that is not all here (or not in order): nothing of it
+    /// is applied, and the cursor stops in front of it.
+    Incomplete,
+}
+
+/// Every part of one group, in order and consecutive, from `entries`; `None`
+/// when they are not exactly that.
+fn whole_group<'a>(entries: &[&'a crate::VaultEntry]) -> Option<Vec<(VaultPart, &'a str)>> {
+    let first = entries.first()?.part?;
+    if !first.is_valid() || entries.len() != first.count as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let part = entry.part?;
+        if part.group != first.group || part.count != first.count || part.index as usize != index {
+            return None;
+        }
+        out.push((part, entry.blob.as_str()));
+    }
+    Some(out)
+}
+
+/// A `vaultFetch` answer as what applies: the snapshot first (whole, or every
+/// one of its parts), then every update, the parts of an append sent in
+/// parts together as one unit.
+pub fn fetched_units(fetched: &VaultFetchResponse) -> Vec<Unit<'_>> {
+    let mut out = Vec::new();
+    if let Some(snapshot) = &fetched.snapshot {
+        let mark = Mark::Through(snapshot.seq);
+        if snapshot.part.is_none() && fetched.snapshot_parts.is_empty() {
+            out.push(Unit::Whole { mark, blob: snapshot.blob.as_str() });
+        } else {
+            let all: Vec<&crate::VaultEntry> = std::iter::once(snapshot).chain(fetched.snapshot_parts.iter()).collect();
+            out.push(match whole_group(&all) {
+                Some(parts) => Unit::Parts { mark, parts },
+                None => Unit::Incomplete,
+            });
+        }
+    }
+    let mut i = 0;
+    let updates = &fetched.updates;
+    while i < updates.len() {
+        let entry = &updates[i];
+        let Some(part) = entry.part else {
+            out.push(Unit::Whole { mark: Mark::One(entry.seq), blob: entry.blob.as_str() });
+            i += 1;
+            continue;
+        };
+        // The run of this group's entries.
+        let mut j = i;
+        while j < updates.len() && updates[j].part.is_some_and(|p| p.group == part.group) {
+            j += 1;
+        }
+        let run: Vec<&crate::VaultEntry> = updates[i..j].iter().collect();
+        let consecutive = run.windows(2).all(|w| w[1].seq == w[0].seq + 1);
+        out.push(match whole_group(&run).filter(|_| consecutive) {
+            Some(parts) => Unit::Parts { mark: Mark::Span(run[0].seq, run[run.len() - 1].seq), parts },
+            None => Unit::Incomplete,
+        });
+        i = j;
+    }
+    out
+}
+
+/// The parts of appends sent in parts, as they arrive one notification at a
+/// time, kept until every part of a group is here.
+#[derive(Debug, Default)]
+pub struct PartBuffer {
+    groups: HashMap<(String, Uuid), Vec<Option<(u64, String)>>>,
+}
+
+impl PartBuffer {
+    /// Take one part of `doc`. When it completes its group: what the group
+    /// vouches for and its parts in order. A part whose numbers make no sense
+    /// is dropped (the document is read again by its next fetch).
+    pub fn take(&mut self, doc: &str, seq: u64, part: VaultPart, blob: String) -> Option<(Mark, Vec<(VaultPart, String)>)> {
+        if !part.is_valid() {
+            return None;
+        }
+        let slots = self.groups.entry((doc.to_string(), part.group)).or_insert_with(|| vec![None; part.count as usize]);
+        if slots.len() != part.count as usize {
+            self.groups.remove(&(doc.to_string(), part.group));
+            return None;
+        }
+        slots[part.index as usize] = Some((seq, blob));
+        if slots.iter().any(Option::is_none) {
+            return None;
+        }
+        let slots = self.groups.remove(&(doc.to_string(), part.group))?;
+        let seqs: Vec<u64> = slots.iter().flatten().map(|(seq, _)| *seq).collect();
+        let (first, last) = (*seqs.iter().min()?, *seqs.iter().max()?);
+        if last - first + 1 != seqs.len() as u64 {
+            return None;
+        }
+        let parts = slots.into_iter().flatten().enumerate().map(|(index, (_, blob))| (VaultPart { index: index as u32, ..part }, blob)).collect();
+        Some((Mark::Span(first, last), parts))
+    }
+
+    /// Whether some group of `doc` is still waiting for a part.
+    pub fn holds(&self, doc: &str) -> bool {
+        self.groups.keys().any(|(d, _)| d == doc)
+    }
+
+    /// Forget the parts held of one document (it is being read again from
+    /// its cursor, which brings every group whole).
+    pub fn forget(&mut self, doc: &str) {
+        self.groups.retain(|(d, _), _| d != doc);
+    }
+
+    /// Forget every part held (a connection ended: what it was in the middle
+    /// of is read again by the next fetch).
+    pub fn clear(&mut self) {
+        self.groups.clear();
+    }
+}
+
 /// A `vaultFetch` answer's blobs in the order they apply: the snapshot first,
-/// then every update.
+/// then every update, each blob alone. For a picture's document, whose
+/// chunks are never sent in parts; a node document is read with
+/// [`fetched_units`].
 pub fn fetched_entries(fetched: &VaultFetchResponse) -> Vec<(Mark, &str)> {
     let mut out = Vec::with_capacity(fetched.updates.len() + 1);
     if let Some(entry) = &fetched.snapshot {
@@ -158,6 +375,40 @@ pub enum Unopened {
     NoKey(KeyId),
     /// The named key is held and the blob does not decrypt under it.
     Failed(String),
+    /// Written in a format newer than this client reads (a blob version it
+    /// does not know): made by a newer Pimble.
+    Newer,
+    /// Parts of a group that is not all here.
+    Incomplete,
+}
+
+impl Unopened {
+    /// Why the document waits, as the sentence the app and the MCP show
+    /// (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits").
+    pub fn reason(&self) -> String {
+        match self {
+            Unopened::NoKey(_) => WAITING_FOR_KEY.to_string(),
+            Unopened::Newer => MADE_BY_NEWER.to_string(),
+            Unopened::Incomplete => "Part of a large change to it has not arrived yet.".to_string(),
+            Unopened::Malformed(message) | Unopened::Failed(message) => format!("A change to it would not open here ({message})."),
+        }
+    }
+}
+
+/// A document waiting for a key this device does not hold.
+pub const WAITING_FOR_KEY: &str = "Waiting for its key: no key on this device opens it yet.";
+/// A document written in a format this client does not read.
+pub const MADE_BY_NEWER: &str = "Made by a newer Pimble: update Pimble on this device to read it.";
+/// An update the remote would not take for its size, from a remote that
+/// takes nothing in parts.
+pub const TOO_LARGE_FOR_REMOTE: &str = "Too large for the server it syncs with, which needs a newer Pimble to take it in parts.";
+
+/// A blob's header, as an error that tells a newer format from damage.
+fn header_key_id(blob: &[u8]) -> Result<KeyId, Unopened> {
+    Blob::key_id(blob).map_err(|e| match e {
+        CryptoError::UnsupportedVersion(_) => Unopened::Newer,
+        other => Unopened::Malformed(other.to_string()),
+    })
 }
 
 impl std::fmt::Display for Unopened {
@@ -166,6 +417,8 @@ impl std::fmt::Display for Unopened {
             Unopened::Malformed(message) => write!(f, "malformed blob: {message}"),
             Unopened::NoKey(key_id) => write!(f, "no key {key_id} held here"),
             Unopened::Failed(message) => write!(f, "decryption failed: {message}"),
+            Unopened::Newer => f.write_str("made by a newer Pimble"),
+            Unopened::Incomplete => f.write_str("parts of it have not all arrived"),
         }
     }
 }
@@ -378,11 +631,60 @@ impl DocKeys {
 
     /// Open one blob of one document.
     pub fn open(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str, scope: &impl ScopeKeys) -> Result<Vec<u8>, Unopened> {
-        let blob = decode_blob(encoded).map_err(Unopened::Malformed)?;
-        let key_id = Blob::key_id(&blob).map_err(|e| Unopened::Malformed(e.to_string()))?;
-        let key = self.blob_key(store_id, node_id, key_id, scope).ok_or(Unopened::NoKey(key_id))?;
         let aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
-        Blob::decrypt(&key, &aad, &blob).map_err(|e| Unopened::Failed(e.to_string()))
+        self.open_with(store_id, node_id, encoded, &aad, scope)
+    }
+
+    /// Open one part of a group of one document.
+    pub fn open_part(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str, part: VaultPart, scope: &impl ScopeKeys) -> Result<Vec<u8>, Unopened> {
+        let aad = blob_part_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str(), part.index, part.count, &part.group.to_string());
+        self.open_with(store_id, node_id, encoded, &aad, scope)
+    }
+
+    /// Open every part of a group, in order, as the one plaintext they were
+    /// cut from.
+    pub fn open_parts<'a>(&mut self, store_id: StoreId, node_id: NodeId, parts: impl IntoIterator<Item = (VaultPart, &'a str)>, scope: &impl ScopeKeys) -> Result<Vec<u8>, Unopened> {
+        let mut out = Vec::new();
+        for (part, encoded) in parts {
+            out.extend(self.open_part(store_id, node_id, encoded, part, scope)?);
+        }
+        Ok(out)
+    }
+
+    /// Open one unit of a fetch ([`fetched_units`]).
+    pub fn open_unit(&mut self, store_id: StoreId, node_id: NodeId, unit: &Unit<'_>, scope: &impl ScopeKeys) -> Result<Vec<u8>, Unopened> {
+        match unit {
+            Unit::Whole { blob, .. } => self.open(store_id, node_id, blob, scope),
+            Unit::Parts { parts, .. } => self.open_parts(store_id, node_id, parts.iter().map(|(p, b)| (*p, *b)), scope),
+            Unit::Incomplete => Err(Unopened::Incomplete),
+        }
+    }
+
+    fn open_with(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str, aad: &[u8], scope: &impl ScopeKeys) -> Result<Vec<u8>, Unopened> {
+        let blob = decode_blob(encoded).map_err(Unopened::Malformed)?;
+        let key_id = header_key_id(&blob)?;
+        let key = self.blob_key(store_id, node_id, key_id, scope).ok_or(Unopened::NoKey(key_id))?;
+        Blob::decrypt(&key, aad, &blob).map_err(|e| Unopened::Failed(e.to_string()))
+    }
+}
+
+impl Unit<'_> {
+    /// What applying this unit vouches for; `None` for one that cannot apply.
+    pub fn mark(&self) -> Option<Mark> {
+        match self {
+            Unit::Whole { mark, .. } | Unit::Parts { mark, .. } => Some(*mark),
+            Unit::Incomplete => None,
+        }
+    }
+
+    /// The key id the unit's (first) blob names, when nothing here yields
+    /// it (see [`DocKeys::key_wanted`]).
+    pub fn first_blob(&self) -> Option<&str> {
+        match self {
+            Unit::Whole { blob, .. } => Some(blob),
+            Unit::Parts { parts, .. } => parts.first().map(|(_, b)| *b),
+            Unit::Incomplete => None,
+        }
     }
 }
 
@@ -676,9 +978,11 @@ mod tests {
         let sealed: Vec<String> = chunks.iter().map(|c| seal_picture(store_id, blob, dek_id, &dek, c)).collect();
         let fetch = |upto: usize, keys: Option<VaultDocKeys>| VaultFetchResponse {
             snapshot: None,
-            updates: sealed[..upto].iter().enumerate().map(|(i, blob)| VaultEntry { seq: i as u64 + 1, blob: blob.clone() }).collect(),
+            snapshot_parts: Vec::new(),
+            updates: sealed[..upto].iter().enumerate().map(|(i, blob)| VaultEntry { seq: i as u64 + 1, blob: blob.clone(), part: None }).collect(),
             head: upto as u64,
             keys,
+            more: false,
         };
         assert_eq!(open_picture(store_id, blob, &fetch(2, Some(keys.clone())), &scope), Ok(None), "not whole yet");
         assert_eq!(open_picture(store_id, blob, &fetch(3, Some(keys.clone())), &scope), Ok(Some(("image/png".to_string(), bytes.clone()))));
@@ -692,16 +996,16 @@ mod tests {
         assert_eq!(rest.iter().map(|c| c.offset).collect::<Vec<_>>(), vec![PICTURE_CHUNK as u64, 2 * PICTURE_CHUNK as u64]);
         let mut resumed = fetch(1, Some(keys.clone()));
         for (i, chunk) in rest.iter().enumerate() {
-            resumed.updates.push(VaultEntry { seq: i as u64 + 2, blob: seal_picture(store_id, blob, dek_id, &dek, chunk) });
+            resumed.updates.push(VaultEntry { seq: i as u64 + 2, blob: seal_picture(store_id, blob, dek_id, &dek, chunk), part: None });
         }
         assert_eq!(open_picture(store_id, blob, &resumed, &scope).unwrap().map(|(_, b)| b.len()), Some(bytes.len()));
         // A run that cannot be continued (a stray chunk after it) is started
         // over from the first chunk, and that reads whole too.
         let mut restarted = fetch(1, Some(keys.clone()));
         let stray = PictureChunk { mime: "image/png".into(), total: bytes.len() as u64, offset: 5, bytes: vec![1, 2, 3] };
-        restarted.updates.push(VaultEntry { seq: 2, blob: seal_picture(store_id, blob, dek_id, &dek, &stray) });
+        restarted.updates.push(VaultEntry { seq: 2, blob: seal_picture(store_id, blob, dek_id, &dek, &stray), part: None });
         for (i, chunk) in continue_picture(&PictureProgress::Nothing, "image/png", &bytes).iter().enumerate() {
-            restarted.updates.push(VaultEntry { seq: i as u64 + 3, blob: seal_picture(store_id, blob, dek_id, &dek, chunk) });
+            restarted.updates.push(VaultEntry { seq: i as u64 + 3, blob: seal_picture(store_id, blob, dek_id, &dek, chunk), part: None });
         }
         assert_eq!(open_picture(store_id, blob, &restarted, &scope).unwrap().map(|(_, b)| b), Some(bytes.clone()));
         assert_eq!(picture_chunk_count(bytes.len()), 3);
@@ -743,10 +1047,12 @@ mod tests {
     #[test]
     fn a_fetch_applies_snapshot_first_and_marks_what_each_entry_vouches_for() {
         let fetched = VaultFetchResponse {
-            snapshot: Some(VaultEntry { seq: 5, blob: "s".into() }),
-            updates: vec![VaultEntry { seq: 7, blob: "u".into() }],
+            snapshot: Some(VaultEntry { seq: 5, blob: "s".into(), part: None }),
+            snapshot_parts: Vec::new(),
+            updates: vec![VaultEntry { seq: 7, blob: "u".into(), part: None }],
             head: 7,
             keys: None,
+            more: false,
         };
         let entries = fetched_entries(&fetched);
         assert_eq!(entries, vec![(Mark::Through(5), "s"), (Mark::One(7), "u")]);
@@ -808,5 +1114,123 @@ mod tests {
         keys.note_created(node_id, &wraps);
         assert!(matches!(keys.seal_key(store_id, node_id, None, &scope), SealKey::With(id, _) if id == first));
         assert!(keys.create_key(store_id, NodeId::new(), &[KeyId::new_v4()], &scope).is_none(), "nothing held, nothing made");
+    }
+
+    #[test]
+    fn a_snapshot_is_due_by_size_once_the_log_outgrows_twice_the_snapshot() {
+        let mut cursor = VaultCursor::starting_at(0);
+        cursor.mark(1);
+        cursor.mark(2);
+        let small = LogSizes { log_bytes: COMPACT_FLOOR, snapshot_bytes: 0 };
+        assert!(!snapshot_due_by(2, 0, &cursor, Some(small)), "not past the floor");
+        let big = LogSizes { log_bytes: COMPACT_FLOOR + 1, snapshot_bytes: 0 };
+        assert!(snapshot_due_by(2, 0, &cursor, Some(big)), "past the floor, two appends");
+        let under_twice = LogSizes { log_bytes: 6 * COMPACT_FLOOR, snapshot_bytes: 3 * COMPACT_FLOOR };
+        assert!(!snapshot_due_by(2, 0, &cursor, Some(under_twice)));
+        let over_twice = LogSizes { log_bytes: 6 * COMPACT_FLOOR + 1, snapshot_bytes: 3 * COMPACT_FLOOR };
+        assert!(snapshot_due_by(2, 0, &cursor, Some(over_twice)));
+        // The same `applied_through` rule as by count.
+        cursor.mark(4);
+        assert!(!snapshot_due_by(4, 0, &cursor, Some(big)), "3 is still on its way");
+        // An older server gives no sizes: the count rule alone.
+        assert!(!snapshot_due_by(2, 0, &cursor, None));
+        assert_eq!(LogSizes::of(&VaultAppendResponse { seq: 1, first_seq: None, log_bytes: None, snapshot_bytes: None }), None);
+    }
+
+    fn parts_fixture(len: usize) -> (StoreId, NodeId, KeyId, HashMap<KeyId, SymmetricKey>, SymmetricKey, Vec<u8>) {
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+        let key_id = KeyId::new_v4();
+        let (scope, key) = scope_with(key_id);
+        let plain: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        (store_id, node_id, key_id, scope, key, plain)
+    }
+
+    #[test]
+    fn a_large_blob_goes_in_parts_and_opens_only_whole() {
+        let (store_id, node_id, key_id, scope, key, plain) = parts_fixture(PART_BYTES * 2 + 5);
+        assert_eq!(seal_parts(store_id, node_id, key_id, &key, &plain[..10], true).len(), 1, "small: whole");
+        assert_eq!(seal_parts(store_id, node_id, key_id, &key, &plain, false).len(), 1, "no parts at a remote that takes none");
+        let sealed = seal_parts(store_id, node_id, key_id, &key, &plain, true);
+        assert_eq!(sealed.len(), 3);
+        let fetched = VaultFetchResponse {
+            snapshot: None,
+            snapshot_parts: Vec::new(),
+            updates: sealed.iter().enumerate().map(|(i, s)| VaultEntry { seq: i as u64 + 4, blob: s.blob.clone(), part: s.part }).collect(),
+            head: 6,
+            keys: None,
+            more: false,
+        };
+        let units = fetched_units(&fetched);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].mark(), Some(Mark::Span(4, 6)));
+        let mut keys = DocKeys::default();
+        assert_eq!(keys.open_unit(store_id, node_id, &units[0], &scope).unwrap(), plain);
+        // A reader that knows nothing of parts (the whole-blob associated
+        // data) opens no part of it: it never applies a fragment.
+        for s in &sealed {
+            assert!(matches!(keys.open(store_id, node_id, &s.blob, &scope), Err(Unopened::Failed(_))));
+        }
+        // A part is not another index of its group, nor another group's.
+        let p0 = sealed[0].part.unwrap();
+        assert!(keys.open_part(store_id, node_id, &sealed[0].blob, VaultPart { index: 1, ..p0 }, &scope).is_err());
+        assert!(keys.open_part(store_id, node_id, &sealed[0].blob, VaultPart { group: Uuid::new_v4(), ..p0 }, &scope).is_err());
+        // Missing a part: incomplete, nothing applies.
+        let mut short = fetched.clone();
+        short.updates.remove(1);
+        assert_eq!(fetched_units(&short), vec![Unit::Incomplete]);
+    }
+
+    #[test]
+    fn a_snapshot_in_parts_reads_as_one_unit() {
+        let (store_id, node_id, key_id, scope, key, plain) = parts_fixture(PART_BYTES + 1);
+        let sealed = seal_parts(store_id, node_id, key_id, &key, &plain, true);
+        let entries: Vec<VaultEntry> = sealed.iter().map(|s| VaultEntry { seq: 9, blob: s.blob.clone(), part: s.part }).collect();
+        let fetched = VaultFetchResponse {
+            snapshot: Some(entries[0].clone()),
+            snapshot_parts: entries[1..].to_vec(),
+            updates: vec![VaultEntry::whole(10, seal(store_id, node_id, key_id, &key, b"after"))],
+            head: 10,
+            keys: None,
+            more: false,
+        };
+        let units = fetched_units(&fetched);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].mark(), Some(Mark::Through(9)));
+        let mut keys = DocKeys::default();
+        assert_eq!(keys.open_unit(store_id, node_id, &units[0], &scope).unwrap(), plain);
+        assert_eq!(keys.open_unit(store_id, node_id, &units[1], &scope).unwrap(), b"after");
+        let mut cursor = VaultCursor::default();
+        for unit in &units {
+            unit.mark().unwrap().apply(&mut cursor);
+        }
+        assert_eq!(cursor.applied_through(), 10);
+    }
+
+    #[test]
+    fn live_parts_wait_for_their_group() {
+        let (store_id, node_id, key_id, scope, key, plain) = parts_fixture(PART_BYTES * 2 + 1);
+        let sealed = seal_parts(store_id, node_id, key_id, &key, &plain, true);
+        let mut buffer = PartBuffer::default();
+        let doc = node_id.to_string();
+        assert!(buffer.take(&doc, 7, sealed[0].part.unwrap(), sealed[0].blob.clone()).is_none());
+        assert!(buffer.holds(&doc));
+        assert!(buffer.take(&doc, 8, sealed[1].part.unwrap(), sealed[1].blob.clone()).is_none());
+        let (mark, parts) = buffer.take(&doc, 9, sealed[2].part.unwrap(), sealed[2].blob.clone()).unwrap();
+        assert_eq!(mark, Mark::Span(7, 9));
+        assert!(!buffer.holds(&doc));
+        let mut keys = DocKeys::default();
+        assert_eq!(keys.open_parts(store_id, node_id, parts.iter().map(|(p, b)| (*p, b.as_str())), &scope).unwrap(), plain);
+    }
+
+    #[test]
+    fn a_blob_of_a_newer_format_says_so() {
+        let (store_id, node_id, key_id, scope, key, _) = parts_fixture(1);
+        let mut raw = decode_blob(&seal(store_id, node_id, key_id, &key, b"x")).unwrap();
+        raw[2] = 2;
+        let encoded = URL_SAFE_NO_PAD.encode(raw);
+        let mut keys = DocKeys::default();
+        assert_eq!(keys.open(store_id, node_id, &encoded, &scope), Err(Unopened::Newer));
+        assert_eq!(Unopened::Newer.reason(), MADE_BY_NEWER);
     }
 }

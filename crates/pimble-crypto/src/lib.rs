@@ -535,6 +535,17 @@ pub fn blob_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}").into_bytes()
 }
 
+/// The associated data for one part of a document's blob that was sealed in
+/// parts (docs/SYNC_LIMITS_CONTRACT.md, "Snapshots and appends in parts"):
+/// the document's, naming the part's index, the number of parts and the
+/// group they belong to. A part therefore never opens as a whole blob (an
+/// older reader, which knows nothing of parts, fails to decrypt it and never
+/// applies a fragment), never as another index of its group, and never as a
+/// part of another group.
+pub fn blob_part_aad(store_id: &str, doc_id: &str, index: u32, count: u32, group: &str) -> Vec<u8> {
+    format!("{store_id}/{doc_id}#{index}/{count}/{group}").into_bytes()
+}
+
 /// The associated data a presence frame's body is sealed with
 /// (docs/PRESENCE_CONTRACT.md section 9): never the same as a document's
 /// blobs', so neither can stand in for the other.

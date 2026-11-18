@@ -85,10 +85,10 @@ use pimble_core::{
 };
 use pimble_crdt::{derive_changes, move_order, DocShape, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{Blob, KeyId, SymmetricKey};
-use pimble_rpc::vault::{self as protocol, should_apply, DocKeys, Mark, NewDocument, SealKey};
+use pimble_rpc::vault::{self as protocol, should_apply, DocKeys, LogSizes, Mark, NewDocument, PartBuffer, SealKey, Sealed};
 use pimble_rpc::{
-    SearchResultItem, StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId,
-    VaultDocKeys, VaultFetchResponse,
+    SearchResultItem, StoreChangeKind, StoreChangedNotification, VaultAppendResponse, VaultCursor, VaultDocId,
+    VaultDocKeys, VaultFetchResponse, VaultPart,
 };
 
 use crate::keys::{self, KeyError, Keyring};
@@ -135,7 +135,9 @@ const WAITING_SUFFIX: &str = " (waiting for the key)";
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait VaultWire: pimble_api::MaybeSend + pimble_api::MaybeSync {
     /// `vaultAppend`: the blob numbered, for a new document with its parent
-    /// or the node a new discussion is on, and its wrapped data key.
+    /// or the node a new discussion is on, and its wrapped data key; `part`
+    /// for one part of an append sent in parts (docs/SYNC_LIMITS_CONTRACT.md).
+    /// The whole answer: the numbers and the log's sizes.
     #[allow(clippy::too_many_arguments)]
     async fn append(
         &self,
@@ -146,9 +148,10 @@ pub trait VaultWire: pimble_api::MaybeSend + pimble_api::MaybeSync {
         parent_id: Option<NodeId>,
         discussion_host: Option<NodeId>,
         keys: Option<VaultDocKeys>,
-    ) -> Result<u64, ClientError>;
+        part: Option<VaultPart>,
+    ) -> Result<VaultAppendResponse, ClientError>;
 
-    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError>;
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String, part: Option<VaultPart>) -> Result<(), ClientError>;
 
     async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError>;
 }
@@ -165,15 +168,23 @@ impl VaultWire for PimbleClient {
         parent_id: Option<NodeId>,
         discussion_host: Option<NodeId>,
         keys: Option<VaultDocKeys>,
-    ) -> Result<u64, ClientError> {
-        match discussion_host {
-            Some(host) => self.vault_append_new_discussion(store_id, doc_id, blob, client_id, host, keys).await,
-            None => self.vault_append_with_keys(store_id, doc_id, blob, client_id, parent_id, keys).await,
-        }
+        part: Option<VaultPart>,
+    ) -> Result<VaultAppendResponse, ClientError> {
+        self.vault_append_request(pimble_rpc::VaultAppendRequest {
+            store_id,
+            doc_id,
+            blob,
+            client_id,
+            parent_id: discussion_host.or(parent_id),
+            keys,
+            discussion: discussion_host.is_some(),
+            part,
+        })
+        .await
     }
 
-    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError> {
-        self.vault_snapshot(store_id, doc_id, upto_seq, blob).await
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String, part: Option<VaultPart>) -> Result<(), ClientError> {
+        self.vault_snapshot_request(pimble_rpc::VaultSnapshotRequest { store_id, doc_id, upto_seq, blob, covers_prefix: true, part }).await
     }
 
     async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
@@ -193,12 +204,13 @@ impl<T: VaultWire + ?Sized> VaultWire for Arc<T> {
         parent_id: Option<NodeId>,
         discussion_host: Option<NodeId>,
         keys: Option<VaultDocKeys>,
-    ) -> Result<u64, ClientError> {
-        (**self).append(store_id, doc_id, blob, client_id, parent_id, discussion_host, keys).await
+        part: Option<VaultPart>,
+    ) -> Result<VaultAppendResponse, ClientError> {
+        (**self).append(store_id, doc_id, blob, client_id, parent_id, discussion_host, keys, part).await
     }
 
-    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError> {
-        (**self).snapshot(store_id, doc_id, upto_seq, blob).await
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String, part: Option<VaultPart>) -> Result<(), ClientError> {
+        (**self).snapshot(store_id, doc_id, upto_seq, blob, part).await
     }
 
     async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
@@ -455,6 +467,26 @@ struct VaultStore {
     /// listens through the API ([`VaultClient::watch`]): a plugin's `Pimble`,
     /// which holds copies of its own (docs/PLUGINS_CONTRACT.md wave 3).
     heard: Vec<pimble_api::StoreChange>,
+    /// Whether the server takes snapshots and appends in parts, as its
+    /// `vaultListDocs` last said (docs/SYNC_LIMITS_CONTRACT.md): an older one
+    /// is sent whole blobs only.
+    parts_ok: bool,
+    /// The parts of groups announced live and not all here yet.
+    parts: PartBuffer,
+    /// The documents this page is holding back, each way, with the sentence
+    /// that says why (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits"), as
+    /// the desktop's link keeps them; and whether that changed since the UI
+    /// was last told.
+    held_back: HashMap<(NodeId, Side), String>,
+    held_changed: bool,
+}
+
+/// Which way a document is held back: what this page has not sent, or what
+/// it has not been able to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Side {
+    Send,
+    Read,
 }
 
 /// What an open store is still owed from outside, and when to go and look.
@@ -513,7 +545,8 @@ struct Pulled {
 /// One blob ready to append, and what to record once the server numbers it.
 struct Outgoing {
     doc_id: VaultDocId,
-    blob: String,
+    /// One whole blob, or the parts of one group in order.
+    blobs: Vec<Sealed>,
     /// The plaintext that went into the blob, to move `known_sv` by.
     payload: Vec<u8>,
     /// The document's state vector when the blob was made: what the server
@@ -526,6 +559,14 @@ struct Outgoing {
     /// (the parent, so a scoped member's new document joins their scope; a
     /// discussion's host).
     created: Option<(VaultDocKeys, NewDocument)>,
+}
+
+impl Outgoing {
+    /// The first (for a small update, the only) blob.
+    #[cfg(test)]
+    fn blob(&self) -> &str {
+        &self.blobs[0].blob
+    }
 }
 
 /// A store this account holds a grant on whose key has not arrived yet.
@@ -669,7 +710,7 @@ impl VaultClient {
         for chunk in protocol::picture_chunks(mime, bytes) {
             let sealed = protocol::seal_picture(store_id, blob, dek_id, &dek, &chunk);
             let first = keys.is_some();
-            wire.append(store_id, VaultDocId::Blob(blob), sealed, Some(self.client_id.clone()), first.then_some(node_id), None, keys.take())
+            wire.append(store_id, VaultDocId::Blob(blob), sealed, Some(self.client_id.clone()), first.then_some(node_id), None, keys.take(), None)
                 .await
                 .map_err(|e| ApiError::store_error(e.to_string()))?;
         }
@@ -1174,6 +1215,7 @@ impl VaultClient {
 
         let (mut vault_store, shut) = VaultStore::from_fetched(store.clone(), keys, scope_roots, fetched_docs);
         vault_store.epoch = epoch;
+        vault_store.parts_ok = listing.parts;
         // The shares in a whole store: what the first pass opened says which
         // nodes are shared, and their keys open what members made that no
         // desktop of the owner's has wrapped under the store key yet. Before
@@ -1248,6 +1290,9 @@ impl VaultClient {
                 let row = self.rows.get(&store_id);
                 let Some(store) = self.stores.get_mut(&store_id) else { continue };
                 let rebuilt = store.take_epoch(listing.epoch.as_deref(), row);
+                store.parts_ok = listing.parts;
+                // Read again from the cursors: every group comes whole.
+                store.parts.clear();
                 if rebuilt {
                     tracing::info!("Store {}: the server's logs are not the ones this page read (its twin was built again); reading them from the start and offering every document again", store_id);
                 }
@@ -1370,7 +1415,7 @@ impl VaultClient {
         events.extend(self.plugin_events());
         events.extend(self.open_presence());
         while let Ok(notification) = self.notices_rx.try_recv() {
-            let StoreChangeKind::VaultAppended { doc_id, seq } = &notification.change_kind else {
+            let StoreChangeKind::VaultAppended { doc_id, seq, part } = &notification.change_kind else {
                 // A vault store emits nothing else, but forward anything that
                 // does arrive rather than swallowing it.
                 events.push(BackendEvent::RemoteStoreChange {
@@ -1396,9 +1441,10 @@ impl VaultClient {
                 continue;
             };
             let source = notification.source_client_id.clone();
-            events.extend(self.apply_notification(store_id, node_id, seq, &blob, source));
+            events.extend(self.apply_notification(store_id, node_id, seq, *part, &blob, source));
         }
         self.tell_watchers();
+        events.extend(self.held_back_events());
         events
     }
 
@@ -1407,6 +1453,7 @@ impl VaultClient {
         store_id: StoreId,
         node_id: NodeId,
         seq: u64,
+        part: Option<VaultPart>,
         blob: &str,
         source_client_id: Option<String>,
     ) -> Vec<BackendEvent> {
@@ -1423,7 +1470,15 @@ impl VaultClient {
             return Vec::new();
         }
 
-        let merged = store.take_blob(store_id, node_id, seq, blob, source_client_id, now_ms());
+        let merged = match part {
+            // One part of an append sent in parts: held until its group is
+            // whole, then applied as one.
+            Some(part) => match store.parts.take(&node_id.to_string(), seq, part, blob.to_string()) {
+                Some((mark, parts)) => store.take_parts(store_id, node_id, mark, &parts, source_client_id, now_ms()),
+                None => return Vec::new(),
+            },
+            None => store.take_blob(store_id, node_id, seq, blob, source_client_id, now_ms()),
+        };
 
         let mut events = merged.events;
         if merged.structure {
@@ -1633,7 +1688,20 @@ impl VaultClient {
             ended_roots: Vec::new(),
             relay: if self.is_relayed(store_id) { RelaySide::Member } else { RelaySide::None },
             owner_offline: self.owner_offline.contains(&store_id),
+            waiting: self.stores.get(&store_id).map(VaultStore::waiting_list).unwrap_or_default(),
         }
+    }
+
+    /// A store's sync answer again for every store whose held-back documents
+    /// changed since the UI was last told: the row's badge and the waiting
+    /// node's Properties panel follow it.
+    fn held_back_events(&mut self) -> Vec<BackendEvent> {
+        let changed: Vec<StoreId> = self
+            .stores
+            .iter_mut()
+            .filter_map(|(id, store)| std::mem::take(&mut store.held_changed).then_some(*id))
+            .collect();
+        changed.into_iter().map(|id| self.sync_event(id)).collect()
     }
 
     /// Answer `cmd` for a store whose endpoint is down because its owner's
@@ -2094,10 +2162,17 @@ impl VaultClient {
         // A new discussion on a node says so, which is what lets a commenter
         // create it and puts it in the store's discussion set
         // (docs/DISCUSSIONS_CONTRACT.md section 7).
-        let appended = client
-            .append(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), new.parent_id, new.discussion_host, keys)
-            .await
-            .map_err(ApiError::from);
+        let mut appended: Result<VaultAppendResponse, ApiError> = Err(ApiError::Failed { sentence: "nothing was sent".into() });
+        for one in &outgoing.blobs {
+            appended = client
+                .append(store_id, outgoing.doc_id.clone(), one.blob.clone(), Some(self.client_id.clone()), new.parent_id, new.discussion_host, keys.clone(), one.part)
+                .await
+                .map_err(ApiError::from);
+            if appended.is_err() {
+                break;
+            }
+        }
+        let appended = appended.map(|answer| (answer.first_seq.unwrap_or(answer.seq), answer.seq, LogSizes::of(&answer)));
 
         // A refusal is the server saying no — a reader's root inside a store
         // this account edits elsewhere, or a document in nobody's scope. There
@@ -2114,7 +2189,7 @@ impl VaultClient {
         }
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
-        let snapshot = match store.record(node_id, &outgoing, appended.clone().map_err(|e| e.sentence())) {
+        let snapshot = match store.record_span(node_id, &outgoing, appended.clone().map_err(|e| e.sentence())) {
             Ok(snapshot) => snapshot,
             Err(sentence) => return Err(appended.err().unwrap_or(ApiError::Failed { sentence })),
         };
@@ -2126,8 +2201,17 @@ impl VaultClient {
 
         if let Some(upto_seq) = snapshot {
             let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
-            let blob = store.snapshot_blob(store_id, node_id).map_err(|sentence| ApiError::Failed { sentence })?;
-            match client.snapshot(store_id, outgoing.doc_id, upto_seq, blob).await {
+            let blobs = store.snapshot_blob(store_id, node_id).map_err(|sentence| ApiError::Failed { sentence })?;
+            // In parts when it is large: the server replaces the snapshot it
+            // holds only when the last part lands.
+            let mut sent = Ok(());
+            for one in blobs {
+                sent = client.snapshot(store_id, outgoing.doc_id.clone(), upto_seq, one.blob, one.part).await;
+                if sent.is_err() {
+                    break;
+                }
+            }
+            match sent {
                 Ok(()) => {
                     if let Some(doc) = self.stores.get_mut(&store_id).and_then(|s| s.docs.get_mut(&node_id)) {
                         doc.snapshot_seq = doc.snapshot_seq.max(upto_seq);
@@ -2512,6 +2596,7 @@ impl VaultStore {
         let mut node_docs: HashMap<NodeId, NodeDoc> = HashMap::new();
         let mut docs: HashMap<NodeId, VaultDoc> = HashMap::new();
         let mut heads = HashMap::new();
+        let mut held_back = HashMap::new();
         for Pulled { node_id, entries, head } in pulled {
             let node_doc = node_docs.entry(node_id).or_default();
             let doc = docs.entry(node_id).or_default();
@@ -2522,9 +2607,15 @@ impl VaultStore {
                             advance(&mut doc.known_sv, &bytes);
                             doc.applied(mark);
                         }
-                        Err(e) => tracing::warn!("Skipping an unreadable update of {}: {}", node_id, e),
+                        Err(e) => {
+                            tracing::warn!("Skipping an unreadable update of {}: {}", node_id, e);
+                            held_back.entry((node_id, Side::Read)).or_insert_with(|| format!("A change to it would not apply here ({e})."));
+                        }
                     },
-                    Err(message) => tracing::warn!("Skipping a blob of {}: {}", node_id, message),
+                    Err(reason) => {
+                        tracing::warn!("Skipping a blob of {}: {}", node_id, reason);
+                        held_back.entry((node_id, Side::Read)).or_insert(reason);
+                    }
                 }
             }
             heads.insert(node_id, head);
@@ -2543,7 +2634,50 @@ impl VaultStore {
                 tree.reroot(root);
             }
         }
-        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default(), epoch: None, heard: Vec::new() }
+        Self {
+            listed,
+            keys,
+            scope_roots,
+            tree,
+            docs,
+            heads,
+            repair_due: None,
+            look: KeyLook::default(),
+            epoch: None,
+            heard: Vec::new(),
+            parts_ok: false,
+            parts: PartBuffer::default(),
+            held_changed: !held_back.is_empty(),
+            held_back,
+        }
+    }
+
+    /// Hold `node_id` back one way, with the sentence that says why.
+    fn hold(&mut self, node_id: NodeId, side: Side, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.held_back.get(&(node_id, side)) != Some(&reason) {
+            self.held_back.insert((node_id, side), reason);
+            self.held_changed = true;
+        }
+    }
+
+    fn release(&mut self, node_id: NodeId, side: Side) {
+        if self.held_back.remove(&(node_id, side)).is_some() {
+            self.held_changed = true;
+        }
+    }
+
+    /// One entry per document held back, the reason it cannot be sent first.
+    fn waiting_list(&self) -> Vec<pimble_core::WaitingDoc> {
+        let mut out: Vec<pimble_core::WaitingDoc> = Vec::new();
+        let mut held: Vec<(&(NodeId, Side), &String)> = self.held_back.iter().collect();
+        held.sort_by_key(|((node_id, side), _)| (node_id.to_string(), *side));
+        for ((node_id, _), reason) in held {
+            if !out.iter().any(|w| w.node_id == *node_id) {
+                out.push(pimble_core::WaitingDoc { node_id: *node_id, reason: reason.clone() });
+            }
+        }
+        out
     }
 
     /// Whether this page holds only a scope of the store: a share's recipient.
@@ -2579,11 +2713,16 @@ impl VaultStore {
         let marker_before = before.as_ref().and_then(share_key_id);
         let mut effect = NodeUpdateEffect::default();
         let mut content_updates = Vec::new();
+        // Why the document waits after this, if it does (rule 3: nothing is
+        // held back silently).
+        let mut unread: Option<String> = None;
+        let any = !entries.is_empty();
         for (mark, update) in entries {
             let bytes = match update {
                 Ok(bytes) => bytes,
-                Err(message) => {
-                    tracing::warn!("Skipping a blob of {}: {}", node_id, message);
+                Err(reason) => {
+                    tracing::warn!("Skipping a blob of {}: {}", node_id, reason);
+                    unread.get_or_insert(reason);
                     continue;
                 }
             };
@@ -2600,8 +2739,16 @@ impl VaultStore {
                         content_updates.push(bytes);
                     }
                 }
-                Err(e) => tracing::warn!("An update of {} would not apply: {}", node_id, e),
+                Err(e) => {
+                    tracing::warn!("An update of {} would not apply: {}", node_id, e);
+                    unread.get_or_insert_with(|| format!("A change to it would not apply here ({e})."));
+                }
             }
+        }
+        match unread {
+            Some(reason) => self.hold(node_id, Side::Read, reason),
+            None if any => self.release(node_id, Side::Read),
+            None => {}
         }
         if !effect.changed {
             return Merged { events: Vec::new(), structure: false, wants_key: false };
@@ -2687,6 +2834,28 @@ impl VaultStore {
         let merged = self.merge(store_id, node_id, vec![(Mark::One(seq), update)], true, source);
         let head = self.heads.entry(node_id).or_insert(0);
         *head = (*head).max(seq);
+        if merged.wants_key {
+            self.look.want(now);
+        }
+        if let Some(key_id) = unopened {
+            self.note_unopened(node_id, key_id, now);
+        }
+        merged
+    }
+
+    /// Take a group of parts from the live path, once every part of it is
+    /// here: decrypt them as one, merge, note the head.
+    fn take_parts(&mut self, store_id: StoreId, node_id: NodeId, mark: Mark, parts: &[(VaultPart, String)], source: Option<String>, now: f64) -> Merged {
+        let update = self.keys.decrypt_parts(store_id, node_id, parts);
+        let unopened = match &update {
+            Ok(_) => None,
+            Err(_) => parts.first().and_then(|(_, blob)| self.keys.key_wanted(store_id, node_id, blob)),
+        };
+        let merged = self.merge(store_id, node_id, vec![(mark, update)], true, source);
+        if let Mark::Span(_, last) = mark {
+            let head = self.heads.entry(node_id).or_insert(0);
+            *head = (*head).max(last);
+        }
         if merged.wants_key {
             self.look.want(now);
         }
@@ -3079,11 +3248,14 @@ impl VaultStore {
             // is already in the document, so it is marked unsent and the next
             // connection — which fetches the wraps — resends it.
             self.docs.entry(node_id).or_default().unsent = true;
+            self.hold(node_id, Side::Send, protocol::WAITING_FOR_KEY);
             return Err(format!("no key for the document {node_id} on this device yet"));
         };
 
-        let blob = protocol::seal(store_id, node_id, key_id, &key, &payload);
-        Ok(Outgoing { doc_id: VaultDocId::Node(node_id), blob, payload, sent_sv, resend, created })
+        // In parts when it is larger than a part and the server takes them
+        // (docs/SYNC_LIMITS_CONTRACT.md).
+        let blobs = protocol::seal_parts(store_id, node_id, key_id, &key, &payload, self.parts_ok);
+        Ok(Outgoing { doc_id: VaultDocId::Node(node_id), blobs, payload, sent_sv, resend, created })
     }
 
     /// The scope keys that cover a node (`pimble_rpc::vault::scope_key_ids`):
@@ -3101,28 +3273,37 @@ impl VaultStore {
     /// Record how an append went. `Ok(Some(seq))` says a snapshot stamped
     /// `seq` is due; `Err` is the append's failure, recorded against the
     /// document so the next append (or the next connect) resends it.
+    #[cfg(test)]
     fn record(&mut self, node_id: NodeId, outgoing: &Outgoing, appended: Result<u64, String>) -> Result<Option<u64>, String> {
-        let doc = self.docs.entry(node_id).or_default();
-        let seq = match appended {
-            Ok(seq) => seq,
+        self.record_span(node_id, outgoing, appended.map(|seq| (seq, seq, None)))
+    }
+
+    /// [`VaultStore::record`] for an append that may have gone in parts:
+    /// numbered `first..=last`, with the log's sizes when the server gave
+    /// them (what a snapshot is also due by, `snapshot_due_by`).
+    fn record_span(&mut self, node_id: NodeId, outgoing: &Outgoing, appended: Result<(u64, u64, Option<LogSizes>), String>) -> Result<Option<u64>, String> {
+        let (first, seq, sizes) = match appended {
+            Ok(span) => span,
             Err(message) => {
-                doc.unsent = true;
+                self.docs.entry(node_id).or_default().unsent = true;
+                self.hold(node_id, Side::Send, format!("Not sent yet: {message}"));
                 return Err(message);
             }
         };
+        self.release(node_id, Side::Send);
+        let doc = self.docs.entry(node_id).or_default();
         if outgoing.resend {
             doc.known_sv = outgoing.sent_sv.clone();
             doc.unsent = false;
         } else {
             advance(&mut doc.known_sv, &outgoing.payload);
         }
-        doc.cursor.mark(seq);
+        Mark::Span(first, seq).apply(&mut doc.cursor);
+        // Stamped only with a number read *through* (`snapshot_due_by`): the
+        // server deletes every log entry at or below a snapshot's number.
+        let due = protocol::snapshot_due_by(seq, doc.snapshot_seq, &doc.cursor, sizes);
         let head = self.heads.entry(node_id).or_insert(0);
         *head = (*head).max(seq);
-
-        // Stamped only with a number read *through* (`snapshot_due`): the
-        // server deletes every log entry at or below a snapshot's number.
-        let due = protocol::snapshot_due(seq, doc.snapshot_seq, &doc.cursor);
         Ok(due.then_some(seq))
     }
 
@@ -3185,13 +3366,13 @@ impl VaultStore {
 
     /// The document's whole state, encrypted, for a snapshot. Under the same
     /// key its updates go out under: a snapshot replaces them.
-    fn snapshot_blob(&mut self, store_id: StoreId, node_id: NodeId) -> Result<String, String> {
+    fn snapshot_blob(&mut self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Sealed>, String> {
         let full = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
         let (key_id, key) = self
             .keys
             .encrypt_key(store_id, node_id)
             .ok_or_else(|| format!("no key for the document {node_id} on this device"))?;
-        Ok(protocol::seal(store_id, node_id, key_id, &key, &full))
+        Ok(protocol::seal_parts(store_id, node_id, key_id, &key, &full, self.parts_ok))
     }
 }
 
@@ -3321,21 +3502,34 @@ impl StoreKeys {
         self.docs.key_wanted(store_id, node_id, encoded, &self.scope)
     }
 
-    /// Open one blob of one document.
+    /// Open one blob of one document. The error is the sentence the
+    /// document waits with (`pimble_rpc::vault::Unopened::reason`).
     fn decrypt_blob(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Result<Vec<u8>, String> {
-        self.docs.open(store_id, node_id, encoded, &self.scope).map_err(|e| format!("the document {node_id}: {e}"))
+        self.docs.open(store_id, node_id, encoded, &self.scope).map_err(|e| e.reason())
     }
 
-    /// Every blob in a fetch, snapshot first, decrypted in order.
+    /// Open every part of a group of one document, as the one update they
+    /// were cut from.
+    fn decrypt_parts(&mut self, store_id: StoreId, node_id: NodeId, parts: &[(VaultPart, String)]) -> Result<Vec<u8>, String> {
+        self.docs.open_parts(store_id, node_id, parts.iter().map(|(p, b)| (*p, b.as_str())), &self.scope).map_err(|e| e.reason())
+    }
+
+    /// Everything in a fetch, snapshot first, decrypted in order: a whole
+    /// blob alone, a group's parts together (`pimble_rpc::vault::fetched_units`).
+    /// A group not all here is an error with no mark of its own: nothing of
+    /// it applies, and the cursor stops in front of it.
     fn decrypt_entries(
         &mut self,
         store_id: StoreId,
         node_id: NodeId,
         fetched: &VaultFetchResponse,
     ) -> Vec<(Mark, Result<Vec<u8>, String>)> {
-        protocol::fetched_entries(fetched)
+        protocol::fetched_units(fetched)
             .into_iter()
-            .map(|(mark, blob)| (mark, self.decrypt_blob(store_id, node_id, blob)))
+            .map(|unit| {
+                let opened = self.docs.open_unit(store_id, node_id, &unit, &self.scope).map_err(|e| e.reason());
+                (unit.mark().unwrap_or(Mark::One(0)), opened)
+            })
             .collect()
     }
 }
@@ -3804,6 +3998,102 @@ mod tests {
         assert!(store.adopt_root().is_none(), "settled");
     }
 
+    // ── Sizes and parts (docs/SYNC_LIMITS_CONTRACT.md) ──────────────────────
+
+    /// The same scope keys as `store`'s, for a second page reading what the
+    /// first one sent.
+    fn same_keys(store: &VaultStore) -> StoreKeys {
+        StoreKeys::new(Keyring { keys: store.keys.scope.keys.clone(), current: store.keys.scope.current, scopes: store.keys.scope.scopes.clone() })
+    }
+
+    /// A 20 MiB edit goes out as parts of one group (and whole to a server
+    /// that takes no parts); its answer's sizes make a snapshot due; a page
+    /// reading the parts applies them as one, from a fetch or live, and one
+    /// missing a part applies nothing and says why it waits; a reader that
+    /// knows nothing of parts opens none of them.
+    #[test]
+    fn a_large_edit_goes_in_parts_and_is_read_only_whole() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let mut store = opened(&peer);
+        let text: String = (0..20 * 1024 * 1024).map(|i| (b'a' + (i * 7 % 26) as u8) as char).collect();
+        let mut big = NodeDoc::load(&store.tree.doc(root).unwrap().save()).unwrap();
+        let before = big.state_vector();
+        big.set_data("blob", &serde_json::Value::String(text.clone())).unwrap();
+        let update = big.diff_since(&before).unwrap();
+        store.tree.apply_update(root, &update).unwrap();
+
+        assert_eq!(store.prepare(store_id, root, &update).unwrap().blobs.len(), 1, "whole to a server that takes no parts");
+        store.parts_ok = true;
+        let outgoing = store.prepare(store_id, root, &update).unwrap();
+        assert_eq!(outgoing.blobs.len(), 3, "in parts");
+        let sizes = LogSizes { log_bytes: 27 << 20, snapshot_bytes: 0 };
+        assert_eq!(store.record_span(root, &outgoing, Ok((2, 4, Some(sizes)))).unwrap(), Some(4), "a snapshot is due by size");
+        assert_eq!(store.docs[&root].cursor.applied_through(), 4, "the whole group counts as read");
+        let snapshot = store.snapshot_blob(store_id, root).unwrap();
+        assert!(snapshot.len() >= 3 && snapshot.iter().all(|s| s.part.is_some()), "the snapshot goes in parts too");
+
+        // An older reader opens no part.
+        for one in &outgoing.blobs {
+            assert!(store.keys.decrypt_blob(store_id, root, &one.blob).is_err());
+        }
+
+        let entries: Vec<pimble_rpc::VaultEntry> = outgoing.blobs.iter().enumerate().map(|(i, one)| pimble_rpc::VaultEntry { seq: i as u64 + 2, blob: one.blob.clone(), part: one.part }).collect();
+        let fetch = |updates: Vec<pimble_rpc::VaultEntry>| VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head: 4, keys: None, more: false };
+
+        // Fetched whole.
+        let mut reader = VaultStore::assemble(listed(root), same_keys(&store), Vec::new(), pull_of(&peer));
+        reader.take_fetched(store_id, root, &fetch(entries.clone()), 0.0);
+        assert_eq!(reader.tree.doc(root).unwrap().data_json()["blob"].as_str().map(str::len), Some(text.len()));
+        assert_eq!(reader.docs[&root].cursor.applied_through(), 4);
+        assert!(reader.waiting_list().is_empty());
+
+        // A part missing: nothing applies, the cursor stays, and it waits.
+        let mut short = VaultStore::assemble(listed(root), same_keys(&store), Vec::new(), pull_of(&peer));
+        let mut missing = entries.clone();
+        missing.remove(1);
+        short.take_fetched(store_id, root, &fetch(missing), 0.0);
+        assert!(short.tree.doc(root).unwrap().data_json()["blob"].is_null());
+        assert_eq!(short.docs[&root].cursor.applied_through(), 1);
+        let waiting = short.waiting_list();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].node_id, root);
+        assert!(short.held_changed, "the UI is told");
+
+        // Live, one notification a part: applied once the last is in, and
+        // what waited is let go.
+        for entry in &entries {
+            if let Some((mark, parts)) = short.parts.take(&root.to_string(), entry.seq, entry.part.unwrap(), entry.blob.clone()) {
+                short.take_parts(store_id, root, mark, &parts, Some("another-page".into()), 0.0);
+            }
+        }
+        assert_eq!(short.tree.doc(root).unwrap().data_json()["blob"].as_str().map(str::len), Some(text.len()));
+        assert_eq!(short.docs[&root].cursor.applied_through(), 4);
+        assert!(short.waiting_list().is_empty());
+    }
+
+    /// A blob this page cannot open keeps its document waiting with the
+    /// reason, in the store's sync answer, and a send that fails says so
+    /// too; both go when the document does.
+    #[test]
+    fn a_document_held_back_is_listed_with_its_reason() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let mut store = opened(&peer);
+        let merged = store.merge(store_id, root, vec![(Mark::One(2), Err(protocol::MADE_BY_NEWER.to_string()))], true, None);
+        assert!(merged.events.is_empty());
+        assert_eq!(store.waiting_list(), vec![pimble_core::WaitingDoc { node_id: root, reason: protocol::MADE_BY_NEWER.to_string() }]);
+        let update = store.tree.set_title(root, "Renamed", T1).unwrap().touched[0].1.clone();
+        let outgoing = store.prepare(store_id, root, &update).unwrap();
+        assert!(store.record(root, &outgoing, Err("the socket went away".into())).is_err());
+        assert_eq!(store.waiting_list().len(), 1, "one entry per document");
+        assert!(store.record(root, &outgoing, Ok(3)).is_ok());
+        assert_eq!(store.waiting_list()[0].reason, protocol::MADE_BY_NEWER, "the send is no longer held back; the read still is");
+        let ok = store.tree.doc(root).unwrap().save();
+        store.merge(store_id, root, vec![(Mark::One(2), Ok(ok))], true, None);
+        assert!(store.waiting_list().is_empty());
+    }
+
     // ── What a tree edit appends ────────────────────────────────────────────
 
     #[test]
@@ -3822,10 +4112,10 @@ mod tests {
             assert!(!outgoing.resend);
             // The blob is that document's update and nothing else, under
             // this store's and this document's associated data.
-            let opened = store.keys.decrypt_blob(store_id, *node_id, &outgoing.blob).unwrap();
+            let opened = store.keys.decrypt_blob(store_id, *node_id, outgoing.blob()).unwrap();
             assert_eq!(&opened, update);
             assert!(
-                store.keys.decrypt_blob(store_id, NodeId::new(), &outgoing.blob).is_err(),
+                store.keys.decrypt_blob(store_id, NodeId::new(), outgoing.blob()).is_err(),
                 "bound to its document"
             );
             seq += 1;
@@ -4637,7 +4927,7 @@ mod tests {
         let dek = unwrap_dek(&keys.wraps[0], &share_key, &dek_aad_of(store_id, mine)).unwrap();
         assert!(unwrap_dek(&keys.wraps[0], &share_key, &dek_aad_of(store_id, NodeId::new())).is_err());
         // And the blob is under that data key.
-        let blob = decode_blob(&outgoing.blob).unwrap();
+        let blob = decode_blob(outgoing.blob()).unwrap();
         assert_eq!(Blob::key_id(&blob).unwrap(), keys.dek_id);
         assert_eq!(
             Blob::decrypt(&dek, &blob_aad(&store_id.to_string(), &VaultDocId::Node(mine).as_str()), &blob).unwrap(),
@@ -4650,7 +4940,7 @@ mod tests {
         store.record(mine, &outgoing, Err("the socket went away".to_string())).unwrap_err();
         let again = store.prepare(store_id, mine, &[]).unwrap();
         assert_eq!(again.created.as_ref().map(|(keys, _)| keys), Some(keys));
-        assert_eq!(Blob::key_id(&decode_blob(&again.blob).unwrap()).unwrap(), keys.dek_id);
+        assert_eq!(Blob::key_id(&decode_blob(again.blob()).unwrap()).unwrap(), keys.dek_id);
 
         // A document the store already has is not created again: its key is
         // its own, not a fresh one.
@@ -4731,10 +5021,11 @@ mod tests {
             .map(|(i, payload)| pimble_rpc::VaultEntry {
                 seq: i as u64 + 1,
                 blob: blob_under(store_id, node_id, dek_id, &dek, payload),
+                part: None,
             })
             .collect();
         let head = updates.len() as u64;
-        (VaultFetchResponse { snapshot: None, updates, head, keys: Some(VaultDocKeys { dek_id, wraps }) }, (dek_id, dek))
+        (VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head, keys: Some(VaultDocKeys { dek_id, wraps }), more: false }, (dek_id, dek))
     }
 
     /// An owner's page as `open_store` builds it, holding the store key only:

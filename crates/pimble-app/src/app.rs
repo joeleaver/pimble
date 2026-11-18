@@ -1192,6 +1192,19 @@ fn sync_badge_text(
     }
 }
 
+/// A badge with what the link is holding back after it
+/// (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits"): "encrypted · synced
+/// · 1 note waiting", or the count alone where the row has no badge of its
+/// own (the browser's encrypted stores, a store shared from here).
+fn badge_with_waiting(base: &str, waiting: usize) -> String {
+    let waits = pimble_core::waiting_phrase(waiting);
+    match (base.is_empty(), waits.is_empty()) {
+        (_, true) => base.to_string(),
+        (true, false) => waits,
+        (false, false) => format!("{base} · {waits}"),
+    }
+}
+
 /// Walk the DOM subtree to find a `data-oncontextmenu` handler and copy it
 /// to `target`. Used to hoist the context menu handler from the invisible
 /// ContextMenuTarget (display:contents) to a visible wrapper div.
@@ -2522,7 +2535,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 // shared with, and the shared nodes carry the
                                 // share icon (Joe, 2026-11-06).
                                 let owner = store_sig.map_or(false, |sig| sig.with(|s| s.relay == pimble_core::RelaySide::Owner));
-                                if (linked || owner_offline) && !ended && !owner {
+                                // Documents the link is holding back are said
+                                // on every row, an owner's and the browser's
+                                // included (docs/SYNC_LIMITS_CONTRACT.md).
+                                let waits = parsed.map_or(0, |(s_id, _)| store.waiting.with(|m| m.get(&s_id).map_or(0, Vec::len)));
+                                if ((linked || owner_offline) && !owner || waits > 0) && !ended {
                                     "margin-left: 6px; cursor: default; font-size: 10px; font-weight: 400; \
                                      text-transform: none; letter-spacing: normal; opacity: 0.6;"
                                 } else {
@@ -2539,9 +2556,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 .unwrap_or_default();
                             let owner_offline = parsed
                                 .map_or(false, |(s_id, _)| store.owner_offline.with(|set| set.contains(&s_id)));
-                            sync_sig
+                            let waits = parsed.map_or(0, |(s_id, _)| store.waiting.with(|m| m.get(&s_id).map_or(0, Vec::len)));
+                            let linked = sync_sig.map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()));
+                            let base = sync_sig
+                                .filter(|_| linked || owner_offline)
                                 .map(|sig| sig.with(|(_, state)| sync_badge_text(state, mode, relay, owner_offline).to_string()))
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            badge_with_waiting(&base, waits)
                         }}
                     }
 
@@ -4866,7 +4887,7 @@ pub fn run(renderer: Renderer) {
 mod tests {
     use super::{
         hosted_store_label, host_to_share, member_role_text, member_status_text, open_share_modal, open_stop_relay_modal,
-        account_showing, cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
+        account_showing, badge_with_waiting, cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
     };
     use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
     use crate::state::{AppStore, ShareFace};
@@ -5177,6 +5198,10 @@ mod tests {
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, none, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault, none, false), "encrypted · syncing");
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, none, false), "encrypted · synced");
+        assert_eq!(badge_with_waiting("encrypted · synced", 1), "encrypted · synced · 1 note waiting");
+        assert_eq!(badge_with_waiting("synced", 3), "synced · 3 notes waiting");
+        assert_eq!(badge_with_waiting("", 2), "2 notes waiting");
+        assert_eq!(badge_with_waiting("synced", 0), "synced");
     }
 
     #[test]

@@ -1223,6 +1223,7 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
         // `offline`, so nobody is told somebody else's computer is off
         // when it is their own connection.
         owner_offline: answer.owner_offline,
+        waiting: answer.waiting,
     }
 }
 

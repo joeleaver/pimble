@@ -138,6 +138,31 @@ pub struct Store {
     /// in older serializations: not relayed.
     #[serde(default, skip_serializing_if = "RelaySide::is_none")]
     pub relay: RelaySide,
+
+    /// The documents of this store its link is holding back, each with the
+    /// sentence that says why (docs/SYNC_LIMITS_CONTRACT.md, "Saying what
+    /// waits"): an update the remote would not take, a blob no key held
+    /// here opens, parts made by a newer Pimble. Every other document keeps
+    /// syncing. Missing in older serializations: nothing waits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<WaitingDoc>,
+}
+
+/// One document a sync link is holding back, and why, in a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingDoc {
+    pub node_id: NodeId,
+    pub reason: String,
+}
+
+/// "1 note waiting", "3 notes waiting": what a store's badge adds while its
+/// link holds documents back. Empty when nothing waits.
+pub fn waiting_phrase(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => "1 note waiting".to_string(),
+        n => format!("{n} notes waiting"),
+    }
 }
 
 impl Store {
@@ -178,6 +203,7 @@ impl Store {
             read_only_roots: Vec::new(),
             ended_roots: Vec::new(),
             relay: RelaySide::None,
+            waiting: Vec::new(),
         }
     }
 
@@ -198,6 +224,7 @@ impl Store {
             read_only_roots: Vec::new(),
             ended_roots: Vec::new(),
             relay: RelaySide::None,
+            waiting: Vec::new(),
         }
     }
 

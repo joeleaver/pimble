@@ -1679,6 +1679,14 @@ impl RpcHandler {
     async fn describe_link(&self, store: &mut pimble_core::Store) {
         store.sync_state = self.sync_state_of(store.id).await;
         (store.sync_mode, store.relay) = self.link_kind_of(store.id).await;
+        store.waiting = self.waiting_of(store.id).await;
+    }
+
+    /// The documents of `store_id` its vault link is holding back, and why
+    /// (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits"). None for a store
+    /// with no vault link.
+    pub(crate) async fn waiting_of(&self, store_id: StoreId) -> Vec<pimble_core::WaitingDoc> {
+        self.vault_links.read().await.get(&store_id).map(|link| link.waiting()).unwrap_or_default()
     }
 
     /// Start a sync link for `store_id` if one isn't already running.
@@ -2893,6 +2901,16 @@ impl PimbleApiServer for RpcHandler {
             .map_err(|e| to_rpc_error(format!("invalid base64url blob: {}", e)))?;
 
         let mut manager = self.store_manager.write().await;
+        let part = request.part.map(|p| pimble_store::PartMeta { index: p.index, count: p.count, group: p.group });
+        if request.part.is_some_and(|p| !p.is_valid()) {
+            return Err(invalid_params("A part's index must be below its count, and the count at least 1 and at most 4096."));
+        }
+        // A part before the last of a new document: nothing of it lands
+        // yet, so the new document's keys and scopes wait for the last.
+        let lands = match part {
+            Some(part) => manager.vault_completes_group(request.store_id, &request.doc_id.as_str(), part).map_err(to_rpc_error)?,
+            None => true,
+        };
 
         // A scoped member reaches its scope's documents, and may add one
         // under a parent it may write: the new id then joins every scope of
@@ -2979,7 +2997,7 @@ impl PimbleApiServer for RpcHandler {
         // a document's keys change only through `vaultSetDocKeys`, which
         // merges. Any other key would put a blob in the log that nobody but
         // its sender can open, and every reader's cursor would stop at it.
-        if let Some(keys) = &request.keys {
+        if let Some(keys) = request.keys.as_ref().filter(|_| lands) {
             let doc = request.doc_id.as_str();
             if !manager.vault_has_blobs(request.store_id, &doc).map_err(to_rpc_error)? {
                 let json = serde_json::to_string(keys).map_err(to_rpc_error)?;
@@ -2998,16 +3016,32 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
-        let seq = manager
-            .vault_append(request.store_id, &request.doc_id.as_str(), blob)
-            .await
-            .map_err(|e| match e {
-                pimble_store::StoreError::VaultSnapshotRequired => snapshot_required_error(format!(
-                    "store {} document {:?}: log is at its size limit; upload a snapshot before appending more",
-                    request.store_id, request.doc_id
-                )),
-                other => to_rpc_error(other),
-            })?;
+        let full = |e: pimble_store::StoreError| match e {
+            pimble_store::StoreError::VaultSnapshotRequired => snapshot_required_error(format!(
+                "store {} document {:?}: log is at its size limit; upload a snapshot before appending more",
+                request.store_id, request.doc_id
+            )),
+            other => to_rpc_error(other),
+        };
+        let doc = request.doc_id.as_str();
+        // Each entry that landed, with the part it is.
+        let landed: Vec<(u64, Option<pimble_store::PartMeta>, Option<Vec<u8>>)> = match part {
+            None => {
+                let seq = manager.vault_append(request.store_id, &doc, blob).await.map_err(full)?;
+                vec![(seq, None, None)]
+            }
+            Some(part) => match manager.vault_append_part(request.store_id, &doc, part, blob).await.map_err(full)? {
+                pimble_store::PartAppended::Held => {
+                    let (log_bytes, snapshot_bytes) = manager.vault_sizes(request.store_id, &doc).map_err(to_rpc_error)?;
+                    return Ok(VaultAppendResponse { seq: 0, first_seq: None, log_bytes: Some(log_bytes), snapshot_bytes: Some(snapshot_bytes) });
+                }
+                pimble_store::PartAppended::Landed(entries) => entries.into_iter().map(|e| (e.seq, e.part, Some(e.blob))).collect(),
+            },
+        };
+        let seq = landed.last().map(|(seq, _, _)| *seq).unwrap_or(0);
+        let first_seq = part.and(landed.first().map(|(seq, _, _)| *seq));
+        let (log_bytes, snapshot_bytes) = manager.vault_sizes(request.store_id, &doc).map_err(to_rpc_error)?;
+        let answer = VaultAppendResponse { seq, first_seq, log_bytes: Some(log_bytes), snapshot_bytes: Some(snapshot_bytes) };
         if let Some((roots, parent_id, node_id)) = joins_scopes {
             manager.vault_extend_scopes(request.store_id, &roots, parent_id, node_id).await.map_err(to_rpc_error)?;
         }
@@ -3023,24 +3057,35 @@ impl PimbleApiServer for RpcHandler {
         // fetches it when a document names it, and a client from before
         // pictures replicated could not read the notification.
         if matches!(request.doc_id, VaultDocId::Blob(_)) {
-            return Ok(VaultAppendResponse { seq });
+            return Ok(answer);
         }
 
         // The blob rides the notification verbatim (still base64url) so a
         // live subscriber never re-fetches; `source_client_id` carries the
         // caller's id (the same way `applyEdit`'s `client_id` propagates),
         // so a client can drop its own echo by identity, not only by seq.
-        let kind = StoreChangeKind::VaultAppended { doc_id: request.doc_id.clone(), seq };
-        let delivery = self.delivery_for(request.store_id, &kind).await;
-        let notification = StoreChangedNotification {
-            store_id: request.store_id,
-            change_kind: kind,
-            source_client_id: request.client_id.clone(),
-            update: Some(request.blob.clone()),
-        };
-        self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
+        // A group's parts are announced one by one, in order, each naming
+        // its part: a reader applies the group once it has them all.
+        for (seq, part, bytes) in landed {
+            let kind = StoreChangeKind::VaultAppended {
+                doc_id: request.doc_id.clone(),
+                seq,
+                part: part.map(|p| pimble_rpc::VaultPart { index: p.index, count: p.count, group: p.group }),
+            };
+            let delivery = self.delivery_for(request.store_id, &kind).await;
+            let notification = StoreChangedNotification {
+                store_id: request.store_id,
+                change_kind: kind,
+                source_client_id: request.client_id.clone(),
+                update: Some(match bytes {
+                    Some(bytes) => URL_SAFE_NO_PAD.encode(bytes),
+                    None => request.blob.clone(),
+                }),
+            };
+            self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
+        }
 
-        Ok(VaultAppendResponse { seq })
+        Ok(answer)
     }
 
     async fn vault_fetch(&self, ext: &Extensions, request: VaultFetchRequest) -> Result<VaultFetchResponse, ErrorObjectOwned> {
@@ -3053,7 +3098,7 @@ impl PimbleApiServer for RpcHandler {
 
         let manager = self.store_manager.read().await;
         self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Read)?;
-        let (snapshot, updates, head) = manager
+        let fetched = manager
             .vault_fetch(request.store_id, &request.doc_id.as_str(), request.after_seq)
             .await
             .map_err(to_rpc_error)?;
@@ -3062,15 +3107,54 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?
             .and_then(|record| serde_json::from_str::<VaultDocKeys>(&record.json).ok());
 
-        Ok(VaultFetchResponse {
-            snapshot: snapshot.map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) }),
-            updates: updates
-                .into_iter()
-                .map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) })
-                .collect(),
-            head,
-            keys,
-        })
+        let as_part = |p: pimble_store::PartMeta| pimble_rpc::VaultPart { index: p.index, count: p.count, group: p.group };
+        // A snapshot in parts: its first part where a whole one goes, so an
+        // older reader meets a blob it cannot decrypt and applies nothing of
+        // it, and the rest beside it.
+        let mut snapshot_entries: Vec<VaultEntry> = fetched
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .parts()
+                    .into_iter()
+                    .map(|(part, blob)| VaultEntry { seq: snapshot.seq, blob: URL_SAFE_NO_PAD.encode(blob), part: part.map(as_part) })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut updates: Vec<VaultEntry> = fetched
+            .updates
+            .into_iter()
+            .map(|entry| VaultEntry { seq: entry.seq, blob: URL_SAFE_NO_PAD.encode(entry.blob), part: entry.part.map(as_part) })
+            .collect();
+        // Paged (docs/SYNC_LIMITS_CONTRACT.md): the answer's entries in order,
+        // the snapshot's first, from `skip`, until `max_bytes` is reached (at
+        // least one), so no answer outgrows a relay's message size.
+        let mut more = false;
+        if request.max_bytes.is_some() || request.skip > 0 {
+            let budget = request.max_bytes.unwrap_or(u64::MAX);
+            let snapshot_count = snapshot_entries.len();
+            let mut all: Vec<VaultEntry> = snapshot_entries.drain(..).chain(updates.drain(..)).collect();
+            let skip = (request.skip as usize).min(all.len());
+            let mut page = all.split_off(skip);
+            let mut taken = 0usize;
+            let mut bytes = 0u64;
+            for entry in &page {
+                if taken > 0 && bytes + entry.blob.len() as u64 > budget {
+                    break;
+                }
+                bytes += entry.blob.len() as u64;
+                taken += 1;
+            }
+            more = taken < page.len();
+            page.truncate(taken);
+            let snapshot_left = snapshot_count.saturating_sub(skip);
+            let rest = page.split_off(snapshot_left.min(page.len()));
+            snapshot_entries = page;
+            updates = rest;
+        }
+        let snapshot = (!snapshot_entries.is_empty()).then(|| snapshot_entries.remove(0));
+        Ok(VaultFetchResponse { snapshot, snapshot_parts: snapshot_entries, updates, head: fetched.head, keys, more })
     }
 
     async fn vault_snapshot(&self, ext: &Extensions, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
@@ -3098,10 +3182,22 @@ impl PimbleApiServer for RpcHandler {
 
         let mut manager = self.store_manager.write().await;
         self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Write)?;
-        manager
-            .vault_snapshot(request.store_id, &request.doc_id.as_str(), request.upto_seq, blob)
-            .await
-            .map_err(to_rpc_error)?;
+        match request.part {
+            None => manager
+                .vault_snapshot(request.store_id, &request.doc_id.as_str(), request.upto_seq, blob)
+                .await
+                .map_err(to_rpc_error)?,
+            Some(part) => {
+                if !part.is_valid() {
+                    return Err(invalid_params("A part's index must be below its count, and the count at least 1 and at most 4096."));
+                }
+                let part = pimble_store::PartMeta { index: part.index, count: part.count, group: part.group };
+                manager
+                    .vault_snapshot_part(request.store_id, &request.doc_id.as_str(), request.upto_seq, part, blob)
+                    .await
+                    .map_err(to_rpc_error)?;
+            }
+        }
 
         Ok(EmptyResponse {})
     }
@@ -3139,6 +3235,9 @@ impl PimbleApiServer for RpcHandler {
                 })
                 .collect(),
             epoch,
+            // This server takes snapshots and appends in parts
+            // (docs/SYNC_LIMITS_CONTRACT.md).
+            parts: true,
         })
     }
 
@@ -3931,6 +4030,7 @@ impl PimbleApiServer for RpcHandler {
             if let Ok(mut store) = manager.get_store_info(id) {
                 store.sync_state = self.sync_state_of(id).await;
                 (store.sync_mode, store.relay) = self.link_kind_of_locked(&manager, id).await;
+                store.waiting = self.waiting_of(id).await;
                 self.mark_replica(&mut store);
                 Self::present_store_to(&principal, &mut store);
                 stores.push(store);
@@ -4899,7 +4999,8 @@ impl PimbleApiServer for RpcHandler {
 
         // `Service` only, and a store just linked or unlinked this way is
         // held whole: `sync.json` says `full` or is gone.
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false })
+        let waiting = self.waiting_of(request.store_id).await;
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false, waiting })
     }
 
     async fn get_store_sync(
@@ -4924,7 +5025,8 @@ impl PimbleApiServer for RpcHandler {
         let (sync_mode, relay) = self.link_kind_of(request.store_id).await;
 
         let owner_offline = self.vault_links.read().await.get(&request.store_id).is_some_and(|link| link.owner_offline());
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline })
+        let waiting = self.waiting_of(request.store_id).await;
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline, waiting })
     }
 
     async fn list_remote_stores(

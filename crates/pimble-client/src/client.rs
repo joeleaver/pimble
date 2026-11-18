@@ -25,7 +25,7 @@ use pimble_rpc::{
     TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest,
     BacklinksRequest, SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
-    VaultAppendRequest, VaultDocId,
+    VaultAppendRequest, VaultAppendResponse, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
     GetBlobRequest, HaveBlobsRequest, PutBlobRequest, BLOB_CHUNK_BYTES,
@@ -1292,7 +1292,7 @@ impl PimbleClient {
     ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys, discussion: false })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys, discussion: false, part: None })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)
@@ -1312,10 +1312,25 @@ impl PimbleClient {
     ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id: Some(host), keys, discussion: true })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id: Some(host), keys, discussion: true, part: None })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)
+    }
+
+    /// `vaultAppend` as a whole request, answered in full: the sequence
+    /// numbers, and the log's and the snapshot's sizes a client compacts by
+    /// (docs/SYNC_LIMITS_CONTRACT.md). What a caller that sends parts uses.
+    pub async fn vault_append_request(&self, request: VaultAppendRequest) -> Result<VaultAppendResponse> {
+        self.client.vault_append(request).await.map_err(rpc_error)
+    }
+
+    /// `vaultSnapshot` as a whole request (one part of a snapshot sent in
+    /// parts, or a whole one). `covers_prefix` is the caller's to set: see
+    /// [`PimbleClient::vault_snapshot`].
+    pub async fn vault_snapshot_request(&self, request: VaultSnapshotRequest) -> Result<()> {
+        self.client.vault_snapshot(request).await.map_err(rpc_error)?;
+        Ok(())
     }
 
     // ── Sharing on node documents, docs/NODE_DOCUMENT_CONTRACT.md section 5 ──
@@ -1393,10 +1408,30 @@ impl PimbleClient {
         doc_id: VaultDocId,
         after_seq: u64,
     ) -> Result<VaultFetchResponse> {
-        self.client
-            .vault_fetch(VaultFetchRequest { store_id, doc_id, after_seq })
+        // A page at a time (docs/SYNC_LIMITS_CONTRACT.md): a document of
+        // several parts never comes as one answer larger than a relay
+        // between here and its server takes. An older server answers all
+        // of it at once and says nothing of `more`.
+        let mut fetched = self
+            .client
+            .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip: 0 })
             .await
-            .map_err(rpc_error)
+            .map_err(rpc_error)?;
+        let mut skip = fetched.entry_count();
+        while fetched.more {
+            let page = self
+                .client
+                .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip })
+                .await
+                .map_err(rpc_error)?;
+            let carried = page.entry_count();
+            fetched.extend(page);
+            if carried == 0 {
+                break;
+            }
+            skip += carried;
+        }
+        Ok(fetched)
     }
 
     /// Store a snapshot covering every update up to and including `upto_seq`.
@@ -1411,7 +1446,7 @@ impl PimbleClient {
         blob: String,
     ) -> Result<()> {
         self.client
-            .vault_snapshot(VaultSnapshotRequest { store_id, doc_id, upto_seq, blob, covers_prefix: true })
+            .vault_snapshot(VaultSnapshotRequest { store_id, doc_id, upto_seq, blob, covers_prefix: true, part: None })
             .await
             .map_err(rpc_error)?;
         Ok(())

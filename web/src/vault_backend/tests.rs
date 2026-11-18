@@ -38,15 +38,16 @@ impl VaultWire for Logs {
         _parent_id: Option<NodeId>,
         _discussion_host: Option<NodeId>,
         _keys: Option<VaultDocKeys>,
-    ) -> Result<u64, ClientError> {
+        _part: Option<pimble_rpc::VaultPart>,
+    ) -> Result<pimble_rpc::VaultAppendResponse, ClientError> {
         self.appends.fetch_add(1, Ordering::SeqCst);
         let mut logs = self.logs.lock().unwrap();
         let head = logs.entry((store_id, doc_id)).or_default();
         *head += 1;
-        Ok(*head)
+        Ok(pimble_rpc::VaultAppendResponse { seq: *head, first_seq: None, log_bytes: None, snapshot_bytes: None })
     }
 
-    async fn snapshot(&self, _store_id: StoreId, _doc_id: VaultDocId, _upto_seq: u64, _blob: String) -> Result<(), ClientError> {
+    async fn snapshot(&self, _store_id: StoreId, _doc_id: VaultDocId, _upto_seq: u64, _blob: String, _part: Option<pimble_rpc::VaultPart>) -> Result<(), ClientError> {
         Ok(())
     }
 
@@ -122,10 +123,23 @@ fn an_encrypted_store_says_what_it_cannot_do() {
     assert!(!caps.mounts && !caps.sync_links && !caps.semantic_search && !caps.index_rebuild);
 }
 
-/// A twin that keeps what is appended, and the keys a document came with.
+/// A twin that keeps what is appended, and the keys a document came with; it
+/// takes parts as a server does (docs/SYNC_LIMITS_CONTRACT.md): an append's
+/// held aside until the last lands them as consecutive entries, a
+/// snapshot's stored only whole, and it answers the log's size.
 #[derive(Default)]
 struct Twin {
-    docs: Mutex<HashMap<(StoreId, VaultDocId), (Vec<pimble_rpc::VaultEntry>, Option<VaultDocKeys>)>>,
+    docs: Mutex<HashMap<(StoreId, VaultDocId), TwinDoc>>,
+}
+
+#[derive(Default, Clone)]
+struct TwinDoc {
+    entries: Vec<pimble_rpc::VaultEntry>,
+    keys: Option<VaultDocKeys>,
+    head: u64,
+    snapshot: Vec<pimble_rpc::VaultEntry>,
+    held: Vec<(pimble_rpc::VaultPart, String)>,
+    held_snapshot: Vec<(pimble_rpc::VaultPart, String)>,
 }
 
 #[async_trait]
@@ -139,25 +153,70 @@ impl VaultWire for Twin {
         _parent_id: Option<NodeId>,
         _discussion_host: Option<NodeId>,
         keys: Option<VaultDocKeys>,
-    ) -> Result<u64, ClientError> {
+        part: Option<pimble_rpc::VaultPart>,
+    ) -> Result<pimble_rpc::VaultAppendResponse, ClientError> {
         let mut docs = self.docs.lock().unwrap();
-        let (entries, held) = docs.entry((store_id, doc_id)).or_default();
-        if held.is_none() {
-            *held = keys;
+        let doc = docs.entry((store_id, doc_id)).or_default();
+        let landing: Vec<(Option<pimble_rpc::VaultPart>, String)> = match part {
+            None => vec![(None, blob)],
+            Some(part) => {
+                if part.index == 0 {
+                    doc.held.clear();
+                }
+                doc.held.push((part, blob));
+                if !part.is_last() {
+                    return Ok(pimble_rpc::VaultAppendResponse { seq: 0, first_seq: None, log_bytes: None, snapshot_bytes: None });
+                }
+                std::mem::take(&mut doc.held).into_iter().map(|(p, b)| (Some(p), b)).collect()
+            }
+        };
+        if doc.keys.is_none() {
+            doc.keys = keys;
         }
-        let seq = entries.len() as u64 + 1;
-        entries.push(pimble_rpc::VaultEntry { seq, blob });
-        Ok(seq)
+        let first = doc.head + 1;
+        for (part, blob) in landing {
+            doc.head += 1;
+            doc.entries.push(pimble_rpc::VaultEntry { seq: doc.head, blob, part });
+        }
+        let log_bytes = doc.entries.iter().map(|e| e.blob.len() as u64).sum();
+        let snapshot_bytes = doc.snapshot.iter().map(|e| e.blob.len() as u64).sum();
+        Ok(pimble_rpc::VaultAppendResponse { seq: doc.head, first_seq: part.map(|_| first), log_bytes: Some(log_bytes), snapshot_bytes: Some(snapshot_bytes) })
     }
 
-    async fn snapshot(&self, _store_id: StoreId, _doc_id: VaultDocId, _upto_seq: u64, _blob: String) -> Result<(), ClientError> {
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String, part: Option<pimble_rpc::VaultPart>) -> Result<(), ClientError> {
+        let mut docs = self.docs.lock().unwrap();
+        let doc = docs.entry((store_id, doc_id)).or_default();
+        let whole: Vec<pimble_rpc::VaultEntry> = match part {
+            None => vec![pimble_rpc::VaultEntry::whole(upto_seq, blob)],
+            Some(part) => {
+                if part.index == 0 {
+                    doc.held_snapshot.clear();
+                }
+                doc.held_snapshot.push((part, blob));
+                if !part.is_last() {
+                    return Ok(());
+                }
+                std::mem::take(&mut doc.held_snapshot).into_iter().map(|(p, b)| pimble_rpc::VaultEntry { seq: upto_seq, blob: b, part: Some(p) }).collect()
+            }
+        };
+        doc.snapshot = whole;
+        doc.entries.retain(|e| e.seq > upto_seq);
         Ok(())
     }
 
     async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
         let docs = self.docs.lock().unwrap();
-        let (entries, keys) = docs.get(&(store_id, doc_id)).cloned().unwrap_or_default();
-        Ok(VaultFetchResponse { snapshot: None, head: entries.len() as u64, updates: entries.into_iter().filter(|e| e.seq > after_seq).collect(), keys })
+        let doc = docs.get(&(store_id, doc_id)).cloned().unwrap_or_default();
+        let mut snapshot = doc.snapshot.into_iter().filter(|e| e.seq > after_seq);
+        let first = snapshot.next();
+        Ok(VaultFetchResponse {
+            snapshot: first,
+            snapshot_parts: snapshot.collect(),
+            head: doc.head,
+            updates: doc.entries.into_iter().filter(|e| e.seq > after_seq).collect(),
+            keys: doc.keys,
+            more: false,
+        })
     }
 }
 
@@ -186,7 +245,7 @@ fn a_picture_goes_out_encrypted_and_comes_back_from_the_twin() {
     assert_eq!(url.store, store);
     {
         let docs = twin.docs.lock().unwrap();
-        let (entries, keys) = &docs[&(store, VaultDocId::Blob(url.blob))];
+        let TwinDoc { entries, keys, .. } = &docs[&(store, VaultDocId::Blob(url.blob))];
         assert_eq!(entries.len(), 2, "in chunks");
         assert!(keys.is_some(), "with its wraps on the first");
         let run = &picture[1000..1064];

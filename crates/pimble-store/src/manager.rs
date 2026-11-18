@@ -226,6 +226,7 @@ impl StoreManager {
                 ended_roots: manifest.ended_roots.clone(),
                 // A placeholder like `sync_mode`: `RpcHandler::link_kind_of`.
                 relay: pimble_core::RelaySide::None,
+                waiting: Vec::new(),
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -247,6 +248,7 @@ impl StoreManager {
                 read_only_roots: Vec::new(),
                 ended_roots: Vec::new(),
                 relay: pimble_core::RelaySide::None,
+                waiting: Vec::new(),
             });
         }
         Err(StoreError::StoreNotFound(store_id))
@@ -302,9 +304,34 @@ impl StoreManager {
         store.append(doc_id, blob).await
     }
 
+    /// Take one part of an append sent in parts (`VaultStore::append_part`).
+    pub async fn vault_append_part(&mut self, store_id: StoreId, doc_id: &str, part: crate::vault::PartMeta, blob: Vec<u8>) -> Result<crate::vault::PartAppended> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.append_part(doc_id, part, blob).await
+    }
+
+    /// Whether `part` would land its group (`VaultStore::completes_group`).
+    pub fn vault_completes_group(&self, store_id: StoreId, doc_id: &str, part: crate::vault::PartMeta) -> Result<bool> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.completes_group(doc_id, part))
+    }
+
+    /// Take one part of a snapshot sent in parts (`VaultStore::snapshot_part`):
+    /// whether the snapshot was stored with it.
+    pub async fn vault_snapshot_part(&mut self, store_id: StoreId, doc_id: &str, upto_seq: u64, part: crate::vault::PartMeta, blob: Vec<u8>) -> Result<bool> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.snapshot_part(doc_id, upto_seq, part, blob).await
+    }
+
+    /// A document's log and snapshot sizes in bytes.
+    pub fn vault_sizes(&self, store_id: StoreId, doc_id: &str) -> Result<(u64, u64)> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.sizes(doc_id))
+    }
+
     /// The snapshot (if newer than `after_seq`), every update after
     /// `max(after_seq, snapshot.seq)`, and the document's head.
-    pub async fn vault_fetch(&self, store_id: StoreId, doc_id: &str, after_seq: u64) -> Result<(Option<(u64, Vec<u8>)>, Vec<(u64, Vec<u8>)>, u64)> {
+    pub async fn vault_fetch(&self, store_id: StoreId, doc_id: &str, after_seq: u64) -> Result<crate::vault::Fetched> {
         let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
         store.fetch(doc_id, after_seq).await
     }

@@ -673,6 +673,11 @@ pub enum BackendEvent {
         ended_roots: Vec<NodeId>,
         relay: pimble_core::RelaySide,
         owner_offline: bool,
+        /// The documents the store's link is holding back, each with the
+        /// sentence that says why (docs/SYNC_LIMITS_CONTRACT.md, "Saying what
+        /// waits"): the row's badge counts them, and the Properties panel of
+        /// a waiting node shows its reason.
+        waiting: Vec<pimble_core::WaitingDoc>,
     },
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).

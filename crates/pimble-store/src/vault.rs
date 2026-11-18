@@ -8,8 +8,8 @@
 //! takes `doc_id` as a `&str`):
 //!
 //! ```text
-//! <store>/vault/{doc_id}/log       # append-only: seq u64 | len u32 | blob
-//! <store>/vault/{doc_id}/snapshot  # seq u64 | blob
+//! <store>/vault/{doc_id}/log       # append-only: seq u64 | len u32 | [part] | blob
+//! <store>/vault/{doc_id}/snapshot  # seq u64 | blob, or seq u64 | "PP" | count u32 | group (16) | (len u32 | blob)*
 //! <store>/vault/{doc_id}/keys.json # the document's wrapped data keys, opaque here
 //! <store>/scopes.json              # the store's published scope sets
 //! ```
@@ -17,6 +17,18 @@
 //! An in-memory index of each log entry's byte offset and length is built at
 //! open (and kept current on every append/snapshot), so fetching a range of
 //! updates reads exactly those bytes rather than rescanning the file.
+//!
+//! **Parts** (docs/SYNC_LIMITS_CONTRACT.md): a snapshot or an append too
+//! large for one blob arrives as parts, each a blob of its own. They are held
+//! aside in memory as they come ([`VaultStore::append_part`],
+//! [`VaultStore::snapshot_part`]) and land only when the last one does: an
+//! append's parts as consecutive log entries, each record carrying its part
+//! (the high bit of `len` says a 24-byte `index u32 | count u32 | group` header
+//! follows), written in one write; a snapshot's as one `snapshot` file that
+//! replaces the old one atomically, so a half-uploaded snapshot never replaces
+//! a whole one. Every limit applies per part. A log whose tail is a group cut
+//! short (a crash mid-write) loses that tail at open, as a truncated record
+//! does: its sender was never answered and sends it again.
 //!
 //! Sharing (docs/NODE_DOCUMENT_CONTRACT.md section 5) adds two things the
 //! server reads but never interprets as data: a document's data keys
@@ -31,6 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use pimble_core::{BlobId, NodeId, StoreId, StoreKind, StoreManifest};
 use serde::{Deserialize, Serialize};
@@ -77,6 +90,40 @@ async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()
     Ok(())
 }
 
+/// Which part of a blob sealed in parts an entry or a snapshot blob is
+/// (`pimble_rpc::VaultPart`, which this crate does not depend on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PartMeta {
+    pub index: u32,
+    pub count: u32,
+    pub group: Uuid,
+}
+
+impl PartMeta {
+    const LEN: usize = 4 + 4 + 16;
+
+    fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.index.to_le_bytes());
+        out[4..8].copy_from_slice(&self.count.to_le_bytes());
+        out[8..24].copy_from_slice(self.group.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let index = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        let count = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+        let group = Uuid::from_slice(bytes.get(8..24)?).ok()?;
+        Some(Self { index, count, group })
+    }
+}
+
+/// A log record's `len` with this bit set is followed by a [`PartMeta`].
+const PART_FLAG: u32 = 1 << 31;
+
+/// How long the parts of a group may sit unfinished before they are let go.
+const PENDING_FOR: Duration = Duration::from_secs(15 * 60);
+
 /// One log entry's location within `log`, without its bytes.
 #[derive(Debug, Clone, Copy)]
 struct LogEntryMeta {
@@ -84,6 +131,136 @@ struct LogEntryMeta {
     /// Byte offset of this entry's header (`seq | len`) within the log file.
     offset: u64,
     len: u32,
+    part: Option<PartMeta>,
+}
+
+impl LogEntryMeta {
+    /// The record's header length: `seq | len`, and the part when it has one.
+    fn header_len(&self) -> u64 {
+        12 + if self.part.is_some() { PartMeta::LEN as u64 } else { 0 }
+    }
+
+    fn record(seq: u64, part: Option<PartMeta>, blob: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(12 + PartMeta::LEN + blob.len());
+        record.extend_from_slice(&seq.to_le_bytes());
+        let len = blob.len() as u32 | if part.is_some() { PART_FLAG } else { 0 };
+        record.extend_from_slice(&len.to_le_bytes());
+        if let Some(part) = part {
+            record.extend_from_slice(&part.encode());
+        }
+        record.extend_from_slice(blob);
+        record
+    }
+}
+
+/// A document's snapshot: one blob, or every part of one group in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSnapshot {
+    pub seq: u64,
+    pub blobs: Vec<Vec<u8>>,
+    /// The group of a snapshot stored in parts; `None` for one blob.
+    pub group: Option<Uuid>,
+}
+
+impl StoredSnapshot {
+    const PARTS_MAGIC: &'static [u8; 2] = b"PP";
+
+    fn bytes(&self) -> u64 {
+        self.blobs.iter().map(|b| b.len() as u64).sum()
+    }
+
+    /// Each blob with the part it is (none for a whole snapshot).
+    pub fn parts(&self) -> Vec<(Option<PartMeta>, &[u8])> {
+        let count = self.blobs.len() as u32;
+        self.blobs
+            .iter()
+            .enumerate()
+            .map(|(index, blob)| (self.group.map(|group| PartMeta { index: index as u32, count, group }), blob.as_slice()))
+            .collect()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.bytes() as usize + 24 + 4 * self.blobs.len());
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        match self.group {
+            None => out.extend_from_slice(&self.blobs[0]),
+            Some(group) => {
+                out.extend_from_slice(Self::PARTS_MAGIC);
+                out.extend_from_slice(&(self.blobs.len() as u32).to_le_bytes());
+                out.extend_from_slice(group.as_bytes());
+                for blob in &self.blobs {
+                    out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                    out.extend_from_slice(blob);
+                }
+            }
+        }
+        out
+    }
+
+    /// A whole snapshot's blob starts `PB` (every `pimble_crypto::Blob`
+    /// does); one in parts starts `PP`.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let seq = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+        let body = &bytes[8..];
+        if body.get(0..2) != Some(Self::PARTS_MAGIC.as_slice()) {
+            return Some(Self { seq, blobs: vec![body.to_vec()], group: None });
+        }
+        let count = u32::from_le_bytes(body.get(2..6)?.try_into().ok()?) as usize;
+        let group = Uuid::from_slice(body.get(6..22)?).ok()?;
+        let mut at = 22;
+        let mut blobs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?) as usize;
+            blobs.push(body.get(at + 4..at + 4 + len)?.to_vec());
+            at += 4 + len;
+        }
+        Some(Self { seq, blobs, group: Some(group) })
+    }
+}
+
+/// One log entry as a fetch hands it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEntry {
+    pub seq: u64,
+    pub blob: Vec<u8>,
+    pub part: Option<PartMeta>,
+}
+
+/// What [`VaultStore::fetch`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Fetched {
+    pub snapshot: Option<StoredSnapshot>,
+    pub updates: Vec<StoredEntry>,
+    pub head: u64,
+}
+
+/// What a part being held aside belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    Append,
+    /// A snapshot through `upto_seq`; `ignored` when it was not newer than
+    /// the snapshot held when its first part came (its parts are taken and
+    /// dropped, as a whole snapshot that is not newer is).
+    Snapshot { upto_seq: u64, ignored: bool },
+}
+
+/// The parts of one group received so far.
+struct Pending {
+    kind: PendingKind,
+    count: u32,
+    blobs: Vec<Vec<u8>>,
+    bytes: u64,
+    touched: Instant,
+}
+
+/// What a part of an append came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartAppended {
+    /// Held aside until the rest of its group comes.
+    Held,
+    /// The group's last part: every part is in the log now, numbered
+    /// consecutively, each with its blob and part.
+    Landed(Vec<StoredEntry>),
 }
 
 /// One document's in-memory state: every log entry currently on disk (in
@@ -91,7 +268,7 @@ struct LogEntryMeta {
 struct VaultDoc {
     dir: PathBuf,
     entries: Vec<LogEntryMeta>,
-    snapshot: Option<(u64, Vec<u8>)>,
+    snapshot: Option<StoredSnapshot>,
     /// The latest sequence number ever handed out (0 = nothing appended
     /// yet). Distinct from "the highest seq still in `entries`": a snapshot
     /// can drop every entry without lowering this.
@@ -173,19 +350,17 @@ impl VaultDoc {
             let snapshot_path = dir.join("snapshot");
             if snapshot_path.exists() {
                 let bytes = fs::read(&snapshot_path).await?;
-                if bytes.len() >= 8 {
-                    let seq = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    Some((seq, bytes[8..].to_vec()))
-                } else {
-                    warn!("Vault snapshot {:?} is too short to contain a seq; ignoring it", snapshot_path);
-                    None
+                let decoded = if bytes.len() >= 8 { StoredSnapshot::decode(&bytes) } else { None };
+                if decoded.is_none() {
+                    warn!("Vault snapshot {:?} is too short or malformed; ignoring it", snapshot_path);
                 }
+                decoded
             } else {
                 None
             }
         };
 
-        let mut head = snapshot.as_ref().map(|(seq, _)| *seq).unwrap_or(0);
+        let mut head = snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(0);
         let mut entries = Vec::new();
         let log_path = dir.join("log");
         if log_path.exists() {
@@ -201,17 +376,43 @@ impl VaultDoc {
                     break;
                 }
                 let seq = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-                let len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap());
-                let body_start = offset + 12;
+                let raw_len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap());
+                let (len, part) = if raw_len & PART_FLAG != 0 {
+                    match bytes.get(offset + 12..offset + 12 + PartMeta::LEN).and_then(PartMeta::decode) {
+                        Some(part) => (raw_len & !PART_FLAG, Some(part)),
+                        None => {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                } else {
+                    (raw_len, None)
+                };
+                let meta = LogEntryMeta { seq, offset: offset as u64, len, part };
+                let body_start = offset + meta.header_len() as usize;
                 let body_end = body_start + len as usize;
                 if body_end > bytes.len() {
                     truncated = true;
                     break;
                 }
-                entries.push(LogEntryMeta { seq, offset: offset as u64, len });
-                head = head.max(seq);
+                entries.push(meta);
                 offset = body_end;
             }
+            // A group whose last parts never reached the disk (a crash in the
+            // middle of its one write) is cut off with the record that was:
+            // nobody could ever apply it, and every reader's cursor would
+            // stop in front of it for good. Its sender had no answer and
+            // sends it again.
+            if let Some(last) = entries.last().and_then(|e| e.part) {
+                let run = entries.iter().rev().take_while(|e| e.part.is_some_and(|p| p.group == last.group)).count();
+                if run != last.count as usize {
+                    let cut = entries.len() - run;
+                    offset = entries[cut].offset as usize;
+                    entries.truncate(cut);
+                    truncated = true;
+                }
+            }
+            head = entries.iter().map(|e| e.seq).fold(head, u64::max);
             if truncated {
                 warn!(
                     "Vault log {:?} has a truncated trailing record ({} of {} bytes read); dropping it",
@@ -241,7 +442,7 @@ impl VaultDoc {
     /// The bytes of one already-recorded log entry, read fresh from disk.
     async fn read_entry(&self, entry: &LogEntryMeta) -> Result<Vec<u8>> {
         let mut file = fs::File::open(self.dir.join("log")).await?;
-        file.seek(std::io::SeekFrom::Start(entry.offset + 12)).await?;
+        file.seek(std::io::SeekFrom::Start(entry.offset + entry.header_len())).await?;
         let mut buf = vec![0u8; entry.len as usize];
         file.read_exact(&mut buf).await?;
         Ok(buf)
@@ -249,7 +450,11 @@ impl VaultDoc {
 
     /// Every log entry's total on-disk size (header plus blob).
     fn log_size(&self) -> u64 {
-        self.entries.iter().map(|e| 12 + e.len as u64).sum()
+        self.entries.iter().map(|e| e.header_len() + e.len as u64).sum()
+    }
+
+    fn snapshot_size(&self) -> u64 {
+        self.snapshot.as_ref().map(StoredSnapshot::bytes).unwrap_or(0)
     }
 }
 
@@ -264,6 +469,11 @@ pub struct VaultStore {
     /// The published scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5),
     /// `scopes.json`, loaded at open and rewritten on every change.
     scopes: ScopesFile,
+    /// The parts of groups still arriving, by document and group (see the
+    /// module doc, "Parts"). In memory only: a server that restarts in the
+    /// middle of one answers its next part with an error, and the sender
+    /// starts the group again.
+    pending: HashMap<(String, Uuid), Pending>,
 }
 
 impl VaultStore {
@@ -299,7 +509,7 @@ impl VaultStore {
         fs::write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
 
         info!("Created vault store '{}' ({}) at {:?}", name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, manifest, docs: HashMap::new(), scopes: ScopesFile::default() })
+        Ok(Self { id: manifest.id, path, manifest, docs: HashMap::new(), scopes: ScopesFile::default(), pending: HashMap::new() })
     }
 
     /// Open an existing vault store, loading every document under
@@ -346,7 +556,7 @@ impl VaultStore {
         };
 
         info!("Opened vault store '{}' ({}) from {:?}", manifest.name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, manifest, docs, scopes })
+        Ok(Self { id: manifest.id, path, manifest, docs, scopes, pending: HashMap::new() })
     }
 
     pub fn manifest(&self) -> &StoreManifest {
@@ -533,56 +743,160 @@ impl VaultStore {
     /// would push the log past [`MAX_LOG_BYTES`] (`VaultSnapshotRequired`:
     /// the caller must upload a snapshot first).
     pub async fn append(&mut self, doc_id: &str, blob: Vec<u8>) -> Result<u64> {
-        if blob.len() > blob_limit() {
+        let landed = self.append_records(doc_id, vec![(None, blob)]).await?;
+        Ok(landed[0].seq)
+    }
+
+    /// Append records in one write, numbered consecutively from the head.
+    /// Every limit applies per record; the log limit to them all together.
+    async fn append_records(&mut self, doc_id: &str, blobs: Vec<(Option<PartMeta>, Vec<u8>)>) -> Result<Vec<StoredEntry>> {
+        if let Some((_, blob)) = blobs.iter().find(|(_, blob)| blob.len() > blob_limit()) {
             return Err(StoreError::VaultBlobTooLarge { size: blob.len() });
         }
 
         let dir = self.doc_dir(doc_id);
         let doc = self.docs.entry(doc_id.to_string()).or_insert_with(|| VaultDoc::empty(dir));
 
-        let entry_size = 12u64 + blob.len() as u64;
-        if doc.log_size() + entry_size > log_limit() {
+        let size: u64 = blobs.iter().map(|(part, blob)| 12 + if part.is_some() { PartMeta::LEN as u64 } else { 0 } + blob.len() as u64).sum();
+        if doc.log_size() + size > log_limit() {
             return Err(StoreError::VaultSnapshotRequired);
         }
 
         fs::create_dir_all(&doc.dir).await?;
         let log_path = doc.dir.join("log");
-        let offset = fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(0);
+        let mut offset = fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(0);
 
-        let seq = doc.head + 1;
-        let mut record = Vec::with_capacity(entry_size as usize);
-        record.extend_from_slice(&seq.to_le_bytes());
-        record.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        record.extend_from_slice(&blob);
+        let mut records = Vec::with_capacity(size as usize);
+        let mut metas = Vec::with_capacity(blobs.len());
+        let mut landed = Vec::with_capacity(blobs.len());
+        let mut seq = doc.head;
+        for (part, blob) in blobs {
+            seq += 1;
+            let record = LogEntryMeta::record(seq, part, &blob);
+            metas.push(LogEntryMeta { seq, offset, len: blob.len() as u32, part });
+            offset += record.len() as u64;
+            records.extend_from_slice(&record);
+            landed.push(StoredEntry { seq, blob, part });
+        }
 
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&log_path).await?;
-        file.write_all(&record).await?;
+        file.write_all(&records).await?;
         file.flush().await?;
 
-        doc.entries.push(LogEntryMeta { seq, offset, len: blob.len() as u32 });
+        doc.entries.extend(metas);
         doc.head = seq;
-        Ok(seq)
+        Ok(landed)
+    }
+
+    /// Let go of groups nobody has sent a part of for [`PENDING_FOR`].
+    fn prune_pending(&mut self) {
+        self.pending.retain(|_, pending| pending.touched.elapsed() < PENDING_FOR);
+    }
+
+    /// Take one part of a group, in order: part 0 starts (or starts over) the
+    /// group, and every later part must be the next one, of the same count
+    /// and kind. Answers the group's blobs once its last part is in, taking
+    /// the group out of `pending`.
+    fn take_part(&mut self, doc_id: &str, part: PartMeta, kind: PendingKind, blob: Vec<u8>) -> Result<Option<(PendingKind, Vec<Vec<u8>>)>> {
+        self.prune_pending();
+        if part.count == 0 || part.index >= part.count {
+            return Err(StoreError::InvalidOperation(format!("part {} of {} makes no sense", part.index, part.count)));
+        }
+        if blob.len() > blob_limit() {
+            return Err(StoreError::VaultBlobTooLarge { size: blob.len() });
+        }
+        let key = (doc_id.to_string(), part.group);
+        if part.index == 0 {
+            self.pending.insert(key.clone(), Pending { kind, count: part.count, blobs: Vec::new(), bytes: 0, touched: Instant::now() });
+        }
+        let Some(pending) = self.pending.get_mut(&key) else {
+            return Err(StoreError::InvalidOperation(format!(
+                "part {} of {} of a group this server does not hold (the first part never came, or the server restarted): send the group again from its first part",
+                part.index, part.count
+            )));
+        };
+        let same_kind = match (pending.kind, kind) {
+            (PendingKind::Append, PendingKind::Append) => true,
+            (PendingKind::Snapshot { upto_seq: a, .. }, PendingKind::Snapshot { upto_seq: b, .. }) => a == b,
+            _ => false,
+        };
+        if !same_kind || pending.count != part.count || pending.blobs.len() != part.index as usize {
+            self.pending.remove(&key);
+            return Err(StoreError::InvalidOperation(format!(
+                "part {} of {} arrived out of order: send the group again from its first part",
+                part.index, part.count
+            )));
+        }
+        pending.touched = Instant::now();
+        let ignored = matches!(pending.kind, PendingKind::Snapshot { ignored: true, .. });
+        pending.bytes += blob.len() as u64;
+        // A snapshot that will not be stored keeps nothing of what it sends.
+        pending.blobs.push(if ignored { Vec::new() } else { blob });
+        if (pending.blobs.len() as u32) < pending.count {
+            return Ok(None);
+        }
+        let pending = self.pending.remove(&key).expect("held above");
+        Ok(Some((pending.kind, pending.blobs)))
+    }
+
+    /// Take one part of an append sent in parts (see the module doc,
+    /// "Parts"). The log limit is judged with the parts held so far, so a
+    /// group that would not fit is refused at the part that would overflow
+    /// it (`VaultSnapshotRequired`), and the group is let go.
+    pub async fn append_part(&mut self, doc_id: &str, part: PartMeta, blob: Vec<u8>) -> Result<PartAppended> {
+        let held: u64 = self.pending.get(&(doc_id.to_string(), part.group)).filter(|_| part.index > 0).map(|p| p.bytes + p.blobs.len() as u64 * (12 + PartMeta::LEN as u64)).unwrap_or(0);
+        let log = self.docs.get(doc_id).map(VaultDoc::log_size).unwrap_or(0);
+        if log + held + 12 + PartMeta::LEN as u64 + blob.len() as u64 > log_limit() {
+            self.pending.remove(&(doc_id.to_string(), part.group));
+            return Err(StoreError::VaultSnapshotRequired);
+        }
+        let Some((_, blobs)) = self.take_part(doc_id, part, PendingKind::Append, blob)? else {
+            return Ok(PartAppended::Held);
+        };
+        let count = blobs.len() as u32;
+        let records = blobs.into_iter().enumerate().map(|(index, blob)| (Some(PartMeta { index: index as u32, count, group: part.group }), blob)).collect();
+        Ok(PartAppended::Landed(self.append_records(doc_id, records).await?))
+    }
+
+    /// Whether `part` would be the last of its group, every earlier part
+    /// held: what the server checks before it stores the keys a new
+    /// document's first append carries, which must land with its blobs.
+    pub fn completes_group(&self, doc_id: &str, part: PartMeta) -> bool {
+        part.index + 1 == part.count
+            && (part.index == 0 || self.pending.get(&(doc_id.to_string(), part.group)).is_some_and(|p| p.count == part.count && p.blobs.len() as u32 == part.index))
+    }
+
+    /// The document's log and snapshot sizes, in bytes (what a client
+    /// compacts by, docs/SYNC_LIMITS_CONTRACT.md "Compaction by size").
+    pub fn sizes(&self, doc_id: &str) -> (u64, u64) {
+        self.docs.get(doc_id).map(|doc| (doc.log_size(), doc.snapshot_size())).unwrap_or((0, 0))
     }
 
     /// The snapshot (if its seq is greater than `after_seq`), every update
     /// after `max(after_seq, snapshot.seq)` in ascending order, and the
-    /// document's head (0 if it doesn't exist or is empty).
-    pub async fn fetch(&self, doc_id: &str, after_seq: u64) -> Result<(Option<(u64, Vec<u8>)>, Vec<(u64, Vec<u8>)>, u64)> {
+    /// document's head (0 if it doesn't exist or is empty). A range that
+    /// would start inside a group starts at its first part: a group is
+    /// applied whole or not at all.
+    pub async fn fetch(&self, doc_id: &str, after_seq: u64) -> Result<Fetched> {
         let Some(doc) = self.docs.get(doc_id) else {
-            return Ok((None, Vec::new(), 0));
+            return Ok(Fetched::default());
         };
 
-        let snapshot = doc.snapshot.clone().filter(|(seq, _)| *seq > after_seq);
-        let baseline = snapshot.as_ref().map(|(seq, _)| *seq).unwrap_or(after_seq).max(after_seq);
+        let snapshot = doc.snapshot.clone().filter(|snapshot| snapshot.seq > after_seq);
+        let baseline = snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(after_seq).max(after_seq);
 
-        let mut updates = Vec::new();
-        for entry in &doc.entries {
-            if entry.seq > baseline {
-                updates.push((entry.seq, doc.read_entry(entry).await?));
+        let mut start = doc.entries.iter().position(|e| e.seq > baseline).unwrap_or(doc.entries.len());
+        if let Some(part) = doc.entries.get(start).and_then(|e| e.part) {
+            while start > 0 && doc.entries[start - 1].part.is_some_and(|p| p.group == part.group) {
+                start -= 1;
             }
         }
+        let mut updates = Vec::new();
+        for entry in &doc.entries[start..] {
+            updates.push(StoredEntry { seq: entry.seq, blob: doc.read_entry(entry).await?, part: entry.part });
+        }
 
-        Ok((snapshot, updates, doc.head))
+        Ok(Fetched { snapshot, updates, head: doc.head })
     }
 
     /// Store a snapshot covering every update up to and including
@@ -593,7 +907,35 @@ impl VaultStore {
         if blob.len() > blob_limit() {
             return Err(StoreError::VaultBlobTooLarge { size: blob.len() });
         }
+        self.store_snapshot(doc_id, StoredSnapshot { seq: upto_seq, blobs: vec![blob], group: None }).await
+    }
 
+    /// Take one part of a snapshot sent in parts. The snapshot held is
+    /// replaced only when the last part arrives (answering `true`), so a
+    /// half-uploaded one never replaces a whole one. Its first part is
+    /// judged as a whole snapshot is: beyond the head is refused, not newer
+    /// than the one held is taken and dropped.
+    pub async fn snapshot_part(&mut self, doc_id: &str, upto_seq: u64, part: PartMeta, blob: Vec<u8>) -> Result<bool> {
+        let mut ignored = false;
+        if part.index == 0 {
+            let head = self.docs.get(doc_id).map(|doc| doc.head).unwrap_or(0);
+            if upto_seq > head {
+                return Err(StoreError::InvalidOperation(format!("upto_seq {} is beyond document {}'s head {}", upto_seq, doc_id, head)));
+            }
+            ignored = self.docs.get(doc_id).and_then(|doc| doc.snapshot.as_ref()).is_some_and(|held| held.seq >= upto_seq);
+        }
+        let Some((kind, blobs)) = self.take_part(doc_id, part, PendingKind::Snapshot { upto_seq, ignored }, blob)? else {
+            return Ok(false);
+        };
+        if matches!(kind, PendingKind::Snapshot { ignored: true, .. }) {
+            return Ok(false);
+        }
+        self.store_snapshot(doc_id, StoredSnapshot { seq: upto_seq, blobs, group: Some(part.group) }).await?;
+        Ok(true)
+    }
+
+    async fn store_snapshot(&mut self, doc_id: &str, snapshot: StoredSnapshot) -> Result<()> {
+        let upto_seq = snapshot.seq;
         let dir = self.doc_dir(doc_id);
         let doc = self.docs.entry(doc_id.to_string()).or_insert_with(|| VaultDoc::empty(dir));
 
@@ -607,18 +949,15 @@ impl VaultStore {
         // would put a snapshot covering less in front of a log that no longer
         // has the difference. Not an error: two devices racing to snapshot is
         // ordinary, and the slower one has nothing to do.
-        if let Some((held, _)) = &doc.snapshot {
-            if *held >= upto_seq {
+        if let Some(held) = &doc.snapshot {
+            if held.seq >= upto_seq {
                 return Ok(());
             }
         }
 
         fs::create_dir_all(&doc.dir).await?;
-        let mut snapshot_bytes = Vec::with_capacity(8 + blob.len());
-        snapshot_bytes.extend_from_slice(&upto_seq.to_le_bytes());
-        snapshot_bytes.extend_from_slice(&blob);
-        atomic_write(&doc.dir.join("snapshot"), &snapshot_bytes).await?;
-        doc.snapshot = Some((upto_seq, blob));
+        atomic_write(&doc.dir.join("snapshot"), snapshot.encode()).await?;
+        doc.snapshot = Some(snapshot);
 
         // Drop every entry at or below the new snapshot, rewriting the log
         // atomically with only what's left (reading each kept entry's bytes
@@ -630,10 +969,8 @@ impl VaultStore {
             for entry in &keep {
                 let bytes = doc.read_entry(entry).await?;
                 let offset = new_log.len() as u64;
-                new_log.extend_from_slice(&entry.seq.to_le_bytes());
-                new_log.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                new_log.extend_from_slice(&bytes);
-                new_entries.push(LogEntryMeta { seq: entry.seq, offset, len: bytes.len() as u32 });
+                new_log.extend_from_slice(&LogEntryMeta::record(entry.seq, entry.part, &bytes));
+                new_entries.push(LogEntryMeta { seq: entry.seq, offset, len: bytes.len() as u32, part: entry.part });
             }
             atomic_write(&doc.dir.join("log"), &new_log).await?;
             doc.entries = new_entries;
@@ -650,7 +987,7 @@ impl VaultStore {
             .map(|(doc_id, doc)| VaultDocSummary {
                 doc_id: doc_id.clone(),
                 head: doc.head,
-                snapshot_seq: doc.snapshot.as_ref().map(|(seq, _)| *seq).unwrap_or(0),
+                snapshot_seq: doc.snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(0),
                 dek_id: doc.keys.as_ref().map(|k| k.dek_id),
             })
             .collect()
@@ -681,6 +1018,156 @@ pub struct VaultDocSummary {
 mod tests {
     use super::*;
 
+    /// A fetch of whole blobs only, as tuples.
+    fn flat(fetched: Fetched) -> (Option<(u64, Vec<u8>)>, Vec<(u64, Vec<u8>)>, u64) {
+        (
+            fetched.snapshot.map(|s| (s.seq, s.blobs.concat())),
+            fetched.updates.into_iter().map(|e| (e.seq, e.blob)).collect(),
+            fetched.head,
+        )
+    }
+
+    fn part(index: u32, count: u32, group: Uuid) -> PartMeta {
+        PartMeta { index, count, group }
+    }
+
+    /// An append in parts lands only with its last part, as consecutive
+    /// entries marked as one group, survives a reopen, and a fetch that
+    /// would start inside it starts at its first part.
+    #[tokio::test]
+    async fn an_append_in_parts_lands_whole_with_its_last_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pimble");
+        let group = Uuid::new_v4();
+        {
+            let mut store = VaultStore::create(&path, "V", None).await.unwrap();
+            store.append("doc", b"before".to_vec()).await.unwrap();
+            assert_eq!(store.append_part("doc", part(0, 3, group), b"p0".to_vec()).await.unwrap(), PartAppended::Held);
+            assert!(!store.completes_group("doc", part(2, 3, group)), "part 1 has not come");
+            assert_eq!(store.append_part("doc", part(1, 3, group), b"p1".to_vec()).await.unwrap(), PartAppended::Held);
+            // Another client's append lands between the parts: the group still
+            // goes in consecutively.
+            assert_eq!(store.append("doc", b"between".to_vec()).await.unwrap(), 2);
+            assert_eq!(flat(store.fetch("doc", 0).await.unwrap()).2, 2, "nothing of the group is in the log yet");
+            assert!(store.completes_group("doc", part(2, 3, group)));
+            let PartAppended::Landed(landed) = store.append_part("doc", part(2, 3, group), b"p2".to_vec()).await.unwrap() else { panic!("the last part lands the group") };
+            assert_eq!(landed.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        }
+        let store = VaultStore::open(&path).await.unwrap();
+        let fetched = store.fetch("doc", 0).await.unwrap();
+        assert_eq!(fetched.head, 5);
+        let parts: Vec<_> = fetched.updates.iter().filter_map(|e| e.part).collect();
+        assert_eq!(parts, vec![part(0, 3, group), part(1, 3, group), part(2, 3, group)]);
+        assert_eq!(fetched.updates[2].blob, b"p0");
+        // Asked from inside the group: from its first part.
+        let fetched = store.fetch("doc", 4).await.unwrap();
+        assert_eq!(fetched.updates.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        let (log, snapshot) = store.sizes("doc");
+        assert!(log > 0 && snapshot == 0);
+    }
+
+    /// Parts out of order, or of a group never started, are refused; a part
+    /// 0 starts a group over.
+    #[tokio::test]
+    async fn parts_out_of_order_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VaultStore::create(dir.path().join("v.pimble"), "V", None).await.unwrap();
+        let group = Uuid::new_v4();
+        assert!(matches!(store.append_part("doc", part(1, 2, group), b"x".to_vec()).await, Err(StoreError::InvalidOperation(_))));
+        store.append_part("doc", part(0, 3, group), b"a".to_vec()).await.unwrap();
+        assert!(matches!(store.append_part("doc", part(2, 3, group), b"c".to_vec()).await, Err(StoreError::InvalidOperation(_))));
+        // Started over.
+        store.append_part("doc", part(0, 2, group), b"a".to_vec()).await.unwrap();
+        assert!(matches!(store.append_part("doc", part(1, 2, group), b"b".to_vec()).await.unwrap(), PartAppended::Landed(_)));
+    }
+
+    /// A snapshot in parts replaces the held one only when its last part
+    /// arrives: one cut short leaves the whole one standing.
+    #[tokio::test]
+    async fn a_half_uploaded_snapshot_never_replaces_a_whole_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pimble");
+        let mut store = VaultStore::create(&path, "V", None).await.unwrap();
+        for i in 0..6u8 {
+            store.append("doc", vec![i]).await.unwrap();
+        }
+        store.snapshot("doc", 2, b"whole".to_vec()).await.unwrap();
+        let group = Uuid::new_v4();
+        assert!(!store.snapshot_part("doc", 5, part(0, 2, group), b"half".to_vec()).await.unwrap());
+        let fetched = store.fetch("doc", 0).await.unwrap();
+        assert_eq!(fetched.snapshot.as_ref().map(|s| s.seq), Some(2), "the whole one stands");
+        assert_eq!(fetched.updates.len(), 4);
+        // Beyond the head is refused at the first part.
+        assert!(store.snapshot_part("doc", 9, part(0, 2, Uuid::new_v4()), b"x".to_vec()).await.is_err());
+        // Finished: replaces it, drops the log it covers, survives a reopen.
+        assert!(store.snapshot_part("doc", 5, part(1, 2, group), b"-and-half".to_vec()).await.unwrap());
+        drop(store);
+        let store = VaultStore::open(&path).await.unwrap();
+        let fetched = store.fetch("doc", 0).await.unwrap();
+        let snapshot = fetched.snapshot.unwrap();
+        assert_eq!((snapshot.seq, snapshot.group), (5, Some(group)));
+        assert_eq!(snapshot.blobs, vec![b"half".to_vec(), b"-and-half".to_vec()]);
+        assert_eq!(fetched.updates.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![6]);
+        assert_eq!(store.sizes("doc").1, 13);
+        // A snapshot in parts not newer than the held one is taken and dropped.
+        let mut store = store;
+        let older = Uuid::new_v4();
+        assert!(!store.snapshot_part("doc", 4, part(0, 2, older), b"o".to_vec()).await.unwrap());
+        assert!(!store.snapshot_part("doc", 4, part(1, 2, older), b"o".to_vec()).await.unwrap());
+        assert_eq!(store.fetch("doc", 0).await.unwrap().snapshot.unwrap().seq, 5);
+    }
+
+    /// A log whose tail is a group cut short loses that tail at open.
+    #[tokio::test]
+    async fn a_group_cut_short_by_a_crash_is_dropped_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pimble");
+        let group = Uuid::new_v4();
+        {
+            let mut store = VaultStore::create(&path, "V", None).await.unwrap();
+            store.append("doc", b"one".to_vec()).await.unwrap();
+        }
+        let log_path = path.join("vault").join("doc").join("log");
+        let mut bytes = std::fs::read(&log_path).unwrap();
+        bytes.extend_from_slice(&LogEntryMeta::record(2, Some(part(0, 2, group)), b"first half"));
+        std::fs::write(&log_path, &bytes).unwrap();
+        let mut store = VaultStore::open(&path).await.unwrap();
+        assert_eq!(flat(store.fetch("doc", 0).await.unwrap()), (None, vec![(1, b"one".to_vec())], 1));
+        assert_eq!(store.append("doc", b"two".to_vec()).await.unwrap(), 2, "the number is handed out again");
+    }
+
+    /// Every limit applies per part: a group larger than one blob's limit
+    /// goes through in parts under it; the log limit stops a group at the
+    /// part that would overflow it.
+    #[tokio::test]
+    async fn limits_apply_per_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VaultStore::create(dir.path().join("v.pimble"), "V", None).await.unwrap();
+        // The limits are process-wide: these are the ones
+        // `append_refuses_an_oversized_blob` sets, which every test here
+        // satisfies.
+        set_limits_for_tests(4 * 1024 * 1024, 64 * 1024 * 1024);
+        let mib = 1024 * 1024;
+        let group = Uuid::new_v4();
+        store.append_part("doc", part(0, 2, group), vec![1u8; 3 * mib]).await.unwrap();
+        let landed = store.append_part("doc", part(1, 2, group), vec![2u8; 3 * mib]).await.unwrap();
+        assert!(matches!(landed, PartAppended::Landed(entries) if entries.len() == 2), "6 MiB in parts under a 4 MiB blob limit");
+        assert!(matches!(store.append_part("doc", part(0, 2, Uuid::new_v4()), vec![0u8; 5 * mib]).await, Err(StoreError::VaultBlobTooLarge { .. })), "but no part over it");
+        let big = Uuid::new_v4();
+        let mut refused = None;
+        for index in 0..30u32 {
+            if let Err(e) = store.append_part("doc", part(index, 30, big), vec![3u8; 3 * mib]).await {
+                refused = Some((index, e));
+                break;
+            }
+        }
+        let (index, e) = refused.expect("a 90 MiB group does not fit a 64 MiB log");
+        assert!(matches!(e, StoreError::VaultSnapshotRequired));
+        assert!(index > 10 && index < 30, "refused at the part that overflows, not before ({index})");
+        assert!(!store.completes_group("doc", part(29, 30, big)), "and the group is let go");
+        assert_eq!(store.fetch("doc", 0).await.unwrap().updates.len(), 2);
+    }
+
     #[tokio::test]
     async fn append_and_fetch_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -690,12 +1177,12 @@ mod tests {
         let seq2 = store.append("tree", b"two".to_vec()).await.unwrap();
         assert_eq!((seq1, seq2), (1, 2));
 
-        let (snapshot, updates, head) = store.fetch("tree", 0).await.unwrap();
+        let (snapshot, updates, head) = flat(store.fetch("tree", 0).await.unwrap());
         assert!(snapshot.is_none());
         assert_eq!(updates, vec![(1, b"one".to_vec()), (2, b"two".to_vec())]);
         assert_eq!(head, 2);
 
-        let (_, updates, _) = store.fetch("tree", 1).await.unwrap();
+        let (_, updates, _) = flat(store.fetch("tree", 1).await.unwrap());
         assert_eq!(updates, vec![(2, b"two".to_vec())]);
     }
 
@@ -712,7 +1199,7 @@ mod tests {
             store.append("tree", b"three".to_vec()).await.unwrap();
             store.snapshot("tree", 2, b"snap-of-one-two".to_vec()).await.unwrap();
 
-            let (snapshot, updates, head) = store.fetch("tree", 0).await.unwrap();
+            let (snapshot, updates, head) = flat(store.fetch("tree", 0).await.unwrap());
             assert_eq!(snapshot, Some((2, b"snap-of-one-two".to_vec())));
             assert_eq!(updates, vec![(3, b"three".to_vec())]);
             assert_eq!(head, 3);
@@ -720,7 +1207,7 @@ mod tests {
 
         let store = VaultStore::open(&path).await.unwrap();
         assert_eq!(store.id, store_id);
-        let (snapshot, updates, head) = store.fetch("tree", 0).await.unwrap();
+        let (snapshot, updates, head) = flat(store.fetch("tree", 0).await.unwrap());
         assert_eq!(snapshot, Some((2, b"snap-of-one-two".to_vec())));
         assert_eq!(updates, vec![(3, b"three".to_vec())]);
         assert_eq!(head, 3);
@@ -738,7 +1225,7 @@ mod tests {
         store.snapshot("doc", 2, b"older".to_vec()).await.unwrap();
         store.snapshot("doc", 4, b"same seq, other device".to_vec()).await.unwrap();
 
-        let (snapshot, updates, head) = store.fetch("doc", 0).await.unwrap();
+        let (snapshot, updates, head) = flat(store.fetch("doc", 0).await.unwrap());
         assert_eq!(snapshot, Some((4, b"newer".to_vec())));
         assert_eq!(updates.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![5, 6]);
         assert_eq!(head, 6);
@@ -783,7 +1270,7 @@ mod tests {
         std::fs::write(&log_path, &bytes).unwrap();
 
         let store = VaultStore::open(&path).await.unwrap();
-        let (_, updates, head) = store.fetch("tree", 0).await.unwrap();
+        let (_, updates, head) = flat(store.fetch("tree", 0).await.unwrap());
         assert_eq!(updates, vec![(1, b"one".to_vec())], "the truncated record must be dropped, not the good one before it");
         assert_eq!(head, 1);
 
@@ -898,7 +1385,7 @@ mod tests {
             store.set_doc_keys("doc", json.clone()).await.unwrap();
             assert!(store.has_doc("doc"));
             assert_eq!(store.doc_keys("doc").unwrap().json, json);
-            let (_, _, head) = store.fetch("doc", 0).await.unwrap();
+            let (_, _, head) = flat(store.fetch("doc", 0).await.unwrap());
             assert_eq!(head, 0, "keys are not a log entry");
         }
         let store = VaultStore::open(&path).await.unwrap();

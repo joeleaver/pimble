@@ -247,6 +247,14 @@ impl Pimble {
     /// What get_node says of a node before its content: title, link, path,
     /// type, tags, fields, children, discussions, modified, access, and what
     /// kind of node it is when that matters.
+    /// Why a node waits to sync, when its store's link holds it back: asked
+    /// of the stores as they are now, not as last listed.
+    async fn waiting_reason(&self, addr: Addr) -> Option<String> {
+        let stores = self.api.stores().await.ok()?;
+        let store = stores.into_iter().find(|s| s.id == addr.store)?;
+        store.waiting.into_iter().find(|w| w.node_id == addr.node).map(|w| w.reason)
+    }
+
     async fn node_header(&self, addr: Addr, node: &Node) -> String {
         let mut out = format!(
             "title: {}\nlink: {}\npath: {}\ntype: {}\n",
@@ -267,6 +275,10 @@ impl Pimble {
             out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
         }
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
+        // Held back by its store's link, and why (docs/SYNC_LIMITS_CONTRACT.md).
+        if let Some(reason) = self.waiting_reason(addr).await {
+            out.push_str(&format!("sync: waiting. {reason} (Edits here are kept on this computer and go out once it syncs.)\n"));
+        }
         match node.access {
             StoreAccess::Read => out.push_str("access: read-only\n"),
             StoreAccess::Comment => out.push_str("access: comment-only (start_discussion and reply work here)\n"),
@@ -671,6 +683,15 @@ impl Pimble {
                 store.id,
                 PimbleUrl { store: store.id, node: store.root_node_id, anchor: None }
             ));
+            // What the link is holding back, and why (docs/SYNC_LIMITS_CONTRACT.md):
+            // every other note of the store keeps syncing.
+            if !store.waiting.is_empty() {
+                out.push_str(&format!("  {} (the rest keeps syncing):\n", pimble_core::waiting_phrase(store.waiting.len())));
+                for waiting in &store.waiting {
+                    let link = PimbleUrl { store: store.id, node: waiting.node_id, anchor: None };
+                    out.push_str(&format!("  - {link}: {}\n", waiting.reason));
+                }
+            }
         }
         Ok(out)
     }
