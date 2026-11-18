@@ -334,7 +334,7 @@ what it touched and that selected (`Presence::say_on_board`).
 | `add_elements` | any kind (sticky, text, rect, ellipse, diamond, polygon, star, path, frame, line, arrow, connector, pen, highlighter, step, callout, card, picture, spotlight, group) with text, style, rotation, layer, frame or group membership and lock; `ref` names an element within the call, so connectors, parents and a group's `members` can point at elements made in the same call; connectors are added after the rest whatever their place in the list; picture `file`s are stored as blobs first (`pimble_image::fit`, as the app) |
 | `update_elements` | per element, only what is given: geometry merged into what it has, points, a path's `d` and `rule`, text (smallest edit), style keys set or cleared, `move_by` and `rotation` (its transform, so a frame's members move with it), layer, parent, stacking order, lock |
 | `delete_elements` | by id |
-| `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order, `blend`, `parent` (the group it is in; `""` in an update moves it to the top level); `add_layer` takes `kind` (`vector`, the default, `paint` or `group`); delete with its elements (a group with everything in it) or `merge_down` (a group: Merge Group) |
+| `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order, `blend`, `parent` (the group it is in; `""` in an update moves it to the top level), `clip` (an element id; null or `""` in an update releases it); `add_layer` takes `kind` (`vector`, the default, `paint` or `group`); delete with its elements (a group with everything in it) or `merge_down` (a group: Merge Group) |
 | `set_canvas` | a page (or one fitted to what shows, or none) and the markup switch |
 
 Added the same day, from sketching a floor plan and a game level with contour lines
@@ -356,6 +356,20 @@ into a group (on top unless `order` says where); a group is never moved into its
 group it holds. Merging down onto a paint layer, and merging a group that holds a paint
 layer, draw what merges as pixels (wave 5, "Painting" below); a paint layer merging down onto
 a vector layer is refused with a sentence.
+
+**Clip masks** (docs/DRAWING_WAVE6_CONTRACT.md section 1, built 2026-11-18): `add_layer` and
+`update_layer` take `clip`, the id of a closed shape (rect, ellipse, diamond, polygon, star,
+frame) or a closed path of the same canvas; everything the layer or group draws, its
+elements and its paint, then shows only inside that outline, and inside every clip of the
+groups above it too. In `update_layer`, `clip` null (or `""`) releases it and leaving it out
+keeps it. Refused with the board's sentences: not closed ("Only a closed shape or a closed
+path can clip a layer: ..."), no such element, inside the layer or group it would clip, and
+a locked layer. The clip element still draws where it is, so the usual way is a hidden
+"Clips" layer holding the clip shapes. `get_canvas` says `clipped to <id>` on the layer's
+line, or `clip <id> not in effect (its shape is gone | is not closed | is inside the layer
+it clips)` when the key names something that cannot clip. `export_canvas` writes a
+`<clipPath>`; `render_canvas` draws the clip; Merge Down of a clipped layer keeps only what
+showed, and `flatten_layer` keeps the layer's clip as it is (the pixels stay whole).
 
 **Paths, live shapes and stroke detail** (docs/DRAWING_CONTRACT.md sections 2 and 5, built
 2026-11-16): `add_elements` takes kind `path` with its outline as SVG path data (`d`: `M L H

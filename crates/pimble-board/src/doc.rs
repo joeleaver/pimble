@@ -8,6 +8,7 @@
 //!   edited_by: Any { id, name }?, edited_at: String?,   // board-level writes
 //!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity,
 //!                               kind: String?, blend: String?, parent: String?,
+//!                               clip: String?,   // an element id (wave 6, crate::clip)
 //!                               note: Text?, "field:<name>": String... }>,
 //!   elements: Map<element id, Map {
 //!     layer, order, parent?, kind,
@@ -112,6 +113,9 @@ pub(crate) mod keys {
     pub const EDITED_AT: &str = "edited_at";
     pub const NOTE: &str = "note";
     pub const BLEND: &str = "blend";
+    /// A layer's or group's clip: the id of a closed element
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 1, [`crate::clip`]).
+    pub const LAYER_CLIP: &str = "clip";
 }
 
 /// The prefix of an element's or layer's named fields (see the module doc).
@@ -697,6 +701,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 if let Some(parent) = &layer.parent {
                     map.insert(self.txn, PARENT, parent.clone());
                 }
+                if let Some(clip) = &layer.clip {
+                    map.insert(self.txn, LAYER_CLIP, clip.clone());
+                }
                 copy_meaning(self.txn, &map, layer.note.as_deref(), &layer.fields);
             }
         }
@@ -956,6 +963,47 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             return Err(BoardError::Invalid("Pass Through is for groups. Pick another blend mode for a layer.".into()));
         }
         self.layer_map(id)?.insert(self.txn, BLEND, blend.as_str());
+        self.layers_changed();
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// Clip a layer or group to element `clip` (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 1), or with `None` release its clip. Refused with a sentence
+    /// when the layer is locked (itself or by a group), the element is not
+    /// in this canvas, is not a closed shape or closed path, or is drawn
+    /// inside the layer or group it would clip.
+    pub fn set_layer_clip(&mut self, id: &str, clip: Option<&str>) -> Result<()> {
+        let ls = self.tree()?;
+        let at = ls.entry(id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
+        if let Some(locked) = ls.locked(at) {
+            return Err(BoardError::LayerLocked(locked));
+        }
+        let layer = self.layer_map(id)?;
+        match clip {
+            None => {
+                if layer.get(self.txn, LAYER_CLIP).is_none() {
+                    return Ok(());
+                }
+                layer.remove(self.txn, LAYER_CLIP);
+            }
+            Some(element) => {
+                let map = match self.elements()?.get(self.txn, element) {
+                    Some(Out::YMap(map)) => map,
+                    _ => return Err(BoardError::Invalid(format!("This canvas has no element {element} to clip to."))),
+                };
+                let raw = read_element(self.txn, element, &map);
+                if !crate::clip::is_closed(&raw.kind, &raw.geom) {
+                    return Err(BoardError::Invalid(crate::clip::NOT_CLOSED.into()));
+                }
+                let home = self.drawn_in(&map)?;
+                let home_at = ls.entry(&home).ok_or_else(|| BoardError::NoLayer(home.clone()))?;
+                if ls.tree.is_within(home_at, at) {
+                    return Err(BoardError::Invalid(crate::clip::CLIP_CYCLE.into()));
+                }
+                layer.insert(self.txn, LAYER_CLIP, element.to_string());
+            }
+        }
         self.layers_changed();
         self.stamp_board();
         Ok(())
@@ -2723,6 +2771,9 @@ pub struct RawLayer {
     /// The group it is in, as stored (`order` is then among that group's
     /// layers). [`crate::layer_tree::resolve`] reads what it means.
     pub parent: Option<String>,
+    /// The element that clips it, as stored ([`crate::clip`] reads whether
+    /// it is in effect).
+    pub clip: Option<String>,
 }
 
 /// An element as stored.
@@ -2830,6 +2881,7 @@ pub(crate) fn read_layers<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<RawLayer> {
             kind: LayerKind::parse(&string_of(layer.get(txn, KIND)).unwrap_or_default()),
             blend: string_of(layer.get(txn, BLEND)).as_deref().and_then(Blend::parse),
             parent: string_of(layer.get(txn, PARENT)).filter(|p| !p.is_empty()),
+            clip: string_of(layer.get(txn, LAYER_CLIP)).filter(|c| !c.is_empty()),
         });
     }
     layers

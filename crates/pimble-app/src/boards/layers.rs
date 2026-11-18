@@ -12,6 +12,12 @@
 //! (`PutBlob`), and one edit lays it down once its URL comes back. The
 //! panel says so meanwhile and takes no other such job.
 //!
+//! "Clip to Selection" clips the picked layer or group to the one closed
+//! shape selected on the canvas, "Release Clip" lets it draw everywhere
+//! again (docs/DRAWING_WAVE6_CONTRACT.md section 1); a clipped row shows a
+//! small clip icon whose tooltip names the shape (dimmed, and saying why,
+//! when the clip it names is not in effect).
+//!
 //! The judgements are pure and tested here: which rows show
 //! ([`visible_rows`]), where a drop lands ([`zone_at`], [`drop_move`]).
 
@@ -49,10 +55,41 @@ pub(super) fn rows_of(snapshot: &BoardSnapshot) -> Vec<LayerRow> {
             shown: l.effective_visible,
             held: l.effective_locked,
             children: 0,
+            clip: clip_title(snapshot, l),
+            clipped: l.clip.is_some(),
         })
         .collect();
     count_children(&mut rows);
     rows
+}
+
+/// What a clipped row's tooltip says: what clips it (named as
+/// [`pimble_board::clip::describe`] names it), or why the clip its `clip`
+/// key names is not in effect. `None` when it names no clip.
+pub(super) fn clip_title(snapshot: &BoardSnapshot, l: &pimble_board::Layer) -> Option<String> {
+    let what = if l.kind.is_group() { "group" } else { "layer" };
+    match (&l.clip, &l.clip_named) {
+        (Some(clip), _) => Some(format!("Clipped to {}: this {what} shows only inside it", pimble_board::clip::describe(snapshot, clip))),
+        (None, Some(named)) => Some(format!(
+            "Clipped to {}, not in effect: {} (Release Clip clears it)",
+            pimble_board::clip::describe(snapshot, named),
+            pimble_board::clip::unmet(snapshot, named)
+        )),
+        (None, None) => None,
+    }
+}
+
+/// "Clip to Selection": the picked layer or group clipped to the one
+/// selected element (refusals are the model's sentences).
+pub(super) fn clip_to_selection(store: AppStore, pane: PaneId, layer: &str) {
+    let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
+    match ids.as_slice() {
+        [one] => {
+            layer_edit(store, pane, |t| t.set_layer_clip(layer, Some(one)));
+        }
+        [] => crate::events::show_notice(store, "Select a closed shape on the canvas to clip the picked layer to.".to_string()),
+        _ => crate::events::show_notice(store, "Select one closed shape to clip to, not several.".to_string()),
+    }
 }
 
 /// Fill each row's `children`: the rows naming it as their parent.
@@ -504,6 +541,23 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
             IconGlyph { name: TablerIcon::Stack2.name().to_string() }
         }
     };
+    let clip_btn = small_button(__scope, TablerIcon::Mask, "Clip to Selection (the picked layer or group shows only inside the one closed shape selected)", move || {
+        let Some(id) = untracked(|| picked()) else { return };
+        clip_to_selection(store, pane, &id);
+    });
+    // Release Clip: shown for a layer that names a clip.
+    let release_btn = rsx! {
+        div {
+            title: "Release Clip (the picked layer or group draws everywhere again)",
+            class: "pimble-board-tool pimble-board-tool--small",
+            style: {move || if picked_row().is_some_and(|r| r.clip.is_some()) { "" } else { "display: none;" }},
+            onclick: move || {
+                let Some(id) = untracked(|| picked()) else { return };
+                layer_edit(store, pane, |t| t.set_layer_clip(&id, None));
+            },
+            IconGlyph { name: TablerIcon::MaskOff.name().to_string() }
+        }
+    };
     let move_here = small_button(__scope, TablerIcon::TransferIn, "Move Selection to Layer (the picked one)", move || {
         let Some(id) = untracked(|| picked()) else { return };
         let ids = with_session(pane, |s| s.selected.clone()).unwrap_or_default();
@@ -549,15 +603,16 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
             },
             div {
                 class: "pimble-board__layers",
-                for (row, v, class_id, thumb_id) in row_views(&ui.layers.get(), &ui.folded_groups.get()).into_iter().map(|(r, v)| { let c = r.id.clone(); let t = r.id.clone(); (r, v, c, t) }) {
+                for (row, v, class_id, thumb_id, clip_class, clip_title) in row_views(&ui.layers.get(), &ui.folded_groups.get()).into_iter().map(|(r, v)| { let c = r.id.clone(); let t = r.id.clone(); let (cc, ct) = (v.clip_class, v.clip_title.clone()); (r, v, c, t, cc, ct) }) {
                     div {
                         // A keyed row is drawn once: everything it shows is in its key.
                         key: format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {}",
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {:?} {}",
                             row.id, row.name, row.visible, row.locked, row.count, row.depth, row.shown, row.held, row.children,
                             row.kind, row.blend.as_str(),
                             ui.renaming.get().as_deref() == Some(row.id.as_str()),
                             ui.folded_groups.get().contains(&row.id),
+                            row.clip, row.clipped,
                         ),
                         class: {|| row_class(ui, &class_id)},
                         style: format!("padding-left: {}px;", indent_px(row.depth)),
@@ -668,6 +723,13 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                             }
                         }
                         {name_cell(__scope, pane, ui, &row)}
+                        if !clip_title.is_empty() {
+                            div {
+                                class: clip_class,
+                                title: clip_title.clone(),
+                                IconGlyph { name: TablerIcon::Mask.name().to_string() }
+                            }
+                        }
                         span {
                             class: "pimble-board__layer-count",
                             title: v.count_title,
@@ -721,6 +783,8 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                 {ungroup_btn}
                 {merge_btn}
                 {flatten_btn}
+                {clip_btn}
+                {release_btn}
                 {move_here}
                 {delete_btn}
             }
@@ -740,6 +804,10 @@ struct RowView {
     count_title: &'static str,
     /// A group's layers, a layer's elements.
     count: String,
+    /// It names a clip: the small clip icon's classes and tooltip (empty
+    /// when it names none).
+    clip_class: &'static str,
+    clip_title: String,
 }
 
 /// A row's classes: picked, and where a dragged row would land on it.
@@ -769,6 +837,12 @@ fn row_views(rows: &[LayerRow], folded: &[String]) -> Vec<(LayerRow, RowView)> {
                 kind_glyph: kind_icon(&r.kind, is_folded).name().to_string(),
                 count_title: if r.is_group() { "Layers in this group" } else { "Elements in this layer" },
                 count: if r.is_group() { r.children.to_string() } else { r.count.to_string() },
+                clip_class: if r.clipped {
+                    "pimble-board__layer-icon pimble-board__layer-clip"
+                } else {
+                    "pimble-board__layer-icon pimble-board__layer-icon--inherited pimble-board__layer-clip"
+                },
+                clip_title: r.clip.clone().unwrap_or_default(),
             };
             (r, v)
         })
@@ -874,6 +948,8 @@ mod tests {
             shown: true,
             held: false,
             children: 0,
+            clip: None,
+            clipped: false,
         }
     }
 

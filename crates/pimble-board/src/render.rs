@@ -334,6 +334,32 @@ pub fn render_area(
     only: Option<&HashSet<String>>,
     trim: bool,
 ) -> Option<Rendered> {
+    render_area_with(snapshot, pictures, rect, scale, background, only, trim, true)
+}
+
+/// [`render_area`] without the layers' clips (docs/DRAWING_WAVE6_CONTRACT.md
+/// section 1): what the elements hold, as a layer's thumbnail shows it.
+pub fn render_area_unclipped(
+    snapshot: &BoardSnapshot,
+    pictures: &dyn PictureSource,
+    rect: Rect,
+    scale: f32,
+    only: Option<&HashSet<String>>,
+) -> Option<Rendered> {
+    render_area_with(snapshot, pictures, rect, scale, None, only, false, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_area_with(
+    snapshot: &BoardSnapshot,
+    pictures: &dyn PictureSource,
+    rect: Rect,
+    scale: f32,
+    background: Option<Color>,
+    only: Option<&HashSet<String>>,
+    trim: bool,
+    clipped: bool,
+) -> Option<Rendered> {
     let rect = rect.normalized();
     if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
         return None;
@@ -349,7 +375,7 @@ pub fn render_area(
         pixmap.fill(tiny_color(bg, 1.0));
     }
     let mask = only.map(|ids| included(snapshot, ids));
-    draw_region_masked(&mut pixmap, snapshot, pictures, &view, mask.as_deref());
+    draw_region_masked(&mut pixmap, snapshot, pictures, &view, mask.as_deref(), clipped);
     if !trim {
         return Some(Rendered { rect: view.board_rect(w, h), image: RgbaImage::from_pixmap(pixmap) });
     }
@@ -432,7 +458,7 @@ pub fn selection_bounds(snapshot: &BoardSnapshot, ids: &[String]) -> Option<Rect
 /// Draw every visible element `view` touches over what `pixmap` holds. The
 /// one drawing path: everything else calls this.
 pub fn draw_region(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View) {
-    draw_region_masked(pixmap, snapshot, pictures, view, None);
+    draw_region_masked(pixmap, snapshot, pictures, view, None, true);
 }
 
 /// [`draw_region`], drawing only the elements `mask` (by z-order index)
@@ -446,7 +472,7 @@ pub fn draw_region(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn
 /// down with its opacity and blend when the drawing order leaves it. The
 /// drawing order keeps each layer's and group's elements together, so one
 /// stack of buffers is enough.
-fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>) {
+fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>, clipped: bool) {
     let region = view.board_rect(pixmap.width(), pixmap.height());
     let vt = view.transform();
     let (w, h) = (pixmap.width(), pixmap.height());
@@ -467,7 +493,7 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
             while next_paint < paint.len() && paint[next_paint] < l {
                 let layer = paint[next_paint];
                 next_paint += 1;
-                if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h) {
+                if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h, vt, clipped) {
                     return;
                 }
                 let target = match stack.last_mut() {
@@ -478,7 +504,7 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
             }
         }
         let chain = e.layer_index.map_or(NONE, chain_of);
-        if !enter(pixmap, &mut stack, chain, snapshot, w, h) {
+        if !enter(pixmap, &mut stack, chain, snapshot, w, h, vt, clipped) {
             return;
         }
         let target = match stack.last_mut() {
@@ -488,7 +514,7 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
         draw_element(target, e, pictures, vt, &region);
     }
     for &layer in &paint[next_paint..] {
-        if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h) {
+        if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h, vt, clipped) {
             return;
         }
         let target = match stack.last_mut() {
@@ -498,16 +524,17 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
         snapshot.paint_cache().draw_layer(target, snapshot, layer, view, &region, pictures);
     }
     while !stack.is_empty() {
-        close_buffer(pixmap, &mut stack, snapshot);
+        close_buffer(pixmap, &mut stack, snapshot, vt, clipped);
     }
 }
 
 /// Make the open buffers `chain` (close the ones it leaves, open the ones
 /// it enters). False when a buffer could not be made.
-fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize], snapshot: &BoardSnapshot, w: u32, h: u32) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize], snapshot: &BoardSnapshot, w: u32, h: u32, vt: Affine, clipped: bool) -> bool {
     let common = stack.iter().zip(chain).take_while(|((open, _), want)| open == *want).count();
     while stack.len() > common {
-        close_buffer(pixmap, stack, snapshot);
+        close_buffer(pixmap, stack, snapshot, vt, clipped);
     }
     for layer in &chain[stack.len()..] {
         match Pixmap::new(w, h) {
@@ -519,8 +546,10 @@ fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize],
 }
 
 /// Blend the innermost open buffer into the one below it (or `pixmap`) with
-/// its layer's opacity and blend.
-fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, snapshot: &BoardSnapshot) {
+/// its layer's opacity and blend, inside its clip when it has one
+/// (docs/DRAWING_WAVE6_CONTRACT.md section 1: the mask is the size of the
+/// target, a tile or the visible area, never of the world).
+fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, snapshot: &BoardSnapshot, vt: Affine, clipped: bool) {
     let Some((layer, buffer)) = stack.pop() else { return };
     let l = &snapshot.layers[layer];
     let paint = PixmapPaint { opacity: l.opacity, blend_mode: l.blend.to_tiny(), quality: FilterQuality::Nearest };
@@ -528,7 +557,20 @@ fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, snapshot:
         Some((_, below)) => below,
         None => pixmap,
     };
-    target.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
+    blend_clipped(target, &buffer, &paint, if clipped { snapshot.clip_of(layer) } else { None }, vt);
+}
+
+/// Blend `buffer` (the same size as `target`) onto `target` with `paint`,
+/// only inside `clip` when given.
+pub(crate) fn blend_clipped(target: &mut Pixmap, buffer: &Pixmap, paint: &PixmapPaint, clip: Option<&crate::clip::Clip>, vt: Affine) {
+    match clip {
+        None => target.draw_pixmap(0, 0, buffer.as_ref(), paint, Affine::identity(), None),
+        Some(clip) => {
+            // Nothing of the clip in this target: nothing shows.
+            let Some(mask) = clip.mask(buffer.width(), buffer.height(), vt) else { return };
+            target.draw_pixmap(0, 0, buffer.as_ref(), paint, Affine::identity(), Some(&mask));
+        }
+    }
 }
 
 fn paint_of(color: Color, opacity: f32) -> Paint<'static> {

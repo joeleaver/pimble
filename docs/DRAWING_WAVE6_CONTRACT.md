@@ -115,3 +115,120 @@ All five recommendations, for the first pass:
 4. **Soft edges last** in this wave.
 5. The order in section 6: clip masks, pictures in paint layers, map lettering, symbols and
    scatter, soft edges.
+
+## Built: clip masks
+
+Built 2026-11-18 on `master` (part 1 of the order in section 6), in `crates/pimble-board`,
+the layers panel (`crates/pimble-app/src/boards/layers.rs`, both apps) and `pimble-mcp`.
+
+### Stored keys
+
+One new key, on a layer's map (layers and groups alike): `clip`, the id of an element of the
+same canvas. Nothing else is written; an older version ignores the key and draws the layer
+unclipped. Last writer wins, like every key of a layer's map. `copy_from` (Convert to Node)
+copies it.
+
+### How it reads (`pimble_board::clip`, the one place)
+
+- A clip is **in effect** when the element it names exists, is closed
+  (`clip::is_closed`: a rect, ellipse, diamond, polygon, star or frame, or a path whose every
+  subpath is closed with at least two anchors), and is not drawn inside the layer or group it
+  clips (its layer, after the usual fallback for a layer that is gone, is not that entry or
+  inside it). Otherwise it reads as no clip, on every device the same: deleting the shape
+  (undo brings the clip back with it), moving it into the layer it clips, reshaping it into
+  something open. Nothing is rewritten.
+- The outline is the element's fill outline (a live shape's `shape_path`, a frame's
+  rectangle, a path's subpaths with its fill rule) through its world transform, so moving,
+  rotating, scaling or reshaping it moves the edge. A clip shape inside a clip shape's group
+  element moves with that group.
+- A clipped layer or group counts as **isolated**: it draws into a buffer of its own, which is
+  blended down through a tiny-skia `Mask` of the outline. The mask is the size of the target
+  being drawn (a view, a 256-pixel paint tile's composite, a 2,048-pixel flatten tile, an
+  export), never of the canvas, so a map-sized canvas costs one target-sized byte mask per
+  clipped layer while it is drawn.
+- **Paint** is kept whole: its operations and tiles are untouched, and clipped when its
+  layer's buffer is composited. Moving the clip shows paint that was hidden.
+- **Nesting**: a clipped layer inside a clipped group is masked by its own clip into the
+  group's buffer, which is masked by the group's: they intersect.
+- **The raster cache**: each layer's composite hash (`composite_of`) folds in the outline's
+  hash (`Clip::hash`) of every clip on its chain, so a clip that moves changes the
+  fingerprints of every element it clips and the paint marks of every paint layer it clips,
+  and the view redraws them.
+- **Hit testing**: `Element::hits` (and `BoardSnapshot::hit`) refuse a point outside any clip
+  the element draws inside (`Element::inside_clips`); a marquee does not take an element its
+  clips leave nothing of. The visible extent (what an export or "fit" shows) is cut to the
+  clips (`Element::shown_bounds`, `BoardSnapshot::clip_bounds`).
+- **SVG export**: a clipped layer's `<g>` carries `clip-path="url(#pimble-clip-N)"`, its
+  `<clipPath clipPathUnits="userSpaceOnUse">` holding the outline in board units (with
+  `clip-rule="evenodd"` for an even-odd path) just before it.
+- **Rasterizing**: Flatten keeps the layer, so its clip stays a key and the pixels are drawn
+  whole; Merge Down of a clipped layer onto the paint layer below takes the clip into the
+  pixels (only what showed is merged); Merge Group draws each clipped child through its clip,
+  and the group's own clip stays on the layer the group becomes.
+
+### API
+
+- `BoardTxn::set_layer_clip(layer, Option<&str>)`: `None` releases. Refused with a sentence
+  when the layer is locked, itself or by a group (`BoardError::LayerLocked`); when the canvas
+  has no such element ("This canvas has no element ... to clip to."); when it is not closed
+  (`clip::NOT_CLOSED`); when it is inside the layer or group it would clip
+  (`clip::CLIP_CYCLE`, which suggests a hidden "Clips" layer).
+- `RawLayer.clip` (as stored); `Layer.clip` (in effect) and `Layer.clip_named` (as stored);
+  `BoardSnapshot::clip_of(at)`, `clip_bounds(at, rect)`; `Element::inside_clips`,
+  `is_clipped`, `shown_bounds`; `clip::Clip` (outline, rule, bounds, hash, `contains`),
+  `clip::is_closed`, `clip::unmet` (why a named clip is not in effect, in words),
+  `clip::describe` (how the panel names a clip element: its note's first line, else its kind
+  and the start of its id).
+
+### UI (desktop and browser, the same `pimble-app` code)
+
+Layer thumbnails show what a layer holds, unclipped (`render_area_unclipped` for a vector
+layer; a paint layer's thumbnail was never composited); the clip icon says it is clipped.
+
+The layers panel's button row gains **Clip to Selection** (mask icon: the picked layer or
+group clipped to the one element selected on the canvas; nothing selected or several
+selected says so; the model's refusals are said as sentences) and **Release Clip** (mask-off
+icon, shown when the picked layer names a clip). A row that names a clip shows a small mask
+icon after its name; its tooltip names the shape ("Clipped to the star 0da15e11: this layer
+shows only inside it"), dimmed with the reason when the clip is not in effect.
+
+### MCP
+
+`add_layer` and `update_layer` take `clip` (an element id; in an update null or `""`
+releases it, left out keeps it); `get_canvas` says `clipped to <id>`, or `clip <id> not in
+effect (<why>)`. docs/MCP_CONTRACT.md "Clip masks".
+
+### Tests
+
+`crates/pimble-board/tests/clip.rs`: the stored key; pixels inside drawn and outside not, for
+a vector layer and a paint layer; a visible clip still drawing; moving and reshaping the clip
+moving the edge (and the clipped element's fingerprint changing); nested clips intersecting;
+hit testing inside and outside; every refusal's sentence and a locked layer; a deleted clip
+and a clip moved into its own layer reading as none; SVG `<clipPath>`; the raster cache's
+frame after the clip moves matching a full render; Merge Down taking the clip, Flatten
+keeping it, a copy keeping the key; two devices clipping and moving at once reading the same
+picture. `pimble-mcp`: `layers_take_a_clip_and_release_it` against a real server.
+
+### Deviations
+
+- A clipped group that passes through at full opacity is isolated by its clip, so blend
+  modes of the layers inside it blend with the group's own buffer rather than with what is
+  below the group (as any isolated group's do). Painting apps differ here; this is the one
+  rule the renderer already had.
+- The pen's live stroke (the stamps drawn into the view while the pointer is down,
+  `BoardView::extend_stroke`) is not clipped; the stroke is clipped once it is an element
+  (on release). Paint strokes are clipped while they are drawn (they go through the
+  snapshot).
+- Merge Group of a group of vector layers only (no paint, no pixels) moves the children's
+  elements into the group's layer and drops the children's own clips, as it already drops
+  their opacity and blend.
+- The MCP's `copy_layer` between canvases does not copy a clip (the copied elements get
+  new ids); set it again on the copy with `update_layer`.
+
+### Not built
+
+- Clips on single elements (Joe's decision 1: layers and groups first).
+- A clip made from text, a stroke, a picture's outline or a paint layer's pixels (an alpha
+  mask).
+- Inverted clips ("everything outside the shape").
+- Showing the clip outline while the layer is picked.

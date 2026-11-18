@@ -18,7 +18,7 @@
 //! Also here: [`fill_clip`], the area a fill may fill, worked out by the
 //! filler's device.
 
-use tiny_skia::{BlendMode, FilterQuality, Pixmap, PixmapPaint, Transform as Affine};
+use tiny_skia::{BlendMode, FilterQuality, Pixmap, PixmapPaint};
 
 use crate::brush::PX_PER_UNIT;
 use crate::doc::BoardError;
@@ -310,13 +310,16 @@ pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job:
                 // One layer: its own pixels, its opacity baked in for a merge
                 // (its blend goes on the operation), none for a flatten (the
                 // layer keeps its opacity).
-                if opacity >= 1.0 {
+                // A merge takes the layer's clip into the pixels (the layer
+                // goes); a flatten keeps the layer, and its clip with it.
+                let clip = if matches!(job, RasterJob::Flatten(_)) { None } else { snapshot.clip_of(at) };
+                if opacity >= 1.0 && clip.is_none() {
                     draw_entry(&mut pixmap, snapshot, pictures, at, &view, &region, &mut complete);
                 } else {
                     let mut buffer = Pixmap::new(w, h).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
                     draw_entry(&mut buffer, snapshot, pictures, at, &view, &region, &mut complete);
                     let paint = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
-                    pixmap.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
+                    crate::render::blend_clipped(&mut pixmap, &buffer, &paint, clip, view.transform());
                 }
             } else {
                 for child in &drawn {
@@ -356,7 +359,7 @@ fn draw_composited(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn
     let Some(mut buffer) = Pixmap::new(pixmap.width(), pixmap.height()) else { return };
     draw_entry(&mut buffer, snapshot, pictures, at, view, region, complete);
     let paint = PixmapPaint { opacity: l.opacity, blend_mode: l.blend.to_tiny(), quality: FilterQuality::Nearest };
-    pixmap.draw_pixmap(0, 0, buffer.as_ref(), &paint, Affine::identity(), None);
+    crate::render::blend_clipped(pixmap, &buffer, &paint, snapshot.clip_of(at), view.transform());
 }
 
 /// What entry `at` holds, drawn straight into `pixmap`: a vector layer's

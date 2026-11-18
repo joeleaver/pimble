@@ -660,7 +660,9 @@ fn signature(snapshot: &BoardSnapshot, layer: &pimble_board::Layer) -> u64 {
 
 /// Draw one layer's thumbnail: a paint layer through `render_paint_layer`
 /// (its tiles, from the shared cache), a vector layer through the regular
-/// renderer limited to its elements. `None` for an empty layer.
+/// renderer limited to its elements. Both unclipped: a thumbnail shows what
+/// the layer holds; the row's clip icon says it is clipped. `None` for an
+/// empty layer.
 fn draw_thumb(snapshot: &BoardSnapshot, pictures: &HashMap<String, Arc<Picture>>, layer: &pimble_board::Layer) -> Option<RgbaImage> {
     let rendered = match layer.kind {
         LayerKind::Paint => {
@@ -671,7 +673,7 @@ fn draw_thumb(snapshot: &BoardSnapshot, pictures: &HashMap<String, Arc<Picture>>
         LayerKind::Vector => {
             let ids: HashSet<String> = snapshot.elements.iter().filter(|e| e.layer == layer.id).map(|e| e.raw.id.clone()).collect();
             let rect = snapshot.elements.iter().filter(|e| e.layer == layer.id).map(|e| e.bounds).reduce(|a, b| a.union(&b))?;
-            pimble_board::render_area(snapshot, pictures, rect, thumb_scale(&rect), None, Some(&ids), false)?
+            pimble_board::render_area_unclipped(snapshot, pictures, rect, thumb_scale(&rect), Some(&ids))?
         }
     };
     Some(boxed(&rendered.image))

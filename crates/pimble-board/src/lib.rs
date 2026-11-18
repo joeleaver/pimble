@@ -52,6 +52,7 @@
 //!   Flatten Layer and merges onto paint layers drawn as one picture.
 
 pub mod brush;
+pub mod clip;
 pub mod combine;
 pub mod doc;
 pub mod paint_ops;
@@ -95,7 +96,7 @@ pub use paint::pressure_width;
 pub use path::{Anchor, AnchorMode, AnchorRef, HandleRef, HandleSide, PathError, PathGeom, PathRule, SegmentHit, Subpath};
 pub use options::{author_color, author_color_index, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 pub use render::{
-    draw_region, render, render_area, render_extent, render_paint_layer, sample_color, selection_bounds, NoPictures, Picture, PictureSource,
+    draw_region, render, render_area, render_area_unclipped, render_extent, render_paint_layer, sample_color, selection_bounds, NoPictures, Picture, PictureSource,
     Rendered, RgbaImage, View, MAX_EXTENT_PX,
 };
 pub use snapshot::{BoardSnapshot, Element, Layer, PaintMark};

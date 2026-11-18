@@ -83,6 +83,10 @@ impl Element {
         if !self.visible || !self.has_extent || self.global {
             return false;
         }
+        // Outside its layer's clip it shows nothing, so it is not hit there.
+        if !self.inside_clips(p) {
+            return false;
+        }
         let s = &self.style;
         let tol = tolerance.max(0.0);
         if let Kind::Connector = self.raw.kind {
@@ -203,6 +207,7 @@ impl BoardSnapshot {
                 let b = e.bounds;
                 !e.global
                     && e.has_extent
+                    && e.shown_bounds().is_some()
                     && !matches!(e.raw.kind, Kind::Group)
                     && b.x >= rect.x
                     && b.y >= rect.y

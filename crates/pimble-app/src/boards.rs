@@ -517,6 +517,11 @@ pub struct LayerRow {
     pub held: bool,
     /// Layers directly inside it (a group's).
     pub children: usize,
+    /// Its clip, as the row's tooltip says it (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 1): what clips it, or why the clip it names is not in effect.
+    pub clip: Option<String>,
+    /// That clip is in effect.
+    pub clipped: bool,
 }
 
 impl LayerRow {

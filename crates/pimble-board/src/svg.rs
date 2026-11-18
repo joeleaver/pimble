@@ -263,8 +263,8 @@ fn write_picture(out: &mut String, e: &Element, p: &PictureGeom, picture_bytes: 
 /// An element's opacity applies to each of its parts, as the renderer's
 /// does, so it is on each part, not on the element's group. A layer or
 /// group the renderer gives a buffer of its own (an opacity below 1, a
-/// blend that is not normal) is a `<g>` carrying `opacity` and
-/// `mix-blend-mode` around its elements.
+/// blend that is not normal, a clip) is a `<g>` carrying `opacity`,
+/// `mix-blend-mode` and `clip-path` around its elements.
 pub fn render_svg(
     snapshot: &BoardSnapshot,
     rect: Rect,
@@ -312,7 +312,7 @@ pub fn render_svg(
             while next_paint < paint.len() && paint[next_paint] < l {
                 let layer = paint[next_paint];
                 next_paint += 1;
-                sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot);
+                sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients);
                 write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
             }
         }
@@ -321,7 +321,7 @@ pub fn render_svg(
             continue;
         }
         let chain = e.layer_index.map_or(NONE, chain_of);
-        sync_chain(&mut out, &mut open_layers, chain, snapshot);
+        sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients);
         // Consecutive ops in one space share a group.
         let mut open: Option<Space> = None;
         for op in &ops {
@@ -348,7 +348,7 @@ pub fn render_svg(
         out.push_str("</g>");
     }
     for &layer in &paint[next_paint..] {
-        sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot);
+        sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients);
         write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
     }
     for _ in open_layers {
@@ -361,7 +361,7 @@ pub fn render_svg(
 /// Close the layer groups `chain` leaves and open the ones it enters (a
 /// layer or group with a buffer of its own is a `<g>` with its opacity and
 /// blend).
-fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], snapshot: &BoardSnapshot) {
+fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], snapshot: &BoardSnapshot, next_id: &mut usize) {
     let common = open_layers.iter().zip(chain).take_while(|(a, b)| a == b).count();
     while open_layers.len() > common {
         open_layers.pop();
@@ -369,7 +369,22 @@ fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], s
     }
     for layer in &chain[open_layers.len()..] {
         let l = &snapshot.layers[*layer];
+        // A clip in effect (docs/DRAWING_WAVE6_CONTRACT.md section 1): its
+        // outline in board units, as a <clipPath> on the layer's group.
+        let clip = snapshot.clip_of(*layer).map(|c| {
+            *next_id += 1;
+            let id = format!("pimble-clip-{next_id}");
+            let _ = write!(out, "<defs><clipPath id=\"{id}\" clipPathUnits=\"userSpaceOnUse\"><path d=\"{}\"", path_data(&c.path));
+            if c.rule == FillRule::EvenOdd {
+                out.push_str(" clip-rule=\"evenodd\"");
+            }
+            out.push_str("/></clipPath></defs>");
+            id
+        });
         out.push_str("<g");
+        if let Some(id) = clip {
+            let _ = write!(out, " clip-path=\"url(#{id})\"");
+        }
         if l.opacity < 1.0 {
             let _ = write!(out, " opacity=\"{}\"", n(l.opacity));
         }

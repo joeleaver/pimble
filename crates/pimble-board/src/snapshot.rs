@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use tiny_skia::{Path, Transform as Affine};
 
+use crate::clip::Clip;
 use crate::doc::{Board, Changes, RawBoard, RawElement};
 use crate::paint_ops::{points_bounds, settings_hash, PaintBody, PaintOp, RawPaintOp};
 use crate::tiles::PaintCache;
@@ -64,8 +65,14 @@ pub struct Layer {
     pub locked_by: Option<String>,
     /// Drawn into a buffer of its own and then blended (a blend that is not
     /// normal, opacity below 1; a group that does not pass through at full
-    /// opacity).
+    /// opacity; a clip in effect).
     pub isolated: bool,
+    /// The element that clips it, when that clip is in effect
+    /// ([`crate::clip`]: a closed element of this canvas, not inside this
+    /// layer).
+    pub clip: Option<String>,
+    /// The element its `clip` key names, as stored, in effect or not.
+    pub clip_named: Option<String>,
 }
 
 /// One element, as stored and as resolved for drawing.
@@ -121,6 +128,9 @@ pub struct Element {
     /// Changes whenever anything about how it looks changes.
     pub fingerprint: u64,
     pub(crate) text_path: OnceLock<Option<Path>>,
+    /// The clips of its layer and of every group above it: it shows (and
+    /// is hit) only inside all of them.
+    pub(crate) clips: Vec<Arc<Clip>>,
 }
 
 impl Element {
@@ -130,6 +140,24 @@ impl Element {
 
     pub fn kind(&self) -> &Kind {
         &self.raw.kind
+    }
+
+    /// Whether board point `p` is inside every clip it is drawn inside (its
+    /// layer's and its groups'): outside them it shows nothing and is not
+    /// hit.
+    pub fn inside_clips(&self, p: Point) -> bool {
+        self.clips.iter().all(|c| c.contains(p))
+    }
+
+    /// Whether it draws inside a clip.
+    pub fn is_clipped(&self) -> bool {
+        !self.clips.is_empty()
+    }
+
+    /// Its bounds cut to its clips' (what it can show at most); `None` when
+    /// its clips leave nothing of it.
+    pub fn shown_bounds(&self) -> Option<Rect> {
+        self.clips.iter().try_fold(self.bounds, |b, c| b.intersect(&c.bounds))
     }
 
     /// The glyph outlines of its text in element space, built once.
@@ -171,6 +199,8 @@ pub struct BoardSnapshot {
     /// Per layer (as `layers`), a hash of how it is composited and where it
     /// is in the draw order.
     pub(crate) composite: Vec<u64>,
+    /// Per layer (as `layers`), its clip when one is in effect.
+    pub(crate) clips: Vec<Option<Arc<Clip>>>,
     /// Every paint operation, by layer id, then order, then id
     /// (docs/DRAWING_CONTRACT.md section 3).
     pub paint: Vec<PaintOp>,
@@ -225,6 +255,7 @@ impl BoardSnapshot {
                 tree: LayerTree::default(),
                 chains: Vec::new(),
                 composite: Vec::new(),
+                clips: Vec::new(),
                 paint: Vec::new(),
                 paint_index: HashMap::new(),
                 paint_cache: PaintCache::new(),
@@ -521,14 +552,33 @@ impl BoardSnapshot {
     /// included; `None` when nothing shows. Not yet trimmed to pixels: that
     /// is [`crate::render_extent`].
     pub fn visible_extent(&self) -> Option<Rect> {
-        let paint = (0..self.layers.len()).filter(|at| self.paint_shown(*at)).filter_map(|at| self.paint_bounds(&self.layers[at].id));
+        let paint = (0..self.layers.len())
+            .filter(|at| self.paint_shown(*at))
+            .filter_map(|at| self.paint_bounds(&self.layers[at].id).and_then(|b| self.clip_bounds(at, b)));
         self.elements
             .iter()
             .filter(|e| e.visible && e.has_extent && !matches!(e.raw.kind, Kind::Group))
-            .map(|e| e.bounds)
+            .filter_map(|e| e.shown_bounds())
             .chain(paint)
             .filter(|b| b.is_finite())
             .reduce(|a, b| a.union(&b))
+    }
+
+    /// `bounds` of something layer `at` draws, cut to the clips it draws
+    /// inside (its own and its groups'); `None` when they leave nothing.
+    pub fn clip_bounds(&self, at: usize, bounds: Rect) -> Option<Rect> {
+        if self.clips.is_empty() {
+            return Some(bounds);
+        }
+        std::iter::once(at)
+            .chain(self.tree.ancestors(at))
+            .filter_map(|a| self.clips.get(a).and_then(|c| c.as_ref()))
+            .try_fold(bounds, |b, c| b.intersect(&c.bounds))
+    }
+
+    /// The clip in effect on layer `at` (an index into `layers`).
+    pub fn clip_of(&self, at: usize) -> Option<&Clip> {
+        self.clips.get(at).and_then(|c| c.as_deref())
     }
 
     /// What a board renders as when embedded or exported: its page when it
@@ -561,7 +611,7 @@ impl BoardSnapshot {
     /// The topmost visible element under `p` (by bounds), for hit testing.
     pub fn hit(&self, p: Point) -> Option<&Element> {
         let r = Rect::new(p.x, p.y, 0.001, 0.001);
-        self.query(&r).into_iter().rev().map(|i| &self.elements[i]).find(|e| !e.global && e.bounds.contains(p))
+        self.query(&r).into_iter().rev().map(|i| &self.elements[i]).find(|e| !e.global && e.bounds.contains(p) && e.inside_clips(p))
     }
 }
 
@@ -629,25 +679,14 @@ impl Resolver {
                     effective_locked: e.effective_locked,
                     locked_by: e.locked_by.map(|b| raw_layers[tree.entries[b].index].id.clone()),
                     isolated: e.isolated,
+                    clip: None,
+                    clip_named: l.clip.clone(),
                 }
             })
             .collect();
-        let chains: Vec<Vec<usize>> = (0..layers.len()).map(|at| tree.chain(at)).collect();
-        let composite: Vec<u64> = chains
-            .iter()
-            .enumerate()
-            .map(|(at, chain)| {
-                let mut h = Fx::default();
-                at.hash(&mut h);
-                for c in chain {
-                    let l = &layers[*c];
-                    l.id.hash(&mut h);
-                    l.opacity.to_bits().hash(&mut h);
-                    l.blend.hash(&mut h);
-                }
-                h.finish()
-            })
-            .collect();
+        let mut tree = tree;
+        let mut chains: Vec<Vec<usize>> = (0..layers.len()).map(|at| tree.chain(at)).collect();
+        let composite = composite_of(&chains, &layers, &[]);
 
         // z-order: by the drawing order of the layers, then element order.
         let mut ranked: Vec<(Option<usize>, RawElement)> =
@@ -657,10 +696,48 @@ impl Resolver {
         let raws: Vec<RawElement> = ranked.into_iter().map(|(_, e)| e).collect();
         let by_id: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, e)| (id_hash(&e.id), i)).collect();
         let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options };
-        let snapshot_elements = r.resolve(markup_visible);
-        let index = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
+        let mut snapshot_elements = r.resolve(markup_visible);
+        let index: HashMap<u64, usize> = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
+        let mut composite = std::mem::take(&mut r.composite);
+        // Clips (docs/DRAWING_WAVE6_CONTRACT.md section 1): read once the
+        // elements are placed, since a clip is an element's outline where
+        // it is drawn. A clip in effect gives its layer a buffer, and its
+        // outline goes into the fingerprints of everything it clips.
+        let mut clips: Vec<Option<Arc<Clip>>> = vec![None; r.layers.len()];
+        for at in 0..r.layers.len() {
+            let Some(id) = r.layers[at].clip_named.as_deref() else { continue };
+            let Some(e) = index.get(&id_hash(id)).map(|i| &snapshot_elements[*i]).filter(|e| e.raw.id == id) else { continue };
+            // A clip drawn inside the layer or group it clips reads as none.
+            if e.layer_index.is_none_or(|home| tree.is_within(home, at)) {
+                continue;
+            }
+            if let Some(clip) = Clip::of(e) {
+                clips[at] = Some(Arc::new(clip));
+            }
+        }
+        if clips.iter().any(Option::is_some) {
+            for (at, clip) in clips.iter().enumerate() {
+                if let Some(clip) = clip {
+                    tree.entries[at].isolated = true;
+                    r.layers[at].isolated = true;
+                    r.layers[at].clip = Some(clip.element.clone());
+                }
+            }
+            chains = (0..r.layers.len()).map(|at| tree.chain(at)).collect();
+            let next = composite_of(&chains, &r.layers, &clips);
+            // The clips each layer draws inside: its own and its groups'.
+            let within: Vec<Vec<Arc<Clip>>> = (0..r.layers.len())
+                .map(|at| std::iter::once(at).chain(tree.ancestors(at)).filter_map(|a| clips[a].clone()).collect())
+                .collect();
+            for e in &mut snapshot_elements {
+                if let Some(l) = e.layer_index {
+                    e.fingerprint ^= composite[l] ^ next[l];
+                    e.clips = within[l].clone();
+                }
+            }
+            composite = next;
+        }
         let grid = Grid::build(&snapshot_elements);
-        let composite = std::mem::take(&mut r.composite);
         let mut snapshot = BoardSnapshot {
             exists: true,
             version,
@@ -676,6 +753,7 @@ impl Resolver {
             tree,
             chains,
             composite,
+            clips,
             paint: Vec::new(),
             paint_index: HashMap::new(),
             paint_cache: PaintCache::new(),
@@ -924,6 +1002,7 @@ impl Resolver {
                 card: cards[i].take(),
                 fingerprint: 0,
                 text_path,
+                clips: Vec::new(),
                 raw,
             };
             e.fingerprint = fingerprint(&e) ^ composite;
@@ -931,6 +1010,31 @@ impl Resolver {
         }
         out
     }
+}
+
+/// Per layer, a hash of how it is composited (its chain's ids, opacities,
+/// blends and clips) and its place in the draw order, folded into its
+/// elements' fingerprints and its paint marks so the raster cache redraws
+/// them when any of it changes.
+fn composite_of(chains: &[Vec<usize>], layers: &[Layer], clips: &[Option<Arc<Clip>>]) -> Vec<u64> {
+    chains
+        .iter()
+        .enumerate()
+        .map(|(at, chain)| {
+            let mut h = Fx::default();
+            at.hash(&mut h);
+            for c in chain {
+                let l = &layers[*c];
+                l.id.hash(&mut h);
+                l.opacity.to_bits().hash(&mut h);
+                l.blend.hash(&mut h);
+                if let Some(Some(clip)) = clips.get(*c) {
+                    clip.hash.hash(&mut h);
+                }
+            }
+            h.finish()
+        })
+        .collect()
 }
 
 /// Arrow head length for a stroke width.

@@ -265,6 +265,7 @@ mod tests {
             kind,
             blend: None,
             parent: parent.map(Into::into),
+            clip: None,
         }
     }
 

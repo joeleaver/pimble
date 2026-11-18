@@ -742,6 +742,14 @@ pub struct AddLayerParams {
     /// grouped).
     #[serde(default)]
     pub blend: Option<String>,
+    /// Clip it to an element of this canvas (its id): everything the layer or
+    /// group draws, shapes and paint, then shows only inside that element's
+    /// outline. The element must be a closed shape (rect, ellipse, diamond,
+    /// polygon, star, frame) or a closed path, and not inside this layer; it
+    /// still draws where it is unless its own layer is hidden (keep clip
+    /// shapes in a hidden "Clips" layer). Moving or reshaping it moves the edge.
+    #[serde(default)]
+    pub clip: Option<String>,
     /// Where it goes among the layers of its group: "top" (the default),
     /// "bottom", "above:<layer>" or "below:<layer>" (a layer's name or id;
     /// it then goes in that layer's group).
@@ -776,6 +784,11 @@ pub struct UpdateLayerParams {
     /// A blend mode, as add_layer takes it ("pass-through" only for a group).
     #[serde(default)]
     pub blend: Option<String>,
+    /// Clip the layer or group to an element (its id; a closed shape or
+    /// closed path not inside this layer, as add_layer's `clip`), or null
+    /// (or "") to release its clip.
+    #[serde(default, deserialize_with = "present")]
+    pub clip: Option<Option<String>>,
     /// Move it into this group (a group's name or id), or "" for the top
     /// level. On top of the group unless `order` says where.
     #[serde(default)]
@@ -790,6 +803,12 @@ pub struct UpdateLayerParams {
     /// Fields to set; a field given as null is removed. Fields not named stay.
     #[serde(default)]
     pub fields: Option<BTreeMap<String, Option<String>>>,
+}
+
+/// A field that may be given as null: absent is `None`, null is
+/// `Some(None)`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2091,6 +2110,11 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
         }
         if layer.opacity < 1.0 {
             flags.push(format!("opacity {}", n(layer.opacity)));
+        }
+        match (&layer.clip, &layer.clip_named) {
+            (Some(clip), _) => flags.push(format!("clipped to {clip}")),
+            (None, Some(named)) => flags.push(format!("clip {named} not in effect ({})", pimble_board::clip::unmet(snapshot, named))),
+            (None, None) => {}
         }
         let flags = if flags.is_empty() { String::new() } else { format!(", {}", flags.join(", ")) };
         let heading = "#".repeat(2 + layer.depth.min(4));
@@ -3464,7 +3488,7 @@ impl Pimble {
         }
         let order = p.order.clone().unwrap_or_default();
         let (note, fields) = (p.note.clone(), p.fields.clone());
-        let (kind, parent, blend) = (p.kind.clone(), p.parent.clone(), p.blend.clone());
+        let (kind, parent, blend, clip) = (p.kind.clone(), p.parent.clone(), p.blend.clone(), p.clip.clone());
         let id = self
             .canvas_edit(&target, Default::default(), move |t, scene, _| {
                 let at = placement(&order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
@@ -3477,6 +3501,9 @@ impl Pimble {
                 let id = t.add_layer_in(&name, kind, parent.as_deref(), at)?;
                 if let Some(blend) = blend {
                     t.set_layer_blend(&id, blend)?;
+                }
+                if let Some(clip) = clip.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                    t.set_layer_clip(&id, Some(clip))?;
                 }
                 if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
                     t.set_layer_note(&id, note)?;
@@ -3491,15 +3518,17 @@ impl Pimble {
         Ok(format!("Added {what} \"{}\" ({id}) to {}.", p.name.trim(), target.what()))
     }
 
-    /// Rename, show or hide, lock or unlock, fade, blend, reorder or move into
-    /// or out of a group a layer of a canvas, or say what it holds (its note
-    /// and fields). Hiding or locking a group hides or locks what is in it.
+    /// Rename, show or hide, lock or unlock, fade, blend, clip, reorder or move
+    /// into or out of a group a layer of a canvas, or say what it holds (its
+    /// note and fields). Hiding or locking a group hides or locks what is in
+    /// it. A clip (`clip`: a closed shape's or closed path's id) keeps
+    /// everything the layer or group draws inside that shape's outline.
     /// What a layer shows is the same for everyone who opens the canvas.
     #[tool(name = "update_layer")]
     async fn update_layer(&self, Parameters(p): Parameters<UpdateLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, name, visible, locked, opacity, order) = (p.layer.clone(), p.name.clone(), p.visible, p.locked, p.opacity, p.order.clone());
-        let (note, fields, blend, parent) = (p.note.clone(), p.fields.clone(), p.blend.clone(), p.parent.clone());
+        let (note, fields, blend, parent, clip) = (p.note.clone(), p.fields.clone(), p.blend.clone(), p.parent.clone(), p.clip.clone());
         self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -3516,6 +3545,9 @@ impl Pimble {
             }
             if let Some(blend) = blend.as_deref() {
                 t.set_layer_blend(&id, blend_mode(blend)?)?;
+            }
+            if let Some(clip) = &clip {
+                t.set_layer_clip(&id, clip.as_deref().map(str::trim).filter(|c| !c.is_empty()))?;
             }
             match (parent.as_deref().map(str::trim), order.as_deref()) {
                 (Some(parent), order) => {
@@ -4199,5 +4231,61 @@ mod tests {
         assert!(err.to_string().contains("two stops or more"), "{err}");
         let bad_kind = GradientSpec { kind: Some("conic".into()), stops: vec![StopSpec { offset: None, color: "#fff".into() }; 2], ..Default::default() };
         assert!(style_of(&StyleSpec { fill_gradient: Some(bad_kind), ..Default::default() }).is_err());
+    }
+
+    fn jp<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> rmcp::handler::server::wrapper::Parameters<T> {
+        rmcp::handler::server::wrapper::Parameters(serde_json::from_value(v).expect("params"))
+    }
+
+    /// Clip masks through the tools (docs/DRAWING_WAVE6_CONTRACT.md section 1):
+    /// `add_layer` and `update_layer` take `clip`, `get_canvas` says it, null
+    /// releases it, and what cannot clip is refused with the board's sentence.
+    #[tokio::test]
+    async fn layers_take_a_clip_and_release_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        let url = format!("http://{}", server.addr());
+        let service = pimble_client::PimbleClient::connect(&url).await.unwrap();
+        service.create_store(dir.path().join("maps.pimble"), "Maps").await.unwrap();
+        let pimble = super::super::Pimble::new(std::sync::Arc::new(crate::connection::Connection::with_client(pimble_client::PimbleClient::connect(&url).await.unwrap())));
+
+        pimble.create_canvas(jp(serde_json::json!({ "parent": "Maps", "title": "County" }))).await.unwrap();
+        pimble.add_layer(jp(serde_json::json!({ "node": "Maps/County", "name": "Clips", "order": "bottom" }))).await.unwrap();
+        let added = pimble
+            .add_elements(jp(serde_json::json!({ "node": "Maps/County", "layer": "Clips", "elements": [
+                { "kind": "star", "x": 0, "y": 0, "w": 100, "h": 100 },
+                { "kind": "line", "points": [[0, 0], [10, 10]] },
+            ] })))
+            .await
+            .unwrap();
+        let id_of = |name: &str| {
+            added.lines().find(|l| l.ends_with(&format!("({name})"))).and_then(|l| l.split_whitespace().nth(1)).unwrap_or_else(|| panic!("{added}")).to_string()
+        };
+        let (star, road) = (id_of("element 1"), id_of("element 2"));
+        let made = pimble.add_layer(jp(serde_json::json!({ "node": "Maps/County", "name": "Fields", "clip": star }))).await.unwrap();
+        assert!(made.contains("Added layer \"Fields\""), "{made}");
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(read.contains(&"Layer \"Fields\"") && read.contains(&format!("clipped to {star}")), "{read}");
+
+        // Not closed: the board's sentence, nothing written.
+        let refused = pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "clip": road }))).await.unwrap_err();
+        assert!(refused.contains("Only a closed shape or a closed path can clip a layer"), "{refused}");
+        // Inside the layer it would clip.
+        let refused = pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Clips", "clip": star }))).await.unwrap_err();
+        assert!(refused.contains("inside the layer it would clip"), "{refused}");
+
+        // Null releases it; leaving `clip` out keeps it.
+        pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "opacity": 0.5 }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(read.contains(&format!("clipped to {star}")), "{read}");
+        pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "clip": null }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(!read.contains("clipped to"), "{read}");
+        let _ = server.stop().await;
     }
 }
