@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-18 (session 78e7f30f): v0.26.2: large canvases.** `syncNodes` answers by bytes
+(`max_bytes`, `deferred`), so no document locks a store for new clients; a single document too
+big for one message is named with a sentence. Flatten, Merge Down and Merge Group work in tiles
+(about 1,024 units, one blob each, one undo; `flatten_layer` takes `scale`). Memory: the tile
+cache keeps its budget during a draw, the picture cache keeps 512 MB, freed heap goes back to
+the system (painting peak 3.9 GB -> 1.76 GB). MCP: `get_canvas` `layer`/`offset`/`limit` and
+sizes, `get_elements`, `export_canvas`, `copy_elements`, `copy_layer`, an 8 MB warning. Open: a
+coarse paint-tile level for far zoom-outs; the sync design (compaction by size, snapshots in
+parts, a document that cannot sync said in the app); the wave 6 contract for Joe; a tray mode
+so sync runs with the window closed (offered to Joe).
+
 **2026-11-18 (session 78e7f30f): v0.26.1, emergency: Personal stopped syncing.** The relay
 twin's encrypted log for "County map (illustrated)" (4.9 MB) hit the vault's 64 MiB log limit;
 its snapshot was refused at the 4 MiB blob limit; and the vault link took "snapshot required"
