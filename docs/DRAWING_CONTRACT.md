@@ -1019,7 +1019,7 @@ colors) over 1,920 × 1,080 units, 205 tiles at 2 px per unit:
 A profile of the cold replay: 42% stamping dabs, 25% laying strokes down, the rest
 compositing. **Cold replay is over a second**, so the design leans on the caches: the view
 replays only the tiles it shows (a painting seen at 100% on a laptop is a fraction of these
-205 tiles), every tile is kept in memory once replayed (256 MB budget by default, least
+205 tiles), every tile is kept in memory once replayed (512 MB budget by default, least
 recently used out first), the disk cache brings a reopened painting back in about a fifth
 of a cold replay, and Flatten (wave 5) is the answer for a history that has grown long. The
 stamp loop already only visits each row's span inside the circle; a falloff table and SIMD
@@ -1118,7 +1118,7 @@ Only new keys; a board made before painting needs nothing, and an older app igno
   `visible_extent()` includes shown paint; `markup_visible` off hides paint layers (as it
   hides every element that is not a picture).
 - **Tiles and cache** (`tiles`): `TILE_PX = 256`, `TILE_UNITS = 128.0`, `tile_rect(tx, ty)`,
-  `tiles_of(&Rect)`; `PaintCache::new() -> Arc<PaintCache>` (memory, 256 MB),
+  `tiles_of(&Rect)`; `PaintCache::new() -> Arc<PaintCache>` (memory, 512 MB),
   `PaintCache::with_store(Option<Arc<dyn TileStore>>, budget_bytes)`, `stats() ->
   CacheStats { replayed, appended, stacked, loaded, hits }`, `memory_bytes()`, `clear()`,
   `tile_pixels(&snapshot, layer, tx, ty, &pictures) -> Option<Vec<u8>>`. **The disk hook**:
@@ -1218,7 +1218,7 @@ Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not
     replacing "multiply over a picture or not").
 11. **Hiding markup hides the Highlights layer too** (the model's rule for every paint
     layer).
-12. **The tile cache**: 256 MB in memory; on the desktop a disk cache under the user's
+12. **The tile cache**: 512 MB in memory; on the desktop a disk cache under the user's
     cache folder, pruned to 512 MB when the app starts.
 
 - **Files**: `boards/paint.rs` (new: presets and settings, pressure, `[`/`]`, a stroke's
@@ -1299,7 +1299,7 @@ Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not
   and pictures in text (`text_boards::draw` hands each render's snapshot the shared
   cache, so a picture in text keeps its tiles between renders and shares them with a
   pane showing the same canvas: the model's "not built" line). Tiles are keyed by layer
-  and operations, so one cache for every board is safe; 256 MB. **Desktop**: a
+  and operations, so one cache for every board is safe; 512 MB. **Desktop**: a
   `DirTileStore` at `<cache dir>/pimble/tiles` (one folder for every board, as
   `DirTileStore` keys tiles), pruned to 512 MB on a background thread when the cache is
   first made (the first canvas shown in a run), not again per store opened. **Browser**:
@@ -1831,7 +1831,7 @@ and a paint layer of about 25,000 single-point dabs, on a canvas in the Personal
 
 ### Limits
 
-- Every JSON-RPC message, both ways, up to `pimble_rpc::MAX_MESSAGE_BYTES` (256 MiB): the
+- Every JSON-RPC message, both ways, up to `pimble_rpc::MAX_MESSAGE_BYTES` (512 MiB): the
   server (`max_request_body_size`, `max_response_body_size`) and the native client
   (`WsClientBuilder::max_request_size`/`max_response_size`); the browser's `WebSocket` has
   no limit to set. The hosted path adds none: jkbase's proxy splices the upgraded socket's
@@ -1905,7 +1905,7 @@ What held it, and the fixes:
    evicted once, at the end of a draw, and never anything used in that draw. A draw over
    the whole layer (the pane fitted to the map, a layer thumbnail, `render_canvas` of
    everything) replays every 256-pixel tile at full density: about 7,900 tiles of 256 KB
-   (512 KB more for the few still open) were all held, about 2.5 GB, far past the 256 MB
+   (512 KB more for the few still open) were all held, about 2.5 GB, far past the 512 MB
    budget. It now keeps to the budget as it goes (every 32 tiles, with what is already
    drawn allowed to go). `crates/pimble-board/examples/large_canvas_memory.rs` replays the
    session headless (a 1,920 × 1,080 view, 50 remote edits of 500 dabs, a thumbnail): live

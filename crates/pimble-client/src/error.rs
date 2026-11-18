@@ -94,6 +94,6 @@ mod tests {
         let (store, node) = (pimble_core::StoreId::new(), pimble_core::NodeId::new());
         let sentence = too_big_sentence(store, node);
         assert!(sentence.contains(&format!("pimble:{store}/{node}")), "{sentence}");
-        assert!(sentence.contains("flatten") && sentence.contains("256 MB"), "{sentence}");
+        assert!(sentence.contains("flatten") && sentence.contains(&format!("{} MB", pimble_rpc::MAX_MESSAGE_BYTES >> 20)), "{sentence}");
     }
 }

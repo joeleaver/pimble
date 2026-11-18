@@ -136,7 +136,7 @@ repair touched. `applyStoreUpdate` and `syncStoreDocument` go away.
   whole, as before. `PimbleClient::sync_nodes` asks with `SYNC_ANSWER_BYTES` (8 MiB) and
   re-asks what is deferred, so a large canvas travels alone; a request that still fails as
   too big (a server from before `max_bytes`) is asked again a document at a time, and a
-  single document past `MAX_MESSAGE_BYTES` (256 MiB, the limit on every message both
+  single document past `MAX_MESSAGE_BYTES` (512 MiB, the limit on every message both
   ways) is an error naming it (`pimble_client::too_big_sentence`).
 - **Vault**: `VaultDocId` is a node id; the `tree` document is gone. The vault link and the
   web vault client hold node documents and build the tree from them (the manifest's root

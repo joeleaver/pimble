@@ -229,12 +229,7 @@ impl PimbleServer {
                 .with_agents(agents.clone()),
         );
 
-        // One large canvas must not lock its store (docs/DRAWING_CONTRACT.md
-        // "Large canvases"): jsonrpsee's 10 MB default refused the answer
-        // that carried it with "Response is too big".
         let server = Server::builder()
-            .max_request_body_size(pimble_rpc::MAX_MESSAGE_BYTES)
-            .max_response_body_size(pimble_rpc::MAX_MESSAGE_BYTES)
             .set_http_middleware(http_middleware)
             // jsonrpsee's 10 MB defaults made a store whose one document
             // outgrew them unloadable for every new client (2026-11-18).

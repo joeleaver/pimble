@@ -843,14 +843,6 @@ pub struct HaveBlobsResponse {
 /// more; `PimbleClient::sync_nodes` splits a longer list.
 pub const MAX_SYNC_NODE_CONTENTS: usize = 100;
 
-/// The largest JSON-RPC message (request, answer or notification) a Pimble
-/// server and a native client take: 256 MiB, set on the server's
-/// `Server::builder()` and on `WsClientBuilder` both. jsonrpsee's default
-/// (10 MB) let one large canvas make its whole store unloadable for a fresh
-/// client (docs/DRAWING_CONTRACT.md "Large canvases"). The browser's
-/// `WebSocket` has no such limit to set.
-pub const MAX_MESSAGE_BYTES: u32 = 256 * 1024 * 1024;
-
 /// The most bytes of diffs `PimbleClient::sync_nodes` asks one `syncNodes`
 /// answer to carry ([`SyncNodesRequest::max_bytes`]); a document larger
 /// than this still comes, alone.

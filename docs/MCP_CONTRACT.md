@@ -68,7 +68,7 @@ depends on pimble-client), and both binaries call them:
 3. Otherwise `pimble-mcp` starts the embedded server itself and opens the stores in the
    app's saved list (`<config dir>/pimble/state.json`, `open_stores`), so the LLM sees
    what the person sees in the explorer.
-4. Every connection takes messages up to `pimble_rpc::MAX_MESSAGE_BYTES` (256 MiB) both
+4. Every connection takes messages up to `pimble_rpc::MAX_MESSAGE_BYTES` (512 MiB) both
    ways, the server's `Server::builder()` and the native `WsClientBuilder` alike (the
    browser's `WebSocket` has no limit to set); before 2026-11-18 jsonrpsee's 10 MB default
    applied, and one canvas past it made its store unloadable for every new connection
@@ -460,7 +460,7 @@ holds (a single-point brush dab measured at about 600 bytes stored) and scaled t
 document's real size for a canvas node. `list_stores` does not give a store's size (the
 server does not keep one; adding it would read every document).
 
-A message too large for the connection (a single document past 256 MB, now that the limit
+A message too large for the connection (a single document past 512 MB, now that the limit
 is not 10 MB) is a sentence naming the document and the way out (`flatten_layer`, or
 splitting), never jsonrpsee's "Response is too big" (`pimble_client::too_big_sentence`).
 
