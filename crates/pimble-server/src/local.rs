@@ -98,13 +98,41 @@ async fn probe(url: &str, addr: &str) -> Option<Found> {
             tracing::info!("The Pimble server on {} is version {}, older than this {}: asking it to hand over", addr, info.version, VERSION);
             match client.hand_over().await {
                 Ok(()) => Some(Found::HandingOver),
+                // Gone before it answered: it was already stopping (another
+                // process asked first), so wait for the port like any handover.
+                Err(e) if !answered(&e) => Some(Found::HandingOver),
                 Err(e) => Some(Found::TooOld(format!("An older Pimble server ({}) is running on {} and would not hand over ({e}). {}", info.version, addr, quit_hint(addr)))),
             }
         }
         Ok(info) => Some(Found::TooOld(format!("An older Pimble server ({}) is running on {}. {}", info.version, addr, quit_hint(addr)))),
-        // From before 0.12.2, which is when servers started saying.
-        Err(_) => Some(Found::TooOld(format!("An older Pimble server (from before 0.12.2) is running on {}. {}", addr, quit_hint(addr)))),
+        // From before 0.12.2, which is when servers started saying: only a
+        // server that answers "no such method" is one.
+        Err(e) if lacks_server_info(&e) => Some(Found::TooOld(format!("An older Pimble server (from before 0.12.2) is running on {}. {}", addr, quit_hint(addr)))),
+        // Anything else (the connection dropped between the two calls) is a
+        // server stopping, most often one handing over to a newer Pimble: not
+        // a server to use, and nothing to tell anyone to quit. The caller
+        // tries again (2026-11-18: two Braynard sessions were told to quit a
+        // "server from before 0.12.2" that was a 0.22.9 one mid-handover).
+        Err(e) => {
+            tracing::info!("The Pimble server on {} stopped answering while probed ({e}): trying again", addr);
+            None
+        }
     }
+}
+
+/// JSON-RPC's "method not found".
+const METHOD_NOT_FOUND: i32 = -32601;
+
+/// Whether `serverInfo` failed because the server has no such method: one
+/// from before 0.12.2. Every other failure is transient.
+fn lacks_server_info(e: &pimble_client::ClientError) -> bool {
+    matches!(e, pimble_client::ClientError::Server { code, .. } if *code == METHOD_NOT_FOUND)
+}
+
+/// Whether the server answered the call at all (with an error of its own),
+/// as against the connection failing under it.
+fn answered(e: &pimble_client::ClientError) -> bool {
+    matches!(e, pimble_client::ClientError::Server { .. })
 }
 
 /// Which process holds the port, as a sentence to act on.
@@ -306,6 +334,17 @@ pub fn add_open_store(path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod version_tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_method_means_a_server_from_before_0_12_2() {
+        use pimble_client::ClientError;
+        assert!(lacks_server_info(&ClientError::Server { code: METHOD_NOT_FOUND, message: "Method not found".into() }));
+        assert!(!lacks_server_info(&ClientError::Rpc("The background task closed".into())), "a dropped connection is a server stopping");
+        assert!(!lacks_server_info(&ClientError::NotConnected));
+        assert!(!lacks_server_info(&ClientError::Server { code: -32004, message: "Denied".into() }));
+        assert!(!answered(&ClientError::Rpc("connection closed".into())));
+        assert!(answered(&ClientError::Server { code: -32004, message: "This server does not hand over".into() }));
+    }
 
     #[test]
     fn versions_compare_as_numbers() {
