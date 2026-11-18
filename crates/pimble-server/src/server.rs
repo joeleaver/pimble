@@ -231,6 +231,10 @@ impl PimbleServer {
 
         let server = Server::builder()
             .set_http_middleware(http_middleware)
+            // jsonrpsee's 10 MB defaults made a store whose one document
+            // outgrew them unloadable for every new client (2026-11-18).
+            .max_request_body_size(pimble_rpc::MAX_MESSAGE_BYTES)
+            .max_response_body_size(pimble_rpc::MAX_MESSAGE_BYTES)
             .build(&self.config.addr)
             .await
             .map_err(|e| crate::ServerError::Server(e.to_string()))?;

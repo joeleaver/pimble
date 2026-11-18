@@ -246,6 +246,8 @@ async fn snapshot_drops_old_entries_and_survives_close_and_reopen() {
 
 #[tokio::test]
 async fn snapshot_required_once_the_log_hits_its_size_limit() {
+    // The limits as they were: every test in this binary was written within them.
+    pimble_store::vault::set_limits_for_tests(4 * 1024 * 1024, 64 * 1024 * 1024);
     let (_server, client) = start_server().await;
     let dir = tempfile::tempdir().unwrap();
     let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
@@ -276,6 +278,7 @@ async fn snapshot_required_once_the_log_hits_its_size_limit() {
 
 #[tokio::test]
 async fn append_refuses_a_blob_over_4_mib() {
+    pimble_store::vault::set_limits_for_tests(4 * 1024 * 1024, 64 * 1024 * 1024);
     let (_server, client) = start_server().await;
     let dir = tempfile::tempdir().unwrap();
     let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();

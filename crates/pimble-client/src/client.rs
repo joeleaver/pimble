@@ -172,7 +172,9 @@ impl PimbleClient {
     /// Open the WebSocket to `ws_url`, carrying `auth` in a request header.
     #[cfg(not(target_arch = "wasm32"))]
     async fn build_transport(ws_url: &Url, auth: &AuthMethod) -> Result<RpcClient> {
-        let mut builder = WsClientBuilder::default();
+        let mut builder = WsClientBuilder::default()
+            .max_request_size(pimble_rpc::MAX_MESSAGE_BYTES)
+            .max_response_size(pimble_rpc::MAX_MESSAGE_BYTES);
         match auth {
             AuthMethod::None => {}
             AuthMethod::Bearer { token } => {
