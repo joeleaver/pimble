@@ -669,6 +669,10 @@ pub struct SearchResultItem {
     /// ordinal), for deep-linking and highlighting. Empty when the hit is a
     /// whole-node keyword match with no specific location.
     pub path: String,
+    /// The headings the match sits under, outermost first (`SearchHit::section`
+    /// in pimble-search). Empty above every heading, or from an older server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub section: Vec<String>,
 }
 
 /// Response with search results

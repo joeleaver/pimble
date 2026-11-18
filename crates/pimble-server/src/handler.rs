@@ -5493,6 +5493,7 @@ impl PimbleApiServer for RpcHandler {
                 kind: hit.kind.clone(),
                 node_type,
                 path: hit.path.clone().unwrap_or_default(),
+                section: hit.section.clone(),
             });
         }
 

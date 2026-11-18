@@ -59,7 +59,12 @@ depends on pimble-client), and both binaries call them:
    the process holding the port ("An older Pimble server (from before 0.12.2) is running on
    127.0.0.1:7462. Quit pimble-mcp (process 2065674), then start Pimble again."). Added
    2026-10-21 after a `pimble-mcp` left running for a day from an older dev build served the
-   0.12.1 app, whose Discuss button then answered "method not found".
+   0.12.1 app, whose Discuss button then answered "method not found". Only a
+   `serverInfo` answered with "method not found" reads as a server from before 0.12.2; a
+   connection that drops during the probe, or during `handOver` (another process asked
+   first), is a server stopping, and the caller tries again as it does for a free port
+   (2026-11-18: two Braynard sessions were told to quit a "server from before 0.12.2" that
+   was a 0.22.9 server handing over to 0.23.0, and the calls cleared a minute later).
 3. Otherwise `pimble-mcp` starts the embedded server itself and opens the stores in the
    app's saved list (`<config dir>/pimble/state.json`, `open_stores`), so the LLM sees
    what the person sees in the explorer.
@@ -206,6 +211,15 @@ edit changes anything is now what merging it into the document as it was says,
 code was dropped without a word: rinch's `code` mark excludes them, so `check` refuses
 inline code inside any of them with a sentence that says how to write it instead.
 
+A heading (for `insert_after` with `after_section`, `replace_section`, `remove_section`,
+`get_node`'s `section` and `split_note`) is found one way, `markdown::find_heading`
+(2026-11-18): some of its text, where a heading whose text is the name exactly
+(`markdown::loose`: any case, punctuation and curly quotes ignored) wins over headings that
+only contain it; or a heading path, the headings from the outermost in joined by `" > "` (as
+search hits and outlines write them) or `"/"`, each one inside the section of the one
+before. Several matches are refused with each one's heading path, so the next call can
+name one.
+
 A quote names a block by its text, the way a deep link's quote does
 (`docs/LINKS_CONTRACT.md`, `quote`). It must match exactly one block; zero or several
 matches fail with a sentence that says which, and how many.
@@ -228,8 +242,8 @@ Read:
 | `list_stores` | open stores: id, name, kind, sync state, whether this device may write |
 | `list_children` | a node's children (title, id, type, child count), through mounts; with `depth` > 1, the subtree as an indented outline, each line carrying its id (a store row's root when given a store) |
 | `find_node` | nodes whose title matches (exact first, then prefix, then contains), each with its id and path; for "put this under the MEDICAL node" |
-| `get_node` | id, `pimble:` link, title, tags, path from the root, child count, and the content as Markdown |
-| `search` | keyword or semantic (`search`, `semantic` flag), with snippets |
+| `get_node` | id, `pimble:` link, title, tags, path from the root, child count, and the content as Markdown; or only part of it: `outline: true` (the headings, indented by level, each with its block number and its section's size in characters), `section` (one heading and its section, named as the section edits name one, heading paths included), `blocks` ("12" or "12-20", top-level blocks as the outline numbers them). A whole text note over 15,000 characters starts with one line giving its size and pointing at `outline` and `section`; all of it still follows |
+| `search` | keyword or semantic (`search`, `semantic` flag), with snippets; each hit says where in the note it is (`in: Design > The county's edges`), a heading path `get_node`'s `section` takes as it is. Without `store`, every open store is searched and the hits of the store this session last worked in come first (below) |
 | `resolve_link` | where a `pimble:` URL points now (follows `became`) |
 | `list_deleted` | a store's recently deleted nodes |
 | `get_metanode` | what a metanode shows (docs/METANODES_CONTRACT.md): its source's forest as an indented outline in the tree's order, each line with its link, under a sentence saying what it is; a node with no viewer is read as its children |
@@ -240,6 +254,7 @@ Write:
 | --- | --- |
 | `create_node` | a child of a node, with a title and optional Markdown content |
 | `append`, `insert_after`, `replace_section`, `replace_text`, `replace_block`, `remove_section`, `replace_content` | as above |
+| `split_note` | split a text note by its headings of one `level` (default: the highest level it has) into child notes, last among its children and in order, each titled with its heading and holding the section under it; the note keeps the rest, and with `links` a list of links to the new notes where the first section was (below) |
 | `rename`, `set_tags` | the node's title and tags |
 | `move_node` | within a store, or between stores (`transplantNode`); planned first with `pimble_core::plan::plan_move` through `pimble-api`, so it refuses what the explorer refuses with the same sentences (into itself, read only, a mount whose store is not open, beside a store) before sending, says the cross-store and share-leaving warnings in its answer, and takes several nodes with `nodes` (one `moveNodes`, all or none) |
 | `delete_node`, `undelete_node` | tombstone, put back |
@@ -422,6 +437,54 @@ a remote, closing or removing stores, signing in or out. Nothing is hosted unles
 person asked for it (CLAUDE.md), and an LLM asking is not the person asking. Signing in
 stays in the app's Account menu; when no account is signed in, the cloud tools answer
 "Sign in from Pimble's Account menu first."
+
+### Reading part of a note, and where a search hit is (2026-11-18)
+
+Measured over about 1,300 calls of another project's agents: long notes were read whole to
+find one section, search hits did not say where in a note they matched, a query that was a
+heading's exact words ranked that note last, and long notes were split by hand.
+
+- **`get_node` reads part of a note.** `outline: true` answers the metadata and the
+  headings only; `section` answers one heading and its section (`NodeDoc::section_markdown`
+  over `markdown::find_heading`); `blocks` a range of top-level blocks
+  (`NodeDoc::blocks_markdown`). Tables and discussions in that part are shown where they are,
+  as in a whole read. A whole text note over 15,000 characters starts with a line saying its
+  size and how to read less; it is never cut.
+- **Hits say where.** `SearchHit::section` (pimble-search, and `SearchResultItem::section`
+  over RPC, empty and left out when there is none) is the heading path above the match. The
+  index keeps each node's headings: `Node.headings` (one per line, `@fulltext`, english) and
+  `Node.outline` (block, offset in `text`, level and text per heading, from the node's
+  `IndexUnit`s). A keyword hit is placed where the query is in the text (the whole query,
+  else its first word that is not a stop word, which also moves the snippet there); a
+  semantic hit at its chunk's first block (`b:N`).
+- **Exact heading matches rank well.** The keyword query runs over `headings` too (weight
+  1.5 beside title 2 and text 1), and among the candidates a note whose title is the query
+  (`markdown::loose`) comes first, then one with a heading that is, then the rest in score
+  order, so the app's search gets it too. The test (`pimble-search/tests/headings.rs`): six
+  short notes that repeat "county" and "edges", and a long note with the heading "The
+  county's edges" among eleven; before, the long note ranked 7th of 7 for "The county's
+  edges", after, 1st, with `in: Design > The county's edges`, for that query in any case,
+  without the apostrophe, or with a curly one. **The schema changed**, so every store's
+  index is rebuilt once when it opens with this version (the `schema_hash` check in
+  `open_index_for_store`).
+- **The last store first.** Without `store`, `search` still searches every open store (Joe,
+  2026-11-18, option a), but the hits of the store this MCP process last read or wrote in
+  (any tool that named a node or a store in it: `Pimble::resolve`/`find_store` in
+  pimble-mcp, in memory only) come first, all of them before the others', each group in its
+  own score order; the answer's first line says so ("Hits from Family Management first (the
+  store this session last worked in); pass `store` to search one store."). Until a tool
+  names a store, and when that store has no hits, the ranking is unchanged and nothing is
+  said.
+- **`split_note`** (`Pimble::split_by_headings` in pimble-api, `NodeDoc::split_parts` and
+  `cut_parts`): every section is judged first on a copy (a section that cannot be written
+  writes nothing anywhere); then per section a `createNode` and an `applyEdit` that writes
+  its Markdown (the canvases' and sheets' `data` copied with it), then one `applyEdit` of the
+  note taking the sections out (and their canvases' and sheets' `data`) and putting the link
+  list where the first was. The note keeps its id and link. Content moves as Markdown, so
+  what Markdown cannot say about a block does not move, and a discussion anchored in a moved
+  section stays on the note. Tested on ten sections with tables, code, nested lists, quotes,
+  rules and subsections: each child's Markdown is byte for byte the section's before the
+  split, and the Markdown it was written with.
 
 ### Naming a node
 

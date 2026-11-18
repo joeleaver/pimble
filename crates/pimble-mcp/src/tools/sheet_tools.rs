@@ -504,7 +504,7 @@ impl Pimble {
     async fn list_tables(&self, Parameters(p): Parameters<ListTablesParams>) -> Result<String, String> {
         if let Some(reads) = &p.reads {
             let name = p.node.as_deref().ok_or("Name the node whose table is read, with `node`.")?;
-            let addr = self.api.resolve(name).await?;
+            let addr = self.resolve(name).await?;
             let node = self.api.node(addr).await?;
             let snap = sheets_of(&node);
             let target = find_table(&snap, reads)?.clone();
@@ -531,14 +531,14 @@ impl Pimble {
         let mut found: Vec<(Addr, Node, String)> = Vec::new();
         match (&p.node, &p.store) {
             (Some(name), _) => {
-                let addr = self.api.resolve(name).await?;
+                let addr = self.resolve(name).await?;
                 let node = self.api.node(addr).await?;
                 self.present(addr).await;
                 let path = self.api.path(addr).await;
                 found.push((addr, node, path));
             }
             (None, Some(store)) => {
-                let store = self.api.find_store(store).await?;
+                let store = self.find_store(store).await?;
                 found = self.walk_store(&store).await;
             }
             (None, None) => return Err("Name a node (`node`) or a store (`store`).".into()),
@@ -572,7 +572,7 @@ impl Pimble {
     /// for big tables.
     #[tool(name = "get_table")]
     async fn get_table(&self, Parameters(p): Parameters<GetTableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let limit = p.limit.unwrap_or(100).clamp(1, 1000);
         let equals: Vec<(String, String)> = p.filter.clone().unwrap_or_default().into_iter().collect();
         self.sheet_read(addr, &[], |w| {
@@ -588,7 +588,7 @@ impl Pimble {
     /// Formulas are Excel's; read sheet_formula_guide first.
     #[tool(name = "evaluate")]
     async fn evaluate(&self, Parameters(p): Parameters<EvaluateParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let formula = p.formula.trim().to_string();
         self.sheet_read(addr, &[&formula], |w| ops::evaluate(w, p.table.as_deref(), p.row.as_deref(), &formula))
             .await
@@ -607,7 +607,7 @@ impl Pimble {
     #[tool(name = "create_sheet")]
     async fn create_sheet(&self, Parameters(p): Parameters<CreateSheetParams>) -> Result<String, String> {
         // A node made under a mount lives in the mount's source store.
-        let parent = self.api.create_parent(self.api.resolve(&p.parent).await?).await?;
+        let parent = self.api.create_parent(self.resolve(&p.parent).await?).await?;
         let title = p.title.trim().to_string();
         if title.is_empty() {
             return Err("A title cannot be empty.".into());
@@ -626,7 +626,7 @@ impl Pimble {
     /// one edit. Formula columns are checked first (read sheet_formula_guide).
     #[tool(name = "create_table")]
     async fn create_table(&self, Parameters(p): Parameters<CreateTableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         let shown = shown_of(&p.columns);
         let shown = as_strs(&shown);
@@ -675,7 +675,7 @@ impl Pimble {
     /// that matches no row, is refused unless keep_as_typed.
     #[tool(name = "add_rows")]
     async fn add_rows(&self, Parameters(p): Parameters<AddRowsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| {
             let ids = ops::add_rows(w, &p.table, &p.rows, p.keep_as_typed, p.after.as_deref())?;
             Ok(format!("Added {} row(s) to {} (ids {}).", ids.len(), p.table, ids.join(", ")))
@@ -687,7 +687,7 @@ impl Pimble {
     /// Only the cells named are written; values as a person types them.
     #[tool(name = "update_rows")]
     async fn update_rows(&self, Parameters(p): Parameters<UpdateRowsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| {
             let n = ops::update_rows(w, &p.table, &p.updates, p.keep_as_typed)?;
             Ok(format!("Changed {n} cell(s) in {}.", p.table))
@@ -698,7 +698,7 @@ impl Pimble {
     /// Delete rows, by id or by their first column's value.
     #[tool(name = "delete_rows")]
     async fn delete_rows(&self, Parameters(p): Parameters<DeleteRowsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| {
             let n = ops::delete_rows(w, &p.table, &p.rows)?;
             Ok(format!("Deleted {n} row(s) from {}.", p.table))
@@ -713,7 +713,7 @@ impl Pimble {
     /// answers its first values. Read sheet_formula_guide first.
     #[tool(name = "add_column")]
     async fn add_column(&self, Parameters(p): Parameters<AddColumnParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let shown = shown_of(std::slice::from_ref(&p.column));
         let shown = as_strs(&shown);
         self.sheet_edit(addr, &shown, |w| ops::add_column(w, &p.table, &p.column)).await
@@ -724,7 +724,7 @@ impl Pimble {
     /// are checked as add_column checks them. Read sheet_formula_guide first.
     #[tool(name = "update_column")]
     async fn update_column(&self, Parameters(p): Parameters<UpdateColumnParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let spec = ColumnSpec {
             name: String::new(),
             ty: p.ty.clone(),
@@ -742,7 +742,7 @@ impl Pimble {
     /// Delete a column and its values; formulas that read it show #REF!.
     #[tool(name = "delete_column")]
     async fn delete_column(&self, Parameters(p): Parameters<ColumnParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| ops::delete_column(w, &p.table, &p.column)).await
     }
 
@@ -752,7 +752,7 @@ impl Pimble {
     /// answer shows its first rows. Read sheet_formula_guide first.
     #[tool(name = "set_summary")]
     async fn set_summary(&self, Parameters(p): Parameters<SetSummaryParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let formula = p.formula.trim().to_string();
         self.sheet_edit(addr, &[&formula], |w| ops::set_summary(w, &p.table, &formula, p.column_names.as_deref()))
             .await
@@ -765,7 +765,7 @@ impl Pimble {
     /// Table[[#Total],[column]], Table[[#Average],[column]].
     #[tool(name = "add_summary_row")]
     async fn add_summary_row(&self, Parameters(p): Parameters<AddSummaryRowParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let shown: Vec<String> = p.cells.values().filter(|v| v.trim_start().starts_with('=')).cloned().collect();
         let shown = as_strs(&shown);
         self.sheet_edit(addr, &shown, |w| ops::add_summary_row(w, &p.table, p.name.as_deref(), &p.cells)).await
@@ -775,7 +775,7 @@ impl Pimble {
     /// add_summary_row), or its place among the summary rows.
     #[tool(name = "update_summary_row")]
     async fn update_summary_row(&self, Parameters(p): Parameters<UpdateSummaryRowParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let shown: Vec<String> = p.cells.values().filter(|v| v.trim_start().starts_with('=')).cloned().collect();
         let shown = as_strs(&shown);
         self.sheet_edit(addr, &shown, |w| ops::update_summary_row(w, &p.table, &p.row, p.new_name.as_deref(), &p.cells, p.position.as_deref()))
@@ -785,7 +785,7 @@ impl Pimble {
     /// Remove a summary row; formulas that read it show #REF!.
     #[tool(name = "remove_summary_row")]
     async fn remove_summary_row(&self, Parameters(p): Parameters<SummaryRowParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| ops::remove_summary_row(w, &p.table, &p.row)).await
     }
 
@@ -794,7 +794,7 @@ impl Pimble {
     /// sees the grouping.
     #[tool(name = "group_table")]
     async fn group_table(&self, Parameters(p): Parameters<GroupTableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| ops::group_table(w, &p.table, p.column.as_deref())).await
     }
 
@@ -805,14 +805,14 @@ impl Pimble {
     /// building a comparison out of SWITCH/INDEX formulas.
     #[tool(name = "rotate_table")]
     async fn rotate_table(&self, Parameters(p): Parameters<RotateTableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| ops::rotate_table(w, &p.table, p.rotated)).await
     }
 
     /// Rename a table; formulas that read it show the new name.
     #[tool(name = "rename_table")]
     async fn rename_table(&self, Parameters(p): Parameters<RenameTableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.sheet_edit(addr, &[], |w| ops::rename_table(w, &p.table, &p.new_name)).await
     }
 
@@ -821,7 +821,7 @@ impl Pimble {
     /// link-to-a-node column, `[@project].rate`.
     #[tool(name = "get_fields")]
     pub(super) async fn get_fields(&self, Parameters(p): Parameters<super::NodeParam>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         self.present(addr).await;
         if node.metadata.fields.is_empty() {
@@ -835,7 +835,7 @@ impl Pimble {
     /// co-edited value, so only the fields named are written.
     #[tool(name = "set_fields")]
     pub(super) async fn set_fields(&self, Parameters(p): Parameters<SetFieldsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         if p.fields.keys().any(|n| n.trim().is_empty()) {
             return Err("A field needs a name.".into());
         }
@@ -866,7 +866,7 @@ impl Pimble {
     /// are computed as the app does.
     #[tool(name = "rows_pointing_here")]
     async fn rows_pointing_here(&self, Parameters(p): Parameters<RowsPointingHereParams>) -> Result<String, String> {
-        let target = self.api.resolve(&p.node).await?;
+        let target = self.resolve(&p.node).await?;
         // The walk is the API's, shared with the app's Properties panel.
         let mut out = String::new();
         for here in self.api.rows_pointing_here(target).await? {
@@ -892,7 +892,7 @@ impl Pimble {
     /// in the text goes too).
     #[tool(name = "delete_table")]
     async fn delete_table(&self, Parameters(p): Parameters<TableParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let mut book = self.api.sheet_book(addr, &[]).await?;
         let mut answer = String::new();
         let answer_ref = &mut answer;
@@ -920,12 +920,12 @@ impl Pimble {
     /// it (a link reaches its own note's rows only).
     #[tool(name = "move_table")]
     async fn move_table(&self, Parameters(p): Parameters<MoveTableParams>) -> Result<String, String> {
-        let from = self.api.resolve(&p.node).await?;
+        let from = self.resolve(&p.node).await?;
         let from_node = self.api.node(from).await?;
         let snap = sheets_of(&from_node);
         let table = find_table(&snap, &p.table)?.clone();
         let to = match &p.to {
-            Some(to) => self.api.resolve(to).await?,
+            Some(to) => self.resolve(to).await?,
             None => from,
         };
         let to_node = if to == from { from_node.clone() } else { self.api.node(to).await? };

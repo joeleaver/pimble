@@ -25,6 +25,26 @@ pub struct Joined {
     pub delta: Option<Vec<u8>>,
 }
 
+/// What splitting a note by its headings made: each section's new child, in
+/// order, with its title, and the heading level it split at.
+#[derive(Debug, Clone)]
+pub struct SplitByHeadings {
+    pub level: i64,
+    pub children: Vec<(Addr, String)>,
+}
+
+/// A title as the text of a Markdown link.
+fn link_text(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if matches!(c, '[' | ']' | '\\' | '*' | '_' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The parent of a text node that can be split or joined, or why it cannot.
 fn text_parent(doc: &NodeDoc) -> Result<NodeId, ApiError> {
     let fields = doc.fields()?;
@@ -66,6 +86,59 @@ impl Pimble {
         }
         let kept = self.edit(addr, move |doc, _| doc.split_off(&at).map(|_| ())).await?;
         Ok(Split { new, kept_delta: kept.delta })
+    }
+
+    /// Split the text note `addr` by its headings of `level` (the highest
+    /// level present when `None`): each such heading becomes a child of the
+    /// note, last among its children and in order, titled with the heading's
+    /// text and holding the section under it (as Markdown, with the canvases
+    /// and sheets in it); the note keeps everything else, and with `links` a
+    /// list of links to the new children where the first section was. Each
+    /// child is judged on a copy first, so a section that cannot be written
+    /// writes nothing anywhere. Made of the ordinary writes: a `createNode`
+    /// and an `applyEdit` per child, one `applyEdit` of the note, which keeps
+    /// its link.
+    pub async fn split_by_headings(&self, addr: Addr, level: Option<i64>, links: bool) -> Result<SplitByHeadings, ApiError> {
+        let doc = self.doc(addr).await?;
+        let fields = doc.fields()?;
+        if fields.node_type != node_types::DOCUMENT {
+            return Err(ApiError::refused("Only a text note can be split by its headings."));
+        }
+        if fields.deleted_at.is_some() {
+            return Err(ApiError::refused("That note was deleted."));
+        }
+        let split = doc.split_parts(level)?;
+        // Judged on copies: what each child's content will be.
+        for part in &split.parts {
+            if part.markdown.trim().is_empty() {
+                continue;
+            }
+            let mut copy = NodeDoc::new();
+            copy.copy_data_keys(&doc, &part.keys);
+            copy.write_markdown(&part.markdown).map_err(|e| {
+                ApiError::refused(format!("The section \"{}\" cannot be moved into a note of its own: {}", part.title, ApiError::from(e).sentence()))
+            })?;
+        }
+        let explicit = vec![(pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::Value::Bool(true))];
+        let mut children = Vec::with_capacity(split.parts.len());
+        for part in &split.parts {
+            let title = if part.title.is_empty() { "Untitled".to_string() } else { part.title.clone() };
+            let init = NodeInit { node_type: node_types::DOCUMENT.to_string(), title: title.clone(), content: None, custom: explicit.clone() };
+            let child = self.create(addr, Place::Last, init).await?;
+            if !part.markdown.trim().is_empty() {
+                let (from, keys, md) = (NodeDoc::load(&doc.save()).map_err(ApiError::unreadable)?, part.keys.clone(), part.markdown.clone());
+                self.edit(child, move |new, _| {
+                    new.copy_data_keys(&from, &keys);
+                    new.write_markdown(&md).map(drop)
+                })
+                .await?;
+            }
+            children.push((child, title));
+        }
+        let list = links.then(|| children.iter().map(|(a, t)| format!("- [{}]({})\n", link_text(t), a.link())).collect::<String>());
+        let level = split.level;
+        self.edit(addr, move |doc, _| doc.cut_parts(level, list.as_deref()).map(drop)).await?;
+        Ok(SplitByHeadings { level, children })
     }
 
     /// Join the node right below `addr` (its next sibling) into it: that

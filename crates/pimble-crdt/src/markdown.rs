@@ -487,14 +487,158 @@ fn block_index(doc: &Node, quote: &str) -> Result<usize> {
     Ok(find_quote(doc, quote, |_| true, "block")?.path[0])
 }
 
-/// The top-level heading a quote names, and its level.
-fn heading_index(doc: &Node, quote: &str) -> Result<(usize, i64)> {
-    let found = find_quote(doc, quote, |b| b.type_name() == "heading", "heading")?;
-    if found.path.len() != 1 {
-        return Err(refused(format!("The heading \"{quote}\" is inside another block, so it has no section.")));
+/// A heading's text made loose for comparing: lowercase, curly apostrophes and
+/// quotes straightened and then dropped with every other punctuation mark,
+/// whitespace collapsed. "The County’s Edges!" and "the countys edges" read the
+/// same. The search index compares a query with titles and headings this way too.
+pub fn loose(text: &str) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        let word: String = word.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect();
+        if word.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&word);
     }
-    let index = found.path[0];
-    Ok((index, doc.child(index).attrs().get_int("level").unwrap_or(1)))
+    out
+}
+
+/// One top-level heading of a document and the section under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    /// Its block's index among the document's top-level blocks.
+    pub index: usize,
+    /// 1 for `#`, 2 for `##`, ...
+    pub level: i64,
+    /// Its text (an atom in it as U+FFFC).
+    pub text: String,
+    /// The headings it sits under, then itself: what a heading path names.
+    pub path: Vec<String>,
+    /// Where its section ends: the next top-level heading of its level or
+    /// higher, or the end of the document (exclusive).
+    pub end: usize,
+}
+
+/// Every top-level heading of `doc`, in order, with its path and section.
+pub fn headings(doc: &Node) -> Vec<Heading> {
+    let mut out: Vec<Heading> = Vec::new();
+    let mut stack: Vec<(i64, String)> = Vec::new();
+    for (index, block) in doc.content().iter().enumerate() {
+        if block.type_name() != "heading" {
+            continue;
+        }
+        let level = block.attrs().get_int("level").unwrap_or(1);
+        let text = textblock_text(block);
+        while stack.last().is_some_and(|(l, _)| *l >= level) {
+            stack.pop();
+        }
+        stack.push((level, text.clone()));
+        out.push(Heading { index, level, text, path: stack.iter().map(|(_, t)| t.clone()).collect(), end: section_end(doc, index, level) });
+    }
+    out
+}
+
+/// How a heading path is written where one is shown (search hits, outlines):
+/// the headings from the outermost in, joined by " > ". Naming a section takes
+/// it as it is, or joined by "/".
+pub const PATH_SEPARATOR: &str = " > ";
+
+/// The headings among `among` one segment of a name names: those whose loose
+/// text equals the segment's, when any does; else those containing it as
+/// written; else those containing it in any case.
+fn named_by<'a>(among: impl Iterator<Item = &'a Heading> + Clone, segment: &str) -> Vec<&'a Heading> {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        return Vec::new();
+    }
+    let wanted = loose(segment);
+    let exact: Vec<&Heading> = among.clone().filter(|h| !wanted.is_empty() && loose(&h.text) == wanted).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let contains: Vec<&Heading> = among.clone().filter(|h| h.text.contains(segment)).collect();
+    if !contains.is_empty() {
+        return contains;
+    }
+    let lower = segment.to_lowercase();
+    among.filter(|h| h.text.to_lowercase().contains(&lower)).collect()
+}
+
+/// The headings a path of segments names: the first among all, each next one
+/// inside the section of the one before.
+fn named_by_path<'a>(all: &'a [Heading], segments: &[&str]) -> Vec<&'a Heading> {
+    let mut found: Vec<&Heading> = named_by(all.iter(), segments[0]);
+    for segment in &segments[1..] {
+        let mut next: Vec<&Heading> = Vec::new();
+        for outer in &found {
+            let inside = all.iter().filter(|h| h.index > outer.index && h.index < outer.end);
+            for h in named_by(inside, segment) {
+                if !next.iter().any(|n| n.index == h.index) {
+                    next.push(h);
+                }
+            }
+        }
+        found = next;
+    }
+    found
+}
+
+/// The segments of a heading path written with `" > "` or `"/"`, or none when
+/// `name` has neither.
+fn path_segments(name: &str) -> Option<Vec<&str>> {
+    let segments: Vec<&str> = if name.contains('>') { name.split('>').collect() } else { name.split('/').collect() };
+    (segments.len() > 1 && segments.iter().all(|s| !s.trim().is_empty())).then_some(segments)
+}
+
+/// The one top-level heading `name` names: some of its text (a heading whose
+/// text is exactly it, ignoring case and punctuation, wins over headings that
+/// merely contain it), or a heading path such as "Design/The county's edges"
+/// or "Design > The county's edges" for a heading inside another's section.
+/// No match and several are refusals; several are listed by their paths.
+/// The one way a section is found: reading one, inserting after one,
+/// replacing or removing one, and splitting a note by its headings.
+pub fn find_heading(doc: &Node, name: &str) -> Result<Heading> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(refused("Name the heading with some of its text."));
+    }
+    let all = headings(doc);
+    let mut found = named_by(all.iter(), name);
+    if found.len() != 1 {
+        if let Some(segments) = path_segments(name) {
+            let by_path = named_by_path(&all, &segments);
+            if by_path.len() == 1 || (found.is_empty() && !by_path.is_empty()) {
+                found = by_path;
+            }
+        }
+    }
+    match found.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => {
+            // A heading inside a quote or a list has no section of its own.
+            if find_quote(doc, name, |b| b.type_name() == "heading", "heading").is_ok() {
+                return Err(refused(format!("The heading \"{name}\" is inside another block, so it has no section.")));
+            }
+            Err(refused(format!("No heading in this node contains \"{name}\".")))
+        }
+        several => {
+            let listed: Vec<String> = several.iter().map(|h| format!("\"{}\"", h.path.join(PATH_SEPARATOR))).collect();
+            Err(refused(format!(
+                "\"{name}\" names {} headings in this node: {}. Give one of these heading paths so it names one.",
+                several.len(),
+                listed.join(", ")
+            )))
+        }
+    }
+}
+
+/// The top-level heading `name` names, and its level ([`find_heading`]).
+fn heading_index(doc: &Node, name: &str) -> Result<(usize, i64)> {
+    let h = find_heading(doc, name)?;
+    Ok((h.index, h.level))
 }
 
 /// Where the section under the heading at `index` ends: the next top-level heading of
@@ -506,6 +650,16 @@ fn section_end(doc: &Node, index: usize, level: i64) -> usize {
             block.type_name() == "heading" && block.attrs().get_int("level").unwrap_or(1) <= level
         })
         .unwrap_or(doc.child_count())
+}
+
+/// The top-level blocks `from..to` of `doc` as Markdown (empty for none).
+pub fn blocks_markdown(schema: &Schema, doc: &Node, from: usize, to: usize) -> Result<String> {
+    let to = to.min(doc.child_count());
+    if from >= to {
+        return Ok(String::new());
+    }
+    let blocks = doc.content().children()[from..to].to_vec();
+    Ok(render(&schema.branch("doc", Fragment::from_children(blocks)).map_err(collab)?))
 }
 
 // ── The edits, model before to model after ───────────────────────────────
@@ -598,6 +752,25 @@ pub(crate) fn remove_section(schema: &Rc<Schema>, doc: &Node, heading: &str) -> 
     let (index, level) = heading_index(doc, heading)?;
     let end = section_end(doc, index, level);
     let after = splice(doc, index, end, &[]);
+    with_blocks(schema, &after, after.content().children().to_vec())
+}
+
+/// Every top-level heading of `level` and the section under it, taken out;
+/// `links` (Markdown) goes where the first one was. Refused when there is
+/// none to take.
+pub(crate) fn cut_sections(schema: &Rc<Schema>, doc: &Node, level: i64, links: Option<&str>) -> Result<Node> {
+    let pieces: Vec<Heading> = headings(doc).into_iter().filter(|h| h.level == level).collect();
+    let Some(first) = pieces.first().map(|h| h.index) else {
+        return Err(refused(format!("This note has no level-{level} headings to split it at.")));
+    };
+    let mut after = doc.clone();
+    for h in pieces.iter().rev() {
+        after = splice(&after, h.index, h.end, &[]);
+    }
+    if let Some(md) = links.filter(|md| !md.trim().is_empty()) {
+        let blocks = parsed_blocks(schema, md)?;
+        after = splice(&after, first, first, &blocks);
+    }
     with_blocks(schema, &after, after.content().children().to_vec())
 }
 
@@ -920,6 +1093,36 @@ mod tests {
         let d = doc("# A\n\na1\n\n## A.1\n\na11\n\n# B\n\nb1");
         assert_eq!(render(&replace_section(&s, &d, "A.1", "fresh").unwrap()), "# A\n\na1\n\n## A.1\n\nfresh\n\n# B\n\nb1");
         assert_eq!(render(&replace_section(&s, &d, "B", "- x\n- y").unwrap()), "# A\n\na1\n\n## A.1\n\na11\n\n# B\n\n- x\n- y");
+    }
+
+    #[test]
+    fn a_section_is_named_by_its_text_or_its_heading_path() {
+        let s = schema();
+        let d = doc("# Design\n\nd\n\n## The county's edges\n\nedges\n\n## Roads\n\nr\n\n# History\n\n## The county's edges\n\nold edges\n\n## The county's edges, revisited\n\nnew");
+        // Several headings read the same: the refusal lists their paths.
+        let err = replace_section(&s, &d, "The county's edges", "x").unwrap_err().to_string();
+        assert!(err.contains("\"Design > The county's edges\"") && err.contains("\"History > The county's edges\""), "{err}");
+        // A path names one, with "/" or " > ", in any case and punctuation.
+        for name in ["Design/The county's edges", "Design > The county's edges", "design / the countys edges"] {
+            let h = find_heading(&d, name).unwrap();
+            assert_eq!(h.path, vec!["Design".to_string(), "The county's edges".to_string()], "{name}");
+        }
+        // An exact match beats one that only contains it.
+        assert_eq!(find_heading(&d, "History/The county's edges").unwrap().index, 7);
+        assert_eq!(render(&replace_section(&s, &d, "Design/The county's edges", "fresh").unwrap()).matches("fresh").count(), 1);
+        // A unique part of a heading still names it, as before.
+        assert_eq!(find_heading(&d, "revisited").unwrap().text, "The county's edges, revisited");
+        assert!(find_heading(&d, "Design/Nowhere").unwrap_err().to_string().contains("No heading"));
+        assert_eq!(loose("The County’s Edges!"), "the countys edges");
+    }
+
+    #[test]
+    fn cutting_sections_keeps_the_rest_and_puts_links_where_they_were() {
+        let s = schema();
+        let d = doc("intro\n\n# A\n\na1\n\n## A.1\n\na11\n\n# B\n\nb1");
+        assert_eq!(render(&cut_sections(&s, &d, 1, Some("- [A](pimble:x/y)")).unwrap()), "intro\n\n- [A](pimble:x/y)");
+        assert_eq!(render(&cut_sections(&s, &d, 2, None).unwrap()), "intro\n\n# A\n\na1\n\n# B\n\nb1");
+        assert!(cut_sections(&s, &d, 3, None).is_err());
     }
 
     #[test]

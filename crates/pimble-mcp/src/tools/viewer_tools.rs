@@ -241,7 +241,7 @@ impl Pimble {
     /// The viewer a settings call means, and refusals in words: the one named,
     /// which the node must be shown with, or the node's own.
     async fn settings_target(&self, node: &str, viewer: Option<&str>) -> Result<(Addr, String, String), String> {
-        let addr = self.api.resolve(node).await?;
+        let addr = self.resolve(node).await?;
         let n = self.api.node(addr).await?;
         let shown = n.metadata.metanode.as_ref().map(|m| m.viewer.clone());
         let name = label(&n);

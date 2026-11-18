@@ -52,4 +52,11 @@ pub struct SearchHit {
     /// The matched chunk's locator (see `IndexUnit::path`), when the hit
     /// resolved to a specific chunk. `None` for a whole-node keyword match.
     pub path: Option<String>,
+    /// The headings the match sits under, outermost first, ending with the
+    /// nearest one: for a keyword hit, the headings above where the query's
+    /// words are in the text (the heading itself when the query is a
+    /// heading); for a semantic hit, those above the matched chunk. Empty
+    /// when the match is above every heading or the node has none.
+    #[serde(default)]
+    pub section: Vec<String>,
 }

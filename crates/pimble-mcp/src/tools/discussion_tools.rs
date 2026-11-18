@@ -171,7 +171,7 @@ impl Pimble {
     /// The discussion named `name`: its address and node, refused when it is
     /// not a discussion.
     async fn discussion(&self, name: &str) -> Result<(Addr, Node), String> {
-        let addr = self.api.resolve(name).await?;
+        let addr = self.resolve(name).await?;
         let node = self.api.node(addr).await?;
         if node.node_type != node_types::DISCUSSION {
             return Err(format!("{} is not a discussion; list_discussions names a node's discussions.", label(&node)));
@@ -215,7 +215,7 @@ impl Pimble {
     /// and the latest), or say what a discussion node is.
     #[tool(name = "list_discussions")]
     async fn list_discussions(&self, Parameters(p): Parameters<ListDiscussionsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         self.present(addr).await;
         if node.node_type == node_types::DISCUSSION {
@@ -273,7 +273,7 @@ impl Pimble {
         let author = self.author().await;
         // Where on its host it is: a place in the host's text, named by a quote.
         let host = match &p.on {
-            Some(on) => Some(self.api.resolve(on).await?),
+            Some(on) => Some(self.resolve(on).await?),
             None => None,
         };
         let anchor = match (host, &p.after_text) {
@@ -321,7 +321,7 @@ impl Pimble {
                 Ok(answer)
             }
             (None, Some(parent)) => {
-                let parent = self.api.resolve(parent).await?;
+                let parent = self.resolve(parent).await?;
                 let addr = self.api.create(parent, pimble_core::Place::Last, init).await?;
                 Ok(format!("Created the discussion {}.", self.describe(addr).await))
             }

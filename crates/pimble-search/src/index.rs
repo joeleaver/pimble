@@ -30,6 +30,122 @@ use crate::schema::{compose_schema, schema_hash, SCHEMA_HASH_FILE};
 /// always returns its `k` best candidates, never "none."
 const SEMANTIC_MAX_DISTANCE: f32 = 0.65;
 
+/// How much a title match counts against a match in the text.
+const TITLE_WEIGHT: f32 = 2.0;
+/// How much a heading match counts against a match in the text (the same
+/// words are in the text too, so this is on top of it).
+const HEADING_WEIGHT: f32 = 1.5;
+
+/// The block a unit or chunk locator starts in: `"b:12"` and `"b:12/r:3"` are 12.
+fn block_of(path: &str) -> Option<u32> {
+    path.strip_prefix("b:")?.split('/').next()?.parse().ok()
+}
+
+/// One heading of a node, as the index keeps it (`Node.outline`).
+#[derive(Debug, Clone, PartialEq)]
+struct OutlineEntry {
+    block: Option<u32>,
+    /// Its byte offset in the node's indexed `text`, when it is found there.
+    offset: Option<usize>,
+    level: u8,
+    text: String,
+}
+
+/// A node's headings in order: what says which heading a hit is under.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Outline {
+    entries: Vec<OutlineEntry>,
+}
+
+impl Outline {
+    /// The headings among `units`, each placed in `text` (the units' text
+    /// joined by newlines, as the server builds it; searched for otherwise).
+    fn of(text: &str, units: &[IndexUnit]) -> Self {
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        let mut searched_from = 0usize;
+        for unit in units {
+            if let pimble_core::UnitKind::Heading(level) = unit.kind {
+                let heading = unit.text.replace(['\t', '\n'], " ");
+                let at = if text.get(offset..).is_some_and(|rest| rest.starts_with(unit.text.as_str())) {
+                    Some(offset)
+                } else {
+                    text.get(searched_from..).and_then(|rest| rest.find(unit.text.as_str())).map(|p| p + searched_from)
+                };
+                if let Some(at) = at {
+                    searched_from = at + unit.text.len();
+                }
+                if !heading.trim().is_empty() {
+                    entries.push(OutlineEntry { block: block_of(&unit.path), offset: at, level, text: heading.trim().to_string() });
+                }
+            }
+            offset += unit.text.len() + 1;
+        }
+        Self { entries }
+    }
+
+    /// The `headings` field: one heading per line.
+    fn headings_text(&self) -> String {
+        self.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The `outline` field.
+    fn encode(&self) -> String {
+        let num = |n: Option<String>| n.unwrap_or_else(|| "-".to_string());
+        self.entries
+            .iter()
+            .map(|e| format!("{}\t{}\t{}\t{}", num(e.block.map(|b| b.to_string())), num(e.offset.map(|o| o.to_string())), e.level, e.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `outline` field read back; a line it cannot read is left out.
+    fn decode(field: &str) -> Self {
+        let entries = field
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(4, '\t');
+                let block = parts.next()?.parse().ok();
+                let offset = parts.next()?.parse().ok();
+                let level = parts.next()?.parse().ok()?;
+                let text = parts.next()?.to_string();
+                Some(OutlineEntry { block, offset, level, text })
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// The path of headings ending with entry `i`: it and the ones above it.
+    fn path_to(&self, i: usize) -> Vec<String> {
+        let mut stack: Vec<&OutlineEntry> = Vec::new();
+        for e in &self.entries[..=i] {
+            while stack.last().is_some_and(|top| top.level >= e.level) {
+                stack.pop();
+            }
+            stack.push(e);
+        }
+        stack.into_iter().map(|e| e.text.clone()).collect()
+    }
+
+    /// The path of headings above the last entry `before` accepts.
+    fn last_path(&self, before: impl Fn(&OutlineEntry) -> bool) -> Vec<String> {
+        match self.entries.iter().rposition(before) {
+            Some(i) => self.path_to(i),
+            None => Vec::new(),
+        }
+    }
+
+    /// The headings above byte `at` of the text.
+    fn section_at_offset(&self, at: usize) -> Vec<String> {
+        self.last_path(|e| e.offset.is_some_and(|o| o <= at))
+    }
+
+    /// The headings above block `block` (or that block itself, a heading).
+    fn section_at_block(&self, block: u32) -> Vec<String> {
+        self.last_path(|e| e.block.is_some_and(|b| b <= block))
+    }
+}
+
 /// A node's projection into the index: what [`SearchIndex::upsert`] needs to
 /// create or update the `Node` object (and, with semantic search on, its
 /// `Chunk` children).
@@ -166,6 +282,9 @@ impl SearchIndex {
         fields.insert("kind".to_string(), Value::String(node.kind.clone()));
         fields.insert("title".to_string(), Value::String(node.title.clone()));
         fields.insert("text".to_string(), Value::String(node.text.clone()));
+        let outline = Outline::of(&node.text, &node.units);
+        fields.insert("headings".to_string(), Value::String(outline.headings_text()));
+        fields.insert("outline".to_string(), Value::String(outline.encode()));
         fields.insert("modified_at".to_string(), Value::I64(node.modified_at));
 
         let object_id = match existing {
@@ -479,23 +598,12 @@ impl SearchIndex {
 
     // -- search -------------------------------------------------------------
 
-    /// Run the same full-text query over `title` and `text`.
-    fn fulltext_both(
-        &self,
-        query: &str,
-        k: usize,
-    ) -> Result<(Vec<rhypedb_engine::fulltext::FulltextHit>, Vec<rhypedb_engine::fulltext::FulltextHit>)> {
-        let title = self
-            .db
-            .fulltext_search("Node", "title", query, k, None, None)
-            .map_err(map_fulltext_err)?
-            .hits;
-        let text = self
-            .db
-            .fulltext_search("Node", "text", query, k, None, None)
-            .map_err(map_fulltext_err)?
-            .hits;
-        Ok((title, text))
+    /// Run the same full-text query over `title`, `text` and `headings`.
+    fn fulltext_all(&self, query: &str, k: usize) -> Result<[Vec<rhypedb_engine::fulltext::FulltextHit>; 3]> {
+        let field = |name: &str| -> Result<Vec<rhypedb_engine::fulltext::FulltextHit>> {
+            Ok(self.db.fulltext_search("Node", name, query, k, None, None).map_err(map_fulltext_err)?.hits)
+        };
+        Ok([field("title")?, field("text")?, field("headings")?])
     }
 
     fn keyword_search(&self, query_text: &str, limit: usize) -> Result<Vec<SearchHit>> {
@@ -508,24 +616,28 @@ impl SearchIndex {
         // term. If the engine refuses the expansion (too short after analysis, or
         // more than its cap of distinct terms), fall back to the literal query.
         let typed = with_trailing_prefix(query_text);
-        let (title_hits, text_hits) = match self.fulltext_both(&typed, k) {
-            Ok(hits) if typed != query_text => hits,
+        let [title_hits, text_hits, heading_hits] = match self.fulltext_all(&typed, k) {
             Ok(hits) => hits,
-            Err(_) if typed != query_text => self.fulltext_both(query_text, k)?,
+            Err(_) if typed != query_text => self.fulltext_all(query_text, k)?,
             Err(e) => return Err(e),
         };
 
         let mut combined: HashMap<u64, f32> = HashMap::new();
         for h in &title_hits {
-            *combined.entry(h.object_id).or_insert(0.0) += h.score * 2.0;
+            *combined.entry(h.object_id).or_insert(0.0) += h.score * TITLE_WEIGHT;
         }
         for h in &text_hits {
             *combined.entry(h.object_id).or_insert(0.0) += h.score;
         }
+        for h in &heading_hits {
+            *combined.entry(h.object_id).or_insert(0.0) += h.score * HEADING_WEIGHT;
+        }
 
         let mut ranked: Vec<(u64, f32)> = combined.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(limit);
+        // Every candidate is judged for an exact title or heading before the
+        // cut, so one that BM25 put low still comes up.
+        ranked.truncate(k);
 
         let ids: Vec<u64> = ranked.iter().map(|(id, _)| *id).collect();
         let objects_by_id: HashMap<u64, Object> = self
@@ -536,13 +648,20 @@ impl SearchIndex {
             .map(|o| (o.id, o))
             .collect();
 
-        Ok(ranked
+        let wanted = pimble_crdt::markdown::loose(query_text);
+        let mut hits: Vec<(Exact, SearchHit)> = ranked
             .into_iter()
             .filter_map(|(id, score)| {
                 let obj = objects_by_id.get(&id)?;
-                node_hit(obj, score, query_text, "node", None)
+                keyword_hit(obj, score, query_text, &wanted)
             })
-            .collect())
+            .collect();
+        // A note titled exactly the query first, then one with a heading that
+        // is exactly it (ignoring case and punctuation), then the rest; each
+        // group in score order (the sort is stable).
+        hits.sort_by_key(|(exact, _)| std::cmp::Reverse(*exact));
+        hits.truncate(limit);
+        Ok(hits.into_iter().map(|(_, hit)| hit).collect())
     }
 
     fn semantic_search(&self, query_text: &str, k: usize) -> Result<Vec<SearchHit>> {
@@ -637,27 +756,54 @@ fn drop_hits_beyond_max_distance(mut hits: Vec<SimilarHit>) -> Vec<SimilarHit> {
     hits
 }
 
-fn node_hit(obj: &Object, score: f32, query_text: &str, kind: &str, path: Option<String>) -> Option<SearchHit> {
+fn string_field(obj: &Object, name: &str) -> String {
+    match obj.fields.get(name) {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// How exactly a node matched a query as a whole: its title, one of its
+/// headings, or neither (ordered so the better match is the greater).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Exact {
+    No,
+    Heading,
+    Title,
+}
+
+/// A keyword hit on a whole node: its snippet around where the query is in
+/// its text and the headings above that place. `wanted` is the query made
+/// [`pimble_crdt::markdown::loose`].
+fn keyword_hit(obj: &Object, score: f32, query_text: &str, wanted: &str) -> Option<(Exact, SearchHit)> {
     let node_id = match obj.fields.get("node_id") {
         Some(Value::String(s)) => NodeId::parse(s).ok()?,
         _ => return None,
     };
-    let title = match obj.fields.get("title") {
-        Some(Value::String(s)) => s.clone(),
-        _ => String::new(),
+    let title = string_field(obj, "title");
+    let text = string_field(obj, "text");
+    let outline = Outline::decode(&string_field(obj, "outline"));
+    let heading = (!wanted.is_empty())
+        .then(|| outline.entries.iter().position(|e| pimble_crdt::markdown::loose(&e.text) == wanted))
+        .flatten();
+    let exact = if !wanted.is_empty() && pimble_crdt::markdown::loose(&title) == wanted {
+        Exact::Title
+    } else if heading.is_some() {
+        Exact::Heading
+    } else {
+        Exact::No
     };
-    let text = match obj.fields.get("text") {
-        Some(Value::String(s)) => s.clone(),
-        _ => String::new(),
+    // Where the hit is: the heading the query names, else where its words are.
+    let at = heading.and_then(|i| outline.entries[i].offset).or_else(|| match_position(&text, query_text));
+    let section = match (heading, at) {
+        (Some(i), _) => outline.path_to(i),
+        (None, Some(at)) => outline.section_at_offset(at),
+        (None, None) => Vec::new(),
     };
-    Some(SearchHit {
-        node_id,
-        score,
-        title,
-        snippet: snippet_around(&text, query_text),
-        kind: kind.to_string(),
-        path,
-    })
+    Some((
+        exact,
+        SearchHit { node_id, score, title, snippet: snippet_at(&text, at), kind: "node".to_string(), path: None, section },
+    ))
 }
 
 /// `distance` is `SimilarHit::distance` from the hit `semantic_search` chose
@@ -689,6 +835,12 @@ fn chunk_hit(node_obj: &Object, chunk_obj: &Object, distance: f32) -> Option<Sea
         _ => None,
     };
     let score = 1.0 / (1.0 + distance.max(0.0));
+    // The chunk's first block, from its locator ("b:12", "b:12/r:3/c:1").
+    let block = path.as_deref().and_then(block_of);
+    let section = match block {
+        Some(block) => Outline::decode(&string_field(node_obj, "outline")).section_at_block(block),
+        None => Vec::new(),
+    };
     Some(SearchHit {
         node_id,
         score,
@@ -696,28 +848,49 @@ fn chunk_hit(node_obj: &Object, chunk_obj: &Object, distance: f32) -> Option<Sea
         snippet,
         kind,
         path,
+        section,
     })
 }
 
-/// First query term's window (about 160 chars) in `text`, or its first 160
-/// chars if the term isn't found (or the query is unparseable-for-snippet
-/// purposes, e.g. only phrase/`+`/quote syntax) — a best-effort preview,
-/// never an error. The window is snapped outward to whitespace on each side
-/// it doesn't already touch (so it never opens or closes mid-word), each such
-/// trimmed side gets an "…", and every cut stays on a UTF-8 char boundary.
+/// Where `query_text` is in `text` (a byte offset into it): the whole query,
+/// in any case; else its first word that is not a stop word; else its first
+/// word. `None` when none of them is in it (or the query is only syntax).
+fn match_position(text: &str, query_text: &str) -> Option<usize> {
+    // Lowercasing can change a text's length (rarely); a position found in
+    // the lowercased text is then near, not at, the place, and kept on a
+    // char boundary of the original.
+    let lower_text = text.to_lowercase();
+    let terms: Vec<String> = query_text
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| c == '+' || c == '"' || c == '*').to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let whole = terms.join(" ");
+    let found = (terms.len() > 1)
+        .then(|| lower_text.find(&whole))
+        .flatten()
+        .or_else(|| terms.iter().filter(|t| !PREFIX_STOP_WORDS.contains(&t.as_str())).find_map(|t| lower_text.find(t.as_str())))
+        .or_else(|| terms.first().and_then(|t| lower_text.find(t.as_str())))?;
+    Some(floor_boundary(text, found))
+}
+
+/// [`snippet_at`] around where the query is in `text`.
+#[cfg(test)]
 fn snippet_around(text: &str, query_text: &str) -> String {
+    snippet_at(text, match_position(text, query_text))
+}
+
+/// A window of about 160 chars of `text` around byte `at`, or its first 160
+/// chars without one: a best-effort preview, never an error. The window is
+/// snapped outward to whitespace on each side it doesn't already touch (so it
+/// never opens or closes mid-word), each such trimmed side gets an "…", and
+/// every cut stays on a UTF-8 char boundary.
+fn snippet_at(text: &str, at: Option<usize>) -> String {
     const WINDOW: usize = 160;
     if text.is_empty() {
         return String::new();
     }
-    let lower_text = text.to_lowercase();
-    let first_term = query_text
-        .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| c == '+' || c == '"').to_lowercase())
-        .find(|t| !t.is_empty());
-
-    let pos = first_term.and_then(|t| lower_text.find(&t));
-    let (start, end) = match pos {
+    let (start, end) = match at {
         Some(byte_pos) => (
             byte_pos.saturating_sub(WINDOW / 2),
             (byte_pos + WINDOW / 2).min(text.len()),
@@ -991,5 +1164,31 @@ mod tests {
         let snippet = snippet_around(&text, "keyword");
         assert!(!snippet.is_empty());
         assert!(snippet.contains("keyword"));
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+    use pimble_core::UnitKind;
+
+    #[test]
+    fn an_outline_places_headings_and_reads_back() {
+        let units = vec![
+            IndexUnit::new(UnitKind::Prose, "b:0", "intro"),
+            IndexUnit::new(UnitKind::Heading(1), "b:1", "Design"),
+            IndexUnit::new(UnitKind::Prose, "b:2", "body"),
+            IndexUnit::new(UnitKind::Heading(2), "b:3", "Edges"),
+            IndexUnit::new(UnitKind::Heading(1), "b:4", "Budget"),
+        ];
+        let text = "intro\nDesign\nbody\nEdges\nBudget";
+        let outline = Outline::of(text, &units);
+        assert_eq!(Outline::decode(&outline.encode()), outline);
+        assert_eq!(outline.entries[1].offset, Some(text.find("Edges").unwrap()));
+        assert_eq!(outline.section_at_block(3), vec!["Design", "Edges"]);
+        assert_eq!(outline.section_at_block(2), vec!["Design"]);
+        assert_eq!(outline.section_at_block(0), Vec::<String>::new());
+        assert_eq!(outline.section_at_offset(text.find("Budget").unwrap()), vec!["Budget"]);
+        assert_eq!(block_of("b:12/r:3/c:1"), Some(12));
     }
 }

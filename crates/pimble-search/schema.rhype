@@ -10,6 +10,13 @@ type Node {
     kind: String
     title: String @fulltext(analyzer: "english")
     text: String @fulltext(analyzer: "english")
+    // The node's headings, one per line: searched beside title and text, so a
+    // query that is a heading's words finds the note with that heading.
+    headings: String @fulltext(analyzer: "english")
+    // Where each heading is, one per line: "block\toffset in text\tlevel\ttext"
+    // (`pimble_search::index` writes and reads it), so a hit can say which
+    // heading it sits under.
+    outline: String
     modified_at: i64
     // A to-one relation with no @on_delete defaults to Deny (rhypedb only
     // defaults an *unspecified* policy to Remove for a to-many field); an

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use pimble_api::names::{label, stop_sentence, store_tops};
 use pimble_api::rpc::RpcBackend;
 use pimble_api::{recipes, Addr, ApiError, Edited, Pimble as Api};
-use pimble_core::{LinkResolution, Node, PimbleUrl, Place, Store, StoreAccess, StoreKind, SyncState};
+use pimble_core::{LinkResolution, Node, PimbleUrl, Place, Store, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::{CrdtError, NodeDoc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,6 +29,8 @@ mod discussion_tools;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
+mod large_notes_tests;
+#[cfg(test)]
 mod presence_tests;
 mod sheet_tools;
 mod viewer_tools;
@@ -45,6 +47,17 @@ titles from the store's name such as \"Family Management/MEDICAL\" (or from anyw
 the tool says so and lists the links to choose from. Use list_stores and list_children (with \
 depth for an outline) or find_node to discover where things are.
 
+Long notes: get_node with outline: true lists a note's headings (indented, each with its \
+block number and its section's size) and section reads one heading's section, by some of its \
+text or a heading path such as \"Design/The county's edges\" or \"Design > The county's \
+edges\"; blocks reads a range of blocks (\"12-20\"). A whole note over 15,000 characters says \
+so first. search finds notes by words or meaning; each hit's `in:` line is the heading path \
+of where it matched, to pass to get_node as section, and a note whose title or a heading is \
+exactly the query comes first. Without store, search looks in every open store and lists the \
+hits of the store you last worked in first; pass store to search one. split_note splits a \
+note by its headings into child notes, one per section, the note keeping its link and what \
+comes before the first heading.
+
 Content is Markdown: headings, paragraphs, bold, italic, strikethrough, inline code, links, \
 fenced code, bullet and numbered lists (nested), block quotes, pipe tables, horizontal \
 rules. Underline, highlight, text colour, subscript and superscript are the HTML tags <u>, \
@@ -56,7 +69,8 @@ images, task lists, footnotes and any other HTML are refused with a sentence nam
 written then. Link to another node with its pimble: link as the href.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
-section), replace_section (the blocks under a heading), replace_text (an exact quote inside \
+section), replace_section (the blocks under a heading; a heading is named as get_node's \
+section names one), replace_text (an exact quote inside \
 one paragraph, plain text), replace_block (one block replaced, or removed with empty \
 Markdown: a heading removed or re-levelled), remove_section (a heading and everything under \
 it). A quote must appear exactly once in the node. For restructuring, replace_content \
@@ -125,6 +139,10 @@ pub struct Pimble {
     /// connection, so the server judges them by its grant. None for an API
     /// handed in (the presence tests), whose plugins then run no tools.
     tool_backend: Option<Arc<dyn pimble_api::Backend>>,
+    /// The store this process last read or wrote in (any tool that named a
+    /// node or a store in it): an unscoped search ranks its hits first
+    /// (docs/MCP_CONTRACT.md, "search"). In memory only.
+    last_store: std::sync::Mutex<Option<StoreId>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -159,8 +177,33 @@ impl Pimble {
         Self {
             api: Arc::new(api),
             tool_backend: None,
+            last_store: std::sync::Mutex::new(None),
             tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router() + Self::viewer_router(),
         }
+    }
+
+    /// The node a tool's argument names ([`Api::resolve`]); its store is then
+    /// the one this session last worked in.
+    async fn resolve(&self, name: &str) -> Result<Addr, ApiError> {
+        let addr = self.api.resolve(name).await?;
+        self.worked_in(addr.store);
+        Ok(addr)
+    }
+
+    /// The store a tool's argument names ([`Api::find_store`]), which is then
+    /// the one this session last worked in.
+    async fn find_store(&self, name: &str) -> Result<Store, ApiError> {
+        let store = self.api.find_store(name).await?;
+        self.worked_in(store.id);
+        Ok(store)
+    }
+
+    fn worked_in(&self, store: StoreId) {
+        *self.last_store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
+    }
+
+    fn last_store(&self) -> Option<StoreId> {
+        *self.last_store.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Say this agent is in `addr` (a tool read it), keeping its caret there.
@@ -195,6 +238,50 @@ impl Pimble {
         format!("{} ({})", self.api.path(addr).await, addr.link())
     }
 
+    /// What get_node says of a node before its content: title, link, path,
+    /// type, tags, fields, children, discussions, modified, access, and what
+    /// kind of node it is when that matters.
+    async fn node_header(&self, addr: Addr, node: &Node) -> String {
+        let mut out = format!(
+            "title: {}\nlink: {}\npath: {}\ntype: {}\n",
+            label(node),
+            addr.link(),
+            self.api.path(addr).await,
+            type_name(node)
+        );
+        if !node.metadata.tags.is_empty() {
+            out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));
+        }
+        if !node.metadata.fields.is_empty() {
+            let fields: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("{n} = {v}")).collect();
+            out.push_str(&format!("fields: {}\n", fields.join("; ")));
+        }
+        out.push_str(&format!("children: {}\n", node.children.len()));
+        if node.attachments > 0 {
+            out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
+        }
+        out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
+        match node.access {
+            StoreAccess::Read => out.push_str("access: read-only\n"),
+            StoreAccess::Comment => out.push_str("access: comment-only (start_discussion and reply work here)\n"),
+            StoreAccess::Full => {}
+        }
+        if let Some(metanode) = &node.metadata.metanode {
+            // docs/METANODES_CONTRACT.md section 3: what it shows, and how.
+            out.push_str(&format!(
+                "({}; get_metanode lists what it shows; list_viewers says what its viewer reads and takes; get_viewer_settings shows its settings)\n",
+                metanode.describe(&label(node))
+            ));
+            if let Some(why) = metanode.source.not_understood() {
+                out.push_str(&format!("({why})\n"));
+            }
+        }
+        if node.metadata.custom.contains_key("mount") || node.node_type == "mount" {
+            out.push_str("(a mount: its children are another store's; list_children shows them)\n");
+        }
+        out
+    }
+
     /// A query metanode's source from what an agent gave (docs/QUERY_METANODES_CONTRACT.md
     /// section 3), with its nodes and stores named as the source names them.
     async fn match_source(&self, q: &MatchParams) -> Result<pimble_core::metanode::Source, String> {
@@ -202,10 +289,10 @@ impl Pimble {
         let within = match q.within.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
             None => None,
             Some(w) if w.eq_ignore_ascii_case("everywhere") => Some(Within::Everywhere),
-            Some(w) => match self.api.find_store(w).await {
+            Some(w) => match self.find_store(w).await {
                 Ok(store) => Some(Within::Store(store.id)),
                 Err(_) => {
-                    let under = self.api.resolve(w).await?;
+                    let under = self.resolve(w).await?;
                     Some(Within::Under(node_ref(under.store, under.node)))
                 }
             },
@@ -238,7 +325,7 @@ impl Pimble {
                 }
                 Condition::Field { field: field.clone(), is, value: c.value.clone() }
             } else if let Some(node) = &c.links_to {
-                let target = self.api.resolve(node).await?;
+                let target = self.resolve(node).await?;
                 Condition::LinksTo { links_to: node_ref(target.store, target.node) }
             } else {
                 Condition::Type { node_type: c.node_type.clone().unwrap_or_default() }
@@ -267,6 +354,41 @@ impl Pimble {
 pub struct NodeParam {
     /// The node: a pimble: link, a node id, or a path like "Store/Folder/Note".
     pub node: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetNodeParams {
+    /// The node: a pimble: link, a node id, or a path like "Store/Folder/Note".
+    pub node: String,
+    /// Read only one heading and its section: some of the heading's text, or a
+    /// heading path such as "Design/The county's edges" (or "Design > The
+    /// county's edges", as search hits and the outline write it) for a heading
+    /// inside another's section. Several headings that match are listed.
+    #[serde(default)]
+    pub section: Option<String>,
+    /// Read only the outline: every heading, indented by level, with its block
+    /// number and its section's size in characters, and the node's metadata.
+    /// For a long note, read this first, then a `section`.
+    #[serde(default)]
+    pub outline: bool,
+    /// Read only these top-level blocks, numbered from 0 as the outline numbers
+    /// them: "12" or "12-20" (both ends included).
+    #[serde(default)]
+    pub blocks: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SplitNoteParams {
+    /// The text note to split.
+    pub node: String,
+    /// The heading level to split at (1 for "#", 2 for "##", ...). Leave it out
+    /// for the highest level the note has.
+    #[serde(default)]
+    pub level: Option<u8>,
+    /// Leave a list of links to the new notes in the note, where the first
+    /// section was.
+    #[serde(default)]
+    pub links: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -341,7 +463,8 @@ pub struct InsertAfterParams {
     /// Text that appears in exactly one block of the node: the new content goes after
     /// that block (a list item's text names its whole list).
     pub after: String,
-    /// When `after` names a heading: go after the whole section under it instead.
+    /// When `after` names a heading: go after the whole section under it instead
+    /// (`after` may then be a heading path, as get_node's `section` takes).
     #[serde(default)]
     pub after_section: bool,
     /// What to insert, as Markdown.
@@ -352,7 +475,9 @@ pub struct InsertAfterParams {
 pub struct ReplaceSectionParams {
     /// The node.
     pub node: String,
-    /// Text of the heading whose section is replaced; the heading itself stays.
+    /// The heading whose section is replaced (the heading itself stays): some of
+    /// its text, or a heading path such as "Design/Roads" for one inside another's
+    /// section, as get_node's `section` takes.
     pub heading: String,
     /// The section's new content, as Markdown.
     pub markdown: String,
@@ -385,7 +510,8 @@ pub struct ReplaceBlockParams {
 pub struct RemoveSectionParams {
     /// The node.
     pub node: String,
-    /// Text of the heading to remove, together with everything under it.
+    /// The heading to remove, together with everything under it: some of its
+    /// text, or a heading path, as get_node's `section` takes.
     pub heading: String,
 }
 
@@ -549,9 +675,9 @@ impl Pimble {
     async fn list_children(&self, Parameters(p): Parameters<ListChildrenParams>) -> Result<String, String> {
         let depth = p.depth.unwrap_or(1).clamp(1, 6);
         // A store with several shared roots lists them as its top level.
-        let tops = match self.api.find_store(&p.node).await {
+        let tops = match self.find_store(&p.node).await {
             Ok(store) if !store.roots.is_empty() => store_tops(&store),
-            _ => vec![self.api.resolve(&p.node).await?],
+            _ => vec![self.resolve(&p.node).await?],
         };
         let stores = self.api.known_stores().await?;
         let mut out = String::new();
@@ -577,7 +703,7 @@ impl Pimble {
             return Err("Give some of the title to look for.".into());
         }
         let searched: Vec<Store> = match &p.store {
-            Some(name) => vec![self.api.find_store(name).await?],
+            Some(name) => vec![self.find_store(name).await?],
             None => self.api.known_stores().await?,
         };
         // (rank, path, link): 0 exact, 1 prefix, 2 contains.
@@ -615,54 +741,70 @@ impl Pimble {
     }
 
     /// A node: its link, path, title, tags, number of children, and content as
-    /// Markdown.
+    /// Markdown. For a long note, `outline: true` lists its headings with their
+    /// sizes, and `section` reads one heading's section (a search hit's `in:`
+    /// line is a heading path `section` takes as it is); `blocks` reads a range
+    /// of blocks.
     #[tool(name = "get_node")]
-    async fn get_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+    async fn get_node(&self, Parameters(p): Parameters<GetNodeParams>) -> Result<String, String> {
+        let addr = self.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         self.present(addr).await;
         let doc = NodeDoc::load(&node.content).map_err(|e| e.to_string())?;
+        let mut out = self.node_header(addr, &node).await;
+        let part = p.section.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let blocks = p.blocks.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if p.outline || part.is_some() || blocks.is_some() {
+            if [p.outline, part.is_some(), blocks.is_some()].iter().filter(|x| **x).count() > 1 {
+                return Err("Give one of `outline`, `section` and `blocks`.".into());
+            }
+            let special = [pimble_core::node_types::DISCUSSION, pimble_core::node_types::BOARD, pimble_core::node_types::SHEET];
+            if special.contains(&node.node_type.as_str()) {
+                return Err(format!("A {} has no headings to read by; read it whole.", type_name(&node)));
+            }
+            if p.outline {
+                out.push_str("---\n");
+                out.push_str(&outline_of(&doc).map_err(crdt)?);
+                return Ok(out);
+            }
+            let (said, md) = match (part, blocks) {
+                (Some(name), _) => {
+                    let (heading, md) = doc.section_markdown(name).map_err(crdt)?;
+                    let total = doc.outline().map_err(crdt)?.blocks;
+                    (
+                        format!(
+                            "section: {} (blocks {}-{} of 0-{}; {} characters)\n",
+                            heading.path.join(pimble_crdt::markdown::PATH_SEPARATOR),
+                            heading.index,
+                            heading.end.saturating_sub(1),
+                            total.saturating_sub(1),
+                            md.chars().count()
+                        ),
+                        md,
+                    )
+                }
+                (None, Some(range)) => {
+                    let (from, to) = block_range(range)?;
+                    let (md, total) = doc.blocks_markdown(from, to).map_err(crdt)?;
+                    let to = to.min(total.saturating_sub(1));
+                    (format!("blocks: {from}-{to} of 0-{} ({} characters)\n", total.saturating_sub(1), md.chars().count()), md)
+                }
+                (None, None) => unreachable!(),
+            };
+            out.push_str(&said);
+            out.push_str("---\n");
+            let md = self.inline_discussions(&md).await;
+            // A part of the text: the tables it holds are shown where they are,
+            // and the note's other tables are not this part's to list.
+            let (md, _) = self.tables_in_text(addr, &node, &md).await;
+            out.push_str(md.trim_end());
+            out.push('\n');
+            return Ok(out);
+        }
         let content = match doc.markdown() {
             Ok(md) => md,
             Err(_) => format!("(formatting left out: this content cannot be shown as Markdown)\n\n{}", doc.text()),
         };
-        let mut out = format!(
-            "title: {}\nlink: {}\npath: {}\ntype: {}\n",
-            label(&node),
-            addr.link(),
-            self.api.path(addr).await,
-            type_name(&node)
-        );
-        if !node.metadata.tags.is_empty() {
-            out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));
-        }
-        if !node.metadata.fields.is_empty() {
-            let fields: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("{n} = {v}")).collect();
-            out.push_str(&format!("fields: {}\n", fields.join("; ")));
-        }
-        out.push_str(&format!("children: {}\n", node.children.len()));
-        if node.attachments > 0 {
-            out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
-        }
-        out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
-        match node.access {
-            StoreAccess::Read => out.push_str("access: read-only\n"),
-            StoreAccess::Comment => out.push_str("access: comment-only (start_discussion and reply work here)\n"),
-            StoreAccess::Full => {}
-        }
-        if let Some(metanode) = &node.metadata.metanode {
-            // docs/METANODES_CONTRACT.md section 3: what it shows, and how.
-            out.push_str(&format!(
-                "({}; get_metanode lists what it shows; list_viewers says what its viewer reads and takes; get_viewer_settings shows its settings)\n",
-                metanode.describe(&label(&node))
-            ));
-            if let Some(why) = metanode.source.not_understood() {
-                out.push_str(&format!("({why})\n"));
-            }
-        }
-        if node.metadata.custom.contains_key("mount") || node.node_type == "mount" {
-            out.push_str("(a mount: its children are another store's; list_children shows them)\n");
-        }
         out.push_str("---\n");
         let tables = if node.node_type == pimble_core::node_types::DISCUSSION {
             out.push_str("(a discussion: its content is its messages)\n");
@@ -676,6 +818,23 @@ impl Pimble {
             out.push_str("(a sheet node: its content is its tables)\n");
             self.tables_of_node(addr, &node).await.map(|t| ("Tables", t))
         } else {
+            // A long note says so first, and how to read less of it; all of it
+            // still follows.
+            let size = content.chars().count();
+            if size > LONG_NOTE {
+                let headings = doc.outline().map(|o| o.sections.len()).unwrap_or(0);
+                out.insert_str(
+                    0,
+                    &format!(
+                        "(This note is {size} characters long{}; get_node with `outline: true` lists its headings and their sizes, and `section` reads one. The whole note follows.)\n",
+                        match headings {
+                            0 => String::new(),
+                            1 => " with 1 heading".to_string(),
+                            n => format!(" with {n} headings"),
+                        }
+                    ),
+                );
+            }
             // A text node's tables are shown where they are in its text.
             let content = self.inline_discussions(&content).await;
             let (content, lost) = self.tables_in_text(addr, &node, &content).await;
@@ -696,24 +855,54 @@ impl Pimble {
         Ok(out)
     }
 
-    /// Search the open stores, by words or (with `semantic`) by meaning.
+    /// Search the open stores, by words or (with `semantic`) by meaning. Each
+    /// hit says where in the note it is (`in: Design > The county's edges`): a
+    /// heading path to pass to get_node as `section`, to read just that part.
+    /// A note with a heading (or title) that is exactly the query comes first.
+    /// Without `store`, every open store is searched, and the hits from the
+    /// store this session last read or wrote in come first.
     #[tool(name = "search")]
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> Result<String, String> {
         let only = match &p.store {
-            Some(name) => vec![self.api.find_store(name).await?.id],
+            Some(name) => vec![self.find_store(name).await?.id],
             None => Vec::new(),
         };
         let limit = p.limit.unwrap_or(20).clamp(1, 50);
-        let results = self.api.search(&p.query, only, p.semantic, limit).await?;
+        let mut results = self.api.search(&p.query, only, p.semantic, limit).await?;
+        // Unscoped: the store this session last worked in first, its hits in
+        // their own order, then everyone else's in theirs.
+        let mut favored = None;
+        if let (None, Some(store)) = (&p.store, self.last_store()) {
+            let mine = self.api.search(&p.query, vec![store], p.semantic, limit).await.unwrap_or_default();
+            if !mine.is_empty() {
+                let others: Vec<_> = results.into_iter().filter(|r| r.store_id != store).collect();
+                results = mine.into_iter().chain(others).take(limit).collect();
+                favored = Some(store);
+            }
+        }
         if results.is_empty() {
             return Ok(format!("Nothing matches \"{}\".", p.query));
         }
         let mut out = String::new();
+        if let Some(store) = favored {
+            let name = self
+                .api
+                .known_stores()
+                .await
+                .ok()
+                .and_then(|stores| stores.into_iter().find(|s| s.id == store).map(|s| s.name))
+                .unwrap_or_else(|| store.to_string());
+            out.push_str(&format!("Hits from {name} first (the store this session last worked in); pass `store` to search one store.\n"));
+        }
         for r in results {
             let addr = Addr { store: r.store_id, node: r.node_id };
             let path = self.api.path(addr).await;
             let snippet: String = r.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-            out.push_str(&format!("- {path} ({})\n  {snippet}\n", addr.link()));
+            out.push_str(&format!("- {path} ({})\n", addr.link()));
+            if !r.section.is_empty() {
+                out.push_str(&format!("  in: {}\n", r.section.join(pimble_crdt::markdown::PATH_SEPARATOR)));
+            }
+            out.push_str(&format!("  {snippet}\n"));
         }
         Ok(out)
     }
@@ -741,7 +930,7 @@ impl Pimble {
     /// A store's recently deleted nodes, which undelete_node can put back.
     #[tool(name = "list_deleted")]
     async fn list_deleted(&self, Parameters(p): Parameters<StoreParam>) -> Result<String, String> {
-        let store = self.api.find_store(&p.store).await?;
+        let store = self.find_store(&p.store).await?;
         let deleted = self.api.list_deleted(store.id).await?;
         if deleted.is_empty() {
             return Ok(format!("Nothing was deleted in {}.", store.name));
@@ -764,7 +953,7 @@ impl Pimble {
     /// Create a node under `parent`, with a title and optionally its first content.
     #[tool(name = "create_node")]
     async fn create_node(&self, Parameters(p): Parameters<CreateNodeParams>) -> Result<String, String> {
-        let parent = self.api.resolve(&p.parent).await?;
+        let parent = self.resolve(&p.parent).await?;
         // Made with its content in the one createNode (a node under a mount
         // lives in the mount's source store).
         let init = recipes::document(&p.title, p.markdown.as_deref())?;
@@ -776,7 +965,7 @@ impl Pimble {
     /// Append Markdown after the node's content.
     #[tool(name = "append")]
     async fn append(&self, Parameters(p): Parameters<AppendParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.append_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Appended to {}.", addr.link()))
     }
@@ -785,7 +974,7 @@ impl Pimble {
     /// section.
     #[tool(name = "insert_after")]
     async fn insert_after(&self, Parameters(p): Parameters<InsertAfterParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.insert_markdown_after(&p.after, p.after_section, &p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Inserted into {}.", addr.link()))
     }
@@ -794,7 +983,7 @@ impl Pimble {
     /// higher); the heading stays.
     #[tool(name = "replace_section")]
     async fn replace_section(&self, Parameters(p): Parameters<ReplaceSectionParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.replace_section_markdown(&p.heading, &p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the section under \"{}\" in {}.", p.heading, addr.link()))
     }
@@ -802,7 +991,7 @@ impl Pimble {
     /// Replace an exact quote inside one paragraph with new text.
     #[tool(name = "replace_text")]
     async fn replace_text(&self, Parameters(p): Parameters<ReplaceTextParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.replace_text(&p.quote, &p.text).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the text in {}.", addr.link()))
     }
@@ -812,7 +1001,7 @@ impl Pimble {
     /// turning a paragraph into a list.
     #[tool(name = "replace_block")]
     async fn replace_block(&self, Parameters(p): Parameters<ReplaceBlockParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.replace_block_markdown(&p.block, &p.markdown).map(drop).map_err(crdt)).await?;
         let did = if p.markdown.trim().is_empty() { "Removed" } else { "Replaced" };
         Ok(format!("{did} the block in {}.", addr.link()))
@@ -822,9 +1011,37 @@ impl Pimble {
     /// or higher.
     #[tool(name = "remove_section")]
     async fn remove_section(&self, Parameters(p): Parameters<RemoveSectionParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.remove_section(&p.heading).map(drop).map_err(crdt)).await?;
         Ok(format!("Removed the section \"{}\" from {}.", p.heading, addr.link()))
+    }
+
+    /// Split a long text note by its headings of one level (the highest level
+    /// it has, unless `level` says): each section becomes a child note named by
+    /// its heading and holding what was under it, in order after the note's
+    /// other children; the note keeps what comes before the first heading (and
+    /// anything between sections of a higher level), and with `links` a list
+    /// of links to the new notes where the first section was. The note keeps
+    /// its link; each new note has its own.
+    #[tool(name = "split_note")]
+    async fn split_note(&self, Parameters(p): Parameters<SplitNoteParams>) -> Result<String, String> {
+        let addr = self.resolve(&p.node).await?;
+        if p.level == Some(0) {
+            return Err("`level` is 1 for \"#\", 2 for \"##\", and so on.".into());
+        }
+        let split = self.api.split_by_headings(addr, p.level.map(i64::from), p.links).await?;
+        self.present(addr).await;
+        let mut out = format!(
+            "Split {} at its level-{} headings into {} notes under it{}:\n",
+            self.describe(addr).await,
+            split.level,
+            split.children.len(),
+            if p.links { ", with links to them where the first section was" } else { "" }
+        );
+        for (child, title) in &split.children {
+            out.push_str(&format!("- {title} ({})\n", child.link()));
+        }
+        Ok(out)
     }
 
     /// Replace the node's whole content, for restructuring. Only what differs is
@@ -832,7 +1049,7 @@ impl Pimble {
     /// them), and the node keeps its link. Prefer the smaller edits for small changes.
     #[tool(name = "replace_content")]
     async fn replace_content(&self, Parameters(p): Parameters<ReplaceContentParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the content of {}.", addr.link()))
     }
@@ -843,7 +1060,7 @@ impl Pimble {
     /// own children, then the nodes it finds, each marked found with where it lives.
     #[tool(name = "get_metanode")]
     async fn get_metanode(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let forest = self.api.metanode_source(addr).await?;
         self.present(addr).await;
         let name = label(&forest.node);
@@ -897,7 +1114,7 @@ impl Pimble {
     #[tool(name = "set_metanode")]
     async fn set_metanode(&self, Parameters(p): Parameters<SetMetanodeParams>) -> Result<String, String> {
         use pimble_core::metanode::{Source, MAX_SUBTREE_DEPTH};
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let mut viewer = p.viewer.as_deref().map(str::trim).filter(|v| !v.is_empty());
         let source = match (p.depth, &p.query) {
             (Some(_), Some(_)) => return Err("Give `depth` or `query`, not both.".into()),
@@ -941,7 +1158,7 @@ impl Pimble {
     /// Rename a node.
     #[tool(name = "rename")]
     async fn rename(&self, Parameters(p): Parameters<RenameParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let title = p.title.trim().to_string();
         if title.is_empty() {
             return Err("A title cannot be empty.".into());
@@ -958,7 +1175,7 @@ impl Pimble {
     /// Set a node's tags (replacing the ones it has).
     #[tool(name = "set_tags")]
     async fn set_tags(&self, Parameters(p): Parameters<SetTagsParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let tags: Vec<String> = p.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
         self.edit(addr, |doc| doc.set_tags(&tags, &pimble_api::now()).map_err(crdt)).await?;
         Ok(format!("Tagged {}: {}.", addr.link(), if tags.is_empty() { "(none)".into() } else { tags.join(", ") }))
@@ -972,17 +1189,17 @@ impl Pimble {
     async fn move_node(&self, Parameters(p): Parameters<MoveNodeParams>) -> Result<String, String> {
         let mut nodes = Vec::new();
         for name in p.node.iter().chain(&p.nodes) {
-            nodes.push(self.api.resolve(name).await?);
+            nodes.push(self.resolve(name).await?);
         }
         if nodes.is_empty() {
             return Err("Name the node to move (`node`, or `nodes` for several).".into());
         }
-        let target = self.api.resolve(&p.new_parent).await?;
+        let target = self.resolve(&p.new_parent).await?;
         let place = match (&p.after, p.first) {
             (Some(_), true) => return Err("Give `after` or `first`, not both.".into()),
             (None, true) => Place::First,
             (None, false) => Place::Last,
-            (Some(after), false) => Place::After(self.api.resolve(after).await?.node),
+            (Some(after), false) => Place::After(self.resolve(after).await?.node),
         };
         // Under a mount is under its source, as everything made there is.
         let plan = self.api.plan_move(&nodes, target, place).await?;
@@ -1018,7 +1235,7 @@ impl Pimble {
     /// Recently Deleted.
     #[tool(name = "delete_node")]
     async fn delete_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         self.api.can_delete(&[addr]).await?;
         self.api.delete(addr).await?;
         Ok(format!("Deleted {} (undelete_node puts it back).", addr.link()))
@@ -1030,7 +1247,7 @@ impl Pimble {
         // A link to a deleted node names it as it is, not where it would lead.
         let addr = match PimbleUrl::parse(p.node.trim()) {
             Some(url) => Addr { store: url.store, node: url.node },
-            None => self.api.resolve(&p.node).await?,
+            None => self.resolve(&p.node).await?,
         };
         self.api.undelete(addr).await?;
         Ok(format!("Put back {}", self.describe(addr).await))
@@ -1055,6 +1272,63 @@ fn moved_from(plan: &pimble_api::plan::MovePlan, i: usize) -> Option<Addr> {
 /// Whether listing `top` is listing a store's single root (so no header line).
 fn store_listing_is_top(stores: &[Store], top: Addr) -> bool {
     stores.iter().any(|s| s.id == top.store && s.root_node_id == top.node)
+}
+
+/// Past this many characters, a whole note read with get_node starts with a
+/// line saying its size and how to read less of it.
+const LONG_NOTE: usize = 15_000;
+
+/// A `blocks` argument, "12" or "12-20", as an inclusive range.
+fn block_range(range: &str) -> Result<(usize, usize), String> {
+    let bad = || format!("`blocks` is a block number or a range such as \"12-20\" (not \"{range}\").");
+    let number = |s: &str| s.trim().parse::<usize>().map_err(|_| bad());
+    match range.split_once('-') {
+        Some((a, b)) => {
+            let (a, b) = (number(a)?, number(b)?);
+            if b < a {
+                return Err(bad());
+            }
+            Ok((a, b))
+        }
+        None => {
+            let n = number(range)?;
+            Ok((n, n))
+        }
+    }
+}
+
+/// A note's headings as get_node's `outline` answer: each indented by its
+/// level, with its block and its section's size.
+fn outline_of(doc: &NodeDoc) -> Result<String, CrdtError> {
+    let outline = doc.outline()?;
+    if outline.blocks == 0 {
+        return Ok("(no content)\n".into());
+    }
+    let mut out = format!(
+        "outline: {} characters in {} blocks (0-{}); `section` reads a heading's section (a heading path joins headings with \" > \" or \"/\"), `blocks` a range.\n",
+        outline.total_chars,
+        outline.blocks,
+        outline.blocks - 1
+    );
+    if outline.sections.is_empty() {
+        out.push_str("(no headings)\n");
+        return Ok(out);
+    }
+    let first = outline.sections[0].0.index;
+    if first > 0 {
+        out.push_str(&format!("(before the first heading: blocks 0-{}, {} characters)\n", first - 1, outline.intro_chars));
+    }
+    let top = outline.sections.iter().map(|(h, _)| h.level).min().unwrap_or(1);
+    for (h, chars) in &outline.sections {
+        out.push_str(&format!(
+            "{}- {} {} (block {}, {chars} characters)\n",
+            "  ".repeat((h.level - top).max(0) as usize),
+            "#".repeat(h.level.clamp(1, 6) as usize),
+            h.text,
+            h.index
+        ));
+    }
+    Ok(out)
 }
 
 /// An indented outline of `at`'s subtree, `depth` levels deep.

@@ -2417,6 +2417,7 @@ impl VaultClient {
                     kind: "prose".to_string(),
                     node_type: info.node_type,
                     path: String::new(),
+                    section: Vec::new(),
                 });
             }
         }

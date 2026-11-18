@@ -1919,7 +1919,7 @@ impl Pimble {
             Some(rest) if rest.contains('/') => format!("pimble:{}", rest.split('#').next().unwrap_or(rest)),
             _ => node.to_string(),
         };
-        let addr = self.api.resolve(&node).await?;
+        let addr = self.resolve(&node).await?;
         let found = self.api.node(addr).await?;
         let canvas = canvas.map(canvas_id).filter(|c| !c.is_empty());
         if found.node_type == node_types::BOARD {
@@ -2045,7 +2045,7 @@ impl Pimble {
     }
 
     async fn card_target(&self, node: &str) -> Result<(String, String), String> {
-        let addr = self.api.resolve(node).await?;
+        let addr = self.resolve(node).await?;
         let found = self.api.node(addr).await?;
         Ok((addr.link(), label(&found)))
     }
@@ -2284,7 +2284,7 @@ impl Pimble {
     #[tool(name = "create_canvas")]
     async fn create_canvas(&self, Parameters(p): Parameters<CreateCanvasParams>) -> Result<String, String> {
         // A node made under a mount lives in the mount's source store.
-        let parent = self.api.create_parent(self.api.resolve(&p.parent).await?).await?;
+        let parent = self.api.create_parent(self.resolve(&p.parent).await?).await?;
         // Pictures are stored as writes of the parent, as the app stores a
         // picture dropped on a row, since the canvas does not exist yet.
         let picture = match &p.picture {
@@ -2321,7 +2321,7 @@ impl Pimble {
     /// other canvas tools take as `canvas`.
     #[tool(name = "insert_canvas")]
     async fn insert_canvas(&self, Parameters(p): Parameters<InsertCanvasParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
+        let addr = self.resolve(&p.node).await?;
         let node = self.api.node(addr).await?;
         if node.node_type == node_types::BOARD || node.node_type == node_types::SHEET || node.node_type == node_types::DISCUSSION || node.node_type == node_types::MOUNT {
             return Err(format!(

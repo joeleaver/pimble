@@ -392,6 +392,110 @@ impl NodeDoc {
         self.markdown_edit(|schema, doc| markdown::remove_section(schema, doc, heading))
     }
 
+    // ── Reading part of the content, and splitting it by its headings ──
+
+    /// The content's top-level model (a never-written document reads as one
+    /// empty paragraph).
+    fn content_model(&self) -> Result<rinch_editor_core::Node> {
+        model_of(&self.save(), !self.has_projection())
+    }
+
+    /// The content's outline: every top-level heading with the size of its
+    /// section (heading included) in characters of Markdown, and the sizes of
+    /// what comes before the first heading and of the whole.
+    pub fn outline(&self) -> Result<Outline> {
+        let schema = rinch_editor_core::Schema::starter_kit();
+        let model = self.content_model()?;
+        if markdown::is_blank(&model) {
+            return Ok(Outline::default());
+        }
+        let headings = markdown::headings(&model);
+        let size = |from: usize, to: usize| -> Result<usize> { Ok(markdown::blocks_markdown(&schema, &model, from, to)?.chars().count()) };
+        let mut sections = Vec::with_capacity(headings.len());
+        for h in headings {
+            let chars = size(h.index, h.end)?;
+            sections.push((h, chars));
+        }
+        let first = sections.first().map_or(model.child_count(), |(h, _)| h.index);
+        Ok(Outline { intro_chars: size(0, first)?, total_chars: size(0, model.child_count())?, blocks: model.child_count(), sections })
+    }
+
+    /// The heading `name` names ([`markdown::find_heading`]: some of its text,
+    /// or a heading path) and its section, heading included, as Markdown.
+    pub fn section_markdown(&self, name: &str) -> Result<(markdown::Heading, String)> {
+        let schema = rinch_editor_core::Schema::starter_kit();
+        let model = self.content_model()?;
+        let heading = markdown::find_heading(&model, name)?;
+        let md = markdown::blocks_markdown(&schema, &model, heading.index, heading.end)?;
+        Ok((heading, md))
+    }
+
+    /// The top-level blocks `from..=to` (0-based, as the outline numbers
+    /// them) as Markdown, and how many blocks the content has.
+    pub fn blocks_markdown(&self, from: usize, to: usize) -> Result<(String, usize)> {
+        let schema = rinch_editor_core::Schema::starter_kit();
+        let model = self.content_model()?;
+        let count = if markdown::is_blank(&model) { 0 } else { model.child_count() };
+        if from >= count || to < from {
+            return Err(CrdtError::Refused(match count {
+                0 => "This node has no content, so it has no blocks.".to_string(),
+                n => format!("This node has blocks 0 to {}; give `blocks` as \"first-last\" inside that.", n - 1),
+            }));
+        }
+        Ok((markdown::blocks_markdown(&schema, &model, from, to.saturating_add(1))?, count))
+    }
+
+    /// What splitting the content at its headings of `level` (the highest
+    /// level present when `None`) makes: one part per such heading, its title
+    /// the heading's text, its Markdown the section under the heading (the
+    /// heading itself left out), and the `data` keys of the canvases and
+    /// sheets in it. Refused when there is no heading to split at.
+    pub fn split_parts(&self, level: Option<i64>) -> Result<SplitParts> {
+        let schema = rinch_editor_core::Schema::starter_kit();
+        let model = self.content_model()?;
+        let headings = markdown::headings(&model);
+        let level = match level.or_else(|| headings.iter().map(|h| h.level).min()) {
+            Some(l) => l,
+            None => return Err(CrdtError::Refused("This note has no headings, so there is nothing to split it at.".into())),
+        };
+        let mut parts = Vec::new();
+        for h in headings.iter().filter(|h| h.level == level) {
+            let body = rinch_editor_core::Node::clone(&model).copy_with_content(rinch_editor_core::Fragment::from_children(
+                model.content().children()[h.index + 1..h.end].to_vec(),
+            ));
+            parts.push(SplitPart {
+                title: h.text.replace(markdown_atom(), "").trim().to_string(),
+                markdown: markdown::blocks_markdown(&schema, &model, h.index + 1, h.end)?,
+                keys: data_keys_named(&body),
+                heading: h.clone(),
+            });
+        }
+        if parts.is_empty() {
+            return Err(CrdtError::Refused(format!("This note has no level-{level} headings to split it at.")));
+        }
+        Ok(SplitParts { level, parts })
+    }
+
+    /// Take the sections [`NodeDoc::split_parts`] names out of the content
+    /// (each heading of `level` and what is under it), as one edit: whatever
+    /// else the content holds stays, and `links` (Markdown, such as a list of
+    /// links to where the sections went) goes where the first one was. The
+    /// `data` of canvases and sheets no longer in the text goes too.
+    pub fn cut_parts(&mut self, level: i64, links: Option<&str>) -> Result<Vec<u8>> {
+        let before = self.content_model()?;
+        let delta = self.markdown_edit(|schema, doc| markdown::cut_sections(schema, doc, level, links))?;
+        let after = self.content_model()?;
+        let kept = data_keys_named(&after);
+        let gone: Vec<String> = data_keys_named(&before).into_iter().filter(|k| !kept.contains(k)).collect();
+        if !gone.is_empty() {
+            let mut txn = self.doc.transact_mut();
+            for key in &gone {
+                self.data.remove(&mut txn, key);
+            }
+        }
+        Ok(delta)
+    }
+
     /// The whole content replaced by `md`, recorded as the smallest set of block
     /// edits: the blocks that read the same stay untouched (see
     /// [`markdown::replace_content`]). The node keeps its id and its link.
@@ -1564,6 +1668,41 @@ impl NodeDoc {
         self.children.remove(txn, at as u32);
         Ok(())
     }
+}
+
+
+/// A node's content outline ([`NodeDoc::outline`]).
+#[derive(Debug, Clone, Default)]
+pub struct Outline {
+    /// Each top-level heading and its section's size in characters.
+    pub sections: Vec<(markdown::Heading, usize)>,
+    /// The characters before the first heading.
+    pub intro_chars: usize,
+    /// The characters of the whole content.
+    pub total_chars: usize,
+    /// How many top-level blocks the content has.
+    pub blocks: usize,
+}
+
+/// One section of a split ([`NodeDoc::split_parts`]).
+#[derive(Debug, Clone)]
+pub struct SplitPart {
+    pub heading: markdown::Heading,
+    pub title: String,
+    pub markdown: String,
+    pub keys: Vec<String>,
+}
+
+/// What a split by headings makes ([`NodeDoc::split_parts`]).
+#[derive(Debug, Clone)]
+pub struct SplitParts {
+    pub level: i64,
+    pub parts: Vec<SplitPart>,
+}
+
+/// The character an atom reads as in a heading's text.
+fn markdown_atom() -> char {
+    '\u{FFFC}'
 }
 
 /// What splitting a node's text leaves for the new node: its content, a fresh

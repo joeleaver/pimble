@@ -501,6 +501,7 @@ mod tests {
             kind: "prose".into(),
             node_type: "document".into(),
             path: String::new(),
+            section: Vec::new(),
         }
     }
 
