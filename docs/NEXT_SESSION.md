@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-18 (session 78e7f30f): v0.26.1, emergency: Personal stopped syncing.** The relay
+twin's encrypted log for "County map (illustrated)" (4.9 MB) hit the vault's 64 MiB log limit;
+its snapshot was refused at the 4 MiB blob limit; and the vault link took "snapshot required"
+for a lost connection and dropped every document, retrying every 32 s, so nothing in Personal
+synced (Will's edits) and the relay stopped announcing it (gone on the web). Fixed: the vault's
+limits are runaway guards only (256 MiB a blob, 1 GiB a log), the link snapshots and retries on
+-32006 and leaves only that document waiting, the 3 MiB catch-up skip is 200 MiB, and the RPC
+message caps (jsonrpsee's 10 MB) are `pimble_rpc::MAX_MESSAGE_BYTES` (512 MiB) on the server and
+the native client. Next: the real design (logs compacted by size, snapshots in parts, a
+document that cannot sync said in the app), merged with the "Large canvases" batch.
+
 **2026-11-18 (session 78e7f30f): v0.26.0: the MCP for large notes, from the Braynard sessions'
 feedback.** `get_node` takes `section` (a heading or heading path), `outline: true` and
 `blocks`, and warns over 15,000 characters; search hits carry `in: <heading path>`, exact

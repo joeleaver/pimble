@@ -42,9 +42,30 @@ use uuid::Uuid;
 use crate::error::{Result, StoreError};
 
 /// One blob's maximum size, and the maximum a document's log may reach
-/// before a snapshot is required (docs/CRYPTO_CONTRACT.md "RPCs").
-const MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
-const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+/// before a snapshot is required (docs/CRYPTO_CONTRACT.md "RPCs"). Guards
+/// against runaway growth only: a document that outgrows them must still
+/// sync (Joe, 2026-11-18, after a 4.9 MB canvas filled its 64 MiB log and
+/// its snapshot was refused at the old 4 MiB, stopping the store's sync).
+const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024;
+
+static BLOB_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_BLOB_BYTES);
+static LOG_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MAX_LOG_BYTES);
+
+/// Lower the limits for this process, for tests that reach them.
+#[doc(hidden)]
+pub fn set_limits_for_tests(blob: usize, log: u64) {
+    BLOB_LIMIT.store(blob, std::sync::atomic::Ordering::SeqCst);
+    LOG_LIMIT.store(log, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn blob_limit() -> usize {
+    BLOB_LIMIT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn log_limit() -> u64 {
+    LOG_LIMIT.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// Write a file atomically: write to a `.tmp` sibling, then rename into
 /// place. Mirrors `local::atomic_write` (not reused directly: that function
@@ -512,7 +533,7 @@ impl VaultStore {
     /// would push the log past [`MAX_LOG_BYTES`] (`VaultSnapshotRequired`:
     /// the caller must upload a snapshot first).
     pub async fn append(&mut self, doc_id: &str, blob: Vec<u8>) -> Result<u64> {
-        if blob.len() > MAX_BLOB_BYTES {
+        if blob.len() > blob_limit() {
             return Err(StoreError::VaultBlobTooLarge { size: blob.len() });
         }
 
@@ -520,7 +541,7 @@ impl VaultStore {
         let doc = self.docs.entry(doc_id.to_string()).or_insert_with(|| VaultDoc::empty(dir));
 
         let entry_size = 12u64 + blob.len() as u64;
-        if doc.log_size() + entry_size > MAX_LOG_BYTES {
+        if doc.log_size() + entry_size > log_limit() {
             return Err(StoreError::VaultSnapshotRequired);
         }
 
@@ -569,7 +590,7 @@ impl VaultStore {
     /// atomically). Refused if `upto_seq` is beyond the document's head, or
     /// `blob` exceeds [`MAX_BLOB_BYTES`].
     pub async fn snapshot(&mut self, doc_id: &str, upto_seq: u64, blob: Vec<u8>) -> Result<()> {
-        if blob.len() > MAX_BLOB_BYTES {
+        if blob.len() > blob_limit() {
             return Err(StoreError::VaultBlobTooLarge { size: blob.len() });
         }
 
@@ -737,7 +758,8 @@ mod tests {
     async fn append_refuses_an_oversized_blob() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = VaultStore::create(dir.path().join("v.pimble"), "V", None).await.unwrap();
-        let big = vec![0u8; MAX_BLOB_BYTES + 1];
+        set_limits_for_tests(4 * 1024 * 1024, 64 * 1024 * 1024);
+        let big = vec![0u8; 4 * 1024 * 1024 + 1];
         let err = store.append("tree", big).await.unwrap_err();
         assert!(matches!(err, StoreError::VaultBlobTooLarge { .. }));
     }

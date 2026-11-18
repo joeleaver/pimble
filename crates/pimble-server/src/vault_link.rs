@@ -158,9 +158,14 @@ const ANNOUNCE_CHECK_EVERY: Duration = Duration::from_millis(250);
 /// highest number seen", which may sit beyond an entry that never arrived; one
 /// full refetch of every document settles it.
 const CURSOR_VERSION: u32 = 1;
-/// A reconnect's catch-up push is one blob per document; the hosted server
-/// refuses a blob over 4 MiB, and one refused blob must not take the link down.
-const MAX_CATCH_UP_BLOB: usize = 3 * 1024 * 1024;
+/// A reconnect's catch-up push is one blob per document, kept under the
+/// vault's blob limit (`pimble_store::vault`, 256 MiB): one refused blob must
+/// not take the link down. Was 3 MiB, which left any larger document
+/// silently unsynced after a reconnect.
+const MAX_CATCH_UP_BLOB: usize = 200 * 1024 * 1024;
+/// JSON-RPC code of "upload a snapshot before appending more"
+/// (`pimble_rpc::RpcError::SnapshotRequired`).
+const SNAPSHOT_REQUIRED: i32 = -32006;
 /// How often the live loop writes `vault-link.json` when it has changed.
 const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
 /// How often a connected link asks the accounts service whether the
@@ -1508,6 +1513,17 @@ enum Applying {
     Skipped,
 }
 
+/// Whether the remote asked for a snapshot before more appends.
+fn snapshot_required(error: &pimble_client::ClientError) -> bool {
+    matches!(error, pimble_client::ClientError::Server { code, .. } if *code == SNAPSHOT_REQUIRED)
+}
+
+/// Whether the remote refused this document's blob for its size: the
+/// document waits, the link stays.
+fn is_document_error(error: &pimble_client::ClientError) -> bool {
+    matches!(error, pimble_client::ClientError::Server { message, .. } if message.contains("per-blob limit"))
+}
+
 /// Whether the remote refused a call for this one document (it is out of
 /// the account's scope now, or under a root the account only reads) as
 /// opposed to failing: the document is left for later and the link stays up.
@@ -1788,14 +1804,40 @@ async fn append_blob(
     // create (and is ignored for anyone else's).
     let keys = created.as_ref().map(|(keys, _)| keys.clone());
     let new = created.as_ref().map(|(_, new)| *new).unwrap_or_default();
-    let appended = match new.discussion_host {
-        Some(host) => client.vault_append_new_discussion(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), host, keys).await,
-        None => client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), new.parent_id, keys).await,
+    let send = |blob_b64: String, keys: Option<VaultDocKeys>| {
+        let doc_id = doc_id.clone();
+        async move {
+            match new.discussion_host {
+                Some(host) => client.vault_append_new_discussion(store_id, doc_id, blob_b64, Some(link_id.to_string()), host, keys).await,
+                None => client.vault_append_with_keys(store_id, doc_id, blob_b64, Some(link_id.to_string()), new.parent_id, keys).await,
+            }
+        }
     };
+    let mut appended = send(blob_b64.clone(), keys.clone()).await;
+    // The remote's log for this document is full: snapshot what this device
+    // has applied (a snapshot holds the whole document, this update
+    // included), then send the update once more. Whatever happens, only this
+    // document waits: the link stays up for every other one.
+    if matches!(&appended, Err(e) if snapshot_required(e)) {
+        let upto = progress.cursor(&doc_id).applied_through();
+        warn!("Vault link for store {} doc {:?}: the remote's log is full; snapshotting through seq {} and sending again", store_id, doc_id, upto);
+        let snapped = upto > 0 && upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, upto, progress).await.unwrap_or_else(|e| {
+            warn!("Vault link for store {} doc {:?}: the snapshot failed: {}", store_id, doc_id, e);
+            false
+        });
+        if snapped {
+            progress.note_snapshot(&doc_id, upto);
+            appended = send(blob_b64, keys).await;
+        }
+    }
     let seq = match appended {
         Ok(seq) => seq,
         Err(e) if is_refusal(&e) => {
             debug!("Vault link for store {} doc {:?}: append refused ({}); leaving the document for later", store_id, doc_id, e);
+            return Ok(Appended::Refused);
+        }
+        Err(e) if snapshot_required(&e) || is_document_error(&e) => {
+            warn!("Vault link for store {} doc {:?}: the remote would not take this update ({}); leaving the document for later, the rest keeps syncing", store_id, doc_id, e);
             return Ok(Appended::Refused);
         }
         Err(e) => return Err(anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e)),
