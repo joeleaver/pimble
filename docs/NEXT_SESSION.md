@@ -1,5 +1,17 @@
 # Next session: start here
 
+**2026-11-18 (session 78e7f30f): v0.28.0: drawing wave 6** (docs/DRAWING_WAVE6_CONTRACT.md,
+every part built). Clip masks on layers and groups; pictures placed, scaled and painted over in
+paint layers; map lettering (nine bundled Noto faces, halos, tracking, text on a path); symbols
+and scatter (Make Symbol, Edit Symbol, the Stamp on Shift+S, Scatter in Shape, MCP `add_symbol`
+and `scatter`: 25,000 trees in about 400 KB); soft edges (`feather` on filled elements and
+layers, `blur` on layers, cached, baked by Flatten and Merge, `feGaussianBlur` in SVG). Open: a
+paint layer holding one picture stretched over a county-sized canvas takes 6-9 s a zoom step
+(the picture is decoded again each step; the picture cache's 4 s idle trim is shorter than the
+step), `export_canvas` 62 s there; zoom-to-fit sometimes leaves the selection handles and zoom
+label behind; `relay.rs` `a_twenty_megabyte_document...` timed out once under a loaded full
+run (5 s alone). Still open from before: Will's edits, the 369-byte resend, tray mode.
+
 **2026-11-18 (session 78e7f30f): v0.27.0: no size stops a store from syncing**
 (docs/SYNC_LIMITS_CONTRACT.md, built). Vault logs compact by size (past twice the last
 snapshot, at least 1 MiB) besides every 200 appends; anything over 8 MiB of plaintext goes in

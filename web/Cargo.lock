@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-web"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
