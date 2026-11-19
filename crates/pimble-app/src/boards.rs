@@ -474,6 +474,9 @@ pub struct StyleUi {
     /// The Stamp's symbol and settings (docs/DRAWING_WAVE6_CONTRACT.md
     /// section 2), which Scatter in Shape takes too.
     pub stamp: stamp::StampUi,
+    /// The first selected element's feather, board units
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3): what the slider shows.
+    pub feather: Signal<f32>,
 }
 
 impl StyleUi {
@@ -523,6 +526,7 @@ impl StyleUi {
             along_offset: Signal::new(0.0),
             along_side: Signal::new(pimble_board::AlongSide::Above),
             stamp: stamp::StampUi::new(),
+            feather: Signal::new(0.0),
         }
     }
 }
@@ -561,6 +565,10 @@ pub struct LayerRow {
     pub clip: Option<String>,
     /// That clip is in effect.
     pub clipped: bool,
+    /// Its blur and feather radii, board units (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 3); 0: none.
+    pub blur: f32,
+    pub feather: f32,
 }
 
 impl LayerRow {
@@ -1141,7 +1149,7 @@ impl Session {
     /// The union of the selected elements' bounds.
     fn selection_bounds(&self) -> Option<Rect> {
         let snapshot = self.snapshot();
-        self.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| e.bounds).reduce(|a, b| a.union(&b))
+        self.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| e.hard_bounds()).reduce(|a, b| a.union(&b))
     }
 
     /// Whether element `id` may be changed by the tools: neither it nor its
@@ -1792,6 +1800,39 @@ pub(crate) fn write_field(store: AppStore, pane: PaneId, name: &str, value: Opti
     });
 }
 
+/// A slider's change in `pane` about to be written: when the last one came
+/// moments ago (the slider is being dragged), the undo clock is held at that
+/// change's time so this one joins its undo step however long the frames
+/// between them took, and true is answered (call [`slider_done`] after the
+/// edit). A drag is then one undo step.
+pub(super) fn slider_dragging(pane: PaneId) -> bool {
+    thread_local! {
+        static LAST: std::cell::RefCell<HashMap<PaneId, (f64, u64)>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let now = now_ms();
+    let last = LAST.with(|l| l.borrow().get(&pane).copied());
+    match last.filter(|(t, _)| now - t < 1500.0) {
+        Some((_, stamp)) => {
+            LAST.with(|l| l.borrow_mut().insert(pane, (now, stamp)));
+            with_session(pane, |s| s.clock.store(stamp, std::sync::atomic::Ordering::Relaxed));
+            true
+        }
+        None => {
+            // This change is written at the held time too, so the ones that
+            // follow (held at the same time) are never "before" it.
+            let stamp = now.max(1.0) as u64;
+            LAST.with(|l| l.borrow_mut().insert(pane, (now, stamp)));
+            with_session(pane, |s| s.clock.store(stamp, std::sync::atomic::Ordering::Relaxed));
+            false
+        }
+    }
+}
+
+/// After a slider's change written: the undo clock is the real one again.
+pub(super) fn slider_done(pane: PaneId) {
+    with_session(pane, |s| s.clock.store(0, std::sync::atomic::Ordering::Relaxed));
+}
+
 /// Start a new undo step: the next edit is taken back on its own, however
 /// soon after the last.
 fn new_undo_step(pane: PaneId) {
@@ -1823,7 +1864,7 @@ fn after_change(store: AppStore, pane: PaneId) {
             .iter()
             .filter(|id| !pointing.as_ref().is_some_and(|ids| ids.contains(*id)))
             .filter_map(|id| snapshot.get(id))
-            .map(|e| logical(s.to_screen(&e.bounds)))
+            .map(|e| logical(s.to_screen(&e.hard_bounds())))
             .collect();
         let handles = if let Some(b) = s.paint_sel.as_ref().and_then(|sel| sel.box_now()) {
             // A paint selection's handles, on its pixels where they are now.
@@ -1961,7 +2002,7 @@ pub(crate) fn draw_others(store: AppStore, pane: PaneId) {
         for (session, board, who, title) in sessions {
             for id in &board.selection {
                 let Some(e) = snapshot.get(id) else { continue };
-                let (x, y, w, h) = rect_on_screen(&view, scale, &e.bounds);
+                let (x, y, w, h) = rect_on_screen(&view, scale, &e.hard_bounds());
                 others.outlines.push(OutlineView { x, y, w, h, color: who.color.clone() });
             }
             if let Some((x, y)) = board.pointer.and_then(|p| on_screen(&view, size, scale, p)) {
@@ -3894,6 +3935,48 @@ mod tests {
         assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![line.clone()]);
         tools::undo(store, P[0], false);
         assert_eq!(only_element().raw.kind, Kind::Line, "one undo");
+        stop(store, P[0]);
+    }
+
+    /// Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3): the
+    /// context bar's feather on a filled selection (not a line), the
+    /// selection's feather shown, one undo step; the layers panel's blur and
+    /// feather on the picked layer, its row reading them.
+    #[test]
+    fn feather_a_shape_and_blur_a_layer() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let (shape, line) = local_edit(store, P[0], |t| {
+            let shape = t.add_element(NewElement::new(Kind::Ellipse, Geom::Rect(Rect::new(0.0, 0.0, 200.0, 100.0))).with_style(Style { fill: Some(Color::rgb(40, 140, 60)), ..Style::default() }))?;
+            let line = t.add_element(NewElement::new(Kind::Line, Geom::Segment { a: Point::new(0.0, 200.0), b: Point::new(100.0, 200.0) }))?;
+            Ok((shape, line))
+        })
+        .unwrap();
+        let feather_of = |id: &str| with_session(P[0], |s| s.snapshot().get(id).map(|e| (e.raw.style.feather, e.soft))).flatten().unwrap();
+        tools::select(store, P[0], vec![shape.clone(), line.clone()]);
+        tools::apply_feather(store, P[0], 40.0, false);
+        assert_eq!(feather_of(&shape), (Some(40.0), 60.0));
+        assert_eq!(feather_of(&line), (None, 0.0), "a line takes no feather");
+        // Selected again, the bar shows it.
+        tools::select(store, P[0], vec![]);
+        untracked(|| store.board_style.feather.set(0.0));
+        tools::select(store, P[0], vec![shape.clone()]);
+        assert_eq!(untracked(|| store.board_style.feather.get()), 40.0);
+        tools::apply_feather(store, P[0], 0.0, false);
+        assert_eq!(feather_of(&shape).0, None, "0 takes it off");
+        tools::undo(store, P[0], false);
+        assert_eq!(feather_of(&shape).0, Some(40.0), "one undo puts it back");
+        assert_eq!(untracked(|| store.board_style.feather.get()), 40.0, "and the bar shows it");
+        // The layers panel: blur and feather on the layer, read by its row.
+        let layer = with_session(P[0], |s| s.snapshot().get(&shape).unwrap().layer.clone()).unwrap();
+        layers::layer_edit(store, P[0], |t| t.set_layer_blur(&layer, 25.0));
+        layers::layer_edit(store, P[0], |t| t.set_layer_feather(&layer, 10.0));
+        let row = with_session(P[0], |s| layers::rows_of(s.snapshot()).into_iter().find(|r| r.id == layer)).flatten().unwrap();
+        assert_eq!((row.blur, row.feather), (25.0, 10.0));
+        assert_eq!(feather_of(&shape).1, 60.0 + 37.5 + 15.0, "the layer's reach adds to the element's");
+        tools::undo(store, P[0], false);
+        let row = with_session(P[0], |s| layers::rows_of(s.snapshot()).into_iter().find(|r| r.id == layer)).flatten().unwrap();
+        assert_eq!((row.blur, row.feather), (25.0, 0.0), "each is its own undo step");
         stop(store, P[0]);
     }
 

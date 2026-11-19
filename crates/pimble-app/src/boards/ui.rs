@@ -616,6 +616,25 @@ pub(super) fn opacity_signal(store: AppStore) -> Signal<f64> {
     sig
 }
 
+/// The feather slider's place, mirrored from the selection's feather
+/// (docs/DRAWING_WAVE6_CONTRACT.md section 3).
+pub(super) fn soft_signal(store: AppStore) -> Signal<f64> {
+    thread_local! {
+        static SIGNAL: Cell<Option<Signal<f64>>> = const { Cell::new(None) };
+    }
+    if let Some(sig) = SIGNAL.with(Cell::get) {
+        return sig;
+    }
+    let sig = Signal::new(0.0f64);
+    let st = store.board_style;
+    let _ = rinch::Effect::new(move || {
+        let v = super::rail::soft_to_slider(st.feather.get());
+        untracked(|| sig.set_if_changed(v));
+    });
+    SIGNAL.with(|s| s.set(Some(sig)));
+    sig
+}
+
 /// "Meaning" (docs/IMAGE_MARKUP_CONTRACT.md, "Meaning"): what the selected
 /// element, or else the picked layer, means: a free note and named fields,
 /// for the people and the assistants who read the canvas. Nothing here is

@@ -2860,6 +2860,30 @@ pub(crate) const APP_CSS: &str = "
     padding: 0 4px;
 }
 
+/* The feather beside the opacity in its popup (soft edges, drawing wave 6). */
+.pimble-board__ctx-soft {
+    display: flex;
+    align-items: center;
+    margin-left: 6px;
+    padding-left: 6px;
+    border-left: 1px solid var(--rinch-color-border);
+}
+
+/* The picked layer's blur and feather, under its opacity. */
+.pimble-board__layer-soft {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-board__layer-soft > .pimble-board__label {
+    min-width: 52px;
+}
+
+.pimble-board__layer-soft > .pimble-board__grow {
+    flex: 1;
+}
+
 /* The context bar's stroke and fill: a ring in the stroke's color, a disc
    in the fill's. */
 .pimble-board__ctx-color {

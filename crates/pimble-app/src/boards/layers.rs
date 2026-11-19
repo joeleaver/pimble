@@ -57,6 +57,8 @@ pub(super) fn rows_of(snapshot: &BoardSnapshot) -> Vec<LayerRow> {
             children: 0,
             clip: clip_title(snapshot, l),
             clipped: l.clip.is_some(),
+            blur: l.blur,
+            feather: l.feather,
         })
         .collect();
     count_children(&mut rows);
@@ -193,9 +195,19 @@ pub(super) fn picked_for_group(rows: &[LayerRow], picked: Option<&str>, extra: &
         .collect()
 }
 
+/// A layer's blur or feather from its slider: a drag is one undo step.
+fn soft_edit(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<()>) {
+    if super::slider_dragging(pane) {
+        local_edit(store, pane, f);
+    } else {
+        layer_edit(store, pane, f);
+    }
+    super::slider_done(pane);
+}
+
 /// A layer edit whose refusal is said (the model's sentence), not only
 /// logged as `local_edit` does with refusals that are not locks.
-fn layer_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
+pub(super) fn layer_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
     let mut refused: Option<String> = None;
     new_undo_step(pane);
     let result = local_edit(store, pane, |t| {
@@ -451,6 +463,22 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
         let picked = ui.layer.get();
         let opacity = picked.and_then(|id| layers.iter().find(|l| l.id == id).map(|l| l.opacity)).unwrap_or(1.0);
         untracked(|| layer_opacity.set_if_changed(opacity as f64));
+    });
+    // Its blur and feather (docs/DRAWING_WAVE6_CONTRACT.md section 3), as
+    // places of their sliders.
+    let layer_blur = Signal::new(0.0f64);
+    let layer_feather = Signal::new(0.0f64);
+    let soft_of = move |read: fn(&LayerRow) -> f32| {
+        let layers = ui.layers.get();
+        let picked = ui.layer.get().or_else(|| layers.iter().find(|l| !l.held && !l.is_group()).map(|l| l.id.clone()));
+        picked.and_then(|id| layers.iter().find(|l| l.id == id).map(read)).unwrap_or(0.0)
+    };
+    let _ = rinch::Effect::new(move || {
+        let (b, f) = (soft_of(|l| l.blur), soft_of(|l| l.feather));
+        untracked(|| {
+            layer_blur.set_if_changed(super::rail::soft_to_slider(b));
+            layer_feather.set_if_changed(super::rail::soft_to_slider(f));
+        });
     });
     let picked = move || ui.layer.get().or_else(|| ui.layers.get().iter().find(|l| !l.held && !l.is_group()).map(|l| l.id.clone()));
     let picked_row = move || {
@@ -767,6 +795,48 @@ pub(super) fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: Pa
                         layer_edit(store, pane, |t| t.set_layer_opacity(&id, v as f32));
                     },
                 }
+                // Soft edges: everything in it blurred (haze), or its edge
+                // faded with its inside kept sharp.
+                div {
+                    class: "pimble-board__layer-soft",
+                    title: "Blur: everything this layer draws softened, by this many canvas units",
+                    div { class: "pimble-board__label", "Blur" }
+                    div { class: "pimble-board__grow",
+                        Slider {
+                            min: 0.0,
+                            max: 1.0,
+                            step: 0.02,
+                            size: "sm",
+                            value_signal: Some(layer_blur),
+                            onchange: move |v: f64| {
+                                let Some(id) = untracked(|| picked()) else { return };
+                                let r = super::rail::slider_to_soft(v);
+                                soft_edit(store, pane, |t| t.set_layer_blur(&id, r));
+                            },
+                        }
+                    }
+                    div { class: "pimble-board__label", {move || super::rail::soft_label(picked_row().map_or(0.0, |r| r.blur))} }
+                }
+                div {
+                    class: "pimble-board__layer-soft",
+                    title: "Feather: the edge of what this layer draws fades out over this many canvas units",
+                    div { class: "pimble-board__label", "Feather" }
+                    div { class: "pimble-board__grow",
+                        Slider {
+                            min: 0.0,
+                            max: 1.0,
+                            step: 0.02,
+                            size: "sm",
+                            value_signal: Some(layer_feather),
+                            onchange: move |v: f64| {
+                                let Some(id) = untracked(|| picked()) else { return };
+                                let r = super::rail::slider_to_soft(v);
+                                soft_edit(store, pane, |t| t.set_layer_feather(&id, r));
+                            },
+                        }
+                    }
+                    div { class: "pimble-board__label", {move || super::rail::soft_label(picked_row().map_or(0.0, |r| r.feather))} }
+                }
             }
             div {
                 class: "pimble-board__row pimble-board__label",
@@ -950,6 +1020,8 @@ mod tests {
             children: 0,
             clip: None,
             clipped: false,
+            blur: 0.0,
+            feather: 0.0,
         }
     }
 

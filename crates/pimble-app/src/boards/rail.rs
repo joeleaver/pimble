@@ -140,6 +140,10 @@ pub struct Controls {
     pub strength: bool,
     /// The Stamp's symbol and settings (a selected scatter's symbol).
     pub stamp: bool,
+    /// A soft edge (docs/DRAWING_WAVE6_CONTRACT.md section 3): a selected
+    /// filled element's feather, in the opacity popup. New elements do not
+    /// take one.
+    pub feather: bool,
 }
 
 impl Controls {
@@ -169,6 +173,7 @@ impl Controls {
             || self.contiguous
             || self.strength
             || self.stamp
+            || self.feather
     }
 
     /// Any of the pickers (everything but the two swatches).
@@ -203,6 +208,7 @@ impl Controls {
             contiguous: self.contiguous || o.contiguous,
             strength: self.strength || o.strength,
             stamp: self.stamp || o.stamp,
+            feather: self.feather || o.feather,
         }
     }
 }
@@ -229,16 +235,17 @@ pub fn controls_of(kind: &Kind) -> Controls {
             radius: *kind == Kind::Rect,
             sides: *kind == Kind::Polygon,
             star: *kind == Kind::Star,
+            feather: true,
             ..none
         },
-        Kind::Path => Controls { stroke: true, fill: true, width: true, dash: true, opacity: true, cap: true, join: true, rule: true, ..none },
-        Kind::Text | Kind::Callout => Controls { stroke: true, fill: true, font: true, align: true, opacity: true, ..none },
+        Kind::Path => Controls { stroke: true, fill: true, width: true, dash: true, opacity: true, cap: true, join: true, rule: true, feather: true, ..none },
+        Kind::Text | Kind::Callout => Controls { stroke: true, fill: true, font: true, align: true, opacity: true, feather: true, ..none },
         // A sticky note's color is its fill.
-        Kind::Sticky => Controls { fill: true, font: true, align: true, opacity: true, ..none },
+        Kind::Sticky => Controls { fill: true, font: true, align: true, opacity: true, feather: true, ..none },
         Kind::Step => Controls { stroke: true, font: true, opacity: true, ..none },
         Kind::Spotlight => Controls { opacity: true, ..none },
         // A scatter: its opacity, and its symbol and tint (the stamp's row).
-        Kind::Scatter => Controls { opacity: true, stamp: true, ..none },
+        Kind::Scatter => Controls { opacity: true, stamp: true, feather: true, ..none },
         Kind::Frame | Kind::Picture | Kind::Group | Kind::Card | Kind::Other(_) => none,
     }
 }
@@ -264,6 +271,7 @@ pub fn controls_of_tool(tool: Tool) -> Controls {
     }
     let mut c = tool.kind().map(|k| controls_of(&k)).unwrap_or_default();
     c.rule = false;
+    c.feather = false;
     c.smoothing = tool == Tool::Pencil;
     c
 }
@@ -281,6 +289,37 @@ pub const TRACKINGS: [(&str, f32); 5] = [("Tight", -0.05), ("Normal", 0.0), ("Wi
 pub const HALOS: [(&str, f32); 4] = [("Off", 0.0), ("S", 0.06), ("M", 0.12), ("L", 0.2)];
 /// Halo colors offered: white, black, and map paper.
 pub const HALO_COLORS: [(&str, &str); 3] = [("#ffffff", "White"), ("#000000", "Black"), ("#f4ecd8", "Paper")];
+
+/// The widest feather the context bar's and the layers panel's sliders
+/// offer, board units (the MCP takes more).
+pub const SOFT_MAX: f32 = 2000.0;
+
+/// A feather or blur radius at a place (0 to 1) of its slider:
+/// logarithmic from 1 to [`SOFT_MAX`] units, so small radii get fine steps;
+/// the left end is none. Whole units.
+pub fn slider_to_soft(v: f64) -> f32 {
+    if v <= 0.01 {
+        return 0.0;
+    }
+    SOFT_MAX.powf(v.clamp(0.0, 1.0) as f32).round().max(1.0)
+}
+
+/// The slider's place for a radius (the inverse of [`slider_to_soft`]).
+pub fn soft_to_slider(radius: f32) -> f64 {
+    if radius < 1.0 {
+        return 0.0;
+    }
+    (radius.min(SOFT_MAX).ln() / SOFT_MAX.ln()) as f64
+}
+
+/// A radius as the sliders' labels say it.
+pub fn soft_label(radius: f32) -> String {
+    if radius <= 0.0 {
+        "Off".to_string()
+    } else {
+        format!("{}", radius.round())
+    }
+}
 
 /// The step of [`HALOS`] nearest a halo `fraction` of the font size wide.
 pub fn halo_step(fraction: f32) -> f32 {
@@ -1207,14 +1246,19 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         }
     };
     let opacity_face = rsx! {
-        span { class: "pimble-board__face-text", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
+        span { class: "pimble-board__face-text", {move || {
+            // A soft edge shows as a ring after the percentage.
+            let soft = if controls().feather && st.feather.get() > 0.0 { " ◌" } else { "" };
+            format!("{}%{soft}", (st.opacity.get() * 100.0).round())
+        }} }
     };
+    let feather_slider = super::ui::soft_signal(store);
     let width_btn = picker_button(__scope, ui, "Width", Popup::Width, "", width_face);
     let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, "", dash_face);
     let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, "", heads_face);
     let font_btn = picker_button(__scope, ui, "Text: size, font, spacing, halo", Popup::Font, "pimble-board__chooser--words", font_face);
     let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, "", align_face);
-    let opacity_btn = picker_button(__scope, ui, "Opacity", Popup::Opacity, "pimble-board__chooser--number", opacity_face);
+    let opacity_btn = picker_button(__scope, ui, "Opacity and feather (a soft edge)", Popup::Opacity, "pimble-board__chooser--number", opacity_face);
     let more_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::ChevronUp, "Bring Forward (Ctrl+])", Box::new(|s, p| tools::reorder(s, p, Order::Forward))),
         menu_item(__scope, store, pane, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", Box::new(|s, p| tools::reorder(s, p, Order::Backward))),
@@ -1374,6 +1418,29 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     }
                 }
                 span { class: "pimble-board__ctx-number", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
+                // Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3): the
+                // selection's feather, canvas units.
+                div {
+                    class: "pimble-board__ctx-soft",
+                    style: {move || shown(controls().feather && ui.selected.get() > 0)},
+                    span { class: "pimble-board__ctx-label", title: "Feather: the edge fades out over this many canvas units", "Feather" }
+                    div { class: "pimble-board__ctx-opacity",
+                        Slider {
+                            min: 0.0,
+                            max: 1.0,
+                            step: 0.02,
+                            size: "xs",
+                            value_signal: Some(feather_slider),
+                            onchange: move |v: f64| {
+                                let r = slider_to_soft(v);
+                                st.feather.set(r);
+                                tools::apply_feather(store, pane, r, super::slider_dragging(pane));
+                                super::slider_done(pane);
+                            },
+                        }
+                    }
+                    span { class: "pimble-board__ctx-number", {move || soft_label(st.feather.get())} }
+                }
             }
             div {
                 class: "pimble-float pimble-board__menu",
@@ -1998,6 +2065,21 @@ mod tests {
         assert_eq!(paint::choice_label(&paint::TOLERANCES, 0.15), "15%");
         assert_eq!(paint::choice_label(&paint::TOLERANCES, 0.22), "22%", "a value set elsewhere still shows");
         assert_eq!(paint::choice_label(&paint::STRENGTHS, 1.0), "100%");
+    }
+
+    #[test]
+    fn the_soft_edge_sliders_are_logarithmic_and_offer_none() {
+        assert_eq!(slider_to_soft(0.0), 0.0);
+        assert_eq!(slider_to_soft(1.0), SOFT_MAX);
+        for r in [2.0f32, 5.0, 40.0, 300.0, 2000.0] {
+            assert!((slider_to_soft(soft_to_slider(r)) - r).abs() <= r * 0.05 + 0.5, "{r}");
+        }
+        assert!(slider_to_soft(0.5) < 60.0, "the middle is a modest radius");
+        assert_eq!(soft_label(0.0), "Off");
+        // Filled kinds offer a feather; lines and new elements do not.
+        assert!(controls_of(&Kind::Rect).feather && controls_of(&Kind::Path).feather && controls_of(&Kind::Sticky).feather);
+        assert!(!controls_of(&Kind::Line).feather && !controls_of(&Kind::Pen).feather);
+        assert!(!controls_of_tool(Tool::Rect).feather);
     }
 
     #[test]

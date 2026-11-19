@@ -1186,7 +1186,7 @@ fn base_of(snapshot: &BoardSnapshot, e: &pimble_board::Element) -> Base {
         pivot: e.pivot_bounds,
         parent_offset,
         plain,
-        bounds: e.bounds,
+        bounds: e.hard_bounds(),
     }
 }
 
@@ -1442,11 +1442,11 @@ fn end_at(s: &Session, p: Point, except: Option<&str>) -> End {
                 && e.raw.kind != Kind::Connector
                 && !e.global
                 && e.visible
-                && (e.hits(p, tolerance) || (e.raw.kind != Kind::Frame && e.bounds.contains(p)))
+                && (e.hits(p, tolerance) || (e.raw.kind != Kind::Frame && e.hard_bounds().contains(p)))
         });
     match target {
         Some(e) => {
-            let b = e.bounds;
+            let b = e.hard_bounds();
             let c = b.center();
             let reach = (12.0 / s.view.zoom().max(1e-3)).max(b.w.min(b.h) * 0.15);
             let sides = [
@@ -1488,7 +1488,7 @@ fn frame_membership(store: AppStore, pane: PaneId, ids: &[String]) {
             if current.as_ref().and_then(|p| snapshot.get(p)).is_some_and(|p| p.raw.kind == Kind::Group) {
                 continue;
             }
-            let c = e.bounds.center();
+            let c = e.hard_bounds().center();
             let next = frames.iter().rev().find(|f| f.raw.id != *id && frame_rect(f).contains(c)).map(|f| f.raw.id.clone());
             if next == current {
                 continue;
@@ -2193,6 +2193,9 @@ pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
             st.halo_color.set_if_changed(Color { a: 255, ..h.color }.to_hex());
         }
     }
+    if controls_of(&kind).feather {
+        st.feather.set_if_changed(s.feather);
+    }
     let on_path = kind == Kind::Text && placed;
     st.on_path.set_if_changed(on_path);
     if on_path {
@@ -2256,6 +2259,9 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
             }
             if *kind != Kind::Text {
                 (s.along, s.along_offset, s.along_side) = (None, None, None);
+            }
+            if !controls_of(kind).feather {
+                s.feather = None;
             }
             if s == Style::default() && style != Style::default() {
                 continue;
@@ -2422,6 +2428,35 @@ pub(super) fn apply_halo(store: AppStore, pane: PaneId, fraction: f32, color: &s
     });
 }
 
+/// A feather of `radius` board units on every selected element that takes
+/// one (docs/DRAWING_WAVE6_CONTRACT.md section 3); 0 takes it off. One undo
+/// step, or part of the last one when `joined`.
+pub(super) fn apply_feather(store: AppStore, pane: PaneId, radius: f32, joined: bool) {
+    let ids: Vec<String> = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        s.selected.iter().filter(|id| s.editable(id) && snapshot.get(id).is_some_and(|e| controls_of(&e.raw.kind).feather)).cloned().collect()
+    })
+    .unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    // `joined`: a slider being dragged, one undo step for the drag (its
+    // moves come within the undo manager's capture time of each other).
+    if !joined {
+        new_undo_step(pane);
+    }
+    local_edit(store, pane, |t| {
+        for id in &ids {
+            if radius <= 0.0 {
+                t.clear_style(id, pimble_board::StyleKey::Feather)?;
+            } else {
+                t.set_style(id, &Style { feather: Some(radius), ..Style::default() })?;
+            }
+        }
+        Ok(())
+    });
+}
+
 /// Put Text on Path (docs/DRAWING_WAVE6_CONTRACT.md section 4): with one
 /// text and one path, line or pen stroke selected, the text is set along
 /// it; the text stays selected. A refusal is said.
@@ -2531,7 +2566,7 @@ pub(super) fn begin_text_existing(store: AppStore, pane: PaneId, id: &str) {
     let found = with_session(pane, |s| {
         let e = s.snapshot().get(id)?;
         let text = e.raw.text.clone().unwrap_or_default();
-        s.text = Some(TextEdit { id: Some(id.to_string()), kind: e.raw.kind.clone(), at: Point::new(e.bounds.x, e.bounds.y), last: text.clone() });
+        s.text = Some(TextEdit { id: Some(id.to_string()), kind: e.raw.kind.clone(), at: Point::new(e.hard_bounds().x, e.hard_bounds().y), last: text.clone() });
         Some(text)
     })
     .flatten();
@@ -2972,6 +3007,9 @@ pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) {
     .flatten();
     if let Some(bytes) = update {
         send_update(store, pane, held.0, held.1, bytes);
+        // The bar shows the selection as it is again (a feather or an
+        // opacity taken back).
+        load_selection_style(store, pane);
     }
     after_change(store, pane);
 }

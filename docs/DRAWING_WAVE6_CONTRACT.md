@@ -753,3 +753,186 @@ canvas (`w6s_24_forest_with_star.png`).
 - Copying a scatter between stores does not copy pictures inside its symbol.
 - A coarser level than one dot per placement at extreme zoom-outs (100,000 placements
   are still 100,000 dots).
+
+## Built: soft edges
+
+Built 2026-11-18 on `master` (part 5, the last, of the order in section 6), in
+`crates/pimble-board` (the new `soft.rs`; `render.rs`, `snapshot.rs`, `layer_tree.rs`,
+`raster.rs`, `svg.rs`, `doc.rs`, `model.rs`, `hit.rs`), the context bar and the layers panel
+(`crates/pimble-app/src/boards/rail.rs`, `layers.rs`, `tools.rs`; both apps) and `pimble-mcp`.
+
+### Stored keys
+
+| Where | Key | Value | Absent |
+| --- | --- | --- | --- |
+| an element's `style` map | `feather` | board units | a hard edge |
+| a layer's or group's map | `blur` | board units | none |
+| a layer's or group's map | `feather` | board units | none |
+
+Each its own last-writer-wins number. Read as 0 when negative or not a number, at most
+`soft::MAX_RADIUS` (10,000). An older app ignores them and draws hard edges. The element's
+key lives in its style map (with the halo and the rest), so `set_style`/`clear_style`
+(`StyleKey::Feather`), duplicate and every copy carry it; `copy_from` (Convert to Node) and the
+MCP's `copy_layer` carry the layer's two.
+
+**The radius**: sigma is half the radius, so an edge fades over about the radius on either
+side, and nothing reaches more than three sigma (1.5 times the radius, `soft::reach`) past
+the hard edge.
+
+### How it draws (`pimble_board::soft`)
+
+- **The blur**: three box passes each way (Kutskir's box sizes for a Gaussian), sliding sums
+  on premultiplied RGBA, transparency outside, the cost per pixel independent of the radius.
+- **Density**: a sigma up to `WORK_SIGMA_PX` (6) pixels on the target is blurred at the
+  target's density, over the target grown by three sigma. A wider one is worked at the
+  power-of-two density where sigma is 3 to 6 pixels and laid onto the target bilinear.
+  Worked that way, what is blurred (an element, or what a layer holds) is drawn and blurred
+  **whole** once and kept in a process cache (`soft::BUDGET` 160 MB, least recently used
+  out; one entry at most 2,048 × 2,048), keyed by what it draws (an element's fingerprint, a
+  layer's hash of every element fingerprint and paint operation inside it, and whether it
+  is drawn clipped) and the density. Panning and zooming over a large feather or a hazy
+  layer reuse it; an entry too large, or something showing a picture still loading, is
+  worked for the area drawn only and not kept.
+- **Feather keeps the inside**: per pixel, with `M` the sharp alpha and `Mb` the blurred
+  one, `out = (1 - M) · blurred + Mb · sharp`, alpha `Mb` (premultiplied). A flat color comes
+  out as its plain blur; a picture or text inside keeps its detail and only its rim fades.
+- **An element's feather** (`render::draw_element`): drawn hard into a buffer the size of
+  its pixels on the target, its blur beside it, combined, laid over. Feathers on elements
+  inside a symbol work in its sprites (which are upright); drawn turned (a placement past
+  384 pixels, drawn as vectors through a rotation) it is drawn hard.
+- **A layer's blur and feather**: a layer or group with either is isolated (it gets a
+  buffer). When its buffer is closed the blur replaces it with what the layer holds drawn
+  inside it (`render::draw_layer_inside`: its children's buffers, blends, clips and soft
+  edges; not its own) and blurred; the feather then works on that, its mask the edge of the
+  blurred drawing (two Gaussians, sigma √(b² + f²)). Then the opacity, blend and **clip**
+  apply as before: a clip cuts after the blur, and a feathered element in a clipped layer
+  is clipped.
+- **Where it reaches**: an element's `bounds` grow by its own feather's reach plus its layer
+  and groups' (`Element::soft`), and a paint layer's by its chain's
+  (`BoardSnapshot::paint_reach`, `soft_reach`), so the spatial index, the visible extent
+  (fit, export, thumbnails, the navigator, `render_canvas`), the raster cache's dirty areas
+  and Flatten's area see the spread. `Element::hard_bounds` is the box without it: a marquee
+  must hold that, and the app's selection box, handles, snapping, alignment, click-inside and
+  the outlines others see use it. Hit testing stays on the hard geometry.
+- **The raster cache**: the element feather is in its fingerprint; a layer's blur and feather
+  are in its composite hash, so changing one redraws every element and paint mark in it,
+  over their grown bounds.
+- **SVG export**: a feathered element is a `<g filter>`; a blurred or feathered layer's `<g>`
+  carries the filter with its clip (SVG applies the filter before clipping and opacity, as
+  the renderer does). The filter, in board units (`filterUnits="userSpaceOnUse"`, sRGB):
+  `feGaussianBlur` for a blur, and for a feather the same sum as the renderer's: blurred,
+  `core = input in blurred`, `rim = blurred out input`, `core + rim` (`feComposite`
+  arithmetic).
+- **Flatten and merges bake them**: Merge Down draws the merged layer's elements' feathers
+  and its own blur and feather into the pixels (the layer goes); Merge Group its children's
+  (the group's own keys stay on the layer it becomes, like its clip); **Flatten** of a paint
+  layer draws its own blur and feather into the pixels and, in the same edit, takes the two
+  keys off the layer (unless someone changed them meanwhile), so the picture looks the same.
+  `LayerRaster.baked` says what was drawn in.
+
+### UI (desktop and browser, the same `pimble-app` code)
+
+- **Context bar**: the opacity button became "Opacity and feather"; its popup has the
+  opacity slider and, for a selection of filled kinds (shapes, paths, text, callouts, sticky
+  notes, scatters; not lines, arrows, pens), a **Feather** slider with the radius beside it
+  ("Off", "130"). The slider is logarithmic from 1 to 2,000 units (`rail::slider_to_soft`;
+  the left end is off). The button shows "100% ◌" while the selection is feathered, so the
+  bar keeps its width. New elements never take a feather.
+- **Layers panel**: under the picked layer's blend and opacity, **Blur** and **Feather**
+  rows (slider, radius), the same scale.
+- **Undo**: a slider drag is one undo step (`boards::slider_dragging` holds the undo clock at
+  the drag's first change while changes keep coming within 1.5 s); undo also reloads the
+  bar from the selection (the opacity and feather it shows had stayed at the undone value).
+
+### MCP
+
+`feather` in `style` on `add_elements` and `update_elements` (`clear_style` `"feather"`);
+`blur` and `feather` on `add_layer` and `update_layer` (0 removes); `get_canvas` says
+`feather 60` in an element's style and `blur 40, feather 12.5` in a layer's flags;
+`get_elements` gives `feather`; `export_canvas` writes the filters. docs/MCP_CONTRACT.md,
+"Wave 6, soft edges".
+
+### Tests
+
+`crates/pimble-board/src/soft.rs`: the three boxes' spread matches sigma; blurred and
+feathered pixels stay valid premultiplied; the work density and the radius read.
+`crates/pimble-board/tests/soft_edges.rs`: the stored key; a feathered square half covered at
+its edge, fading out and in, opaque in the middle, its color in the rim, bounds grown by 1.5
+radii, hard bounds for a marquee, the index and extent reaching; cleared back to hard; the
+same picture at 1 and 4 pixels per unit and a part drawn alone equal to the whole, and the
+lower-density blur kept; a feathered layer keeping a thin line inside sharp; a blurred layer
+softening it; a clip cutting the blur's spread and a feathered element inside it; a paint
+layer blurred, its reach grown; the raster cache equal to a full render after a move and after
+the layer's feather changes; SVG filters; Merge Down's pixels soft at the edge and Flatten
+baking a blur and taking the key off, looking the same; refusals and clamping; a copy keeping
+the keys; two devices' feather, blur and fill merging into the same pixels; a map-sized canvas
+(below). `pimble-mcp` (`soft_edges_round_trip`, against a real server): a layer made with blur
+and feather, an element with a feather, read back by `get_canvas` and `get_elements`, the SVG
+filters, changed, cleared. `pimble-app` (`feather_a_shape_and_blur_a_layer`): the feather on a
+selection of an ellipse and a line (only the ellipse takes it), the bar showing it when
+selected, 0 taking it off, undo putting it back with the bar following, the layer's blur and
+feather through the panel's edit read by its row, each its own step; `rail.rs`: the slider's
+scale and which kinds offer a feather.
+
+**Measured** (release build, the machine shared): `a_big_feather_on_a_map_sized_canvas_renders_fast`,
+an 11,800 × 11,000 frame, twelve 2,400 × 3,000 regions feathered 400 in a layer feathered 150,
+and a haze layer blurred 600, at 1,920 × 1,080: fitted 121 ms cold, 75 ms warm; at 2 pixels per
+unit (sigma 400 pixels on the screen) 140 ms cold, 139 ms warm; 2.6 MB of blurs kept.
+
+### Checked in the test app
+
+Desktop, scratch store and data, its own port (7483), a canvas "Soft" made through the MCP: an
+11,800 × 11,000 paint layer "Ground" (a picture laid across it and a blue brush stroke),
+"Regions" (a polygon feathered 400, a quadrilateral 120, an ellipse 1,500), "Haze" (two white
+ellipses, layer blur 600), "Fields" (a purple rectangle feathered 500, the layer blurred 60 and
+clipped to a hidden ellipse): the MCP's render (`w6f_0_mcp_render.png`), the canvas opened
+(`w6f_1_opened.png`), zoomed in (`w6f_2_zoomed_in.png`), the clipped feather with its hard clip
+edge (`w6f_4_clipped_feather.png`, `w6f_5_clipped_feather_close.png`), inside the 1,500 feather
+at 114% (`w6f_6_big_feather_edge.png`), fitted (`w6f_7_fitted.png`), the bar's popup with the
+Feather slider (`w6f_8_feather_popup.png`), raised to 1,718 (`w6f_9_feather_raised.png`), the
+selection box on the hard edge (`w6f_11_selected_hard_box.png`), a drag from 130 to 1,718 and
+one undo back to 130 with the bar following (`w6f_15a_before_drag.png`,
+`w6f_15_feather_dragged.png`, `w6f_16_one_undo.png`), the Regions layer feathered from the
+panel (`w6f_17_layer_feather.png`), the Haze layer's blur 600 in the panel
+(`w6f_18_haze_picked.png`), the light theme without and with the ground (`w6f_19_light.png`,
+`w6f_20_light_with_ground.png`), the SVG export of Regions drawn by librsvg
+(`w6f_21_svg_export.png`).
+
+Zoom steps with the soft layers shown and the ground hidden: 125 to 130 ms from the click to
+the second frame after it (two idle frames take 84 ms here), so about 45 ms of drawing per
+step, fitted or at 114% inside the large feather. App resident 650 to 710 MB.
+
+### Deviations
+
+- The element's `feather` is in its **style map**, not on the element's map, so it is a style
+  edit (merges, clears, copies and undoes like the rest).
+- **Flatten takes the layer's blur and feather off** after drawing them in (a clip stays a key
+  on Flatten, part 1); without that the flattened layer would be blurred twice.
+- **Feather is centered on the edge** (half the fade outside the shape), not inward only; the
+  inside keeps its detail.
+- **The radius is twice sigma** (the fade spans about the radius on each side), not sigma as
+  in CSS `blur()`; SVG's `stdDeviation` is half the stored radius.
+- An element drawn into its own buffer to be feathered loses a highlighter's multiply
+  against what is below it (it is laid over).
+- Very wide feathers seen close (sigma hundreds of pixels on the screen) can show faint
+  steps: an 8-bit gradient stretched over that many pixels, from the lower-density blur.
+- librsvg (and browsers) cut a filter at its region, so the SVG's faintest rim, at three
+  sigma, may show a hairline where the renderer's fades out.
+
+### Not built
+
+- An inward-only feather, and feathering a picture element (the bar offers feather to kinds
+  with a fill; the MCP writes it on any element, and every kind draws it).
+- Drop shadows with blur (a shadow is still the offset fill), glow, and other filters.
+- A blur that follows a path (motion blur), and per-element blur of the inside.
+- A paint layer's own tiles kept blurred: a blurred paint layer is blurred from its tiles as
+  drawn, so a view far out over a huge blurred paint layer pays the existing replay cost
+  ("Large canvases", "Not done") once per density and edit.
+
+### Seen, not fixed
+
+- A paint layer holding a picture laid across the 11,800-unit canvas makes every zoom step 6
+  to 9 s, with or without soft edges (perf: PNG decode and `render::halve` of the picture per
+  step, the tiles replayed at full density): the window's picture cache lets the decoded
+  picture go after 4 s, and a step takes longer than that. `export_canvas` of that canvas took
+  62 s and `render_canvas` 6.5 s for the same reason.
