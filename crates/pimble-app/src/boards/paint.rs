@@ -463,7 +463,7 @@ pub(super) fn cancelled(store: AppStore, pane: PaneId, stroke: Stroke) {
 }
 
 /// An edit made here at once and sent later with the others ([`flush`]).
-fn held_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
+pub(super) fn held_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
     let held = with_session(pane, |s| (s.store_id, s.node_id))?;
     let author = crate::shares::author_in(store, held.0, held.1);
     let now = now_stamp();
@@ -685,7 +685,7 @@ pub(super) fn blank_thumb() -> String {
     BLANK.get_or_init(|| data_url(&RgbaImage { width: 1, height: 1, data: vec![0; 4] }).unwrap_or_default()).clone()
 }
 
-fn data_url(image: &RgbaImage) -> Option<String> {
+pub(super) fn data_url(image: &RgbaImage) -> Option<String> {
     use base64::Engine;
     let png = image.encode_png().ok()?;
     Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))

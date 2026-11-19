@@ -2656,6 +2656,22 @@ pub(crate) const APP_CSS: &str = "
     min-width: 54px;
 }
 
+/* The Stamp's symbol (a thumbnail and its name) and its settings. */
+.pimble-board__context .pimble-board__chooser--symbol {
+    min-width: 104px;
+}
+
+.pimble-board__context .pimble-board__chooser--stamp {
+    min-width: 108px;
+}
+
+.pimble-board__symbol-face .pimble-board__face-text {
+    max-width: 76px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
 /* Longer words: the Fill tolerance and reach, the retouch strength. */
 .pimble-board__context .pimble-board__chooser--long {
     min-width: 92px;
@@ -3139,6 +3155,40 @@ pub(crate) const APP_CSS: &str = "
     border: 1px solid var(--rinch-color-border);
     border-radius: 2px;
     background: var(--rinch-color-default-hover);
+}
+
+/* The Stamp's symbol picker and settings (docs/DRAWING_WAVE6_CONTRACT.md
+   section 2): thumbnails on a faint panel, a column of rows. */
+.pimble-board__symbol-thumb {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 2px;
+    background: var(--rinch-color-default-hover);
+}
+
+.pimble-board__symbol-face {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pimble-board__symbol {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-board__stack {
+    flex-direction: column;
+    align-items: stretch;
+    max-width: 360px;
+}
+
+.pimble-board__symbols {
+    flex-wrap: wrap;
+    max-width: 480px;
 }
 
 /* An eye or lock that a group's own flag decides. */

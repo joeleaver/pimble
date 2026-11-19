@@ -46,6 +46,7 @@ mod paint;
 mod paint_select;
 mod points;
 mod rail;
+mod stamp;
 mod svg_import;
 mod tools;
 mod ui;
@@ -90,6 +91,9 @@ pub enum Tool {
     /// Freehand, fitted to a path on release (today's pen became it,
     /// docs/DRAWING_CONTRACT.md decision 3).
     Pencil,
+    /// The stamp brush (docs/DRAWING_WAVE6_CONTRACT.md section 2): places
+    /// the chosen symbol along the pointer into one scatter per stroke.
+    Stamp,
     /// The paint brush (docs/DRAWING_CONTRACT.md section 3), with the preset
     /// picked in the context bar.
     Brush,
@@ -128,12 +132,13 @@ pub enum Tool {
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 27] = [
+    pub const ALL: [Tool; 28] = [
         Tool::Select,
         Tool::DirectSelect,
         Tool::Hand,
         Tool::Pen,
         Tool::Pencil,
+        Tool::Stamp,
         Tool::Brush,
         Tool::Highlighter,
         Tool::Line,
@@ -161,6 +166,7 @@ impl Tool {
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
     /// where they do not collide, docs/DRAWING_CONTRACT.md's P, A and N for
     /// the Pen, Direct select and the Pencil, B, E and I for the Brush, the
+    /// Stamp Shift+S (docs/DRAWING_WAVE6_CONTRACT.md section 2), the
     /// Eraser and the Eyedropper, G, R and Shift+R for Fill, Smudge and
     /// Blur, M and L for the paint selections; so the Rectangle is U (the
     /// shapes flyout's letter), the Polygon Y, the numbered step J, and the
@@ -175,6 +181,7 @@ impl Tool {
             Tool::Hand => 'h',
             Tool::Pen => 'p',
             Tool::Pencil => 'n',
+            Tool::Stamp => 's',
             Tool::Brush => 'b',
             Tool::Highlighter => 'b',
             Tool::Line => 'w',
@@ -203,7 +210,7 @@ impl Tool {
     /// Whether the tool's key is its letter with Shift: a variant of the
     /// tool the plain letter picks.
     pub fn shifted(self) -> bool {
-        matches!(self, Tool::Highlighter | Tool::Line | Tool::Blur)
+        matches!(self, Tool::Highlighter | Tool::Line | Tool::Blur | Tool::Stamp)
     }
 
     /// The key as a tooltip and a menu show it: "B", "Shift+R".
@@ -245,6 +252,7 @@ impl Tool {
             Tool::Hand => "Hand",
             Tool::Pen => "Pen",
             Tool::Pencil => "Pencil",
+            Tool::Stamp => "Stamp",
             Tool::Brush => "Brush",
             Tool::Highlighter => "Highlighter",
             Tool::Line => "Line",
@@ -277,6 +285,7 @@ impl Tool {
             Tool::Hand => TablerIcon::HandStop,
             Tool::Pen => TablerIcon::VectorBezier2,
             Tool::Pencil => TablerIcon::Pencil,
+            Tool::Stamp => TablerIcon::RubberStamp,
             Tool::Brush => TablerIcon::Brush,
             Tool::Highlighter => TablerIcon::Highlight,
             Tool::Line => TablerIcon::Line,
@@ -326,6 +335,7 @@ impl Tool {
             | Tool::Hand
             | Tool::Eraser
             | Tool::Pin
+            | Tool::Stamp
             | Tool::Brush
             | Tool::Highlighter
             | Tool::Eyedropper
@@ -461,6 +471,9 @@ pub struct StyleUi {
     pub on_path: Signal<bool>,
     pub along_offset: Signal<f32>,
     pub along_side: Signal<pimble_board::AlongSide>,
+    /// The Stamp's symbol and settings (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 2), which Scatter in Shape takes too.
+    pub stamp: stamp::StampUi,
 }
 
 impl StyleUi {
@@ -509,6 +522,7 @@ impl StyleUi {
             on_path: Signal::new(false),
             along_offset: Signal::new(0.0),
             along_side: Signal::new(pimble_board::AlongSide::Above),
+            stamp: stamp::StampUi::new(),
         }
     }
 }
@@ -596,6 +610,9 @@ pub enum Popup {
     FillMode,
     /// Smudge's and Blur's strength.
     Strength,
+    /// The Stamp's symbol (and a selected scatter's), and its settings.
+    Symbol,
+    Stamp,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -717,6 +734,11 @@ pub struct PaneUi {
     /// A Flatten or a merge drawn as pixels is under way (drawn, then its
     /// picture stored): what the layers panel says meanwhile.
     pub rasterizing: Signal<Option<&'static str>>,
+    /// The canvas's symbols, as the Stamp's picker shows them.
+    pub symbols: Signal<Vec<stamp::SymbolRow>>,
+    /// The symbol being edited in this pane (its name): the canvas shows
+    /// only its elements until Done.
+    pub editing_symbol: Signal<Option<String>>,
 }
 
 impl PaneUi {
@@ -757,6 +779,8 @@ impl PaneUi {
             drop_at: Signal::new(None),
             thumbs: Signal::new(HashMap::new()),
             rasterizing: Signal::new(None),
+            symbols: Signal::new(Vec::new()),
+            editing_symbol: Signal::new(None),
         }
     }
 }
@@ -960,6 +984,8 @@ enum Gesture {
     /// The paint selection's pixels dragged: moved, scaled by a handle or
     /// turned.
     PaintSelDrag(paint_select::SelDrag),
+    /// The Stamp, placing its symbol along the pointer.
+    Stamp(stamp::Stamping),
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -1045,6 +1071,8 @@ struct Session {
     paint_sel: Option<paint_select::PaintSel>,
     /// How far the selection's ants have marched.
     ants: f32,
+    /// While a symbol is edited: the camera the canvas was left at.
+    symbol_camera: Option<(Point, f32)>,
 }
 
 /// A picture in text being marked up in a pane.
@@ -1281,6 +1309,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         paint_pressure: 1.0,
         paint_sel: None,
         ants: 0.0,
+        symbol_camera: None,
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -1542,6 +1571,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         paint_pressure: 1.0,
         paint_sel: None,
         ants: 0.0,
+        symbol_camera: None,
     };
     // The watch and the undo manager start after the board was made here,
     // so undo never takes back the board itself.
@@ -1889,6 +1919,7 @@ fn after_change(store: AppStore, pane: PaneId) {
             ui.handles.set_if_changed(None);
         }
     }
+    stamp::publish(store, pane);
     points::refresh_overlay(store, pane);
     present(pane);
     nav::changed(store, pane);
@@ -3916,6 +3947,101 @@ mod tests {
         assert_eq!(style.font, Some(pimble_board::FontFamily::Serif), "the lettering stays");
         tools::undo(store, P[0], false);
         assert!(snap().1, "one undo puts it back on");
+        stop(store, P[0]);
+    }
+
+    /// Symbols and scatter (docs/DRAWING_WAVE6_CONTRACT.md section 2): Make
+    /// Symbol replacing the selection with one placement, the Stamp placing
+    /// it along a drag into one scatter (one undo step, its appends sent
+    /// together), a second drag with the scatter selected appending to it,
+    /// Edit Symbol showing the symbol alone and a recolor reaching every
+    /// placement, Done going back, Scatter in Shape filling a rectangle.
+    #[test]
+    fn make_a_symbol_stamp_it_edit_it_and_fill_a_shape() {
+        use rinch::render_surface::SurfacePointer;
+        let left = SurfaceMouseButton::Left;
+        let (store, commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| {
+            s.view.resize(800, 600);
+            s.view.set_camera(Point::new(400.0, 300.0), 1.0);
+        });
+        let fill = |c: Color| Style { fill: Some(c), stroke: Some(c), width: Some(0.0), ..Style::default() };
+        let (crown, trunk) = local_edit(store, P[0], |t| {
+            let trunk = t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(98.0, 100.0, 4.0, 10.0))).with_style(fill(Color::rgb(110, 70, 30))))?;
+            let crown = t.add_element(NewElement::new(Kind::Ellipse, Geom::Rect(Rect::new(90.0, 85.0, 20.0, 20.0))).with_style(fill(Color::rgb(30, 140, 40))))?;
+            Ok((crown, trunk))
+        })
+        .unwrap();
+        // Nothing to stamp yet: said, nothing written.
+        store.board_tool.set(Tool::Stamp);
+        tools::pointer_down(store, P[0], 300.0, 300.0, left, SurfacePointer::mouse(true));
+        tools::pointer_up(store, P[0], 300.0, 300.0, left, SurfacePointer::mouse(false));
+        assert_eq!(texts(P[0]), 2);
+        // Make Symbol.
+        tools::select(store, P[0], vec![crown.clone(), trunk.clone()]);
+        stamp::make_symbol(store, P[0]);
+        let (instance, symbol) = with_session(P[0], |s| {
+            let snap = s.snapshot();
+            assert_eq!(snap.elements.len(), 1);
+            (snap.elements[0].raw.id.clone(), snap.symbols[0].id.clone())
+        })
+        .unwrap();
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![instance.clone()]);
+        assert_eq!(untracked(|| store.board_style.stamp.symbol.get()), Some(symbol.clone()));
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.symbols.get()).len(), 1, "the picker lists it");
+        // The Stamp: a drag of 300 pixels at a spacing of one symbol size
+        // (28 units) places about eleven, into a new scatter.
+        tools::select(store, P[0], vec![]);
+        let _ = broadcasts(&commands);
+        tools::pointer_down(store, P[0], 200.0, 400.0, left, SurfacePointer::mouse(true));
+        for i in 1..=30 {
+            tools::pointer_move(store, P[0], 200.0 + i as f32 * 10.0, 400.0, SurfacePointer::mouse(true));
+        }
+        tools::pointer_up(store, P[0], 500.0, 400.0, left, SurfacePointer::mouse(false));
+        let scatters = || with_session(P[0], |s| s.snapshot().elements.iter().filter_map(|e| e.raw.scatter.clone().map(|sc| (e.raw.id.clone(), sc.placements.len()))).collect::<Vec<_>>()).unwrap();
+        let all = scatters();
+        assert_eq!(all.len(), 2);
+        let row = all.iter().find(|(id, _)| *id != instance).unwrap().clone();
+        assert!((9..=14).contains(&row.1), "{} placements", row.1);
+        assert!(broadcasts(&commands) <= 6, "sent together, not one per move");
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![row.0.clone()], "the scatter is selected");
+        // With it selected, another drag appends to it.
+        tools::pointer_down(store, P[0], 200.0, 500.0, left, SurfacePointer::mouse(true));
+        tools::pointer_move(store, P[0], 350.0, 500.0, SurfacePointer::mouse(true));
+        tools::pointer_up(store, P[0], 350.0, 500.0, left, SurfacePointer::mouse(false));
+        let grown = scatters().into_iter().find(|(id, _)| *id == row.0).unwrap().1;
+        assert!(grown > row.1 + 3, "{grown}");
+        assert_eq!(scatters().len(), 2);
+        // One undo takes back the second drag only.
+        tools::undo(store, P[0], false);
+        assert_eq!(scatters().into_iter().find(|(id, _)| *id == row.0).unwrap().1, row.1);
+        // Edit Symbol: the symbol alone, with its two elements.
+        tools::select(store, P[0], vec![row.0.clone()]);
+        stamp::edit_symbol(store, P[0]);
+        assert!(untracked(|| store.pane(P[0]).board_ui.editing_symbol.get()).is_some());
+        let (members, layers) = with_session(P[0], |s| (s.snapshot().elements.iter().map(|e| e.raw.id.clone()).collect::<Vec<_>>(), s.snapshot().layers.len())).unwrap();
+        assert_eq!((members.len(), layers), (2, 1));
+        let crown_copy = with_session(P[0], |s| s.snapshot().elements.iter().find(|e| e.raw.kind == Kind::Ellipse).map(|e| e.raw.id.clone())).flatten().unwrap();
+        tools::select(store, P[0], vec![crown_copy]);
+        tools::apply_style(store, P[0], Style { fill: Some(Color::rgb(200, 120, 0)), ..Style::default() });
+        stamp::done(store, P[0]);
+        assert!(untracked(|| store.pane(P[0]).board_ui.editing_symbol.get()).is_none());
+        let orange = with_session(P[0], |s| s.snapshot().symbol(&symbol).unwrap().elements.iter().any(|e| e.raw.style.fill == Some(Color::rgb(200, 120, 0)))).unwrap();
+        assert!(orange, "the symbol changed, so every placement did");
+        assert_eq!(texts(P[0]), 2, "back on the canvas");
+        // Scatter in Shape: one rectangle filled.
+        let rect = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 600.0, 400.0, 200.0))))).unwrap();
+        tools::select(store, P[0], vec![rect.clone()]);
+        stamp::scatter_in_shape(store, P[0]);
+        let filled = with_session(P[0], |s| {
+            let id = s.selected.first()?.clone();
+            let e = s.snapshot().get(&id)?;
+            Some(e.raw.scatter.as_ref()?.placements.iter().all(|p| p.x >= 0.0 && p.x <= 400.0 && p.y >= 600.0 && p.y <= 800.0) as usize * e.raw.scatter.as_ref()?.placements.len())
+        })
+        .flatten()
+        .unwrap();
+        assert!(filled > 20, "{filled} placements, all inside");
         stop(store, P[0]);
     }
 

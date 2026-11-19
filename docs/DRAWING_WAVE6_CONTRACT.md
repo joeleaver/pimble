@@ -528,3 +528,228 @@ from Path keeping the lettering, one undo putting it back.
 - SVG import reading `font-family`, `font-weight`, `font-style` and `letter-spacing`, and
   `<textPath>`.
 - Fonts installed on the computer (decided against: the same picture on every device).
+
+## Built: symbols and scatter
+
+Built 2026-11-18 on `master` (part 4 of the order in section 6), in `crates/pimble-board`
+(the new `scatter.rs`; `doc.rs`, `snapshot.rs`, `render.rs`, `hit.rs`, `svg.rs`, `view.rs`,
+`clip.rs`), the canvas (`crates/pimble-app/src/boards/stamp.rs`, the rail, the context bar
+and the selection's menu; both apps) and `pimble-mcp`.
+
+### Stored keys
+
+- **A symbol** is one key of the board map, `symbol:<id>`: a `Map { name, created_at,
+  author?, elements: Map<element id, element Map> }`, the key and its `elements` map made
+  together in one transaction (never a container made on first use). Its elements have
+  the shape of the board's own (kind, geom, style, transform, text, parent, note, fields)
+  without a `layer`; their coordinates are the symbol's own, (0, 0) being where a
+  placement puts it. Nothing draws them by themselves. An older app ignores the key.
+- **A scatter** is an element of `kind: "scatter"` with two new keys of its map: `symbol`
+  (the symbol's id, last writer wins) and its `geom`, an `Array` of `Buffer` chunks, as a
+  stroke's points are. A placement is 16 bytes, little-endian: `x`, `y` (`f32`, the
+  scatter's own space), the scale (`u16`, 1/1024 steps up to 64), the rotation (`u16`,
+  1/65,536 of a turn), a tint (four bytes: red, green, blue and how far the symbol's
+  colors move toward it, 0 none). Chunks are at most 256 placements when many are written
+  at once (a region fill sorts its placements into 512-unit cells first, so each chunk
+  covers a small area); a stamp stroke appends a chunk per append. A scatter takes at most
+  100,000 placements. An older app reads the kind as one it does not know and draws
+  nothing.
+- **A tint over a whole scatter**: the style key `tint` (`#rrggbbaa`, the alpha the
+  amount), applied before each placement's own.
+
+**25,000 placements**: a region fill of an 11,800 × 11,000 polygon at a 62-unit jittered
+grid made 25,320 placements, **405,996 bytes** of document (16.0 per placement; the
+25,000 single-dab strokes of the map session were 14.8 MB). Measured in
+`twenty_five_thousand_placements_are_one_small_element` (release build, the machine
+shared): the fill 4.5 to 6.6 ms, a snapshot of the canvas 1.4 to 2.1 ms, a render fitted to
+the whole map at 1,920 × 1,080 26 to 35 ms cold and 22 to 35 ms warm, a 1:1 view of a part
+16 to 24 ms, sprites held 91 KB (before the far-off dots below: 95 and 85 ms fitted, 31 ms
+1:1). In the test app, a canvas of 28,968 placements (a 24,909 one tinted, 457 KB of
+document): each zoom step redrawn in 50 to 140 ms, the app at 340 MB resident.
+
+### How it draws (`pimble_board::scatter`)
+
+- Each symbol is resolved as a board of its own, in one layer named after it, before the
+  board's elements (`SymbolDef`: its elements resolved, what they paint, a hash of their
+  fingerprints, the pictures it shows). A symbol never holds a scatter (refused; one
+  written anyway is left out), so this never recurses.
+- A scatter's extent is its placements' boxes (the symbol's bounds through each
+  placement), kept per chunk (`ResolvedScatter.chunks`). Drawing visits only the chunks,
+  and in them the placements, whose boxes meet the region drawn.
+- A placement smaller than 3 pixels across (`SPLAT_PX`) is a **dot**: the symbol's mean
+  color over its bounds (worked out once per symbol from a 32 × 32 drawing, tinted as the
+  sprite would be) spread over the pixels its box covers, each taking its share of the
+  area. A forest seen from far off (and the navigator, and a layer's thumbnail) is a few
+  pixel writes per tree instead of a draw: before it, the test app took 2 to 4 s to redraw
+  a zoom step of the 29,000-placement canvas above (the navigator and thumbnails draw the
+  whole canvas), 50 to 140 ms after.
+- Each larger placement draws the symbol from a **sprite**: the symbol drawn at a half-octave
+  size step at least as fine as the placement shows, with its tints, kept in one cache
+  for the process with a 64 MB budget (least recently used go), keyed by the symbol's
+  hash, the step and the quantized tints (5 bits a channel, 4 for the amount), and drawn
+  through the placement's transform, bilinear. A placement larger than 384 pixels on the
+  screen is drawn as vectors (through a buffer when tinted or faded). A symbol with a
+  picture not loaded yet is drawn but its sprite is not kept.
+- **Tint**: every color the symbol paints moves toward the tint's color by its amount,
+  each pixel keeping its coverage (the scatter's tint first, then the placement's).
+- The scatter is an element of its layer: clips, layer opacity and blends, groups and the
+  layer order apply as to any element. The element's own transform moves, turns and
+  scales the whole scatter (its pivot is its extent, as a stroke's is its points').
+- **The raster cache**: a scatter's fingerprint folds in its symbol's hash, its tint and
+  every placement, so editing the symbol redraws every scatter of it. Placements only
+  appended (the scatter's look unchanged and more placements) dirty only where the new
+  ones are (`ResolvedScatter::look`, `tail_extent`), so stamping into a forest does not
+  redraw the forest.
+- **Hit testing**: a point on any placement's box hits the scatter (one element: it is
+  selected, moved and deleted whole); its bounds are all its placements'.
+- **SVG export**: each symbol a `<symbol id="pimble-symbol-<id>" overflow="visible">`
+  (one per tint pair it is drawn with, its colors moved toward them as the renderer
+  does), written at its first use, and a `<use>` per placement that reaches the area,
+  through the scatter's and the placement's transforms.
+
+### Editing
+
+- `BoardTxn::make_symbol(ids, name, keep)`: copies of the elements (with their groups'
+  and frames' members, new ids, parents and `along` remapped) become the definition,
+  centered on what the top-level ones cover; unless `keep`, the elements are deleted and
+  one scatter with one placement at that center takes the topmost one's place in its
+  layer, so the canvas looks the same. One transaction, one undo. Refused, writing
+  nothing: no elements, a locked one (unless `keep`), a scatter, connector, node card or
+  spotlight among them.
+- The symbol's elements are edited by the ordinary edits (`set_style`, `set_geom`,
+  `set_transform`, `set_text`, `delete_element(s)`): `BoardTxn` finds an element in a
+  symbol when the board does not hold it, and judges only its own lock (a symbol is in no
+  layer). `add_element` with the layer `symbol:<id>` adds to the symbol.
+- `ViewOptions::editing_symbol`: a snapshot that shows the symbol's elements alone, in its
+  space, in one layer whose id is `symbol:<id>` (so a tool picking "the layer new elements
+  go into" draws into the symbol); such a snapshot is always read again whole.
+- `create_symbol`, `rename_symbol`, `delete_symbol` (its scatters draw nothing; undo
+  brings it back), `adopt_symbol` (a copy between canvases), `add_scatter`,
+  `append_placements`, `set_scatter_symbol`, `scatter_in_shape(shape, symbol, fill,
+  layer)`, `scatter_in_region(clip, ...)`; `NewElement::with_scatter` copies one
+  (duplicate, copy between canvases).
+- **Making placements**: `Jitter` (scale, its jitter, rotation jitter, a tint and its
+  jitter: lighter and darker without a tint, around the tint's color with one),
+  `StampWalker` (a placement at the first point, then one every `spacing` along the path,
+  strayed up to `scatter`; placement `n` varied by `Rng::at(seed, n)`, so a path replayed
+  in any pieces places the same), `fill_region(clip, RegionFill)` (Poisson-disk,
+  Bridson's, seeded at a coarse grid so every piece of a shape fills; or a jittered grid;
+  centers inside the outline by its fill rule), `scatter::seed_of(id)`.
+
+### UI (desktop and browser, the same `pimble-app` code)
+
+- **The Stamp**, Shift+S, on the rail in the Draw group after the Pencil (the rubber stamp
+  icon). The letters are now: V Select, A Direct select, H Hand, P Pen, N Pencil,
+  **Shift+S Stamp**, U Rectangle, O Ellipse, D Diamond, Y Polygon, K Star, W Arrow,
+  Shift+W Line, B Brush, Shift+B Highlighter, E Eraser, G Fill, R Smudge, Shift+R Blur,
+  M and L the paint selections, I Eyedropper, T Text, S Sticky note, C Connector, F Frame,
+  J Numbered step, Q Discussion pin (X swaps the well's colors; Z is still free). A drag
+  places the chosen symbol along the pointer into a new scatter in the layer new elements
+  go into, or into the one selected scatter of that symbol; the scatter is selected on
+  release. Placements go into the document at once and out about every 100 ms; the
+  undo clock is held from press to release (one stroke, one undo step); a cancelled
+  stroke's new scatter goes.
+- **The context bar** (the Stamp's, and a selected scatter's): the symbol picker (a
+  thumbnail and the name; its popup lists the canvas's symbols with thumbnails; picking
+  one sets the Stamp's and changes the selected scatters' symbol) and the settings button
+  ("Every 1.0× · ±20%"), whose popup has sliders: spacing and scatter in symbol sizes,
+  size, size jitter, rotation jitter (degrees either way), tint (toward the well's stroke
+  color) and tint jitter. The bar grows by those two buttons.
+- **The selection's ··· menu**: Make Symbol (the selection replaced by one placement; the
+  Stamp takes the new symbol; a sentence says so), Edit Symbol (one scatter selected),
+  Scatter in Shape (one closed shape selected: filled with the Stamp's symbol at its
+  spacing and jitter, Poisson-disk, seeded from the shape's id, just above it).
+- **Editing a symbol** is an isolated view: the pane shows the symbol alone, fitted, with
+  "Symbol "Tree"" and Done at the left of the context bar; every tool draws and edits in
+  it, and every placement changes (in this pane when Done is pressed, live in any other
+  pane showing the canvas). Done, or Escape with nothing selected, goes back to the camera
+  the canvas was left at. The Stamp, Make Symbol and Scatter in Shape say to finish first.
+
+### MCP
+
+`add_symbol` and `scatter`; `get_canvas` lists symbols and scatters compactly,
+`get_elements` gives a scatter's symbol, count and bounds; `update_elements` changes a
+symbol's elements by id, a scatter's `symbol` and `tint`; copies bring the symbol along.
+docs/MCP_CONTRACT.md, "Wave 6, symbols and scatter".
+
+### Tests
+
+`crates/pimble-board/src/scatter.rs`: a placement is 16 bytes and reads back; stamps are
+the same whatever pieces the pointer path comes in, and differ for another seed.
+`crates/pimble-board/tests/scatter.rs`: Make Symbol replacing the selection with one
+placement drawn where it was, the stored keys, `keep`; 1,000 placements under 17.5 KB, the
+chunks, appending; instances drawn scaled, turned and tinted, nothing between them,
+nothing for a view far away, the scatter's own tint; editing the symbol's element changing
+every instance (and the fingerprint), the isolated view and drawing into the symbol
+through its layer, deleting from it, a scatter refused in a symbol, a deleted symbol
+drawing nothing; hit testing on placements, not between; Poisson and grid fills inside an
+ellipse, at least the spacing apart (Poisson), just above the shape, the same for the same
+seed, an open line and a tiny shape refused; a clip and a blend applying; SVG with a
+`<symbol>` per tint and a `<use>` per placement shown; the raster cache equal to a full
+render after placements are appended; two devices appending and recoloring the symbol at
+once reading the same; a placement far off drawn as a few greenish pixels; the
+25,000-placement forest (size and timings above). `pimble-mcp`
+(`symbols_and_scatters_round_trip`, against a real server): a symbol from specs, a
+polygon filled at a density by the symbol's name, a list appended into the scatter,
+get_canvas and get_elements, the crown recolored by id, a scatter's tint and symbol
+changed, a symbol made from an element on the canvas, the SVG, the refusals.
+`pimble-app` (`make_a_symbol_stamp_it_edit_it_and_fill_a_shape`): nothing to stamp said,
+Make Symbol, a drag stamping about eleven placements sent together, a second drag
+appending to the selected scatter and one undo taking only it back, Edit Symbol showing
+two elements in one layer, a recolor reaching the symbol, Done back on the canvas, Scatter
+in Shape filling a rectangle with every placement inside; `stamp.rs`: Shift+S, beside the
+Pencil.
+
+### Checked in the test app
+
+Desktop, scratch store and data (`XDG_*` in the scratchpad), its own port (7483), a fresh
+canvas "Forest": a tree drawn with the Ellipse and Rectangle tools and colored from the
+well (`w6s_1_tree.png`), both selected (`w6s_2_tree_selected.png`), the ··· menu with Make
+Symbol, Edit Symbol and Scatter in Shape (`w6s_3_more_menu.png`), Make Symbol replacing
+them with one placement, the context bar showing the symbol's thumbnail and name and the
+sentence in the status line (`w6s_4_made_symbol.png`); a 7-sided polygon 16,000 units
+across (added through the MCP) selected and Scatter in Shape filling it with 4,040 trees in
+0.7 s, Poisson-disk, lighter and darker, sized and turned (`w6s_5_polygon_selected.png`,
+`w6s_6_forest.png`, `w6s_7_forest_closer.png`); the Stamp by Shift+S
+(`w6s_8_stamp_tool.png`) dragged along an arc in empty space, 18 trees in one scatter,
+selected on release (`w6s_9_stamped_row.png`); the symbol picker with its thumbnail
+(`w6s_10_symbol_picker.png`); Edit Symbol showing the tree alone, fitted, with "Symbol
+"Symbol 1"" and Done (`w6s_11_editing_symbol.png`, `w6s_22_editing_symbol.png`), the crown
+selected and filled orange there (`w6s_12_symbol_recolored.png`), Done back at the camera
+the canvas was left at with the row and the forest orange (`w6s_13_done_row_orange.png`),
+zoomed out over all of it (`w6s_14_zoomed_out.png`, `w6s_15_zoomed_far_out.png`); the
+MCP's render of the canvas (`w6s_16_mcp_render.png`); 24,909 more tinted trees placed by
+the MCP's `scatter` (a grid over a `d` square, 204 ms), fitted and zoomed in, each step
+redrawn in 50 to 140 ms (`w6s_17_25k_fitted.png`, `w6s_18_25k_closer.png`,
+`w6s_19_25k_close.png`); the Stamp's bar and its settings popup
+(`w6s_20_stamp_bar.png`, `w6s_21_stamp_settings.png`); a star drawn into the symbol while it
+was edited (three elements: `w6s_23_drawn_into_symbol.png`), Escape twice back to the
+canvas (`w6s_24_forest_with_star.png`).
+
+### Deviations
+
+- **Make Symbol replaces** the selection with one placement (the contract allowed keeping
+  it); the MCP's `add_symbol` has `keep`.
+- **Edit Symbol is an isolated view** (the symbol alone in its own space), not editing in
+  place among the canvas: every tool works there unchanged, and new elements go into the
+  symbol through its layer's id.
+- A scatter's **pivot is its extent**, so a scatter that is turned or scaled as a whole
+  shifts a little when placements are appended outside it (as a turned stroke does when
+  it grows). Moving it is exact.
+- Tints are **quantized** when drawn (5 bits a channel, 4 for the amount), so placements
+  share sprites; the stored tint is exact. The SVG uses the same quantized tints.
+- The Stamp's spacing and scatter are in **symbol sizes** (1.0× is one symbol across at
+  its size), so the same settings suit a 30-unit tree and a 300-unit house.
+- The MCP's `density` maps to a Poisson spacing of √(0.68 × 10,000 / density) (Bridson's
+  fill packs about 0.68 / r²), a grid's √(10,000 / density).
+
+### Not built
+
+- Editing a symbol in place among the canvas; renaming or deleting a symbol in the UI
+  (the MCP and `BoardTxn` can; a symbol nobody places stays in the document).
+- Symbols holding scatters (nested); scatters as clips.
+- Erasing or moving single placements (the eraser deletes a scatter whole); a paint
+  version of the stamp (a dab shape from a picture).
+- Copying a scatter between stores does not copy pictures inside its symbol.
+- A coarser level than one dot per placement at extreme zoom-outs (100,000 placements
+  are still 100,000 dots).

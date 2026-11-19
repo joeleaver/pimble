@@ -47,17 +47,18 @@ pub const FLYOUTS: [&[Tool]; 5] = [
 ];
 
 /// The rail, top to bottom: Select, Direct select and Hand; Draw (the Pen,
-/// the Pencil, the shapes); Paint (the brush and the highlighter, the
+/// the Pencil, the Stamp, the shapes); Paint (the brush and the highlighter, the
 /// eraser, the fill with smudge and blur, the paint selections, the
 /// eyedropper); Diagram (text, sticky notes, the other diagram tools,
 /// discussion pins); pictures.
-pub const RAIL: [Slot; 19] = [
+pub const RAIL: [Slot; 20] = [
     Slot::Tool(Tool::Select),
     Slot::Tool(Tool::DirectSelect),
     Slot::Tool(Tool::Hand),
     Slot::Gap,
     Slot::Tool(Tool::Pen),
     Slot::Tool(Tool::Pencil),
+    Slot::Tool(Tool::Stamp),
     Slot::Flyout(0),
     Slot::Gap,
     Slot::Flyout(2),
@@ -137,6 +138,8 @@ pub struct Controls {
     pub contiguous: bool,
     /// Smudge's and Blur's strength.
     pub strength: bool,
+    /// The Stamp's symbol and settings (a selected scatter's symbol).
+    pub stamp: bool,
 }
 
 impl Controls {
@@ -165,6 +168,7 @@ impl Controls {
             || self.tolerance
             || self.contiguous
             || self.strength
+            || self.stamp
     }
 
     /// Any of the pickers (everything but the two swatches).
@@ -198,6 +202,7 @@ impl Controls {
             tolerance: self.tolerance || o.tolerance,
             contiguous: self.contiguous || o.contiguous,
             strength: self.strength || o.strength,
+            stamp: self.stamp || o.stamp,
         }
     }
 }
@@ -233,7 +238,7 @@ pub fn controls_of(kind: &Kind) -> Controls {
         Kind::Step => Controls { stroke: true, font: true, opacity: true, ..none },
         Kind::Spotlight => Controls { opacity: true, ..none },
         // A scatter: its opacity, and its symbol and tint (the stamp's row).
-        Kind::Scatter => Controls { opacity: true, ..none },
+        Kind::Scatter => Controls { opacity: true, stamp: true, ..none },
         Kind::Frame | Kind::Picture | Kind::Group | Kind::Card | Kind::Other(_) => none,
     }
 }
@@ -254,6 +259,7 @@ pub fn controls_of_tool(tool: Tool) -> Controls {
         Tool::Eraser => return Controls { size: true, ..Controls::default() },
         Tool::Fill => return Controls { color: true, tolerance: true, contiguous: true, ..Controls::default() },
         Tool::Smudge | Tool::Blur => return Controls { size: true, strength: true, ..Controls::default() },
+        Tool::Stamp => return Controls { stamp: true, ..Controls::default() },
         _ => {}
     }
     let mut c = tool.kind().map(|k| controls_of(&k)).unwrap_or_default();
@@ -297,6 +303,7 @@ pub fn hint(tool: Tool) -> &'static str {
         Tool::Eyedropper => "Click to pick the color under the pointer (Alt with a brush does it too)",
         Tool::Pin => "Click to start a discussion there",
         Tool::Frame => "Drag out a frame; what it covers goes with it",
+        Tool::Stamp => "Drag to place the symbol along the way",
         Tool::SelectRect => "Drag over paint to select it, then move, scale or turn it",
         Tool::SelectLasso => "Draw round paint to select it, then move, scale or turn it",
         _ => "",
@@ -553,7 +560,7 @@ fn icon_button(__scope: &mut RenderScope, icon: TablerIcon, tip: String, active:
 ///
 /// `size` is a class giving a face of words its width ("" for an icon's):
 /// the button does not grow with its face.
-fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, size: &'static str, face: NodeHandle) -> NodeHandle {
+pub(super) fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, size: &'static str, face: NodeHandle) -> NodeHandle {
     let class = format!("pimble-board-tool pimble-board__chooser {size}");
     let active = format!("{class} pimble-board-tool--active");
     rsx! {
@@ -1218,7 +1225,11 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::BorderOuter, "Outline Stroke", Box::new(tools::outline_stroke)),
         menu_item(__scope, store, pane, TablerIcon::Route, "Put Text on Path", Box::new(tools::put_text_on_path)),
         menu_item(__scope, store, pane, TablerIcon::RouteOff, "Release from Path", Box::new(tools::release_from_path)),
+        menu_item(__scope, store, pane, TablerIcon::Components, "Make Symbol", Box::new(super::stamp::make_symbol)),
+        menu_item(__scope, store, pane, TablerIcon::Edit, "Edit Symbol", Box::new(super::stamp::edit_symbol)),
+        menu_item(__scope, store, pane, TablerIcon::Trees, "Scatter in Shape", Box::new(super::stamp::scatter_in_shape)),
     ];
+    let (stamp_bar, stamp_popups) = super::stamp::render_controls(__scope, store, pane);
     let writable = move || {
         state
             .board
@@ -1252,6 +1263,18 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         "Done"
                     }
                 }
+                // Editing a symbol (docs/DRAWING_WAVE6_CONTRACT.md section
+                // 2): "Done" goes back to the canvas.
+                div {
+                    class: "pimble-board__ctx-group",
+                    style: {move || shown(ui.editing_symbol.get().is_some())},
+                    span { class: "pimble-board__ctx-label", {move || ui.editing_symbol.get().map(|n| format!("Symbol \"{n}\"")).unwrap_or_default()} }
+                    Button {
+                        size: "xs",
+                        onclick: move || super::stamp::done(store, pane),
+                        "Done"
+                    }
+                }
                 div {
                     class: "pimble-board__ctx-group",
                     style: {move || if writable() { "" } else { "opacity: 0.45; pointer-events: none;" }},
@@ -1282,6 +1305,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().tolerance)}, {tolerance_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().contiguous)}, {fill_mode_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().strength)}, {strength_btn} }
+                        div { class: "pimble-board__ctx-group", style: {move || shown(controls().stamp)}, {stamp_bar} }
                     }
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
@@ -1416,6 +1440,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Tolerance)}, {tolerances} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::FillMode)}, {fill_modes} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Strength)}, {strengths} }
+            {stamp_popups}
         }
     }
 }

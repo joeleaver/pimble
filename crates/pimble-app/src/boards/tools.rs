@@ -62,7 +62,7 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
         "Tab" => !primary && !key.alt,
         "x" | "X" if !primary && !key.alt => true,
         "Delete" | "Backspace" => selected || paint_selection,
-        "Escape" => active || paint_selection,
+        "Escape" => active || paint_selection || super::stamp::editing(pane),
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => selected,
         // Ctrl+V is the board's on the desktop; in the browser it is left to
         // the page, whose `paste` brings the clipboard's files
@@ -374,6 +374,7 @@ pub(super) fn cancel_gesture(store: AppStore, pane: PaneId) {
     let Err(gesture) = super::paint_select::cancelled(store, pane, gesture) else { return };
     match gesture {
         Gesture::Paint(stroke) => super::paint::cancelled(store, pane, stroke),
+        Gesture::Stamp(stamping) => super::stamp::cancelled(store, pane, stamping),
         Gesture::Stroke { id, .. } => {
             with_session(pane, |s| s.view.cancel_stroke());
             if let Some(id) = id {
@@ -480,6 +481,7 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
         Tool::DirectSelect => points::press(store, pane, px, py),
         Tool::Pen => points::pen_press(store, pane, px, py),
         Tool::Pencil => begin_stroke(store, pane, Kind::Pen, p, true),
+        Tool::Stamp => super::stamp::press(store, pane, p),
         // A press the paint tools did not take (they take every one).
         Tool::Brush | Tool::Highlighter | Tool::Smudge | Tool::Blur => {}
         Tool::Fill => super::paint::fill(store, pane, p),
@@ -759,6 +761,8 @@ enum Write {
     Erase(Point),
     /// A paint stroke's next point.
     Paint(String, pimble_board::BrushPoint),
+    /// The Stamp's next placements.
+    Stamp(String, Vec<pimble_board::scatter::Placement>),
     Eyedrop,
 }
 
@@ -884,6 +888,10 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 Write::Paint(stroke.id.clone(), point)
             }
             Gesture::Eyedrop => Write::Eyedrop,
+            Gesture::Stamp(stamping) => match super::stamp::walk(stamping, p) {
+                Some((id, placed)) => Write::Stamp(id, placed),
+                None => Write::Nothing,
+            },
             Gesture::Pinch
             | Gesture::PenPlace
             | Gesture::Points(_)
@@ -961,6 +969,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
             });
         }
         Write::Erase(p) => erase_at(store, pane, p),
+        Write::Stamp(id, placed) => super::stamp::moved(store, pane, id, placed),
     }
 }
 
@@ -982,6 +991,7 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
             super::paint::eyedrop(store, pane, px, py);
             after_change(store, pane);
         }
+        Gesture::Stamp(stamping) => super::stamp::released(store, pane, stamping, p),
         Gesture::Stroke { id, kind, style, layer, mut pending, pencil, .. } => {
             let (points, min_gap) = with_session(pane, |s| {
                 // The release's own pressure is none: the stroke ends at the
@@ -2870,6 +2880,10 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             // back first).
             cancel_gesture(store, pane);
             points::finish_pen(store, pane);
+        }
+        // Escape with nothing selected leaves a symbol being edited.
+        "Escape" if super::stamp::editing(pane) && with_session(pane, |s| s.selected.is_empty() && matches!(s.gesture, Gesture::Idle)).unwrap_or(false) => {
+            super::stamp::done(store, pane);
         }
         "Escape" => {
             // Escape mid-gesture takes the gesture back, as a cancelled
