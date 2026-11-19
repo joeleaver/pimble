@@ -439,6 +439,9 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
     match button {
         SurfaceMouseButton::Middle => begin_pan(pane, px, py),
         SurfaceMouseButton::Left if space || tool == Tool::Hand => begin_pan(pane, px, py),
+        // A picture being placed takes every press, whatever the tool: on
+        // it or its handles a drag, elsewhere it is laid down.
+        SurfaceMouseButton::Left if super::paint_select::placing(pane) => super::paint_select::press(store, pane, tool, px, py),
         SurfaceMouseButton::Left => {
             if double && tool == Tool::DirectSelect {
                 if points::double_click(store, pane, px, py) {
@@ -2804,6 +2807,11 @@ pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) {
     // A Pen path under way is finished first, so undo takes it back whole;
     // a paint selection ends with its pixels where they are.
     points::finish_pen(store, pane);
+    // A picture being placed goes (nothing of it was written), and that
+    // is all this undo does.
+    if super::paint_select::drop_placing(store, pane) {
+        return;
+    }
     super::paint_select::commit(store, pane);
     if !store.node_access(held.0, held.1).allows_write() {
         return;

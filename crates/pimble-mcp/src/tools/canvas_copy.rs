@@ -266,6 +266,8 @@ pub(super) fn moved_body(body: &PaintBody, d: Point) -> Option<PaintBody> {
         PaintBody::Pixels(p) => {
             let mut p = p.clone();
             p.rect = shift_rect(&p.rect);
+            // A placed picture's transform, where it now is.
+            p.transform = p.transform.map(|t| PixelTransform::translate(-d.x, -d.y).then(&t).then(&PixelTransform::translate(d.x, d.y)));
             PaintBody::Pixels(p)
         }
         PaintBody::Fill(f) => {

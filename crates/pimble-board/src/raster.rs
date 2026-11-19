@@ -382,3 +382,68 @@ fn draw_entry(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn Pict
         LayerKind::Other(_) => {}
     }
 }
+
+/// One piece of a picture placed in a paint layer
+/// (docs/DRAWING_WAVE6_CONTRACT.md section 5): its own blob, its own
+/// `pixels` operation, all the pieces sharing the placement's transform.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PicturePiece {
+    /// The piece encoded: PNG when it has any transparency, else JPEG at
+    /// [`PIECE_JPEG_QUALITY`].
+    pub bytes: Vec<u8>,
+    /// Where it lies before the placement's transform, board units: its
+    /// share of the whole picture's rectangle.
+    pub rect: Rect,
+    /// Its size in pixels.
+    pub pixel_size: (u32, u32),
+}
+
+/// The quality an opaque piece of a large placed picture is written at.
+pub const PIECE_JPEG_QUALITY: u8 = 90;
+
+/// Whether a picture `width` × `height` pixels is placed in pieces: more
+/// than [`RASTER_TILE_PX`] on a side, as Flatten tiles a layer.
+pub fn needs_pieces(width: u32, height: u32) -> bool {
+    width as usize > RASTER_TILE_PX || height as usize > RASTER_TILE_PX
+}
+
+/// A large picture placed over `rect` cut into a grid of pieces of at most
+/// [`RASTER_TILE_PX`] on a side (row by row), so no blob holds more than
+/// one tile's pixels and a view decodes only the pieces it shows, as
+/// Flatten's tiles. Refused past [`MAX_RASTER_TILES`] pieces, and for a
+/// rectangle with no area.
+pub fn picture_pieces(picture: &crate::render::Picture, rect: Rect) -> Result<Vec<PicturePiece>, BoardError> {
+    let rect = rect.normalized();
+    let (pw, ph) = (picture.width(), picture.height());
+    if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) || pw == 0 || ph == 0 {
+        return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
+    }
+    let t = RASTER_TILE_PX as u32;
+    let (cols, rows) = (pw.div_ceil(t), ph.div_ceil(t));
+    if (cols * rows) as usize > MAX_RASTER_TILES {
+        return Err(BoardError::Invalid(format!(
+            "This picture is {pw} × {ph} pixels, more than {MAX_RASTER_TILES} pieces of {RASTER_TILE_PX} pixels; scale it down first."
+        )));
+    }
+    let (kx, ky) = (rect.w / pw as f32, rect.h / ph as f32);
+    let mut out = Vec::with_capacity((cols * rows) as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let (x0, y0) = (col * t, row * t);
+            let (w, h) = ((pw - x0).min(t), (ph - y0).min(t));
+            let area = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, w, h).ok_or_else(|| BoardError::Invalid("a piece with no area".into()))?;
+            let piece = picture.pixmap().clone_rect(area).ok_or_else(|| BoardError::Invalid("a piece with no area".into()))?;
+            let opaque = piece.data().chunks_exact(4).all(|px| px[3] == 255);
+            let image = RgbaImage::from_pixmap(piece);
+            let encoded = if opaque { image.encode_jpeg(PIECE_JPEG_QUALITY, crate::model::Color::WHITE) } else { image.encode_png() };
+            let bytes = encoded.map_err(|e| BoardError::Invalid(format!("the picture could not be encoded: {e}")))?;
+            // The edges are worked out from the whole picture's, so the
+            // pieces meet exactly.
+            let (left, top) = (rect.x + x0 as f32 * kx, rect.y + y0 as f32 * ky);
+            let right = if x0 + w == pw { rect.right() } else { rect.x + (x0 + w) as f32 * kx };
+            let bottom = if y0 + h == ph { rect.bottom() } else { rect.y + (y0 + h) as f32 * ky };
+            out.push(PicturePiece { bytes, rect: Rect::new(left, top, right - left, bottom - top), pixel_size: (w, h) });
+        }
+    }
+    Ok(out)
+}

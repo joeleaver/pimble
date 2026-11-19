@@ -126,8 +126,35 @@ pub struct EditOverlay {
     pub dashed: Vec<Vec<Point>>,
     /// How far the ants have marched, in dash lengths (a timer moves it).
     pub dash_phase: f32,
+    /// A picture being placed in a paint layer, drawn under the marks
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 5): nothing of it is in the
+    /// document until it is committed.
+    pub picture: Option<OverlayPicture>,
     pub color: Color,
     pub scale: f32,
+}
+
+/// A picture drawn in the edit overlay: `picture` over `rect` (board units)
+/// put through `transform`.
+#[derive(Debug, Clone)]
+pub struct OverlayPicture {
+    pub picture: Arc<crate::render::Picture>,
+    pub rect: Rect,
+    pub transform: crate::paint_ops::PixelTransform,
+}
+
+impl PartialEq for OverlayPicture {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.picture, &other.picture) && self.rect == other.rect && self.transform == other.transform
+    }
+}
+
+impl OverlayPicture {
+    /// The corners where it shows, board units.
+    fn corners(&self) -> [Point; 4] {
+        let r = self.rect.normalized();
+        [Point::new(r.x, r.y), Point::new(r.right(), r.y), Point::new(r.right(), r.bottom()), Point::new(r.x, r.bottom())].map(|p| self.transform.apply(p))
+    }
 }
 
 impl Default for EditOverlay {
@@ -141,6 +168,7 @@ impl Default for EditOverlay {
             hot: None,
             dashed: Vec::new(),
             dash_phase: 0.0,
+            picture: None,
             color: Color { r: 34, g: 139, b: 230, a: 255 },
             scale: 1.0,
         }
@@ -732,6 +760,9 @@ fn overlay_box(view: &View, o: &EditOverlay) -> Option<(i64, i64, i64, i64)> {
     for d in &o.dashed {
         pts.extend_from_slice(d);
     }
+    if let Some(pic) = &o.picture {
+        pts.extend_from_slice(&pic.corners());
+    }
     let mut it = pts.into_iter().filter(|p| p.x.is_finite() && p.y.is_finite()).map(|p| ((p.x - view.x) * view.scale, (p.y - view.y) * view.scale));
     let first = it.next()?;
     let (mut x0, mut y0, mut x1, mut y1) = (first.0, first.1, first.0, first.1);
@@ -781,6 +812,11 @@ fn draw_overlay(frame: &mut Pixmap, view: &View, o: &EditOverlay) {
     white.anti_alias = true;
     white.set_color(tiny_skia::Color::WHITE);
     let id = Affine::identity();
+    if let Some(pic) = &o.picture {
+        let t = pic.transform;
+        let ts = view.transform().pre_concat(Affine::from_row(t.a, t.b, t.c, t.d, t.e, t.f));
+        crate::render::draw_placed_picture(frame, &pic.picture, pic.rect.normalized(), ts);
+    }
     let cubic = |pb: &mut PathBuilder, c: &[Point; 4]| {
         let (a, b, cc, d) = (at(c[0]), at(c[1]), at(c[2]), at(c[3]));
         pb.move_to(a.0, a.1);

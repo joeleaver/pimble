@@ -423,8 +423,14 @@ Wave 5 (built 2026-11-17):
 | `flatten_layer` | `layer` (a paint layer): its whole history becomes pictures, one per tile of at most 1,024 units on a side (2,048 pixels; empty tiles left out), each stored as a blob of the canvas's store, laid down in one edit (`pimble_board::rasterize_at` with `RasterJob::Flatten`, `put_blob` per tile, `BoardTxn::apply_raster`). `scale` (pixels per unit, 0.125 to 2, default 2) draws a very large layer at fewer pixels. Refused with a sentence when a picture it draws cannot be fetched, or it needs more than 256 tiles at that density (since 2026-11-18; before, anything past 4,096 units across was refused) |
 | `delete_layer` with `merge_down` | onto a paint layer (a vector layer's shapes, or a paint layer, with its opacity in the pixels and its blend on the `pixels` operation), or a group holding a paint layer (one paint layer of the group's pixels, keeping the group's name, opacity and blend): drawn as pixels the same way (`RasterJob::MergeDown`, `RasterJob::MergeGroup`). A hidden layer is refused (it would merge as nothing); a paint layer onto a vector layer is refused |
 
-Smudge, blur and moves of paint selections have no tool: an agent paints and fills; the
-summary counts them when a person made them.
+Wave 6, pictures in paint layers (docs/DRAWING_WAVE6_CONTRACT.md section 5, built 2026-11-18):
+
+| Tool | What it does |
+| --- | --- |
+| `paint` | also `pictures` (laid first, in order, so this call's strokes and fills go above them), each `src` (a `pimble-blob:` URL already in Pimble) or `file` (a picture file on this computer, fitted under the 20 MiB limit with `pimble_image::fit` as `add_elements` and `insert_canvas` take one), `x`, `y` (its top-left corner before rotation), `w` and `h` (canvas units; both left out, one unit per picture pixel; one left out, the picture's proportions) and `rotation` (degrees clockwise about its center). Each becomes `pixels` operations of the paint layer with its rectangle and, when turned, a `transform` (`BoardTxn::add_placed_pixels`): one for a picture up to 2,048 pixels on a side (a `src` is laid as it is; a `file` is stored as one blob of the canvas's store), else one per piece of a grid of at most 2,048 pixels on a side (`pimble_board::picture_pieces`: each piece its own blob, JPEG when opaque, PNG otherwise; the pieces share the transform), as Flatten tiles a layer. `strokes` and `fills` may be left out when `pictures` are given. Refused with a sentence, nothing written: neither or both of `src` and `file`, a `src` that is not a `pimble-blob:` URL or cannot be fetched, a file that cannot be read or is not a picture, a size of 0 or less, more than 256 pieces. The answer names each picture's operation ids |
+
+Smudge, blur and moves of paint selections have no tool: an agent paints, fills and lays
+pictures; the summary counts them when a person made them.
 
 `get_canvas` gives a paint layer one line under its heading, never the points: how many
 brush strokes, eraser strokes, pictures (pasted, flattened or merged), fills, smudges,

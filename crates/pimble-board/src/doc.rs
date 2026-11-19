@@ -2343,7 +2343,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
             return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
         }
-        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend: Blend::Normal }))
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp::new(src, rect)))
     }
 
     /// Any operation laid on top of paint layer `layer` as it is (copying a
@@ -2367,6 +2367,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
             PaintBody::Retouch(r) if r.points.is_empty() => return Err(BoardError::Invalid("a smudge or blur needs at least one point".into())),
             PaintBody::Pixels(p) if !sized(&p.rect.normalized()) => return Err(BoardError::Invalid("pixels need a rectangle with a size".into())),
+            PaintBody::Pixels(p) if p.bounds().is_none() => return Err(BoardError::Invalid(crate::paint_ops::PIXELS_FLAT.into())),
             PaintBody::Fill(f) if !sized(&f.clip.normalized()) => return Err(BoardError::Invalid("a fill needs an area".into())),
             PaintBody::Move(m) if !m.selection.is_valid() => return Err(BoardError::Invalid("a move needs a selection".into())),
             other => other,
@@ -2382,7 +2383,46 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
         }
         let blend = if blend == Blend::PassThrough { Blend::Normal } else { blend };
-        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend }))
+        self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.to_string(), rect, blend, transform: None }))
+    }
+
+    /// Pictures placed in paint layer `layer` (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 5: a paste, a drop or Insert Image into a paint layer, the
+    /// MCP's `paint` with `pictures`): one `pixels` operation per piece, each
+    /// `(src, rect)` put through `transform` (`None` or the identity: as the
+    /// rectangle says), on top of the layer in the order given, in this one
+    /// transaction (one undo step). A large picture comes as several pieces
+    /// ([`crate::raster::picture_pieces`]) sharing one transform. Refused,
+    /// writing nothing, with no pieces, a piece with no area, a transform
+    /// that flattens the picture, or anything but an unlocked paint layer.
+    /// Answers the op ids.
+    pub fn add_placed_pixels(&mut self, layer: &str, pieces: &[(String, Rect)], transform: Option<crate::paint_ops::PixelTransform>) -> Result<Vec<String>> {
+        if pieces.is_empty() {
+            return Err(BoardError::Invalid("A placed picture needs at least one piece.".into()));
+        }
+        let transform = transform.filter(|t| !t.is_identity());
+        if transform.is_some_and(|t| !t.is_finite() || t.inverse().is_none()) {
+            return Err(BoardError::Invalid(crate::paint_ops::PIXELS_FLAT.into()));
+        }
+        let bodies = pieces
+            .iter()
+            .map(|(src, rect)| {
+                let rect = rect.normalized();
+                if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
+                    return Err(BoardError::Invalid("pixels need a rectangle with a size".into()));
+                }
+                if src.trim().is_empty() {
+                    return Err(BoardError::Invalid("pixels need a picture".into()));
+                }
+                Ok(crate::paint_ops::PixelsOp { src: src.clone(), rect, blend: Blend::Normal, transform })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.judge_paint_into(layer)?;
+        let mut ids = Vec::with_capacity(bodies.len());
+        for body in bodies {
+            ids.push(self.insert_paint_op(layer, crate::paint_ops::PaintBody::Pixels(body))?);
+        }
+        Ok(ids)
     }
 
     /// A flood fill on top of its paint layer (docs/DRAWING_CONTRACT.md
@@ -2494,7 +2534,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 .tiles
                 .iter()
                 .zip(srcs)
-                .map(|(tile, src)| crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.clone(), rect: tile.rect, blend }))
+                .map(|(tile, src)| crate::paint_ops::PaintBody::Pixels(crate::paint_ops::PixelsOp { src: src.clone(), rect: tile.rect, blend, transform: None }))
                 .collect()
         };
         match &raster.job {
@@ -2970,8 +3010,17 @@ pub(crate) fn read_paint_op<T: ReadTxn>(txn: &T, id: &str, map: &MapRef) -> crat
                 _ => None,
             };
             let blend = string_of(map.get(txn, BLEND)).as_deref().and_then(Blend::parse).filter(|b| *b != Blend::PassThrough).unwrap_or(Blend::Normal);
+            // A malformed transform draws the picture where its rectangle
+            // says (an older app does the same with any transform).
+            let transform = match map.get(txn, paint_keys::TRANSFORM) {
+                Some(Out::Any(Any::Array(items))) => {
+                    let n: Vec<f32> = items.iter().filter_map(number).map(|v| v as f32).collect();
+                    (n.len() == 6).then(|| PixelTransform::from_array([n[0], n[1], n[2], n[3], n[4], n[5]])).filter(|t| t.is_finite() && t.inverse().is_some())
+                }
+                _ => None,
+            };
             match (string_of(map.get(txn, paint_keys::SRC)), rect) {
-                (Some(src), Some(rect)) => PaintBody::Pixels(PixelsOp { src, rect, blend }),
+                (Some(src), Some(rect)) => PaintBody::Pixels(PixelsOp { src, rect, blend, transform }),
                 _ => PaintBody::Other(kind.clone()),
             }
         }
@@ -3133,6 +3182,9 @@ fn write_paint_op(txn: &mut TransactionMut, map: &MapRef, op: &crate::paint_ops:
             map.insert(txn, paint_keys::RECT, Any::Map(Arc::new(rect_fields(&p.rect))));
             if p.blend != Blend::Normal {
                 map.insert(txn, BLEND, p.blend.as_str());
+            }
+            if let Some(t) = p.transform.filter(|t| !t.is_identity()) {
+                map.insert(txn, paint_keys::TRANSFORM, pixel_transform_any(&t));
             }
         }
         PaintBody::Fill(f) => {

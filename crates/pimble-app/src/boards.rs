@@ -1272,7 +1272,9 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 /// document as this pane last had it.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
-    // A paint selection's pixels stay where they were put.
+    // A picture not placed yet goes; a paint selection's pixels stay where
+    // they were put.
+    let _ = paint_select::drop_placing(store, pane);
     paint_select::commit(store, pane);
     remember_camera(pane, scale_of(pane));
     // A paint stroke under way ends here, and what it held goes out.
@@ -2512,6 +2514,12 @@ pub(crate) fn add_image_nodes(store: AppStore, store_id: StoreId, parent_id: Nod
 /// and when every layer is locked, before anything is stored.
 pub(crate) fn add_to_board(store: AppStore, pane: PaneId, at: Option<(f32, f32)>, pictures: Vec<(Option<String>, Vec<u8>)>) {
     let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    // Into a paint layer (picked, or a paint tool in hand) a picture is
+    // placed as pixels (docs/DRAWING_WAVE6_CONTRACT.md section 5).
+    if let Some(layer) = paint_select::paints_into(store, pane) {
+        paint_select::place_pictures(store, pane, at, layer, pictures);
+        return;
+    }
     if pictures.is_empty() || !writable_or_say(store, pane) || tools::target_layer(store, pane).is_none() {
         return;
     }
@@ -2543,6 +2551,10 @@ fn pump(store: AppStore) {
 pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
     // A flattened layer's picture (Flatten, a merge as pixels).
     if layers::raster_stored(store, request_id, result) {
+        return true;
+    }
+    // A picture placed in a paint layer.
+    if paint_select::placed_stored(store, request_id, result) {
         return true;
     }
     let Some((_, store_id, parent_id, title, batch)) = IN_FLIGHT.with(|f| f.borrow_mut().take_if(|(id, ..)| *id == request_id)) else {
@@ -4392,6 +4404,179 @@ mod tests {
         assert_eq!(op_kinds(), vec!["pixels"; ids.len()]);
         tools::undo(store, P[0], false);
         assert_eq!(op_kinds(), vec!["stroke"], "one undo step");
+        stop(store, P[0]);
+    }
+
+    // ── Wave 6: pictures in paint layers (docs/DRAWING_WAVE6_CONTRACT.md) ───
+
+    /// A PNG `w` × `h` of one color.
+    fn png_of(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let pixels: Vec<u8> = (0..w * h).flat_map(|_| rgba).collect();
+        ::image::ImageEncoder::write_image(::image::codecs::png::PngEncoder::new(&mut out), &pixels, w, h, ::image::ExtendedColorType::Rgba8).unwrap();
+        out
+    }
+
+    /// Every `PutBlob` sent since the last look: request id and bytes.
+    fn puts(commands: &crossbeam_channel::Receiver<BackendCommand>) -> Vec<(u64, Vec<u8>)> {
+        commands
+            .try_iter()
+            .filter_map(|c| match c {
+                BackendCommand::PutBlob { request_id, bytes, .. } => Some((request_id, bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each `PutBlob` answered as stored at the size its bytes decode to.
+    fn answer_puts(store: AppStore, sent: &[(u64, Vec<u8>)]) {
+        for (k, (request_id, bytes)) in sent.iter().enumerate() {
+            let size = Picture::decode(bytes).map(|p| (p.width(), p.height())).ok();
+            let blob = pimble_core::BlobId::from_bytes([k as u8 + 7; 16]);
+            let url = BlobUrl::parse(&format!("pimble-blob:00000000-0000-0000-0000-000000000001/{blob}")).unwrap();
+            assert!(stored(store, *request_id, &Ok(StoredBlob { url, size, notice: None })));
+        }
+    }
+
+    fn pixels_ops() -> Vec<(String, pimble_board::PixelsOp)> {
+        with_session(P[0], |s| {
+            s.snapshot()
+                .paint
+                .iter()
+                .filter_map(|op| match &op.raw.body {
+                    PaintBody::Pixels(p) => Some((op.raw.layer.clone(), p.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// A picture pasted with a paint tool in hand is placed, not added: it
+    /// shows with the selection's handles, fitted to the view, and nothing
+    /// is written or stored while it is moved and scaled. Enter stores it
+    /// and lays it down as one `pixels` operation with its rectangle and
+    /// transform, in a paint layer made in the same edit: one undo step.
+    /// Painting goes on above it in the same layer.
+    #[test]
+    fn a_picture_pasted_into_a_paint_layer_is_placed_then_laid_down() {
+        let (store, commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(1600, 1200));
+        store.board_tool.set(Tool::Brush);
+        let layers_before = with_session(P[0], |s| s.snapshot().layers.len()).unwrap();
+        let _ = commands.try_iter().count();
+
+        add_to_board(store, P[0], None, vec![(None, png_of(4000, 1000, [30, 60, 220, 255]))]);
+        assert!(paint_select::placing(P[0]), "placed first");
+        assert!(puts(&commands).is_empty() && op_kinds().is_empty(), "nothing stored or written while placing");
+        assert!(pictures_on(P[0]).is_empty(), "not a picture element");
+        let placed = with_session(P[0], |s| s.paint_sel.as_ref().unwrap().box_now().unwrap()).unwrap();
+        let view = with_session(P[0], |s| s.view.size()).unwrap();
+        assert!(placed.w < view.0 as f32 && (placed.w / placed.h - 4.0).abs() < 0.01, "fitted to the view, its proportions kept: {placed:?}");
+        assert!(untracked(|| store.pane(P[0]).board_ui.handles.get()).is_some(), "the handles show");
+        assert!(with_session(P[0], |s| paint_select::overlay(s).is_some_and(|o| o.picture.is_some())).unwrap(), "drawn over the canvas");
+
+        // Moved by a drag inside, made twice as tall by the bottom handle.
+        let c = placed.center();
+        mouse_drag(store, on_screen(c), on_screen(Point::new(c.x + 40.0, c.y)));
+        let b = with_session(P[0], |s| s.paint_sel.as_ref().unwrap().box_now().unwrap()).unwrap();
+        mouse_drag(store, on_screen(Point::new(b.center().x, b.bottom())), on_screen(Point::new(b.center().x, b.bottom() + b.h)));
+        assert!(puts(&commands).is_empty() && op_kinds().is_empty(), "still nothing written");
+        let (rect, t) = with_session(P[0], |s| {
+            let sel = s.paint_sel.as_ref().unwrap();
+            (sel.selection.bounds().unwrap(), sel.transform)
+        })
+        .unwrap();
+        assert!((t.d - 2.0).abs() < 0.01 && (t.a - 1.0).abs() < 0.01, "{t:?}");
+
+        key_event(store, "Enter");
+        assert!(!paint_select::placing(P[0]));
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.rasterizing.get()), Some("Placing the picture..."));
+        let sent = puts(&commands);
+        assert_eq!(sent.len(), 2, "a picture past 2,048 pixels goes in pieces");
+        assert!(sent.iter().all(|(id, _)| *id >= 1 << 42), "a placement's requests");
+        assert!(op_kinds().is_empty(), "nothing until every piece is stored");
+        answer_puts(store, &sent);
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.rasterizing.get()), None);
+        let ops = pixels_ops();
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|(_, p)| p.transform == Some(t)), "every piece goes through the placement's transform");
+        let union = ops[0].1.rect.union(&ops[1].1.rect);
+        assert!((union.x - rect.x).abs() < 0.01 && (union.w - rect.w).abs() < 0.01 && (union.h - rect.h).abs() < 0.01, "{union:?} {rect:?}");
+        assert!((ops[0].1.rect.right() - ops[1].1.rect.x).abs() < 1e-3, "the pieces meet");
+        let layer = ops[0].0.clone();
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before + 1, "a paint layer made for it");
+        assert_eq!(untracked(|| store.pane(P[0]).board_ui.layer.get()), Some(layer.clone()), "and picked");
+
+        // Painted over, in the same layer.
+        mouse_drag(store, on_screen(Point::new(c.x - 100.0, c.y)), on_screen(Point::new(c.x + 100.0, c.y)));
+        assert_eq!(op_kinds(), vec!["pixels", "pixels", "stroke"]);
+        assert!(with_session(P[0], |s| s.snapshot().paint.iter().all(|op| op.raw.layer == layer)).unwrap());
+        tools::undo(store, P[0], false);
+        assert_eq!(op_kinds(), vec!["pixels", "pixels"]);
+        tools::undo(store, P[0], false);
+        assert!(op_kinds().is_empty(), "the picture and its layer are one undo step");
+        assert_eq!(with_session(P[0], |s| s.snapshot().layers.len()).unwrap(), layers_before);
+        stop(store, P[0]);
+    }
+
+    /// A picture dropped with a paint layer picked goes into that layer
+    /// and shows at once (its picture seeded, one piece); turned with the
+    /// rotate handle it keeps the turn. Escape (and undo) drops a placement
+    /// with nothing stored or written; a press outside lays it down.
+    #[test]
+    fn a_placement_is_turned_kept_by_a_press_outside_and_escape_drops_it() {
+        let (store, commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(1600, 1200));
+        let paint = local_edit(store, P[0], |t| t.paint_layer_for(None)).unwrap();
+        store.pane(P[0]).board_ui.layer.set(Some(paint.clone()));
+        store.board_tool.set(Tool::Select);
+        let _ = commands.try_iter().count();
+        let png = png_of(200, 100, [220, 40, 40, 255]);
+
+        // Escape: nothing.
+        add_to_board(store, P[0], None, vec![(None, png.clone())]);
+        assert!(paint_select::placing(P[0]));
+        key_event(store, "Escape");
+        assert!(!paint_select::placing(P[0]));
+        assert!(puts(&commands).is_empty() && op_kinds().is_empty(), "Escape adds nothing");
+        // Undo drops one too, and that is all it does.
+        add_to_board(store, P[0], None, vec![(None, png.clone())]);
+        tools::undo(store, P[0], false);
+        assert!(!paint_select::placing(P[0]) && puts(&commands).is_empty());
+        assert_eq!(with_session(P[0], |s| s.snapshot().layer(&paint).is_some()).unwrap(), true);
+
+        // Dropped at a point, turned a quarter, laid down by a press outside.
+        let at = on_screen(Point::new(300.0, 200.0));
+        add_to_board(store, P[0], Some(at), vec![(Some("red.png".into()), png.clone())]);
+        let b = with_session(P[0], |s| s.paint_sel.as_ref().unwrap().box_now().unwrap()).unwrap();
+        assert!((b.center().x - 300.0).abs() < 0.5 && (b.center().y - 200.0).abs() < 0.5, "where it was dropped: {b:?}");
+        assert_eq!((b.w, b.h), (200.0, 100.0), "one unit per pixel when it fits");
+        let center = b.center();
+        with_session(P[0], |s| {
+            let sel = s.paint_sel.as_mut().unwrap();
+            sel.transform = pimble_board::PixelTransform::rotate(90.0, center);
+        });
+        mouse_click(store, on_screen(Point::new(center.x + 400.0, center.y + 400.0)));
+        assert!(!paint_select::placing(P[0]));
+        let sent = puts(&commands);
+        assert_eq!(sent.len(), 1, "one piece");
+        assert_eq!(sent[0].1, png, "stored as it came");
+        answer_puts(store, &sent);
+        let ops = pixels_ops();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].0, paint, "into the picked paint layer");
+        assert_eq!(ops[0].1.rect, b);
+        let bounds = with_session(P[0], |s| s.snapshot().paint[0].bounds).unwrap().unwrap();
+        assert!((bounds.w - 100.0).abs() < 0.01 && (bounds.h - 200.0).abs() < 0.01, "turned: {bounds:?}");
+        let red = color_at(Point::new(center.x, center.y + 80.0));
+        assert!(red.r > 200 && red.g < 80 && red.a > 200, "it shows at once, turned: {red:?}");
+        let empty = color_at(Point::new(center.x + 80.0, center.y));
+        assert!(empty.a < 10, "not where it was before the turn: {empty:?}");
+        tools::undo(store, P[0], false);
+        assert!(op_kinds().is_empty(), "one undo step");
         stop(store, P[0]);
     }
 }

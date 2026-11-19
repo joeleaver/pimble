@@ -12,10 +12,20 @@
 //! keeps it where it is; Escape takes it back (the move goes); Delete
 //! clears the selected pixels (a move with no transform).
 //!
+//! **Pictures placed in a paint layer** (docs/DRAWING_WAVE6_CONTRACT.md
+//! section 5) are a selection too: a paste, a drop or Insert Image with a
+//! paint layer picked (or a paint tool in hand) shows the picture over the
+//! canvas with the same handles, fitted to the view, and nothing is written
+//! while it is moved, scaled and turned. Enter, a press outside or another
+//! tool commits it: the picture is stored (`PutBlob`, in pieces of at most
+//! 2,048 pixels when it is larger, as Flatten tiles a layer) and laid down
+//! as `pixels` operations with its rectangle and transform in one edit (one
+//! undo step). Escape, Delete, undo or closing the canvas drops it.
+//!
 //! The pure parts are tested here: a drawn rectangle or lasso as a
 //! selection, and a drag as the transform it puts the pixels through.
 
-use pimble_board::{EditOverlay, LayerKind, PixelTransform, Selection};
+use pimble_board::{EditOverlay, LayerKind, OverlayPicture, PixelTransform, Selection};
 
 use super::*;
 
@@ -40,6 +50,19 @@ pub(super) struct PaintSel {
     pub transform: PixelTransform,
     /// The `move` operation, once the pixels were first dragged.
     pub move_id: Option<String>,
+    /// A picture being placed (its selection is its rectangle): nothing is
+    /// written until it is committed. Its `layer` is the paint layer
+    /// picked when it began, or empty for the one the brush would paint
+    /// into (made at commit when there is none).
+    pub placing: Option<Placing>,
+}
+
+/// A picture being placed in a paint layer.
+#[derive(Debug, Clone)]
+pub(super) struct Placing {
+    pub picture: Arc<Picture>,
+    /// The picture as it came (stored as it is when it is one piece).
+    pub bytes: Arc<Vec<u8>>,
 }
 
 impl PaintSel {
@@ -255,8 +278,13 @@ pub(super) fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32)
         after_change(store, pane);
         return;
     }
-    // A press outside keeps what was selected where it is.
+    // A press outside keeps what was selected where it is (a picture being
+    // placed is laid down, and the press does nothing more).
+    let was_placing = placing(pane);
     commit(store, pane);
+    if was_placing {
+        return;
+    }
     let Some(p) = with_session(pane, |s| s.view.screen_to_board(px, py)) else { return };
     match paint_layer_at(store, pane, p, NO_PAINT_TO_SELECT) {
         Ok(layer) => {
@@ -305,7 +333,8 @@ pub(super) fn moved(store: AppStore, pane: PaneId, px: f32, py: f32) -> bool {
                 }
                 let sel = s.paint_sel.as_mut()?;
                 sel.transform = t;
-                if !due {
+                // A picture being placed is not written until committed.
+                if !due || sel.placing.is_some() {
                     return Some(Next::Redraw);
                 }
                 Some(match &sel.move_id {
@@ -377,6 +406,7 @@ pub(super) fn released(store: AppStore, pane: PaneId, gesture: Gesture, px: f32,
                     selection,
                     transform: PixelTransform::IDENTITY,
                     move_id: None,
+                    placing: None,
                 });
             });
             after_change(store, pane);
@@ -388,7 +418,7 @@ pub(super) fn released(store: AppStore, pane: PaneId, gesture: Gesture, px: f32,
                 let t = dragged(&d.kind, &d.base, &d.bounds, &d.own, d.start, p, s.shift);
                 let sel = s.paint_sel.as_mut()?;
                 sel.transform = t;
-                if t == d.base {
+                if t == d.base || sel.placing.is_some() {
                     return None;
                 }
                 Some(match &sel.move_id {
@@ -464,6 +494,9 @@ pub(super) fn commit(store: AppStore, pane: PaneId) {
             super::points::hold_clock(pane, false);
             new_undo_step(pane);
         }
+        if sel.placing.is_some() {
+            store_placed(store, pane, sel);
+        }
         after_change(store, pane);
     }
 }
@@ -494,6 +527,11 @@ pub(super) fn clear(store: AppStore, pane: PaneId) {
     })
     .flatten();
     let Some(sel) = had else { return };
+    if sel.placing.is_some() {
+        // A picture not placed yet: nothing to clear, it goes.
+        after_change(store, pane);
+        return;
+    }
     match sel.move_id {
         Some(id) => {
             local_edit_said(store, pane, |t| t.set_move_transform(&id, None));
@@ -524,7 +562,254 @@ pub(super) fn overlay(s: &Session) -> Option<EditOverlay> {
             sel.selection.outline_through(&sel.transform)
         }
     };
-    (outline.len() >= 2).then(|| EditOverlay { dashed: vec![outline], dash_phase: s.ants, ..EditOverlay::default() })
+    let picture = s.paint_sel.as_ref().and_then(|sel| {
+        let placing = sel.placing.as_ref()?;
+        Some(OverlayPicture { picture: placing.picture.clone(), rect: sel.selection.bounds()?, transform: sel.transform })
+    });
+    (outline.len() >= 2).then(|| EditOverlay { dashed: vec![outline], dash_phase: s.ants, picture, ..EditOverlay::default() })
+}
+
+// ── Pictures placed in a paint layer ────────────────────────────────────────
+
+/// `PutBlob` request ids of placed pictures' pieces start here, clear of
+/// image nodes' (`1 << 40`) and flattened layers' (`1 << 41`).
+const PLACE_BASE: u64 = 1 << 42;
+
+/// What the layers panel says while a placed picture is stored.
+const PLACING_WORDS: &str = "Placing the picture...";
+
+/// More than one picture for a paint layer.
+const ONE_AT_A_TIME: &str = "A paint layer takes one picture at a time, so the first was taken.";
+
+/// Whether pane `pane` is placing a picture.
+pub(super) fn placing(pane: PaneId) -> bool {
+    with_session(pane, |s| s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_some())).unwrap_or(false)
+}
+
+/// Where a picture put on pane `pane`'s board goes as pixels: `Some` when
+/// the layers panel's pick is a paint layer (its id) or a paint tool is in
+/// hand (empty: the layer the brush would paint into); `None` when it is a
+/// picture element as before.
+pub(super) fn paints_into(store: AppStore, pane: PaneId) -> Option<String> {
+    let picked = untracked(|| store.pane(pane).board_ui.layer.get());
+    let paint = with_session(pane, |s| picked.as_deref().and_then(|id| s.snapshot().layer(id)).filter(|l| l.kind == LayerKind::Paint).map(|l| l.id.clone())).flatten();
+    if paint.is_some() {
+        return paint;
+    }
+    let tool = untracked(|| store.board_tool.get());
+    (tool.paints() || tool.selects_paint() || matches!(tool, Tool::Fill | Tool::Eyedropper)).then(String::new)
+}
+
+/// Pictures put on pane `pane`'s board while it paints into `layer`
+/// ([`paints_into`]): the first is decoded (off the UI thread on the
+/// desktop) and shown for placing, fitted to the view, centered where it
+/// was dropped or on the view.
+pub(super) fn place_pictures(store: AppStore, pane: PaneId, at: Option<(f32, f32)>, layer: String, mut pictures: Vec<(Option<String>, Vec<u8>)>) {
+    if pictures.is_empty() || !writable_or_say(store, pane) {
+        return;
+    }
+    if pictures.len() > 1 {
+        crate::events::show_notice(store, ONE_AT_A_TIME.to_string());
+    }
+    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    let (_, bytes) = pictures.swap_remove(0);
+    let work = move || -> Result<(Arc<Picture>, Vec<u8>), String> {
+        let picture = Picture::decode(&bytes).map_err(|_| NOT_A_PICTURE.to_string())?;
+        Ok((Arc::new(picture), bytes))
+    };
+    #[cfg(all(feature = "native", not(test)))]
+    std::thread::spawn(move || {
+        let result = work();
+        run_on_main_thread(move || begin_placing(store, pane, held, at, layer, result));
+    });
+    #[cfg(any(not(feature = "native"), test))]
+    begin_placing(store, pane, held, at, layer, work());
+}
+
+/// The picture was decoded: it shows over the canvas with the selection's
+/// handles. A selection or placement under way is kept where it is first.
+fn begin_placing(store: AppStore, pane: PaneId, held: (StoreId, NodeId), at: Option<(f32, f32)>, layer: String, decoded: Result<(Arc<Picture>, Vec<u8>), String>) {
+    let (picture, bytes) = match decoded {
+        Ok(d) => d,
+        Err(sentence) => {
+            crate::events::show_notice(store, sentence);
+            return;
+        }
+    };
+    if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) {
+        return;
+    }
+    commit(store, pane);
+    with_session(pane, |s| {
+        let (w, h) = s.view.size();
+        let center = match at {
+            Some((x, y)) => s.view.screen_to_board(x, y),
+            None => s.view.center(),
+        };
+        let a = s.view.screen_to_board(0.0, 0.0);
+        let b = s.view.screen_to_board(w as f32, h as f32);
+        let view = Rect::new(a.x.min(b.x), a.y.min(b.y), (b.x - a.x).abs(), (b.y - a.y).abs());
+        // Large pictures are fitted to the view at first.
+        let rect = super::lay_out(&[(picture.width(), picture.height())], center, view)[0];
+        s.selected.clear();
+        s.paint_sel = Some(PaintSel {
+            layer,
+            selection: Selection::Rect(rect),
+            transform: PixelTransform::IDENTITY,
+            move_id: None,
+            placing: Some(Placing { picture, bytes: Arc::new(bytes) }),
+        });
+    });
+    after_change(store, pane);
+}
+
+/// A placed picture whose pieces are being stored. Their `PutBlob` request
+/// ids are `first .. first + pieces`.
+struct PendingPlace {
+    pane: PaneId,
+    held: (StoreId, NodeId),
+    layer: String,
+    transform: PixelTransform,
+    /// Each piece's rectangle, and its URL once stored.
+    rects: Vec<Rect>,
+    srcs: Vec<Option<String>>,
+    first: u64,
+    /// One piece stored as it came: this window's picture cache gets the
+    /// decoded picture (a picture in pieces is fetched as any is).
+    whole: Option<(Arc<Picture>, Arc<Vec<u8>>)>,
+}
+
+thread_local! {
+    static PLACES: RefCell<Vec<PendingPlace>> = const { RefCell::new(Vec::new()) };
+    static NEXT_PLACE: Cell<u64> = const { Cell::new(PLACE_BASE) };
+}
+
+/// A placement committed: its pieces (the picture as it came, or a grid
+/// of tiles past 2,048 pixels on a side, cut off the UI thread on the
+/// desktop) go to be stored; nothing is written until they all are.
+fn store_placed(store: AppStore, pane: PaneId, sel: PaintSel) {
+    let Some(placing) = sel.placing else { return };
+    let Some(rect) = sel.selection.bounds() else { return };
+    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    let ui = store.pane(pane).board_ui;
+    ui.rasterizing.set(Some(PLACING_WORDS));
+    let (layer, transform) = (sel.layer, sel.transform);
+    let picture = placing.picture.clone();
+    let work = move || -> Result<Vec<(Vec<u8>, Rect)>, String> {
+        let pieces = pimble_board::picture_pieces(&picture, rect).map_err(|e| e.to_string())?;
+        Ok(pieces.into_iter().map(|p| (p.bytes, p.rect)).collect())
+    };
+    if !pimble_board::needs_pieces(placing.picture.width(), placing.picture.height()) {
+        let pieces = vec![((*placing.bytes).clone(), rect)];
+        send_pieces(store, PendingPlace { pane, held, layer, transform, rects: Vec::new(), srcs: Vec::new(), first: 0, whole: Some((placing.picture, placing.bytes)) }, pieces);
+        return;
+    }
+    let pending = PendingPlace { pane, held, layer, transform, rects: Vec::new(), srcs: Vec::new(), first: 0, whole: None };
+    #[cfg(all(feature = "native", not(test)))]
+    std::thread::spawn(move || {
+        let result = work();
+        run_on_main_thread(move || cut(store, pending, result));
+    });
+    #[cfg(any(not(feature = "native"), test))]
+    cut(store, pending, work());
+}
+
+fn cut(store: AppStore, pending: PendingPlace, result: Result<Vec<(Vec<u8>, Rect)>, String>) {
+    match result {
+        Ok(pieces) => send_pieces(store, pending, pieces),
+        Err(sentence) => {
+            store.pane(pending.pane).board_ui.rasterizing.set(None);
+            crate::events::show_notice(store, sentence);
+        }
+    }
+}
+
+fn send_pieces(store: AppStore, mut pending: PendingPlace, pieces: Vec<(Vec<u8>, Rect)>) {
+    let first = NEXT_PLACE.with(|n| n.replace(n.get() + pieces.len() as u64));
+    pending.first = first;
+    pending.rects = pieces.iter().map(|(_, r)| *r).collect();
+    pending.srcs = vec![None; pieces.len()];
+    let held = pending.held;
+    PLACES.with(|p| p.borrow_mut().push(pending));
+    for (i, (bytes, _)) in pieces.into_iter().enumerate() {
+        store.send(BackendCommand::PutBlob { store_id: held.0, node_id: held.1, bytes, request_id: first + i as u64 });
+    }
+}
+
+/// The answer to a placed picture's piece's `PutBlob`; answers whether it
+/// was one. Once every piece is stored the picture is laid down in one edit
+/// (one undo step): the paint layer (made when needed) and a `pixels`
+/// operation per piece, with the placement's transform. A piece that could
+/// not be stored ends it with its sentence and nothing written.
+pub(super) fn placed_stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
+    let at = PLACES.with(|p| p.borrow().iter().position(|p| (p.first..p.first + p.srcs.len() as u64).contains(&request_id)));
+    let Some(at) = at else { return false };
+    let blob = match result {
+        Err(sentence) => {
+            let pending = PLACES.with(|p| p.borrow_mut().remove(at));
+            store.pane(pending.pane).board_ui.rasterizing.set(None);
+            crate::events::show_notice(store, sentence.clone());
+            return true;
+        }
+        Ok(blob) => blob,
+    };
+    if let Some(notice) = &blob.notice {
+        crate::events::show_notice(store, notice.clone());
+    }
+    let done = PLACES.with(|p| {
+        let mut p = p.borrow_mut();
+        let index = (request_id - p[at].first) as usize;
+        p[at].srcs[index] = Some(blob.url.to_string());
+        p[at].srcs.iter().all(Option::is_some)
+    });
+    if !done {
+        return true;
+    }
+    let PendingPlace { pane, held, layer, transform, rects, srcs, whole, .. } = PLACES.with(|p| p.borrow_mut().remove(at));
+    store.pane(pane).board_ui.rasterizing.set(None);
+    if with_session(pane, |s| (s.store_id, s.node_id)) != Some(held) {
+        crate::events::show_notice(store, "The canvas was closed before its picture was stored, so nothing changed.".to_string());
+        return true;
+    }
+    let pieces: Vec<(String, Rect)> = srcs.into_iter().flatten().zip(rects).collect();
+    if let (Some((picture, bytes)), [(src, _)]) = (whole, pieces.as_slice()) {
+        if blob.size == Some((picture.width(), picture.height())) {
+            super::seed_picture(src, picture, (*bytes).clone());
+        }
+    }
+    let picked = untracked(|| store.pane(pane).board_ui.layer.get());
+    new_undo_step(pane);
+    let laid = local_edit_said(store, pane, |t| {
+        let into = if layer.is_empty() { t.paint_layer_for(picked.as_deref())? } else { layer.clone() };
+        t.add_placed_pixels(&into, &pieces, Some(transform))?;
+        Ok(into)
+    });
+    new_undo_step(pane);
+    if let Some(into) = laid {
+        store.pane(pane).board_ui.layer.set_if_changed(Some(into));
+        super::request_wanted_pictures();
+    }
+    true
+}
+
+/// A picture being placed goes without being laid down (undo, the canvas
+/// closing); answers whether there was one.
+pub(super) fn drop_placing(store: AppStore, pane: PaneId) -> bool {
+    let had = with_session(pane, |s| {
+        if !s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_some()) {
+            return false;
+        }
+        if matches!(s.gesture, Gesture::PaintSelDrag(_)) {
+            s.gesture = Gesture::Idle;
+        }
+        s.paint_sel = None;
+        true
+    })
+    .unwrap_or(false);
+    if had {
+        after_change(store, pane);
+    }
+    had
 }
 
 thread_local! {
@@ -550,7 +835,9 @@ fn step(store: AppStore, pane: PaneId) {
     // nothing is drawn) until this one has it again.
     let focused = untracked(|| store.focused_pane.get()) == pane;
     let go = with_session(pane, |s| {
-        let on = s.paint_sel.is_some() || matches!(s.gesture, Gesture::PaintSelect { .. });
+        // A picture being placed shows still ants: marching would redraw
+        // the picture under them five times a second.
+        let on = s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_none()) || matches!(s.gesture, Gesture::PaintSelect { .. });
         if on && focused {
             s.ants = (s.ants + 1.0) % 64.0;
         }

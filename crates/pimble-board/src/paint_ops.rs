@@ -21,6 +21,8 @@
 //!     // pixels
 //!     src: "pimble-blob:...", rect: Any { x, y, w, h },
 //!     blend: "multiply" | ...?,              // absent: normal (wave 5)
+//!     transform: Any [a, b, c, d, e, f]?,     // absent: none (wave 6, a
+//!                                             // picture placed, scaled, turned)
 //!     // fill (wave 5)
 //!     seed: Any { x, y }, color, tolerance: Number (0..1),
 //!     clip: Any { x, y, w, h }, contiguous: Bool?,   // absent: true
@@ -71,6 +73,10 @@ pub struct StrokeOp {
     pub points: Vec<BrushPoint>,
 }
 
+/// The refusal of a placed picture whose transform flattens it (or is not
+/// a number).
+pub const PIXELS_FLAT: &str = "A placed picture needs a transform that keeps it a picture, not one that flattens it onto a line.";
+
 /// A picture laid over a rectangle of the layer (Flatten, Merge Down,
 /// paste).
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +88,31 @@ pub struct PixelsOp {
     /// How it is laid onto the layer's pixels (stored only when not
     /// normal: Merge Down of a layer that blends keeps its blend here).
     pub blend: Blend,
+    /// What the picture over `rect` is put through (a picture pasted into
+    /// a paint layer, scaled and turned before it was placed:
+    /// docs/DRAWING_WAVE6_CONTRACT.md section 5); `None` lies as `rect`
+    /// says. Stored only when there is one.
+    pub transform: Option<PixelTransform>,
+}
+
+impl PixelsOp {
+    /// A picture over `rect`, laid normally, not transformed.
+    pub fn new(src: impl Into<String>, rect: Rect) -> PixelsOp {
+        PixelsOp { src: src.into(), rect, blend: Blend::Normal, transform: None }
+    }
+
+    /// Where it lies, board units: `rect` through the transform's box.
+    pub fn bounds(&self) -> Option<Rect> {
+        let r = self.rect.normalized();
+        if !(r.w > 0.0 && r.h > 0.0 && r.is_finite()) {
+            return None;
+        }
+        match self.transform {
+            None => Some(r),
+            Some(t) if t.is_finite() && t.inverse().is_some() => Some(t.map_rect(&r)),
+            Some(_) => None,
+        }
+    }
 }
 
 /// A flood fill (docs/DRAWING_CONTRACT.md section 3, "fill"): the pixels
@@ -414,10 +445,7 @@ impl RawPaintOp {
     pub fn bounds(&self) -> Option<Rect> {
         match &self.body {
             PaintBody::Stroke(s) => points_bounds(&s.points).map(|r| r.inflate(s.settings.reach())),
-            PaintBody::Pixels(p) => {
-                let r = p.rect.normalized();
-                (r.w > 0.0 && r.h > 0.0 && r.is_finite()).then_some(r)
-            }
+            PaintBody::Pixels(p) => p.bounds(),
             PaintBody::Fill(f) => {
                 let r = f.clip.normalized();
                 (r.w > 0.0 && r.h > 0.0 && r.is_finite() && r.contains(f.seed)).then_some(r)
@@ -491,6 +519,11 @@ pub(crate) fn fingerprint(op: &RawPaintOp) -> u64 {
                 h.write_u32(v.to_bits());
             }
             p.blend.as_str().hash(&mut h);
+            if let Some(t) = p.transform {
+                for v in t.to_array() {
+                    h.write_u32(v.to_bits());
+                }
+            }
         }
         PaintBody::Fill(f) => {
             4u8.hash(&mut h);

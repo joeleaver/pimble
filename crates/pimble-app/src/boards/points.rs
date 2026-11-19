@@ -1238,7 +1238,10 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
         if let Some(pe) = s.points.as_mut() {
             pe.others.retain(|o| !gone.contains(&o.id));
         }
-        let overlay = if let Some(pen) = s.pen.as_ref().filter(|_| tool == Tool::Pen) {
+        let overlay = if s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_some()) {
+            // A picture being placed in a paint layer, whatever the tool.
+            super::paint_select::overlay(s)
+        } else if let Some(pen) = s.pen.as_ref().filter(|_| tool == Tool::Pen) {
             pen_overlay(s, pen, scale)
         } else if let Some(pe) = s.points.as_ref().filter(|_| tool == Tool::DirectSelect) {
             points_overlay(s, pe, scale)

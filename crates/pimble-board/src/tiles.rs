@@ -43,7 +43,7 @@ use crate::brush::{self, Dab, DabWalker, Lay, PxRect, StrokeBlend, PX_PER_UNIT};
 use crate::model::{Blend, Rect};
 use crate::paint_ops::{settings_hash, PaintBody, PaintOp, StrokeOp};
 use crate::retouch::{self, PxBox};
-use crate::render::{draw_picture_rect, Picture, PictureSource, View};
+use crate::render::{draw_picture_rect, draw_placed_picture, Picture, PictureSource, View};
 use crate::snapshot::{id_hash, BoardSnapshot, Fx};
 
 /// A tile's side in pixels.
@@ -778,12 +778,26 @@ fn replay(
             }
             PaintBody::Pixels(p) => match pictures.picture(&p.src) {
                 Some(pic) => {
+                    // A placed picture (wave 6) goes through its transform;
+                    // Flatten's lie on the pixel grid as they are.
+                    let placed = p.transform.is_some() || !on_pixel_grid(&p.rect);
+                    let ts = match p.transform {
+                        Some(t) => to_tile.pre_concat(Affine::from_row(t.a, t.b, t.c, t.d, t.e, t.f)),
+                        None => to_tile,
+                    };
+                    let draw = |into: &mut Pixmap| {
+                        if placed {
+                            draw_placed_picture(into, &pic, p.rect.normalized(), ts);
+                        } else {
+                            draw_picture_rect(into, &pic, p.rect.normalized(), None, ts, 1.0, true, false);
+                        }
+                    };
                     if p.blend == Blend::Normal {
-                        draw_picture_rect(picture.pixmap_mut(), &pic, p.rect.normalized(), None, to_tile, 1.0, true, false);
+                        draw(picture.pixmap_mut());
                     } else {
                         // Drawn on its own, then blended onto what is there.
                         let mut alone = Pixmap::new(TILE_PX, TILE_PX).expect("a tile's size");
-                        draw_picture_rect(&mut alone, &pic, p.rect.normalized(), None, to_tile, 1.0, true, false);
+                        draw(&mut alone);
                         let paint = PixmapPaint { opacity: 1.0, blend_mode: p.blend.to_tiny(), quality: FilterQuality::Nearest };
                         picture.pixmap_mut().draw_pixmap(0, 0, alone.as_ref(), &paint, Affine::identity(), None);
                     }
@@ -841,6 +855,16 @@ fn replay(
         }
     }
     (TileEntry { ops: want.to_vec(), picture, open, complete, used: clock }, complete)
+}
+
+/// Whether a rectangle's edges lie on whole paint pixels (what Flatten
+/// writes).
+fn on_pixel_grid(r: &Rect) -> bool {
+    let r = r.normalized();
+    [r.x, r.y, r.right(), r.bottom()].iter().all(|v| {
+        let px = v * PX_PER_UNIT;
+        (px - px.round()).abs() < 1e-3
+    })
 }
 
 fn clear(mask: &mut [f32], r: PxRect) {

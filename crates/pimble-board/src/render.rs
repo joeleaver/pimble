@@ -699,6 +699,26 @@ pub(crate) fn draw_picture_rect(pixmap: &mut Pixmap, picture: &Picture, r: Rect,
     pixmap.fill_path(&rect_path, &paint, FillRule::Winding, ts, None);
 }
 
+/// A placed picture (a `pixels` operation with a transform, or one piece of
+/// a large picture placed off the pixel grid) laid over `r` through `ts`,
+/// bilinear, its outline grown by half an output pixel: a large picture
+/// comes in pieces that meet edge to edge, and antialiasing each piece's
+/// own edge would leave a faint seam between them (the picture's edge
+/// pixels spread into the half pixel, so nothing else shows there).
+pub(crate) fn draw_placed_picture(pixmap: &mut Pixmap, picture: &Picture, r: Rect, ts: Affine) {
+    let scale = ts_scale(&ts);
+    if !(scale > 0.0 && scale.is_finite()) || picture.width() == 0 || picture.height() == 0 {
+        return;
+    }
+    let Some(path) = rect_path(&r.inflate(0.5 / scale)) else { return };
+    let (kx, ky) = (r.w / picture.width() as f32, r.h / picture.height() as f32);
+    let (level, factor) = picture.level_for(scale * (kx * ky).abs().sqrt());
+    let image_ts = Affine::from_row(kx * factor, 0.0, 0.0, ky * factor, r.x, r.y);
+    let shader = Pattern::new(level.as_ref(), SpreadMode::Pad, FilterQuality::Bilinear, 1.0, image_ts);
+    let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+    pixmap.fill_path(&path, &paint, FillRule::Winding, ts, None);
+}
+
 /// A picture drawn one pixel per pixel at (`x`, `y`), source-over, over
 /// only the part of `dst` it covers (whole pixels). tiny-skia's
 /// `draw_pixmap` of a picture lying far outside on the left or top could

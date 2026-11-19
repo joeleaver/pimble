@@ -20,7 +20,7 @@ use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICK
 use pimble_board::{
     dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
     BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
-    fill_clip, merge_needs_pixels, rasterize_at, NewElement, NewFill, NewStroke, Page, PaintBody, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
+    fill_clip, merge_needs_pixels, rasterize_at, NewElement, NewFill, NewStroke, Page, PaintBody, PixelTransform, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
     StyleKey, SvgPlacement, Transform, ViewOptions,
 };
 use pimble_board::path::{parse_d, to_d};
@@ -656,6 +656,34 @@ pub struct PaintParams {
     /// there (within the tolerance), as a person's Fill tool does.
     #[serde(default)]
     pub fills: Vec<FillSpec>,
+    /// Pictures laid into the paint layer, first (under this call's strokes
+    /// and fills), in this order: a base to paint over (a hillshade, a scan,
+    /// a photo), kept as pixels of the layer, which Flatten folds in.
+    #[serde(default)]
+    pub pictures: Vec<PaintPictureSpec>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone)]
+pub struct PaintPictureSpec {
+    /// A picture already in Pimble, its pimble-blob: URL.
+    #[serde(default)]
+    pub src: Option<String>,
+    /// Or a picture file on this computer (PNG, JPEG, GIF, WebP, AVIF),
+    /// fitted under Pimble's 20 MiB limit as the app fits one.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Its top-left corner before any rotation, canvas units.
+    pub x: f32,
+    pub y: f32,
+    /// Its size, canvas units. Both left out: one unit per picture pixel;
+    /// one left out: the picture's proportions.
+    #[serde(default)]
+    pub w: Option<f32>,
+    #[serde(default)]
+    pub h: Option<f32>,
+    /// Degrees clockwise about its center.
+    #[serde(default)]
+    pub rotation: Option<f32>,
 }
 
 #[derive(Deserialize, JsonSchema, Clone)]
@@ -2377,6 +2405,72 @@ impl Pimble {
         Ok(tiles)
     }
 
+    /// A picture for `paint`'s `pictures` (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 5), stored as blobs of `addr`'s store: its pieces (one, or a
+    /// grid of tiles for a picture past 2,048 pixels on a side, each its own
+    /// blob, as Flatten tiles a layer), the transform its rotation makes,
+    /// and where it shows.
+    async fn paint_picture(&self, addr: Addr, spec: &PaintPictureSpec, i: usize) -> Result<(Vec<(String, Rect)>, Option<PixelTransform>, Rect), String> {
+        let n = i + 1;
+        let (src, bytes) = match (spec.src.as_deref().map(str::trim).filter(|s| !s.is_empty()), spec.file.as_deref().map(str::trim).filter(|s| !s.is_empty())) {
+            (Some(src), None) => {
+                let src = src.split('#').next().unwrap_or_default();
+                let url = BlobUrl::parse(src).ok_or_else(|| format!("Nothing was written: picture {n}'s src \"{src}\" is not a pimble-blob: URL."))?;
+                let (_, bytes) = self.api.get_blob(url.store, url.blob).await.map_err(|e| format!("Nothing was written: picture {n} ({src}) could not be read: {e}"))?;
+                (Some(url.to_string()), bytes)
+            }
+            (None, Some(file)) => {
+                let path = std::path::Path::new(file);
+                let bytes = std::fs::read(path).map_err(|e| format!("Nothing was written: picture {n}, {}, could not be read: {e}", path.display()))?;
+                let fitted = pimble_image::fit(bytes).map_err(|e| format!("Nothing was written: picture {n}: {e}"))?;
+                (None, fitted.bytes)
+            }
+            _ => return Err(format!("Nothing was written: picture {n} takes a src or a file, one of them.")),
+        };
+        let picture = Picture::decode(&bytes).map_err(|e| format!("Nothing was written: picture {n} is not a picture Pimble can show: {e}"))?;
+        let (pw, ph) = (picture.width() as f32, picture.height() as f32);
+        let positive = |v: Option<f32>, what: &str| match v {
+            Some(v) if !(v.is_finite() && v > 0.0) => Err(format!("Nothing was written: picture {n}'s {what} must be more than 0.")),
+            v => Ok(v),
+        };
+        let (w, h) = match (positive(spec.w, "w")?, positive(spec.h, "h")?) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * ph / pw),
+            (None, Some(h)) => (h * pw / ph, h),
+            (None, None) => (pw, ph),
+        };
+        if !(spec.x.is_finite() && spec.y.is_finite()) {
+            return Err(format!("Nothing was written: picture {n}'s x and y must be numbers."));
+        }
+        let rect = Rect::new(spec.x, spec.y, w, h);
+        let transform = match spec.rotation {
+            Some(r) if !r.is_finite() => return Err(format!("Nothing was written: picture {n}'s rotation must be a number.")),
+            Some(r) if r.rem_euclid(360.0).abs() > 1e-4 => Some(PixelTransform::rotate(r, rect.center())),
+            _ => None,
+        };
+        let bounds = transform.map_or(rect, |t| t.map_rect(&rect));
+        let pieces = if pimble_board::needs_pieces(picture.width(), picture.height()) {
+            let cut = pimble_board::picture_pieces(&picture, rect).map_err(|e| format!("Nothing was written: picture {n}: {}.", said(&e)))?;
+            drop(picture);
+            let mut pieces = Vec::with_capacity(cut.len());
+            for piece in cut {
+                let mime = pimble_core::ImageMime::sniff(&piece.bytes).map(|m| m.as_str()).unwrap_or("image/png");
+                pieces.push((self.api.put_blob(addr, mime, &piece.bytes).await?.to_string(), piece.rect));
+            }
+            pieces
+        } else {
+            let src = match src {
+                Some(src) => src,
+                None => {
+                    let mime = pimble_core::ImageMime::sniff(&bytes).map(|m| m.as_str()).unwrap_or("image/png");
+                    self.api.put_blob(addr, mime, &bytes).await?.to_string()
+                }
+            };
+            vec![(src, rect)]
+        };
+        Ok((pieces, transform, bounds))
+    }
+
     /// A picture already in Pimble: its URL and pixel size.
     async fn known_picture(&self, src: &str) -> Result<(String, u32, u32), String> {
         let src = src.trim().split('#').next().unwrap_or_default();
@@ -3362,8 +3456,11 @@ impl Pimble {
         Ok(out)
     }
 
-    /// Paint brush strokes and flood fills on a canvas, as a person paints
-    /// with the brush and the fill: each stroke is a brush (round, pencil,
+    /// Paint brush strokes, flood fills and pictures on a canvas, as a person
+    /// paints with the brush and the fill and pastes a picture into a paint
+    /// layer: each picture (a pimble-blob: src or a file, its rectangle and an
+    /// optional rotation) is laid into the layer first, as pixels to paint
+    /// over; each stroke is a brush (round, pencil,
     /// ink, airbrush, marker, charcoal, watercolor, highlighter), a color, a
     /// size and its points (optionally with pressure); each fill a point, a
     /// color and a tolerance (it fills the matching pixels of the layer
@@ -3379,8 +3476,14 @@ impl Pimble {
     #[tool(name = "paint")]
     async fn paint(&self, Parameters(p): Parameters<PaintParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
-        if p.strokes.is_empty() && p.fills.is_empty() {
-            return Err("Give at least one stroke or fill to paint.".into());
+        if p.strokes.is_empty() && p.fills.is_empty() && p.pictures.is_empty() {
+            return Err("Give at least one stroke, fill or picture to paint.".into());
+        }
+        // Pictures are stored first (their blobs), then laid down in the
+        // one edit with the strokes and fills.
+        let mut placed = Vec::with_capacity(p.pictures.len());
+        for (i, spec) in p.pictures.iter().enumerate() {
+            placed.push(self.paint_picture(target.addr, spec, i).await?);
         }
         let mut strokes = Vec::with_capacity(p.strokes.len());
         for (i, spec) in p.strokes.iter().enumerate() {
@@ -3394,7 +3497,7 @@ impl Pimble {
         if layer.is_some() && picture.is_some() {
             return Err("Give `layer` or `highlight_picture`, not both.".into());
         }
-        let ((layer_id, ids, filled, known_name), doc_bytes) = self
+        let ((layer_id, ids, filled, known_name, laid), doc_bytes) = self
             .canvas_edit_sized(&target, Default::default(), move |t, scene, snapshot| {
                 let layer_id = match (layer.as_deref().map(str::trim).filter(|l| !l.is_empty()), picture.as_deref().map(str::trim)) {
                     (Some(l), _) => scene.layer(l)?.id.clone(),
@@ -3409,6 +3512,11 @@ impl Pimble {
                 };
                 // What the strokes of this call reach, for the fills' areas.
                 let mut reach: Option<Rect> = None;
+                let mut laid = Vec::with_capacity(placed.len());
+                for (pieces, transform, bounds) in placed {
+                    laid.push(t.add_placed_pixels(&layer_id, &pieces, transform)?);
+                    reach = Some(reach.map_or(bounds, |a| a.union(&bounds)));
+                }
                 let mut ids = Vec::with_capacity(strokes.len());
                 for stroke in strokes {
                     let mut stroke = stroke;
@@ -3436,7 +3544,7 @@ impl Pimble {
                     filled.push(t.add_fill(fill)?);
                 }
                 let known_name = scene.layers.iter().find(|l| l.id == layer_id).map(|l| l.name.clone());
-                Ok((layer_id, ids, filled, known_name))
+                Ok((layer_id, ids, filled, known_name, laid))
             })
             .await?;
         // A layer this call made is read back for its name.
@@ -3448,6 +3556,12 @@ impl Pimble {
             }
         };
         let mut what = Vec::new();
+        for (i, pieces) in laid.iter().enumerate() {
+            what.push(match pieces.as_slice() {
+                [one] => format!("picture {} ({one})", i + 1),
+                many => format!("picture {} in {} pieces ({})", i + 1, many.len(), many.join(", ")),
+            });
+        }
         if !ids.is_empty() {
             what.push(format!("{} stroke{} ({})", ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")));
         }
@@ -4286,6 +4400,77 @@ mod tests {
         pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "clip": null }))).await.unwrap();
         let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
         assert!(!read.contains("clipped to"), "{read}");
+        let _ = server.stop().await;
+    }
+
+    /// Pictures in paint layers through `paint` (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 5): a file becomes a blob and a `pixels` operation with its
+    /// rectangle and rotation; a pimble-blob: src is laid again as it is;
+    /// a picture past 2,048 pixels goes in pieces; strokes go above.
+    #[tokio::test]
+    async fn paint_lays_pictures_into_a_paint_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        let url = format!("http://{}", server.addr());
+        let service = pimble_client::PimbleClient::connect(&url).await.unwrap();
+        service.create_store(dir.path().join("maps.pimble"), "Maps").await.unwrap();
+        let pimble = super::super::Pimble::new(std::sync::Arc::new(crate::connection::Connection::with_client(pimble_client::PimbleClient::connect(&url).await.unwrap())));
+        pimble.create_canvas(jp(serde_json::json!({ "parent": "Maps", "title": "Relief" }))).await.unwrap();
+
+        let png = |w: u32, h: u32| pimble_board::RgbaImage { width: w, height: h, data: (0..w * h).flat_map(|_| [90u8, 120, 60, 255]).collect() }.encode_png().unwrap();
+        let small = dir.path().join("hillshade.png");
+        std::fs::write(&small, png(300, 200)).unwrap();
+        let big = dir.path().join("wide.png");
+        std::fs::write(&big, png(2100, 40)).unwrap();
+
+        let painted = pimble
+            .paint(jp(serde_json::json!({ "node": "Maps/Relief", "pictures": [
+                { "file": small.to_string_lossy(), "x": 0, "y": 0, "w": 150, "rotation": 90 },
+                { "file": big.to_string_lossy(), "x": 0, "y": 500 },
+            ], "strokes": [{ "brush": "round", "color": "#ff0000", "size": 8, "points": [[0, 50], [150, 50]] }] })))
+            .await
+            .unwrap();
+        assert!(painted.contains("picture 1 (") && painted.contains("picture 2 in 2 pieces"), "{painted}");
+        let addr = pimble.resolve("Maps/Relief").await.unwrap();
+        let doc = doc_of(&pimble.api.node(addr).await.unwrap()).unwrap();
+        let snap = Board::of_node(&doc).snapshot();
+        let ops = &snap.paint;
+        let kinds: Vec<&str> = ops.iter().map(|o| o.raw.body.kind()).collect();
+        assert_eq!(kinds, vec!["pixels", "pixels", "pixels", "stroke"], "pictures first, the strokes above");
+        let PaintBody::Pixels(first) = &ops[0].raw.body else { panic!() };
+        assert_eq!(first.rect, Rect::new(0.0, 0.0, 150.0, 100.0), "w given, h from the proportions");
+        let b = ops[0].bounds.unwrap();
+        assert!((b.w - 100.0).abs() < 0.01 && (b.h - 150.0).abs() < 0.01, "turned a quarter: {b:?}");
+        let (PaintBody::Pixels(a), PaintBody::Pixels(c)) = (&ops[1].raw.body, &ops[2].raw.body) else { panic!() };
+        assert!(a.transform.is_none() && a.src != c.src);
+        assert_eq!((a.rect.w + c.rect.w, a.rect.h), (2100.0, 40.0), "one unit per pixel, in two pieces");
+        assert_eq!(a.rect.right(), c.rect.x);
+
+        // A picture already in Pimble, laid again as it is.
+        let again = pimble
+            .paint(jp(serde_json::json!({ "node": "Maps/Relief", "pictures": [{ "src": first.src, "x": 400, "y": 0, "h": 50 }] })))
+            .await
+            .unwrap();
+        assert!(again.contains("picture 1 ("), "{again}");
+        let doc = doc_of(&pimble.api.node(addr).await.unwrap()).unwrap();
+        let snap = Board::of_node(&doc).snapshot();
+        let PaintBody::Pixels(last) = &snap.paint.last().unwrap().raw.body else { panic!() };
+        assert_eq!((last.src.as_str(), last.rect), (first.src.as_str(), Rect::new(400.0, 0.0, 75.0, 50.0)));
+        // A rendering shows it.
+        let shown = pimble.pictures_of(&snap).await;
+        let c = pimble_board::sample_color(&snap, &shown, Point::new(437.0, 25.0), None);
+        assert!(c.g > 100 && c.a > 240, "{c:?}");
+
+        // Refusals: neither src nor file; nothing written.
+        let refused = pimble.paint(jp(serde_json::json!({ "node": "Maps/Relief", "pictures": [{ "x": 0, "y": 0 }] }))).await.unwrap_err();
+        assert!(refused.contains("takes a src or a file"), "{refused}");
+        let refused = pimble.paint(jp(serde_json::json!({ "node": "Maps/Relief", "pictures": [{ "src": "pimble-blob:nope", "x": 0, "y": 0 }] }))).await.unwrap_err();
+        assert!(refused.contains("is not a pimble-blob: URL"), "{refused}");
         let _ = server.stop().await;
     }
 }
