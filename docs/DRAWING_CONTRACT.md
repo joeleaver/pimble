@@ -1928,8 +1928,33 @@ What held it, and the fixes:
    inside a paint tile doubled that column; `render::draw_exact` now fills only the covered
    whole pixels.
 
-Not done: a view zoomed far out over a large paint layer still replays its tiles at full
-density (bounded now, but CPU-heavy, and after a flatten it decodes every tile's picture
-once); a coarser level of paint tiles for small zooms is the real fix. The document copies
+Not done on 2026-11-18: a view zoomed far out over a large paint layer still replayed its
+tiles at full density. The document copies
 (the server's, the app's, each client's) are as large as the document: Flatten is what
 makes a big painting small.
+
+### The tile pyramid (2026-11-19)
+
+A paint layer zoomed out reads a **pyramid** of tiles (`pimble_board::tiles`). A level-`k` tile is
+still 256 pixels square, covering 2^k × 2^k tiles of level 0, so it covers 128 × 2^k units. A view at
+`scale` pixels per unit reads the coarsest level whose density is still at least the screen's
+(`level_for_scale`: level 0 at a scale of 2 and above, level 1 at 1, level 3 at 0.16, at most
+`MAX_LEVEL` = 12). Before this, an 11,800-unit layer fitted to a window was about 8,000
+full tiles (2 GB, past the 256 MB budget), so every zoom step replayed or reloaded them all. With
+one picture stretched over the layer, that was 6 to 9 s per step.
+
+- **A coarse tile is keyed like a full one**: its layer and level, its place, and the
+  operations that touch it, with their fingerprints. Every child's operations are among
+  them, so an unchanged list means an unchanged tile. It is kept in memory and on disk (the
+  same `TileStore`).
+- **Built from below**: its four children at half size (a 2×2 box filter over premultiplied
+  pixels). A child merged into its parent is marked oldest, so it is evicted before
+  the coarse tiles the same step drew. When every operation touching it is a `pixels` one (a
+  placed picture, Flatten's pieces), it is drawn straight from the pictures at its own scale,
+  with none of the tiles under it.
+- A tile that lacked a picture is not kept, as at level 0.
+
+Measured on the loaded machine (release, `tests/pyramid.rs`): the stretched county picture
+fitted at 1920 × 1080 renders in 139 ms cold and 41 ms warm. A full-tile pyramid built from
+strokes is made once, then answered from memory or disk.
+

@@ -2330,6 +2330,7 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
             present(pane);
             if let Some(store) = APP.with(Cell::get) {
                 nav::changed(store, pane);
+                paint::thumbs_due(store, pane);
             }
         }
     }

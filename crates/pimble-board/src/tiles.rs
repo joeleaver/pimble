@@ -78,6 +78,57 @@ pub fn tiles_of(r: &Rect) -> Option<(i32, i32, i32, i32)> {
     Some((x0, y0, g(r.right()).max(x0), g(r.bottom()).max(y0)))
 }
 
+/// The coarsest level of the tile pyramid: a level-`k` tile covers
+/// 2^k × 2^k tiles of level 0 at the same [`TILE_PX`] pixels, so a view
+/// zoomed far out reads a few coarse tiles instead of every full one.
+pub const MAX_LEVEL: u8 = 12;
+
+/// The pyramid level a view at `scale` (screen pixels per board unit)
+/// reads: the coarsest whose density is still at least the screen's.
+pub fn level_for_scale(scale: f32) -> u8 {
+    if !(scale > 0.0) || scale >= PX_PER_UNIT {
+        return 0;
+    }
+    ((PX_PER_UNIT / scale).log2().floor().max(0.0) as u8).min(MAX_LEVEL)
+}
+
+/// The board rectangle of tile (`tx`, `ty`) of pyramid level `k`.
+pub fn tile_rect_at(k: u8, tx: i32, ty: i32) -> Rect {
+    let side = TILE_UNITS * (1u32 << k) as f32;
+    Rect::new(tx as f32 * side, ty as f32 * side, side, side)
+}
+
+/// The tiles of level `k` a board rectangle meets.
+fn tiles_of_at(r: &Rect, k: u8) -> Option<(i32, i32, i32, i32)> {
+    let r = r.normalized();
+    if !r.is_finite() || r.w < 0.0 || r.h < 0.0 {
+        return None;
+    }
+    let side = TILE_UNITS * (1u32 << k) as f32;
+    let f = |v: f32| (v / side).floor().clamp(-1e7, 1e7) as i32;
+    let g = |v: f32| ((v / side).ceil() - 1.0).clamp(-1e7, 1e7) as i32;
+    let (x0, y0) = (f(r.x), f(r.y));
+    Some((x0, y0, g(r.right()).max(x0), g(r.bottom()).max(y0)))
+}
+
+/// Lay `src` (a whole tile) at half size into quadrant (`dx`, `dy`) of
+/// `out`: a 2×2 box filter over premultiplied pixels.
+fn halve_into(out: &mut [u8], src: &[u8], dx: usize, dy: usize) {
+    let side = TILE_PX as usize;
+    let half = side / 2;
+    for y in 0..half {
+        let (r0, r1) = (2 * y * side * 4, (2 * y + 1) * side * 4);
+        let o = ((dy * half + y) * side + dx * half) * 4;
+        for x in 0..half {
+            let (a, b) = (r0 + 8 * x, r1 + 8 * x);
+            for c in 0..4 {
+                let sum = src[a + c] as u16 + src[a + 4 + c] as u16 + src[b + c] as u16 + src[b + 4 + c] as u16;
+                out[o + 4 * x + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+}
+
 /// Where a tile is kept on disk: a hash of its layer, its place and the
 /// operations that touch it (each with its fingerprint).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -201,6 +252,8 @@ pub struct CacheStats {
     pub loaded: u64,
     /// Tiles answered from memory unchanged.
     pub hits: u64,
+    /// Coarse tiles (pyramid levels above 0) made from the four below.
+    pub merged: u64,
 }
 
 /// The tile cache: memory first, then a [`TileStore`]. Shared by snapshots
@@ -263,7 +316,12 @@ impl PaintCache {
         let ops = snapshot.paint_ops(&l.id);
         let Some(bounds) = snapshot.paint_bounds(&l.id) else { return true };
         let Some(area) = region.intersect(&bounds) else { return true };
-        let Some((x0, y0, x1, y1)) = tiles_of(&area) else { return true };
+        // Zoomed out, the pyramid level whose density is the screen's: a
+        // county-sized layer fitted to a window is about 130 tiles of level
+        // 3, not 8,000 of level 0 (2 GB, past any budget, so every step
+        // replayed or reloaded them all).
+        let k = level_for_scale(view.scale);
+        let Some((x0, y0, x1, y1)) = tiles_of_at(&area, k) else { return true };
         let vt = view.transform();
         let recent_from = ops.len().saturating_sub(KEEP_OPEN);
         let ctx = Ctx { layer: &l.id, ops, store: self.store.as_deref(), pictures };
@@ -274,7 +332,19 @@ impl PaintCache {
         let mut drawn = 0usize;
         for ty in y0..=y1 {
             for tx in x0..=x1 {
-                let rect = tile_rect(tx, ty);
+                let rect = tile_rect_at(k, tx, ty);
+                if k > 0 {
+                    let budget = self.budget;
+                    let Some(entry) = inner.coarse(&ctx, k, tx, ty, budget) else { continue };
+                    complete &= entry.complete;
+                    draw_picture_rect(target, &entry.picture, rect, None, vt, 1.0, false, false);
+                    drawn += 1;
+                    if drawn % EVICT_EVERY == 0 {
+                        inner.clock += 1;
+                        inner.evict(self.budget);
+                    }
+                    continue;
+                }
                 touching.clear();
                 touching.extend(ops.iter().enumerate().filter(|(_, o)| o.touches(&rect)).map(|(i, _)| (i, i >= recent_from)));
                 if touching.is_empty() {
@@ -522,6 +592,100 @@ impl Inner {
         }
         tiles.insert(key.clone(), entry);
         &tiles[&key]
+    }
+
+    /// Tile (`tx`, `ty`) of pyramid level `k` of the layer (level 0 is
+    /// [`Inner::tile`]), or `None` when nothing of the layer reaches it. A
+    /// coarse tile is its four children at half size, keyed like a full one
+    /// by the operations that touch it (every child's are among them, so an
+    /// unchanged list is an unchanged tile), in memory and on disk.
+    fn coarse(&mut self, ctx: &Ctx<'_>, k: u8, tx: i32, ty: i32, budget: usize) -> Option<&TileEntry> {
+        let rect = tile_rect_at(k, tx, ty);
+        let recent_from = ctx.ops.len().saturating_sub(KEEP_OPEN);
+        let touching: Vec<(usize, bool)> = ctx.ops.iter().enumerate().filter(|(_, o)| o.touches(&rect)).map(|(i, _)| (i, i >= recent_from)).collect();
+        if touching.is_empty() {
+            return None;
+        }
+        if k == 0 {
+            return Some(self.tile(ctx, None, tx, ty, &touching));
+        }
+        let want: Vec<(u64, u64)> = touching.iter().map(|(i, _)| (id_hash(&ctx.ops[*i].raw.id), ctx.ops[*i].effective)).collect();
+        let key = (format!("{}\u{2}{}", ctx.layer, k), tx, ty);
+        let clock = self.clock;
+        let mut fresh = true;
+        if let Some(entry) = self.tiles.get_mut(&key) {
+            entry.used = clock;
+            if entry.ops == want {
+                self.stats.hits += 1;
+                fresh = false;
+            }
+        }
+        if !fresh {
+            return self.tiles.get(&key);
+        }
+        let disk_key = TileKey::of(&key.0, tx, ty, &want);
+        if let Some(px) = ctx.store.and_then(|s| s.load(&disk_key)).filter(|px| px.len() == TILE_BYTES) {
+            self.stats.loaded += 1;
+            let picture = Picture::from_premultiplied(TILE_PX, TILE_PX, px).expect("a tile's size");
+            self.tiles.insert(key.clone(), TileEntry { ops: want, picture, open: None, complete: true, used: clock });
+            return self.tiles.get(&key);
+        }
+        // Only pictures here (a placed picture, Flatten's pieces): drawn
+        // straight at this level's scale, without the 4^k full tiles under
+        // it (a county-sized picture fitted: 130 draws, not 8,000 replays).
+        if touching.iter().all(|(i, _)| matches!(ctx.ops[*i].raw.body, PaintBody::Pixels(_))) {
+            let k_scale = PX_PER_UNIT / (1u32 << k) as f32;
+            let to_tile = Affine::from_row(k_scale, 0.0, 0.0, k_scale, -rect.x * k_scale, -rect.y * k_scale);
+            let mut pixmap = Pixmap::new(TILE_PX, TILE_PX).expect("a tile's size");
+            let mut complete = true;
+            for (i, _) in &touching {
+                let PaintBody::Pixels(p) = &ctx.ops[*i].raw.body else { continue };
+                match ctx.pictures.picture(&p.src) {
+                    Some(pic) => draw_pixels_op(&mut pixmap, p, &pic, to_tile, false),
+                    None => complete = false,
+                }
+            }
+            self.stats.merged += 1;
+            return Some(self.keep_coarse(ctx, key, disk_key, want, pixmap.take(), complete));
+        }
+        let mut px = vec![0u8; TILE_BYTES];
+        let mut complete = true;
+        for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            let (cx, cy) = (tx * 2 + dx as i32, ty * 2 + dy as i32);
+            let Some(child) = self.coarse(ctx, k - 1, cx, cy, budget) else { continue };
+            complete &= child.complete;
+            halve_into(&mut px, child.picture.pixmap().data(), dx, dy);
+            // Material for this tile, not what is shown: the first to go,
+            // before the coarse tiles drawn earlier in the same step (by
+            // age alone, a fitted step evicted its own level and replayed
+            // all 8,000 tiles again the next time).
+            let child_key = if k == 1 { (ctx.layer.to_string(), cx, cy) } else { (format!("{}\u{2}{}", ctx.layer, k - 1), cx, cy) };
+            if let Some(e) = self.tiles.get_mut(&child_key) {
+                e.used = 0;
+            }
+        }
+        self.stats.merged += 1;
+        // Made from many tiles below (a thumbnail's level 8 is 65,536 of
+        // level 0 at most): keep to the budget while going, sparing this
+        // tile, which is put in after.
+        self.clock += 1;
+        self.evict(budget);
+        Some(self.keep_coarse(ctx, key, disk_key, want, px, complete))
+    }
+
+    /// Keep a coarse tile just made: in memory, and on disk when complete
+    /// (one that lacked a picture is drawn again next time).
+    fn keep_coarse(&mut self, ctx: &Ctx<'_>, key: (String, i32, i32), disk_key: TileKey, want: Vec<(u64, u64)>, px: Vec<u8>, complete: bool) -> &TileEntry {
+        let mut entry = TileEntry { ops: want, picture: Picture::from_premultiplied(TILE_PX, TILE_PX, px).expect("a tile's size"), open: None, complete, used: self.clock };
+        if complete {
+            if let Some(s) = ctx.store {
+                s.save(&disk_key, entry.picture.pixmap().data());
+            }
+        } else {
+            entry.ops.push((0, 0));
+        }
+        self.tiles.insert(key.clone(), entry);
+        &self.tiles[&key]
     }
 
     /// The tiles of the layer below operation `k` that `touching` reach,
@@ -777,31 +941,7 @@ fn replay(
                 }
             }
             PaintBody::Pixels(p) => match pictures.picture(&p.src) {
-                Some(pic) => {
-                    // A placed picture (wave 6) goes through its transform;
-                    // Flatten's lie on the pixel grid as they are.
-                    let placed = p.transform.is_some() || !on_pixel_grid(&p.rect);
-                    let ts = match p.transform {
-                        Some(t) => to_tile.pre_concat(Affine::from_row(t.a, t.b, t.c, t.d, t.e, t.f)),
-                        None => to_tile,
-                    };
-                    let draw = |into: &mut Pixmap| {
-                        if placed {
-                            draw_placed_picture(into, &pic, p.rect.normalized(), ts);
-                        } else {
-                            draw_picture_rect(into, &pic, p.rect.normalized(), None, ts, 1.0, true, false);
-                        }
-                    };
-                    if p.blend == Blend::Normal {
-                        draw(picture.pixmap_mut());
-                    } else {
-                        // Drawn on its own, then blended onto what is there.
-                        let mut alone = Pixmap::new(TILE_PX, TILE_PX).expect("a tile's size");
-                        draw(&mut alone);
-                        let paint = PixmapPaint { opacity: 1.0, blend_mode: p.blend.to_tiny(), quality: FilterQuality::Nearest };
-                        picture.pixmap_mut().draw_pixmap(0, 0, alone.as_ref(), &paint, Affine::identity(), None);
-                    }
-                }
+                Some(pic) => draw_pixels_op(picture.pixmap_mut(), p, &pic, to_tile, true),
                 None => complete = false,
             },
             PaintBody::Fill(f) => {
@@ -859,6 +999,35 @@ fn replay(
 
 /// Whether a rectangle's edges lie on whole paint pixels (what Flatten
 /// writes).
+/// A `pixels` operation drawn into a tile through `to_tile` (board units
+/// to the tile's pixels). A placed picture (wave 6) goes through its
+/// transform; Flatten's pieces lie on the grid as they are, with crisp
+/// edges so neighbours neither overlap nor part (`full`: at level 0's own
+/// density, where they fall on whole pixels).
+fn draw_pixels_op(target: &mut Pixmap, p: &crate::paint_ops::PixelsOp, pic: &Picture, to_tile: Affine, full: bool) {
+    let placed = p.transform.is_some() || !on_pixel_grid(&p.rect);
+    let ts = match p.transform {
+        Some(t) => to_tile.pre_concat(Affine::from_row(t.a, t.b, t.c, t.d, t.e, t.f)),
+        None => to_tile,
+    };
+    let draw = |into: &mut Pixmap| {
+        if placed {
+            draw_placed_picture(into, pic, p.rect.normalized(), ts);
+        } else {
+            draw_picture_rect(into, pic, p.rect.normalized(), None, ts, 1.0, full, false);
+        }
+    };
+    if p.blend == Blend::Normal {
+        draw(target);
+    } else {
+        // Drawn on its own, then blended onto what is there.
+        let mut alone = Pixmap::new(TILE_PX, TILE_PX).expect("a tile's size");
+        draw(&mut alone);
+        let paint = PixmapPaint { opacity: 1.0, blend_mode: p.blend.to_tiny(), quality: FilterQuality::Nearest };
+        target.draw_pixmap(0, 0, alone.as_ref(), &paint, Affine::identity(), None);
+    }
+}
+
 fn on_pixel_grid(r: &Rect) -> bool {
     let r = r.normalized();
     [r.x, r.y, r.right(), r.bottom()].iter().all(|v| {

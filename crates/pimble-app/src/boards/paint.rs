@@ -769,12 +769,12 @@ fn draw_thumbs(store: AppStore, pane: PaneId) {
             .collect();
         let all: Vec<String> = layers.iter().map(|(l, _)| l.id.clone()).collect();
         let changed: Vec<(pimble_board::Layer, u64)> = layers.into_iter().filter(|(l, sig)| drawn.get(&l.id) != Some(sig)).collect();
-        let (pictures, _) = pictures_of(snapshot);
+        let (pictures, every) = pictures_of(snapshot);
         // A snapshot of its own to draw from (off the UI thread on the
         // desktop), drawing paint from the shared tiles.
-        (s.board.snapshot().with_paint_cache(shared_cache()), pictures, changed, all)
+        (s.board.snapshot().with_paint_cache(shared_cache()), pictures, changed, all, every)
     });
-    let Some((snapshot, pictures, changed, all)) = job else {
+    let Some((snapshot, pictures, changed, all, every)) = job else {
         with_thumbs(pane, |t| t.busy = false);
         return;
     };
@@ -788,8 +788,13 @@ fn draw_thumbs(store: AppStore, pane: PaneId) {
         with_thumbs(pane, |t| {
             t.busy = false;
             t.drawn.retain(|id, _| all.contains(id));
-            for (id, sig, _) in &results {
-                t.drawn.insert(id.clone(), *sig);
+            // Drawn without a picture not decoded yet: still due, drawn
+            // again when it arrives (`boards::installed`). A fast first
+            // draw showed a layer's strokes without its picture for good.
+            if every {
+                for (id, sig, _) in &results {
+                    t.drawn.insert(id.clone(), *sig);
+                }
             }
         });
         let ui = store.pane(pane).board_ui;

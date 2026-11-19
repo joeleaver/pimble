@@ -340,7 +340,10 @@ fn pixels_draw_their_picture_and_wait_for_it() {
     let px = render(&snap, &pictures, &View::new(0.0, 0.0, 1.0), 40, 40, None).unwrap().take();
     assert_eq!(at(&px, 40, 20, 20), [0, 180, 0, 255]);
     assert_eq!(at(&px, 40, 5, 5)[3], 0);
-    assert_eq!(snap.paint_cache().stats().replayed, 2, "the tile drawn without its picture was drawn again");
+    // At scale 1 it is a level-1 tile (docs/DRAWING_CONTRACT.md "Large
+    // canvases": the pyramid), made from the picture straight.
+    let stats = snap.paint_cache().stats();
+    assert_eq!(stats.replayed + stats.merged, 2, "the tile drawn without its picture was drawn again: {stats:?}");
 }
 
 #[test]
