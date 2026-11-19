@@ -377,3 +377,154 @@ taking back the stroke and then the picture in one step (`w6p_16_undo_stroke.png
 - Copying a paint selection's pixels to a placement (copy and paste inside a paint layer).
 - An MCP `blend` or `opacity` for a placed picture (Merge Down's `blend` key already exists
   on `pixels`).
+
+## Built: map lettering
+
+Built 2026-11-18 on `master` (part 3 of the order in section 6), in `crates/pimble-board`
+(`text.rs`, the new `along.rs`, `snapshot.rs`, `paint.rs`, `hit.rs`, `doc.rs`), the context
+bar (`crates/pimble-app/src/boards/rail.rs` and `tools.rs`, both apps) and `pimble-mcp`.
+
+### Fonts
+
+Ten faces, all SIL OFL 1.1 (`crates/pimble-board/fonts/OFL.txt` says where each came from;
+no Reserved Font Name): Noto Sans Regular (the full font, unchanged, so every older board
+draws pixel for pixel as before), Noto Sans Bold, Italic and Bold Italic, Noto Serif
+Regular, Bold, Italic and Bold Italic (Noto 2.004), and Noto Sans Condensed Regular and Bold
+(instances at width 75 of the variable Noto Sans 2.015). The nine new faces are subset by
+`fonts/subset.py` to Latin (Basic, Latin-1, Extended A, B and Additional), IPA, combining
+marks, punctuation, super- and subscripts, currency, letterlike symbols, number forms,
+arrows and a few math signs, with hinting and the layout tables dropped (nothing reads
+them: no shaping, no kerning). A character a face lacks is drawn from Noto Sans Regular (a
+Greek letter in a serif label). Condensed italic is the condensed face slanted about 12
+degrees (no condensed italic is bundled). Every face shares Noto Sans's vertical metrics,
+so line height and baselines do not change with the font.
+
+**Size**: the new faces are 1,004,940 bytes (about 0.96 MiB; 100 to 126 KB each), embedded
+with `include_bytes!` in both apps. Desktop `pimble` release binary: 188,063,936 bytes before,
+189,183,808 after (+1,119,872, about 1.07 MiB). The browser's wasm carries the same
+1,004,940 bytes verbatim as data, plus a few KB of code (not measured against a build of
+the previous version).
+
+### Stored keys
+
+All new keys of an element's `style` map, each its own last-writer-wins value (one person
+making a label serif while another makes it bold keeps both); an older app ignores them and
+draws the text in Noto Sans Regular in its own box:
+
+| Key | Value | Absent |
+| --- | --- | --- |
+| `font` | `"sans"`, `"serif"`, `"condensed"` | sans; an unknown name reads as sans |
+| `bold`, `italic` | bool | false |
+| `halo_color` | `#rrggbb[aa]` | white |
+| `halo_width` | board units past the glyphs | none, or a tenth of the font size when only `halo_color` is set |
+| `tracking` | em after each character but a line's last (drawn clamped to -0.5..2) | 0 |
+| `along` | an element id | plain text |
+| `along_offset` | 0..1 of the line's length | by alignment: left 0, center 0.5, right 1 |
+| `along_side` | `"above"`, `"on"`, `"below"` | above |
+
+`font` + `bold` + `italic` are three keys rather than one `serif-bold-italic` value so they
+merge independently; the MCP takes either form. `along*` live in the style map with the
+rest, so `set_style`/`clear_style`, duplicate and copy carry them; duplicating or copying a
+text with its path points the copy at the copied path.
+
+### Model
+
+- `text::layout_styled(text, size, wrap, &TextStyle { font: FontChoice { family, bold,
+  italic }, tracking })`; `text::layout` is it with the default. `Glyph` carries its face and
+  advance. Tracking is in the layout, so measuring, wrapping, bounds, hit testing, alignment
+  and export all see it.
+- `ResolvedStyle.text`, `.halo: Option<Halo { color, width }>`, `.along`, `.along_offset`,
+  `.along_side`; `StyleKey::{Font, Bold, Italic, HaloColor, HaloWidth, Tracking, Along,
+  AlongOffset, AlongSide}`.
+- **Halo**: `paint::text_ops` strokes the glyph outlines behind their fill, twice the width,
+  round joins and caps, in the element's opacity, for every kind with text (text, sticky
+  notes, shapes, callouts, frames' names, cards, steps, connector labels). The element's
+  bounds grow by the width. Bars drawn for text too small to read carry no halo.
+- **Text on a path** (`crate::along`, read in the snapshot once every element is placed):
+  the target must be a path (its first subpath, curves flattened in 24 steps), line, arrow,
+  pen or highlighter stroke, taken through its world transform (a group's move moves it).
+  Anything else, nothing, or the text itself (the only cycle: a text is never a line) reads
+  as plain text, the same on every device. Each glyph's middle is placed at its distance
+  along the line and turned to its direction; past an end, straight on. Text reads left to
+  right: when the stretch it covers runs leftward the line is read from the other end (a
+  river drawn east to west is labelled upright). Above: the baseline a quarter em above the
+  line; on: centered across it; below: the capitals' tops a quarter em below; more lines
+  stack away from it. While it applies, the text's own box and transform are ignored:
+  `Element::along` holds the glyphs' outlines, their turned boxes (`quads`, what hit testing
+  reads) and a hash folded into the fingerprint, so the raster cache redraws the text when
+  its path moves or is reshaped; the element's `world` is the identity and its boxes are
+  the glyphs' in board units. A text box's fill is not drawn on a path.
+- `BoardTxn::put_on_path(text, line)` (refused with `along::NEEDS_TEXT_AND_PATH` or
+  `along::NOT_A_LINE`, writing nothing) and `release_from_path(text)` (clears the three
+  `along` keys).
+- **SVG export**: glyphs as paths, as all board text already was (no `<text>`, no
+  `<textPath>`): the curved glyphs are exactly what the raster draws, and no user text goes
+  into the file; the halo is a round-joined stroke of the same outlines before the fill.
+
+### UI (desktop and browser, the same `pimble-app` code)
+
+The text picker in the context bar (the size button, now showing size and family, in bold
+or italic when they are on) opens rows instead of the four sizes alone: **Size** (S, M, L,
+XL), **Font** (Sans, Serif, Condensed, then Bold and Italic toggles), **Spacing** (Tight
+-0.05, Normal, Wide 0.1, Wider 0.25, Widest 0.5 em), **Halo** (Off, S, M, L: 0.06, 0.12,
+0.2 of each selected element's font size, written in board units; and white, black and
+paper swatches, a swatch turning the halo on), and, when the selection is a text on a path,
+**Path** (Above, On, Below, and a slider for the place along it). The bar itself grows only
+by the wider face of that one button. New text, sticky notes and shapes take the bar's
+font, spacing and halo; only values that are not the default are written. The selection's
+"more" menu has **Put Text on Path** (one text and one path, line or stroke selected; the
+text stays selected) and **Release from Path**; each is one undo step, refusals said.
+
+### MCP
+
+`add_elements` and `update_elements` take `font` (`"serif bold italic"` or the parts),
+`bold`, `italic`, `halo_color`, `halo_width`, `tracking`, `along` (an id or a ref of the same
+call; `""` releases), `along_offset`, `along_side` in `style`, and the same names in
+`clear_style`; `get_canvas` and `get_elements` show them. docs/MCP_CONTRACT.md, "Wave 6,
+map lettering".
+
+### Tests
+
+`crates/pimble-board/src/text.rs`: every face parses and draws, bold wider and condensed
+narrower, an unknown name sans, Greek in serif from Noto Sans, tracking's widths and its
+effect on wrapping. `crates/pimble-board/tests/lettering.rs`: font keys round-trip and a
+`font` written by a newer app (`"fraktur"`) draws pixel for pixel as Noto Sans Regular;
+halo pixels around dark text on a dark ground with the fill still on top, bounds grown,
+the color-only default, shape and sticky text haloed; tracking's width (nine gaps of half
+an em), bounds and a hit on the tracked-out end; text along an arching path (glyphs rising,
+level, falling, centered, hit on glyphs and not between), the path moved and reshaped
+moving them (fingerprint changed); offset, side and a right-to-left line read upright; a
+pen stroke in a moved group; nothing, itself, another text, a shape, two texts naming each
+other and a deleted path all reading as plain text, the refusals' sentences; release back
+to its box; SVG with no text nodes, the halo stroke before the fill; the raster cache equal
+to a full render after the path moves; two people's font and bold-plus-halo edits merging.
+`pimble-mcp`: lettering in through `add_elements` with `along` naming a ref, read back by
+`get_canvas`, written back verbatim from `get_elements` (along resolved to the copy),
+changed and released through `update_elements`, refusals. `pimble-app` (`boards.rs`): Put
+Text on Path refused with one selected and done with two, the options writing font, bold,
+tracking, side and a per-size halo, a duplicate of both following its copied line, Release
+from Path keeping the lettering, one undo putting it back.
+
+### Deviations
+
+- `along_offset` is a fraction of the line's length only (not a distance), and the text's
+  alignment chooses which part of it sits there.
+- A third side, **on** (centered on the line), beside above and below: a road's name in
+  the road.
+- Text always reads left to right on a path (the line is read backwards where it runs
+  leftward), so `along_side` is judged in the reading direction.
+- Export draws the glyphs as paths, never `<textPath>` (faithful, and the SVG export already
+  writes no text).
+- Halo widths in the bar are steps relative to the font size, stored in board units, as the
+  contract asked.
+
+### Not built
+
+- Dragging a text on a path along it (the slider in the text options moves it; a drag,
+  resize or turn of the text alone writes its own transform, which is ignored until it is
+  released from the path). Editing its words opens the editor over the curved text's box,
+  straight.
+- Kerning and shaping (ligatures, marks placed by GPOS): the layout stays per character.
+- SVG import reading `font-family`, `font-weight`, `font-style` and `letter-spacing`, and
+  `<textPath>`.
+- Fonts installed on the computer (decided against: the same picture on every device).

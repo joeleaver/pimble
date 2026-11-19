@@ -265,6 +265,20 @@ pub fn controls_of_tool(tool: Tool) -> Controls {
 pub const SMOOTHING: [(&str, f32); 3] = [("Low", 0.75), ("Medium", 2.0), ("High", 5.0)];
 /// The Pencil's first smoothing.
 pub const DEFAULT_SMOOTHING: f32 = 2.0;
+/// Letter spacing steps (em) the text options offer.
+pub const TRACKINGS: [(&str, f32); 5] = [("Tight", -0.05), ("Normal", 0.0), ("Wide", 0.1), ("Wider", 0.25), ("Widest", 0.5)];
+/// Halo widths the text options offer, as fractions of the font size
+/// (written as board units: a halo stays as wide when the text is resized
+/// by its font size later only if picked again).
+pub const HALOS: [(&str, f32); 4] = [("Off", 0.0), ("S", 0.06), ("M", 0.12), ("L", 0.2)];
+/// Halo colors offered: white, black, and map paper.
+pub const HALO_COLORS: [(&str, &str); 3] = [("#ffffff", "White"), ("#000000", "Black"), ("#f4ecd8", "Paper")];
+
+/// The step of [`HALOS`] nearest a halo `fraction` of the font size wide.
+pub fn halo_step(fraction: f32) -> f32 {
+    HALOS.iter().skip(1).map(|(_, v)| *v).min_by(|a, b| (a - fraction).abs().total_cmp(&(b - fraction).abs())).unwrap_or(0.0)
+}
+
 /// The polygon sides and star points the context bar offers.
 pub const SIDES: [u32; 7] = [3, 4, 5, 6, 8, 10, 12];
 /// The miter limits offered while corners are mitered (4 is the default).
@@ -799,6 +813,94 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             })
         })
         .collect();
+    // Lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4): family, bold,
+    // italic, letter spacing, halo, and a text's place along its path.
+    let families: Vec<NodeHandle> = pimble_board::FontFamily::ALL
+        .into_iter()
+        .map(|family| {
+            text_button(__scope, family.label(), "Font", move || st.font.get() == family, move || {
+                st.font.set(family);
+                apply(Style { font: Some(family), ..Style::default() });
+            })
+        })
+        .collect();
+    let bold_btn = icon_button(__scope, TablerIcon::Bold, "Bold".to_string(), move || st.bold.get(), move || {
+        let on = !untracked(|| st.bold.get());
+        st.bold.set(on);
+        apply(Style { bold: Some(on), ..Style::default() });
+    });
+    let italic_btn = icon_button(__scope, TablerIcon::Italic, "Italic".to_string(), move || st.italic.get(), move || {
+        let on = !untracked(|| st.italic.get());
+        st.italic.set(on);
+        apply(Style { italic: Some(on), ..Style::default() });
+    });
+    let trackings: Vec<NodeHandle> = TRACKINGS
+        .iter()
+        .map(|&(label, v)| {
+            text_button(__scope, label, "Letter spacing", move || (st.tracking.get() - v).abs() < 1e-3, move || {
+                st.tracking.set(v);
+                apply(Style { tracking: Some(v), ..Style::default() });
+            })
+        })
+        .collect();
+    let halos: Vec<NodeHandle> = HALOS
+        .iter()
+        .map(|&(label, v)| {
+            text_button(__scope, label, "Halo: the letters outlined behind, to read over a busy background", move || (st.halo.get() - v).abs() < 1e-3, move || {
+                st.halo.set(v);
+                tools::apply_halo(store, pane, v, &untracked(|| st.halo_color.get()));
+            })
+        })
+        .collect();
+    let halo_colors: Vec<NodeHandle> = HALO_COLORS
+        .iter()
+        .map(|&(hex, name)| {
+            rsx! {
+                div {
+                    title: format!("{name} halo"),
+                    class: {move || if st.halo_color.get() == hex { "pimble-board__ctx-color pimble-board__halo-swatch pimble-board-tool--active" } else { "pimble-board__ctx-color pimble-board__halo-swatch" }},
+                    style: format!("background: {hex};"),
+                    onclick: move || {
+                        st.halo_color.set(hex.to_string());
+                        // Picking a color shows the halo.
+                        let width = untracked(|| st.halo.get());
+                        let width = if width > 0.0 { width } else { HALOS[2].1 };
+                        st.halo.set(width);
+                        tools::apply_halo(store, pane, width, hex);
+                    },
+                }
+            }
+        })
+        .collect();
+    let sides_along: Vec<NodeHandle> = pimble_board::AlongSide::ALL
+        .into_iter()
+        .map(|side| {
+            let label = match side {
+                pimble_board::AlongSide::Above => "Above",
+                pimble_board::AlongSide::On => "On",
+                pimble_board::AlongSide::Below => "Below",
+            };
+            text_button(__scope, label, "Which side of the path", move || st.along_side.get() == side, move || {
+                st.along_side.set(side);
+                apply(Style { along_side: Some(side), ..Style::default() });
+            })
+        })
+        .collect();
+    let along_slider = rsx! {
+        div { class: "pimble-board__ctx-opacity",
+            Slider {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+                size: "xs",
+                value_signal: Some(mirror(store, 2, |st| st.along_offset.get() as f64)),
+                onchange: move |v: f64| {
+                    st.along_offset.set(v as f32);
+                    apply(Style { along_offset: Some(v as f32), ..Style::default() });
+                },
+            }
+        }
+    };
     let aligns: Vec<NodeHandle> = [(Align::Left, TablerIcon::AlignLeft, "Align left"), (Align::Center, TablerIcon::AlignCenter, "Center"), (Align::Right, TablerIcon::AlignRight, "Align right")]
         .into_iter()
         .map(|(align, icon, tip)| {
@@ -1076,7 +1178,24 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         (TablerIcon::AlignRight, Box::new(move || st.align.get() == Align::Right)),
     ]);
     let font_face = rsx! {
-        span { class: "pimble-board__face-text", {move || { let size = st.font_size.get(); FONT_SIZES.iter().find(|(_, s)| *s == size).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{size}")) }} }
+        span {
+            class: "pimble-board__face-text",
+            style: {move || format!(
+                "font-weight: {}; font-style: {}; font-family: {};",
+                if st.bold.get() { 700 } else { 400 },
+                if st.italic.get() { "italic" } else { "normal" },
+                if st.font.get() == pimble_board::FontFamily::Serif { "serif" } else { "inherit" },
+            )},
+            {move || {
+                let size = st.font_size.get();
+                let size = FONT_SIZES.iter().find(|(_, s)| *s == size).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{size}"));
+                match st.font.get() {
+                    pimble_board::FontFamily::Sans => format!("{size} Aa"),
+                    pimble_board::FontFamily::Serif => format!("{size} Serif"),
+                    pimble_board::FontFamily::Condensed => format!("{size} Cond"),
+                }
+            }}
+        }
     };
     let opacity_face = rsx! {
         span { class: "pimble-board__face-text", {move || format!("{}%", (st.opacity.get() * 100.0).round())} }
@@ -1084,7 +1203,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let width_btn = picker_button(__scope, ui, "Width", Popup::Width, "", width_face);
     let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, "", dash_face);
     let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, "", heads_face);
-    let font_btn = picker_button(__scope, ui, "Font size", Popup::Font, "", font_face);
+    let font_btn = picker_button(__scope, ui, "Text: size, font, spacing, halo", Popup::Font, "pimble-board__chooser--words", font_face);
     let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, "", align_face);
     let opacity_btn = picker_button(__scope, ui, "Opacity", Popup::Opacity, "pimble-board__chooser--number", opacity_face);
     let more_items: Vec<NodeHandle> = vec![
@@ -1095,6 +1214,8 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::FlipVertical, "Flip Horizontal (Shift+H)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Horizontal))),
         menu_item(__scope, store, pane, TablerIcon::FlipHorizontal, "Flip Vertical (Shift+V)", Box::new(|s, p| tools::flip(s, p, FlipAxis::Vertical))),
         menu_item(__scope, store, pane, TablerIcon::BorderOuter, "Outline Stroke", Box::new(tools::outline_stroke)),
+        menu_item(__scope, store, pane, TablerIcon::Route, "Put Text on Path", Box::new(tools::put_text_on_path)),
+        menu_item(__scope, store, pane, TablerIcon::RouteOff, "Release from Path", Box::new(tools::release_from_path)),
     ];
     let writable = move || {
         state
@@ -1181,7 +1302,34 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Width)}, {widths} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Dash)}, {dashes} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Heads)}, {heads} }
-            div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Font)}, {sizes} }
+            div {
+                class: "pimble-float pimble-board__options pimble-board__options--rows",
+                style: {move || shown(ui.popup.get() == Popup::Font)},
+                div { class: "pimble-board__row",
+                    span { class: "pimble-board__ctx-label", "Size" }
+                    {sizes}
+                }
+                div { class: "pimble-board__row",
+                    span { class: "pimble-board__ctx-label", "Font" }
+                    {families}
+                    {bold_btn}
+                    {italic_btn}
+                }
+                div { class: "pimble-board__row",
+                    span { class: "pimble-board__ctx-label", "Spacing" }
+                    {trackings}
+                }
+                div { class: "pimble-board__row",
+                    span { class: "pimble-board__ctx-label", "Halo" }
+                    {halos}
+                    {halo_colors}
+                }
+                div { class: "pimble-board__row", style: {move || shown(st.on_path.get() && ui.selected.get() > 0)},
+                    span { class: "pimble-board__ctx-label", "Path" }
+                    {sides_along}
+                    {along_slider}
+                }
+            }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::TextAlign)}, {aligns} }
             div {
                 class: "pimble-float pimble-board__options",
@@ -1274,7 +1422,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
 /// radius, 1 a star's inner radius), so the slider follows a selection.
 fn mirror(store: AppStore, slot: usize, read: fn(&StyleUi) -> f64) -> Signal<f64> {
     thread_local! {
-        static SIGNALS: RefCell<[Option<Signal<f64>>; 2]> = const { RefCell::new([None, None]) };
+        static SIGNALS: RefCell<[Option<Signal<f64>>; 3]> = const { RefCell::new([None, None, None]) };
     }
     if let Some(sig) = SIGNALS.with(|s| s.borrow()[slot]) {
         return sig;

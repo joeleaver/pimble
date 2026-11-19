@@ -2861,6 +2861,12 @@ pub(crate) const APP_CSS: &str = "
     position: relative;
 }
 
+/* A halo color in the text options; the picked one ringed. */
+.pimble-board__halo-swatch.pimble-board-tool--active {
+    outline: 2px solid var(--rinch-primary-color);
+    outline-offset: 1px;
+}
+
 /* The brush's color: a disc (it paints with the well's front square). */
 .pimble-board__ctx-brush {
     border-radius: 50%;

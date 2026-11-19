@@ -445,6 +445,22 @@ pub struct StyleUi {
     /// Smudge's and Blur's size, board units, and their strength (0 to 1).
     pub retouch_size: Signal<f32>,
     pub strength: Signal<f32>,
+    /// Text's font: family, bold, italic (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 4, "Built: map lettering").
+    pub font: Signal<pimble_board::FontFamily>,
+    pub bold: Signal<bool>,
+    pub italic: Signal<bool>,
+    /// Letter spacing in em.
+    pub tracking: Signal<f32>,
+    /// The halo's width as a fraction of the font size (0: none; written as
+    /// board units, `rail::HALOS`) and its color.
+    pub halo: Signal<f32>,
+    pub halo_color: Signal<String>,
+    /// The first selected element is a text set along a path: where along
+    /// it (0 to 1) and on which side.
+    pub on_path: Signal<bool>,
+    pub along_offset: Signal<f32>,
+    pub along_side: Signal<pimble_board::AlongSide>,
 }
 
 impl StyleUi {
@@ -484,6 +500,15 @@ impl StyleUi {
             contiguous: Signal::new(true),
             retouch_size: Signal::new(paint::RETOUCH_SIZE),
             strength: Signal::new(pimble_board::paint_ops::DEFAULT_STRENGTH),
+            font: Signal::new(pimble_board::FontFamily::Sans),
+            bold: Signal::new(false),
+            italic: Signal::new(false),
+            tracking: Signal::new(0.0),
+            halo: Signal::new(0.0),
+            halo_color: Signal::new("#ffffff".to_string()),
+            on_path: Signal::new(false),
+            along_offset: Signal::new(0.0),
+            along_side: Signal::new(pimble_board::AlongSide::Above),
         }
     }
 }
@@ -3838,6 +3863,59 @@ mod tests {
         assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![line.clone()]);
         tools::undo(store, P[0], false);
         assert_eq!(only_element().raw.kind, Kind::Line, "one undo");
+        stop(store, P[0]);
+    }
+
+    /// Map lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4): Put Text
+    /// on Path with a text and a line selected, the text options writing
+    /// font, halo and spacing, the place along the path, duplicating both
+    /// together, and Release from Path.
+    #[test]
+    fn put_text_on_path_and_letter_it() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        let (line, label) = local_edit(store, P[0], |t| {
+            let line = t.add_element(NewElement::new(Kind::Line, Geom::Segment { a: Point::new(0.0, 200.0), b: Point::new(400.0, 200.0) }))?;
+            let label = t.add_element(NewElement::new(Kind::Text, Geom::Rect(Rect::new(0.0, 0.0, 0.0, 0.0))).with_text("Mill Road"))?;
+            Ok((line, label))
+        })
+        .unwrap();
+        let snap = || with_session(P[0], |s| s.snapshot().get(&label).map(|e| (e.raw.style.clone(), e.along.is_some(), e.bounds))).flatten().unwrap();
+        // One selected is not enough.
+        tools::select(store, P[0], vec![label.clone()]);
+        tools::put_text_on_path(store, P[0]);
+        assert!(!snap().1);
+        tools::select(store, P[0], vec![line.clone(), label.clone()]);
+        tools::put_text_on_path(store, P[0]);
+        let (style, placed, bounds) = snap();
+        assert_eq!(style.along.as_deref(), Some(line.as_str()));
+        assert!(placed && bounds.bottom() < 202.0 && bounds.y > 150.0, "{bounds:?}");
+        assert_eq!(with_session(P[0], |s| s.selected.clone()).unwrap(), vec![label.clone()], "the text stays selected");
+        assert!(untracked(|| store.board_style.on_path.get()));
+        // The text options.
+        tools::apply_style(store, P[0], Style { font: Some(pimble_board::FontFamily::Serif), bold: Some(true), tracking: Some(0.25), along_side: Some(pimble_board::AlongSide::Below), ..Style::default() });
+        tools::apply_halo(store, P[0], 0.12, "#ffffff");
+        let (style, ..) = snap();
+        assert_eq!((style.font, style.bold, style.tracking), (Some(pimble_board::FontFamily::Serif), Some(true), Some(0.25)));
+        assert_eq!(style.along_side, Some(pimble_board::AlongSide::Below));
+        assert!((style.halo_width.unwrap() - 0.12 * 24.0).abs() < 1e-4 && style.halo_color == Some(Color::WHITE));
+        tools::apply_halo(store, P[0], 0.0, "#ffffff");
+        assert_eq!(snap().0.halo_width, None);
+        // Duplicated with its line, the copy follows the copied line.
+        tools::select(store, P[0], vec![line.clone(), label.clone()]);
+        tools::duplicate(store, P[0]);
+        let copies = with_session(P[0], |s| s.selected.clone()).unwrap();
+        let (copy_line, copy_label) = (copies[0].clone(), copies[1].clone());
+        let along = with_session(P[0], |s| s.snapshot().get(&copy_label).and_then(|e| e.raw.style.along.clone())).flatten();
+        assert_eq!(along, Some(copy_line));
+        // Release from Path.
+        tools::select(store, P[0], vec![label.clone()]);
+        tools::release_from_path(store, P[0]);
+        let (style, placed, _) = snap();
+        assert!(!placed && style.along.is_none() && style.along_side.is_none());
+        assert_eq!(style.font, Some(pimble_board::FontFamily::Serif), "the lettering stays");
+        tools::undo(store, P[0], false);
+        assert!(snap().1, "one undo puts it back on");
         stop(store, P[0]);
     }
 

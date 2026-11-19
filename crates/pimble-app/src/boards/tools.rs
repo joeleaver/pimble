@@ -1701,6 +1701,9 @@ pub(super) fn duplicate(store: AppStore, pane: PaneId) {
     new_undo_step(pane);
     let copies = local_edit(store, pane, |t| {
         let mut out = Vec::new();
+        // Every copy by its original, for text on a path duplicated with
+        // its path (it follows the copy).
+        let mut all: HashMap<String, String> = HashMap::new();
         for (top, members) in &plan {
             let mut map: HashMap<String, String> = HashMap::new();
             let first = copy_element(t, top, top.parent.clone(), DUPLICATE_OFFSET)?;
@@ -1711,7 +1714,13 @@ pub(super) fn duplicate(store: AppStore, pane: PaneId) {
                 let id = copy_element(t, m, parent, 0.0)?;
                 map.insert(m.id.clone(), id);
             }
+            all.extend(map);
             out.push(first);
+        }
+        for e in plan.iter().flat_map(|(top, members)| std::iter::once(top).chain(members)) {
+            if let (Some(copy), Some(line)) = (all.get(&e.id), e.style.along.as_ref().and_then(|a| all.get(a))) {
+                t.set_style(copy, &Style { along: Some(line.clone()), ..Style::default() })?;
+            }
         }
         Ok(out)
     });
@@ -2026,6 +2035,19 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     let miter = (join == Some(pimble_board::Join::Miter) && (miter - pimble_board::DEFAULT_MITER).abs() > 1e-3).then_some(miter);
     // The well's gradients (a fill's only when there is a fill).
     let (fill_gradient, stroke_gradient) = untracked(|| (st.fill_gradient.get().filter(|_| fill.is_some()), st.stroke_gradient.get()));
+    // Lettering: only what is not the default is written (an older app
+    // draws the text as before).
+    let (font, bold, italic, tracking, halo, halo_color) =
+        untracked(|| (st.font.get(), st.bold.get(), st.italic.get(), st.tracking.get(), st.halo.get(), st.halo_color.get()));
+    let lettering = |size: f32| Style {
+        font: (font != pimble_board::FontFamily::Sans).then_some(font),
+        bold: bold.then_some(true),
+        italic: italic.then_some(true),
+        tracking: (tracking.abs() > 1e-4).then_some(tracking),
+        halo_width: (halo > 0.0).then_some(halo * size),
+        halo_color: (halo > 0.0).then(|| Color::parse(&halo_color)).flatten(),
+        ..Style::default()
+    };
     let shape = |kind_extra: Style| Style {
         stroke,
         fill,
@@ -2040,6 +2062,12 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
         miter,
         font_size: Some(font_size),
         align: Some(align),
+        font: lettering(font_size).font,
+        bold: lettering(font_size).bold,
+        italic: lettering(font_size).italic,
+        tracking: lettering(font_size).tracking,
+        halo_width: lettering(font_size).halo_width,
+        halo_color: lettering(font_size).halo_color,
         ..kind_extra
     };
     match kind {
@@ -2058,8 +2086,8 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
         Kind::Polygon => shape(Style { sides: Some(sides), ..Style::default() }),
         Kind::Star => shape(Style { points: Some(points), inner: Some(inner), ..Style::default() }),
         Kind::Path => Style { stroke, fill, fill_gradient, stroke_gradient, width: Some(width), opacity, dash, dash_pattern, cap, join, miter, ..Style::default() },
-        Kind::Text => Style { stroke, fill, opacity, font_size: Some(font_size), align: Some(align), ..Style::default() },
-        Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..Style::default() },
+        Kind::Text => Style { stroke, fill, opacity, font_size: Some(font_size), align: Some(align), ..lettering(font_size) },
+        Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..lettering(font_size * 0.85) },
         Kind::Step => Style { stroke, opacity, font_size: Some(font_size), ..Style::default() },
         Kind::Frame => Style::default(),
         _ => Style { stroke, opacity, ..Style::default() },
@@ -2076,10 +2104,10 @@ pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
             Geom::Path(p) => Some(p.rule),
             _ => None,
         };
-        (!matches!(e.raw.kind, Kind::Picture | Kind::Group | Kind::Card)).then(|| (e.raw.kind.clone(), e.style.clone(), e.raw.style.clone(), rule))
+        (!matches!(e.raw.kind, Kind::Picture | Kind::Group | Kind::Card)).then(|| (e.raw.kind.clone(), e.style.clone(), e.raw.style.clone(), rule, e.along.is_some()))
     })
     .flatten();
-    let Some((kind, s, raw, rule)) = style else { return };
+    let Some((kind, s, raw, rule, placed)) = style else { return };
     let st = store.board_style;
     // Stroke detail and the live shapes' parameters.
     if controls_of(&kind).cap {
@@ -2144,6 +2172,27 @@ pub(super) fn load_selection_style(store: AppStore, pane: PaneId) {
     // A sticky note's text is drawn smaller than the size picked (`new_style`).
     st.font_size.set_if_changed(if kind == Kind::Sticky { (s.font_size / 0.85).round() } else { s.font_size });
     st.align.set_if_changed(s.align);
+    // Lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4).
+    if controls_of(&kind).font {
+        st.font.set_if_changed(s.text.font.family);
+        st.bold.set_if_changed(s.text.font.bold);
+        st.italic.set_if_changed(s.text.font.italic);
+        st.tracking.set_if_changed(s.text.tracking);
+        st.halo.set_if_changed(s.halo.map_or(0.0, |h| super::rail::halo_step(h.width / s.font_size.max(1.0))));
+        if let Some(h) = s.halo {
+            st.halo_color.set_if_changed(Color { a: 255, ..h.color }.to_hex());
+        }
+    }
+    let on_path = kind == Kind::Text && placed;
+    st.on_path.set_if_changed(on_path);
+    if on_path {
+        st.along_offset.set_if_changed(s.along_offset.unwrap_or(match s.align {
+            Align::Left => 0.0,
+            Align::Center => 0.5,
+            Align::Right => 1.0,
+        }));
+        st.along_side.set_if_changed(s.along_side);
+    }
 }
 
 /// One style key changed in the panel: written to every selected element
@@ -2189,6 +2238,14 @@ pub(super) fn apply_style(store: AppStore, pane: PaneId, style: Style) {
             }
             if !controls_of(kind).dash {
                 s.dash_pattern = None;
+            }
+            // Lettering only where there is text; a place along a path only
+            // on a text.
+            if !controls_of(kind).font {
+                (s.font, s.bold, s.italic, s.tracking, s.halo_color, s.halo_width) = (None, None, None, None, None, None);
+            }
+            if *kind != Kind::Text {
+                (s.along, s.along_offset, s.along_side) = (None, None, None);
             }
             if s == Style::default() && style != Style::default() {
                 continue;
@@ -2323,6 +2380,82 @@ pub(super) fn outline_stroke(store: AppStore, pane: PaneId) {
         new_undo_step(pane);
         select(store, pane, out);
     }
+}
+
+/// A halo on every selected element with text: `fraction` of each one's
+/// own font size wide (0 takes it off), in `color`.
+pub(super) fn apply_halo(store: AppStore, pane: PaneId, fraction: f32, color: &str) {
+    let targets: Vec<(String, f32)> = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        s.selected
+            .iter()
+            .filter(|id| s.editable(id))
+            .filter_map(|id| snapshot.get(id).filter(|e| controls_of(&e.raw.kind).font).map(|e| (id.clone(), e.style.font_size)))
+            .collect()
+    })
+    .unwrap_or_default();
+    if targets.is_empty() {
+        return;
+    }
+    let color = Color::parse(color);
+    new_undo_step(pane);
+    local_edit(store, pane, |t| {
+        for (id, size) in &targets {
+            if fraction <= 0.0 {
+                t.clear_style(id, pimble_board::StyleKey::HaloWidth)?;
+                t.clear_style(id, pimble_board::StyleKey::HaloColor)?;
+            } else {
+                t.set_style(id, &Style { halo_width: Some(fraction * size), halo_color: color, ..Style::default() })?;
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Put Text on Path (docs/DRAWING_WAVE6_CONTRACT.md section 4): with one
+/// text and one path, line or pen stroke selected, the text is set along
+/// it; the text stays selected. A refusal is said.
+pub(super) fn put_text_on_path(store: AppStore, pane: PaneId) {
+    let pair = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        let kinds: Vec<(String, Kind)> = s.selected.iter().filter_map(|id| snapshot.get(id).map(|e| (id.clone(), e.raw.kind.clone()))).collect();
+        match kinds.as_slice() {
+            [(a, ka), (b, kb)] if *ka == Kind::Text && *kb != Kind::Text => Some((a.clone(), b.clone())),
+            [(a, ka), (b, kb)] if *kb == Kind::Text && *ka != Kind::Text => Some((b.clone(), a.clone())),
+            _ => None,
+        }
+    })
+    .flatten();
+    let Some((text, line)) = pair else {
+        crate::events::show_notice(store, pimble_board::along::NEEDS_TEXT_AND_PATH.to_string());
+        return;
+    };
+    new_undo_step(pane);
+    if local_edit_said(store, pane, |t| t.put_on_path(&text, &line)).is_some() {
+        select(store, pane, vec![text]);
+    }
+}
+
+/// Release from Path: each selected text set along a path is drawn in its
+/// own box again.
+pub(super) fn release_from_path(store: AppStore, pane: PaneId) {
+    let ids: Vec<String> = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        s.selected.iter().filter(|id| snapshot.get(id).is_some_and(|e| e.raw.style.along.is_some())).cloned().collect()
+    })
+    .unwrap_or_default();
+    if ids.is_empty() {
+        crate::events::show_notice(store, "Select a text that is on a path to release it.".to_string());
+        return;
+    }
+    new_undo_step(pane);
+    local_edit_said(store, pane, |t| {
+        for id in &ids {
+            t.release_from_path(id)?;
+        }
+        Ok(())
+    });
+    load_selection_style(store, pane);
 }
 
 /// Flip the selection about its middle (docs/DRAWING_CONTRACT.md section 2,

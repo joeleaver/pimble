@@ -18,8 +18,8 @@ use std::sync::Arc;
 use base64::Engine;
 use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
-    dash_pattern_text, parse_dash_pattern, selection_bounds, Align, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
-    BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, Join, Kind, LayerKind,
+    dash_pattern_text, parse_dash_pattern, selection_bounds, Align, AlongSide, ArrowHeads, Author, Blend, Board, BoardError, BoardSnapshot,
+    BoardTxn, Cap, CardLabel, Color, CombineOp, Dash, End, FlipAxis, Geom, Gradient, GradientKind, GradientStop, FontFamily, Join, Kind, LayerKind,
     fill_clip, merge_needs_pixels, rasterize_at, NewElement, NewFill, NewStroke, Page, PaintBody, PixelTransform, RasterJob, PathGeom, PathRule, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, StrokeBlend, Style,
     StyleKey, SvgPlacement, Transform, ViewOptions,
 };
@@ -290,6 +290,44 @@ pub struct StyleSpec {
     /// Paint the outline or line with a gradient.
     #[serde(default)]
     pub stroke_gradient: Option<GradientSpec>,
+    /// Text's font (text, sticky notes, shape and other text): "sans" (the
+    /// default, Noto Sans), "serif" (Noto Serif) or "condensed" (Noto Sans
+    /// Condensed), optionally with "bold" and "italic" after it ("serif
+    /// bold italic", "condensed-bold"). The same fonts on every device.
+    #[serde(default)]
+    pub font: Option<String>,
+    #[serde(default)]
+    pub bold: Option<bool>,
+    #[serde(default)]
+    pub italic: Option<bool>,
+    /// A halo behind the text's glyphs, for names that stay legible on busy
+    /// ground: its color (default white).
+    #[serde(default)]
+    pub halo_color: Option<String>,
+    /// How far the halo reaches past the glyphs, canvas units (with only a
+    /// color, a tenth of the font size).
+    #[serde(default)]
+    pub halo_width: Option<f32>,
+    /// Letter spacing in em: 0 the font's own, 0.2 to 1 tracked out (region
+    /// names), slightly negative to tighten.
+    #[serde(default)]
+    pub tracking: Option<f32>,
+    /// text: set it along this element (a path, line, arrow or pen stroke:
+    /// an id, or a ref from this call), each letter following the curve, as
+    /// a river or road name; its own x, y and w are then ignored. Moving or
+    /// reshaping the path moves the text. "" takes it off its path.
+    #[serde(default)]
+    pub along: Option<String>,
+    /// text along a path: where along it, 0 (its start) to 1 (its end); the
+    /// text's align says which part sits there (left its start, center its
+    /// middle, right its end). Default: left 0, center 0.5, right 1. Text
+    /// always reads left to right, whichever way the path was drawn.
+    #[serde(default)]
+    pub along_offset: Option<f32>,
+    /// text along a path: "above" (the default), "on" (centered on it, a
+    /// road's name in the road) or "below".
+    #[serde(default)]
+    pub along_side: Option<String>,
 }
 
 /// A gradient. Its handles are in the element's own box: [0,0] is its
@@ -520,7 +558,9 @@ pub struct ElementChange {
     /// Style keys to clear back to the kind's default: stroke, fill, width,
     /// opacity, font_size, align, shadow, arrow_heads, dash (a custom pattern
     /// too), cap, join, miter, radius, sides, points, inner, fill_gradient,
-    /// stroke_gradient (clearing fill or stroke clears its gradient too).
+    /// stroke_gradient (clearing fill or stroke clears its gradient too),
+    /// font, bold, italic, halo_color, halo_width, tracking, along,
+    /// along_offset, along_side.
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -1083,6 +1123,8 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
     pick(&spec.dash, "dash", &|s| Dash::parse(s).is_some() || parse_dash_pattern(s).is_some(), "solid, dashed, dotted, or a pattern of lengths like \"8 4\"")?;
     pick(&spec.cap, "cap", &|s| Cap::parse(s).is_some(), "butt, round, square")?;
     pick(&spec.join, "join", &|s| Join::parse(s).is_some(), "miter, round, bevel")?;
+    pick(&spec.along_side, "along_side", &|s| AlongSide::parse(s).is_some(), "above, on, below")?;
+    let font = spec.font.as_deref().map(font_of).transpose()?;
     if spec.sides.is_some_and(|n| n < 3) || spec.points.is_some_and(|n| n < 3) {
         return Err(bad("a polygon has 3 sides or more, and a star 3 points or more"));
     }
@@ -1113,7 +1155,52 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         inner: spec.inner.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0)),
         fill_gradient: spec.fill_gradient.as_ref().map(|g| gradient_of(g, "fill_gradient")).transpose()?,
         stroke_gradient: spec.stroke_gradient.as_ref().map(|g| gradient_of(g, "stroke_gradient")).transpose()?,
+        font: font.map(|f| f.0),
+        bold: spec.bold.or(font.and_then(|f| f.1)),
+        italic: spec.italic.or(font.and_then(|f| f.2)),
+        halo_color: spec.halo_color.as_deref().map(|s| color(s, "halo_color")).transpose()?,
+        halo_width: spec.halo_width.filter(|w| w.is_finite()).map(|w| w.max(0.0)),
+        tracking: spec.tracking.filter(|v| v.is_finite()).map(|v| v.clamp(-0.5, 2.0)),
+        // Named elements are resolved (and judged) by `put_on_path`.
+        along: None,
+        along_offset: spec.along_offset.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
+        along_side: spec.along_side.as_deref().and_then(|s| AlongSide::parse(s.trim())),
     })
+}
+
+/// A `font` as an agent writes it: a family, then "bold" and "italic" as
+/// it likes ("serif bold italic", "condensed-bold"). Answers the family and
+/// the bold and italic it named (`None` where it named neither).
+fn font_of(s: &str) -> Result<(FontFamily, Option<bool>, Option<bool>), BoardError> {
+    let words: Vec<String> = s.split(|c: char| c.is_whitespace() || c == '-' || c == ',').filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    let family = words
+        .first()
+        .and_then(|w| FontFamily::parse(w))
+        .ok_or_else(|| bad(format!("font \"{s}\" is not sans, serif or condensed (with bold and italic after it as you like)")))?;
+    let (mut bold, mut italic) = (None, None);
+    for w in &words[1..] {
+        match w.as_str() {
+            "bold" => bold = Some(true),
+            "italic" => italic = Some(true),
+            "regular" | "normal" => {
+                bold = bold.or(Some(false));
+                italic = italic.or(Some(false));
+            }
+            other => return Err(bad(format!("font \"{s}\": \"{other}\" is not bold or italic"))),
+        }
+    }
+    Ok((family, bold, italic))
+}
+
+/// Put text `id` on the element its spec's `along` names, or with "" take
+/// it off its path.
+fn apply_along(t: &mut BoardTxn<'_, '_>, scene: &Scene, id: &str, spec: Option<&StyleSpec>) -> Result<(), BoardError> {
+    let Some(along) = spec.and_then(|s| s.along.as_deref()).map(str::trim) else { return Ok(()) };
+    if along.is_empty() {
+        return t.release_from_path(id);
+    }
+    let target = scene.id(along)?;
+    t.put_on_path(id, &target)
 }
 
 /// A gradient as an agent writes it.
@@ -1189,6 +1276,15 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "inner" => StyleKey::Inner,
         "fill_gradient" => StyleKey::FillGradient,
         "stroke_gradient" => StyleKey::StrokeGradient,
+        "font" => StyleKey::Font,
+        "bold" => StyleKey::Bold,
+        "italic" => StyleKey::Italic,
+        "halo_color" => StyleKey::HaloColor,
+        "halo_width" => StyleKey::HaloWidth,
+        "tracking" => StyleKey::Tracking,
+        "along" => StyleKey::Along,
+        "along_offset" => StyleKey::AlongOffset,
+        "along_side" => StyleKey::AlongSide,
         other => return Err(bad(format!("\"{other}\" is not a style key"))),
     })
 }
@@ -1333,9 +1429,9 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         Kind::Sticky => Geom::Rect(rect("sticky note", Some((STICKY_SIZE, STICKY_SIZE)))?),
         Kind::Text if spec.center == Some(true) => {
             let (cx, cy) = xy("text label")?;
-            let font = spec.style.as_ref().and_then(|s| s.font_size).unwrap_or_else(|| Style::default().resolved(&Kind::Text).font_size);
+            let style = spec.style.as_ref().map(style_of).transpose()?.unwrap_or_default().resolved(&Kind::Text);
             let wrap = spec.w.filter(|w| *w > 0.0);
-            let l = pimble_board::text::layout(spec.text.as_deref().unwrap_or(""), font, wrap);
+            let l = pimble_board::text::layout_styled(spec.text.as_deref().unwrap_or(""), style.font_size, wrap, &style.text);
             let w = wrap.unwrap_or(l.width);
             Geom::Rect(Rect::new(cx - w / 2.0, cy - l.height / 2.0, wrap.unwrap_or(0.0), 0.0))
         }
@@ -1535,6 +1631,9 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
         }
     }
     for (spec, id) in specs.iter().zip(&ids) {
+        apply_along(t, scene, id, spec.style.as_ref())?;
+    }
+    for (spec, id) in specs.iter().zip(&ids) {
         if let Some(note) = spec.note.as_deref().filter(|n| !n.trim().is_empty()) {
             t.set_note(id, note)?;
         }
@@ -1692,6 +1791,7 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
         }
         t.set_style(&id, &style)?;
     }
+    apply_along(t, scene, &id, change.style.as_ref())?;
     for key in &change.clear_style {
         t.clear_style(&id, style_key(key)?)?;
     }
@@ -1817,6 +1917,38 @@ fn style_text(style: &Style) -> Vec<String> {
     }
     if let Some(v) = style.inner {
         out.push(format!("inner {}", n(v)));
+    }
+    // Lettering, read back in the words `font` takes.
+    if style.font.is_some() || style.bold == Some(true) || style.italic == Some(true) {
+        let mut words = vec![style.font.unwrap_or_default().as_str()];
+        if style.bold == Some(true) {
+            words.push("bold");
+        }
+        if style.italic == Some(true) {
+            words.push("italic");
+        }
+        out.push(format!("typeface \"{}\"", words.join(" ")));
+    }
+    match (style.halo_color, style.halo_width) {
+        (None, None) => {}
+        (c, w) => out.push(format!(
+            "halo {}{}",
+            c.unwrap_or(Color::WHITE).to_hex(),
+            w.map(|w| format!(" {}", n(w))).unwrap_or_default()
+        )),
+    }
+    if let Some(v) = style.tracking {
+        out.push(format!("tracking {}", n2(v)));
+    }
+    if let Some(a) = &style.along {
+        let mut s = format!("along {a}");
+        if let Some(o) = style.along_offset {
+            s.push_str(&format!(" at {}", n2(o)));
+        }
+        if let Some(side) = style.along_side {
+            s.push_str(&format!(" {}", side.as_str()));
+        }
+        out.push(s);
     }
     out
 }
@@ -4345,6 +4477,83 @@ mod tests {
         assert!(err.to_string().contains("two stops or more"), "{err}");
         let bad_kind = GradientSpec { kind: Some("conic".into()), stops: vec![StopSpec { offset: None, color: "#fff".into() }; 2], ..Default::default() };
         assert!(style_of(&StyleSpec { fill_gradient: Some(bad_kind), ..Default::default() }).is_err());
+    }
+
+    /// Map lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4): font,
+    /// halo, tracking and text along a path go in through add_elements
+    /// (along naming a ref of the same call), read back in get_canvas and
+    /// get_elements, write back verbatim, change and come off the path
+    /// through update_elements, and refusals say why.
+    #[test]
+    fn lettering_goes_in_reads_back_and_writes_back() {
+        let board = fresh();
+        let river = ElementSpec { name: Some("river".into()), d: Some("M0 200 C100 100 300 100 400 200".into()), ..spec("path") };
+        let label = ElementSpec {
+            x: Some(0.0),
+            y: Some(0.0),
+            text: Some("Braynard River".into()),
+            style: Some(StyleSpec {
+                font: Some("serif bold italic".into()),
+                halo_color: Some("#ffffff".into()),
+                halo_width: Some(3.0),
+                tracking: Some(0.2),
+                along: Some("river".into()),
+                along_offset: Some(0.5),
+                along_side: Some("below".into()),
+                align: Some("center".into()),
+                ..Default::default()
+            }),
+            ..spec("text")
+        };
+        let ids = add(&board, &[label, river]).unwrap();
+        let snap = board.snapshot();
+        let e = snap.get(&ids[0]).unwrap();
+        let s = &e.raw.style;
+        assert_eq!((s.font, s.bold, s.italic), (Some(FontFamily::Serif), Some(true), Some(true)));
+        assert_eq!((s.halo_color, s.halo_width, s.tracking), (Some(Color::WHITE), Some(3.0), Some(0.2)));
+        assert_eq!((s.along.as_deref(), s.along_offset, s.along_side), (Some(ids[1].as_str()), Some(0.5), Some(AlongSide::Below)));
+        assert!(e.along.is_some(), "set along the path");
+        let text = describe(&snap, &HashMap::new());
+        assert!(text.contains("typeface \"serif bold italic\""), "{text}");
+        assert!(text.contains("halo #ffffff 3"), "{text}");
+        assert!(text.contains("tracking 0.2"), "{text}");
+        assert!(text.contains(&format!("along {} at 0.5 below", ids[1])), "{text}");
+
+        // get_elements' JSON writes back verbatim, along and all.
+        let json: Vec<serde_json::Value> = snap.elements.iter().map(|e| canvas_copy::element_json(e, "Layer 1")).collect();
+        let back: Vec<ElementSpec> = json.iter().map(|v| serde_json::from_value(v.clone()).expect("add_elements takes it")).collect();
+        let other = fresh();
+        let copied = add(&other, &back).unwrap();
+        let copy = other.snapshot();
+        let c = copy.elements.iter().find(|e| e.raw.kind == Kind::Text).unwrap();
+        let path = copy.elements.iter().find(|e| e.raw.kind == Kind::Path).unwrap();
+        assert_eq!(c.raw.style.along.as_deref(), Some(path.raw.id.as_str()));
+        assert!(c.along.is_some());
+        assert_eq!(Style { along: None, ..c.raw.style.clone() }, Style { along: None, ..e.raw.style.clone() });
+        let _ = copied;
+
+        // update_elements: a plainer face, then off the path.
+        let st = Stamp::new(None, "2026-10-29T00:00:00.000Z");
+        let change = |c: ElementChange| {
+            let snapshot = board.snapshot();
+            let mut scene = Scene::of(&snapshot);
+            board.edit(st, |t| change_element(t, &mut scene, &snapshot, &c, 0)).result
+        };
+        change(ElementChange { id: ids[0].clone(), style: Some(StyleSpec { font: Some("condensed".into()), ..Default::default() }), clear_style: vec!["halo_color".into(), "halo_width".into()], ..Default::default() }).unwrap();
+        let s = board.snapshot().get(&ids[0]).unwrap().raw.style.clone();
+        assert_eq!((s.font, s.bold, s.halo_width), (Some(FontFamily::Condensed), Some(true), None), "only what is named changes");
+        change(ElementChange { id: ids[0].clone(), style: Some(StyleSpec { along: Some(String::new()), ..Default::default() }), ..Default::default() }).unwrap();
+        let snap = board.snapshot();
+        let e = snap.get(&ids[0]).unwrap();
+        assert!(e.along.is_none() && e.raw.style.along.is_none() && e.raw.style.along_side.is_none());
+
+        // Refusals.
+        assert!(said(&style_of(&StyleSpec { font: Some("comic".into()), ..Default::default() }).unwrap_err()).contains("not sans, serif or condensed"));
+        assert!(said(&style_of(&StyleSpec { along_side: Some("left".into()), ..Default::default() }).unwrap_err()).contains("above, on, below"));
+        let rect = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") }]).unwrap();
+        let err = change(ElementChange { id: ids[0].clone(), style: Some(StyleSpec { along: Some(rect[0].clone()), ..Default::default() }), ..Default::default() }).unwrap_err();
+        assert!(said(&err).contains("only on a path"), "{err}");
+        assert_eq!(font_of("Condensed-Bold").unwrap(), (FontFamily::Condensed, Some(true), None));
     }
 
     fn jp<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> rmcp::handler::server::wrapper::Parameters<T> {

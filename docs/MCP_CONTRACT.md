@@ -432,6 +432,25 @@ Wave 6, pictures in paint layers (docs/DRAWING_WAVE6_CONTRACT.md section 5, buil
 Smudge, blur and moves of paint selections have no tool: an agent paints, fills and lays
 pictures; the summary counts them when a person made them.
 
+Wave 6, map lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4, built 2026-11-18): new
+style keys, taken by `add_elements` and `update_elements` (`style`, and `clear_style` by
+the same names) and shown by `get_canvas` and `get_elements`:
+
+| Key | What it does |
+| --- | --- |
+| `font` | `"sans"` (Noto Sans, the default), `"serif"` (Noto Serif) or `"condensed"` (Noto Sans Condensed), optionally followed by `bold` and `italic` (`"serif bold italic"`, `"condensed-bold"`); something else is refused with a sentence. Stored as three keys: `font`, `bold`, `italic` |
+| `bold`, `italic` | booleans, over what `font` names |
+| `halo_color`, `halo_width` | a halo behind the glyphs (white by default; with only a color, a tenth of the font size wide), canvas units |
+| `tracking` | letter spacing in em (stored clamped to -0.5..2) |
+| `along` | on a text: an element id or a ref of the same call (a path, line, arrow or pen stroke); the text is set along it (`BoardTxn::put_on_path`, refused with its sentence for anything else). `""` takes it off (`release_from_path`) |
+| `along_offset` | 0..1 of the path's length; the text's `align` says which part sits there (default left 0, center 0.5, right 1) |
+| `along_side` | `"above"` (default), `"on"` or `"below"` |
+
+`get_canvas` reads them back in one phrase each (`typeface "serif bold italic"`, `halo
+#ffffff 3`, `tracking 0.2`, `along <id> at 0.5 below`); `get_elements` gives them as the
+keys above, so its JSON writes back verbatim (an `along` naming an element of the same
+list resolves to its copy, as `copy_elements` does).
+
 `get_canvas` gives a paint layer one line under its heading, never the points: how many
 brush strokes, eraser strokes, pictures (pasted, flattened or merged), fills, smudges,
 blurs, selections moved and selections cleared, and operations of a later version it

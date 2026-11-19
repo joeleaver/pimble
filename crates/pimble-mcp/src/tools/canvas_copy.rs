@@ -73,6 +73,16 @@ pub(super) fn style_json(style: &Style) -> Value {
     put("inner", style.inner.map(num));
     put("fill_gradient", style.fill_gradient.as_ref().map(gradient_json));
     put("stroke_gradient", style.stroke_gradient.as_ref().map(gradient_json));
+    // Lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4).
+    put("font", style.font.map(|f| json!(f.as_str())));
+    put("bold", style.bold.map(|v| json!(v)));
+    put("italic", style.italic.map(|v| json!(v)));
+    put("halo_color", style.halo_color.map(|c| json!(c.to_hex())));
+    put("halo_width", style.halo_width.map(num));
+    put("tracking", style.tracking.map(num));
+    put("along", style.along.as_ref().map(|a| json!(a)));
+    put("along_offset", style.along_offset.map(num));
+    put("along_side", style.along_side.map(|s| json!(s.as_str())));
     Value::Object(m)
 }
 
@@ -403,6 +413,10 @@ pub(super) fn write_copy(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, source: &B
         let id = &ids[&e.raw.id];
         if let Some(parent) = e.parent.as_ref().and_then(|p| ids.get(p)) {
             t.set_parent(id, Some(parent))?;
+        }
+        // Text on a path copied with its path follows the copy.
+        if let Some(line) = e.raw.style.along.as_ref().and_then(|a| ids.get(a)) {
+            t.set_style(id, &Style { along: Some(line.clone()), ..Style::default() })?;
         }
         if let Some(note) = e.raw.note.as_deref().filter(|n| !n.trim().is_empty()) {
             t.set_note(id, note)?;
