@@ -1,5 +1,12 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.4: alpha diagnostics send.** Diagnostics wave 2
+(docs/DIAGNOSTICS_CONTRACT.md section 8): release builds send warnings, errors, the sync and
+sharing `info` lines, `system`, `stores`, panics and crashed runs to `pimble-diagnostics`
+(jkbase, deployed), scrubbed on the tester's computer; Settings > Diagnostics turns it off,
+and opens once as the notice. Read with `tools/diagnostics.sh`. Next: wave 3 (Help > "Send
+Diagnostics...", the browser's records).
+
 **2026-11-19 (session 78e7f30f): v0.28.3: dictation on Windows, and logs everywhere.** rinch
 814cac5 (#2848): text typed with `SendInput` `KEYEVENTF_UNICODE` (beardictate and other
 dictation tools) reaches the editor and inputs; characters outside the BMP (emoji) are still
