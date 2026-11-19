@@ -729,6 +729,7 @@ mod tests {
         match load(&src) {
             ImageLoadResult::Loaded(bytes) => assert_eq!(bytes, PNG),
             ImageLoadResult::Failed(e) => panic!("{e}"),
+            ImageLoadResult::Decoded { .. } => panic!("a blob is handed over encoded"),
         }
         assert_eq!(asked(&commands, url), 0);
 
