@@ -128,6 +128,10 @@ pub struct Element {
     /// Changes whenever anything about how it looks changes.
     pub fingerprint: u64,
     pub(crate) text_path: OnceLock<Option<Path>>,
+    /// Its text set along another element (a text whose `along` names a
+    /// path, line or stroke: [`crate::along`]); its `world` is then the
+    /// identity and its boxes are the placed glyphs', in board units.
+    pub along: Option<Arc<crate::along::Placed>>,
     /// The clips of its layer and of every group above it: it shows (and
     /// is hit) only inside all of them.
     pub(crate) clips: Vec<Arc<Clip>>,
@@ -631,7 +635,9 @@ impl Reuse {
 
     fn split(e: Element) -> (RawElement, Reuse) {
         let connector = matches!(e.raw.kind, Kind::Connector);
-        let text_path = if connector { None } else { e.text_path.into_inner().flatten() };
+        // A connector's label and a text set along a path are placed in
+        // board units from other elements: never lent.
+        let text_path = if connector || e.along.is_some() { None } else { e.text_path.into_inner().flatten() };
         let reuse = Reuse { layout: e.layout, text_box: e.text_box, grown: e.grown, step_number: e.step_number, text_path };
         (e.raw, reuse)
     }
@@ -909,7 +915,13 @@ impl Resolver {
                 }
                 acc.map(|r| (r, r))
             });
-            if let Some((p, l)) = extent {
+            if let Some((p, mut l)) = extent {
+                // A halo reaches past the glyphs.
+                if let (Some(h), Some(tb)) = (styles[i].halo, text_boxes[i]) {
+                    if !matches!(e.kind, Kind::Connector) {
+                        l = l.union(&Rect::new(tb.x, tb.y, tb.w, tb.h + ink_below).inflate(h.width));
+                    }
+                }
                 pivot[i] = Some(p);
                 local[i] = Some(l);
             }
@@ -1002,11 +1014,53 @@ impl Resolver {
                 card: cards[i].take(),
                 fingerprint: 0,
                 text_path,
+                along: None,
                 clips: Vec::new(),
                 raw,
             };
             e.fingerprint = fingerprint(&e) ^ composite;
             out.push(e);
+        }
+
+        // Text set along a path (docs/DRAWING_WAVE6_CONTRACT.md section 4):
+        // placed once every element is where it is drawn, since the line it
+        // follows is another element's, through that one's world. Naming
+        // nothing, or anything but a line, reads as plain text.
+        let along: Vec<(usize, String)> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!((&e.raw.kind, &e.raw.geom), (Kind::Text, Geom::Rect(_))))
+            .filter_map(|(i, e)| e.style.along.clone().map(|a| (i, a)))
+            .collect();
+        if !along.is_empty() {
+            let at: HashMap<&str, usize> = out.iter().enumerate().map(|(i, e)| (e.raw.id.as_str(), i)).collect();
+            let placed: Vec<(usize, crate::along::Placed)> = along
+                .iter()
+                .filter_map(|(i, target)| {
+                    let j = *at.get(target.as_str())?;
+                    if j == *i {
+                        return None;
+                    }
+                    let line = crate::along::polyline_of(&out[j])?;
+                    let layout = out[*i].layout.clone()?;
+                    crate::along::place(target, &layout, &out[*i].style, line).map(|p| (*i, p))
+                })
+                .collect();
+            for (i, p) in placed {
+                let composite = layer_of[i].map_or(0, |l| self.composite[l]);
+                let e = &mut out[i];
+                let halo = e.style.halo.map_or(0.0, |h| h.width);
+                e.world = Affine::identity();
+                e.pivot_bounds = p.bounds;
+                e.local_bounds = p.bounds.inflate(halo);
+                e.bounds = e.local_bounds;
+                e.text_box = Some(p.bounds);
+                e.text_path = OnceLock::new();
+                let _ = e.text_path.set(p.path.clone());
+                let hash = p.hash;
+                e.along = Some(Arc::new(p));
+                e.fingerprint = fingerprint(e) ^ composite ^ hash;
+            }
         }
         out
     }
@@ -1054,13 +1108,13 @@ fn lay_out(
     match (&e.kind, &e.geom) {
         (Kind::Step, Geom::Anchor(c)) => {
             let n = step.unwrap_or(0).to_string();
-            let l = text::layout(&n, s.font_size, None);
+            let l = text::layout_styled(&n, s.font_size, None, &s.text);
             let tb = Rect::new(c.x - l.width / 2.0, c.y - l.height / 2.0, l.width, l.height);
             (Some(l), Some(tb), None)
         }
         (Kind::Text, Geom::Rect(r)) => {
             let wrap = (r.w > 0.0).then_some(r.w);
-            let l = text::layout(text, s.font_size, wrap);
+            let l = text::layout_styled(text, s.font_size, wrap, &s.text);
             let w = if r.w > 0.0 { r.w } else { l.width };
             let tb = Rect::new(r.x, r.y, w, l.height.max(r.h));
             (Some(l), Some(tb), None)
@@ -1068,7 +1122,7 @@ fn lay_out(
         (Kind::Sticky, Geom::Rect(r)) => {
             let pad = s.font_size * STICKY_PADDING;
             let inner_w = (r.w - 2.0 * pad).max(1.0);
-            let l = text::layout(text, s.font_size, Some(inner_w));
+            let l = text::layout_styled(text, s.font_size, Some(inner_w), &s.text);
             let h = r.h.max(l.height + 2.0 * pad);
             let grown = Rect::new(r.x, r.y, r.w, h);
             let tb = Rect::new(r.x + pad, r.y + pad, inner_w, l.height);
@@ -1077,18 +1131,18 @@ fn lay_out(
         (Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star, Geom::Rect(r)) if !text.is_empty() => {
             let pad = s.font_size * 0.4;
             let inner_w = (r.w - 2.0 * pad).max(1.0);
-            let l = text::layout(text, s.font_size, Some(inner_w));
+            let l = text::layout_styled(text, s.font_size, Some(inner_w), &s.text);
             let tb = Rect::new(r.x + pad, r.y + (r.h - l.height) / 2.0, inner_w, l.height);
             (Some(l), Some(tb), None)
         }
         (Kind::Callout, Geom::Callout { rect: r, .. }) if !text.is_empty() => {
             let pad = s.font_size * 0.5;
             let inner_w = (r.w - 2.0 * pad).max(1.0);
-            let l = text::layout(text, s.font_size, Some(inner_w));
+            let l = text::layout_styled(text, s.font_size, Some(inner_w), &s.text);
             (Some(l), Some(Rect::new(r.x + pad, r.y + pad, inner_w, r.h - 2.0 * pad)), None)
         }
         (Kind::Frame, Geom::Rect(r)) if !text.is_empty() => {
-            let l = text::layout(text, s.font_size, None);
+            let l = text::layout_styled(text, s.font_size, None, &s.text);
             let tb = Rect::new(r.x, r.y - l.height - s.font_size * 0.2, l.width, l.height);
             (Some(l), Some(tb), None)
         }
@@ -1097,12 +1151,12 @@ fn lay_out(
             let pad = s.font_size * 0.6;
             let icon = s.font_size * 1.2;
             let inner_w = (r.w - 3.0 * pad - icon).max(1.0);
-            let l = text::layout(title, s.font_size, Some(inner_w));
+            let l = text::layout_styled(title, s.font_size, Some(inner_w), &s.text);
             let tb = Rect::new(r.x + 2.0 * pad + icon, r.y + (r.h - l.height) / 2.0, inner_w, l.height);
             (Some(l), Some(tb), None)
         }
         (Kind::Connector, _) if !text.is_empty() => {
-            let l = text::layout(text, s.font_size, None);
+            let l = text::layout_styled(text, s.font_size, None, &s.text);
             (Some(l), Some(Rect::default()), None)
         }
         _ => (None, None, None),
@@ -1366,6 +1420,12 @@ fn fingerprint(e: &Element) -> u64 {
                 }
             }
         }
+    }
+    s.text.font.hash(&mut h);
+    f(&mut h, s.text.tracking);
+    if let Some(halo) = s.halo {
+        halo.color.hash(&mut h);
+        f(&mut h, halo.width);
     }
     if let Some(pattern) = &s.dash_pattern {
         pattern.len().hash(&mut h);

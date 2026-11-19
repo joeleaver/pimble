@@ -18,7 +18,10 @@
 //!     text: Text?, style: Map { stroke, fill, width, opacity, font_size, align,
 //!                               shadow, arrow_heads, dash,
 //!                               cap?, join?, miter?, dash_pattern?,   // stroke detail
-//!                               radius?, sides?, points?, inner? },   // live shapes
+//!                               radius?, sides?, points?, inner?,   // live shapes
+//!                               font?, bold?, italic?, halo_color?, halo_width?,
+//!                               tracking?, along?, along_offset?, along_side? },
+//!                                                  // lettering (wave 6, crate::along)
 //!     transform: Any { tx, ty, rot, sx, sy }?, locked,
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
 //!     note: Text?, "field:<name>": String...,   // what it means (below)
@@ -1532,6 +1535,37 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             if changed {
                 self.stamp_element(&map);
             }
+        }
+        Ok(())
+    }
+
+    /// Put text `text` on `line` (docs/DRAWING_WAVE6_CONTRACT.md section 4,
+    /// [`crate::along`]): its `along` key names the line; its offset and
+    /// side stay as they were. Refused with a sentence when `text` is not a
+    /// text or `line` is not a path, line, arrow or pen stroke of this
+    /// canvas.
+    pub fn put_on_path(&mut self, text: &str, line: &str) -> Result<()> {
+        let map = self.editable(text)?;
+        let raw = read_element(self.txn, text, &map);
+        if raw.kind != Kind::Text || text == line {
+            return Err(BoardError::Invalid(crate::along::NEEDS_TEXT_AND_PATH.into()));
+        }
+        let target = match self.elements()?.get(self.txn, line) {
+            Some(Out::YMap(m)) => read_element(self.txn, line, &m),
+            _ => return Err(BoardError::NoElement(line.to_string())),
+        };
+        if !crate::along::takes_text(&target.kind) {
+            return Err(BoardError::Invalid(crate::along::NOT_A_LINE.into()));
+        }
+        self.set_style(text, &Style { along: Some(line.to_string()), ..Style::default() })
+    }
+
+    /// Release text `text` from the path it is set along: its `along`,
+    /// `along_offset` and `along_side` keys go, and it is drawn in its own
+    /// box again. Nothing changes for a text on no path.
+    pub fn release_from_path(&mut self, text: &str) -> Result<()> {
+        for key in [StyleKey::Along, StyleKey::AlongOffset, StyleKey::AlongSide] {
+            self.clear_style(text, key)?;
         }
         Ok(())
     }
@@ -3322,6 +3356,15 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         inner: number_of(m.get(txn, "inner")),
         fill_gradient: gradient_of(m.get(txn, "fill_gradient")),
         stroke_gradient: gradient_of(m.get(txn, "stroke_gradient")),
+        font: s("font").and_then(|v| FontFamily::parse(&v)),
+        bold: bool_of(m.get(txn, "bold")),
+        italic: bool_of(m.get(txn, "italic")),
+        halo_color: s("halo_color").and_then(|v| Color::parse(&v)),
+        halo_width: number_of(m.get(txn, "halo_width")),
+        tracking: number_of(m.get(txn, "tracking")),
+        along: s("along"),
+        along_offset: number_of(m.get(txn, "along_offset")),
+        along_side: s("along_side").and_then(|v| AlongSide::parse(&v)),
     }
 }
 
@@ -3436,6 +3479,34 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
         if style.stroke.is_none() {
             m.insert(txn, "stroke", g.fallback().to_hex());
         }
+    }
+    // Map lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4).
+    if let Some(v) = style.font {
+        m.insert(txn, "font", v.as_str());
+    }
+    if let Some(v) = style.bold {
+        m.insert(txn, "bold", v);
+    }
+    if let Some(v) = style.italic {
+        m.insert(txn, "italic", v);
+    }
+    if let Some(c) = style.halo_color {
+        m.insert(txn, "halo_color", c.to_hex());
+    }
+    if let Some(v) = style.halo_width {
+        m.insert(txn, "halo_width", v as f64);
+    }
+    if let Some(v) = style.tracking {
+        m.insert(txn, "tracking", v as f64);
+    }
+    if let Some(v) = &style.along {
+        m.insert(txn, "along", v.clone());
+    }
+    if let Some(v) = style.along_offset {
+        m.insert(txn, "along_offset", v as f64);
+    }
+    if let Some(v) = style.along_side {
+        m.insert(txn, "along_side", v.as_str());
     }
 }
 

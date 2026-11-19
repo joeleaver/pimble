@@ -99,6 +99,10 @@ impl Element {
                 _ => false,
             };
         }
+        // Text set along a path: its glyphs' turned boxes, board units.
+        if let Some(along) = &self.along {
+            return along.quads.iter().any(|q| near_polygon(p, q, tol));
+        }
         // Into element space; the tolerance scales with it (widths are
         // already element-space values).
         let Some(inv) = self.world.invert() else { return false };

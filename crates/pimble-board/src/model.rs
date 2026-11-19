@@ -805,6 +805,74 @@ pub struct Style {
     pub fill_gradient: Option<Gradient>,
     /// A gradient stroke; `stroke` is its solid fallback.
     pub stroke_gradient: Option<Gradient>,
+    // Map lettering (docs/DRAWING_WAVE6_CONTRACT.md section 4): text's
+    // font, halo, letter spacing, and text set along a path.
+    /// The font family: absent (or a name this version does not know) is
+    /// sans.
+    pub font: Option<FontFamily>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    /// The halo's color: absent is white (a halo needs a width or a color).
+    pub halo_color: Option<Color>,
+    /// The halo's width in board units, how far it reaches past the
+    /// glyphs: absent is none, or a tenth of the font size when only a
+    /// color is set.
+    pub halo_width: Option<f32>,
+    /// Letter spacing in em: absent is 0.
+    pub tracking: Option<f32>,
+    /// Set along this element (a path, line, arrow or pen stroke): the
+    /// text's own box is ignored while it names one ([`crate::along`]).
+    pub along: Option<String>,
+    /// Where along it, 0 (its start) to 1 (its end): absent is where the
+    /// text's alignment puts it (left 0, center 0.5, right 1).
+    pub along_offset: Option<f32>,
+    /// Which side of it: absent is above.
+    pub along_side: Option<AlongSide>,
+}
+
+pub use crate::text::{FontChoice, FontFamily, TextStyle};
+
+/// Which side of its path a text set along one sits on, reading the path
+/// in the text's direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AlongSide {
+    /// The baseline just above the path.
+    #[default]
+    Above,
+    /// Centered on the path (a road's name in the road).
+    On,
+    /// The capitals' tops just below the path.
+    Below,
+}
+
+impl AlongSide {
+    pub const ALL: [AlongSide; 3] = [AlongSide::Above, AlongSide::On, AlongSide::Below];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlongSide::Above => "above",
+            AlongSide::On => "on",
+            AlongSide::Below => "below",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AlongSide> {
+        Some(match s {
+            "above" => AlongSide::Above,
+            "on" => AlongSide::On,
+            "below" => AlongSide::Below,
+            _ => return None,
+        })
+    }
+}
+
+/// A halo: glyphs stroked behind their fill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Halo {
+    pub color: Color,
+    /// How far it reaches past the glyphs, board units (the stroke is
+    /// twice this wide, centered on the outline).
+    pub width: f32,
 }
 
 /// A [`Style`] with every key decided, by the element or by its kind's
@@ -834,6 +902,14 @@ pub struct ResolvedStyle {
     pub fill_gradient: Option<Gradient>,
     /// The stroke's gradient, when it has one.
     pub stroke_gradient: Option<Gradient>,
+    /// The font and letter spacing its text is set in.
+    pub text: TextStyle,
+    pub halo: Option<Halo>,
+    /// The element its text is set along, as named (whether that names a
+    /// path is the snapshot's judgement).
+    pub along: Option<String>,
+    pub along_offset: Option<f32>,
+    pub along_side: AlongSide,
 }
 
 impl ResolvedStyle {
@@ -1080,6 +1156,21 @@ impl Style {
             inner: self.inner.filter(|r| r.is_finite()).unwrap_or(DEFAULT_STAR_INNER).clamp(0.0, 1.0),
             fill_gradient,
             stroke_gradient,
+            text: TextStyle {
+                font: FontChoice { family: self.font.unwrap_or_default(), bold: self.bold.unwrap_or(false), italic: self.italic.unwrap_or(false) },
+                tracking: self.tracking.filter(|t| t.is_finite()).unwrap_or(0.0).clamp(-0.5, 2.0),
+            },
+            halo: {
+                let width = match (self.halo_width.filter(|w| w.is_finite()), self.halo_color) {
+                    (Some(w), _) => w.max(0.0),
+                    (None, Some(_)) => self.font_size.unwrap_or(font_size).max(1.0) * 0.1,
+                    (None, None) => 0.0,
+                };
+                (width > 0.0).then(|| Halo { color: self.halo_color.unwrap_or(Color::WHITE), width })
+            },
+            along: self.along.clone().filter(|a| !a.is_empty()),
+            along_offset: self.along_offset.filter(|o| o.is_finite()).map(|o| o.clamp(0.0, 1.0)),
+            along_side: self.along_side.unwrap_or_default(),
         }
     }
 }
@@ -1106,6 +1197,15 @@ pub enum StyleKey {
     Inner,
     FillGradient,
     StrokeGradient,
+    Font,
+    Bold,
+    Italic,
+    HaloColor,
+    HaloWidth,
+    Tracking,
+    Along,
+    AlongOffset,
+    AlongSide,
 }
 
 impl StyleKey {
@@ -1130,6 +1230,15 @@ impl StyleKey {
             StyleKey::Inner => "inner",
             StyleKey::FillGradient => "fill_gradient",
             StyleKey::StrokeGradient => "stroke_gradient",
+            StyleKey::Font => "font",
+            StyleKey::Bold => "bold",
+            StyleKey::Italic => "italic",
+            StyleKey::HaloColor => "halo_color",
+            StyleKey::HaloWidth => "halo_width",
+            StyleKey::Tracking => "tracking",
+            StyleKey::Along => "along",
+            StyleKey::AlongOffset => "along_offset",
+            StyleKey::AlongSide => "along_side",
         }
     }
 }

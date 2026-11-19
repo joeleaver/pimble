@@ -483,7 +483,8 @@ fn text_ops<'a>(out: &mut Vec<Op<'a>>, e: &'a Element, color: Color, space: Spac
     if layout.is_empty() {
         return;
     }
-    if px_per_unit.is_some_and(|k| layout.font_size * k < GREEK_BELOW_PX) {
+    // Text set along a path is never drawn as bars (its lines are curves).
+    if e.along.is_none() && px_per_unit.is_some_and(|k| layout.font_size * k < GREEK_BELOW_PX) {
         for r in layout.line_boxes(Point::new(tb.x, tb.y), tb.w, e.style.align) {
             if let Some(path) = rect_path(&r) {
                 out.push(Op::fill(PathRef::Owned(path), color, e.opacity * 0.35, space));
@@ -492,6 +493,13 @@ fn text_ops<'a>(out: &mut Vec<Op<'a>>, e: &'a Element, color: Color, space: Spac
         return;
     }
     if let Some(path) = e.text_path() {
+        // A halo (docs/DRAWING_WAVE6_CONTRACT.md section 4): the glyphs
+        // stroked behind their fill, round-joined, reaching its width past
+        // the outline.
+        if let Some(halo) = e.style.halo {
+            let stroke = StrokeStyle { width: halo.width * 2.0, dash: Dash::Solid, cap: Some(Cap::Round), join: Join::Round, miter: DEFAULT_MITER, pattern: None };
+            out.push(Op::stroke(PathRef::Borrowed(path), halo.color, e.opacity, stroke, space));
+        }
         out.push(Op::fill(PathRef::Borrowed(path), color, e.opacity, space));
     }
 }
@@ -605,7 +613,8 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
             }
         }
         (Kind::Text, Geom::Rect(_)) => {
-            if let Some(fill) = s.fill {
+            // A text set along a path has no box to fill.
+            if let Some(fill) = s.fill.filter(|_| e.along.is_none()) {
                 if let Some(path) = e.text_box.and_then(|tb| rect_path(&tb.inflate(s.font_size * 0.2))) {
                     out.push(Op::fill(PathRef::Owned(path), fill, e.opacity, el));
                 }

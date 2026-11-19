@@ -51,6 +51,7 @@
 //!   [`BoardTxn::begin_retouch`], [`BoardTxn::add_move`]), and [`raster`]:
 //!   Flatten Layer and merges onto paint layers drawn as one picture.
 
+pub mod along;
 pub mod brush;
 pub mod clip;
 pub mod combine;
