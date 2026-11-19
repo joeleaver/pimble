@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.3: dictation on Windows, and logs everywhere.** rinch
+814cac5 (#2848): text typed with `SendInput` `KEYEVENTF_UNICODE` (beardictate and other
+dictation tools) reaches the editor and inputs; characters outside the BMP (emoji) are still
+lost (rinch #2850, a winit-fork change). Grammarly and ProWritingAid need a UI Automation
+provider (rinch #2847, not started). Diagnostics wave 1 (docs/DIAGNOSTICS_CONTRACT.md): the
+app logs to `<data dir>/pimble/logs/pimble.log` on every platform, and
+`pimble_core::diagnostics::Scrubber` is built and tested; waves 2-3 (upload, server, Send
+Diagnostics) next.
+
 **2026-11-19 (session 78e7f30f): v0.28.2: sharing fixes from "Shared with Will".**
 Three faults found in the journal and the documents themselves. (1) A parked yrs update
 (one that arrives before what it builds on) was relayed only as the late bytes when it
