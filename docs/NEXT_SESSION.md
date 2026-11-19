@@ -1,5 +1,23 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.2: sharing fixes from "Shared with Will".**
+Three faults found in the journal and the documents themselves. (1) A parked yrs update
+(one that arrives before what it builds on) was relayed only as the late bytes when it
+merged, so its own content reached no other device: Joe's copy of "Shared Pimble Notes"
+holds 10 KB of Will's edits parked behind twelve structs (client 5596681811603945, clocks
+129-140) that the twin never got. Now the merge relays everything it let in, a parked
+update is logged, and a vault link fills a known gap right after a live append
+(docs/NODE_DOCUMENT_CONTRACT.md section 4, "Parked updates"). Will's device should send the
+twelve on its next connect (its `pushed_sv` stops before them); if not, his logs say why.
+(2) A repair loop on the share's top list, 10:53-12:05: Joe's device took "We have a whole
+shared node-tree now" (deleted 2026-11-18) out, Will's put it back, about 3 a second. Now
+detected and slowed, with the documents sent again whole ("Repair loops" there). Why Will's
+device lacked the tombstone is not known without his log. (3) The server ran in a
+`pimble-mcp` from 07:07 (0.28.1 installed under the running 0.28.0 app), its log lost. Now
+the app takes the server back from a same-version MCP, and an MCP-run server logs to
+`<data dir>/pimble/logs/server.log` (docs/MCP_CONTRACT.md "Which server it talks to").
+Tests: `crates/pimble-server/tests/parked_updates.rs` (the relay test fails on the old code).
+
 **2026-11-19 (session 78e7f30f): v0.28.1: zoomed-out paint is fast.** Paint tiles have a
 pyramid (docs/DRAWING_CONTRACT.md "The tile pyramid"): a view far out reads coarse tiles (its
 four children at half size, or pictures drawn straight when only pictures touch it), in memory
