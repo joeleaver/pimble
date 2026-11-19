@@ -59,6 +59,7 @@ pub mod doc;
 pub mod paint_ops;
 pub mod raster;
 pub mod scatter;
+pub mod soft;
 mod retouch;
 pub mod tiles;
 mod hit;

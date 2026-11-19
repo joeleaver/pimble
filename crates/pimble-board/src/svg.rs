@@ -302,6 +302,7 @@ pub fn render_svg(
     // Paint layers go in at their place in the layer order, each as one
     // picture (none when only some elements are written).
     let paint: Vec<usize> = if only.is_none() { snapshot.paint_layers_in(&rect) } else { Vec::new() };
+    let rect_for_soft = rect;
     let mut next_paint = 0;
     let decoded = |src: &str| picture_bytes(src).and_then(|b| crate::render::Picture::decode(&b).ok()).map(std::sync::Arc::new);
     for i in snapshot.query(&rect) {
@@ -313,14 +314,26 @@ pub fn render_svg(
             while next_paint < paint.len() && paint[next_paint] < l {
                 let layer = paint[next_paint];
                 next_paint += 1;
-                sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients);
+                sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients, &rect_for_soft);
                 write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
             }
         }
+        // A feathered element (docs/DRAWING_WAVE6_CONTRACT.md section 3)
+        // is a group with the feather's filter, in board units.
+        let feathered = |out: &mut String, gradients: &mut usize| {
+            if e.style.feather > 0.0 {
+                let id = write_soft_filter(out, gradients, 0.0, crate::soft::sigma(e.style.feather), &e.bounds);
+                let _ = write!(out, "<g filter=\"url(#{id})\">");
+            }
+        };
         if e.raw.kind == Kind::Scatter {
             let chain = e.layer_index.map_or(NONE, chain_of);
-            sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients);
+            sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients, &rect_for_soft);
+            feathered(&mut out, &mut gradients);
             write_scatter(&mut out, e, &rect, picture_bytes, &mut gradients, &mut symbols_written);
+            if e.style.feather > 0.0 {
+                out.push_str("</g>");
+            }
             continue;
         }
         let ops = element_ops(e, &rect, None);
@@ -328,7 +341,8 @@ pub fn render_svg(
             continue;
         }
         let chain = e.layer_index.map_or(NONE, chain_of);
-        sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients);
+        sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients, &rect_for_soft);
+        feathered(&mut out, &mut gradients);
         // Consecutive ops in one space share a group.
         let mut open: Option<Space> = None;
         for op in &ops {
@@ -353,9 +367,12 @@ pub fn render_svg(
             }
         }
         out.push_str("</g>");
+        if e.style.feather > 0.0 {
+            out.push_str("</g>");
+        }
     }
     for &layer in &paint[next_paint..] {
-        sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients);
+        sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients, &rect_for_soft);
         write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
     }
     for _ in open_layers {
@@ -463,7 +480,7 @@ fn write_scatter(out: &mut String, e: &Element, rect: &Rect, picture_bytes: &dyn
 /// Close the layer groups `chain` leaves and open the ones it enters (a
 /// layer or group with a buffer of its own is a `<g>` with its opacity and
 /// blend).
-fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], snapshot: &BoardSnapshot, next_id: &mut usize) {
+fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], snapshot: &BoardSnapshot, next_id: &mut usize, rect: &Rect) {
     let common = open_layers.iter().zip(chain).take_while(|(a, b)| a == b).count();
     while open_layers.len() > common {
         open_layers.pop();
@@ -483,7 +500,16 @@ fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], s
             out.push_str("/></clipPath></defs>");
             id
         });
+        // Its blur and feather (docs/DRAWING_WAVE6_CONTRACT.md section 3):
+        // a filter, which SVG applies before the clip and the opacity, as
+        // the renderer does.
+        let soft = (l.blur > 0.0 || l.feather > 0.0).then(|| {
+            write_soft_filter(out, next_id, crate::soft::sigma(l.blur), crate::soft::sigma(l.feather), &rect.inflate(snapshot.soft_reach(*layer)))
+        });
         out.push_str("<g");
+        if let Some(id) = soft {
+            let _ = write!(out, " filter=\"url(#{id})\"");
+        }
         if let Some(id) = clip {
             let _ = write!(out, " clip-path=\"url(#{id})\"");
         }
@@ -496,6 +522,40 @@ fn sync_chain(out: &mut String, open_layers: &mut Vec<usize>, chain: &[usize], s
         out.push('>');
         open_layers.push(*layer);
     }
+}
+
+/// A soft-edge filter in board units over `region` (answers its id): a blur
+/// of `blur` sigma, then a feather of `feather` sigma kept as the renderer
+/// keeps it ([`crate::soft`]: the sharp drawing inside times the blurred
+/// alpha, plus the blurred drawing outside).
+fn write_soft_filter(out: &mut String, next_id: &mut usize, blur: f32, feather: f32, region: &Rect) -> String {
+    *next_id += 1;
+    let id = format!("pimble-soft-{next_id}");
+    let _ = write!(
+        out,
+        "<defs><filter id=\"{id}\" filterUnits=\"userSpaceOnUse\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" color-interpolation-filters=\"sRGB\">",
+        n(region.x),
+        n(region.y),
+        n(region.w),
+        n(region.h)
+    );
+    let mut input = "SourceGraphic";
+    if blur > 0.0 {
+        let _ = write!(out, "<feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"{}\" result=\"blurred\"/>", n(blur));
+        input = "blurred";
+    }
+    if feather > 0.0 {
+        let _ = write!(
+            out,
+            "<feGaussianBlur in=\"{input}\" stdDeviation=\"{}\" result=\"soft\"/>\
+             <feComposite in=\"{input}\" in2=\"soft\" operator=\"in\" result=\"core\"/>\
+             <feComposite in=\"soft\" in2=\"{input}\" operator=\"out\" result=\"rim\"/>\
+             <feComposite in=\"core\" in2=\"rim\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>",
+            n(feather)
+        );
+    }
+    out.push_str("</filter></defs>");
+    id
 }
 
 /// A paint layer as one embedded PNG over what it paints within `rect`, at

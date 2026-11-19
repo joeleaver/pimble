@@ -73,6 +73,11 @@ pub struct Layer {
     pub clip: Option<String>,
     /// The element its `clip` key names, as stored, in effect or not.
     pub clip_named: Option<String>,
+    /// Its blur radius, board units (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 3, [`crate::soft`]); 0: none.
+    pub blur: f32,
+    /// Its feather radius, board units; 0: none.
+    pub feather: f32,
 }
 
 /// One element, as stored and as resolved for drawing.
@@ -138,6 +143,10 @@ pub struct Element {
     /// A scatter's symbol and its chunks' bounds
     /// (docs/DRAWING_WAVE6_CONTRACT.md section 2).
     pub scatter: Option<Arc<crate::scatter::ResolvedScatter>>,
+    /// How far `bounds` reach past what it paints with hard edges: its own
+    /// feather's and its layer's and groups' blurs and feathers
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3, [`crate::soft::reach`]).
+    pub soft: f32,
 }
 
 impl Element {
@@ -154,6 +163,16 @@ impl Element {
     /// hit.
     pub fn inside_clips(&self, p: Point) -> bool {
         self.clips.iter().all(|c| c.contains(p))
+    }
+
+    /// Its bounds without what soft edges spread (what it paints with a
+    /// hard edge: what a marquee must hold to take it).
+    pub fn hard_bounds(&self) -> Rect {
+        if self.soft > 0.0 {
+            self.bounds.inflate(-self.soft)
+        } else {
+            self.bounds
+        }
     }
 
     /// Whether it draws inside a clip.
@@ -211,6 +230,13 @@ pub struct BoardSnapshot {
     pub(crate) composite: Vec<u64>,
     /// Per layer (as `layers`), its clip when one is in effect.
     pub(crate) clips: Vec<Option<Arc<Clip>>>,
+    /// Per layer (as `layers`), how far its blurs and feathers, and its
+    /// groups', reach past what it draws (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 3).
+    pub(crate) soft: Vec<f32>,
+    /// Per layer, worked out when first drawn soft: what it draws, for the
+    /// blur cache ([`crate::soft`]).
+    pub(crate) soft_info: Vec<OnceLock<crate::soft::LayerInfo>>,
     /// Every paint operation, by layer id, then order, then id
     /// (docs/DRAWING_CONTRACT.md section 3).
     pub paint: Vec<PaintOp>,
@@ -267,6 +293,8 @@ impl BoardSnapshot {
                 chains: Vec::new(),
                 composite: Vec::new(),
                 clips: Vec::new(),
+                soft: Vec::new(),
+                soft_info: Vec::new(),
                 paint: Vec::new(),
                 paint_index: HashMap::new(),
                 paint_cache: PaintCache::new(),
@@ -411,8 +439,22 @@ impl BoardSnapshot {
     /// `layers`, in draw order.
     pub fn paint_layers_in(&self, region: &Rect) -> Vec<usize> {
         (0..self.layers.len())
-            .filter(|at| self.paint_shown(*at) && self.paint_bounds(&self.layers[*at].id).is_some_and(|b| b.intersects(region)))
+            .filter(|at| self.paint_shown(*at) && self.paint_reach(*at).is_some_and(|b| b.intersects(region)))
             .collect()
+    }
+
+    /// Where paint layer `at` (an index into `layers`) draws: its
+    /// operations' bounds grown by the blurs and feathers it draws through
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3).
+    pub fn paint_reach(&self, at: usize) -> Option<Rect> {
+        let b = self.paint_bounds(&self.layers.get(at)?.id)?;
+        Some(b.inflate(self.soft_reach(at)))
+    }
+
+    /// How far the blurs and feathers of layer `at` and its groups reach
+    /// past what it draws, board units (0 for none).
+    pub fn soft_reach(&self, at: usize) -> f32 {
+        self.soft.get(at).copied().unwrap_or(0.0)
     }
 
     /// Every paint operation as a raster cache follows it (see [`PaintMark`]).
@@ -450,6 +492,7 @@ impl BoardSnapshot {
                 let mut f = Fx::default();
                 look.hash(&mut f);
                 op.effective.hash(&mut f);
+                let bounds = bounds.inflate(self.soft_reach(at));
                 Some(PaintMark { key: id_hash(&op.raw.id), fingerprint: f.finish(), look, points, bounds, index })
             })
             .collect()
@@ -459,12 +502,14 @@ impl BoardSnapshot {
     /// reach: what an appended stroke changed.
     pub fn paint_tail_bounds(&self, index: usize, from: usize) -> Option<Rect> {
         let op = self.paint.get(index)?;
-        match &op.raw.body {
+        let soft = self.layers.iter().position(|l| l.id == op.raw.layer).map_or(0.0, |at| self.soft_reach(at));
+        let tail = match &op.raw.body {
             PaintBody::Stroke(s) => points_bounds(&s.points[from.saturating_sub(1).min(s.points.len())..]).map(|r| r.inflate(s.settings.reach())),
             PaintBody::Retouch(r) => points_bounds(&r.points[from.saturating_sub(1).min(r.points.len())..])
                 .map(|b| b.inflate(r.settings.reach() + crate::paint_ops::RETOUCH_MARGIN + crate::paint_ops::BLUR_MAX_KERNEL_PX as f32 / crate::brush::PX_PER_UNIT)),
             _ => op.bounds,
-        }
+        };
+        tail.map(|b| b.inflate(soft))
     }
 
     /// The `pimble-blob:` URLs the board draws: its pictures' and its paint
@@ -572,7 +617,7 @@ impl BoardSnapshot {
     pub fn visible_extent(&self) -> Option<Rect> {
         let paint = (0..self.layers.len())
             .filter(|at| self.paint_shown(*at))
-            .filter_map(|at| self.paint_bounds(&self.layers[at].id).and_then(|b| self.clip_bounds(at, b)));
+            .filter_map(|at| self.paint_reach(at).and_then(|b| self.clip_bounds(at, b)));
         self.elements
             .iter()
             .filter(|e| e.visible && e.has_extent && !matches!(e.raw.kind, Kind::Group))
@@ -730,6 +775,8 @@ impl Resolver {
                     isolated: e.isolated,
                     clip: None,
                     clip_named: l.clip.clone(),
+                    blur: l.blur,
+                    feather: l.feather,
                 }
             })
             .collect();
@@ -789,7 +836,27 @@ impl Resolver {
             }
             composite = next;
         }
+        // Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3): what a
+        // blur or feather spreads is drawn, so it counts where an element
+        // reaches (the spatial index, the visible extent, what a change
+        // redraws).
+        let soft: Vec<f32> = (0..r.layers.len())
+            .map(|at| {
+                std::iter::once(at)
+                    .chain(tree.ancestors(at))
+                    .map(|a| crate::soft::reach(r.layers[a].blur) + crate::soft::reach(r.layers[a].feather))
+                    .sum()
+            })
+            .collect();
+        for e in &mut snapshot_elements {
+            let reach = crate::soft::reach(e.style.feather) + e.layer_index.and_then(|l| soft.get(l)).copied().unwrap_or(0.0);
+            if reach > 0.0 && e.bounds.is_finite() {
+                e.soft = reach;
+                e.bounds = e.bounds.inflate(reach);
+            }
+        }
         let grid = Grid::build(&snapshot_elements);
+        let soft_info = (0..r.layers.len()).map(|_| OnceLock::new()).collect();
         let mut snapshot = BoardSnapshot {
             exists: true,
             version,
@@ -807,6 +874,8 @@ impl Resolver {
             chains,
             composite,
             clips,
+            soft,
+            soft_info,
             paint: Vec::new(),
             paint_index: HashMap::new(),
             paint_cache: PaintCache::new(),
@@ -1077,6 +1146,7 @@ impl Resolver {
                 along: None,
                 clips: Vec::new(),
                 scatter: scatters[i].take(),
+                soft: 0.0,
                 raw,
             };
             let (print, look) = fingerprint_and_look(&e);
@@ -1147,6 +1217,8 @@ fn composite_of(chains: &[Vec<usize>], layers: &[Layer], clips: &[Option<Arc<Cli
                 l.id.hash(&mut h);
                 l.opacity.to_bits().hash(&mut h);
                 l.blend.hash(&mut h);
+                l.blur.to_bits().hash(&mut h);
+                l.feather.to_bits().hash(&mut h);
                 if let Some(Some(clip)) = clips.get(*c) {
                     clip.hash.hash(&mut h);
                 }
@@ -1523,6 +1595,7 @@ fn fingerprint_and_look(e: &Element) -> (u64, u64) {
         }
     }
     s.tint.hash(&mut h);
+    f(&mut h, s.feather);
     let Some(sc) = &r.scatter else {
         let print = h.finish();
         return (print, print);
@@ -1556,6 +1629,8 @@ pub fn symbol_layer(symbol: &str, name: &str) -> crate::doc::RawLayer {
         blend: None,
         parent: None,
         clip: None,
+        blur: 0.0,
+        feather: 0.0,
     }
 }
 

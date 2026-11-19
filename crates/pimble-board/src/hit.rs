@@ -211,7 +211,7 @@ impl BoardSnapshot {
             .into_iter()
             .map(|i| &self.elements[i])
             .filter(|e| {
-                let b = e.bounds;
+                let b = e.hard_bounds();
                 !e.global
                     && e.has_extent
                     && e.shown_bounds().is_some()

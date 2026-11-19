@@ -130,6 +130,10 @@ pub struct LayerRaster {
     pub ops: Vec<String>,
     /// Merge Down: the paint layer below, as it was when drawn.
     pub onto: Option<String>,
+    /// Flatten: the layer's blur and feather radii drawn into the pixels
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3), which the flatten then
+    /// takes off the layer; (0, 0) when it had none.
+    pub baked: (f32, f32),
 }
 
 impl LayerRaster {
@@ -181,7 +185,7 @@ pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job:
     let at = snapshot.layers.iter().position(|l| l.id == id).ok_or_else(|| BoardError::NoLayer(id.clone()))?;
     let tree = snapshot.layer_tree();
     let layer = &snapshot.layers[at];
-    let mut out = LayerRaster { job: job.clone(), tiles: Vec::new(), blend: Blend::Normal, ops: Vec::new(), onto: None };
+    let mut out = LayerRaster { job: job.clone(), tiles: Vec::new(), blend: Blend::Normal, ops: Vec::new(), onto: None, baked: (0.0, 0.0) };
     // The entries drawn, and how.
     let (drawn, alone): (Vec<usize>, bool) = match &job {
         RasterJob::Flatten(_) => {
@@ -189,6 +193,7 @@ pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job:
                 return Err(BoardError::NotAPaintLayer { id, kind: layer.kind.clone() });
             }
             out.ops = snapshot.paint_ops(&layer.id).iter().map(|o| o.raw.id.clone()).collect();
+            out.baked = (layer.blur, layer.feather);
             (vec![at], true)
         }
         RasterJob::MergeDown(_) => {
@@ -252,7 +257,8 @@ pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job:
                         }
                     }
                 }
-                if let Some(b) = snapshot.paint_bounds(&l.id) {
+                // What a blur or feather spreads is drawn too.
+                if let Some(b) = snapshot.paint_reach(e) {
                     grow(b);
                 }
             }
@@ -312,12 +318,18 @@ pub fn rasterize_at(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, job:
                 // layer keeps its opacity).
                 // A merge takes the layer's clip into the pixels (the layer
                 // goes); a flatten keeps the layer, and its clip with it.
+                // Its blur and feather are drawn in either way (a merge's
+                // layer goes; a flatten takes them off the layer).
                 let clip = if matches!(job, RasterJob::Flatten(_)) { None } else { snapshot.clip_of(at) };
-                if opacity >= 1.0 && clip.is_none() {
+                let soft = layer.blur > 0.0 || layer.feather > 0.0;
+                if opacity >= 1.0 && clip.is_none() && !soft {
                     draw_entry(&mut pixmap, snapshot, pictures, at, &view, &region, &mut complete);
                 } else {
                     let mut buffer = Pixmap::new(w, h).ok_or_else(|| BoardError::Invalid("too large to draw".into()))?;
                     draw_entry(&mut buffer, snapshot, pictures, at, &view, &region, &mut complete);
+                    if soft {
+                        crate::soft::soften_layer(&mut buffer, snapshot, pictures, at, view.transform(), None, true);
+                    }
                     let paint = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
                     crate::render::blend_clipped(&mut pixmap, &buffer, &paint, clip, view.transform());
                 }
@@ -358,6 +370,9 @@ fn draw_composited(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn
     }
     let Some(mut buffer) = Pixmap::new(pixmap.width(), pixmap.height()) else { return };
     draw_entry(&mut buffer, snapshot, pictures, at, view, region, complete);
+    if l.blur > 0.0 || l.feather > 0.0 {
+        crate::soft::soften_layer(&mut buffer, snapshot, pictures, at, view.transform(), None, true);
+    }
     let paint = PixmapPaint { opacity: l.opacity, blend_mode: l.blend.to_tiny(), quality: FilterQuality::Nearest };
     crate::render::blend_clipped(pixmap, &buffer, &paint, snapshot.clip_of(at), view.transform());
 }

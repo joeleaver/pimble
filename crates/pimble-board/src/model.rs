@@ -842,6 +842,10 @@ pub struct Style {
     /// tint, 255: the color itself, keeping each pixel's coverage), before
     /// each placement's own tint.
     pub tint: Option<Color>,
+    /// Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3): the radius,
+    /// in board units, over which its edge fades (a Gaussian blur of what
+    /// it paints, sigma half the radius). Absent or 0: a hard edge.
+    pub feather: Option<f32>,
 }
 
 pub use crate::text::{FontChoice, FontFamily, TextStyle};
@@ -926,6 +930,9 @@ pub struct ResolvedStyle {
     pub along_side: AlongSide,
     /// A scatter's tint (alpha is the amount; transparent: none).
     pub tint: Color,
+    /// Its feather radius, board units (0: a hard edge;
+    /// [`crate::soft::MAX_RADIUS`] at most).
+    pub feather: f32,
 }
 
 impl ResolvedStyle {
@@ -1188,6 +1195,7 @@ impl Style {
             along_offset: self.along_offset.filter(|o| o.is_finite()).map(|o| o.clamp(0.0, 1.0)),
             along_side: self.along_side.unwrap_or_default(),
             tint: self.tint.unwrap_or(Color::TRANSPARENT),
+            feather: crate::soft::radius(self.feather),
         }
     }
 }
@@ -1224,6 +1232,7 @@ pub enum StyleKey {
     AlongOffset,
     AlongSide,
     Tint,
+    Feather,
 }
 
 impl StyleKey {
@@ -1258,6 +1267,7 @@ impl StyleKey {
             StyleKey::AlongOffset => "along_offset",
             StyleKey::AlongSide => "along_side",
             StyleKey::Tint => "tint",
+            StyleKey::Feather => "feather",
         }
     }
 }

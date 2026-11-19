@@ -9,6 +9,7 @@
 //!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity,
 //!                               kind: String?, blend: String?, parent: String?,
 //!                               clip: String?,   // an element id (wave 6, crate::clip)
+//!                               blur: f64?, feather: f64?,   // soft edges (wave 6, crate::soft)
 //!                               note: Text?, "field:<name>": String... }>,
 //!   elements: Map<element id, Map {
 //!     layer, order, parent?, kind,
@@ -20,8 +21,9 @@
 //!                               cap?, join?, miter?, dash_pattern?,   // stroke detail
 //!                               radius?, sides?, points?, inner?,   // live shapes
 //!                               font?, bold?, italic?, halo_color?, halo_width?,
-//!                               tracking?, along?, along_offset?, along_side? },
+//!                               tracking?, along?, along_offset?, along_side?,
 //!                                                  // lettering (wave 6, crate::along)
+//!                               feather? },        // soft edges (wave 6, crate::soft)
 //!     transform: Any { tx, ty, rot, sx, sy }?, locked,
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
 //!     note: Text?, "field:<name>": String...,   // what it means (below)
@@ -119,6 +121,10 @@ pub(crate) mod keys {
     /// A layer's or group's clip: the id of a closed element
     /// (docs/DRAWING_WAVE6_CONTRACT.md section 1, [`crate::clip`]).
     pub const LAYER_CLIP: &str = "clip";
+    /// A layer's or group's blur and feather radii, board units
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3, [`crate::soft`]).
+    pub const LAYER_BLUR: &str = "blur";
+    pub const LAYER_FEATHER: &str = "feather";
     /// A scatter's symbol id (docs/DRAWING_WAVE6_CONTRACT.md section 2).
     pub const SYMBOL: &str = "symbol";
 }
@@ -717,6 +723,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 if let Some(clip) = &layer.clip {
                     map.insert(self.txn, LAYER_CLIP, clip.clone());
                 }
+                if layer.blur > 0.0 {
+                    map.insert(self.txn, LAYER_BLUR, layer.blur as f64);
+                }
+                if layer.feather > 0.0 {
+                    map.insert(self.txn, LAYER_FEATHER, layer.feather as f64);
+                }
                 copy_meaning(self.txn, &map, layer.note.as_deref(), &layer.fields);
             }
         }
@@ -930,6 +942,37 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     pub fn set_layer_opacity(&mut self, id: &str, opacity: f32) -> Result<()> {
         self.layer_map(id)?.insert(self.txn, OPACITY, opacity.clamp(0.0, 1.0) as f64);
+        self.layers_changed();
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// A layer's or group's blur radius in board units
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3): everything it draws is
+    /// softened, non-destructively. 0 (or less) removes the key.
+    pub fn set_layer_blur(&mut self, id: &str, radius: f32) -> Result<()> {
+        self.set_layer_soft(id, LAYER_BLUR, radius)
+    }
+
+    /// A layer's or group's feather radius in board units: the edge of what
+    /// it draws fades out, its inside kept. 0 (or less) removes the key.
+    pub fn set_layer_feather(&mut self, id: &str, radius: f32) -> Result<()> {
+        self.set_layer_soft(id, LAYER_FEATHER, radius)
+    }
+
+    fn set_layer_soft(&mut self, id: &str, key: &str, radius: f32) -> Result<()> {
+        if !radius.is_finite() {
+            return Err(BoardError::Invalid("a radius is a number of canvas units".into()));
+        }
+        let layer = self.layer_map(id)?;
+        let radius = crate::soft::radius(Some(radius));
+        if radius > 0.0 {
+            layer.insert(self.txn, key, radius as f64);
+        } else if layer.get(self.txn, key).is_some() {
+            layer.remove(self.txn, key);
+        } else {
+            return Ok(());
+        }
         self.layers_changed();
         self.stamp_board();
         Ok(())
@@ -2906,6 +2949,19 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 for key in doomed {
                     board.remove(self.txn, &key);
                 }
+                // Its blur and feather are in the pixels now
+                // (docs/DRAWING_WAVE6_CONTRACT.md section 3): taken off the
+                // layer, unless someone changed them meanwhile.
+                let (blur, feather) = raster.baked;
+                if blur > 0.0 || feather > 0.0 {
+                    let map = self.layer_map(layer)?;
+                    for (key, was) in [(LAYER_BLUR, blur), (LAYER_FEATHER, feather)] {
+                        if was > 0.0 && crate::soft::radius(number_of(map.get(self.txn, key))) == was {
+                            map.remove(self.txn, key);
+                        }
+                    }
+                    self.layers_changed();
+                }
                 // The tiles do not overlap, so they share the lowest one's
                 // place in the order (ties break by id, the same on every
                 // device).
@@ -3163,6 +3219,11 @@ pub struct RawLayer {
     /// The element that clips it, as stored ([`crate::clip`] reads whether
     /// it is in effect).
     pub clip: Option<String>,
+    /// Its blur radius, board units: everything it draws softened
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 3); 0 when absent.
+    pub blur: f32,
+    /// Its feather radius, board units: its edge faded; 0 when absent.
+    pub feather: f32,
 }
 
 /// An element as stored.
@@ -3278,6 +3339,8 @@ pub(crate) fn read_layers<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<RawLayer> {
             blend: string_of(layer.get(txn, BLEND)).as_deref().and_then(Blend::parse),
             parent: string_of(layer.get(txn, PARENT)).filter(|p| !p.is_empty()),
             clip: string_of(layer.get(txn, LAYER_CLIP)).filter(|c| !c.is_empty()),
+            blur: crate::soft::radius(number_of(layer.get(txn, LAYER_BLUR))),
+            feather: crate::soft::radius(number_of(layer.get(txn, LAYER_FEATHER))),
         });
     }
     layers
@@ -3799,6 +3862,7 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         along_offset: number_of(m.get(txn, "along_offset")),
         along_side: s("along_side").and_then(|v| AlongSide::parse(&v)),
         tint: s("tint").and_then(|v| Color::parse(&v)),
+        feather: number_of(m.get(txn, "feather")),
     }
 }
 
@@ -3944,6 +4008,10 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
     }
     if let Some(c) = style.tint {
         m.insert(txn, "tint", c.to_hex());
+    }
+    // Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3).
+    if let Some(v) = style.feather {
+        m.insert(txn, "feather", v as f64);
     }
 }
 

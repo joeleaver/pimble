@@ -473,27 +473,63 @@ pub fn draw_region(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn
 /// drawing order keeps each layer's and group's elements together, so one
 /// stack of buffers is enough.
 fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>, clipped: bool) {
+    draw_region_in(pixmap, snapshot, pictures, view, mask, clipped, None);
+}
+
+/// What layer or group `at` holds, drawn as the renderer draws it inside its
+/// buffer (its children's buffers, blends, clips and soft edges), without
+/// its own opacity, blend, clip, blur and feather: what a layer's blur and
+/// feather work on (docs/DRAWING_WAVE6_CONTRACT.md section 3).
+pub(crate) fn draw_layer_inside(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>, clipped: bool, at: usize) {
+    draw_region_in(pixmap, snapshot, pictures, view, mask, clipped, Some(at));
+}
+
+/// What the drawing loop needs when it closes a buffer.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    snapshot: &'a BoardSnapshot,
+    pictures: &'a dyn PictureSource,
+    vt: Affine,
+    clipped: bool,
+    mask: Option<&'a [bool]>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_region_in(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>, clipped: bool, root: Option<usize>) {
     let region = view.board_rect(pixmap.width(), pixmap.height());
     let vt = view.transform();
     let (w, h) = (pixmap.width(), pixmap.height());
+    let ctx = Ctx { snapshot, pictures, vt, clipped, mask };
     let mut stack: Vec<(usize, Pixmap)> = Vec::new();
+    let tree = snapshot.layer_tree();
+    let inside = |layer: usize| root.is_none_or(|r| tree.is_within(layer, r));
     // Paint layers draw at their place in the layer order, between the
     // elements of the layers below and above them (none when only some
     // elements are drawn: paint belongs to no element).
-    let paint: Vec<usize> = if mask.is_some() { Vec::new() } else { snapshot.paint_layers_in(&region) };
+    let paint: Vec<usize> = if mask.is_some() { Vec::new() } else { snapshot.paint_layers_in(&region).into_iter().filter(|l| inside(*l)).collect() };
     let mut next_paint = 0;
     const NONE: &[usize] = &[];
-    let chain_of = |layer: usize| snapshot.chains.get(layer).map_or(NONE, |c| c.as_slice());
+    // Drawing inside `root`, the buffers are those inside it.
+    let chain_of = |layer: usize| {
+        let chain = snapshot.chains.get(layer).map_or(NONE, |c| c.as_slice());
+        match root.and_then(|r| chain.iter().position(|c| *c == r)) {
+            Some(p) => &chain[p + 1..],
+            None => chain,
+        }
+    };
     for i in snapshot.query(&region) {
         if mask.is_some_and(|m| !m[i]) {
             continue;
         }
         let e = &snapshot.elements[i];
+        if root.is_some() && !e.layer_index.is_some_and(inside) {
+            continue;
+        }
         if let Some(l) = e.layer_index {
             while next_paint < paint.len() && paint[next_paint] < l {
                 let layer = paint[next_paint];
                 next_paint += 1;
-                if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h, vt, clipped) {
+                if !enter(pixmap, &mut stack, chain_of(layer), w, h, &ctx) {
                     return;
                 }
                 let target = match stack.last_mut() {
@@ -504,7 +540,7 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
             }
         }
         let chain = e.layer_index.map_or(NONE, chain_of);
-        if !enter(pixmap, &mut stack, chain, snapshot, w, h, vt, clipped) {
+        if !enter(pixmap, &mut stack, chain, w, h, &ctx) {
             return;
         }
         let target = match stack.last_mut() {
@@ -514,7 +550,7 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
         draw_element(target, e, pictures, vt, &region);
     }
     for &layer in &paint[next_paint..] {
-        if !enter(pixmap, &mut stack, chain_of(layer), snapshot, w, h, vt, clipped) {
+        if !enter(pixmap, &mut stack, chain_of(layer), w, h, &ctx) {
             return;
         }
         let target = match stack.last_mut() {
@@ -524,17 +560,16 @@ fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &
         snapshot.paint_cache().draw_layer(target, snapshot, layer, view, &region, pictures);
     }
     while !stack.is_empty() {
-        close_buffer(pixmap, &mut stack, snapshot, vt, clipped);
+        close_buffer(pixmap, &mut stack, &ctx);
     }
 }
 
 /// Make the open buffers `chain` (close the ones it leaves, open the ones
 /// it enters). False when a buffer could not be made.
-#[allow(clippy::too_many_arguments)]
-fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize], snapshot: &BoardSnapshot, w: u32, h: u32, vt: Affine, clipped: bool) -> bool {
+fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize], w: u32, h: u32, ctx: &Ctx) -> bool {
     let common = stack.iter().zip(chain).take_while(|((open, _), want)| open == *want).count();
     while stack.len() > common {
-        close_buffer(pixmap, stack, snapshot, vt, clipped);
+        close_buffer(pixmap, stack, ctx);
     }
     for layer in &chain[stack.len()..] {
         match Pixmap::new(w, h) {
@@ -548,10 +583,15 @@ fn enter(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, chain: &[usize],
 /// Blend the innermost open buffer into the one below it (or `pixmap`) with
 /// its layer's opacity and blend, inside its clip when it has one
 /// (docs/DRAWING_WAVE6_CONTRACT.md section 1: the mask is the size of the
-/// target, a tile or the visible area, never of the world).
-fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, snapshot: &BoardSnapshot, vt: Affine, clipped: bool) {
-    let Some((layer, buffer)) = stack.pop() else { return };
+/// target, a tile or the visible area, never of the world), after its blur
+/// and feather (section 3: the clip cuts what the blur spread).
+fn close_buffer(pixmap: &mut Pixmap, stack: &mut Vec<(usize, Pixmap)>, ctx: &Ctx) {
+    let Some((layer, mut buffer)) = stack.pop() else { return };
+    let (snapshot, vt, clipped) = (ctx.snapshot, ctx.vt, ctx.clipped);
     let l = &snapshot.layers[layer];
+    if l.blur > 0.0 || l.feather > 0.0 {
+        crate::soft::soften_layer(&mut buffer, snapshot, ctx.pictures, layer, vt, ctx.mask, clipped);
+    }
     let paint = PixmapPaint { opacity: l.opacity, blend_mode: l.blend.to_tiny(), quality: FilterQuality::Nearest };
     let target = match stack.last_mut() {
         Some((_, below)) => below,
@@ -622,6 +662,14 @@ pub(crate) fn stroke_paint(kind: &Kind, color: Color, opacity: f32) -> Paint<'st
 }
 
 pub(crate) fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
+    if e.style.feather > 0.0 && crate::soft::draw_feathered(pixmap, e, pictures, vt, region) {
+        return;
+    }
+    draw_element_hard(pixmap, e, pictures, vt, region);
+}
+
+/// [`draw_element`] with a hard edge (its feather left out).
+pub(crate) fn draw_element_hard(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
     if e.raw.kind == Kind::Scatter {
         crate::scatter::draw(pixmap, e, pictures, vt, region);
         return;

@@ -17,8 +17,9 @@
 //! - A layer is effectively hidden or locked when it or any group above it
 //!   is; its own flags are kept and apply again when the group's do not.
 //! - A layer needs a buffer of its own (is *isolated*) when its blend is
-//!   not normal or its opacity is below 1; a group in pass-through at full
-//!   opacity does not, and its children draw as if ungrouped.
+//!   not normal or its opacity is below 1, or it has a blur or a feather;
+//!   a group in pass-through at full opacity does not, and its children
+//!   draw as if ungrouped.
 
 use crate::doc::RawLayer;
 use crate::model::{Blend, LayerKind};
@@ -211,7 +212,10 @@ pub fn resolve(layers: &[RawLayer]) -> LayerTree {
             Some(b) => b,
             None => l.kind.default_blend(),
         };
-        let isolated = if l.kind.is_group() { blend != Blend::PassThrough || l.opacity < 1.0 } else { blend != Blend::Normal || l.opacity < 1.0 };
+        // A blur or feather (docs/DRAWING_WAVE6_CONTRACT.md section 3) is
+        // worked on the layer's own buffer.
+        let soft = l.blur > 0.0 || l.feather > 0.0;
+        let isolated = soft || if l.kind.is_group() { blend != Blend::PassThrough || l.opacity < 1.0 } else { blend != Blend::Normal || l.opacity < 1.0 };
         let children: Vec<usize> = kids[i].iter().map(|c| visit(layers, kids, tree, *c, depth + 1)).collect();
         let at = tree.entries.len();
         for c in &children {
@@ -266,6 +270,8 @@ mod tests {
             blend: None,
             parent: parent.map(Into::into),
             clip: None,
+            blur: 0.0,
+            feather: 0.0,
         }
     }
 
