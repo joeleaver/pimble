@@ -84,6 +84,7 @@ pub(super) fn style_json(style: &Style) -> Value {
     put("along_offset", style.along_offset.map(num));
     put("along_side", style.along_side.map(|s| json!(s.as_str())));
     put("tint", style.tint.map(|c| json!(c.to_hex())));
+    put("feather", style.feather.map(num));
     Value::Object(m)
 }
 
@@ -496,6 +497,12 @@ pub(super) fn copy_layer_tree(
     }
     if l.opacity < 1.0 {
         t.set_layer_opacity(&id, l.opacity)?;
+    }
+    if l.blur > 0.0 {
+        t.set_layer_blur(&id, l.blur)?;
+    }
+    if l.feather > 0.0 {
+        t.set_layer_feather(&id, l.feather)?;
     }
     if !l.visible {
         t.set_layer_visible(&id, false)?;

@@ -333,6 +333,13 @@ pub struct StyleSpec {
     /// way, "#2e7d3266" a little).
     #[serde(default)]
     pub tint: Option<String>,
+    /// A soft edge: the radius, in canvas units, over which the element's
+    /// edge fades out (a Gaussian blur of what it paints; its inside stays
+    /// sharp). For regions, fields and haze without hard edges ("a forest
+    /// whose edge fades over 300 units": 300). The fade reaches 1.5 times
+    /// the radius past the shape. 0 is a hard edge.
+    #[serde(default)]
+    pub feather: Option<f32>,
 }
 
 /// A gradient. Its handles are in the element's own box: [0,0] is its
@@ -666,7 +673,7 @@ pub struct ElementChange {
     /// too), cap, join, miter, radius, sides, points, inner, fill_gradient,
     /// stroke_gradient (clearing fill or stroke clears its gradient too),
     /// font, bold, italic, halo_color, halo_width, tracking, along,
-    /// along_offset, along_side, tint.
+    /// along_offset, along_side, tint, feather.
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -927,6 +934,16 @@ pub struct AddLayerParams {
     /// shapes in a hidden "Clips" layer). Moving or reshaping it moves the edge.
     #[serde(default)]
     pub clip: Option<String>,
+    /// Blur everything the layer or group draws (shapes and paint), by this
+    /// radius in canvas units: haze, mist, a soft glow, out-of-focus ground.
+    /// Non-destructive; 0 or left out is none.
+    #[serde(default)]
+    pub blur: Option<f32>,
+    /// Fade the edge of what the layer or group draws over this radius in
+    /// canvas units, keeping its inside sharp (a whole layer of fields
+    /// whose outer edge fades into the ground). 0 or left out is none.
+    #[serde(default)]
+    pub feather: Option<f32>,
     /// Where it goes among the layers of its group: "top" (the default),
     /// "bottom", "above:<layer>" or "below:<layer>" (a layer's name or id;
     /// it then goes in that layer's group).
@@ -966,6 +983,13 @@ pub struct UpdateLayerParams {
     /// (or "") to release its clip.
     #[serde(default, deserialize_with = "present")]
     pub clip: Option<Option<String>>,
+    /// Blur radius in canvas units (as add_layer's `blur`); 0 removes it.
+    #[serde(default)]
+    pub blur: Option<f32>,
+    /// Feather radius in canvas units (as add_layer's `feather`); 0
+    /// removes it.
+    #[serde(default)]
+    pub feather: Option<f32>,
     /// Move it into this group (a group's name or id), or "" for the top
     /// level. On top of the group unless `order` says where.
     #[serde(default)]
@@ -1275,6 +1299,7 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         along_offset: spec.along_offset.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
         along_side: spec.along_side.as_deref().and_then(|s| AlongSide::parse(s.trim())),
         tint: spec.tint.as_deref().map(|s| color(s, "tint")).transpose()?,
+        feather: spec.feather.filter(|v| v.is_finite()).map(|v| v.max(0.0)),
     })
 }
 
@@ -1396,6 +1421,7 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "along" => StyleKey::Along,
         "along_offset" => StyleKey::AlongOffset,
         "along_side" => StyleKey::AlongSide,
+        "feather" => StyleKey::Feather,
         other => return Err(bad(format!("\"{other}\" is not a style key"))),
     })
 }
@@ -2093,6 +2119,9 @@ fn style_text(style: &Style) -> Vec<String> {
     if let Some(t) = style.tint {
         out.push(format!("tint {}", t.to_hex()));
     }
+    if let Some(f) = style.feather.filter(|f| *f > 0.0) {
+        out.push(format!("feather {}", n(f)));
+    }
     out
 }
 
@@ -2443,6 +2472,12 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
         }
         if layer.opacity < 1.0 {
             flags.push(format!("opacity {}", n(layer.opacity)));
+        }
+        if layer.blur > 0.0 {
+            flags.push(format!("blur {}", n(layer.blur)));
+        }
+        if layer.feather > 0.0 {
+            flags.push(format!("feather {}", n(layer.feather)));
         }
         match (&layer.clip, &layer.clip_named) {
             (Some(clip), _) => flags.push(format!("clipped to {clip}")),
@@ -3540,6 +3575,7 @@ impl Pimble {
     /// frames, lines, arrows, connectors between elements (they follow the
     /// elements when moved), pen strokes, numbered steps, callouts, node cards,
     /// pictures and groups, in one edit. Give elements a `ref` to connect or group them in the same call.
+    /// A style's `feather` fades an element's edge (soft regions and haze).
     /// Answers each new element's id.
     #[tool(name = "add_elements")]
     async fn add_elements(&self, Parameters(p): Parameters<AddElementsParams>) -> Result<String, String> {
@@ -4102,6 +4138,7 @@ impl Pimble {
         let order = p.order.clone().unwrap_or_default();
         let (note, fields) = (p.note.clone(), p.fields.clone());
         let (kind, parent, blend, clip) = (p.kind.clone(), p.parent.clone(), p.blend.clone(), p.clip.clone());
+        let (blur, feather) = (p.blur, p.feather);
         let id = self
             .canvas_edit(&target, Default::default(), move |t, scene, _| {
                 let at = placement(&order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
@@ -4118,6 +4155,12 @@ impl Pimble {
                 if let Some(clip) = clip.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
                     t.set_layer_clip(&id, Some(clip))?;
                 }
+                if let Some(r) = blur {
+                    t.set_layer_blur(&id, r)?;
+                }
+                if let Some(r) = feather {
+                    t.set_layer_feather(&id, r)?;
+                }
                 if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
                     t.set_layer_note(&id, note)?;
                 }
@@ -4131,17 +4174,19 @@ impl Pimble {
         Ok(format!("Added {what} \"{}\" ({id}) to {}.", p.name.trim(), target.what()))
     }
 
-    /// Rename, show or hide, lock or unlock, fade, blend, clip, reorder or move
-    /// into or out of a group a layer of a canvas, or say what it holds (its
-    /// note and fields). Hiding or locking a group hides or locks what is in
-    /// it. A clip (`clip`: a closed shape's or closed path's id) keeps
-    /// everything the layer or group draws inside that shape's outline.
+    /// Rename, show or hide, lock or unlock, fade, blend, clip, blur or
+    /// feather, reorder or move into or out of a group a layer of a canvas,
+    /// or say what it holds (its note and fields). Hiding or locking a group
+    /// hides or locks what is in it. A clip (`clip`: a closed shape's or
+    /// closed path's id) keeps everything the layer or group draws inside
+    /// that shape's outline; it cuts after a blur or feather.
     /// What a layer shows is the same for everyone who opens the canvas.
     #[tool(name = "update_layer")]
     async fn update_layer(&self, Parameters(p): Parameters<UpdateLayerParams>) -> Result<String, String> {
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, name, visible, locked, opacity, order) = (p.layer.clone(), p.name.clone(), p.visible, p.locked, p.opacity, p.order.clone());
         let (note, fields, blend, parent, clip) = (p.note.clone(), p.fields.clone(), p.blend.clone(), p.parent.clone(), p.clip.clone());
+        let (blur, feather) = (p.blur, p.feather);
         self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -4161,6 +4206,12 @@ impl Pimble {
             }
             if let Some(clip) = &clip {
                 t.set_layer_clip(&id, clip.as_deref().map(str::trim).filter(|c| !c.is_empty()))?;
+            }
+            if let Some(r) = blur {
+                t.set_layer_blur(&id, r)?;
+            }
+            if let Some(r) = feather {
+                t.set_layer_feather(&id, r)?;
             }
             match (parent.as_deref().map(str::trim), order.as_deref()) {
                 (Some(parent), order) => {
@@ -4976,6 +5027,55 @@ mod tests {
         pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "clip": null }))).await.unwrap();
         let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
         assert!(!read.contains("clipped to"), "{read}");
+        let _ = server.stop().await;
+    }
+
+    /// Soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3): `feather` in
+    /// an element's style, `blur` and `feather` on a layer, read back by
+    /// get_canvas and get_elements, changed and cleared, exported as SVG
+    /// filters.
+    #[tokio::test]
+    async fn soft_edges_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        let url = format!("http://{}", server.addr());
+        let service = pimble_client::PimbleClient::connect(&url).await.unwrap();
+        service.create_store(dir.path().join("maps.pimble"), "Maps").await.unwrap();
+        let pimble = super::super::Pimble::new(std::sync::Arc::new(crate::connection::Connection::with_client(pimble_client::PimbleClient::connect(&url).await.unwrap())));
+
+        pimble.create_canvas(jp(serde_json::json!({ "parent": "Maps", "title": "County" }))).await.unwrap();
+        let made = pimble.add_layer(jp(serde_json::json!({ "node": "Maps/County", "name": "Haze", "blur": 40, "feather": 12.5 }))).await.unwrap();
+        assert!(made.contains("Added layer \"Haze\""), "{made}");
+        let added = pimble
+            .add_elements(jp(serde_json::json!({ "node": "Maps/County", "layer": "Haze", "elements": [
+                { "kind": "ellipse", "ref": "w", "x": 0, "y": 0, "w": 400, "h": 300, "style": { "fill": "#2e7d32", "feather": 60 } },
+            ] })))
+            .await
+            .unwrap();
+        let woods = added.lines().find(|l| l.contains("(w)")).and_then(|l| l.split_whitespace().nth(1)).unwrap().to_string();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(read.contains("blur 40") && read.contains("feather 12.5"), "{read}");
+        assert!(read.contains("feather 60"), "{read}");
+        let elements = pimble.get_elements(jp(serde_json::json!({ "node": "Maps/County", "ids": [woods.clone()] }))).await.unwrap();
+        assert!(elements.contains("\"feather\": 60") || elements.contains("\"feather\":60"), "{elements}");
+
+        let svg = pimble.export_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(svg.contains("<feGaussianBlur") && svg.matches("filter=\"url(#pimble-soft-").count() == 2, "{svg}");
+
+        // Changed and cleared.
+        pimble.update_elements(jp(serde_json::json!({ "node": "Maps/County", "changes": [{ "id": woods, "style": { "feather": 25 } }] }))).await.unwrap();
+        pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Haze", "blur": 0 }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(!read.contains("blur 40") && read.contains("feather 12.5") && read.contains("feather 25"), "{read}");
+        pimble.update_elements(jp(serde_json::json!({ "node": "Maps/County", "changes": [{ "id": woods, "clear_style": ["feather"] }] }))).await.unwrap();
+        pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Haze", "feather": 0 }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(!read.contains("feather"), "{read}");
         let _ = server.stop().await;
     }
 

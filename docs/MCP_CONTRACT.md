@@ -480,6 +480,23 @@ where a **scatter** places it; a scatter is one element holding thousands of pla
   bring a scatter's symbol along under its id (pictures inside a symbol are not copied
   between stores). `export_canvas` writes `<symbol>`s and a `<use>` per placement.
 
+Wave 6, soft edges (docs/DRAWING_WAVE6_CONTRACT.md section 3, built 2026-11-18): a radius
+in canvas units, the edge fading over about the radius on each side and reaching 1.5 times
+it past the hard edge (a Gaussian with sigma half the radius).
+
+- `add_elements` and `update_elements` take `feather` in `style` (any element; `clear_style`
+  `"feather"`, or 0): the element's edge fades out, its inside stays sharp.
+- `add_layer` and `update_layer` take `blur` (everything the layer or group draws softened:
+  haze, mist, glow) and `feather` (the edge of what it draws faded, its inside sharp); 0
+  removes either. A clip cuts after them.
+- `get_canvas` says `feather 60` among an element's style and `blur 40, feather 12.5`
+  among a layer's flags; `get_elements` gives `feather` in `style`; `copy_layer` and
+  `copy_elements` keep them; `export_canvas` writes `feGaussianBlur` filters in canvas units
+  (a feather as the renderer draws it: the sharp drawing inside times the blurred alpha
+  plus the blurred drawing outside, with `feComposite`); `render_canvas` draws them;
+  `flatten_layer` draws a paint layer's own blur and feather into its pixels and takes the
+  keys off the layer, and a merge down draws them in.
+
 `get_canvas` gives a paint layer one line under its heading, never the points: how many
 brush strokes, eraser strokes, pictures (pasted, flattened or merged), fills, smudges,
 blurs, selections moved and selections cleared, and operations of a later version it
