@@ -259,6 +259,17 @@ impl Tree {
         self.docs.remove(&id)
     }
 
+    /// Every held document, tombstones included, whose stored `parent_id` is
+    /// one of `parents`: the documents a repair of those lists judged. Sent
+    /// again whole when two devices keep undoing each other's repair of a
+    /// list (one of them lacks part of a child's document, most often its
+    /// tombstone).
+    pub fn documents_under(&self, parents: &HashSet<NodeId>) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.docs.iter().filter(|(_, d)| d.stored_parent().is_some_and(|p| parents.contains(&p))).map(|(&id, _)| id).collect();
+        ids.sort_by_key(|id| id.to_string());
+        ids
+    }
+
     /// Every held document's id, tombstoned ones included.
     pub fn ids(&self) -> Vec<NodeId> {
         self.docs.keys().copied().collect()

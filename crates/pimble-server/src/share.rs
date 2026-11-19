@@ -356,6 +356,10 @@ pub(crate) enum ShareCommand {
     /// of the scope is wrapped under the store key, which is what says the
     /// share key can be dropped without losing anything a member made.
     Retire { root: NodeId, done: oneshot::Sender<Result<bool, String>> },
+    /// Send these documents out again whole (the link serves this itself:
+    /// a tree repair that keeps undoing another device's, see
+    /// `RepairLoops` in the handler).
+    Resend(Vec<NodeId>),
 }
 
 /// Resolves when `due` comes; never, without one.
@@ -768,6 +772,8 @@ impl Upkeep {
                 }
                 result
             }
+            // The link answers this before it reaches the upkeep.
+            ShareCommand::Resend(_) => Ok(()),
             ShareCommand::Retire { root, done } => {
                 // Asked while no connection was up and given up on since:
                 // the RPC told its caller nothing was changed, so nothing is.

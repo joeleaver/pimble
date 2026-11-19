@@ -120,6 +120,8 @@ fn main() {
         }
     };
 
+    pimble_server::local::set_host_kind("app");
+
     // Initialize logging
     let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
     match log_file() {

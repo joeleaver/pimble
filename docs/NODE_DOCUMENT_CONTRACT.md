@@ -138,6 +138,24 @@ repair touched. `applyStoreUpdate` and `syncStoreDocument` go away.
   too big (a server from before `max_bytes`) is asked again a document at a time, and a
   single document past `MAX_MESSAGE_BYTES` (512 MiB, the limit on every message both
   ways) is an error naming it (`pimble_client::too_big_sentence`).
+- **Parked updates** (2026-11-19). An update that arrives before the changes it builds on
+  is parked by yrs and shows nothing until they arrive. The server logs it ("an update is
+  parked until earlier changes arrive (missing ...)"), and when a later merge lets a parked
+  update in, what it relays is everything that merge added (the diff from the state vector
+  before it), never only the arriving bytes; before, the parked part reached no other
+  device, and everything built on it waited there for ever (a share member's twelve
+  structs of a note, and the rest of the note after them). A vault link that appends a
+  live change and still knows the remote lacks part of that document (`pushed_sv` behind
+  the document's vector, or the document marked) sends the rest at once
+  (`vault_link::catch_up`), rather than at the next connect.
+- **Repair loops** (2026-11-19). Two devices holding different states of a child (one has
+  its tombstone, one does not) undo each other's repair of its parent's list for as long as
+  both are connected: the one takes it out, the other puts it back (13,000 times in 72
+  minutes on a share's top list). Repair cannot settle it, since each is right by what it
+  holds. A list repaired 20 times within 10 minutes is a loop: the server says so in the
+  log, the share's vault link sends that list's document and every document naming it as
+  parent out again whole (`ShareCommand::Resend`), and the store is repaired at most every
+  30 s until 10 minutes pass without one.
 - **Vault**: `VaultDocId` is a node id; the `tree` document is gone. The vault link and the
   web vault client hold node documents and build the tree from them (the manifest's root
   id is where the tree starts). `vault_log.rs` is unchanged.

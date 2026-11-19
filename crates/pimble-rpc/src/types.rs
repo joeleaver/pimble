@@ -1197,6 +1197,13 @@ pub struct ServerInfoResponse {
     /// Whether this server stops when a newer local client asks it to
     /// (`handOver`): the app's own loopback server, never a hosted one.
     pub hands_over: bool,
+    /// Which program runs it: `"app"` for the desktop app, `"mcp"` for
+    /// `pimble-mcp`, empty for anything else (and servers before 0.28.2).
+    /// The app asks a same-version server it does not run to hand over, so
+    /// the server stays in the program that lives as long as the person's
+    /// session (docs/MCP_CONTRACT.md "Which server it talks to").
+    #[serde(default)]
+    pub host: String,
 }
 
 /// Generic error response

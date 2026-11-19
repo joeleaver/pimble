@@ -17,8 +17,9 @@ use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() {
+    pimble_server::local::set_host_kind("mcp");
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(pimble_server::local::LogWriter)
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

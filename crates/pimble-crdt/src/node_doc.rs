@@ -297,6 +297,16 @@ impl NodeDoc {
         Ok(effect)
     }
 
+    /// What an update yrs parked is waiting for (the encoded state vector of
+    /// the first missing struct per client), or `None` when nothing is
+    /// parked. A parked update stays invisible until the structs before it
+    /// arrive: a document left like this shows a peer's edits only in part.
+    pub fn missing(&self) -> Option<Vec<u8>> {
+        let txn = self.doc.transact();
+        let pending = txn.store().pending_update()?;
+        Some(pending.missing.encode_v1())
+    }
+
     /// Whether the peer lacks something of ours, given its state vector and
     /// the diff it sent (docs/history/HARDENING_CONTRACT.md decision 7).
     pub fn diff_if_peer_lacks_it(&self, remote_sv: &[u8], remote_diff: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1295,6 +1305,12 @@ impl NodeDoc {
     pub(crate) fn is_tombstone(&self) -> bool {
         let txn = self.doc.transact();
         self.node.len(&txn) > 0 && self.node.get(&txn, DELETED_AT).is_some()
+    }
+
+    /// The stored `parent_id` of an initialised document, tombstoned or not.
+    pub(crate) fn stored_parent(&self) -> Option<NodeId> {
+        let txn = self.doc.transact();
+        string_value(self.node.get(&txn, PARENT_ID)).and_then(|s| NodeId::parse(&s).ok())
     }
 
     /// A node's stored `parent_id`, or `None` when this is not a node

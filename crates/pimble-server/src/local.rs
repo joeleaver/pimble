@@ -62,6 +62,20 @@ pub fn handed_over() {
     HANDED_OVER.store(true, Ordering::SeqCst);
 }
 
+/// Which program this process is, as `serverInfo` reports it: set once at
+/// start by the app (`"app"`) and `pimble-mcp` (`"mcp"`).
+static HOST_KIND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Say which program this process is (`"app"`, `"mcp"`), before connecting.
+pub fn set_host_kind(kind: &'static str) {
+    let _ = HOST_KIND.set(kind);
+}
+
+/// Which program this process is; empty when it never said.
+pub fn host_kind() -> &'static str {
+    HOST_KIND.get().copied().unwrap_or("")
+}
+
 /// This build's version, the one a server it finds is compared with.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -93,6 +107,21 @@ async fn probe(url: &str, addr: &str) -> Option<Found> {
     let client = PimbleClient::connect(url).await.ok()?;
     client.list_stores().await.ok()?;
     match client.server_info().await {
+        // The app hosts the server whenever it can: one of the same version
+        // that `pimble-mcp` (or anything but the app) runs is asked to hand
+        // over. An MCP server lives only as long as the chat that started
+        // it, and its log goes to that chat (2026-11-19: after 0.28.1 was
+        // installed under a running 0.28.0 app, a 0.28.1 `pimble-mcp` took
+        // the port and carried every share for the rest of the day).
+        Ok(info) if host_kind() == "app" && info.host != "app" && info.hands_over && info.version == VERSION => {
+            tracing::info!("The Pimble server on {} is run by {}: asking it to hand over to the app", addr, if info.host.is_empty() { "another program" } else { info.host.as_str() });
+            match client.hand_over().await {
+                Ok(()) => Some(Found::HandingOver),
+                Err(e) if !answered(&e) => Some(Found::HandingOver),
+                // Refused: use it as it is.
+                Err(_) => Some(Found::Usable(client)),
+            }
+        }
         Ok(info) if !is_older(&info.version) => Some(Found::Usable(client)),
         Ok(info) if info.hands_over => {
             tracing::info!("The Pimble server on {} is version {}, older than this {}: asking it to hand over", addr, info.version, VERSION);
@@ -227,6 +256,7 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
         };
         match server.start().await {
             Ok(()) => {
+                start_server_log();
                 tracing::info!("Started embedded server on {}", addr);
                 // Connect to the server we just started
                 match PimbleClient::connect(&url).await {
@@ -265,6 +295,61 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
         "Failed to connect or start a server on {} after {} attempts (is the port in use?)",
         addr, MAX_CONNECT_ATTEMPTS
     ))
+}
+
+/// The log of a server that a program without a log of its own runs:
+/// `pimble-mcp`'s standard error goes to the chat that started it, where
+/// nobody reads it, so from the moment it starts the local server its log
+/// is also written to `<data dir>/pimble/logs/server.log` (the last one's
+/// kept beside it as `server.previous.log`). The app logs where it always
+/// has. (2026-11-19: a day of sharing ran in a `pimble-mcp` and left no
+/// trace anywhere.)
+static SERVER_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// Where an MCP-run server's log goes.
+pub fn server_log_path() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("pimble").join("logs").join("server.log"))
+}
+
+fn start_server_log() {
+    if host_kind() == "app" {
+        return;
+    }
+    let Some(path) = server_log_path() else { return };
+    let mut log = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_some() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    let _ = std::fs::rename(&path, path.with_file_name("server.previous.log"));
+    *log = std::fs::File::create(&path).ok();
+}
+
+/// A `tracing_subscriber` writer: standard error always, and the server log
+/// once this process runs the local server.
+#[derive(Clone, Copy, Default)]
+pub struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(file) = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let _ = file.write_all(buf);
+        }
+        std::io::stderr().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(file) = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let _ = file.flush();
+        }
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter
+    }
 }
 
 /// Try to reconnect after a connection loss, optionally starting a new server.

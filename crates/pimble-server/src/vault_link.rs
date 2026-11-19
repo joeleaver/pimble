@@ -792,6 +792,20 @@ async fn connect_and_sync(
                 }
             }
             command = shares.next_command() => {
+                if let ShareCommand::Resend(ids) = command {
+                    // Whole states as fresh appends: whatever part of them a
+                    // device missed, it merges now.
+                    for id in ids {
+                        let doc_id = VaultDocId::Node(id);
+                        if !progress.keyring.remote_docs.contains(&doc_id.as_str()) {
+                            continue;
+                        }
+                        if let Err(e) = push_full(handler, &client, store_id, doc_id, key_id, link_id, &echoes, progress).await {
+                            warn!("Vault link for store {}: sending node {} again failed: {}", store_id, id, e);
+                        }
+                    }
+                    continue;
+                }
                 let mut session = LinkSession { handler, client: &client, store_id, link_key_id: key_id, progress: &mut *progress, calls: 0 };
                 if let Err(e) = shares.upkeep.command(&mut session, command, &shares.sweep_kick).await {
                     warn!("Vault link for store {}: share upkeep failed ({}); trying again shortly", store_id, e);
@@ -2104,7 +2118,65 @@ async fn push_update(
         return push_full(handler, client, store_id, doc_id, key_id, link_id, echoes, progress).await;
     }
     match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes, progress).await? {
-        Appended::Yes => progress.advance(&doc_id, plaintext),
+        Appended::Yes => {
+            // Only a real gap is caught up: the update started past what the
+            // remote is known to hold, or the document is marked. The local
+            // document running ahead of this link's queue (edits made since,
+            // not forwarded yet) is no gap; their own appends follow.
+            let gap = !pimble_crdt::continues_from(&progress.known(&doc_id), plaintext).unwrap_or(true);
+            progress.advance(&doc_id, plaintext);
+            if gap || progress.is_dirty(&doc_id) {
+                catch_up(handler, client, store_id, doc_id, key_id, link_id, echoes, progress).await?;
+            }
+        }
+        Appended::Refused => progress.mark_dirty(&doc_id),
+    }
+    Ok(())
+}
+
+/// After a live append: when the remote is known to lack something of the
+/// document all the same (an earlier change refused or never forwarded, an
+/// update merged here that started past a gap), send it now rather than at
+/// the next connect. A connection can last all day, and every edit made on
+/// top of the gap waits, unseen, on every other device until the gap is
+/// filled (2026-11-19: twelve structs of a shared note, and everything typed
+/// after them).
+#[allow(clippy::too_many_arguments)]
+async fn catch_up(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    doc_id: VaultDocId,
+    key_id: Uuid,
+    link_id: &str,
+    echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
+) -> anyhow::Result<()> {
+    let VaultDocId::Node(node_id) = &doc_id else { return Ok(()) };
+    let known = progress.known(&doc_id);
+    let local_sv = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        match manager.node_state_vector(store_id, *node_id) {
+            Ok(sv) => sv,
+            Err(_) => return Ok(()),
+        }
+    };
+    let ahead = pimble_crdt::state_vector_exceeds(&local_sv, &known).unwrap_or(false);
+    if !ahead && !progress.is_dirty(&doc_id) {
+        return Ok(());
+    }
+    let (local_sv, diff) = doc_diff(handler, store_id, &doc_id, &known).await?;
+    if !progress.parts_ok && diff.len() > MAX_CATCH_UP_BLOB {
+        progress.mark_dirty(&doc_id);
+        return Ok(());
+    }
+    info!("Vault link for store {} doc {:?}: the remote lacks part of it after a live append; sending {} bytes to fill the gap", store_id, doc_id, diff.len());
+    match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await? {
+        Appended::Yes => {
+            progress.set_known(&doc_id, &local_sv);
+            progress.clear_dirty(&doc_id);
+        }
         Appended::Refused => progress.mark_dirty(&doc_id),
     }
     Ok(())

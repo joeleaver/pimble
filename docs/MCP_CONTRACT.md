@@ -77,7 +77,18 @@ depends on pimble-client), and both binaries call them:
    (`jkbase-wsproxy`, a 600 s idle timeout only). The relay keeps its own 16 MB message
    limit (`RelayLimits`), which `syncNodes` never meets there (relayed stores are vaults,
    4 MiB per blob).
-5. When the server goes away (the app that owned it quit), `pimble-mcp` reconnects by the
+5. The app hosts whenever it can (2026-11-19). `serverInfo` says which program runs a
+   server (`host`: `"app"`, `"mcp"`, empty before 0.28.2), and the app asks a server of its
+   own version that it does not run to hand over, then starts its own; `pimble-mcp` joins it
+   on its next reconnect. A server lives as long as the program running it, and an MCP lives
+   only as long as the chat that started it. (0.28.1 was installed under a running 0.28.0
+   app; a 0.28.1 `pimble-mcp` took the port by the newer-version rule and carried every
+   share for the rest of the day.) A newer server is still never asked to make way for an
+   older app: restarting the app brings them level.
+6. A server that `pimble-mcp` runs writes its log to `<data dir>/pimble/logs/server.log`
+   too (`server.previous.log` the one before), from the moment it starts; its standard
+   error goes to the chat, where nobody reads it. The app logs where it always has.
+7. When the server goes away (the app that owned it quit), `pimble-mcp` reconnects by the
    same rule: it joins another server or starts one, and opens the saved list again. A
    tool call made during the gap waits for the reconnect, up to 10 s, then fails with a
    sentence.

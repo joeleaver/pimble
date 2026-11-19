@@ -379,6 +379,67 @@ struct FlushPending {
 #[derive(Default)]
 struct RepairDebouncer {
     generation: Mutex<HashMap<StoreId, u64>>,
+    /// Per store, how often each list was repaired lately (see
+    /// [`RepairLoops`]).
+    loops: Mutex<HashMap<StoreId, RepairLoops>>,
+}
+
+/// Two devices that hold different states of one document undo each other's
+/// repair of the list it is in, for as long as both are connected: one
+/// knows the child is deleted and takes it out, the other does not and puts
+/// it back (2026-11-19: a share's top list, 13,000 times in 72 minutes,
+/// while a member's device lacked a note's tombstone). Repair cannot settle
+/// that, since each device is right by what it holds; what settles it is the
+/// missing state reaching the other device. So a list repaired
+/// [`LOOP_REPAIRS`] times within [`LOOP_WINDOW`] is a loop: it is said in
+/// the log, the documents it is about go out again whole, and the store is
+/// repaired at most every [`LOOP_DEBOUNCE`] until the window passes quietly.
+struct RepairLoops {
+    since: std::time::Instant,
+    counts: HashMap<NodeId, u32>,
+    slowed_until: Option<std::time::Instant>,
+    /// The lists already said and sent in this window.
+    told: HashSet<NodeId>,
+}
+
+const LOOP_REPAIRS: u32 = 20;
+const LOOP_WINDOW: Duration = Duration::from_secs(10 * 60);
+const LOOP_DEBOUNCE: Duration = Duration::from_secs(30);
+
+impl RepairDebouncer {
+    /// The wait before a store's next repair.
+    fn debounce(&self, store_id: StoreId) -> Duration {
+        let loops = self.loops.lock().unwrap();
+        match loops.get(&store_id).and_then(|l| l.slowed_until) {
+            Some(until) if until > std::time::Instant::now() => LOOP_DEBOUNCE,
+            _ => REPAIR_DEBOUNCE,
+        }
+    }
+
+    /// Count a repair that rewrote `lists`; the lists that are looping and
+    /// were not yet told about in this window.
+    fn note(&self, store_id: StoreId, lists: &[NodeId]) -> Vec<NodeId> {
+        let now = std::time::Instant::now();
+        let mut loops = self.loops.lock().unwrap();
+        let l = loops.entry(store_id).or_insert_with(|| RepairLoops { since: now, counts: HashMap::new(), slowed_until: None, told: HashSet::new() });
+        if now.duration_since(l.since) > LOOP_WINDOW {
+            l.since = now;
+            l.counts.clear();
+            l.told.clear();
+        }
+        let mut fresh = Vec::new();
+        for &list in lists {
+            let count = l.counts.entry(list).or_insert(0);
+            *count += 1;
+            if *count >= LOOP_REPAIRS {
+                l.slowed_until = Some(now + LOOP_WINDOW);
+                if l.told.insert(list) {
+                    fresh.push(list);
+                }
+            }
+        }
+        fresh
+    }
 }
 
 /// When the tree is repaired after a merged update touched `node` or
@@ -2499,25 +2560,50 @@ impl RpcHandler {
         source: Option<&str>,
         repair: Repair,
     ) -> Result<NodeUpdateEffect, ErrorObjectOwned> {
-        let (effect, kinds) = {
+        let (effect, kinds, released) = {
             let mut manager = self.store_manager.write().await;
-            let before = manager.tree(store_id).map_err(to_rpc_error)?.shape(node_id);
+            let tree = manager.tree(store_id).map_err(to_rpc_error)?;
+            let before = tree.shape(node_id);
+            // A document holding a parked update: what was held back before
+            // this merge, and where the document stood.
+            let waited = tree.doc(node_id).and_then(|d| d.missing().map(|missing| (missing, d.state_vector())));
             let effect = manager.apply_node_update(store_id, node_id, update).map_err(to_rpc_error)?;
+            let tree = manager.tree(store_id).map_err(to_rpc_error)?;
+            let missing = tree.doc(node_id).and_then(|d| d.missing());
+            if missing.is_some() && missing != waited.as_ref().map(|(m, _)| m.clone()) {
+                // Visible in the log, never silent: the document shows the
+                // edits after the gap only once what is missing arrives.
+                warn!(
+                    "Node {} of store {}: an update is parked until earlier changes arrive (missing {}); its edits stay hidden until then",
+                    node_id,
+                    store_id,
+                    pimble_crdt::describe_state_vector(missing.as_deref().unwrap_or_default())
+                );
+            }
             if !effect.changed {
                 return Ok(effect);
             }
-            let tree = manager.tree(store_id).map_err(to_rpc_error)?;
+            // The merge let a parked update in: what is sent on (to every
+            // link, every window) is everything the merge added, the parked
+            // part included, not only the bytes that arrived. Before
+            // 2026-11-19 only the arriving bytes went on, and the parked part
+            // reached nobody: a share's member saw a note's later edits wait
+            // for ever on twelve that never left the device that had them.
+            let released = match &waited {
+                Some((missing_before, sv_before)) if missing.as_ref() != Some(missing_before) => tree.doc(node_id).and_then(|d| d.diff_since(sv_before).ok()),
+                _ => None,
+            };
             let after = tree.shape(node_id);
             // What the merge changed, by the one derivation the browser's
             // vault client makes too (`pimble_crdt::derive_changes`).
             let kinds: Vec<StoreChangeKind> =
                 derive_changes(node_id, tree.root(), before.as_ref(), after.as_ref(), effect).into_iter().map(StoreChangeKind::from).collect();
-            (effect, kinds)
+            (effect, kinds, released)
         };
 
         self.schedule_content_flush(store_id);
 
-        let update_b64 = base64::engine::general_purpose::STANDARD.encode(update);
+        let update_b64 = base64::engine::general_purpose::STANDARD.encode(released.as_deref().unwrap_or(update));
         for kind in kinds {
             for event in index_events_for(&kind) {
                 self.enqueue_index_event(store_id, event).await;
@@ -2549,7 +2635,7 @@ impl RpcHandler {
         };
         let handler = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(REPAIR_DEBOUNCE).await;
+            tokio::time::sleep(handler.repairs.debounce(store_id)).await;
             let still_current = handler.repairs.generation.lock().unwrap().get(&store_id).copied() == Some(generation);
             if still_current {
                 handler.repair_store_tree(store_id).await;
@@ -2585,6 +2671,28 @@ impl RpcHandler {
             warn!("Failed to flush store {} after tree repair: {}", store_id, e);
         }
         info!("Repaired tree for store {}: {} document(s) touched", store_id, repair.touched.len());
+
+        let looping = self.repairs.note(store_id, &repair.node_ids());
+        if !looping.is_empty() {
+            let resend = {
+                let manager = self.store_manager.read().await;
+                let lists: HashSet<NodeId> = looping.iter().copied().collect();
+                let mut ids = looping.clone();
+                if let Ok(tree) = manager.tree(store_id) {
+                    ids.extend(tree.documents_under(&lists));
+                }
+                ids
+            };
+            warn!(
+                "Tree repair for store {} keeps rewriting the list of {}: another device holds a different state of what is in it and undoes each repair. Sending {} document(s) out again whole, and repairing this store at most every {} s for the next {} minutes",
+                store_id,
+                looping.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+                resend.len(),
+                LOOP_DEBOUNCE.as_secs(),
+                LOOP_WINDOW.as_secs() / 60
+            );
+            self.share_command(store_id, crate::share::ShareCommand::Resend(resend)).await;
+        }
 
         // `source_client_id: None`, like any change with no single originating
         // client, so a sync link forwards it rather than treating it as its
@@ -3317,7 +3425,7 @@ impl PimbleApiServer for RpcHandler {
     }
 
     async fn server_info(&self) -> Result<pimble_rpc::types::ServerInfoResponse, ErrorObjectOwned> {
-        Ok(pimble_rpc::types::ServerInfoResponse { version: self.version.to_string(), hands_over: self.hands_over })
+        Ok(pimble_rpc::types::ServerInfoResponse { version: self.version.to_string(), hands_over: self.hands_over, host: crate::local::host_kind().to_string() })
     }
 
     async fn hand_over(&self, ext: &Extensions) -> Result<EmptyResponse, ErrorObjectOwned> {

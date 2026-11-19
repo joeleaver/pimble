@@ -99,6 +99,28 @@ pub fn advance_state_vector(known: &[u8], update: &[u8]) -> Result<Vec<u8>> {
     Ok(known.encode_v1())
 }
 
+/// Whether `update` continues from `known` for every client it carries (its
+/// lowest clock per client is not beyond the known one): `false` means a gap,
+/// structs the peer at `known` lacks before the update's own.
+pub fn continues_from(known: &[u8], update: &[u8]) -> Result<bool> {
+    let known = yrs::StateVector::decode_v1(known).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let lower = update.state_vector_lower();
+    Ok(lower.iter().all(|(client, clock)| *clock <= known.get(client)))
+}
+
+/// A v1 state vector for a log line: `client 5596…945 from 129, …`.
+pub fn describe_state_vector(state_vector: &[u8]) -> String {
+    match yrs::StateVector::decode_v1(state_vector) {
+        Ok(sv) => {
+            let mut parts: Vec<String> = sv.iter().map(|(client, clock)| format!("client {client} from {clock}")).collect();
+            parts.sort();
+            if parts.is_empty() { "nothing".to_string() } else { parts.join(", ") }
+        }
+        Err(_) => "an unreadable state vector".to_string(),
+    }
+}
+
 /// Whether `local` holds a struct that `known` does not, both v1-encoded.
 /// Deletions do not move a state vector, so `false` is not proof that the peer
 /// lacks nothing; callers that may have deleted while disconnected track that
