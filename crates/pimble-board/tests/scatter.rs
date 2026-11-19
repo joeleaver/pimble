@@ -401,7 +401,23 @@ fn twenty_five_thousand_placements_are_one_small_element() {
         bytes as f64 / n as f64,
         scatter::sprite_bytes() / 1024
     );
-    assert!(fitted_px.chunks_exact(4).filter(|p| is_green([p[0], p[1], p[2], p[3]])).count() > 10_000, "the forest shows fitted");
+    // Fitted, the smallest trees are dots of the tree's mean color over the
+    // pixels they cover (`scatter::SPLAT_PX`): green, lighter than a crown.
+    let greenish = |p: &[u8]| p[1] as i32 > p[0] as i32 + 20 && p[1] as i32 > p[2] as i32 + 20;
+    assert!(fitted_px.chunks_exact(4).filter(|p| greenish(p)).count() > 100_000, "the forest shows fitted");
     assert!(part_px.chunks_exact(4).filter(|p| is_green([p[0], p[1], p[2], p[3]])).count() > 50_000, "and close up");
     assert!(scatter::sprite_bytes() <= scatter::SPRITE_BUDGET);
+}
+
+#[test]
+fn far_off_a_placement_is_a_dot_of_its_mean_color() {
+    let (board, _, _, instance) = tree_symbol();
+    let snap = board.snapshot();
+    // 0.08 pixels a unit: the 20 x 25 tree is 1.6 x 2 pixels, under SPLAT_PX.
+    let view = View::new(100.0 - 50.0 / 0.08, 97.5 - 50.0 / 0.08, 0.08);
+    let px = pixels(&snap, view, 100, 100);
+    let lit: Vec<[u8; 4]> = px.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).filter(|p| *p != WHITE).collect();
+    assert!((1..=9).contains(&lit.len()), "a few pixels: {lit:?}");
+    assert!(lit.iter().all(|p| p[1] > p[0] && p[1] > p[2]), "greenish: {lit:?}");
+    let _ = instance;
 }

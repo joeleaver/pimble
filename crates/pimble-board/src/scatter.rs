@@ -46,6 +46,10 @@ pub const MAX_PLACEMENTS: usize = 100_000;
 /// A placement drawn larger than this many pixels across is drawn as
 /// vectors rather than from a sprite.
 pub const DIRECT_PX: f32 = 384.0;
+/// A placement smaller than this many pixels across is drawn as a dot of the
+/// symbol's mean color spread over the pixels it covers (a forest seen from
+/// far off), not from a sprite: a few pixel writes instead of a draw.
+pub const SPLAT_PX: f32 = 3.0;
 /// The sprite cache's budget, bytes (shared by every canvas in the process).
 pub const SPRITE_BUDGET: usize = 64 << 20;
 /// The largest scale a placement stores.
@@ -181,6 +185,9 @@ pub struct SymbolDef {
     /// The pictures it shows (a sprite drawn while one is missing is not
     /// kept).
     pub pictures: Vec<String>,
+    /// Its mean color over its bounds, premultiplied, 0 to 1 (what a
+    /// placement smaller than [`SPLAT_PX`] is drawn as), worked out once.
+    mean: OnceLock<[f32; 4]>,
 }
 
 impl SymbolDef {
@@ -198,7 +205,7 @@ impl SymbolDef {
                 pictures.push(p.src.clone());
             }
         }
-        SymbolDef { id, name, created_at, author, elements, bounds: bounds.filter(|b| b.is_finite()), hash: h.finish(), pictures }
+        SymbolDef { id, name, created_at, author, elements, bounds: bounds.filter(|b| b.is_finite()), hash: h.finish(), pictures, mean: OnceLock::new() }
     }
 
     /// The symbol as stored (what copying a scatter to another canvas
@@ -391,6 +398,68 @@ fn sprite(def: &SymbolDef, b: &Rect, k: f32, tints: &[Color], pictures: &dyn Pic
     Some(pixmap)
 }
 
+/// The mean color of `def` over `b`, premultiplied 0 to 1: drawn at 32 x 32
+/// stretched over its bounds and averaged.
+fn mean_of(def: &SymbolDef, b: &Rect, pictures: &dyn PictureSource) -> [f32; 4] {
+    const N: u32 = 32;
+    let Some(mut pixmap) = Pixmap::new(N, N) else { return [0.0; 4] };
+    let ts = Affine::from_scale(N as f32 / b.w.max(1e-3), N as f32 / b.h.max(1e-3)).pre_translate(-b.x, -b.y);
+    for e in &def.elements {
+        crate::render::draw_element(&mut pixmap, e, pictures, ts, b);
+    }
+    let mut acc = [0f64; 4];
+    for px in pixmap.pixels() {
+        acc[0] += px.red() as f64;
+        acc[1] += px.green() as f64;
+        acc[2] += px.blue() as f64;
+        acc[3] += px.alpha() as f64;
+    }
+    let n = (N * N) as f64 * 255.0;
+    [(acc[0] / n) as f32, (acc[1] / n) as f32, (acc[2] / n) as f32, (acc[3] / n) as f32]
+}
+
+/// A premultiplied mean color with `tints` applied as [`tint_pixels`] does.
+fn tinted_mean(mut m: [f32; 4], tints: &[Color]) -> [f32; 4] {
+    for tint in tints.iter().filter(|t| t.a > 0) {
+        let t = tint.a as f32 / 255.0;
+        for (c, to) in [(0, tint.r), (1, tint.g), (2, tint.b)] {
+            let target = to as f32 / 255.0 * m[3];
+            m[c] += (target - m[c]) * t;
+        }
+    }
+    m
+}
+
+/// A tiny placement: color `m` (premultiplied, per unit of area) spread
+/// over the device box centered on (`cx`, `cy`), `hw` by `hh` half-sizes,
+/// each pixel taking its share of the area, source-over.
+fn splat(pixmap: &mut Pixmap, (cx, cy): (f32, f32), hw: f32, hh: f32, m: [f32; 4], opacity: f32) {
+    let (w, h) = (pixmap.width() as i64, pixmap.height() as i64);
+    let (x0, x1, y0, y1) = (cx - hw, cx + hw, cy - hh, cy + hh);
+    let (px0, px1) = ((x0.floor() as i64).max(0), (x1.ceil() as i64).min(w));
+    let (py0, py1) = ((y0.floor() as i64).max(0), (y1.ceil() as i64).min(h));
+    let pixels = pixmap.pixels_mut();
+    for py in py0..py1 {
+        let oy = (y1.min(py as f32 + 1.0) - y0.max(py as f32)).max(0.0);
+        for px in px0..px1 {
+            let ox = (x1.min(px as f32 + 1.0) - x0.max(px as f32)).max(0.0);
+            let k = (ox * oy * opacity).min(1.0);
+            if k <= 0.0 {
+                continue;
+            }
+            let a = (m[3] * k).min(1.0);
+            let dst = &mut pixels[(py * w + px) as usize];
+            let keep = 1.0 - a;
+            let ch = |s: f32, d: u8| ((s * k).min(1.0) * 255.0 + d as f32 * keep).round().clamp(0.0, 255.0) as u8;
+            let (r, g, bl) = (ch(m[0], dst.red()), ch(m[1], dst.green()), ch(m[2], dst.blue()));
+            let al = (a * 255.0 + dst.alpha() as f32 * keep).round().clamp(0.0, 255.0) as u8;
+            if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(r.min(al), g.min(al), bl.min(al), al) {
+                *dst = p;
+            }
+        }
+    }
+}
+
 /// Draw one placed symbol through `t` (symbol space to pixels).
 #[allow(clippy::too_many_arguments)]
 fn draw_instance(pixmap: &mut Pixmap, def: &SymbolDef, b: &Rect, t: Affine, tints: (Color, Color), opacity: f32, pictures: &dyn PictureSource, cacheable: bool) {
@@ -400,6 +469,16 @@ fn draw_instance(pixmap: &mut Pixmap, def: &SymbolDef, b: &Rect, t: Affine, tint
     }
     let across = k * b.w.max(b.h);
     let tint_list = [tints.0, tints.1];
+    if across < SPLAT_PX {
+        let mean = if cacheable { *def.mean.get_or_init(|| mean_of(def, b, pictures)) } else { mean_of(def, b, pictures) };
+        let c = b.center();
+        let mut pt = [tiny_skia::Point::from_xy(c.x, c.y)];
+        t.map_points(&mut pt);
+        // The box's area kept as it turns (a dot has no direction).
+        let (hw, hh) = (k * b.w / 2.0, k * b.h / 2.0);
+        splat(pixmap, (pt[0].x, pt[0].y), hw, hh, tinted_mean(mean, &tint_list), opacity);
+        return;
+    }
     if across > DIRECT_PX {
         // Big on the screen: drawn as vectors, into a buffer when it needs
         // tinting or fading.
@@ -496,6 +575,21 @@ pub(crate) fn hits(e: &Element, q: Point, tol: f32) -> bool {
         }
     }
     false
+}
+
+/// Symbol `def` drawn into a `size` x `size` picture (a picker's
+/// thumbnail), fitted with a pixel to spare; `None` when it draws nothing.
+pub fn thumbnail(def: &SymbolDef, size: u32, pictures: &dyn PictureSource) -> Option<crate::render::RgbaImage> {
+    let b = def.bounds?;
+    let size = size.max(4);
+    let k = (size as f32 - 2.0) / b.w.max(b.h).max(1e-3);
+    let mut pixmap = Pixmap::new(size, size)?;
+    let c = b.center();
+    let t = Affine::from_translate(size as f32 / 2.0, size as f32 / 2.0).pre_scale(k, k).pre_translate(-c.x, -c.y);
+    for e in &def.elements {
+        crate::render::draw_element(&mut pixmap, e, pictures, t, &b);
+    }
+    Some(crate::render::RgbaImage::from_pixmap(pixmap))
 }
 
 // ── Making placements: the stamp brush and the region fill ────────────────
@@ -628,6 +722,13 @@ pub struct StampWalker {
 impl StampWalker {
     pub fn new(stamp: Stamp, seed: u64) -> Self {
         StampWalker { stamp, seed, count: 0, last: None, walked: 0.0 }
+    }
+
+    /// Continuing a scatter that holds `count` placements already: the next
+    /// is varied as its `count`th.
+    pub fn after(mut self, count: u64) -> Self {
+        self.count = count;
+        self
     }
 
     /// How many placements so far.
@@ -859,7 +960,8 @@ pub fn describe(e: &Element) -> String {
     }
 }
 
-fn count_text(n: usize, word: &str) -> String {
+/// "1,204 placements".
+pub fn count_text(n: usize, word: &str) -> String {
     let digits = n.to_string();
     let mut grouped = String::new();
     for (i, c) in digits.chars().enumerate() {

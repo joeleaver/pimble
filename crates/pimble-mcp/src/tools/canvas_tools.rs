@@ -2372,7 +2372,7 @@ fn symbols_text(snapshot: &BoardSnapshot) -> String {
         let placements: usize = used.iter().filter_map(|e| e.raw.scatter.as_ref()).map(|sc| sc.placements.len()).sum();
         let ids: Vec<String> = s.elements.iter().map(|e| format!("{} {}", e.raw.id, e.raw.kind)).collect();
         out.push_str(&format!(
-            "- symbol {} \"{}\": {} element{} ({}){}; {} scatter{}, {} placement{}\n",
+            "- symbol {} \"{}\": {} element{} ({}){}; {} scatter{}, {}\n",
             s.id,
             s.name,
             s.elements.len(),
@@ -2381,8 +2381,7 @@ fn symbols_text(snapshot: &BoardSnapshot) -> String {
             s.bounds.map(|b| format!(", {}", rect_text(&b))).unwrap_or_else(|| ", drawing nothing".into()),
             used.len(),
             if used.len() == 1 { "" } else { "s" },
-            placements,
-            if placements == 1 { "" } else { "s" },
+            pimble_board::scatter::count_text(placements, "placement"),
         ));
     }
     out
@@ -3737,10 +3736,9 @@ impl Pimble {
             })
             .await?;
         Ok(format!(
-            "{} {} placement{} of symbol \"{name}\" {} scatter {id} on {}.{}",
+            "{} {} of symbol \"{name}\" {} scatter {id} on {}.{}",
             if appended { "Appended" } else { "Placed" },
-            count,
-            if count == 1 { "" } else { "s" },
+            pimble_board::scatter::count_text(count, "placement"),
             if appended { "to" } else { "as" },
             target.what(),
             size_warning(doc_bytes)
