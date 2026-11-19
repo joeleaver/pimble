@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.1: zoomed-out paint is fast.** Paint tiles have a
+pyramid (docs/DRAWING_CONTRACT.md "The tile pyramid"): a view far out reads coarse tiles (its
+four children at half size, or pictures drawn straight when only pictures touch it), in memory
+and on disk. The wave 6 "Soft" canvas (a picture stretched over a county-sized paint layer)
+went from 8-14 s to 130-260 ms a zoom step in the app. Layer thumbnails drawn before their
+picture decoded are drawn again when it arrives. Still open: `export_canvas` on that canvas
+(62 s, a full-scale render), zoom-to-fit leaving handles behind, Will's edits, the 369-byte
+resend, tray mode.
+
 **2026-11-18 (session 78e7f30f): v0.28.0: drawing wave 6** (docs/DRAWING_WAVE6_CONTRACT.md,
 every part built). Clip masks on layers and groups; pictures placed, scaled and painted over in
 paint layers; map lettering (nine bundled Noto faces, halos, tracking, text on a path); symbols
