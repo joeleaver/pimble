@@ -1,0 +1,22 @@
+# Log lines in the shapes Pimble writes them, with made-up private details.
+# Each is scrubbed by tests/scrub_corpus.rs, which fails when the home folder,
+# an address, a known title or a secret survives. Add a line here whenever a
+# new log line can name a path, a person, a title or a credential.
+INFO pimble_store::local: Opened local store 'Garden Club' from "/home/tester/Dropbox/___Household/Garden Club.pimble"
+INFO pimble_server::handler: Opening store at "/home/tester/Dropbox/Garden Club.pimble"
+INFO pimble_store::vault: Opened vault store '' (1dacd405-1685-43fc-9730-d302dcc09a15) from "/home/tester/.local/share/pimble/relay/1dacd405-1685-43fc-9730-d302dcc09a15.pimble"
+INFO pimble_app::events: Cloud account: signed_in=true email=Some("tester.one@example.com")
+INFO pimble_server::handler: Signing in to Pimble Cloud at https://pimble.app as tester.one@example.com
+INFO pimble_server::share: Inviting friend+notes@example.org to share 280e81c4-8e99-4f62-a045-c14f5d056a9b of store 1dacd405-1685-43fc-9730-d302dcc09a15 as editor
+INFO pimble_server::share: Share 280e81c4-8e99-4f62-a045-c14f5d056a9b of store 1dacd405-1685-43fc-9730-d302dcc09a15: handed the key to friend+notes@example.org
+WARN pimble_server::share: Share 280e81c4-8e99-4f62-a045-c14f5d056a9b of store 1dacd405-1685-43fc-9730-d302dcc09a15: could not hand the key to friend+notes@example.org: timed out
+INFO pimble_server::handler: Removing friend+notes@example.org from share 280e81c4-8e99-4f62-a045-c14f5d056a9b of store 1dacd405-1685-43fc-9730-d302dcc09a15
+WARN pimble_server::handler: Search index open failed for store a224c35b-fb95-4af3-97eb-00616e881159 (index engine error: storage error: data directory is locked: /home/tester/Dropbox/Garden Club.pimble/index/rhypedb/LOCK is locked (held by pid 3819851 on host laptop)
+INFO hf_hub: Using token file found "/home/tester/.cache/huggingface/token"
+WARN pimble_app::commands: OpenStore { path: "/home/tester/Dropbox/Garden Club.pimble" } failed: The background task closed connection closed; restart required
+WARN pimble_import: A picture in "Secret Recipe" was left out: unsupported format
+INFO pimble_server::handler: Creating board attachment 'Secret Recipe' of node 2b56676b-a412-42be-b04f-74500ac473ee in store 1dacd405-1685-43fc-9730-d302dcc09a15
+DEBUG pimble_client: connecting to wss://pimble.app/rpc?access_token=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlc2lnbmF0dXJlc2ln
+DEBUG pimble_server::auth: request with Authorization: Bearer 3f9a8b7c6d5e4f30a1b2c3d4e5f60718293a4b5c
+DEBUG pimble_cloud: cookie pimble_session=9f8e7d6c5b4a39281706f5e4d3c2b1a0ffeeddcc
+WARN pimble_server::vault_link: Vault link for store 1dacd405-1685-43fc-9730-d302dcc09a15 to this computer's relay face dropped: minting a cloud token from https://pimble.app failed: cloud service at https://pimble.app/api/v1/token answered 502: bad gateway

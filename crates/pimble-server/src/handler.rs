@@ -4274,7 +4274,7 @@ impl PimbleApiServer for RpcHandler {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Comment)?;
         self.reject_if_vault(request.store_id).await?;
-        info!("Creating {} attachment '{}' of node {} in store {}", request.node_type, request.title, request.host_id, request.store_id);
+        info!("Creating {} attachment of node {} in store {}", request.node_type, request.host_id, request.store_id);
 
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;

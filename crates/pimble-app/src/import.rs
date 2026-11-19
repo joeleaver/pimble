@@ -374,7 +374,7 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
         match runner.run(BackendCommand::StorePicture { store_id, node_id, bytes: picture.bytes.clone() }).await {
             Some(BackendEvent::BlobStored { result: Ok(blob), .. }) => stored.push(Some(blob)),
             other => {
-                tracing::warn!("A picture in \"{}\" was left out: {}", item.title, unexpected(other));
+                tracing::warn!("A picture in note {:?} was left out: {}", node_id, unexpected(other));
                 stored.push(None);
             }
         }

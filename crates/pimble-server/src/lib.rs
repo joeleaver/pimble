@@ -15,6 +15,7 @@ pub mod handler;
 pub mod jwt;
 pub mod keystore;
 pub mod local;
+pub mod logs;
 pub mod memory;
 mod people;
 pub mod pictures;

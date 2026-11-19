@@ -1,6 +1,6 @@
 # Diagnostics for alpha testers (draft, 2026-11-19)
 
-Status: **decisions answered by Joe 2026-11-19** (section 7). Nothing here is built.
+Status: **decisions answered by Joe 2026-11-19** (section 7). Wave 1 built 2026-11-19 (section 8); waves 2 and 3 not started.
 
 Why: the "Shared with Will" faults of 2026-11-19 took hours to diagnose from one side only.
 Joe's journal showed the symptoms (a repair storm, edits held back), and the cause was on
@@ -111,6 +111,11 @@ Diagnostics..." for when something goes wrong.
 ## 8. Waves
 
 1. The log file everywhere (section 1) and the scrubber with its test. Local only.
+   **Built 2026-11-19**: `pimble_server::logs` (`open`, `LogWriter`; the app's `pimble.log`
+   and an MCP-run server's `server.log`, each `.previous.log` and, past 20 MB, `.older.log`),
+   `pimble_core::diagnostics::Scrubber` (home to `~`, emails, secrets by shape, known titles),
+   `crates/pimble-core/tests/fixtures/log_lines.corpus` with `tests/scrub_corpus.rs`. The four
+   log lines that printed a note's title name it by id now.
 2. The queue, the uploader, `system`/`log`/`stores`/`panic`/`previous_run`, the server,
    `tools/diagnostics.sh`; the notice and the switch.
 3. "Send Diagnostics..." in both apps; the browser's records.

@@ -297,58 +297,13 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
     ))
 }
 
-/// The log of a server that a program without a log of its own runs:
-/// `pimble-mcp`'s standard error goes to the chat that started it, where
-/// nobody reads it, so from the moment it starts the local server its log
-/// is also written to `<data dir>/pimble/logs/server.log` (the last one's
-/// kept beside it as `server.previous.log`). The app logs where it always
-/// has. (2026-11-19: a day of sharing ran in a `pimble-mcp` and left no
-/// trace anywhere.)
-static SERVER_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
-
-/// Where an MCP-run server's log goes.
-pub fn server_log_path() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("pimble").join("logs").join("server.log"))
-}
-
+/// A server `pimble-mcp` runs logs to `server.log` from the moment it starts
+/// (docs/MCP_CONTRACT.md "Which server it talks to"): its standard error goes
+/// to the chat that started it, where nobody reads it. The app's own log
+/// (`pimble.log`) already holds its server's lines.
 fn start_server_log() {
-    if host_kind() == "app" {
-        return;
-    }
-    let Some(path) = server_log_path() else { return };
-    let mut log = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if log.is_some() {
-        return;
-    }
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-    let _ = std::fs::rename(&path, path.with_file_name("server.previous.log"));
-    *log = std::fs::File::create(&path).ok();
-}
-
-/// A `tracing_subscriber` writer: standard error always, and the server log
-/// once this process runs the local server.
-#[derive(Clone, Copy, Default)]
-pub struct LogWriter;
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(file) = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let _ = file.write_all(buf);
-        }
-        std::io::stderr().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(file) = SERVER_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let _ = file.flush();
-        }
-        std::io::stderr().flush()
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
-    type Writer = LogWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter
+    if host_kind() != "app" {
+        crate::logs::open("server");
     }
 }
 

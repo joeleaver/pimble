@@ -871,7 +871,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::NodeLoaded { store_id, node } => {
-                tracing::info!("Node loaded: {:?} - {}", node.id, node.metadata.title);
+                tracing::debug!("Node loaded: {:?}", node.id);
                 if take_node(store, *store_id, node) {
                     store.bump_tree_structure();
                 }
@@ -1393,7 +1393,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::Imported { store_id, parent_id, node_id, title, count } => {
-                tracing::info!("Imported {title} as {node_id:?} ({count} nodes)");
+                tracing::info!("Imported {node_id:?} ({count} nodes)");
                 let notes = if *count == 1 { "1 note".to_string() } else { format!("{count} notes") };
                 show_notice(store, format!("Imported \"{title}\" ({notes})."));
                 // The parent's list has a new entry: fetch it, and open the

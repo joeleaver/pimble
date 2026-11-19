@@ -6,6 +6,7 @@
 //! - `Workspace`: User's view into one or more stores
 
 pub mod blob;
+pub mod diagnostics;
 pub mod index_unit;
 pub mod link;
 pub mod node;
