@@ -232,6 +232,8 @@ pub fn controls_of(kind: &Kind) -> Controls {
         Kind::Sticky => Controls { fill: true, font: true, align: true, opacity: true, ..none },
         Kind::Step => Controls { stroke: true, font: true, opacity: true, ..none },
         Kind::Spotlight => Controls { opacity: true, ..none },
+        // A scatter: its opacity, and its symbol and tint (the stamp's row).
+        Kind::Scatter => Controls { opacity: true, ..none },
         Kind::Frame | Kind::Picture | Kind::Group | Kind::Card | Kind::Other(_) => none,
     }
 }
@@ -1562,6 +1564,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Path => "Path",
         Kind::Polygon => "Polygon",
         Kind::Star => "Star",
+        Kind::Scatter => "Scatter",
         Kind::Other(_) => "Element",
     }
 }

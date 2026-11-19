@@ -119,6 +119,8 @@ pub(crate) mod keys {
     /// A layer's or group's clip: the id of a closed element
     /// (docs/DRAWING_WAVE6_CONTRACT.md section 1, [`crate::clip`]).
     pub const LAYER_CLIP: &str = "clip";
+    /// A scatter's symbol id (docs/DRAWING_WAVE6_CONTRACT.md section 2).
+    pub const SYMBOL: &str = "symbol";
 }
 
 /// The prefix of an element's or layer's named fields (see the module doc).
@@ -218,6 +220,14 @@ impl<R> Edited<R> {
         let Edited { result, update } = self;
         result.map(|r| (r, update))
     }
+}
+
+/// What [`BoardTxn::make_symbol`] made: the symbol, and the scatter that
+/// replaced the elements (none when they were kept).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MadeSymbol {
+    pub symbol: String,
+    pub instance: Option<String>,
 }
 
 /// Where a board lives in a yrs document, and the origin its writes carry.
@@ -711,44 +721,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
         }
         for e in &raw.elements {
-            let map: MapRef = elements.insert(self.txn, e.id.clone(), MapPrelim::default());
-            map.insert(self.txn, LAYER, e.layer.clone());
-            map.insert(self.txn, ORDER, e.order.clone());
-            if let Some(parent) = &e.parent {
-                map.insert(self.txn, PARENT, parent.clone());
+            write_raw_element(self.txn, &elements, e);
+        }
+        if let Some(board) = self.board.clone() {
+            for sym in &raw.symbols {
+                write_raw_symbol(self.txn, &board, sym);
             }
-            map.insert(self.txn, KIND, e.kind.as_str().to_string());
-            match &e.geom {
-                Geom::Stroke => {
-                    let array: ArrayRef = map.insert(self.txn, GEOM, ArrayPrelim::default());
-                    if !e.points.is_empty() {
-                        array.push_back(self.txn, Any::Buffer(pack_points(&e.points).into()));
-                    }
-                }
-                geom => {
-                    map.insert(self.txn, GEOM, geom_any(geom));
-                }
-            }
-            if let Some(text) = &e.text {
-                map.insert(self.txn, TEXT, TextPrelim::new(text.clone()));
-            }
-            let style: MapRef = map.insert(self.txn, STYLE, MapPrelim::default());
-            write_style(self.txn, &style, &e.style);
-            if !e.transform.is_identity() {
-                map.insert(self.txn, TRANSFORM, transform_any(&e.transform));
-            }
-            map.insert(self.txn, LOCKED, e.locked);
-            if let Some(author) = &e.author {
-                map.insert(self.txn, AUTHOR, author_any(author));
-            }
-            map.insert(self.txn, CREATED_AT, e.created_at.clone());
-            if let Some(by) = &e.edited_by {
-                map.insert(self.txn, EDITED_BY, author_any(by));
-            }
-            if let Some(at) = &e.edited_at {
-                map.insert(self.txn, EDITED_AT, at.clone());
-            }
-            copy_meaning(self.txn, &map, e.note.as_deref(), &e.fields);
         }
         if let Some(board) = self.board.clone() {
             for op in &raw.paint {
@@ -1343,8 +1321,36 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     fn element(&self, id: &str) -> Result<MapRef> {
         match self.elements()?.get(self.txn, id) {
             Some(Out::YMap(map)) => Ok(map),
-            _ => Err(BoardError::NoElement(id.to_string())),
+            _ => self.symbol_member(id).map(|(map, _)| map).ok_or_else(|| BoardError::NoElement(id.to_string())),
         }
+    }
+
+    /// Element `id` of a symbol's definition, with that symbol's `elements`
+    /// map (docs/DRAWING_WAVE6_CONTRACT.md section 2).
+    fn symbol_member(&self, id: &str) -> Option<(MapRef, MapRef)> {
+        let board = self.board.clone()?;
+        board.iter(self.txn).find_map(|(key, out)| {
+            let Out::YMap(sym) = out else { return None };
+            if !key.starts_with(crate::scatter::SYMBOL_PREFIX) {
+                return None;
+            }
+            let Some(Out::YMap(els)) = sym.get(self.txn, ELEMENTS) else { return None };
+            match els.get(self.txn, id) {
+                Some(Out::YMap(map)) => Some((map, els)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Remove element `id` from wherever it is (the board or a symbol).
+    fn remove_element(&mut self, id: &str) -> Result<()> {
+        let elements = self.elements()?;
+        if elements.remove(self.txn, id).is_none() {
+            if let Some((_, els)) = self.symbol_member(id) {
+                els.remove(self.txn, id);
+            }
+        }
+        Ok(())
     }
 
     /// Element `id` for an edit the lock guards: refused when it or the
@@ -1356,8 +1362,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     }
 
     fn judge_element(&self, id: &str, map: &MapRef) -> Result<()> {
-        let layer = self.drawn_in(map)?;
         let element_locked = bool_of(map.get(self.txn, LOCKED)).unwrap_or(false);
+        // A symbol's member is in no layer: only its own lock guards it.
+        if map.get(self.txn, LAYER).is_none() {
+            return crate::locks::judge_element(id, element_locked, None);
+        }
+        let layer = self.drawn_in(map)?;
         crate::locks::judge_element(id, element_locked, self.locked_layer(&layer)?)
     }
 
@@ -1398,29 +1408,56 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// elements), at `element.placement` (on top when `None`), stamped
     /// `author` and `created_at`.
     pub fn add_element(&mut self, element: NewElement) -> Result<String> {
+        // Into a symbol's definition (what a tool draws while the symbol is
+        // being edited, docs/DRAWING_WAVE6_CONTRACT.md section 2).
+        if let Some(symbol) = element.layer.as_deref().and_then(|l| l.strip_prefix(crate::scatter::SYMBOL_PREFIX)) {
+            let symbol = symbol.to_string();
+            return self.add_to_symbol(&symbol, element);
+        }
+        if element.kind == Kind::Scatter {
+            let symbol = element.scatter.as_ref().map(|s| s.symbol.clone()).ok_or_else(|| BoardError::Invalid("a scatter needs its symbol and placements".into()))?;
+            self.symbol_map(&symbol)?;
+        }
         let layer = self.layer_for_new(element.layer.as_deref())?;
         if element.kind.is_stroke() != matches!(element.geom, Geom::Stroke) {
             return Err(BoardError::Invalid(format!("a {} takes {}", element.kind, if element.kind.is_stroke() { "stroke geometry" } else { "geometry of its own" })));
         }
         judge_geom(&element.kind, &element.geom)?;
-        let key = match &element.placement {
+        if (element.kind == Kind::Scatter) != matches!(element.geom, Geom::Scatter) {
+            return Err(BoardError::Invalid(format!("a {} does not take that geometry", element.kind)));
+        }
+        let key = self.order_for_new(&layer, element.placement.as_ref())?;
+        let elements = self.elements()?;
+        Ok(self.insert_element(&elements, Some(&layer), key, &element))
+    }
+
+    /// The order key of something new on top of (or at `placement` in)
+    /// `layer`.
+    fn order_for_new(&mut self, layer: &str, placement: Option<&Placement>) -> Result<String> {
+        Ok(match placement {
             None | Some(Placement::Top) => {
-                let top = self.top_order(&layer)?;
+                let top = self.top_order(layer)?;
                 let key = order::after(top.as_deref());
-                self.tops.insert(layer.clone(), Some(key.clone()));
+                self.tops.insert(layer.to_string(), Some(key.clone()));
                 key
             }
             Some(placement) => {
-                let orders = self.element_orders(&layer)?;
+                let orders = self.element_orders(layer)?;
                 let key = place(&orders, None, placement)?;
-                self.tops.remove(&layer);
+                self.tops.remove(layer);
                 key
             }
-        };
+        })
+    }
+
+    /// Write `element` as a new entry of `elements`, in `layer` (none: a
+    /// symbol's member); answers its id.
+    fn insert_element(&mut self, elements: &MapRef, layer: Option<&str>, key: String, element: &NewElement) -> String {
         let id = new_id();
-        let elements = self.elements()?;
         let map: MapRef = elements.insert(self.txn, id.clone(), MapPrelim::default());
-        map.insert(self.txn, LAYER, layer);
+        if let Some(layer) = layer {
+            map.insert(self.txn, LAYER, layer.to_string());
+        }
         map.insert(self.txn, ORDER, key);
         if let Some(parent) = &element.parent {
             map.insert(self.txn, PARENT, parent.clone());
@@ -1431,6 +1468,15 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 let array: ArrayRef = map.insert(self.txn, GEOM, ArrayPrelim::default());
                 if !element.points.is_empty() {
                     array.push_back(self.txn, Any::Buffer(pack_points(&element.points).into()));
+                }
+            }
+            Geom::Scatter => {
+                let array: ArrayRef = map.insert(self.txn, GEOM, ArrayPrelim::default());
+                if let Some(sc) = &element.scatter {
+                    map.insert(self.txn, SYMBOL, sc.symbol.clone());
+                    for range in sc.chunks() {
+                        array.push_back(self.txn, Any::Buffer(crate::scatter::pack(&sc.placements[range]).into()));
+                    }
                 }
             }
             geom => {
@@ -1452,7 +1498,278 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             map.insert(self.txn, AUTHOR, author_any(author));
         }
         map.insert(self.txn, CREATED_AT, self.stamp.now.to_string());
+        id
+    }
+
+    // ── Symbols and scatters (docs/DRAWING_WAVE6_CONTRACT.md section 2) ──
+
+    fn symbol_map(&self, symbol: &str) -> Result<MapRef> {
+        match self.board()?.get(self.txn, &crate::scatter::symbol_key(symbol)) {
+            Some(Out::YMap(map)) => Ok(map),
+            _ => Err(BoardError::Invalid(format!("This canvas has no symbol {symbol}."))),
+        }
+    }
+
+    fn symbol_elements(&self, symbol: &str) -> Result<MapRef> {
+        match self.symbol_map(symbol)?.get(self.txn, ELEMENTS) {
+            Some(Out::YMap(map)) => Ok(map),
+            _ => Err(BoardError::Invalid(format!("This canvas has no symbol {symbol}."))),
+        }
+    }
+
+    /// A new, empty symbol named `name` ("Symbol N" when empty); answers its
+    /// id. Its key and its `elements` map are made together, in this
+    /// transaction.
+    pub fn create_symbol(&mut self, name: &str) -> Result<String> {
+        let board = self.board()?;
+        let name = match name.trim() {
+            "" => {
+                let taken: HashSet<String> = read_symbols(self.txn, &board).into_iter().map(|s| s.name).collect();
+                (1..).map(|n| format!("Symbol {n}")).find(|n| !taken.contains(n)).unwrap_or_default()
+            }
+            n => n.to_string(),
+        };
+        let id = new_id();
+        let map: MapRef = board.insert(self.txn, crate::scatter::symbol_key(&id), MapPrelim::default());
+        map.insert(self.txn, NAME, name);
+        map.insert(self.txn, CREATED_AT, self.stamp.now.to_string());
+        if let Some(author) = self.stamp.author {
+            map.insert(self.txn, AUTHOR, author_any(author));
+        }
+        map.insert(self.txn, ELEMENTS, MapPrelim::default());
         Ok(id)
+    }
+
+    /// Symbol `sym` (read from another canvas) written here under its own
+    /// id, unless this canvas has it already: what copying a scatter
+    /// between canvases brings along. Answers whether it was written.
+    pub fn adopt_symbol(&mut self, sym: &crate::scatter::RawSymbol) -> Result<bool> {
+        if self.symbol_map(&sym.id).is_ok() {
+            return Ok(false);
+        }
+        let board = self.board()?;
+        write_raw_symbol(self.txn, &board, sym);
+        Ok(true)
+    }
+
+    pub fn rename_symbol(&mut self, symbol: &str, name: &str) -> Result<()> {
+        let map = self.symbol_map(symbol)?;
+        if name.trim().is_empty() {
+            return Err(BoardError::Invalid("A symbol needs a name.".into()));
+        }
+        map.insert(self.txn, NAME, name.trim().to_string());
+        Ok(())
+    }
+
+    /// Delete a symbol's definition: the scatters naming it draw nothing
+    /// (and draw again if undo brings it back).
+    pub fn delete_symbol(&mut self, symbol: &str) -> Result<()> {
+        self.symbol_map(symbol)?;
+        self.board()?.remove(self.txn, &crate::scatter::symbol_key(symbol));
+        Ok(())
+    }
+
+    /// Add `element` to symbol `symbol`'s definition (symbol space), on top.
+    fn add_to_symbol(&mut self, symbol: &str, element: NewElement) -> Result<String> {
+        if matches!(element.kind, Kind::Scatter | Kind::Connector | Kind::Card | Kind::Spotlight) {
+            return Err(BoardError::Invalid(crate::scatter::SCATTER_IN_SYMBOL.into()));
+        }
+        if element.kind.is_stroke() != matches!(element.geom, Geom::Stroke) {
+            return Err(BoardError::Invalid(format!("a {} takes {}", element.kind, if element.kind.is_stroke() { "stroke geometry" } else { "geometry of its own" })));
+        }
+        judge_geom(&element.kind, &element.geom)?;
+        let els = self.symbol_elements(symbol)?;
+        let top = els
+            .iter(self.txn)
+            .filter_map(|(_, out)| match out {
+                Out::YMap(m) => string_of(m.get(self.txn, ORDER)),
+                _ => None,
+            })
+            .max();
+        let key = order::after(top.as_deref());
+        Ok(self.insert_element(&els, None, key, &element))
+    }
+
+    /// A new scatter of `symbol` with `placements` (in board units), in
+    /// `layer` (the top layer that takes elements when `None`), with an
+    /// optional tint over all of it; answers its id. One chunk per
+    /// [`crate::scatter::CHUNK_PLACEMENTS`].
+    pub fn add_scatter(&mut self, layer: Option<&str>, symbol: &str, placements: &[crate::scatter::Placement], tint: Option<Color>) -> Result<String> {
+        self.symbol_map(symbol)?;
+        if placements.len() > crate::scatter::MAX_PLACEMENTS {
+            return Err(BoardError::Invalid(crate::scatter::TOO_MANY.into()));
+        }
+        let layer = self.layer_for_new(layer)?;
+        let key = self.order_for_new(&layer, None)?;
+        let mut element = NewElement::new(Kind::Scatter, Geom::Scatter).with_scatter(Some(Arc::new(crate::scatter::RawScatter::of(symbol, placements))));
+        element.style.tint = tint;
+        let elements = self.elements()?;
+        Ok(self.insert_element(&elements, Some(&layer), key, &element))
+    }
+
+    /// Append placements to scatter `id` (a stamp stroke growing): one
+    /// chunk per [`crate::scatter::CHUNK_PLACEMENTS`]. Like a stroke's
+    /// points, appending does not stamp `edited_by`.
+    pub fn append_placements(&mut self, id: &str, placements: &[crate::scatter::Placement]) -> Result<()> {
+        let map = self.editable(id)?;
+        let array = match (string_of(map.get(self.txn, KIND)).as_deref(), map.get(self.txn, GEOM)) {
+            (Some("scatter"), Some(Out::YArray(array))) => array,
+            _ => return Err(BoardError::Invalid(format!("element {id} is not a scatter"))),
+        };
+        let have: usize = array
+            .iter(self.txn)
+            .map(|c| match c {
+                Out::Any(Any::Buffer(b)) => b.len() / crate::scatter::PLACEMENT_BYTES,
+                _ => 0,
+            })
+            .sum();
+        if have + placements.len() > crate::scatter::MAX_PLACEMENTS {
+            return Err(BoardError::Invalid(crate::scatter::TOO_MANY.into()));
+        }
+        for chunk in crate::scatter::chunked(placements) {
+            array.push_back(self.txn, Any::Buffer(crate::scatter::pack(chunk).into()));
+        }
+        Ok(())
+    }
+
+    /// Scatter `id` draws symbol `symbol` from now on.
+    pub fn set_scatter_symbol(&mut self, id: &str, symbol: &str) -> Result<()> {
+        let map = self.editable(id)?;
+        if string_of(map.get(self.txn, KIND)).as_deref() != Some("scatter") {
+            return Err(BoardError::Invalid(format!("element {id} is not a scatter")));
+        }
+        self.symbol_map(symbol)?;
+        map.insert(self.txn, SYMBOL, symbol.to_string());
+        self.stamp_element(&map);
+        Ok(())
+    }
+
+    /// Make a symbol of elements `ids` (with their groups' and frames'
+    /// members), in this one transaction (one undo). Their copies become the
+    /// symbol's definition, in symbol space: (0, 0) is the middle of what
+    /// they cover. Unless `keep`, the elements are deleted and replaced by
+    /// one scatter with one placement where they were, in the layer of the
+    /// topmost, so the canvas looks the same; with `keep` they stay and
+    /// nothing else is added. Refused, writing nothing: no ids, an id that
+    /// names nothing, a locked element (unless `keep`), a scatter,
+    /// connector, node card or spotlight among them.
+    pub fn make_symbol(&mut self, ids: &[String], name: &str, keep: bool) -> Result<MadeSymbol> {
+        let snapshot = self.snapshot_now()?;
+        let mut chosen: Vec<usize> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<String> = ids.to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let e = snapshot.get(&id).ok_or_else(|| BoardError::NoElement(id.clone()))?;
+            if matches!(e.raw.kind, Kind::Scatter | Kind::Connector | Kind::Card | Kind::Spotlight) {
+                return Err(BoardError::Invalid(crate::scatter::SCATTER_IN_SYMBOL.into()));
+            }
+            if !keep {
+                let map = self.element(&id)?;
+                self.judge_element(&id, &map)?;
+            }
+            chosen.push(snapshot.elements.iter().position(|x| x.raw.id == id).unwrap_or(0));
+            for m in &snapshot.elements {
+                if m.parent.as_deref() == Some(id.as_str()) {
+                    stack.push(m.raw.id.clone());
+                }
+            }
+        }
+        if chosen.is_empty() {
+            return Err(BoardError::Invalid(crate::scatter::NO_SYMBOL_ELEMENTS.into()));
+        }
+        chosen.sort_unstable();
+        // What the top-level ones cover.
+        let in_set: HashSet<&str> = chosen.iter().map(|i| snapshot.elements[*i].raw.id.as_str()).collect();
+        let tops: Vec<usize> = chosen.iter().copied().filter(|i| snapshot.elements[*i].parent.as_deref().is_none_or(|p| !in_set.contains(p))).collect();
+        let bounds = tops
+            .iter()
+            .map(|i| &snapshot.elements[*i])
+            .filter(|e| e.has_extent)
+            .map(|e| e.bounds)
+            .reduce(|a, b| a.union(&b))
+            .ok_or_else(|| BoardError::Invalid(crate::scatter::NO_SYMBOL_ELEMENTS.into()))?;
+        let c = bounds.center();
+        let symbol = self.create_symbol(name)?;
+        let els = self.symbol_elements(&symbol)?;
+        let fresh: HashMap<String, String> = chosen.iter().map(|i| (snapshot.elements[*i].raw.id.clone(), new_id())).collect();
+        for (k, i) in chosen.iter().enumerate() {
+            let e = &snapshot.elements[*i];
+            let mut raw = e.raw.clone();
+            raw.id = fresh[&raw.id].clone();
+            raw.layer = String::new();
+            raw.order = format!("a{k:06}");
+            raw.locked = false;
+            let top = tops.contains(i);
+            raw.parent = if top { None } else { e.parent.as_ref().and_then(|p| fresh.get(p)).cloned() };
+            if top {
+                // A member of something left out is placed as it was drawn.
+                let world = e.world;
+                let mut t = raw.transform;
+                if e.parent.is_some() && !world.is_identity() {
+                    let pivot = e.pivot_bounds;
+                    let own = crate::snapshot::own_affine(&t, pivot);
+                    let parent = world.pre_concat(own.invert().unwrap_or_default());
+                    t.tx += parent.tx;
+                    t.ty += parent.ty;
+                }
+                t.tx -= c.x;
+                t.ty -= c.y;
+                raw.transform = t;
+            }
+            raw.style.along = raw.style.along.as_ref().and_then(|a| fresh.get(a)).cloned();
+            write_raw_element(self.txn, &els, &raw);
+        }
+        if keep {
+            return Ok(MadeSymbol { symbol, instance: None });
+        }
+        let top = &snapshot.elements[*tops.last().expect("one top")];
+        let layer = top.layer.clone();
+        let deleted: Vec<String> = chosen.iter().map(|i| snapshot.elements[*i].raw.id.clone()).collect();
+        for id in &deleted {
+            self.remove_element(id)?;
+        }
+        self.tops.remove(&layer);
+        // Where the topmost of them was in the drawing order.
+        let key = top.raw.order.clone();
+        let instance = self.add_scatter_in(&layer, key, &symbol, &[crate::scatter::Placement::at(c.x, c.y)])?;
+        Ok(MadeSymbol { symbol, instance: Some(instance) })
+    }
+
+    /// [`BoardTxn::add_scatter`] into `layer` as it is (the layer the
+    /// elements it replaces were in, locked or not).
+    fn add_scatter_in(&mut self, layer: &str, key: String, symbol: &str, placements: &[crate::scatter::Placement]) -> Result<String> {
+        let element = NewElement::new(Kind::Scatter, Geom::Scatter).with_scatter(Some(Arc::new(crate::scatter::RawScatter::of(symbol, placements))));
+        let elements = self.elements()?;
+        Ok(self.insert_element(&elements, Some(layer), key, &element))
+    }
+
+    /// Fill closed element `shape` with placements of `symbol` ("Scatter in
+    /// Shape"): one new scatter just above the shape, in its layer (or in
+    /// `layer` when given). Refused with a sentence when the shape is not
+    /// closed, nothing fits, or too much would.
+    pub fn scatter_in_shape(&mut self, shape: &str, symbol: &str, fill: &crate::scatter::RegionFill, layer: Option<&str>) -> Result<String> {
+        let snapshot = self.snapshot_now()?;
+        let e = snapshot.get(shape).ok_or_else(|| BoardError::NoElement(shape.to_string()))?;
+        let region = crate::clip::Clip::of(e).ok_or_else(|| BoardError::Invalid(crate::scatter::NEEDS_CLOSED_SHAPE.into()))?;
+        self.scatter_in_region(&region, symbol, fill, Some(layer.unwrap_or(&e.layer)), layer.is_none().then_some(shape)).map(|(id, _)| id)
+    }
+
+    /// Fill `region` (board units) with placements of `symbol`: a new
+    /// scatter in `layer` (the top layer that takes elements when `None`),
+    /// just above element `above` when given. Answers its id and how many
+    /// placements it holds.
+    pub fn scatter_in_region(&mut self, region: &crate::clip::Clip, symbol: &str, fill: &crate::scatter::RegionFill, layer: Option<&str>, above: Option<&str>) -> Result<(String, usize)> {
+        self.symbol_map(symbol)?;
+        let placements = crate::scatter::fill_region(region, fill).map_err(BoardError::Invalid)?;
+        let layer = self.layer_for_new(layer)?;
+        let placement = above.map(|a| Placement::Above(a.to_string()));
+        let key = self.order_for_new(&layer, placement.as_ref())?;
+        let element = NewElement::new(Kind::Scatter, Geom::Scatter).with_scatter(Some(Arc::new(crate::scatter::RawScatter::of(symbol, &placements))));
+        let elements = self.elements()?;
+        Ok((self.insert_element(&elements, Some(&layer), key, &element), placements.len()))
     }
 
     /// Append points (x, y, pressure) to a pen or highlighter stroke: one
@@ -2194,8 +2511,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// as having no parent. Refused when it is locked.
     pub fn delete_element(&mut self, id: &str) -> Result<()> {
         self.editable(id)?;
-        self.elements()?.remove(self.txn, id);
-        Ok(())
+        self.remove_element(id)
     }
 
     /// Remove several elements, skipping the locked ones (contract open
@@ -2218,10 +2534,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
         }
         let mut out = Deleted::default();
-        let elements = self.elements()?;
         for (id, free) in judged {
             if free {
-                elements.remove(self.txn, &id);
+                self.remove_element(&id)?;
                 out.deleted.push(id);
             } else {
                 out.kept.push(id);
@@ -2869,6 +3184,9 @@ pub struct RawElement {
     pub edited_at: Option<String>,
     /// A stroke's points, chunks concatenated.
     pub points: Vec<[f32; 3]>,
+    /// A scatter's symbol and placements (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 2).
+    pub scatter: Option<Arc<crate::scatter::RawScatter>>,
     /// What it means (see the module doc, "Meaning").
     pub note: Option<String>,
     /// Its named fields, by name.
@@ -2888,6 +3206,9 @@ pub struct RawBoard {
     /// Paint operations, in no particular order (docs/DRAWING_CONTRACT.md
     /// section 3); read with the elements.
     pub paint: Vec<crate::paint_ops::RawPaintOp>,
+    /// Symbol definitions (docs/DRAWING_WAVE6_CONTRACT.md section 2), by
+    /// when they were made; always read (a scatter is drawn from them).
+    pub symbols: Vec<crate::scatter::RawSymbol>,
 }
 
 /// The board's values; its elements too when `with_elements`.
@@ -2932,6 +3253,7 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         layers,
         elements,
         paint,
+        symbols: read_symbols(txn, board),
     }
 }
 
@@ -2964,7 +3286,23 @@ pub(crate) fn read_layers<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<RawLayer> {
 fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
     let kind = Kind::parse(&string_of(el.get(txn, KIND)).unwrap_or_default());
     let mut points = Vec::new();
+    let mut scatter = None;
     let geom = match el.get(txn, GEOM) {
+        _ if kind == Kind::Scatter => {
+            let mut sc = crate::scatter::RawScatter { symbol: string_of(el.get(txn, SYMBOL)).unwrap_or_default(), ..Default::default() };
+            if let Some(Out::YArray(array)) = el.get(txn, GEOM) {
+                for chunk in array.iter(txn) {
+                    if let Out::Any(Any::Buffer(bytes)) = chunk {
+                        crate::scatter::unpack(&bytes, &mut sc.placements);
+                        if sc.chunk_ends.last() != Some(&sc.placements.len()) {
+                            sc.chunk_ends.push(sc.placements.len());
+                        }
+                    }
+                }
+            }
+            scatter = Some(Arc::new(sc));
+            Geom::Scatter
+        }
         Some(Out::YArray(array)) => {
             for chunk in array.iter(txn) {
                 if let Out::Any(Any::Buffer(bytes)) = chunk {
@@ -3017,9 +3355,104 @@ fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
         edited_by: author_of(el.get(txn, EDITED_BY)),
         edited_at: string_of(el.get(txn, EDITED_AT)),
         points,
+        scatter,
         note: read_note(txn, el),
         fields: read_fields(txn, el),
     }
+}
+
+
+/// Element `e` written whole into `elements` under its own id (a copy of a
+/// board, a symbol's members).
+fn write_raw_element(txn: &mut TransactionMut, elements: &MapRef, e: &RawElement) {
+    let map: MapRef = elements.insert(txn, e.id.clone(), MapPrelim::default());
+    if !e.layer.is_empty() {
+        map.insert(txn, LAYER, e.layer.clone());
+    }
+    map.insert(txn, ORDER, e.order.clone());
+    if let Some(parent) = &e.parent {
+        map.insert(txn, PARENT, parent.clone());
+    }
+    map.insert(txn, KIND, e.kind.as_str().to_string());
+    match &e.geom {
+        Geom::Stroke => {
+            let array: ArrayRef = map.insert(txn, GEOM, ArrayPrelim::default());
+            if !e.points.is_empty() {
+                array.push_back(txn, Any::Buffer(pack_points(&e.points).into()));
+            }
+        }
+        Geom::Scatter => {
+            let array: ArrayRef = map.insert(txn, GEOM, ArrayPrelim::default());
+            if let Some(sc) = &e.scatter {
+                map.insert(txn, SYMBOL, sc.symbol.clone());
+                for range in sc.chunks() {
+                    array.push_back(txn, Any::Buffer(crate::scatter::pack(&sc.placements[range]).into()));
+                }
+            }
+        }
+        geom => {
+            map.insert(txn, GEOM, geom_any(geom));
+        }
+    }
+    if let Some(text) = &e.text {
+        map.insert(txn, TEXT, TextPrelim::new(text.clone()));
+    }
+    let style: MapRef = map.insert(txn, STYLE, MapPrelim::default());
+    write_style(txn, &style, &e.style);
+    if !e.transform.is_identity() {
+        map.insert(txn, TRANSFORM, transform_any(&e.transform));
+    }
+    map.insert(txn, LOCKED, e.locked);
+    if let Some(author) = &e.author {
+        map.insert(txn, AUTHOR, author_any(author));
+    }
+    map.insert(txn, CREATED_AT, e.created_at.clone());
+    if let Some(by) = &e.edited_by {
+        map.insert(txn, EDITED_BY, author_any(by));
+    }
+    if let Some(at) = &e.edited_at {
+        map.insert(txn, EDITED_AT, at.clone());
+    }
+    copy_meaning(txn, &map, e.note.as_deref(), &e.fields);
+}
+
+/// Symbol `sym` written whole into `board` under its own key.
+fn write_raw_symbol(txn: &mut TransactionMut, board: &MapRef, sym: &crate::scatter::RawSymbol) {
+    let map: MapRef = board.insert(txn, crate::scatter::symbol_key(&sym.id), MapPrelim::default());
+    map.insert(txn, NAME, sym.name.clone());
+    map.insert(txn, CREATED_AT, sym.created_at.clone());
+    if let Some(author) = &sym.author {
+        map.insert(txn, AUTHOR, author_any(author));
+    }
+    let elements: MapRef = map.insert(txn, ELEMENTS, MapPrelim::default());
+    for e in &sym.elements {
+        write_raw_element(txn, &elements, e);
+    }
+}
+
+/// The symbols of a board map, in no particular order.
+pub(crate) fn read_symbols<T: ReadTxn>(txn: &T, board: &MapRef) -> Vec<crate::scatter::RawSymbol> {
+    let mut out = Vec::new();
+    for (key, value) in board.iter(txn) {
+        let (Some(id), Out::YMap(map)) = (key.strip_prefix(crate::scatter::SYMBOL_PREFIX), value) else { continue };
+        let mut elements = Vec::new();
+        if let Some(Out::YMap(els)) = map.get(txn, ELEMENTS) {
+            for (eid, out) in els.iter(txn) {
+                if let Out::YMap(el) = out {
+                    elements.push(read_element(txn, eid, &el));
+                }
+            }
+        }
+        out.push(crate::scatter::RawSymbol {
+            id: id.to_string(),
+            name: string_of(map.get(txn, NAME)).unwrap_or_default(),
+            created_at: string_of(map.get(txn, CREATED_AT)).unwrap_or_default(),
+            author: author_of(map.get(txn, AUTHOR)),
+            elements,
+        });
+    }
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+    out
 }
 
 /// A paint operation as stored (see [`crate::paint_ops`]).
@@ -3365,6 +3798,7 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         along: s("along"),
         along_offset: number_of(m.get(txn, "along_offset")),
         along_side: s("along_side").and_then(|v| AlongSide::parse(&v)),
+        tint: s("tint").and_then(|v| Color::parse(&v)),
     }
 }
 
@@ -3507,6 +3941,9 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
     }
     if let Some(v) = style.along_side {
         m.insert(txn, "along_side", v.as_str());
+    }
+    if let Some(c) = style.tint {
+        m.insert(txn, "tint", c.to_hex());
     }
 }
 
@@ -3727,7 +4164,7 @@ fn end_of(any: Option<&Any>) -> End {
 
 fn geom_any(geom: &Geom) -> Any {
     let m = match geom {
-        Geom::None | Geom::Stroke => HashMap::new(),
+        Geom::None | Geom::Stroke | Geom::Scatter => HashMap::new(),
         Geom::Rect(r) => rect_fields(r),
         Geom::Picture(p) => {
             let mut m = rect_fields(&p.rect);
@@ -3848,6 +4285,7 @@ fn geom_of(kind: &Kind, m: &HashMap<String, Any>) -> Geom {
         Kind::Card => Geom::Card { rect: rect(), link: m.get("link").and_then(any_str).unwrap_or("").to_string() },
         Kind::Group => Geom::None,
         Kind::Pen | Kind::Highlighter => Geom::Stroke,
+        Kind::Scatter => Geom::Scatter,
         Kind::Path => Geom::Path(path_of(m)),
         _ => match rect_of(m) {
             Some(r) => Geom::Rect(r),

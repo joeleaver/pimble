@@ -622,6 +622,10 @@ pub(crate) fn stroke_paint(kind: &Kind, color: Color, opacity: f32) -> Paint<'st
 }
 
 pub(crate) fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
+    if e.raw.kind == Kind::Scatter {
+        crate::scatter::draw(pixmap, e, pictures, vt, region);
+        return;
+    }
     let ts = vt.pre_concat(e.world);
     for op in element_ops(e, region, Some(ts_scale(&ts))) {
         match op {

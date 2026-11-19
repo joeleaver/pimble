@@ -95,6 +95,9 @@ pub struct BoardView {
     overlay_box: Option<(i64, i64, i64, i64)>,
     /// Per paint operation (by a hash of its id), as last seen.
     seen_paint: HashMap<u64, PaintMark>,
+    /// Per scatter (by a hash of its id): its look and how many
+    /// placements, so placements only appended redraw only where they are.
+    seen_scatter: HashMap<u64, (u64, usize)>,
     /// The tiles paint layers are drawn from; every snapshot shown here
     /// draws from it.
     paint_cache: Arc<PaintCache>,
@@ -199,6 +202,7 @@ impl BoardView {
             frame_offset: None,
             overlay_box: None,
             seen_paint: HashMap::new(),
+            seen_scatter: HashMap::new(),
             paint_cache: PaintCache::new(),
         }
     }
@@ -371,11 +375,25 @@ impl BoardView {
         let mut next: HashMap<u64, (u64, Rect, bool)> = HashMap::with_capacity(snapshot.elements.len());
         let mut dirty: Vec<Rect> = Vec::new();
         let mut everything = snapshot.markup_visible != self.snapshot.markup_visible || snapshot.page != self.snapshot.page;
+        let mut next_scatter: HashMap<u64, (u64, usize)> = HashMap::new();
         for e in &snapshot.elements {
             let entry = (e.fingerprint, e.bounds, e.global);
             let key = id_hash(&e.raw.id);
+            let grown = match (&e.scatter, &e.raw.scatter) {
+                (Some(sc), Some(raw)) => {
+                    let now = (sc.look, raw.placements.len());
+                    next_scatter.insert(key, now);
+                    match self.seen_scatter.get(&key) {
+                        // Only appended: where the new placements are.
+                        Some((look, n)) if *look == now.0 && now.1 > *n => Some(sc.tail_extent(raw, *n).map(|r| crate::snapshot::map_rect(&e.world, &r))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             match self.seen.get(&key) {
                 Some(old) if old.0 == entry.0 => {}
+                Some(_) if grown.is_some() => dirty.extend(grown.flatten()),
                 Some(old) => {
                     everything |= old.2 || entry.2;
                     dirty.push(old.1);
@@ -395,6 +413,7 @@ impl BoardView {
             }
         }
         self.seen = next;
+        self.seen_scatter = next_scatter;
         // Paint: an operation changed, came or went; a stroke that only grew
         // dirties where its new points reach.
         let mut next_paint: HashMap<u64, PaintMark> = HashMap::with_capacity(snapshot.paint.len());

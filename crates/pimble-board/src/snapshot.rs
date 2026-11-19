@@ -135,6 +135,9 @@ pub struct Element {
     /// The clips of its layer and of every group above it: it shows (and
     /// is hit) only inside all of them.
     pub(crate) clips: Vec<Arc<Clip>>,
+    /// A scatter's symbol and its chunks' bounds
+    /// (docs/DRAWING_WAVE6_CONTRACT.md section 2).
+    pub scatter: Option<Arc<crate::scatter::ResolvedScatter>>,
 }
 
 impl Element {
@@ -191,6 +194,9 @@ pub struct BoardSnapshot {
     pub layers: Vec<Layer>,
     /// Bottom to top: by layer order, then element order, ties by id.
     pub elements: Vec<Element>,
+    /// The symbols defined in the canvas (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 2), by when they were made.
+    pub symbols: Vec<Arc<crate::scatter::SymbolDef>>,
     /// Element index by a hash of its id (checked against the id on lookup).
     index: HashMap<u64, usize>,
     grid: Grid,
@@ -253,6 +259,7 @@ impl BoardSnapshot {
                 edited_at: None,
                 layers: Vec::new(),
                 elements: Vec::new(),
+                symbols: Vec::new(),
                 index: HashMap::new(),
                 grid: Grid::default(),
                 options,
@@ -309,7 +316,9 @@ impl BoardSnapshot {
         if changes.is_empty() && self.exists {
             return self;
         }
-        if changes.all || !self.exists {
+        // A symbol being edited is drawn alone, from its definition: read
+        // again whole.
+        if changes.all || !self.exists || self.options.editing_symbol.is_some() {
             return self.rebuild(board.read());
         }
         let paint = if changes.paint.is_empty() { None } else { Some(board.read_paint_some(&changes.paint)) };
@@ -492,6 +501,11 @@ impl BoardSnapshot {
         }
     }
 
+    /// Symbol `id`'s definition, resolved.
+    pub fn symbol(&self, id: &str) -> Option<&Arc<crate::scatter::SymbolDef>> {
+        self.symbols.iter().find(|s| s.id == id)
+    }
+
     pub fn get(&self, id: &str) -> Option<&Element> {
         self.index.get(&id_hash(id)).map(|i| &self.elements[*i]).filter(|e| e.raw.id == id)
     }
@@ -655,11 +669,40 @@ struct Resolver {
     raws: Vec<RawElement>,
     by_id: HashMap<u64, usize>,
     options: ViewOptions,
+    symbols: HashMap<String, Arc<crate::scatter::SymbolDef>>,
 }
 
 impl Resolver {
     fn run(raw: RawBoard, reuse: HashMap<String, Reuse>, paint: Option<Vec<PaintOp>>, options: ViewOptions) -> BoardSnapshot {
-        let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements, paint: raw_paint } = raw;
+        let raw = match options.editing_symbol.as_deref() {
+            Some(symbol) => isolate(raw, symbol),
+            None => raw,
+        };
+        let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements, paint: raw_paint, symbols: raw_symbols } = raw;
+        // Symbols first: a scatter's extent is its symbol's, placed. Each is
+        // resolved as a board of its own, in one layer; a symbol holds no
+        // scatter, so this never recurses further.
+        let symbol_options = ViewOptions { editing_symbol: None, show_all: true, ..options.clone() };
+        let symbols: Vec<Arc<crate::scatter::SymbolDef>> = raw_symbols
+            .into_iter()
+            .map(|sym| {
+                let (created_at, author) = (sym.created_at.clone(), sym.author.clone());
+                let inner = RawBoard {
+                    version,
+                    page: None,
+                    markup_visible: true,
+                    edited_by: None,
+                    edited_at: None,
+                    layers: vec![symbol_layer(&sym.id, &sym.name)],
+                    elements: sym.elements.into_iter().filter(|e| e.kind != Kind::Scatter).collect(),
+                    paint: Vec::new(),
+                    symbols: Vec::new(),
+                };
+                let resolved = Resolver::run(inner, HashMap::new(), Some(Vec::new()), symbol_options.clone());
+                Arc::new(crate::scatter::SymbolDef::of(sym.id, sym.name, created_at, author, resolved.elements))
+            })
+            .collect();
+        let symbol_index: HashMap<String, Arc<crate::scatter::SymbolDef>> = symbols.iter().map(|s| (s.id.clone(), s.clone())).collect();
         let paint = paint.unwrap_or_else(|| raw_paint.into_iter().map(PaintOp::of).collect());
         let tree = crate::layer_tree::resolve(&raw_layers);
         let layers: Vec<Layer> = tree
@@ -701,7 +744,7 @@ impl Resolver {
         let homes: Vec<Option<usize>> = ranked.iter().map(|(h, _)| *h).collect();
         let raws: Vec<RawElement> = ranked.into_iter().map(|(_, e)| e).collect();
         let by_id: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, e)| (id_hash(&e.id), i)).collect();
-        let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options };
+        let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options, symbols: symbol_index };
         let mut snapshot_elements = r.resolve(markup_visible);
         let index: HashMap<u64, usize> = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
         let mut composite = std::mem::take(&mut r.composite);
@@ -738,6 +781,9 @@ impl Resolver {
             for e in &mut snapshot_elements {
                 if let Some(l) = e.layer_index {
                     e.fingerprint ^= composite[l] ^ next[l];
+                    if let Some(sc) = e.scatter.as_mut().and_then(Arc::get_mut) {
+                        sc.look ^= composite[l] ^ next[l];
+                    }
                     e.clips = within[l].clone();
                 }
             }
@@ -753,6 +799,7 @@ impl Resolver {
             edited_at,
             layers: r.layers,
             elements: snapshot_elements,
+            symbols,
             index,
             grid,
             options: r.options,
@@ -897,10 +944,23 @@ impl Resolver {
                 }
             }
         }
+        let mut scatters: Vec<Option<Arc<crate::scatter::ResolvedScatter>>> = self
+            .raws
+            .iter()
+            .map(|e| {
+                let raw = e.scatter.as_ref().filter(|_| e.kind == Kind::Scatter)?;
+                Some(Arc::new(crate::scatter::ResolvedScatter::resolve(raw, self.symbols.get(&raw.symbol).cloned())))
+            })
+            .collect();
         for &i in &order_post {
             let e = &self.raws[i];
             let ink_below = layouts[i].as_ref().map_or(0.0, |l| l.ink_below());
-            let extent = own_extent(e, &styles[i], text_boxes[i], grown[i], ink_below).or_else(|| {
+            let scatter_extent = scatters[i].as_ref().map(|sc| sc.extent().map(|r| (r, r)));
+            let extent = match scatter_extent {
+                Some(extent) => extent,
+                None => own_extent(e, &styles[i], text_boxes[i], grown[i], ink_below),
+            }
+            .or_else(|| {
                 if !matches!(e.kind, Kind::Group) {
                     return None;
                 }
@@ -1016,9 +1076,14 @@ impl Resolver {
                 text_path,
                 along: None,
                 clips: Vec::new(),
+                scatter: scatters[i].take(),
                 raw,
             };
-            e.fingerprint = fingerprint(&e) ^ composite;
+            let (print, look) = fingerprint_and_look(&e);
+            e.fingerprint = print ^ composite;
+            if let Some(sc) = e.scatter.as_mut().and_then(Arc::get_mut) {
+                sc.look = look ^ composite;
+            }
             out.push(e);
         }
 
@@ -1346,6 +1411,12 @@ impl Hasher for Fx {
 }
 
 fn fingerprint(e: &Element) -> u64 {
+    fingerprint_and_look(e).0
+}
+
+/// The fingerprint, and the same without a scatter's placements (what
+/// stays while placements are only appended).
+fn fingerprint_and_look(e: &Element) -> (u64, u64) {
     let mut h = Fx::default();
     let r = &e.raw;
     let f = |h: &mut Fx, v: f32| h.write_u32(v.to_bits());
@@ -1357,6 +1428,7 @@ fn fingerprint(e: &Element) -> u64 {
     r.kind.as_str().hash(&mut h);
     match &r.geom {
         Geom::None | Geom::Stroke => 0u8.hash(&mut h),
+        Geom::Scatter => 2u8.hash(&mut h),
         Geom::Rect(x) => rect(&mut h, x),
         Geom::Picture(p) => {
             rect(&mut h, &p.rect);
@@ -1450,7 +1522,63 @@ fn fingerprint(e: &Element) -> u64 {
             f(&mut h, *v);
         }
     }
-    h.finish()
+    s.tint.hash(&mut h);
+    let Some(sc) = &r.scatter else {
+        let print = h.finish();
+        return (print, print);
+    };
+    sc.symbol.hash(&mut h);
+    e.scatter.as_ref().and_then(|s| s.def.as_ref()).map(|d| d.hash).hash(&mut h);
+    let look = h.finish();
+    sc.placements.len().hash(&mut h);
+    for p in &sc.placements {
+        for v in [p.x, p.y, p.scale, p.rotation] {
+            f(&mut h, v);
+        }
+        p.tint.hash(&mut h);
+    }
+    (h.finish(), look)
+}
+
+/// The layer a symbol's elements are resolved in (and shown in while it is
+/// edited): its key as an id, its name.
+pub fn symbol_layer(symbol: &str, name: &str) -> crate::doc::RawLayer {
+    crate::doc::RawLayer {
+        id: crate::scatter::symbol_key(symbol),
+        name: name.to_string(),
+        order: "a".into(),
+        visible: true,
+        locked: false,
+        opacity: 1.0,
+        note: None,
+        fields: Vec::new(),
+        kind: LayerKind::Vector,
+        blend: None,
+        parent: None,
+        clip: None,
+    }
+}
+
+/// The board as seen while symbol `symbol` is edited: its elements alone,
+/// in symbol space, in one layer named after it (new elements drawn there go
+/// into the symbol: [`crate::BoardTxn::add_element`]). Unchanged when the
+/// canvas has no such symbol.
+fn isolate(mut raw: RawBoard, symbol: &str) -> RawBoard {
+    let Some(sym) = raw.symbols.iter().find(|s| s.id == symbol) else { return raw };
+    let layer = symbol_layer(&sym.id, &sym.name);
+    raw.elements = sym
+        .elements
+        .iter()
+        .filter(|e| e.kind != Kind::Scatter)
+        .cloned()
+        .map(|mut e| {
+            e.layer = layer.id.clone();
+            e
+        })
+        .collect();
+    raw.layers = vec![layer];
+    raw.paint = Vec::new();
+    raw
 }
 
 /// The paint operations sorted (by layer, order, id) and indexed by layer.

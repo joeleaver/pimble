@@ -2756,6 +2756,7 @@ pub(super) fn kind_label(e: &pimble_board::Element) -> String {
         Kind::Path => "Path".to_string(),
         Kind::Polygon => "Polygon".to_string(),
         Kind::Star => "Star".to_string(),
+        Kind::Scatter => "Scatter".to_string(),
         Kind::Other(k) => k.clone(),
     }
 }

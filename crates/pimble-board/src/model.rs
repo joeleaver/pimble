@@ -155,6 +155,10 @@ pub enum Kind {
     Polygon,
     /// A star fitted to its box (`style.points`, `style.inner`).
     Star,
+    /// Many placements of one symbol (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 2): the symbol's id in the element's `symbol` key, the
+    /// placements packed in its appendable array ([`crate::scatter`]).
+    Scatter,
     Other(String),
 }
 
@@ -181,6 +185,7 @@ impl Kind {
             Kind::Path => "path",
             Kind::Polygon => "polygon",
             Kind::Star => "star",
+            Kind::Scatter => "scatter",
             Kind::Other(s) => s,
         }
     }
@@ -207,6 +212,7 @@ impl Kind {
             "path" => Kind::Path,
             "polygon" => Kind::Polygon,
             "star" => Kind::Star,
+            "scatter" => Kind::Scatter,
             other => Kind::Other(other.to_string()),
         }
     }
@@ -338,6 +344,9 @@ pub enum Geom {
     Stroke,
     /// A path's subpaths and fill rule, one value like every geometry.
     Path(crate::path::PathGeom),
+    /// A scatter: its placements live in the element's appendable array
+    /// ([`crate::scatter`]), never in this value.
+    Scatter,
 }
 
 impl Geom {
@@ -352,7 +361,7 @@ impl Geom {
             End::Element { id, side, last } => End::Element { id: id.clone(), side: *side, last: f(*last) },
         };
         Some(match self {
-            Geom::None | Geom::Stroke => return None,
+            Geom::None | Geom::Stroke | Geom::Scatter => return None,
             Geom::Rect(r) => Geom::Rect(mr(r)),
             Geom::Picture(p) => Geom::Picture(PictureGeom { rect: mr(&p.rect), ..p.clone() }),
             Geom::Segment { a, b } => Geom::Segment { a: f(*a), b: f(*b) },
@@ -828,6 +837,11 @@ pub struct Style {
     pub along_offset: Option<f32>,
     /// Which side of it: absent is above.
     pub along_side: Option<AlongSide>,
+    /// A scatter's tint (docs/DRAWING_WAVE6_CONTRACT.md section 2): every
+    /// color of its symbol moved toward this color by its alpha (0: no
+    /// tint, 255: the color itself, keeping each pixel's coverage), before
+    /// each placement's own tint.
+    pub tint: Option<Color>,
 }
 
 pub use crate::text::{FontChoice, FontFamily, TextStyle};
@@ -910,6 +924,8 @@ pub struct ResolvedStyle {
     pub along: Option<String>,
     pub along_offset: Option<f32>,
     pub along_side: AlongSide,
+    /// A scatter's tint (alpha is the amount; transparent: none).
+    pub tint: Color,
 }
 
 impl ResolvedStyle {
@@ -1132,7 +1148,7 @@ impl Style {
             Kind::Frame => (Color::rgb(0x9e, 0x9e, 0x9e), None, 2.0, 18.0, ArrowHeads::None, Align::Left, false),
             Kind::Card => (Color::rgb(0x61, 0x61, 0x61), Some(Color::rgb(0xfa, 0xfa, 0xfa)), 1.5, 18.0, ArrowHeads::None, Align::Left, true),
             Kind::Spotlight => (Color::BLACK, Some(Color::rgba(0, 0, 0, 0x99)), 0.0, 24.0, ArrowHeads::None, Align::Left, false),
-            Kind::Picture | Kind::Group | Kind::Other(_) => (Color::BLACK, None, 0.0, 24.0, ArrowHeads::None, Align::Left, false),
+            Kind::Picture | Kind::Group | Kind::Scatter | Kind::Other(_) => (Color::BLACK, None, 0.0, 24.0, ArrowHeads::None, Align::Left, false),
         };
         let fill_gradient = self.fill_gradient.clone().filter(Gradient::is_valid).map(Gradient::normalized);
         let stroke_gradient = self.stroke_gradient.clone().filter(Gradient::is_valid).map(Gradient::normalized);
@@ -1171,6 +1187,7 @@ impl Style {
             along: self.along.clone().filter(|a| !a.is_empty()),
             along_offset: self.along_offset.filter(|o| o.is_finite()).map(|o| o.clamp(0.0, 1.0)),
             along_side: self.along_side.unwrap_or_default(),
+            tint: self.tint.unwrap_or(Color::TRANSPARENT),
         }
     }
 }
@@ -1206,6 +1223,7 @@ pub enum StyleKey {
     Along,
     AlongOffset,
     AlongSide,
+    Tint,
 }
 
 impl StyleKey {
@@ -1239,6 +1257,7 @@ impl StyleKey {
             StyleKey::Along => "along",
             StyleKey::AlongOffset => "along_offset",
             StyleKey::AlongSide => "along_side",
+            StyleKey::Tint => "tint",
         }
     }
 }
@@ -1313,6 +1332,9 @@ pub struct NewElement {
     pub transform: Option<Transform>,
     /// A pen or highlighter's first points (x, y, pressure).
     pub points: Vec<[f32; 3]>,
+    /// A scatter's symbol and placements (a copy of one; new scatters are
+    /// made with [`crate::BoardTxn::add_scatter`]).
+    pub scatter: Option<std::sync::Arc<crate::scatter::RawScatter>>,
 }
 
 impl NewElement {
@@ -1327,7 +1349,14 @@ impl NewElement {
             style: Style::default(),
             transform: None,
             points: Vec::new(),
+            scatter: None,
         }
+    }
+
+    /// A copy of a scatter's symbol and placements.
+    pub fn with_scatter(mut self, scatter: Option<std::sync::Arc<crate::scatter::RawScatter>>) -> Self {
+        self.scatter = scatter;
+        self
     }
 
     pub fn with_text(mut self, text: impl Into<String>) -> Self {

@@ -153,7 +153,7 @@ fn view_options_color_by_author_show_everything_and_title_cards() {
     assert!(!plain.get(&mine).unwrap().visible);
     let mut labels = HashMap::new();
     labels.insert("pimble://node/1".to_string(), CardLabel { title: "Groceries".into(), color: Some(Color::rgb(0, 200, 0)) });
-    let options = ViewOptions { color_by_author: true, show_all: true, card_labels: Arc::new(labels) };
+    let options = ViewOptions { color_by_author: true, show_all: true, card_labels: Arc::new(labels), ..ViewOptions::default() };
     let seen = b.snapshot().with_options(options.clone(), &b);
     assert_eq!(seen.options(), &options);
     let m = seen.get(&mine).unwrap();

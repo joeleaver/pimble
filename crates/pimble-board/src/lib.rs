@@ -58,6 +58,7 @@ pub mod combine;
 pub mod doc;
 pub mod paint_ops;
 pub mod raster;
+pub mod scatter;
 mod retouch;
 pub mod tiles;
 mod hit;
@@ -78,7 +79,7 @@ pub mod text;
 pub mod view;
 
 pub use doc::{
-    PAINT_ONTO_VECTOR, Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
+    PAINT_ONTO_VECTOR, MadeSymbol, Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, FlipAxis, LockedLayer, RawBoard, RawElement, RawLayer, repivot, text_board_key,
     free_layer_name, HIGHLIGHTS_LAYER_NAME, BARE_HIGHLIGHTS_OPACITY, TEXT_BOARD_PREFIX, BOARD_KEY,
 };
 pub use brush::{BrushPoint, BrushSettings, Curve, Jitter, Preset, StrokeBlend, PRESETS, PX_PER_UNIT};

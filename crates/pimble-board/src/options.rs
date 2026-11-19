@@ -31,6 +31,9 @@ pub struct ViewOptions {
     pub show_all: bool,
     /// By a card's link string (`Geom::Card::link`).
     pub card_labels: Arc<HashMap<String, CardLabel>>,
+    /// The symbol being edited (docs/DRAWING_WAVE6_CONTRACT.md section 2):
+    /// the board is seen as that symbol's elements alone, in symbol space.
+    pub editing_symbol: Option<String>,
 }
 
 /// The color of elements nobody is stamped on, when coloring by author.

@@ -83,6 +83,7 @@ pub(super) fn style_json(style: &Style) -> Value {
     put("along", style.along.as_ref().map(|a| json!(a)));
     put("along_offset", style.along_offset.map(num));
     put("along_side", style.along_side.map(|s| json!(s.as_str())));
+    put("tint", style.tint.map(|c| json!(c.to_hex())));
     Value::Object(m)
 }
 
@@ -148,6 +149,17 @@ pub(super) fn element_json(e: &Element, layer: &str) -> Value {
         Geom::Stroke => {
             let points: Vec<Value> = raw.points.iter().map(|p| json!([num(p[0]), num(p[1]), num(p[2])])).collect();
             m.insert("points".into(), Value::Array(points));
+        }
+        // A scatter is shown, not given whole: its symbol, how many
+        // placements and where (the scatter tool adds placements).
+        Geom::Scatter => {
+            if let Some(sc) = &raw.scatter {
+                m.insert("symbol".into(), json!(sc.symbol));
+                m.insert("placements".into(), json!(sc.placements.len()));
+            }
+            if e.has_extent {
+                m.insert("bounds".into(), json!({"x": num(e.bounds.x), "y": num(e.bounds.y), "w": num(e.bounds.w), "h": num(e.bounds.h)}));
+            }
         }
         Geom::Path(p) => {
             m.insert("d".into(), json!(to_d(p)));
@@ -361,6 +373,15 @@ pub(super) fn write_copy(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, source: &B
         .filter(|(i, _)| !matches!(source.elements[*i].raw.geom, Geom::Connector { .. }))
         .chain(plan.elements.iter().filter(|(i, _)| matches!(source.elements[*i].raw.geom, Geom::Connector { .. })))
         .collect();
+    // A scatter brings its symbol along (under its own id, unless the
+    // target has it already).
+    for (i, _) in &plan.elements {
+        if let Some(sc) = &source.elements[*i].raw.scatter {
+            if let Some(def) = source.symbol(&sc.symbol) {
+                t.adopt_symbol(&def.to_raw())?;
+            }
+        }
+    }
     for (i, layer) in order {
         let e = &source.elements[*i];
         let raw = &e.raw;
@@ -397,7 +418,11 @@ pub(super) fn write_copy(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, source: &B
                 other.clone()
             }
         };
-        let mut element = NewElement::new(raw.kind.clone(), geom).with_points(raw.points.clone()).with_style(raw.style.clone()).in_layer(layer.clone());
+        let mut element = NewElement::new(raw.kind.clone(), geom)
+            .with_points(raw.points.clone())
+            .with_scatter(raw.scatter.clone())
+            .with_style(raw.style.clone())
+            .in_layer(layer.clone());
         if let Some(text) = &raw.text {
             element = element.with_text(text.clone());
         }

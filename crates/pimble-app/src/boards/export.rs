@@ -57,7 +57,7 @@ struct Scope {
 fn scope(pane: PaneId, all: bool) -> Option<Scope> {
     with_session(pane, |s| {
         // Exports are never colored by author: that is a way of looking.
-        let options = ViewOptions { color_by_author: false, show_all: all, card_labels: s.options.card_labels.clone() };
+        let options = ViewOptions { color_by_author: false, show_all: all, card_labels: s.options.card_labels.clone(), ..ViewOptions::default() };
         let snapshot = BoardSnapshot::build_with(s.board.read(), options);
         let selected: Vec<String> = s.selected.iter().filter(|id| snapshot.get(id).is_some()).cloned().collect();
         let page_fill = snapshot.page.as_ref().map(|p| p.fill.unwrap_or(Color::WHITE));

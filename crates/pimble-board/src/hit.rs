@@ -111,6 +111,9 @@ impl Element {
         let q = Point::new(q[0].x, q[0].y);
         let tol = tol / ts_scale(&self.world).max(1e-6);
         let half = s.width / 2.0;
+        if self.raw.kind == Kind::Scatter {
+            return crate::scatter::hits(self, q, tol);
+        }
         match (&self.raw.kind, &self.raw.geom) {
             (Kind::Pen | Kind::Highlighter, _) => {
                 // Each point as drawn: where it is and its width there (a

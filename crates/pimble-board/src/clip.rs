@@ -87,6 +87,29 @@ impl Clip {
         Some(Clip { element: e.raw.id.clone(), path, rule, bounds, polys, hash: h.finish() })
     }
 
+    /// The outline of closed element `e` where it is drawn (what Scatter in
+    /// Shape fills): `None` when it is not closed.
+    pub fn of_element(e: &Element) -> Option<Clip> {
+        Clip::of(e)
+    }
+
+    /// An outline given as a path in board units (an SVG `d` read by the
+    /// caller).
+    pub fn of_path(path: Path, rule: FillRule) -> Option<Clip> {
+        let b = path.bounds();
+        let bounds = Rect::new(b.x(), b.y(), b.width(), b.height());
+        if !(bounds.w > 0.0 && bounds.h > 0.0) {
+            return None;
+        }
+        let polys = flatten(&path);
+        let mut h = crate::snapshot::Fx::default();
+        for p in path.points() {
+            p.x.to_bits().hash(&mut h);
+            p.y.to_bits().hash(&mut h);
+        }
+        Some(Clip { element: String::new(), path, rule, bounds, polys, hash: h.finish() })
+    }
+
     /// Whether board point `p` is inside the outline (by its fill rule).
     pub fn contains(&self, p: Point) -> bool {
         if !self.bounds.inflate(1e-3).contains(p) {

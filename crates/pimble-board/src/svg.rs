@@ -295,6 +295,7 @@ pub fn render_svg(
     }
     let mask = only.map(|ids| included(snapshot, ids));
     let mut gradients = 0usize;
+    let mut symbols_written: HashSet<String> = HashSet::new();
     let mut open_layers: Vec<usize> = Vec::new();
     const NONE: &[usize] = &[];
     let chain_of = |layer: usize| snapshot.chains.get(layer).map_or(NONE, |c| c.as_slice());
@@ -315,6 +316,12 @@ pub fn render_svg(
                 sync_chain(&mut out, &mut open_layers, chain_of(layer), snapshot, &mut gradients);
                 write_paint_layer(&mut out, snapshot, layer, &rect, &decoded);
             }
+        }
+        if e.raw.kind == Kind::Scatter {
+            let chain = e.layer_index.map_or(NONE, chain_of);
+            sync_chain(&mut out, &mut open_layers, chain, snapshot, &mut gradients);
+            write_scatter(&mut out, e, &rect, picture_bytes, &mut gradients, &mut symbols_written);
+            continue;
         }
         let ops = element_ops(e, &rect, None);
         if ops.is_empty() {
@@ -356,6 +363,101 @@ pub fn render_svg(
     }
     out.push_str("</svg>");
     out
+}
+
+/// An op with its colors moved toward `tints` (a scatter's, then a
+/// placement's).
+fn tinted_op(op: Op<'_>, tints: (Color, Color)) -> Op<'_> {
+    let t = |c: Color| crate::scatter::tinted(crate::scatter::tinted(c, tints.0), tints.1);
+    let tg = |g: &Option<GradientPaint>| {
+        g.clone().map(|mut g| {
+            for stop in &mut g.gradient.stops {
+                stop.color = t(stop.color);
+            }
+            g
+        })
+    };
+    match op {
+        Op::Fill { path, color, gradient, opacity, rule, space, shadow, multiply } => Op::Fill {
+            path,
+            color: if shadow { color } else { t(color) },
+            gradient: tg(&gradient),
+            opacity,
+            rule,
+            space,
+            shadow,
+            multiply,
+        },
+        Op::Stroke { path, color, gradient, opacity, stroke, space, multiply } => Op::Stroke {
+            path,
+            color: t(color),
+            gradient: tg(&gradient),
+            opacity,
+            stroke,
+            space,
+            multiply,
+        },
+        Op::Picture(p) => Op::Picture(p),
+    }
+}
+
+/// A scatter (docs/DRAWING_WAVE6_CONTRACT.md section 2): its symbol as a
+/// `<symbol>` (one per tint it is drawn with, the colors moved toward it as
+/// the renderer does), defined at its first use, and a `<use>` per
+/// placement that reaches `rect`, through the scatter's and the
+/// placement's transforms.
+fn write_scatter(out: &mut String, e: &Element, rect: &Rect, picture_bytes: &dyn Fn(&str) -> Option<Vec<u8>>, next_id: &mut usize, written: &mut HashSet<String>) {
+    let (Some(sc), Some(raw)) = (&e.scatter, &e.raw.scatter) else { return };
+    let Some(def) = &sc.def else { return };
+    let Some(b) = def.bounds else { return };
+    if !e.visible || e.opacity <= 0.0 {
+        return;
+    }
+    let local = match e.world.invert() {
+        Some(inv) => crate::snapshot::map_rect(&inv, rect),
+        None => return,
+    };
+    let opacity = if e.opacity < 1.0 { format!(" opacity=\"{}\"", n(e.opacity)) } else { String::new() };
+    for (range, cb) in &sc.chunks {
+        if !cb.intersects(&local) {
+            continue;
+        }
+        for p in &raw.placements[range.clone()] {
+            if !crate::scatter::placed_box(p, &b).intersects(&local) {
+                continue;
+            }
+            let tints = crate::scatter::tints_as_drawn(e.style.tint, p.tint);
+            let id = if tints.0.a == 0 && tints.1.a == 0 {
+                format!("pimble-symbol-{}", def.id)
+            } else {
+                format!("pimble-symbol-{}-{}-{}", def.id, tints.0.to_hex().trim_start_matches('#'), tints.1.to_hex().trim_start_matches('#'))
+            };
+            if written.insert(id.clone()) {
+                let _ = write!(out, "<defs><symbol id=\"{id}\" overflow=\"visible\">");
+                for m in &def.elements {
+                    let ops = element_ops(m, &b, None);
+                    if ops.is_empty() {
+                        continue;
+                    }
+                    if m.world.is_identity() {
+                        out.push_str("<g>");
+                    } else {
+                        let _ = write!(out, "<g transform=\"{}\">", matrix(&m.world));
+                    }
+                    for op in ops {
+                        match op {
+                            Op::Picture(pg) => write_picture(out, m, pg, picture_bytes),
+                            op => write_op(out, &tinted_op(op, tints), next_id),
+                        }
+                    }
+                    out.push_str("</g>");
+                }
+                out.push_str("</symbol></defs>");
+            }
+            let m = e.world.pre_concat(p.affine());
+            let _ = write!(out, "<use href=\"#{id}\" xlink:href=\"#{id}\" transform=\"{}\"{opacity}/>", matrix(&m));
+        }
+    }
 }
 
 /// Close the layer groups `chain` leaves and open the ones it enters (a

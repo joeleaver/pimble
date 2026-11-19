@@ -451,6 +451,35 @@ the same names) and shown by `get_canvas` and `get_elements`:
 keys above, so its JSON writes back verbatim (an `along` naming an element of the same
 list resolves to its copy, as `copy_elements` does).
 
+Wave 6, symbols and scatter (docs/DRAWING_WAVE6_CONTRACT.md section 2, built 2026-11-18):
+a **symbol** is a few elements kept as a definition (`symbol:<id>` on the board), drawn only
+where a **scatter** places it; a scatter is one element holding thousands of placements
+(16 bytes each, packed: 25,000 trees are about 400 KB, where 25,000 dabs were 15 MB).
+
+- `add_symbol`: `elements` (specs as `add_elements` takes them, in the symbol's own space:
+  0,0 is where a placement puts it; no connectors, cards, spotlights or scatters), or `ids`
+  of elements on the canvas (copied into the symbol, centered on what they cover, and
+  replaced by one scatter placing it where they were, unless `keep`), or `elements` with
+  `symbol` (an id or name) to add to one. Answers the symbol's id.
+- `scatter`: `symbol` (id or name) and one of `placements` (`[x, y]` or `[x, y, scale,
+  rotation]`), `region` (a closed element's id: rectangle, ellipse, polygon, star, frame,
+  closed path) or `d` (path data), with `density` (per 10,000 square units) or `spacing`
+  (units), `method` (`"poisson"`, the default, or `"grid"` with `position_jitter`), `seed`,
+  `size`, `size_jitter`, `rotation_jitter` (degrees either way), `tint` (`#rrggbbaa`, the
+  alpha how far the colors move), `tint_jitter`; `into` appends to a scatter, `layer` names
+  the layer (a region's scatter goes just above the region otherwise). One call, one edit.
+- `get_canvas` lists the symbols after the element count (`- symbol <id> "Oak": 2 elements
+  (<id> rect, <id> ellipse), at -10,-18 size 20x28; 1 scatter, 1,415 placements`) and a
+  scatter as `scatter 1,415 placements of symbol "Oak" within ...`; `get_elements` gives a
+  scatter as `kind`, `symbol`, `placements` (the count) and `bounds`, never the placements.
+- `update_elements`: a symbol's element ids (listed under the symbol) change like any
+  element's, and every scatter of it with them; on a scatter, `symbol` (id or name) and
+  the style key `tint` (`clear_style` `"tint"`), and `move_by` moves it all. A scatter's
+  geometry is refused with a sentence (placements are added with `scatter`'s `into`).
+- `delete_elements` deletes a symbol's elements by id; `copy_elements` and `copy_layer`
+  bring a scatter's symbol along under its id (pictures inside a symbol are not copied
+  between stores). `export_canvas` writes `<symbol>`s and a `<use>` per placement.
+
 `get_canvas` gives a paint layer one line under its heading, never the points: how many
 brush strokes, eraser strokes, pictures (pasted, flattened or merged), fills, smudges,
 blurs, selections moved and selections cleared, and operations of a later version it

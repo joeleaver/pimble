@@ -328,6 +328,11 @@ pub struct StyleSpec {
     /// road's name in the road) or "below".
     #[serde(default)]
     pub along_side: Option<String>,
+    /// scatter: a tint over every placement, "#rrggbbaa" (the alpha is how
+    /// far the symbol's colors move toward the color: "#2e7d32ff" all the
+    /// way, "#2e7d3266" a little).
+    #[serde(default)]
+    pub tint: Option<String>,
 }
 
 /// A gradient. Its handles are in the element's own box: [0,0] is its
@@ -498,6 +503,107 @@ pub struct AddElementsParams {
     pub elements: Vec<ElementSpec>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct AddSymbolParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// Its name (default "Symbol 1", "Symbol 2", ...).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The elements it is drawn from, bottom to top, as add_elements takes
+    /// them, in the symbol's own space: 0,0 is where each placement puts it
+    /// (draw a tree with its foot or its middle at 0,0). Shapes, paths, pen
+    /// strokes, text and pictures; no connectors, node cards, spotlights or
+    /// scatters.
+    #[serde(default)]
+    pub elements: Vec<ElementSpec>,
+    /// Or elements already on the canvas (ids; a group or frame brings its
+    /// members): copies of them become the symbol, centered on what they
+    /// cover.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// With `ids`: keep them on the canvas. By default they are replaced by
+    /// one scatter placing the symbol where they were, so the canvas looks
+    /// the same and they can be placed again.
+    #[serde(default)]
+    pub keep: Option<bool>,
+    /// Add `elements` to this existing symbol (its id or name) instead of
+    /// making one: every scatter of it changes.
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ScatterParams {
+    /// The canvas node, or the note whose text holds the canvas.
+    pub node: String,
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
+    #[serde(default)]
+    pub canvas: Option<String>,
+    /// The symbol placed (its id or name; add_symbol makes one).
+    pub symbol: String,
+    /// Placements, each [x, y] or [x, y, scale, rotation] (canvas units,
+    /// degrees clockwise): where the symbol's 0,0 goes. The jitter below
+    /// varies them too.
+    #[serde(default)]
+    pub placements: Vec<Vec<f32>>,
+    /// Or fill a region with seeded placements: a closed element of this
+    /// canvas (a rectangle, ellipse, polygon, star, frame or closed path; its
+    /// id), "forest in this polygon" in one call.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Or a region as SVG path data, canvas units (closed or not, it is
+    /// filled as a fill would be).
+    #[serde(default)]
+    pub d: Option<String>,
+    /// Region fill: placements per 10,000 square units (a hectare when a unit
+    /// is a meter). Or give `spacing`.
+    #[serde(default)]
+    pub density: Option<f32>,
+    /// Region fill: about this many units apart (default 40).
+    #[serde(default)]
+    pub spacing: Option<f32>,
+    /// Region fill: "poisson" (the default: natural, none closer than the
+    /// spacing) or "grid" (a jittered grid, rows you can see at little
+    /// jitter).
+    #[serde(default)]
+    pub method: Option<String>,
+    /// grid: how far each point strays from its cell, 0 to 1 (default 0.8).
+    #[serde(default)]
+    pub position_jitter: Option<f32>,
+    /// The seed the variations are drawn from (default 1): the same call with
+    /// the same seed places the same.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Every placement's scale (default 1).
+    #[serde(default)]
+    pub size: Option<f32>,
+    /// How much the scale varies either way, 0 to 0.95.
+    #[serde(default)]
+    pub size_jitter: Option<f32>,
+    /// How far the rotation varies either way, degrees (180: any angle).
+    #[serde(default)]
+    pub rotation_jitter: Option<f32>,
+    /// Every placement's tint, "#rrggbbaa" (the alpha is how far the
+    /// symbol's colors move toward it).
+    #[serde(default)]
+    pub tint: Option<String>,
+    /// How much each placement's color varies, 0 to 1: lighter and darker
+    /// without a tint, around the tint's color with one.
+    #[serde(default)]
+    pub tint_jitter: Option<f32>,
+    /// Append to this scatter (its id) instead of making a new one.
+    #[serde(default)]
+    pub into: Option<String>,
+    /// The layer a new scatter goes in (name or id); a region's scatter goes
+    /// just above the region's element otherwise.
+    #[serde(default)]
+    pub layer: Option<String>,
+}
+
 /// A change to one element: only what is given changes.
 #[derive(Deserialize, JsonSchema, Clone, Default)]
 pub struct ElementChange {
@@ -560,7 +666,7 @@ pub struct ElementChange {
     /// too), cap, join, miter, radius, sides, points, inner, fill_gradient,
     /// stroke_gradient (clearing fill or stroke clears its gradient too),
     /// font, bold, italic, halo_color, halo_width, tracking, along,
-    /// along_offset, along_side.
+    /// along_offset, along_side, tint.
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -578,6 +684,9 @@ pub struct ElementChange {
     /// Its place in its layer: "top", "bottom", "above:<id>" or "below:<id>".
     #[serde(default)]
     pub order: Option<String>,
+    /// scatter: the symbol it draws from now on (its id or name).
+    #[serde(default)]
+    pub symbol: Option<String>,
     /// Lock or unlock it. Unlocking is the one change a locked element takes.
     #[serde(default)]
     pub locked: Option<bool>,
@@ -1165,6 +1274,7 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         along: None,
         along_offset: spec.along_offset.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
         along_side: spec.along_side.as_deref().and_then(|s| AlongSide::parse(s.trim())),
+        tint: spec.tint.as_deref().map(|s| color(s, "tint")).transpose()?,
     })
 }
 
@@ -1280,6 +1390,7 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "bold" => StyleKey::Bold,
         "italic" => StyleKey::Italic,
         "halo_color" => StyleKey::HaloColor,
+        "tint" => StyleKey::Tint,
         "halo_width" => StyleKey::HaloWidth,
         "tracking" => StyleKey::Tracking,
         "along" => StyleKey::Along,
@@ -1419,6 +1530,7 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         spec.points.as_ref().ok_or_else(|| bad(format!("a {what} needs points")))?.iter().map(|p| point(p, "each point")).collect()
     };
     let geom = match &kind {
+        Kind::Scatter => return Err(bad("a scatter is made with the scatter tool (a symbol and its placements, or a region to fill)")),
         Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star | Kind::Frame | Kind::Spotlight => {
             Geom::Rect(rect(kind.as_str(), None)?)
         }
@@ -1549,7 +1661,7 @@ fn rect_of_geom(geom: &Geom, points: &[[f32; 3]]) -> Rect {
             .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0)),
         Geom::Connector { from, to } => Rect::from_points(from.last_point(), to.last_point()),
         Geom::Path(p) => p.bounds().unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0)),
-        Geom::None => Rect::new(0.0, 0.0, 0.0, 0.0),
+        Geom::None | Geom::Scatter => Rect::new(0.0, 0.0, 0.0, 0.0),
     }
 }
 
@@ -1662,6 +1774,24 @@ fn placement(order: &str, resolve: &dyn Fn(&str) -> Result<String, BoardError>) 
     })
 }
 
+/// A symbol named by its id or its name (any case).
+fn symbol_id(snapshot: &BoardSnapshot, given: &str) -> Result<String, BoardError> {
+    let given = given.trim();
+    if let Some(s) = snapshot.symbol(given) {
+        return Ok(s.id.clone());
+    }
+    let named: Vec<&std::sync::Arc<pimble_board::scatter::SymbolDef>> = snapshot.symbols.iter().filter(|s| s.name.eq_ignore_ascii_case(given)).collect();
+    match named.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] if snapshot.symbols.is_empty() => Err(bad(format!("this canvas has no symbols yet; add_symbol makes one (\"{given}\" names none)"))),
+        [] => Err(bad(format!(
+            "this canvas has no symbol \"{given}\"; its symbols: {}",
+            snapshot.symbols.iter().map(|s| format!("\"{}\" ({})", s.name, s.id)).collect::<Vec<_>>().join(", ")
+        ))),
+        _ => Err(bad(format!("several symbols are named \"{given}\"; name one by its id: {}", named.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")))),
+    }
+}
+
 /// Whether a change names anything of an element's geometry.
 fn change_names_geometry(c: &ElementChange) -> bool {
     [c.x, c.y, c.w, c.h].iter().any(Option::is_some)
@@ -1680,7 +1810,12 @@ fn change_names_geometry(c: &ElementChange) -> bool {
 /// written first) and its layer is not locked.
 fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardSnapshot, change: &ElementChange, index: usize) -> Result<(), BoardError> {
     let id = change.id.trim().to_string();
-    let element = snapshot.get(&id).ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")))?;
+    // An element of a symbol's definition changes like any other (and every
+    // scatter of the symbol with it).
+    let element = snapshot
+        .get(&id)
+        .or_else(|| snapshot.symbols.iter().flat_map(|s| s.elements.iter()).find(|e| e.raw.id == id))
+        .ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")))?;
     if element.raw.locked && change.locked == Some(false) {
         t.set_locked(&id, false)?;
     }
@@ -1767,9 +1902,14 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
                 }
                 None
             }
+            Geom::Scatter => return Err(bad("a scatter's placements are added with the scatter tool (`into` its id); move it with move_by")),
             Geom::None => None,
         }
     };
+    if let Some(symbol) = change.symbol.as_deref() {
+        let symbol = symbol_id(snapshot, symbol)?;
+        t.set_scatter_symbol(&id, &symbol)?;
+    }
     if let Some(geom) = geom.filter(|g| *g != raw_geom) {
         t.set_geom(&id, &geom)?;
     }
@@ -1949,6 +2089,9 @@ fn style_text(style: &Style) -> Vec<String> {
             s.push_str(&format!(" {}", side.as_str()));
         }
         out.push(s);
+    }
+    if let Some(t) = style.tint {
+        out.push(format!("tint {}", t.to_hex()));
     }
     out
 }
@@ -2132,6 +2275,7 @@ fn element_weight(e: &pimble_board::RawElement) -> usize {
         Geom::Picture(p) => p.src.len() + 60,
         Geom::Card { link, .. } => link.len() + 40,
         Geom::Connector { .. } => 120,
+        Geom::Scatter => e.scatter.as_ref().map_or(0, |s| s.placements.len() * pimble_board::scatter::PLACEMENT_BYTES + s.chunk_ends.len() * 8),
         _ => 0,
     };
     420 + e.points.len() * 14 + text + fields + geom
@@ -2217,6 +2361,33 @@ fn size_warning(doc_bytes: usize) -> String {
     )
 }
 
+/// The canvas's symbols: each with its id, how many elements it holds
+/// (their ids, which update_elements and delete_elements change), what it
+/// covers around its origin, and how many scatters draw it.
+fn symbols_text(snapshot: &BoardSnapshot) -> String {
+    let mut out = format!("symbols: {} (drawn only through scatters; placements put a symbol's 0,0 where they are)\n", snapshot.symbols.len());
+    for s in &snapshot.symbols {
+        let used: Vec<&pimble_board::Element> =
+            snapshot.elements.iter().filter(|e| e.raw.scatter.as_ref().is_some_and(|sc| sc.symbol == s.id)).collect();
+        let placements: usize = used.iter().filter_map(|e| e.raw.scatter.as_ref()).map(|sc| sc.placements.len()).sum();
+        let ids: Vec<String> = s.elements.iter().map(|e| format!("{} {}", e.raw.id, e.raw.kind)).collect();
+        out.push_str(&format!(
+            "- symbol {} \"{}\": {} element{} ({}){}; {} scatter{}, {} placement{}\n",
+            s.id,
+            s.name,
+            s.elements.len(),
+            if s.elements.len() == 1 { "" } else { "s" },
+            ids.join(", "),
+            s.bounds.map(|b| format!(", {}", rect_text(&b))).unwrap_or_else(|| ", drawing nothing".into()),
+            used.len(),
+            if used.len() == 1 { "" } else { "s" },
+            placements,
+            if placements == 1 { "" } else { "s" },
+        ));
+    }
+    out
+}
+
 fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, listing: &Listing<'_>) -> String {
     let with_field = listing.with_field;
     let mut out = String::new();
@@ -2236,6 +2407,9 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
         out.push_str("markup: hidden (only pictures show; set_canvas markup_visible shows it)\n");
     }
     out.push_str(&format!("elements: {}\n", snapshot.elements.len()));
+    if !snapshot.symbols.is_empty() {
+        out.push_str(&symbols_text(snapshot));
+    }
     let sizes = layer_sizes(snapshot, listing.doc_bytes, listing.whole_doc);
     if let Some(bytes) = listing.doc_bytes {
         out.push_str(&format!(
@@ -2370,6 +2544,11 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
                     link
                 ),
                 Geom::Stroke => format!("{} points within {}", raw.points.len(), rect_text(&e.bounds)),
+                Geom::Scatter => format!(
+                    "{}{}",
+                    pimble_board::scatter::describe(e),
+                    if e.has_extent { format!(" within {}", rect_text(&e.bounds)) } else { ", drawing nothing".to_string() }
+                ),
                 Geom::Path(p) => {
                     let d = to_d(p);
                     let rule = if p.rule == PathRule::EvenOdd { ", rule evenodd" } else { "" };
@@ -3376,6 +3555,196 @@ impl Pimble {
             .canvas_edit_sized(&target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
             .await?;
         Ok(format!("Added to {}:\n{}{}", target.what(), made(&p.elements, &ids), size_warning(doc_bytes)))
+    }
+
+    /// Make a symbol (docs/DRAWING_WAVE6_CONTRACT.md section 2): a few
+    /// elements kept as a definition, drawn only where a scatter places it,
+    /// so one tree drawn once becomes a forest of thousands (the scatter
+    /// tool) that changes everywhere when the tree is edited (update_elements
+    /// on the symbol's element ids, which get_canvas lists under "symbols").
+    /// From element specs in the symbol's own space, or from elements already
+    /// on the canvas (`ids`, replaced by one placement of the symbol unless
+    /// `keep`). Answers the symbol's id.
+    #[tool(name = "add_symbol")]
+    async fn add_symbol(&self, Parameters(p): Parameters<AddSymbolParams>) -> Result<String, String> {
+        if p.elements.is_empty() == p.ids.is_empty() {
+            return Err("Give either `elements` (drawn in the symbol's own space) or `ids` (elements on the canvas), not both.".into());
+        }
+        if !p.ids.is_empty() && p.symbol.is_some() {
+            return Err("`symbol` adds `elements` to a symbol; `ids` always make a new one.".into());
+        }
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let prepared = self.prepare(target.addr, &p.elements).await?;
+        let name = p.name.clone().unwrap_or_default();
+        if !p.ids.is_empty() {
+            let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
+            let keep = p.keep == Some(true);
+            let made = self
+                .canvas_edit(&target, prepared, move |t, scene, _| {
+                    let made = t.make_symbol(&ids, &name, keep)?;
+                    scene.touched.extend(made.instance.clone());
+                    Ok(made)
+                })
+                .await?;
+            return Ok(match made.instance {
+                Some(instance) => format!(
+                    "Made symbol {} of {} element{} on {}; they were replaced by scatter {instance}, one placement where they were (the scatter tool places it again).",
+                    made.symbol,
+                    p.ids.len(),
+                    if p.ids.len() == 1 { "" } else { "s" },
+                    target.what()
+                ),
+                None => format!("Made symbol {} of copies of {} element{} on {} (they stay where they are).", made.symbol, p.ids.len(), if p.ids.len() == 1 { "" } else { "s" }, target.what()),
+            });
+        }
+        let specs: Vec<ElementSpec> = p.elements.iter().cloned().map(|mut s| {
+            s.layer = None;
+            s
+        }).collect();
+        let existing = p.symbol.clone();
+        let (symbol, ids) = self
+            .canvas_edit(&target, prepared, move |t, scene, snapshot| {
+                let symbol = match existing.as_deref() {
+                    Some(given) => symbol_id(snapshot, given)?,
+                    None => t.create_symbol(&name)?,
+                };
+                let key = pimble_board::scatter::symbol_key(&symbol);
+                scene.layers.push(LayerInfo { id: key.clone(), name: key.clone(), group: false });
+                for e in snapshot.symbols.iter().flat_map(|s| s.elements.iter()) {
+                    scene.elements.insert(e.raw.id.clone(), e.bounds);
+                }
+                let ids = add_specs(t, scene, &specs, Some(&key))?;
+                // Nothing of a symbol shows where it is defined.
+                scene.touched.clear();
+                Ok((symbol, ids))
+            })
+            .await?;
+        Ok(format!(
+            "{} symbol {symbol} on {}; its elements:\n{}\nPlace it with the scatter tool (a list of placements, or a region to fill).",
+            if p.symbol.is_some() { "Added to" } else { "Made" },
+            target.what(),
+            made(&p.elements, &ids)
+        ))
+    }
+
+    /// Place a symbol many times as one compact element, a scatter (16 bytes
+    /// a placement: 25,000 trees are about 400 KB, not 25,000 elements):
+    /// a list of placements, or a region filled with seeded placements
+    /// (`region`, a closed element's id, or `d`) at a `density` or `spacing`,
+    /// varied by size, rotation and tint jitter. `into` appends to a scatter.
+    /// Editing the symbol changes every placement; update_elements sets a
+    /// scatter's `symbol` and its `tint` (style), move_by moves it all.
+    #[tool(name = "scatter")]
+    async fn scatter(&self, Parameters(p): Parameters<ScatterParams>) -> Result<String, String> {
+        use pimble_board::scatter::{FillMethod, Jitter, Placement as Placed, RegionFill, Rng};
+        let ways = [!p.placements.is_empty(), p.region.is_some(), p.d.is_some()].iter().filter(|w| **w).count();
+        if ways != 1 {
+            return Err("Give one of `placements` (a list), `region` (a closed element's id) or `d` (a region's path data).".into());
+        }
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let tint = p.tint.as_deref().map(|s| color(s, "tint")).transpose().map_err(|e| said(&e))?;
+        let jitter = Jitter {
+            size: p.size.unwrap_or(1.0),
+            size_jitter: p.size_jitter.unwrap_or(0.0),
+            rotation_jitter: p.rotation_jitter.unwrap_or(0.0),
+            tint: tint.unwrap_or(Color::TRANSPARENT),
+            tint_jitter: p.tint_jitter.unwrap_or(0.0),
+        };
+        let method = match p.method.as_deref().map(str::trim) {
+            None | Some("") => FillMethod::Poisson,
+            Some(m) => FillMethod::parse(m).ok_or_else(|| format!("method \"{m}\" is not \"poisson\" or \"grid\"."))?,
+        };
+        let spacing = match (p.spacing, p.density) {
+            (Some(_), Some(_)) => return Err("Give `density` or `spacing`, not both.".into()),
+            (Some(s), None) if s.is_finite() && s > 0.0 => s,
+            (Some(_), None) => return Err("`spacing` is a distance above 0.".into()),
+            // A Poisson-disk fill at least `r` apart holds about 0.68 / r²
+            // per unit of area; a grid exactly 1 / r².
+            (None, Some(d)) if d.is_finite() && d > 0.0 => match method {
+                FillMethod::Poisson => (0.68 * 10_000.0 / d).sqrt(),
+                FillMethod::Grid => (10_000.0 / d).sqrt(),
+            },
+            (None, Some(_)) => return Err("`density` is a number of placements per 10,000 square units, above 0.".into()),
+            (None, None) => 40.0,
+        };
+        let seed = p.seed.unwrap_or(1);
+        let fill = RegionFill { spacing, position_jitter: p.position_jitter.unwrap_or(0.8), method, seed, jitter };
+        let list: Vec<Placed> = p
+            .placements
+            .iter()
+            .enumerate()
+            .map(|(i, v)| match v.as_slice() {
+                [x, y] | [x, y, ..] if v.len() <= 4 && x.is_finite() && y.is_finite() => {
+                    let mut rng = Rng::at(seed, i as u64);
+                    let mut placed = jitter.place(*x, *y, &mut rng);
+                    if let Some(scale) = v.get(2) {
+                        placed.scale = (scale * (placed.scale / jitter.size.max(1e-3))).clamp(1.0 / 1024.0, pimble_board::scatter::MAX_SCALE);
+                    }
+                    if let Some(rot) = v.get(3) {
+                        placed.rotation += rot;
+                    }
+                    Ok(placed)
+                }
+                _ => Err(format!("placement {} is not [x, y] or [x, y, scale, rotation].", i + 1)),
+            })
+            .collect::<Result<_, _>>()?;
+        let region_d = match p.d.as_deref() {
+            Some(d) => {
+                let path = path_of(d, None).map_err(|e| said(&e))?;
+                let tiny = path.to_tiny().ok_or("That path data draws nothing.")?;
+                Some(pimble_board::clip::Clip::of_path(tiny, path.rule.to_tiny()).ok_or("That path data encloses nothing.")?)
+            }
+            None => None,
+        };
+        let (symbol_given, region, into, layer) = (p.symbol.clone(), p.region.clone(), p.into.clone(), p.layer.clone());
+        let ((id, count, name, appended), doc_bytes) = self
+            .canvas_edit_sized(&target, (HashMap::new(), HashMap::new()), move |t, scene, snapshot| {
+                let symbol = symbol_id(snapshot, &symbol_given)?;
+                let name = snapshot.symbol(&symbol).map(|s| s.name.clone()).unwrap_or_default();
+                let layer = scene.named_layer(layer.as_deref(), None)?;
+                let placements: Vec<Placed> = match (&region, &region_d) {
+                    (Some(region), _) => {
+                        let id = scene.id(region)?;
+                        let e = snapshot.get(&id).ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas")))?;
+                        let clip = pimble_board::clip::Clip::of_element(e).ok_or_else(|| bad(pimble_board::scatter::NEEDS_CLOSED_SHAPE))?;
+                        if into.is_none() {
+                            let (made, n) = t.scatter_in_region(&clip, &symbol, &fill, Some(layer.as_deref().unwrap_or(&e.layer)), layer.is_none().then_some(id.as_str()))?;
+                            scene.touched.push(made.clone());
+                            return Ok((made, n, name, false));
+                        }
+                        pimble_board::scatter::fill_region(&clip, &fill).map_err(BoardError::Invalid)?
+                    }
+                    (None, Some(clip)) => pimble_board::scatter::fill_region(clip, &fill).map_err(BoardError::Invalid)?,
+                    (None, None) => list,
+                };
+                let n = placements.len();
+                let id = match &into {
+                    Some(into) => {
+                        let into = scene.id(into)?;
+                        if snapshot.get(&into).is_none_or(|e| e.raw.kind != Kind::Scatter) {
+                            return Err(bad(format!("{into} is not a scatter")));
+                        }
+                        if snapshot.get(&into).and_then(|e| e.raw.scatter.as_ref()).is_some_and(|sc| sc.symbol != symbol) {
+                            return Err(bad(format!("scatter {into} places another symbol; give its own, or update_elements its `symbol`")));
+                        }
+                        t.append_placements(&into, &placements)?;
+                        into
+                    }
+                    None => t.add_scatter(layer.as_deref(), &symbol, &placements, None)?,
+                };
+                scene.touched.push(id.clone());
+                Ok((id, n, name, into.is_some()))
+            })
+            .await?;
+        Ok(format!(
+            "{} {} placement{} of symbol \"{name}\" {} scatter {id} on {}.{}",
+            if appended { "Appended" } else { "Placed" },
+            count,
+            if count == 1 { "" } else { "s" },
+            if appended { "to" } else { "as" },
+            target.what(),
+            size_warning(doc_bytes)
+        ))
     }
 
     /// Change elements of a canvas: position, size, points, a path's outline
@@ -4680,6 +5049,109 @@ mod tests {
         assert!(refused.contains("takes a src or a file"), "{refused}");
         let refused = pimble.paint(jp(serde_json::json!({ "node": "Maps/Relief", "pictures": [{ "src": "pimble-blob:nope", "x": 0, "y": 0 }] }))).await.unwrap_err();
         assert!(refused.contains("is not a pimble-blob: URL"), "{refused}");
+        let _ = server.stop().await;
+    }
+
+    /// Symbols and scatters through the tools (docs/DRAWING_WAVE6_CONTRACT.md
+    /// section 2): a symbol from specs and one from elements on the canvas, a
+    /// list of placements and a region filled at a density in one call,
+    /// appending into a scatter, get_canvas and get_elements showing them
+    /// compactly, the symbol's element recolored and a scatter's symbol and
+    /// tint changed through update_elements, the SVG export, the refusals.
+    #[tokio::test]
+    async fn symbols_and_scatters_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        let url = format!("http://{}", server.addr());
+        let service = pimble_client::PimbleClient::connect(&url).await.unwrap();
+        service.create_store(dir.path().join("maps.pimble"), "Maps").await.unwrap();
+        let pimble = super::super::Pimble::new(std::sync::Arc::new(crate::connection::Connection::with_client(pimble_client::PimbleClient::connect(&url).await.unwrap())));
+        pimble.create_canvas(jp(serde_json::json!({ "parent": "Maps", "title": "County" }))).await.unwrap();
+
+        let made = pimble
+            .add_symbol(jp(serde_json::json!({ "node": "Maps/County", "name": "Oak", "elements": [
+                { "kind": "rect", "x": -2, "y": 0, "w": 4, "h": 10, "style": { "fill": "#6d4c41", "width": 0 } },
+                { "kind": "ellipse", "x": -10, "y": -18, "w": 20, "h": 20, "style": { "fill": "#2e7d32", "width": 0 } },
+            ] })))
+            .await
+            .unwrap();
+        assert!(made.starts_with("Made symbol "), "{made}");
+        let oak = made.split_whitespace().nth(2).unwrap().to_string();
+        let woods = pimble
+            .add_elements(jp(serde_json::json!({ "node": "Maps/County", "elements": [
+                { "kind": "polygon", "ref": "woods", "x": 0, "y": 0, "w": 2000, "h": 1000, "style": { "fill": "#e8f5e9" } },
+            ] })))
+            .await
+            .unwrap();
+        let woods = woods.lines().find(|l| l.contains("(woods)")).and_then(|l| l.split_whitespace().nth(1)).unwrap_or_else(|| panic!("{woods}")).to_string();
+
+        // A region at a density, by name, in one call.
+        let filled = pimble
+            .scatter(jp(serde_json::json!({ "node": "Maps/County", "symbol": "oak", "region": woods, "density": 10, "size_jitter": 0.3, "rotation_jitter": 10, "tint_jitter": 0.5, "seed": 3 })))
+            .await
+            .unwrap();
+        assert!(filled.starts_with("Placed "), "{filled}");
+        let count: usize = filled.split_whitespace().nth(1).unwrap().replace(',', "").parse().unwrap();
+        // About 1,500,000 square units of polygon at 10 a hectare: ~1,000 (a
+        // hexagon fills about 65% of its box: ~1,300 in the box).
+        assert!((500..2000).contains(&count), "{filled}");
+        let forest = filled.split_whitespace().find(|w| w.len() == 16 && w.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or_else(|| panic!("{filled}")).to_string();
+        // A list, appended into it.
+        let more = pimble
+            .scatter(jp(serde_json::json!({ "node": "Maps/County", "symbol": oak, "into": forest, "placements": [[2100, 50], [2150, 60, 2, 45]] })))
+            .await
+            .unwrap();
+        assert!(more.starts_with("Appended 2 placements"), "{more}");
+
+        // Read back compactly.
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(read.contains(&format!("symbol {oak} \"Oak\": 2 elements")), "{read}");
+        let grouped = format!("{},{:03}", (count + 2) / 1000, (count + 2) % 1000);
+        assert!(read.contains(&format!("{forest} scatter {grouped} placements of symbol \"Oak\" within")), "{read}");
+        let elements = pimble.get_elements(jp(serde_json::json!({ "node": "Maps/County", "ids": [forest.clone()] }))).await.unwrap();
+        assert!(elements.contains(&format!("\"placements\": {}", count + 2)) || elements.contains(&format!("\"placements\":{}", count + 2)), "{elements}");
+        assert!(elements.len() < 2000, "compact: {} bytes", elements.len());
+
+        // The symbol's crown recolored through update_elements: every tree.
+        let crown = read
+            .lines()
+            .find(|l| l.contains(&format!("symbol {oak}")))
+            .and_then(|l| l.split(" ellipse").next())
+            .and_then(|l| l.rsplit(' ').next())
+            .unwrap()
+            .to_string();
+        pimble.update_elements(jp(serde_json::json!({ "node": "Maps/County", "changes": [{ "id": crown, "style": { "fill": "#c62828" } }] }))).await.unwrap();
+        // A scatter's tint, and another symbol made from elements on the canvas.
+        pimble.update_elements(jp(serde_json::json!({ "node": "Maps/County", "changes": [{ "id": forest, "style": { "tint": "#0000ff40" } }] }))).await.unwrap();
+        let pine = pimble
+            .add_elements(jp(serde_json::json!({ "node": "Maps/County", "elements": [{ "kind": "star", "ref": "p", "x": 3000, "y": 0, "w": 30, "h": 40, "style": { "fill": "#1b5e20" } }] })))
+            .await
+            .unwrap();
+        let pine_el = pine.lines().find(|l| l.contains("(p)")).and_then(|l| l.split_whitespace().nth(1)).unwrap().to_string();
+        let pine = pimble.add_symbol(jp(serde_json::json!({ "node": "Maps/County", "name": "Pine", "ids": [pine_el] }))).await.unwrap();
+        assert!(pine.contains("replaced by scatter"), "{pine}");
+        let pine_id = pine.split_whitespace().nth(2).unwrap().to_string();
+        pimble.update_elements(jp(serde_json::json!({ "node": "Maps/County", "changes": [{ "id": forest, "symbol": "Pine" }] }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(read.contains("placements of symbol \"Pine\"") && read.contains("tint #0000ff40"), "{read}");
+        assert!(read.contains(&format!("symbol {pine_id} \"Pine\"")), "{read}");
+
+        // SVG: the symbol once, a use per placement.
+        let svg = pimble.export_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
+        assert!(svg.contains("<symbol ") && svg.matches("<use ").count() >= count, "{} uses", svg.matches("<use ").count());
+
+        // Refusals: no such symbol, two ways at once, a region that is open.
+        let refused = pimble.scatter(jp(serde_json::json!({ "node": "Maps/County", "symbol": "Birch", "placements": [[0, 0]] }))).await.unwrap_err();
+        assert!(refused.contains("no symbol \"Birch\""), "{refused}");
+        let refused = pimble.scatter(jp(serde_json::json!({ "node": "Maps/County", "symbol": "Oak", "placements": [[0, 0]], "region": woods }))).await.unwrap_err();
+        assert!(refused.contains("Give one of"), "{refused}");
+        let refused = pimble.add_elements(jp(serde_json::json!({ "node": "Maps/County", "elements": [{ "kind": "scatter", "x": 0, "y": 0 }] }))).await.unwrap_err();
+        assert!(refused.contains("scatter tool"), "{refused}");
         let _ = server.stop().await;
     }
 }
