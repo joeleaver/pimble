@@ -1,0 +1,10 @@
+{
+  "name": "pimble-diagnostics",
+  "private": true,
+  "type": "module",
+  "description": "Alpha diagnostics server for Pimble (docs/DIAGNOSTICS_CONTRACT.md)",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}

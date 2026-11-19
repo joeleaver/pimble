@@ -4815,6 +4815,7 @@ pub fn run(renderer: Renderer) {
 
     let (store, app_component) = build_view();
     crate::update::start(store);
+    crate::diagnostics_ui::notice_once(store);
 
     // One spec, two shells: `crates/pimble-app/src/menus.rs` says what the
     // menus hold and which target each item belongs on, so the browser's menu

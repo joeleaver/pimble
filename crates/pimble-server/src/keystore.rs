@@ -113,6 +113,7 @@ impl Keystore {
                 KeystoreData::default()
             }
         };
+        crate::diagnostics::set_account(data.account.as_ref().map(|a| a.user_id.clone()));
         Self { path, data: RwLock::new(data) }
     }
 
@@ -129,6 +130,7 @@ impl Keystore {
     ) -> io::Result<()> {
         let snapshot = {
             let mut data = self.data.write().await;
+            crate::diagnostics::set_account(Some(user_id.clone()));
             data.account = Some(AccountSession {
                 url,
                 email,
@@ -150,6 +152,7 @@ impl Keystore {
         let snapshot = {
             let mut data = self.data.write().await;
             data.account = None;
+            crate::diagnostics::set_account(None);
             data.clone()
         };
         self.write_atomic(&snapshot).await

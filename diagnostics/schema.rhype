@@ -1,0 +1,54 @@
+// Alpha diagnostics: what Pimble sends (docs/DIAGNOSTICS_CONTRACT.md).
+
+// One record line, as the app sent it. `data` is kept whole; `text` is a
+// log line's or a panic's message, for search.
+type Record {
+    v: u32
+    install: String @indexed
+    session: String @indexed
+    seq: u64
+    ts: DateTime @indexed
+    received: DateTime
+    app: String @indexed
+    os: String
+    kind: String @indexed
+    account: String @indexed
+    text: String @fulltext
+    data: Json
+}
+
+// A "Send Diagnostics..." report. `body` is the report as sent with each
+// log's text replaced by its length; the text is in its `ReportPart`s.
+type Report {
+    code: String @unique
+    install: String @indexed
+    account: String @indexed
+    session: String
+    app: String
+    os: String
+    ts: DateTime @indexed
+    received: DateTime @indexed
+    note: String
+    body: Json
+}
+
+// Part `n` of the text of a report's log `log` (its place in `logs`).
+type ReportPart {
+    code: String @indexed
+    log: u32
+    n: u32
+    text: String
+}
+
+// What each install has sent, kept as it arrives (the query language has
+// no count). `account` is the last account id a record or report carried.
+type Install {
+    install: String @unique
+    account: String @indexed
+    first_seen: DateTime
+    last_seen: DateTime
+    app: String
+    os: String
+    records: u64
+    reports: u64
+}

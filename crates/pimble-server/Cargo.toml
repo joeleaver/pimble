@@ -32,6 +32,8 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
 dirs = "6"
+# Diagnostics records go gzipped (src/diagnostics.rs).
+flate2 = "1"
 # HTTP-edge auth middleware (docs/history/HARDENING_CONTRACT.md decision 1), wired
 # onto jsonrpsee via `Server::builder().set_http_middleware(...)`. Pinned to
 # the same major version jsonrpsee-server 0.24 depends on internally: the

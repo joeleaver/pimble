@@ -18,14 +18,15 @@ use rmcp::ServiceExt;
 #[tokio::main]
 async fn main() {
     pimble_server::local::set_host_kind("mcp");
-    tracing_subscriber::fmt()
-        .with_writer(pimble_server::logs::LogWriter::default())
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    pimble_server::diagnostics::start("mcp");
+    {
+        use tracing_subscriber::prelude::*;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(pimble_server::logs::LogWriter::default()).with_filter(filter))
+            .with(pimble_server::diagnostics::Layer.with_filter(tracing_subscriber::filter::LevelFilter::INFO))
+            .init();
+    }
 
     // Large canvases are decoded and copied per call; hand freed room back.
     pimble_server::memory::spawn_memory_trimmer(std::time::Duration::from_secs(5));
@@ -47,4 +48,5 @@ async fn main() {
         Err(e) => tracing::error!("the MCP session could not start: {e}"),
     }
     conn.shut_down().await;
+    pimble_server::diagnostics::quit();
 }

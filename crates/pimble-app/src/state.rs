@@ -850,6 +850,9 @@ pub struct AppStore {
     /// Help > About (`about.rs`): whether it is open, where updating stands,
     /// and the version of the server this window talks to.
     pub about_open: Signal<bool>,
+    /// Settings > Diagnostics opened as the first start's notice
+    /// (`diagnostics_ui::notice_once`): its heading says so.
+    pub diagnostics_notice: Signal<bool>,
     pub update_status: Signal<UpdateStatus>,
     pub server_version: Signal<Option<ServerVersion>>,
 
@@ -1164,6 +1167,7 @@ impl AppStore {
             notice: Signal::new(String::new()),
             update_ready: Signal::new(None),
             about_open: Signal::new(false),
+            diagnostics_notice: Signal::new(false),
             update_status: Signal::new(UpdateStatus::NotInstalled),
             server_version: Signal::new(None),
             link_open: Signal::new(None),

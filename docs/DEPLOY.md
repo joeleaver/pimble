@@ -194,6 +194,15 @@ jkbase logs -f --service pimble    # tail the hosted Pimble server
 jkbase deployments                 # history; jkbase rollback --version N to revert
 ```
 
+## Alpha diagnostics (pimble-diagnostics)
+
+A jkbase project of its own: `diagnostics/` (its README has the first deploy and the
+endpoints; docs/DIAGNOSTICS_CONTRACT.md is the contract). Deploy with `cd diagnostics &&
+jkbase deploy`. Secrets `SEND_KEY` (also the repository secret `PIMBLE_DIAGNOSTICS_KEY`,
+which release.yml builds into the app and `pimble-mcp`) and `READ_KEY`, both kept in
+`~/.config/pimble-release/`. Read it with `tools/diagnostics.sh stats | export | reports |
+report <code>`.
+
 ## Running the full stack locally
 
 Four pieces, four terminals. None of this touches jkbase.

@@ -126,13 +126,24 @@ fn main() {
     // (docs/DIAGNOSTICS_CONTRACT.md section 1), and standard error where a
     // window program has one.
     pimble_server::logs::open("pimble");
-    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(pimble_server::logs::LogWriter { quiet: cfg!(windows) }).init();
+    // Alpha diagnostics (docs/DIAGNOSTICS_CONTRACT.md), beside the log, with
+    // a level filter of their own: what they record does not depend on
+    // RUST_LOG.
+    pimble_server::diagnostics::start("app");
+    {
+        use tracing_subscriber::prelude::*;
+        let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(pimble_server::logs::LogWriter { quiet: cfg!(windows) }).with_filter(filter))
+            .with(pimble_server::diagnostics::Layer.with_filter(tracing_subscriber::filter::LevelFilter::INFO))
+            .init();
+    }
 
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
     pimble_app::app::run(renderer);
+    pimble_server::diagnostics::quit();
 }
 
 /// Hand `link` to a Pimble window on this computer's server; whether one took

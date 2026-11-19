@@ -2624,6 +2624,49 @@ impl RpcHandler {
         Ok(effect)
     }
 
+    /// A diagnostics `stores` record (docs/DIAGNOSTICS_CONTRACT.md section 2)
+    /// a moment after stores open or close, once they have settled: each
+    /// open store's id, name, place on disk, kind, role, sync state, size,
+    /// waiting documents and shared roots. Nothing when diagnostics are off.
+    pub(crate) fn record_stores_soon(&self) {
+        if crate::diagnostics::ids().is_none() {
+            return;
+        }
+        let handler = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let ids = handler.store_manager.read().await.list_stores();
+            let mut stores = Vec::new();
+            for store_id in ids {
+                let (info, access, docs, roots) = {
+                    let manager = handler.store_manager.read().await;
+                    let Ok(info) = manager.get_store_info(store_id) else { continue };
+                    (info, manager.store_access(store_id), manager.doc_ids(store_id).map(|d| d.len()).unwrap_or(0), manager.scope_roots(store_id))
+                };
+                let path = match &info.location {
+                    pimble_core::StoreLocation::Local { path } => path.to_string_lossy().into_owned(),
+                    other => format!("{other:?}"),
+                };
+                let sync = handler.sync_state_of(store_id).await;
+                let waiting = handler.waiting_of(store_id).await.len();
+                stores.push(serde_json::json!({
+                    "id": store_id.to_string(),
+                    "name": info.name,
+                    "path": path,
+                    "kind": format!("{:?}", info.kind),
+                    "sync_mode": format!("{:?}", info.sync_mode),
+                    "replica": info.is_replica,
+                    "access": format!("{access:?}"),
+                    "sync": format!("{sync:?}"),
+                    "documents": docs,
+                    "waiting": waiting,
+                    "scope_roots": roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                }));
+            }
+            crate::diagnostics::record("stores", serde_json::json!({ "stores": stores }));
+        });
+    }
+
     /// Repair `store_id`'s tree once no structural update has landed for
     /// [`REPAIR_DEBOUNCE`] (see [`Repair`]).
     pub(crate) fn schedule_repair(&self, store_id: StoreId) {
@@ -4079,6 +4122,7 @@ impl PimbleApiServer for RpcHandler {
 
         self.describe_link(&mut store).await;
         self.mark_replica(&mut store);
+        self.record_stores_soon();
 
         Ok(OpenStoreResponse { store })
     }
@@ -4112,6 +4156,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
         drop(manager);
         self.pictures.forget_store(request.store_id);
+        self.record_stores_soon();
 
         // Clean up subscriptions for this store
         self.subscriptions.write().await.remove_store(request.store_id);

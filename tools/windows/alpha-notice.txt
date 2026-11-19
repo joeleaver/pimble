@@ -1,0 +1,18 @@
+Pimble is an alpha, and it sends diagnostics
+
+While Pimble is being tested, every copy sends its developers what they need to
+see what went wrong:
+
+- warnings and errors, and how syncing and sharing go;
+- your stores' names and where they are on disk;
+- your computer's kind: Windows version, processor, memory.
+
+It never sends anything you wrote in a note, your notes' titles, your email
+address, or any password or key.
+
+Records carry a random install number, and your account's number (not your
+email) when you are signed in, so your devices and both ends of a share can be
+read together.
+
+Turn it off at any time in Settings > Diagnostics. Turned off, nothing more is
+sent and what waits on this computer is deleted.

@@ -19,6 +19,7 @@ pub enum Section {
     Plugins,
     Agents,
     Updates,
+    Diagnostics,
 }
 
 impl Section {
@@ -26,7 +27,7 @@ impl Section {
     /// is always the version pimble.app serves.
     pub fn all() -> &'static [Section] {
         if cfg!(feature = "native") {
-            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates]
+            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates, Section::Diagnostics]
         } else {
             &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins]
         }
@@ -41,6 +42,7 @@ impl Section {
             Section::Plugins => "Plugins",
             Section::Agents => "AI Agents",
             Section::Updates => "Updates",
+            Section::Diagnostics => "Diagnostics",
         }
     }
 
@@ -53,6 +55,7 @@ impl Section {
             Section::Plugins => "plugins",
             Section::Agents => "agents",
             Section::Updates => "updates",
+            Section::Diagnostics => "diagnostics",
         }
     }
 
@@ -92,6 +95,7 @@ fn choose(store: AppStore, section: Section) {
 /// typed password, an agent's key shown once).
 fn close(store: AppStore) {
     store.settings.set(None);
+    store.diagnostics_notice.set(false);
     crate::app::account_hidden(store);
     crate::plugins::hidden();
     #[cfg(feature = "native")]
@@ -127,6 +131,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
     let pages = {
         let agents = crate::agents::render_page(__scope, store);
         let updates = render_updates(__scope, store);
+        let diagnostics = crate::diagnostics_ui::render_page(__scope, store);
         rsx! {
             div {
                 class: "pimble-settings__page",
@@ -137,6 +142,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
                 div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
                 div { style: {move || page_style(store, Section::Agents)}, {agents} }
                 div { style: {move || page_style(store, Section::Updates)}, {updates} }
+                div { style: {move || page_style(store, Section::Diagnostics)}, {diagnostics} }
             }
         }
     };

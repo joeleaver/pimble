@@ -10,6 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Built into the app and pimble-mcp: the key that may only send alpha
+  # diagnostics (docs/DIAGNOSTICS_CONTRACT.md). Reading takes another.
+  PIMBLE_DIAGNOSTICS_KEY: ${{ secrets.PIMBLE_DIAGNOSTICS_KEY }}
 
 permissions:
   contents: write

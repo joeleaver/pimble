@@ -1,6 +1,6 @@
 # Diagnostics for alpha testers (draft, 2026-11-19)
 
-Status: **decisions answered by Joe 2026-11-19** (section 7). Wave 1 built 2026-11-19 (section 8); waves 2 and 3 not started.
+Status: **decisions answered by Joe 2026-11-19** (section 7). Waves 1 and 2 built 2026-11-19 (section 8), the server deployed; wave 3 not started.
 
 Why: the "Shared with Will" faults of 2026-11-19 took hours to diagnose from one side only.
 Joe's journal showed the symptoms (a repair storm, edits held back), and the cause was on
@@ -118,4 +118,19 @@ Diagnostics..." for when something goes wrong.
    log lines that printed a note's title name it by id now.
 2. The queue, the uploader, `system`/`log`/`stores`/`panic`/`previous_run`, the server,
    `tools/diagnostics.sh`; the notice and the switch.
+   **Built 2026-11-19**: `pimble_server::diagnostics` (the `Layer` in the app's and
+   `pimble-mcp`'s subscribers, the queue under `<data dir>/pimble/diagnostics/`, shared by
+   every program of the computer: a file is renamed `sending-<session>-...` by the one that
+   sends it, and one left that way ten minutes goes back; a `running-<session>` file per run
+   for `previous_run`, skipped while its process lives); the account id from the keystore;
+   `stores` three seconds after a store opens or closes; Settings > Diagnostics (desktop),
+   opened once at the first start that sends, as the notice; the notice on the download page
+   and as the Windows Setup's first page (`tools/windows/alpha-notice.txt`). The server is
+   `diagnostics/` (jkbase project `pimble-diagnostics`, deployed; its README), with reports
+   (`POST /v1/reports`, an 8-character code) ready for wave 3. Builds carry the send key
+   from the repository secret `PIMBLE_DIAGNOSTICS_KEY` (release.yml); a build without it,
+   any local one, sends nothing. Keys: `~/.config/pimble-release/diagnostics-send-key` and
+   `diagnostics-read-key` on Joe's machine. Verified end to end against `diagnostics/dev.sh`
+   (system, log, stores and previous_run records; the home folder written `~`). No `report`
+   record kind: reports have their endpoint.
 3. "Send Diagnostics..." in both apps; the browser's records.

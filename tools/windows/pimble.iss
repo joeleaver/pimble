@@ -38,6 +38,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutDir}
 OutputBaseFilename=pimble-{#AppVersion}-windows-x86_64-setup
 SetupIconFile=..\..\assets\brand\pimble.ico
+; The alpha's diagnostics, said before anything is installed
+; (docs/DIAGNOSTICS_CONTRACT.md section 6).
+InfoBeforeFile=alpha-notice.txt
 UninstallDisplayIcon={app}\pimble.exe
 UninstallDisplayName=Pimble
 WizardStyle=modern

@@ -1,0 +1,17 @@
+[project]
+name = "pimble-diagnostics"
+# Local tools and tests are not deployed.
+ignore = ["README.md", "test", "dev.sh", ".data"]
+
+[servers.api]
+source = "."
+language = "node"
+port = 8080
+health_check = { path = "/v1/health", interval = "10s", timeout = "5s" }
+
+[database]
+schema = "schema.rhype"
+size = "2GiB"
+
+[routes]
+"/*" = { service = "server", name = "api" }
