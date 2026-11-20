@@ -178,6 +178,7 @@ sensible statuses):
 | `POST /logout` | session | deletes the session |
 | `GET /me` | session | `{ id, email }` |
 | `POST /token` | session | mints a fresh JWT with the current grants: `{ token, exp, rpc_url }` where `rpc_url` is `wss://<host>/rpc` |
+| | | A session lasts 30 days from its last use (2026-11-19; before, 30 days from sign-in): any request that finds less than 29 days left pushes it back to 30, and `/token` sets the cookie again when it came in one. |
 | `GET /stores` | session | `[ { store_id, name, role, created_at } ]` |
 | `POST /stores` `{name}` | session | creates the store on the Pimble server (`createStore` with path `<PIMBLE_STORES_DIR>/<new uuid>.pimble`), records it and an owner grant |
 | `DELETE /stores/{id}` | owner | marks `deleted`, removes grants; the server-side directory stays (deletion on disk is a later phase) |

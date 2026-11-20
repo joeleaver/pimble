@@ -1012,6 +1012,12 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| session_from_object(&o)).transpose()
     }
 
+    /// Move a session's expiry (renewal while it is used).
+    pub async fn renew_session(&self, session_rid: u64, expires_at_ms: i64) -> CloudResult<()> {
+        self.objects(&format!("Session.get({session_rid}).update({{ expires_at: {} }})", datetime_literal(expires_at_ms))).await?;
+        Ok(())
+    }
+
     pub async fn delete_session(&self, session_rid: u64) -> CloudResult<()> {
         self.objects(&format!("Session.get({session_rid}).delete()")).await?;
         Ok(())

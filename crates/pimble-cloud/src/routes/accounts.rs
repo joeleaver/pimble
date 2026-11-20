@@ -42,7 +42,7 @@ use crate::mail::{recovery_email, verification_email};
 use crate::session::{build_clear_cookie, build_set_cookie, AuthedUser};
 use crate::state::AppState;
 
-const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+use crate::session::SESSION_TTL_MS;
 /// "24 h expiry" (docs/CLOUD_CONTRACT.md, "Phase 1b").
 const VERIFY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// "1 hour" (docs/CRYPTO_CONTRACT.md, "Phase 2a-2").
@@ -698,7 +698,15 @@ pub struct StoreEndpoint {
     exp: i64,
 }
 
-pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<Json<TokenResponse>> {
+pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<(axum::http::HeaderMap, Json<TokenResponse>)> {
+    // A session renewed by this request (the browser's cookie): set again,
+    // so the cookie lasts as long as the session now does.
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(token) = &authed.renewed_cookie {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&build_set_cookie(token, state.config.cookie_secure())) {
+            headers.insert(axum::http::header::SET_COOKIE, v);
+        }
+    }
     let (claims, relayed) = claims_and_relayed_for_user(&state, &authed.user).await?;
     // One more token per relayed store, minted together: with jkbase-Auth
     // each is a round trip.
@@ -712,7 +720,7 @@ pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> Cl
         }
     }));
     let (minted, stores) = futures::future::try_join(state.signer.mint(&authed.user.user_uuid, claims.clone()), per_store).await?;
-    Ok(Json(TokenResponse { token: minted.token, exp: minted.exp, rpc_url: rpc_url(&state), stores }))
+    Ok((headers, Json(TokenResponse { token: minted.token, exp: minted.exp, rpc_url: rpc_url(&state), stores })))
 }
 
 /// `wss://<host>/rpc` (or `ws://` for a plain-http `PIMBLE_CLOUD_PUBLIC_URL`,

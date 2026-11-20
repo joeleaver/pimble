@@ -4335,3 +4335,30 @@ async fn names_per_share_and_no_emails_between_members() {
     let resp = put(&cy_cookie, format!("{}/me/shares/{store_id}", stack.base_url), json!({ "root": root, "name": "Mallory" })).await.unwrap();
     assert_eq!(resp.status(), 403);
 }
+
+/// A session in use is renewed (2026-11-19: a desktop that ran every day lost
+/// its sign-in on day 30). One with a day or two left, used, lasts 30 days
+/// again, and the browser is handed its cookie anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_in_use_is_renewed_and_its_cookie_set_again() {
+    let stack = skip_without_rhypedb!();
+    let (_, cookie) = signup_verify_login(&stack, "renew@example.com", "correct horse battery").await;
+    let token = cookie.strip_prefix("pimble_session=").unwrap().to_string();
+    let hash = pimble_cloud::auth::hash_session_token(&token);
+    let session = stack.app_state.db.find_session_by_token_hash(&hash).await.unwrap().unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    stack.app_state.db.renew_session(session.rid, now + 2 * 24 * 60 * 60 * 1000).await.unwrap();
+
+    let resp = stack.http.post(format!("{}/token", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let set = resp.headers().get("set-cookie").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+    assert!(set.starts_with(&cookie) && set.contains("Max-Age=2592000"), "the cookie is set again: {set:?}");
+    let after = stack.app_state.db.find_session_by_token_hash(&hash).await.unwrap().unwrap();
+    assert!(after.expires_at_ms > now + 29 * 24 * 60 * 60 * 1000, "30 days from now again");
+
+    // Used again at once: no write, no cookie.
+    let resp = stack.http.post(format!("{}/token", stack.base_url)).header("Authorization", format!("Bearer {token}")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("set-cookie").is_none());
+    assert_eq!(stack.app_state.db.find_session_by_token_hash(&hash).await.unwrap().unwrap().expires_at_ms, after.expires_at_ms);
+}
