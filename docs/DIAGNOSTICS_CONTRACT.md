@@ -1,6 +1,6 @@
 # Diagnostics for alpha testers (draft, 2026-11-19)
 
-Status: **decisions answered by Joe 2026-11-19** (section 7). Waves 1 and 2 built 2026-11-19 (section 8), the server deployed; wave 3 not started.
+Status: **decisions answered by Joe 2026-11-19** (section 7). All three waves built 2026-11-19 (section 8), the server deployed.
 
 Why: the "Shared with Will" faults of 2026-11-19 took hours to diagnose from one side only.
 Joe's journal showed the symptoms (a repair storm, edits held back), and the cause was on
@@ -134,3 +134,15 @@ Diagnostics..." for when something goes wrong.
    (system, log, stores and previous_run records; the home folder written `~`). No `report`
    record kind: reports have their endpoint.
 3. "Send Diagnostics..." in both apps; the browser's records.
+   **Built 2026-11-19**: Help > "Send Diagnostics..." (`pimble_app::diagnostics_ui`, both
+   apps; `BackendCommand::SendDiagnostics`, `BackendEvent::DiagnosticsSent`): a note and
+   Send, answered with the report's code. The desktop sends the last 8 MB of each of
+   `pimble.log`, `pimble.previous.log`, `server.log` and `server.previous.log`, scrubbed, from
+   its own process (`pimble_server::diagnostics::send_report`), whether or not records are
+   on. The browser (`web/src/diagnostics.rs`) records as the desktop does, queued in
+   `localStorage` (1 MB), keeps its last 3,000 log lines for a report, and sends both through
+   the accounts service (`POST /api/v1/diagnostics/records` and `/reports`, session
+   required), which adds the send key (jkbase secret `PIMBLE_DIAGNOSTICS_KEY` on `pimble`)
+   and the account (`X-Pimble-Account`); no page carries the key. Settings > Diagnostics is
+   in both apps (`diagnostics_ui::Hooks`). Tests: `report_round_trip` (ignored; against
+   `dev.sh`, run once), `diagnostics_from_a_page_go_on_with_the_key_and_the_account`.

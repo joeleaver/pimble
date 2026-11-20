@@ -634,6 +634,77 @@ impl Uploader {
     }
 }
 
+// ── Help > Send Diagnostics... ──────────────────────────────────────────
+
+/// The most of one log a report carries: its last 8 MB.
+const REPORT_LOG_BYTES: usize = 8 << 20;
+
+/// Send a report (docs/DIAGNOSTICS_CONTRACT.md section 4): the last two runs'
+/// logs of the app and of an MCP-run server, scrubbed as records are, the
+/// open stores as the window knows them (`stores`), and the person's `note`.
+/// Sent whether or not diagnostics are on: pressing Send is the asking. The
+/// answer is the report's code, for the person to tell us. Blocking: call it
+/// off the UI thread.
+pub fn send_report(note: &str, stores: Value) -> Result<String, String> {
+    let key = send_key().ok_or_else(|| "This copy of Pimble cannot send diagnostics: it was built without the key (a development build).".to_string())?;
+    let dir = queue_dir().ok_or_else(|| "There is no folder to keep this computer's install number in.".to_string())?;
+    let _ = fs::create_dir_all(&dir);
+    let install = install_id(&dir.join("install-id"));
+    let session = ids().map(|(_, s)| s).unwrap_or_else(|| random_hex(16));
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    let scrubber = RECORDER.get().and_then(|r| r.scrubber.read().ok().map(|s| s.clone())).unwrap_or_else(|| Scrubber::new(home.as_deref()));
+    let mut logs = Vec::new();
+    if let Some(logs_dir) = crate::logs::dir() {
+        for name in ["pimble.log", "pimble.previous.log", "server.log", "server.previous.log"] {
+            let Ok(bytes) = fs::read(logs_dir.join(name)) else { continue };
+            let start = bytes.len().saturating_sub(REPORT_LOG_BYTES);
+            let text = String::from_utf8_lossy(&bytes[start..]);
+            let text: String = text.lines().map(|line| scrubber.scrub(line)).collect::<Vec<_>>().join("\n");
+            logs.push(json!({ "name": name, "text": text }));
+        }
+    }
+    let mut body = json!({
+        "v": V,
+        "install": install,
+        "session": session,
+        "app": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "ts": rfc3339(SystemTime::now()),
+        "note": scrubber.scrub(note),
+        "logs": logs,
+        "stores": scrub_value(&scrubber, stores),
+    });
+    if let Some(account) = ACCOUNT.read().ok().and_then(|a| a.clone()) {
+        body["account"] = Value::String(account);
+    }
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(body.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    let gz = gz.finish().map_err(|e| e.to_string())?;
+    let base = std::env::var("PIMBLE_DIAGNOSTICS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    runtime.block_on(async move {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().map_err(|e| e.to_string())?;
+        let answer = client
+            .post(format!("{base}/v1/reports"))
+            .header("Authorization", format!("Bearer {key}"))
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(gz)
+            .send()
+            .await
+            .map_err(|e| format!("Pimble's diagnostics server could not be reached ({e}). Try again when this computer is online."))?;
+        let status = answer.status();
+        let text = answer.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("Pimble's diagnostics server did not take the report ({status}: {}).", text.trim()));
+        }
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["report"].as_str().map(str::to_string))
+            .ok_or_else(|| "Pimble's diagnostics server answered without a report code.".to_string())
+    })
+}
+
 // ── Small helpers ─────────────────────────────────────────────────────
 
 fn install_id(path: &Path) -> String {
@@ -683,6 +754,22 @@ mod tests {
         let s = Scrubber::new(Some("/home/tester"));
         let v = scrub_value(&s, json!({"message": "at /home/tester/x for a@b.co", "list": ["/home/tester/y"], "n": 3}));
         assert_eq!(v, json!({"message": "at ~/x for <email>", "list": ["~/y"], "n": 3}));
+    }
+
+    /// Against a diagnostics server (`diagnostics/dev.sh`):
+    /// `PIMBLE_DIAGNOSTICS_URL=http://127.0.0.1:8788 PIMBLE_DIAGNOSTICS_KEY=dev-key
+    /// XDG_DATA_HOME=<scratch> cargo test -p pimble-server --lib report_round_trip -- --ignored`.
+    /// Point `XDG_DATA_HOME` somewhere scratch: the report reads the logs there.
+    #[test]
+    #[ignore = "needs a diagnostics server"]
+    fn report_round_trip() {
+        let logs = crate::logs::dir().unwrap();
+        fs::create_dir_all(&logs).unwrap();
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        fs::write(logs.join("pimble.log"), format!("INFO opened '{home}/Notes.pimble' for tester@example.com\nWARN something odd\n")).unwrap();
+        let code = send_report("The share stopped syncing.", json!({ "stores": [{ "name": "Notes" }] })).expect("a report code");
+        assert_eq!(code.len(), 8, "{code}");
+        eprintln!("REPORT {code}");
     }
 
     #[test]

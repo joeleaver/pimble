@@ -1,4 +1,5 @@
 mod accounts;
+mod diagnostics;
 mod misc;
 mod people;
 mod stores;
@@ -48,5 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/plugins/:file", get(misc::plugin_file))
         .route("/api/v1/.well-known/jwks.json", get(misc::jwks))
         .route("/api/v1/health", get(misc::health))
+        .route("/api/v1/diagnostics/records", post(diagnostics::records))
+        .route("/api/v1/diagnostics/reports", post(diagnostics::reports))
         .with_state(state)
 }

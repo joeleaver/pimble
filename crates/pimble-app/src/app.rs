@@ -3637,6 +3637,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.send(BackendCommand::CloudSignIn { url, email, password });
         };
         let about_modal = crate::about::render_about(__scope, store);
+        let send_diagnostics = crate::diagnostics_ui::render_send(__scope, store);
         // Settings > Account (docs/SETTINGS_CONTRACT.md section 2): the
         // sign-in form, or who is signed in. The browser signs in through its
         // own pages, so there it is a way to them.
@@ -4773,6 +4774,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {appearance_modal}
                 {settings_modal}
                 {about_modal}
+                {send_diagnostics}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
@@ -4807,6 +4809,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {appearance_modal}
                 {settings_modal}
                 {about_modal}
+                {send_diagnostics}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}

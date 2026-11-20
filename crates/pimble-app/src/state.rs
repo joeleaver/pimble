@@ -853,6 +853,12 @@ pub struct AppStore {
     /// Settings > Diagnostics opened as the first start's notice
     /// (`diagnostics_ui::notice_once`): its heading says so.
     pub diagnostics_notice: Signal<bool>,
+    /// Help > "Send Diagnostics..." (`diagnostics_ui`): open, the note being
+    /// written, sending, and what came of it (the report's code, or why not).
+    pub diagnostics_send_open: Signal<bool>,
+    pub diagnostics_note: Signal<String>,
+    pub diagnostics_sending: Signal<bool>,
+    pub diagnostics_sent: Signal<Option<Result<String, String>>>,
     pub update_status: Signal<UpdateStatus>,
     pub server_version: Signal<Option<ServerVersion>>,
 
@@ -1168,6 +1174,10 @@ impl AppStore {
             update_ready: Signal::new(None),
             about_open: Signal::new(false),
             diagnostics_notice: Signal::new(false),
+            diagnostics_send_open: Signal::new(false),
+            diagnostics_note: Signal::new(String::new()),
+            diagnostics_sending: Signal::new(false),
+            diagnostics_sent: Signal::new(None),
             update_status: Signal::new(UpdateStatus::NotInstalled),
             server_version: Signal::new(None),
             link_open: Signal::new(None),

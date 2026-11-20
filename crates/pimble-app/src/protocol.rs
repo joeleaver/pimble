@@ -323,6 +323,10 @@ pub enum BackendCommand {
     /// Whether an account is signed in, and as whom (`CloudStatusChanged`).
     /// The server's version, for Help > About. Answers with `ServerInfo`.
     ServerInfo,
+    /// Help > "Send Diagnostics..." (docs/DIAGNOSTICS_CONTRACT.md section 4):
+    /// the logs, the open stores as this window knows them, and the person's
+    /// note, to Pimble's developers. Answers with `DiagnosticsSent`.
+    SendDiagnostics { note: String, stores: serde_json::Value },
     CloudStatus,
     /// Sign in to the accounts service at `url` (`CloudStatusChanged` with
     /// `signed_in: true`, or `CloudError { op: SignIn }`).
@@ -710,6 +714,8 @@ pub enum BackendEvent {
     /// What `ServerInfo` asked: the server's version, `None` for a server
     /// from before 0.12.2, which has no `serverInfo`.
     ServerInfo { version: Option<String> },
+    /// What `SendDiagnostics` did: the report's code, or why it did not go.
+    DiagnosticsSent { result: Result<String, String> },
     CloudStatusChanged { signed_in: bool, email: Option<String>, user_id: Option<String>, url: Option<String> },
     /// How this computer's connections to Pimble Cloud are doing, heard from
     /// the server whenever it changes; `None` while signed out (desktop only:

@@ -1438,6 +1438,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::AgentsListed { agents } => crate::agents::listed(store, agents),
             BackendEvent::AgentCreated { agent, key } => crate::agents::created(store, agent, key),
             BackendEvent::AgentsError { message } => crate::agents::failed(store, message),
+            BackendEvent::DiagnosticsSent { result } => {
+                store.diagnostics_sending.set(false);
+                if result.is_ok() {
+                    store.diagnostics_note.set(String::new());
+                }
+                store.diagnostics_sent.set(Some(result.clone()));
+            }
+
             BackendEvent::ServerInfo { version } => {
                 store.server_version.set(Some(match version {
                     Some(v) => crate::state::ServerVersion::Known(v.clone()),

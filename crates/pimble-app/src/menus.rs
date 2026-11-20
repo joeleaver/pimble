@@ -65,7 +65,14 @@ pub fn menu_spec(store: AppStore) -> Vec<MenuSection> {
     sections.push(MenuSection { title: "Account", entries: account_entries(store) });
     sections.push(MenuSection { title: "Edit", entries: edit_entries(store) });
     sections.push(MenuSection { title: "View", entries: view_entries(store) });
-    sections.push(MenuSection { title: "Help", entries: vec![MenuEntry::item("About Pimble", "", move || crate::about::open_about(store))] });
+    sections.push(MenuSection {
+        title: "Help",
+        entries: vec![
+            MenuEntry::item("Send Diagnostics...", "", move || crate::diagnostics_ui::open_send(store)),
+            MenuEntry::Separator,
+            MenuEntry::item("About Pimble", "", move || crate::about::open_about(store)),
+        ],
+    });
     sections
 }
 

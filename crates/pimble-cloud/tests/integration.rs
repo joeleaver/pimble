@@ -393,6 +393,8 @@ async fn spawn_stack_inner(
         max_members_per_store: members_cap.unwrap_or(pimble_cloud::config::DEFAULT_MAX_MEMBERS_PER_STORE),
         // The contract's own numbers unless a relay test lowered them.
         relay: relay_limits.unwrap_or_default(),
+        diagnostics_url: "http://127.0.0.1:9".to_string(),
+        diagnostics_key: None,
     };
 
     let app_state = match mailer_override {
@@ -4361,4 +4363,63 @@ async fn a_session_in_use_is_renewed_and_its_cookie_set_again() {
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("set-cookie").is_none());
     assert_eq!(stack.app_state.db.find_session_by_token_hash(&hash).await.unwrap().unwrap().expires_at_ms, after.expires_at_ms);
+}
+
+/// The browser's diagnostics go through this service (docs/DIAGNOSTICS_CONTRACT.md
+/// section 5): passed on with the send key it holds and the signed-in
+/// account named; nothing without a session; 503 while no key is set.
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_from_a_page_go_on_with_the_key_and_the_account() {
+    let stack = skip_without_rhypedb!();
+    let (_, cookie) = signup_verify_login(&stack, "diag@example.com", "correct horse battery").await;
+
+    // No key: refused, and the page keeps what it queued.
+    let resp = stack.http.post(format!("{}/diagnostics/records", stack.base_url)).header("Cookie", &cookie).body("{}\n").send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+
+    // A stand-in diagnostics server that records what it is sent.
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>> = Default::default();
+    let app = {
+        let seen = seen.clone();
+        axum::Router::new().route(
+            "/v1/:what",
+            axum::routing::post(move |axum::extract::Path(what): axum::extract::Path<String>, headers: axum::http::HeaderMap, body: String| {
+                let seen = seen.clone();
+                async move {
+                    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                    seen.lock().unwrap().push((what.clone(), h("authorization"), h("x-pimble-account"), body));
+                    if what == "reports" { r#"{"report":"ABCD2345"}"#.to_string() } else { r#"{"accepted":1,"rejected":0}"#.to_string() }
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut config = stack.app_state.config.clone();
+    config.diagnostics_url = format!("http://{addr}");
+    config.diagnostics_key = Some("send-key".to_string());
+    let state = pimble_cloud::build_state(config).await.unwrap();
+    let router = pimble_cloud::router_from_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cloud = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{cloud}/api/v1");
+
+    let resp = stack.http.post(format!("{base}/diagnostics/records")).body("{\"kind\":\"log\"}\n").send().await.unwrap();
+    assert_eq!(resp.status(), 401, "no session, nothing goes");
+    let resp = stack.http.post(format!("{base}/diagnostics/records")).header("Cookie", &cookie).body("{\"kind\":\"log\"}\n").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = stack.http.post(format!("{base}/diagnostics/reports")).header("Cookie", &cookie).header("content-type", "application/json").body("{\"note\":\"x\"}").send().await.unwrap();
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["report"], "ABCD2345");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let user = stack.app_state.db.find_user_by_email("diag@example.com").await.unwrap().unwrap();
+    for (what, auth, account, _) in &seen {
+        assert_eq!(auth, "Bearer send-key", "{what} carries the service's key");
+        assert_eq!(account, &user.user_uuid, "{what} names the account");
+    }
+    assert_eq!(seen[0].3, "{\"kind\":\"log\"}\n");
 }

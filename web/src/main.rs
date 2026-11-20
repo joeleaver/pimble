@@ -21,6 +21,7 @@ mod accounts;
 mod api;
 mod app_page;
 mod backend;
+mod diagnostics;
 mod endpoints;
 mod http;
 mod keys;
@@ -46,9 +47,15 @@ pub fn start() {
     // through by the thousand, and the console keeps only the most recent
     // few hundred messages, so the app's own warnings were gone before anyone
     // could read them (found looking for one, 2026-09-21).
-    tracing_wasm::set_as_global_default_with_config(
-        tracing_wasm::WASMLayerConfigBuilder::new().set_max_level(tracing::Level::INFO).build(),
-    );
+    // Beside the console, the alpha's diagnostics (docs/DIAGNOSTICS_CONTRACT.md
+    // section 5), with Settings > Diagnostics reaching them.
+    diagnostics::start();
+    pimble_app::diagnostics_ui::set_hooks(diagnostics::hooks());
+    {
+        use tracing_subscriber::prelude::*;
+        let console = tracing_wasm::WASMLayer::new(tracing_wasm::WASMLayerConfigBuilder::new().set_max_level(tracing::Level::INFO).build());
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(console).with(diagnostics::Layer));
+    }
     let _ = console_log::init_with_level(log::Level::Info);
 
     shortcuts::install();

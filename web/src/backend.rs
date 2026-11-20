@@ -710,6 +710,15 @@ impl Web<'_> {
 
 /// One command: the account's and the page's own first, then [`route`].
 async fn dispatch(ctx: &mut Web<'_>, subscriptions: &mut Subscriptions, cmd: BackendCommand) {
+    // Help > "Send Diagnostics...": beside the loop, which goes on meanwhile.
+    if let BackendCommand::SendDiagnostics { note, stores } = cmd {
+        let (event_tx, signal_ui) = (ctx.event_tx.clone(), ctx.signal_ui.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::diagnostics::send_report(note, stores).await;
+            emit(&event_tx, &signal_ui, BackendEvent::DiagnosticsSent { result });
+        });
+        return;
+    }
     // A plugin's call runs beside the loop, a task of its own, through the
     // plugins' router; the router learns its stores first, as a command's
     // route does.

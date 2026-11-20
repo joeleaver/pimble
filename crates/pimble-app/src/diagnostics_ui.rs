@@ -1,10 +1,15 @@
-//! Settings > Diagnostics (docs/DIAGNOSTICS_CONTRACT.md sections 6-7): what
-//! this computer's Pimble sends while it is an alpha, the switch that turns it
-//! off, and the notice shown once, at the first start that sends any. The
-//! records themselves are `pimble_server::diagnostics`'.
+//! Alpha diagnostics in the window (docs/DIAGNOSTICS_CONTRACT.md sections 4,
+//! 6 and 7), the same in the desktop app and in the browser: Settings >
+//! Diagnostics (what is sent, the switch, the notice shown once) and Help >
+//! "Send Diagnostics..." (a report with a note, answered with a code). The
+//! records themselves are each target's own: `pimble_server::diagnostics` on
+//! the desktop, the web crate's in the browser, reached through [`Hooks`].
+
+use std::sync::OnceLock;
 
 use rinch::prelude::*;
 
+use crate::protocol::BackendCommand;
 use crate::state::AppStore;
 
 /// What is sent, said once for the page and the notice.
@@ -14,35 +19,75 @@ and your computer's kind (system, processor, memory). It never sends anything yo
 your notes' titles, your email address, or any password or key. When you are signed in, records \
 carry your account's number (not your email), so your devices and both ends of a share can be read together.";
 
-/// Whether this build sends anything at all (it carries the key).
-pub fn available() -> bool {
-    pimble_server::diagnostics::ids().is_some() || !pimble_server::diagnostics::settings().enabled
+/// How the window reaches this target's diagnostics.
+pub struct Hooks {
+    /// Whether diagnostics are on, and whether the notice was shown.
+    pub settings: fn() -> (bool, bool),
+    /// Save both.
+    pub save: fn(enabled: bool, noticed: bool) -> Result<(), String>,
+    /// This install's number, while diagnostics record.
+    pub install: fn() -> Option<String>,
+    /// Whether this copy sends at all (a build that carries the key, or a
+    /// page whose service takes them).
+    pub available: fn() -> bool,
 }
 
-/// At start: the notice, once, the first time this computer sends.
+static HOOKS: OnceLock<Hooks> = OnceLock::new();
+
+/// The browser's, set once at start before the window is built.
+pub fn set_hooks(hooks: Hooks) {
+    let _ = HOOKS.set(hooks);
+}
+
+#[cfg(feature = "native")]
+fn native_hooks() -> Hooks {
+    Hooks {
+        settings: || {
+            let s = pimble_server::diagnostics::settings();
+            (s.enabled, s.noticed)
+        },
+        save: |enabled, noticed| pimble_server::diagnostics::save_settings(&pimble_server::diagnostics::Settings { enabled, noticed }).map_err(|e| e.to_string()),
+        install: || pimble_server::diagnostics::ids().map(|(install, _)| install),
+        available: || pimble_server::diagnostics::ids().is_some(),
+    }
+}
+
+fn hooks() -> Option<&'static Hooks> {
+    #[cfg(feature = "native")]
+    {
+        Some(HOOKS.get_or_init(native_hooks))
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        HOOKS.get()
+    }
+}
+
+/// At start: the notice, once, the first time this copy sends.
 pub fn notice_once(store: AppStore) {
-    let mut settings = pimble_server::diagnostics::settings();
-    if settings.noticed || pimble_server::diagnostics::ids().is_none() {
+    let Some(h) = hooks() else { return };
+    let (enabled, noticed) = (h.settings)();
+    if noticed || !(h.available)() {
         return;
     }
-    settings.noticed = true;
-    let _ = pimble_server::diagnostics::save_settings(&settings);
+    let _ = (h.save)(enabled, true);
     store.diagnostics_notice.set(true);
     crate::settings::open_at(store, crate::settings::Section::Diagnostics);
 }
 
-/// The page.
+/// Settings > Diagnostics.
 pub fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let enabled = Signal::new(pimble_server::diagnostics::settings().enabled);
-    let install = pimble_server::diagnostics::ids().map(|(install, _)| install);
+    let enabled = Signal::new(hooks().map(|h| (h.settings)().0).unwrap_or(true));
+    let install = hooks().and_then(|h| (h.install)());
     let flip = move || {
-        let mut settings = pimble_server::diagnostics::settings();
-        settings.enabled = !untracked(|| enabled.get());
-        settings.noticed = true;
-        if pimble_server::diagnostics::save_settings(&settings).is_ok() {
-            enabled.set(settings.enabled);
+        let Some(h) = hooks() else { return };
+        let on = !untracked(|| enabled.get());
+        if (h.save)(on, true).is_ok() {
+            enabled.set(on);
         }
     };
+    let when = if cfg!(feature = "native") { "the next time Pimble starts" } else { "the next time this page loads" };
+    let wait = if cfg!(feature = "native") { "on this computer" } else { "in this browser" };
     rsx! {
         div {
             class: "pimble-settings__section",
@@ -61,13 +106,107 @@ pub fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
             div {
                 class: "pimble-settings__note",
                 {move || if enabled.get() {
-                    "Turned off, nothing more is sent and what waits on this computer is deleted.".to_string()
+                    format!("Turned off, nothing more is sent and what waits {wait} is deleted.")
                 } else {
-                    "Off: nothing is recorded or sent. Turned on, sending starts the next time Pimble starts.".to_string()
+                    format!("Off: nothing is recorded or sent. Turned on, sending starts {when}.")
                 }}
             }
+            div {
+                class: "pimble-settings__note",
+                "Help > Send Diagnostics... sends a report whenever something goes wrong, on or off."
+            }
             if let Some(install) = install.clone() {
-                div { class: "pimble-settings__note", {format!("This computer's install number: {install}")} }
+                div { class: "pimble-settings__note", {format!("This install's number: {install}")} }
+            }
+        }
+    }
+}
+
+/// Help > "Send Diagnostics...".
+pub fn open_send(store: AppStore) {
+    store.diagnostics_sent.set(None);
+    store.diagnostics_send_open.set(true);
+}
+
+/// The open stores as this window knows them: what a report says of them.
+fn stores_shape(store: AppStore) -> serde_json::Value {
+    let stores: Vec<serde_json::Value> = untracked(|| {
+        store.store_data.with(|map| {
+            map.values()
+                .map(|sig| {
+                    sig.with(|s| {
+                        serde_json::json!({
+                            "id": s.id.to_string(),
+                            "name": s.name,
+                            "kind": format!("{:?}", s.kind),
+                            "sync": format!("{:?}", s.sync_state),
+                            "replica": s.is_replica,
+                        })
+                    })
+                })
+                .collect()
+        })
+    });
+    serde_json::json!({ "stores": stores })
+}
+
+fn send(store: AppStore) {
+    if untracked(|| store.diagnostics_sending.get()) {
+        return;
+    }
+    store.diagnostics_sent.set(None);
+    store.diagnostics_sending.set(true);
+    let note = untracked(|| store.diagnostics_note.get());
+    store.send(BackendCommand::SendDiagnostics { note, stores: stores_shape(store) });
+}
+
+/// What the report sends, in a sentence.
+fn what_goes() -> &'static str {
+    if cfg!(feature = "native") {
+        "This sends Pimble's developers the log of this run and the last one (with your home folder, email addresses, keys and note titles taken out), your open stores' names and states, and what you write here. Nothing you wrote in your notes goes."
+    } else {
+        "This sends Pimble's developers what this page has logged since it loaded (with email addresses, keys and note titles taken out), your open stores' names and states, and what you write here. Nothing you wrote in your notes goes."
+    }
+}
+
+/// The window.
+pub fn render_send(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    rsx! {
+        Modal {
+            opened_fn: move || store.diagnostics_send_open.get(),
+            onclose: move || store.diagnostics_send_open.set(false),
+            title: "Send Diagnostics",
+            size: "md",
+            div {
+                style: "display: flex; flex-direction: column; gap: 10px;",
+                div { style: "font-size: 13px;", {what_goes()} }
+                Textarea {
+                    label: "What went wrong?",
+                    placeholder: "My edits to the shared note don't reach Joe.",
+                    value_fn: move || store.diagnostics_note.get(),
+                    oninput: move |val: String| store.diagnostics_note.set(val),
+                }
+                div {
+                    style: "font-size: 13px;",
+                    {move || match store.diagnostics_sent.get() {
+                        Some(Ok(code)) => format!("Sent. Its code is {code}: tell us that, and we can find it."),
+                        Some(Err(why)) => why,
+                        None if store.diagnostics_sending.get() => "Sending...".to_string(),
+                        None => String::new(),
+                    }}
+                }
+                div {
+                    style: "display: flex; gap: 8px; justify-content: flex-end;",
+                    Button { variant: "default", size: "xs", onclick: move || store.diagnostics_send_open.set(false), "Close" }
+                    Button {
+                        variant: "filled",
+                        size: "xs",
+                        loading: {|| store.diagnostics_sending.get()},
+                        disabled: {|| store.diagnostics_sending.get()},
+                        onclick: move || send(store),
+                        "Send"
+                    }
+                }
             }
         }
     }

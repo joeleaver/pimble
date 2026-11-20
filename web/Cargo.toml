@@ -83,6 +83,9 @@ log = "0.4"
 # `tracing` calls inside pimble-app reach the browser console through this.
 tracing = "0.1"
 tracing-wasm = "0.2"
+# The diagnostics layer beside the console's (src/diagnostics.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 # The conformance suite the vault runs, as the RPC backend does.

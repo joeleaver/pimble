@@ -22,7 +22,6 @@
 //! or writes a store is a call on `pimble_api::Pimble` ([`commands`]).
 
 pub mod about;
-#[cfg(feature = "native")]
 pub mod diagnostics_ui;
 pub mod agents;
 pub mod app;

@@ -29,7 +29,7 @@ impl Section {
         if cfg!(feature = "native") {
             &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins, Section::Agents, Section::Updates, Section::Diagnostics]
         } else {
-            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins]
+            &[Section::General, Section::Keyboard, Section::Account, Section::Shares, Section::Plugins, Section::Diagnostics]
         }
     }
 
@@ -114,6 +114,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
     let keyboard = render_keyboard(__scope);
     let plugins = crate::plugins::render_page(__scope, store);
     let shares = crate::shares::render_page(__scope, store);
+    let diagnostics = crate::diagnostics_ui::render_page(__scope, store);
     let nav = rsx! {
         div {
             class: "pimble-settings__nav",
@@ -131,7 +132,6 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
     let pages = {
         let agents = crate::agents::render_page(__scope, store);
         let updates = render_updates(__scope, store);
-        let diagnostics = crate::diagnostics_ui::render_page(__scope, store);
         rsx! {
             div {
                 class: "pimble-settings__page",
@@ -155,6 +155,7 @@ pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -
             div { style: {move || page_style(store, Section::Account)}, {account} }
             div { style: {move || page_style(store, Section::Shares)}, {shares} }
             div { style: {move || page_style(store, Section::Plugins)}, {plugins} }
+            div { style: {move || page_style(store, Section::Diagnostics)}, {diagnostics} }
         }
     };
     rsx! {

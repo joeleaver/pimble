@@ -77,6 +77,7 @@ pub fn start() {
         // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
         // section 6): the account this page is unlocked for.
         pimble_app::boards::set_author(session::user_id(), session::email());
+        crate::diagnostics::set_account(session::user_id());
         store.backend.set(Some(backend::spawn(session_token)));
         // An unlocked page is a signed-in account: its personal document
         // follows it (docs/DISCUSSIONS_CONTRACT.md section 8).
@@ -89,6 +90,7 @@ pub fn start() {
         if let Some(link) = take_open_link() {
             pimble_app::links::set_launch_link(link);
         }
+        pimble_app::diagnostics_ui::notice_once(store);
         route::mount_app(store, view);
     });
 }

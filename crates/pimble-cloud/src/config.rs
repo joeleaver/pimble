@@ -70,6 +70,13 @@ pub struct Config {
     /// environment variables; a field only so a test can reach a limit
     /// without sixty-four sockets, or an idle timeout without ninety seconds.
     pub relay: crate::relay::RelayLimits,
+    /// `PIMBLE_DIAGNOSTICS_URL` and `PIMBLE_DIAGNOSTICS_KEY`: where the web
+    /// app's alpha diagnostics go, and the send-only key they go with
+    /// (docs/DIAGNOSTICS_CONTRACT.md section 5). The browser sends through
+    /// this service, which adds the key, so no page carries it. Unset key:
+    /// `/diagnostics/*` answers 503 and the page keeps what it queued.
+    pub diagnostics_url: String,
+    pub diagnostics_key: Option<String>,
 }
 
 /// The value [`Config::from_env`] always uses for
@@ -99,6 +106,8 @@ impl Config {
             kdf_decoy_secret: env_var("PIMBLE_CLOUD_KDF_DECOY_SECRET"),
             max_members_per_store: DEFAULT_MAX_MEMBERS_PER_STORE,
             relay: crate::relay::RelayLimits::default(),
+            diagnostics_url: env_var("PIMBLE_DIAGNOSTICS_URL").unwrap_or_else(|| "https://pimble-diagnostics.jkbase.app".to_string()),
+            diagnostics_key: env_var("PIMBLE_DIAGNOSTICS_KEY"),
         }
     }
 
