@@ -515,11 +515,13 @@ impl Tree {
             if let Some(old_parent) = old_parent {
                 edit.push(old_parent, self.list_edit(old_parent, |d, txn| {
                     d.list_remove_all(txn, id);
+                    d.note_left(txn, id);
                 })?);
             }
             edit.push(new_parent, self.list_edit(new_parent, |d, txn| {
                 d.list_remove_all(txn, id);
                 d.list_place(txn, place, id);
+                d.clear_left(txn, id);
             })?);
         }
         let (_, update) = self.docs[&id].edit(|d, txn| {
@@ -572,6 +574,7 @@ impl Tree {
         if let Some(parent) = fields.parent_id.filter(|p| self.docs.contains_key(p)) {
             edit.push(parent, self.list_edit(parent, |d, txn| {
                 d.list_remove_all(txn, id);
+                d.note_left(txn, id);
             })?);
         }
         Ok(edit)
@@ -606,6 +609,7 @@ impl Tree {
         if let Some(old_parent) = fields.parent_id.filter(|&p| p != parent && self.docs.contains_key(&p)) {
             edit.push(old_parent, self.list_edit(old_parent, |d, txn| {
                 d.list_remove_all(txn, id);
+                d.note_left(txn, id);
             })?);
         }
         for member in self.collect_subtree(id, &|f| f.deleted_at.as_deref() == Some(stamp.as_str())) {
@@ -624,6 +628,7 @@ impl Tree {
         edit.push(parent, self.list_edit(parent, |d, txn| {
             d.list_remove_all(txn, id);
             d.list_insert(txn, None, id);
+            d.clear_left(txn, id);
         })?);
         Ok(edit)
     }
@@ -1047,6 +1052,9 @@ impl Tree {
             }
         }
 
+        // What each list's own document says left it (see `LEFT_PREFIX`).
+        let left: HashMap<NodeId, HashSet<NodeId>> = node_ids.iter().map(|&owner| (owner, self.docs[&owner].left_children())).filter(|(_, l)| !l.is_empty()).collect();
+
         // Step 1: effective parent for every node but the root.
         let mut raw_parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
         let mut effective_parent: HashMap<NodeId, NodeId> = HashMap::new();
@@ -1055,6 +1063,20 @@ impl Tree {
                 continue;
             }
             raw_parent.insert(id, parent);
+            // The parent it names says it left, and its list does not name it:
+            // this copy of the node is older than that parent's (the move or
+            // the deletion that took it out has not reached this device).
+            // Where it is now is not known here, so nothing is decided about
+            // it: no listing, no rewrite, no other list's entry judged by it
+            // (2026-11-19: a member's device lacking a note's tombstone put
+            // it back in the share's list after every repair the owner's
+            // made, thousands of times).
+            if let Some(p) = parent {
+                let names_it = lists.get(&p).is_some_and(|l| l.contains(&Some(id)));
+                if !names_it && left.get(&p).is_some_and(|l| l.contains(&id)) {
+                    continue;
+                }
+            }
             // Where its `parent_id` puts the node, with the issue that says
             // so when that is not simply "under the node it names".
             let (destination, issue) = match parent {
@@ -2174,6 +2196,82 @@ mod tests {
         assert!(a.get_children(fa).unwrap().is_empty());
         let loser = if winner == fb { root } else { fb };
         assert!(!a.get_children(loser).unwrap().contains(&child));
+    }
+
+    /// Only the parent's half of an edit reached `b`: the list document, not
+    /// the child's own (2026-11-19's loop, a member's device lacking a
+    /// note's tombstone).
+    fn deliver_only(edit: &TreeEdit, to: &mut Tree, ids: &[NodeId]) {
+        for (id, update) in &edit.touched {
+            if ids.contains(id) {
+                to.apply_update(*id, update).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_device_without_the_tombstone_leaves_the_deleted_child_out_of_its_list() {
+        let (mut a, root) = tree();
+        let (folder, note) = (id(), id());
+        a.add_node(folder, Some(root), Place::Last, "folder", "Shared", T1).unwrap();
+        a.add_node(note, Some(folder), Place::Last, "document", "Blinking", T1).unwrap();
+        let mut b = replica_of(&a);
+
+        let delete = a.remove_node(note, T2).unwrap();
+        deliver_only(&delete, &mut b, &[folder]);
+        assert!(b.has_node(note), "b still holds the note as live");
+        assert!(!b.doc(folder).unwrap().children().contains(&note));
+        // b's repair puts nothing back, and a's has nothing to take out.
+        if let Some(edit) = b.repair(T3).unwrap() {
+            apply_edit(&mut a, &edit);
+        }
+        assert!(!a.doc(folder).unwrap().children().contains(&note), "the deleted note stays out of the list");
+        assert!(a.repair(T3).unwrap().is_none() && b.repair(T3).unwrap().is_none(), "nothing for either to do: no loop");
+        // The tombstone arrives at last: the same tree on both.
+        sync_and_repair_round(&mut a, &mut b);
+        assert_converged(&mut a, &mut b);
+        assert!(!b.has_node(note));
+    }
+
+    #[test]
+    fn a_device_without_the_move_leaves_the_moved_child_where_it_went() {
+        let (mut a, root) = tree();
+        let (from, to, note) = (id(), id(), id());
+        a.add_node(from, Some(root), Place::Last, "folder", "From", T1).unwrap();
+        a.add_node(to, Some(root), Place::Last, "folder", "To", T1).unwrap();
+        a.add_node(note, Some(from), Place::Last, "document", "Note", T1).unwrap();
+        let mut b = replica_of(&a);
+
+        let moved = a.move_node(note, to, Place::Last, T2).unwrap();
+        deliver_only(&moved, &mut b, &[from, to]);
+        // b's copy of the note still names `from`; both lists say otherwise.
+        if let Some(edit) = b.repair(T3).unwrap() {
+            apply_edit(&mut a, &edit);
+        }
+        assert_eq!(a.doc(to).unwrap().children(), vec![note], "b took nothing out of `to`");
+        assert!(a.doc(from).unwrap().children().is_empty(), "and put nothing back in `from`");
+        sync_and_repair_round(&mut a, &mut b);
+        assert_converged(&mut a, &mut b);
+        assert_eq!(b.get_node_info(note).unwrap().parent_id, Some(to));
+    }
+
+    #[test]
+    fn putting_a_child_back_clears_what_said_it_left() {
+        let (mut a, root) = tree();
+        let (folder, other, note) = (id(), id(), id());
+        a.add_node(folder, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(other, Some(root), Place::Last, "folder", "O", T1).unwrap();
+        a.add_node(note, Some(folder), Place::Last, "document", "N", T1).unwrap();
+        a.remove_node(note, T2).unwrap();
+        assert!(a.doc(folder).unwrap().left_children().contains(&note));
+        a.undelete_node(note, T3).unwrap();
+        assert!(a.doc(folder).unwrap().left_children().is_empty(), "undelete clears it");
+        a.move_node(note, other, Place::Last, T3).unwrap();
+        assert!(a.doc(folder).unwrap().left_children().contains(&note));
+        a.move_node(note, folder, Place::Last, T3).unwrap();
+        assert!(a.doc(folder).unwrap().left_children().is_empty(), "moving back clears it");
+        assert!(a.doc(other).unwrap().left_children().contains(&note));
+        assert!(a.repair(T3).unwrap().is_none());
     }
 
     #[test]

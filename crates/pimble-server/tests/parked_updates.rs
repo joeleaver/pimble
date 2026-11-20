@@ -99,8 +99,9 @@ fn a_document_says_what_its_parked_update_waits_for() {
     assert_eq!(doc.text(), "Hello there, Will");
 }
 
-/// A device that lacks a child's tombstone puts the child back in its
-/// parent's list after every repair here takes it out. The server cannot
+/// A device that lacks a child's tombstone, and predates the `left:` record
+/// (docs/MOVE_CONTRACT.md "Repair"), puts the child back in its parent's
+/// list after every repair here takes it out. The server cannot
 /// settle that by repairing (each side is right by what it holds), so after
 /// a number of rounds it repairs that store only every 30 s, and the storm
 /// (three rounds a second, for as long as both stay connected) stops.
@@ -144,14 +145,19 @@ async fn a_repair_another_device_keeps_undoing_slows_down() {
     let mut rounds = 0;
     for _ in 0..30 {
         rounds += 1;
-        // The peer hears this server's list, repairs, and sends its repair.
+        // The peer hears this server's list and puts the note back, as a
+        // device from before 0.28.5 did (it ignores the `left:` record this
+        // version's repair heeds): an entry appended by hand.
         let list = manager.read().await.tree(store.store_id).unwrap().doc(folder).unwrap().save();
         peer.apply_update(folder, &list).unwrap();
-        if let Some(repair) = peer.repair("2026-11-19T00:00:00Z").unwrap() {
-            for (id, update) in repair.touched {
-                edit(&handler, store.store_id, id, &update).await;
-            }
-        }
+        let doc = peer.doc(folder).unwrap();
+        let mut copy = NodeDoc::load(&doc.save()).unwrap();
+        let before = copy.state_vector();
+        let at = copy.children().len();
+        copy.insert_child(at, child).unwrap();
+        let update = copy.diff_since(&before).unwrap();
+        peer.apply_update(folder, &update).unwrap();
+        edit(&handler, store.store_id, folder, &update).await;
         assert!(listed_here().await, "the peer put it back");
         tokio::time::sleep(Duration::from_millis(600)).await;
         if listed_here().await {

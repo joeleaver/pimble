@@ -130,6 +130,25 @@ back (below), and the owner can drag it back. It is vandalism an editor could al
 commit by deleting, made undoable. Joe, 2026-09-17: "if you share something, it can get
 vandalized."
 
+**What left a list is written in the list's own document** (2026-11-19). An operation
+that takes a child out of a list (a move away, a deletion, a transplant out, an
+undelete's move from a gone parent) writes `left:<child id>` on the list owner's `node`
+root, in the same transaction as the list edit; one that puts the child into a list (a
+move in, an undelete) removes that key there. A node whose stored parent records that it
+left, and whose list does not name it, is a copy older than its parent's: the move or the
+tombstone that took it out has not reached this device. Repair decides nothing about such
+a node (no listing, no rewrite, no other list's entry judged by it), as for a node whose
+parent is not held, until its own document catches up. Before this, a device holding an
+older copy of a deleted note put it back in the list after every repair that took it out
+on a device holding the tombstone: a share member's device and the owner's undid each
+other thousands of times in 72 minutes (the "Repair loops" note in
+docs/NODE_DOCUMENT_CONTRACT.md section 4). Moves had the same hole: an older copy of a
+moved node took it out of its new list. Repair itself never writes `left:` (a judgement
+of what is held must not be frozen into the documents), and devices older than 0.28.5
+ignore it, so a loop with one of them is still possible (then slowed and resent). The
+tests: `a_device_without_the_tombstone_leaves_the_deleted_child_out_of_its_list`,
+`a_device_without_the_move_leaves_the_moved_child_where_it_went` (`tree.rs`).
+
 Share upkeep (`crates/pimble-server/src/share.rs`): a published scope set is the union of
 what it was and what the root reaches now. Only stopping the share empties it.
 

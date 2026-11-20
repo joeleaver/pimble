@@ -1700,8 +1700,11 @@ async fn a_twenty_megabyte_document_goes_both_ways_through_the_relay() {
         member_device(&env, CAROL, &fx).await
     };
     assert!(wait_until(Duration::from_secs(90), || async { blob_len(&carol, store_id, fx.inside).await == big.len() && blob_len(&carol, store_id, fx.leaf).await == back.len() }).await, "a new member reads both");
+    // What waits is cleared as each link settles, a moment after the
+    // documents themselves arrive.
     for device in [&alice, &bob, &carol] {
-        assert!(device.get_store_sync_response(store_id).await.unwrap().waiting.is_empty(), "nothing waits");
+        let settled = wait_until(Duration::from_secs(15), || async { device.get_store_sync_response(store_id).await.unwrap().waiting.is_empty() }).await;
+        assert!(settled, "nothing waits: {:?}", device.get_store_sync_response(store_id).await.unwrap().waiting);
     }
 
     a.stop().await.unwrap();

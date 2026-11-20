@@ -96,6 +96,15 @@ const CUSTOM: &str = "custom";
 /// node's first field while apart would each make one, and one would be lost).
 pub const FIELD_PREFIX: &str = "field:";
 
+/// A key on a list owner's `node` root, `left:<child id>`: an operation (a
+/// move away, a deletion, a transplant) took that child out of this list,
+/// and none has put it back since (docs/MOVE_CONTRACT.md "Repair", 2026-11-19).
+/// It is the evidence, in the list's own document, that a device holding an
+/// older copy of the child (which still names this parent) must not put it
+/// back: before, such a device and one holding the newer copy undid each
+/// other's repair three times a second for as long as both were connected.
+pub const LEFT_PREFIX: &str = "left:";
+
 /// What the `node` root holds, read out as plain values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeFields {
@@ -1661,6 +1670,25 @@ impl NodeDoc {
             }
         };
         self.list_insert(txn, at, id);
+    }
+
+    /// Record that an operation took `id` out of this list.
+    pub(crate) fn note_left(&self, txn: &mut TransactionMut, id: NodeId) {
+        self.node.insert(txn, format!("{LEFT_PREFIX}{id}"), true);
+    }
+
+    /// An operation put `id` (back) into this list: the record goes.
+    pub(crate) fn clear_left(&self, txn: &mut TransactionMut, id: NodeId) {
+        let key = format!("{LEFT_PREFIX}{id}");
+        if self.node.get(txn, &key).is_some() {
+            self.node.remove(txn, &key);
+        }
+    }
+
+    /// The children an operation took out of this list and none put back.
+    pub(crate) fn left_children(&self) -> std::collections::HashSet<NodeId> {
+        let txn = self.doc.transact();
+        self.node.keys(&txn).filter_map(|k| k.strip_prefix(LEFT_PREFIX).and_then(|id| NodeId::parse(id).ok())).collect()
     }
 
     /// Remove every entry naming `id`; whether there was one.
