@@ -1659,8 +1659,10 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
     progress.parts.forget(&doc_id.as_str());
 
     let mut wants_a_key = false;
+    let mut incomplete = false;
     let mut unread: Option<String> = None;
     for unit in protocol::fetched_units(&fetch) {
+        incomplete |= matches!(unit, Unit::Incomplete);
         if let Some(seq) = unit.mark().and_then(|mark| mark.snapshot()) {
             progress.note_snapshot(doc_id, seq);
         }
@@ -1681,7 +1683,12 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
             Applying::Skipped => {}
         }
     }
-    if wants_a_key {
+    // A key that may come, or parts of a large change that did not all come
+    // in this read (another device stored a snapshot while it was paged, or
+    // the rest is still being appended): read again shortly, a few times,
+    // rather than at the next connect. Before 2026-11-19 an incomplete one
+    // waited for a reconnect, however long the connection lasted.
+    if wants_a_key || incomplete {
         progress.keyring.unread.entry(doc_id.as_str()).or_insert(UNREAD_RETRIES);
     } else {
         progress.keyring.unread.remove(&doc_id.as_str());

@@ -981,6 +981,7 @@ mod tests {
             snapshot_parts: Vec::new(),
             updates: sealed[..upto].iter().enumerate().map(|(i, blob)| VaultEntry { seq: i as u64 + 1, blob: blob.clone(), part: None }).collect(),
             head: upto as u64,
+            snapshot_seq: 0,
             keys,
             more: false,
         };
@@ -1051,6 +1052,7 @@ mod tests {
             snapshot_parts: Vec::new(),
             updates: vec![VaultEntry { seq: 7, blob: "u".into(), part: None }],
             head: 7,
+            snapshot_seq: 0,
             keys: None,
             more: false,
         };
@@ -1158,6 +1160,7 @@ mod tests {
             snapshot_parts: Vec::new(),
             updates: sealed.iter().enumerate().map(|(i, s)| VaultEntry { seq: i as u64 + 4, blob: s.blob.clone(), part: s.part }).collect(),
             head: 6,
+            snapshot_seq: 0,
             keys: None,
             more: false,
         };
@@ -1191,6 +1194,7 @@ mod tests {
             snapshot_parts: entries[1..].to_vec(),
             updates: vec![VaultEntry::whole(10, seal(store_id, node_id, key_id, &key, b"after"))],
             head: 10,
+            snapshot_seq: 0,
             keys: None,
             more: false,
         };

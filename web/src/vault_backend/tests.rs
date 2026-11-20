@@ -213,6 +213,7 @@ impl VaultWire for Twin {
             snapshot: first,
             snapshot_parts: snapshot.collect(),
             head: doc.head,
+            snapshot_seq: 0,
             updates: doc.entries.into_iter().filter(|e| e.seq > after_seq).collect(),
             keys: doc.keys,
             more: false,

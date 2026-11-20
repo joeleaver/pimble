@@ -1411,27 +1411,36 @@ impl PimbleClient {
         // A page at a time (docs/SYNC_LIMITS_CONTRACT.md): a document of
         // several parts never comes as one answer larger than a relay
         // between here and its server takes. An older server answers all
-        // of it at once and says nothing of `more`.
-        let mut fetched = self
-            .client
-            .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip: 0 })
-            .await
-            .map_err(rpc_error)?;
-        let mut skip = fetched.entry_count();
-        while fetched.more {
-            let page = self
+        // of it at once and says nothing of `more`. Pages are found by
+        // counting entries, so a snapshot stored between two of them shifts
+        // the rest: then the whole is asked again (`snapshot_seq`).
+        'again: for _ in 0..3 {
+            let mut fetched = self
                 .client
-                .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip })
+                .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip: 0 })
                 .await
                 .map_err(rpc_error)?;
-            let carried = page.entry_count();
-            fetched.extend(page);
-            if carried == 0 {
-                break;
+            let snapshot_seq = fetched.snapshot_seq;
+            let mut skip = fetched.entry_count();
+            while fetched.more {
+                let page = self
+                    .client
+                    .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip })
+                    .await
+                    .map_err(rpc_error)?;
+                if page.snapshot_seq != snapshot_seq {
+                    continue 'again;
+                }
+                let carried = page.entry_count();
+                fetched.extend(page);
+                if carried == 0 {
+                    break;
+                }
+                skip += carried;
             }
-            skip += carried;
+            return Ok(fetched);
         }
-        Ok(fetched)
+        Err(ClientError::Server { code: -32603, message: format!("the log of {doc_id:?} kept changing while it was read; reading it again later") })
     }
 
     /// Store a snapshot covering every update up to and including `upto_seq`.

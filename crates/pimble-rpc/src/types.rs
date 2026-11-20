@@ -238,6 +238,18 @@ pub struct VaultFetchResponse {
     /// answers everything at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub more: bool,
+    /// The seq of the document's snapshot when this answer was made, on every
+    /// page (0: none, or an older server). Pages are found by counting
+    /// entries, so a snapshot stored between two pages (a log compacted
+    /// after a large append) shifts them: a reader that sees this change
+    /// between pages starts again (2026-11-19: a member joining just after a
+    /// 20 MiB edit held part of it and waited for the rest for ever).
+    #[serde(default, skip_serializing_if = "is_zero_seq")]
+    pub snapshot_seq: u64,
+}
+
+fn is_zero_seq(n: &u64) -> bool {
+    *n == 0
 }
 
 impl VaultFetchResponse {

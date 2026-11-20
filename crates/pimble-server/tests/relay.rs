@@ -1699,12 +1699,17 @@ async fn a_twenty_megabyte_document_goes_both_ways_through_the_relay() {
         alice.cloud_share_invite(store_id, fx.shared, CAROL.0, MemberRole::Editor).await.unwrap();
         member_device(&env, CAROL, &fx).await
     };
-    assert!(wait_until(Duration::from_secs(90), || async { blob_len(&carol, store_id, fx.inside).await == big.len() && blob_len(&carol, store_id, fx.leaf).await == back.len() }).await, "a new member reads both");
-    // What waits is cleared as each link settles, a moment after the
-    // documents themselves arrive.
+    let both = wait_until(Duration::from_secs(90), || async { blob_len(&carol, store_id, fx.inside).await == big.len() && blob_len(&carol, store_id, fx.leaf).await == back.len() }).await;
+    assert!(
+        both,
+        "a new member reads both: has {} and {} of {} bytes, waiting on {:?}",
+        blob_len(&carol, store_id, fx.inside).await,
+        blob_len(&carol, store_id, fx.leaf).await,
+        big.len(),
+        carol.get_store_sync_response(store_id).await.map(|r| r.waiting)
+    );
     for device in [&alice, &bob, &carol] {
-        let settled = wait_until(Duration::from_secs(15), || async { device.get_store_sync_response(store_id).await.unwrap().waiting.is_empty() }).await;
-        assert!(settled, "nothing waits: {:?}", device.get_store_sync_response(store_id).await.unwrap().waiting);
+        assert!(device.get_store_sync_response(store_id).await.unwrap().waiting.is_empty(), "nothing waits");
     }
 
     a.stop().await.unwrap();

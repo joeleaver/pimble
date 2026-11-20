@@ -3270,6 +3270,7 @@ impl PimbleApiServer for RpcHandler {
         // A snapshot in parts: its first part where a whole one goes, so an
         // older reader meets a blob it cannot decrypt and applies nothing of
         // it, and the rest beside it.
+        let snapshot_seq = fetched.snapshot.as_ref().map(|s| s.seq).unwrap_or(0);
         let mut snapshot_entries: Vec<VaultEntry> = fetched
             .snapshot
             .as_ref()
@@ -3313,7 +3314,7 @@ impl PimbleApiServer for RpcHandler {
             updates = rest;
         }
         let snapshot = (!snapshot_entries.is_empty()).then(|| snapshot_entries.remove(0));
-        Ok(VaultFetchResponse { snapshot, snapshot_parts: snapshot_entries, updates, head: fetched.head, keys, more })
+        Ok(VaultFetchResponse { snapshot, snapshot_parts: snapshot_entries, updates, head: fetched.head, keys, more, snapshot_seq })
     }
 
     async fn vault_snapshot(&self, ext: &Extensions, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {

@@ -4039,7 +4039,7 @@ mod tests {
         }
 
         let entries: Vec<pimble_rpc::VaultEntry> = outgoing.blobs.iter().enumerate().map(|(i, one)| pimble_rpc::VaultEntry { seq: i as u64 + 2, blob: one.blob.clone(), part: one.part }).collect();
-        let fetch = |updates: Vec<pimble_rpc::VaultEntry>| VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head: 4, keys: None, more: false };
+        let fetch = |updates: Vec<pimble_rpc::VaultEntry>| VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head: 4, keys: None, more: false, snapshot_seq: 0 };
 
         // Fetched whole.
         let mut reader = VaultStore::assemble(listed(root), same_keys(&store), Vec::new(), pull_of(&peer));
@@ -5025,7 +5025,7 @@ mod tests {
             })
             .collect();
         let head = updates.len() as u64;
-        (VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head, keys: Some(VaultDocKeys { dek_id, wraps }), more: false }, (dek_id, dek))
+        (VaultFetchResponse { snapshot: None, snapshot_parts: Vec::new(), updates, head, keys: Some(VaultDocKeys { dek_id, wraps }), more: false, snapshot_seq: 0 }, (dek_id, dek))
     }
 
     /// An owner's page as `open_store` builds it, holding the store key only:
