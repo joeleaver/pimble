@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.8: convergence wave 1.** Devices of an encrypted
+store report, sealed, what they hold of each document (state vector and delete-set
+digest), and send what another's report lacks (docs/CONVERGENCE_CONTRACT.md "Built: wave
+1"; `tests/convergence.rs`). Device ids live in `<data dir>/pimble/devices.json`. Next:
+wave 2 (requests for what a parked update waits for; "out of step" on the note), wave 3
+(the randomized fault test; dropping what nobody holds after 24 h). Known hazard, not yet
+fixed: `vault-link.json` and `sync.json` cursors live inside the store folder, which a
+Dropbox-synced store shares between computers.
+
 **2026-11-19 (session 78e7f30f): v0.28.7: Send Diagnostics, and diagnostics from the
 browser.** Diagnostics wave 3 (docs/DIAGNOSTICS_CONTRACT.md section 8): Help > "Send
 Diagnostics..." in both apps (logs, stores, a note; a report code to tell us), and the web
