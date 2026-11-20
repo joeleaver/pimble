@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.5: sign-ins that last, and no repair loops.** (1) A
+Pimble Cloud session lasts 30 days from its last use, not from sign-in (Joe's desktop lost
+its sign-in on day 30, silently). (2) A refused session stops every link until someone
+signs in (`SessionExpired`, `Keystore::session_expired`), the status bar says "sign-in
+expired", and the tooltip says what waits. (3) What left a list is written in the list's
+own document (`left:<child>`, docs/MOVE_CONTRACT.md "Repair"): a device with an older copy
+of a deleted or moved node no longer puts it back. Why Will's device lacked that tombstone
+is still unknown; diagnostics will say next time.
+
 **2026-11-19 (session 78e7f30f): v0.28.4: alpha diagnostics send.** Diagnostics wave 2
 (docs/DIAGNOSTICS_CONTRACT.md section 8): release builds send warnings, errors, the sync and
 sharing `info` lines, `system`, `stores`, panics and crashed runs to `pimble-diagnostics`
