@@ -1226,7 +1226,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     StoreChangeKind::PeopleChanged => {
                         store.send(BackendCommand::GetPeople { store_id: *store_id });
                     }
-                    StoreChangeKind::VaultAppended { .. } => {
+                    StoreChangeKind::VaultAppended { .. } | StoreChangeKind::VaultReported { .. } => {
                         // Encrypted-store blobs are handled by the vault client
                         // (docs/CRYPTO_CONTRACT.md); the tree does not change here.
                     }

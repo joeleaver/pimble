@@ -385,6 +385,18 @@ impl StoreManager {
         store.set_doc_keys(doc_id, json).await
     }
 
+    /// Store `device`'s state report of `doc_id` (see [`VaultStore::set_report`]).
+    pub async fn vault_set_report(&mut self, store_id: StoreId, doc_id: &str, device: &str, blob: Vec<u8>, at: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.set_report(doc_id, device, blob, at).await
+    }
+
+    /// Every device's latest state report of `doc_id` in vault store `store_id`.
+    pub fn vault_reports(&self, store_id: StoreId, doc_id: &str) -> Result<Vec<crate::vault::StoredReport>> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.reports(doc_id))
+    }
+
     // ── Scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5) ────────────
 
     /// A vault store's published scopes.

@@ -5179,6 +5179,7 @@ dependencies = [
  "rinch-editor-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -5336,6 +5337,7 @@ name = "pimble-rpc"
 version = "0.28.7"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",
@@ -5434,6 +5436,7 @@ name = "pimble-store"
 version = "0.28.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "notify",
  "pimble-core",

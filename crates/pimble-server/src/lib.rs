@@ -9,6 +9,7 @@ pub mod agents;
 pub mod auth;
 pub mod cloud;
 pub mod credentials;
+mod devices;
 pub mod error;
 mod fs_util;
 pub mod handler;

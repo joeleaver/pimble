@@ -960,6 +960,188 @@ impl NewDocument {
     }
 }
 
+// ── State reports and comparing (docs/CONVERGENCE_CONTRACT.md, wave 1) ─────
+
+/// The version of a report's plaintext this client writes.
+pub const REPORT_VERSION: u8 = 1;
+/// How long after the last change to a document its report goes: changes
+/// come in bursts (typing), and a report per keystroke would be a write per
+/// keystroke on every other device. Debounced per document, so two reports of
+/// one document are always at least this far apart.
+pub const REPORT_DEBOUNCE_MS: u64 = 5_000;
+/// How many documents one `vaultReports` asks about: a store of hundreds of
+/// notes is asked in a few calls, each answer well under a relay's message.
+pub const REPORTS_BATCH: usize = 128;
+/// How many reports are sent at once at a connect: one socket carries them,
+/// and a round trip each, one after another, would make a store of hundreds
+/// of notes wait half a minute.
+pub const REPORTS_IN_FLIGHT: usize = 32;
+
+/// What a device holds of one document (docs/CONVERGENCE_CONTRACT.md
+/// section 1): its state vector, a digest of its delete set, and when an
+/// update waits parked in it, the state vector of what that update waits
+/// for. A state vector says exactly which structs a yrs document holds, and
+/// nothing of what it deleted; two devices whose only difference is a delete
+/// have one vector, and only the digest tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// `NodeDoc::state_vector`, yrs v1.
+    pub state_vector: Vec<u8>,
+    /// `NodeDoc::delete_set_digest`. `None` in a report that carries none.
+    pub deletes: Option<[u8; 32]>,
+    /// `NodeDoc::missing`, yrs v1: what a parked update waits for. Said in
+    /// wave 1 and acted on in wave 2 (section 3).
+    pub missing: Option<Vec<u8>>,
+}
+
+/// A report's plaintext: small, versioned JSON. A newer version may add
+/// fields; one that carries a state vector still reads.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReportWire {
+    v: u8,
+    sv: String,
+    /// The delete set's digest, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ds: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing: Option<String>,
+}
+
+impl Report {
+    /// What `doc` holds now.
+    pub fn of(doc: &pimble_crdt::NodeDoc) -> Self {
+        Self { state_vector: doc.state_vector(), deletes: Some(doc.delete_set_digest()), missing: doc.missing() }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let wire = ReportWire {
+            v: REPORT_VERSION,
+            sv: STANDARD.encode(&self.state_vector),
+            ds: self.deletes.map(|d| STANDARD.encode(d)),
+            missing: self.missing.as_ref().map(|m| STANDARD.encode(m)),
+        };
+        serde_json::to_vec(&wire).expect("a report always encodes")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let wire: ReportWire = serde_json::from_slice(bytes).map_err(|e| format!("not a state report: {e}"))?;
+        if wire.v == 0 {
+            return Err("a state report of version 0".to_string());
+        }
+        let state_vector = STANDARD.decode(&wire.sv).map_err(|e| format!("a state report's vector would not decode: {e}"))?;
+        let missing = match wire.missing {
+            Some(m) => Some(STANDARD.decode(m).map_err(|e| format!("a state report's missing vector would not decode: {e}"))?),
+            None => None,
+        };
+        let deletes = match wire.ds {
+            Some(d) => Some(
+                STANDARD
+                    .decode(d)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or_else(|| "a state report's delete digest is not 32 bytes".to_string())?,
+            ),
+            None => None,
+        };
+        Ok(Self { state_vector, deletes, missing })
+    }
+}
+
+/// The associated data a report of `node_id` is sealed with: the document's
+/// own blobs' with `/report` after it. Under the same key as the document's
+/// blobs, but never mistaken for one: a report the server put in a log would
+/// not open there, nor a log entry handed back as a report (decided
+/// 2026-11-19, building wave 1: "sealed like an append blob", with this one
+/// difference).
+fn report_aad(store_id: StoreId, node_id: NodeId) -> Vec<u8> {
+    blob_aad(&store_id.to_string(), &format!("{}/report", VaultDocId::Node(node_id).as_str()))
+}
+
+/// Seal `report` of `node_id` under `key` (the key the document's next blob
+/// would go out under), as `vaultReport` carries it. Always one blob.
+pub fn seal_report(store_id: StoreId, node_id: NodeId, key_id: KeyId, key: &SymmetricKey, report: &Report) -> String {
+    URL_SAFE_NO_PAD.encode(Blob::encrypt(key, key_id, &report_aad(store_id, node_id), &report.encode()))
+}
+
+impl DocKeys {
+    /// Open another device's report of `node_id`.
+    pub fn open_report(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str, scope: &impl ScopeKeys) -> Result<Report, Unopened> {
+        let plaintext = self.open_with(store_id, node_id, encoded, &report_aad(store_id, node_id), scope)?;
+        Report::decode(&plaintext).map_err(Unopened::Malformed)
+    }
+}
+
+/// The comparing half of the rule (docs/CONVERGENCE_CONTRACT.md section 2),
+/// the same on the desktop's link and in the browser: which other device's
+/// report this device answers with an append, and from what vector.
+///
+/// Where this device's vector has a clock beyond another's report, the other
+/// lacks something this one holds, and this one appends the diff from that
+/// report. Where neither vector is beyond the other and the delete digests
+/// differ, the two hold different deletes of the same structs: each appends
+/// the diff from the other's vector, which carries no structs and the whole
+/// delete set, so both end with the union (one exchange each way). Where the
+/// report is beyond this device, nothing is this device's to send: the log
+/// brings it, or the other side sends. And so two devices cannot answer each
+/// other for ever, a (document, device) pair answered once is not answered
+/// again until that device reports a different vector or digest: a
+/// report that did not move after an answer is a device that cannot take
+/// what it was sent, or one that is not there (a replica removed, a browser
+/// cleared), and sending it again changes nothing. An answer is an append the
+/// remote acknowledged, so it is in the log for good (a snapshot holds it
+/// too), which is why this record may be kept (the desktop's `devices.json`,
+/// the browser's `localStorage`) and is forgotten only with the logs
+/// themselves (a twin built again). Without that, every connect of every device would answer
+/// a removed replica's last report again, for every document changed since
+/// (decided 2026-11-19, building wave 1).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Comparing {
+    /// Document -> device -> the report last answered: its vector and its
+    /// delete digest (base64, `vector:digest`).
+    #[serde(default)]
+    answered: HashMap<String, HashMap<String, String>>,
+}
+
+/// How a report is keyed in [`Comparing`]'s record.
+fn answered_key(report: &Report) -> String {
+    format!("{}:{}", STANDARD.encode(&report.state_vector), report.deletes.map(|d| STANDARD.encode(d)).unwrap_or_default())
+}
+
+impl Comparing {
+    /// The vector to append the diff from, when `device`'s `report` of `doc`
+    /// lacks something this device (`own`, holding what `local` says) holds,
+    /// structs or deletes, and that same report has not been answered
+    /// already. A device's own report, and one whose vector will not decode,
+    /// ask nothing; a report without a digest is compared by vector alone.
+    pub fn owed(&self, own: &str, doc: &str, device: &str, local: &Report, report: &Report) -> Option<Vec<u8>> {
+        if device == own {
+            return None;
+        }
+        if self.answered.get(doc).and_then(|devices| devices.get(device)) == Some(&answered_key(report)) {
+            return None;
+        }
+        let ours_beyond = pimble_crdt::state_vector_exceeds(&local.state_vector, &report.state_vector).ok()?;
+        let theirs_beyond = pimble_crdt::state_vector_exceeds(&report.state_vector, &local.state_vector).ok()?;
+        let deletes_differ = matches!((local.deletes, report.deletes), (Some(ours), Some(theirs)) if ours != theirs);
+        (ours_beyond || (!theirs_beyond && deletes_differ)).then(|| report.state_vector.clone())
+    }
+
+    /// `device`'s `reported` report of `doc` was answered with an append.
+    pub fn answered(&mut self, doc: &str, device: &str, reported: &Report) {
+        self.answered.entry(doc.to_string()).or_default().insert(device.to_string(), answered_key(reported));
+    }
+
+    /// The remote's logs are other logs (a twin built again): nothing
+    /// answered there is in these.
+    pub fn forget(&mut self) {
+        self.answered.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.answered.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1236,5 +1418,137 @@ mod tests {
         let mut keys = DocKeys::default();
         assert_eq!(keys.open(store_id, node_id, &encoded, &scope), Err(Unopened::Newer));
         assert_eq!(Unopened::Newer.reason(), MADE_BY_NEWER);
+    }
+
+    /// A report seals under the document's key and opens back to what it
+    /// said; it never opens as one of the document's blobs, nor a blob as a
+    /// report; a holder of no key opens nothing.
+    #[test]
+    fn a_report_opens_as_a_report_and_never_as_a_blob() {
+        use super::*;
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+        let key_id = KeyId::new_v4();
+        let key = SymmetricKey::generate();
+        let mut scope: HashMap<KeyId, SymmetricKey> = HashMap::new();
+        scope.insert(key_id, key.clone());
+        let mut doc = pimble_crdt::NodeDoc::new();
+        doc.replace_plain_text("some words").unwrap();
+        let report = Report::of(&doc);
+        assert_eq!(Report::decode(&report.encode()).unwrap(), report);
+        assert!(report.deletes.is_some(), "a report says what its document deleted");
+        let with_missing = Report { state_vector: report.state_vector.clone(), deletes: None, missing: Some(pimble_crdt::empty_state_vector()) };
+        assert_eq!(Report::decode(&with_missing.encode()).unwrap(), with_missing);
+
+        let sealed = seal_report(store_id, node_id, key_id, &key, &report);
+        let mut keys = DocKeys::default();
+        assert_eq!(keys.open_report(store_id, node_id, &sealed, &scope).unwrap(), report);
+        assert!(keys.open(store_id, node_id, &sealed, &scope).is_err(), "a report is not one of the document's blobs");
+        assert!(keys.open_report(store_id, NodeId::new(), &sealed, &scope).is_err(), "nor another document's report");
+        let blob = seal(store_id, node_id, key_id, &key, &report.encode());
+        assert!(keys.open_report(store_id, node_id, &blob, &scope).is_err(), "a blob is not a report");
+        let stranger: HashMap<KeyId, SymmetricKey> = HashMap::new();
+        assert!(matches!(DocKeys::default().open_report(store_id, node_id, &sealed, &stranger), Err(Unopened::NoKey(_))));
+    }
+
+    /// A device answers a report that lacks what it holds, from that report's
+    /// vector; not its own report, not one ahead of it or equal, and not the
+    /// same report twice, even after a restart; a report that moved is
+    /// answered again.
+    #[test]
+    fn comparing_answers_what_a_report_lacks_once_per_report() {
+        use super::*;
+        let mut ahead_doc = pimble_crdt::NodeDoc::new();
+        ahead_doc.replace_plain_text("one").unwrap();
+        let ahead = Report::of(&ahead_doc);
+        let behind = Report::of(&pimble_crdt::NodeDoc::new());
+        let mut comparing = Comparing::default();
+        assert_eq!(comparing.owed("me", "doc", "me", &ahead, &behind), None, "never its own");
+        assert_eq!(comparing.owed("me", "doc", "other", &ahead, &behind), Some(behind.state_vector.clone()));
+        assert_eq!(comparing.owed("me", "doc", "other", &ahead, &ahead), None, "equal: nothing owed");
+        assert_eq!(comparing.owed("me", "doc", "other", &behind, &ahead), None, "the report is ahead: nothing of this device's to send");
+        comparing.answered("doc", "other", &behind);
+        assert_eq!(comparing.owed("me", "doc", "other", &ahead, &behind), None, "the same report is not answered twice");
+        assert!(comparing.owed("me", "doc", "third", &ahead, &behind).is_some(), "another device is its own pair");
+        let mut moved = pimble_crdt::NodeDoc::new();
+        moved.replace_plain_text("x").unwrap();
+        let moved = Report::of(&moved);
+        assert!(comparing.owed("me", "doc", "other", &ahead, &moved).is_some(), "a report that moved is answered again");
+        let kept: Comparing = serde_json::from_str(&serde_json::to_string(&comparing).unwrap()).unwrap();
+        assert_eq!(kept, comparing, "what was answered is kept as it was");
+        comparing.forget();
+        assert!(comparing.owed("me", "doc", "other", &ahead, &behind).is_some(), "logs built again: compared from the start");
+        let broken = Report { state_vector: vec![0xff, 0xff, 0xff], deletes: None, missing: None };
+        assert_eq!(comparing.owed("me", "doc", "other", &ahead, &broken), None, "a vector that will not decode asks nothing");
+    }
+
+    /// A copy of `doc` holding one more delete and no more structs: what a
+    /// device that deleted text while the other's copy missed it holds.
+    fn with_a_delete(doc: &pimble_crdt::NodeDoc) -> (pimble_crdt::NodeDoc, Vec<u8>) {
+        let mut scratch = pimble_crdt::NodeDoc::load(&doc.save()).unwrap();
+        scratch.replace_plain_text("").unwrap();
+        let deletes_only = scratch.diff_since(&scratch.state_vector()).unwrap();
+        let mut copy = pimble_crdt::NodeDoc::load(&doc.save()).unwrap();
+        copy.apply_update(&deletes_only).unwrap();
+        (copy, deletes_only)
+    }
+
+    /// Two devices with one state vector and different deletes compare
+    /// different, each answers the other once from the other's vector, and
+    /// the answers leave both with the union and equal reports; nothing is
+    /// answered again for the same (vector, digest).
+    #[test]
+    fn a_delete_one_device_lacks_is_compared_by_its_digest() {
+        use super::*;
+        let mut base = pimble_crdt::NodeDoc::new();
+        base.replace_plain_text("socks and a map").unwrap();
+        let (mut deleted, _) = with_a_delete(&base);
+        let mut missed = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
+        assert_eq!(deleted.state_vector(), missed.state_vector(), "a delete moves no clock");
+        assert_eq!(pimble_crdt::NodeDoc::text_of(&deleted.save()), "");
+        let (d, m) = (Report::of(&deleted), Report::of(&missed));
+        assert_ne!(d.deletes, m.deletes, "the digests tell them apart");
+        assert_eq!(Report::of(&base).deletes, m.deletes, "the same delete set, the same digest");
+
+        let mut on_deleted = Comparing::default();
+        let mut on_missed = Comparing::default();
+        let from = on_deleted.owed("del", "doc", "mis", &d, &m).expect("the device with the delete sends it");
+        let back = on_missed.owed("mis", "doc", "del", &m, &d).expect("and the other way: neither knows whose set is larger");
+        missed.apply_update(&deleted.diff_since(&from).unwrap()).unwrap();
+        deleted.apply_update(&missed.diff_since(&back).unwrap()).unwrap();
+        on_deleted.answered("doc", "mis", &m);
+        on_missed.answered("doc", "del", &d);
+        assert_eq!(pimble_crdt::NodeDoc::text_of(&missed.save()), "", "the delete arrived");
+        let (d2, m2) = (Report::of(&deleted), Report::of(&missed));
+        assert_eq!(d2, m2, "both hold the union");
+        assert_eq!(on_deleted.owed("del", "doc", "mis", &d2, &m2), None);
+        assert_eq!(on_missed.owed("mis", "doc", "del", &m2, &d2), None);
+        assert_eq!(on_deleted.owed("del", "doc", "mis", &d, &m), None, "the same report is not answered twice");
+
+        // A report with no digest is compared by vector alone.
+        let undigested = Report { deletes: None, ..m.clone() };
+        assert_eq!(Comparing::default().owed("del", "doc", "mis", &d, &undigested), None);
+    }
+
+    /// The digest is the delete set's and not the blocks': deletes that
+    /// arrive again, through another copy, and a save and load, which writes
+    /// the blocks out afresh, leave it as it was.
+    #[test]
+    fn the_delete_digest_does_not_depend_on_how_deletes_were_made() {
+        let mut base = pimble_crdt::NodeDoc::new();
+        base.replace_plain_text("abcdef").unwrap();
+        let mut once = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
+        once.replace_plain_text("").unwrap();
+        let mut twice = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
+        let all = once.diff_since(&once.state_vector()).unwrap();
+        let mut halves = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
+        halves.apply_update(&all).unwrap();
+        twice.apply_update(&halves.diff_since(&halves.state_vector()).unwrap()).unwrap();
+        twice.apply_update(&all).unwrap();
+        let base_sv = base.state_vector();
+        assert_eq!(twice.state_vector(), base_sv);
+        assert_eq!(twice.delete_set_digest(), halves.delete_set_digest());
+        let reloaded = pimble_crdt::NodeDoc::load(&twice.save()).unwrap();
+        assert_eq!(reloaded.delete_set_digest(), twice.delete_set_digest(), "saving and loading keeps the digest");
     }
 }

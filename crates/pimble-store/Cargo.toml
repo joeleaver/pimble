@@ -15,6 +15,9 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+# A state report's blob is kept base64 in its `reports` file
+# (docs/CONVERGENCE_CONTRACT.md section 1).
+base64 = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }

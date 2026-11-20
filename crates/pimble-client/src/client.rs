@@ -27,7 +27,7 @@ use pimble_rpc::{
     BacklinksRequest, SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
-    VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
+    VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS, VaultReport, VaultReportRequest, VaultReportsRequest,
     GetBlobRequest, HaveBlobsRequest, PutBlobRequest, BLOB_CHUNK_BYTES,
 };
 use tracing::debug;
@@ -1092,6 +1092,24 @@ impl PimbleClient {
         Ok(sub)
     }
 
+    /// [`PimbleClient::subscribe_store_changes`], also hearing every device's
+    /// state reports (`VaultReported`, docs/CONVERGENCE_CONTRACT.md). An older
+    /// server ignores the asking and sends none.
+    pub async fn subscribe_store_changes_with_reports(
+        &self,
+        store_id: StoreId,
+    ) -> Result<jsonrpsee::core::client::Subscription<StoreChangedNotification>> {
+        use jsonrpsee::core::params::ArrayParams;
+
+        let mut params = ArrayParams::new();
+        params.insert(store_id)?;
+        params.insert(pimble_rpc::StoreSubscribeOptions { reports: true })?;
+        self.client
+            .subscribe::<StoreChangedNotification, _>("pimble_subscribeStoreChanges", params, "pimble_unsubscribeStoreChanges")
+            .await
+            .map_err(rpc_error)
+    }
+
     /// Hand a `pimble:` link to a Pimble window on this server; `false` when
     /// no window listens.
     pub async fn open_in_app(&self, url: &str) -> Result<bool> {
@@ -1475,6 +1493,19 @@ impl PimbleClient {
     /// `epoch` that says which log the sequence numbers belong to.
     pub async fn vault_list_docs_response(&self, store_id: StoreId) -> Result<VaultListDocsResponse> {
         self.client.vault_list_docs(VaultListDocsRequest { store_id, blobs: false }).await.map_err(rpc_error)
+    }
+
+    /// Store this device's sealed state report of a vault document
+    /// (docs/CONVERGENCE_CONTRACT.md section 1). A server from before reports
+    /// answers method-not-found ([`ClientError::is_method_not_found`]).
+    pub async fn vault_report(&self, store_id: StoreId, doc_id: VaultDocId, device: &str, blob: String) -> Result<()> {
+        self.client.vault_report(VaultReportRequest { store_id, doc_id, device: device.to_string(), blob }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Every device's latest state report of these vault documents.
+    pub async fn vault_reports(&self, store_id: StoreId, doc_ids: Vec<VaultDocId>) -> Result<Vec<VaultReport>> {
+        Ok(self.client.vault_reports(VaultReportsRequest { store_id, doc_ids }).await.map_err(rpc_error)?.reports)
     }
 
     /// [`PimbleClient::vault_list_docs_response`] with pictures' documents

@@ -43,6 +43,12 @@ impl ClientError {
         self.code() == Some(-32004)
     }
 
+    /// Whether the server does not know the method (`-32601`): a server from
+    /// before it, which a caller treats as "not here" and carries on.
+    pub fn is_method_not_found(&self) -> bool {
+        self.code() == Some(-32601)
+    }
+
     /// Whether the call failed because a message was larger than one
     /// message may be (`pimble_rpc::MAX_MESSAGE_BYTES`): jsonrpsee's
     /// "Request is too big" (`-32007`) or "Response is too big"

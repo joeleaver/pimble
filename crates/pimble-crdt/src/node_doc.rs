@@ -316,6 +316,43 @@ impl NodeDoc {
         Some(pending.missing.encode_v1())
     }
 
+    /// A digest of what this document has deleted, for a state report
+    /// (docs/CONVERGENCE_CONTRACT.md): two documents with one state vector
+    /// differ only if their delete sets do, and a state vector says nothing of
+    /// those. The same delete set gives the same digest on every device: the
+    /// clients in order, each one's deleted clock ranges sorted and joined
+    /// where they touch, so how the store happens to have split or merged its
+    /// blocks (garbage collection replaces a deleted item's content and may
+    /// merge neighbours, keeping its clocks) changes nothing. SHA-256 over
+    /// `client u64 | count u32 | (start u32 | end u32)*` per client, little
+    /// endian.
+    pub fn delete_set_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let snapshot = self.doc.transact().snapshot();
+        let mut hasher = Sha256::new();
+        for (client, ranges) in snapshot.delete_set.iter() {
+            let mut spans: Vec<(u32, u32)> = ranges.iter().map(|r| (r.start, r.end)).filter(|(s, e)| s < e).collect();
+            spans.sort_unstable();
+            let mut joined: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+            for (start, end) in spans {
+                match joined.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => joined.push((start, end)),
+                }
+            }
+            if joined.is_empty() {
+                continue;
+            }
+            hasher.update(client.get().to_le_bytes());
+            hasher.update((joined.len() as u32).to_le_bytes());
+            for (start, end) in joined {
+                hasher.update(start.to_le_bytes());
+                hasher.update(end.to_le_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+
     /// Whether the peer lacks something of ours, given its state vector and
     /// the diff it sent (docs/history/HARDENING_CONTRACT.md decision 7).
     pub fn diff_if_peer_lacks_it(&self, remote_sv: &[u8], remote_diff: &[u8]) -> Result<Option<Vec<u8>>> {

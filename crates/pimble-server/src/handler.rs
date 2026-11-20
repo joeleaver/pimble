@@ -72,6 +72,7 @@ use pimble_rpc::{
     VaultDocKeys, VaultSetDocKeysRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
+    VaultReport, VaultReportRequest, VaultReportsRequest, VaultReportsResponse, StoreSubscribeOptions,
     MAX_SYNC_NODE_CONTENTS,
     AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, ListAgentsResponse, RemoveAgentRequest, UpdateAgentRequest,
 };
@@ -796,7 +797,8 @@ fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::PeopleChanged
-        | StoreChangeKind::VaultAppended { .. } => Vec::new(),
+        | StoreChangeKind::VaultAppended { .. }
+        | StoreChangeKind::VaultReported { .. } => Vec::new(),
     }
 }
 
@@ -891,6 +893,9 @@ pub enum LocalChange {
 struct ScopedSink {
     sink: jsonrpsee::core::server::SubscriptionSink,
     roots: Option<Vec<NodeId>>,
+    /// Whether the subscriber reads `VaultReported` (it asked,
+    /// `StoreSubscribeOptions::reports`); one that did not is never sent one.
+    reports: bool,
 }
 
 /// How a notification reaches one scoped subscriber.
@@ -913,15 +918,18 @@ enum Form {
 struct Delivery {
     admitted: Vec<(Vec<NodeId>, Form)>,
     to_everyone: bool,
+    /// A kind only a subscriber that asked for it reads (`VaultReported`,
+    /// see `StoreSubscribeOptions`).
+    reports_only: bool,
 }
 
 impl Delivery {
     fn everyone() -> Self {
-        Self { admitted: Vec::new(), to_everyone: true }
+        Self { admitted: Vec::new(), to_everyone: true, reports_only: false }
     }
 
     fn unscoped_only() -> Self {
-        Self { admitted: Vec::new(), to_everyone: false }
+        Self { admitted: Vec::new(), to_everyone: false, reports_only: false }
     }
 
     fn form_for(&self, roots: &Option<Vec<NodeId>>) -> Option<Form> {
@@ -958,12 +966,12 @@ impl SubscriptionRegistry {
         self.local_changes.subscribe()
     }
 
-    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>) {
-        self.store_subs.entry(store_id).or_default().push(ScopedSink { sink, roots });
+    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>, reports: bool) {
+        self.store_subs.entry(store_id).or_default().push(ScopedSink { sink, roots, reports });
     }
 
     fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>) {
-        self.node_subs.entry((store_id, node_id)).or_default().push(ScopedSink { sink, roots });
+        self.node_subs.entry((store_id, node_id)).or_default().push(ScopedSink { sink, roots, reports: false });
     }
 
     /// The distinct root sets of `store_id`'s scoped subscribers (store and
@@ -991,6 +999,9 @@ impl SubscriptionRegistry {
         for (i, scoped) in sinks.iter().enumerate() {
             if scoped.sink.is_closed() {
                 closed.push(i);
+                continue;
+            }
+            if delivery.reports_only && !scoped.reports {
                 continue;
             }
             let msg = match delivery.form_for(&scoped.roots) {
@@ -1093,6 +1104,8 @@ fn named_by(kind: &StoreChangeKind) -> Named {
         },
         StoreChangeKind::VaultAppended { doc_id: VaultDocId::Node(node_id), .. } => Named::Document { id: *node_id, others: Vec::new() },
         StoreChangeKind::VaultAppended { doc_id: VaultDocId::Tree | VaultDocId::Blob(_), .. } => Named::Nobodys,
+        StoreChangeKind::VaultReported { doc_id: VaultDocId::Node(node_id), .. } => Named::Document { id: *node_id, others: Vec::new() },
+        StoreChangeKind::VaultReported { doc_id: VaultDocId::Tree | VaultDocId::Blob(_), .. } => Named::Nobodys,
         // `SharesEnded` names roots, and says of them only that they are
         // not this device's to show any more; it is sent on a share's
         // replica, to the app whose replica it is.
@@ -1167,6 +1180,14 @@ pub struct RpcHandler {
     /// its store has changed (`crate::vault_link::GRANT_CHECK_EVERY` unless
     /// `ServerConfig::grant_check_interval` says otherwise).
     grant_check_every: Duration,
+    /// Whether this server's vault links report what they hold and compare
+    /// it with the other devices' reports (docs/CONVERGENCE_CONTRACT.md wave
+    /// 1). Always, but for a test showing what happens without.
+    vault_reports: bool,
+    /// This computer's device id in each vault-linked store, and the reports
+    /// it has answered (`crate::devices`, `devices.json` beside the replicas
+    /// directory, never in a store's folder).
+    devices: Arc<crate::devices::Devices>,
     /// This device's AI agents (docs/AGENTS_CONTRACT.md), on the app's own
     /// server; `None` elsewhere, where the agent RPCs answer that there are
     /// none here.
@@ -1278,7 +1299,9 @@ impl RpcHandler {
             keystore: Arc::new(Keystore::new(keystore_path)),
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
             grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
+            vault_reports: true,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
+            devices: Arc::new(crate::devices::Devices::new(crate::devices::devices_path_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -1364,6 +1387,21 @@ impl RpcHandler {
 
     pub(crate) fn grant_check_every(&self) -> Duration {
         self.grant_check_every
+    }
+
+    /// Whether this server's vault links report and compare (see
+    /// `ServerConfig::vault_reports`).
+    pub fn with_vault_reports(mut self, on: bool) -> Self {
+        self.vault_reports = on;
+        self
+    }
+
+    pub(crate) fn vault_reports(&self) -> bool {
+        self.vault_reports
+    }
+
+    pub(crate) fn devices(&self) -> Arc<crate::devices::Devices> {
+        Arc::clone(&self.devices)
     }
 
     /// Where `addRemoteStore` places a replica when the caller passes
@@ -1600,6 +1638,12 @@ impl RpcHandler {
     /// caller holds at that point. Cheap when nobody scoped is subscribed,
     /// the common case.
     async fn delivery_for(&self, store_id: StoreId, kind: &StoreChangeKind) -> Delivery {
+        let mut delivery = self.delivery_by_scope(store_id, kind).await;
+        delivery.reports_only = matches!(kind, StoreChangeKind::VaultReported { .. });
+        delivery
+    }
+
+    async fn delivery_by_scope(&self, store_id: StoreId, kind: &StoreChangeKind) -> Delivery {
         let (id, others) = match named_by(kind) {
             Named::Nothing => return Delivery::everyone(),
             Named::Nobodys => return Delivery::unscoped_only(),
@@ -1621,7 +1665,7 @@ impl RpcHandler {
                 Some((roots, form))
             })
             .collect();
-        Delivery { admitted, to_everyone: false }
+        Delivery { admitted, to_everyone: false, reports_only: false }
     }
 
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
@@ -3399,6 +3443,57 @@ impl PimbleApiServer for RpcHandler {
             // (docs/SYNC_LIMITS_CONTRACT.md).
             parts: true,
         })
+    }
+
+    async fn vault_report(&self, ext: &Extensions, request: VaultReportRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        // A reader reports: what a device lacks reaches it only if it says so.
+        authorize(&principal, request.store_id, Access::Read)?;
+        if !matches!(request.doc_id, VaultDocId::Node(_)) {
+            return Err(invalid_params("Only a node's document is reported on."));
+        }
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let blob = pimble_rpc::vault::decode_blob(&request.blob).map_err(invalid_params)?;
+        {
+            let mut manager = self.store_manager.write().await;
+            self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Read)?;
+            manager
+                .vault_set_report(request.store_id, &request.doc_id.as_str(), &request.device, blob.clone(), chrono::Utc::now())
+                .await
+                .map_err(|e| match e {
+                    StoreError::InvalidOperation(message) => invalid_params(message),
+                    other => to_rpc_error(other),
+                })?;
+        }
+        debug!("Vault report of store {} doc {:?} from device {}", request.store_id, request.doc_id, request.device);
+        let kind = StoreChangeKind::VaultReported { doc_id: request.doc_id.clone(), device: request.device.clone(), blob: URL_SAFE_NO_PAD.encode(&blob) };
+        let delivery = self.delivery_for(request.store_id, &kind).await;
+        let notification = StoreChangedNotification { store_id: request.store_id, change_kind: kind, source_client_id: None, update: None };
+        self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
+        Ok(EmptyResponse {})
+    }
+
+    async fn vault_reports(&self, ext: &Extensions, request: VaultReportsRequest) -> Result<VaultReportsResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let manager = self.store_manager.read().await;
+        // Asked of a plain store, or one not open: the same refusal a fetch gets.
+        manager.vault_list_docs(request.store_id).map_err(to_rpc_error)?;
+        // A share's member is answered for their scope and nothing else; a
+        // document outside it is left out, without saying whether it exists.
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        let mut reports = Vec::new();
+        for doc_id in request.doc_ids {
+            let VaultDocId::Node(node_id) = doc_id else { continue };
+            if reach.as_ref().is_some_and(|reach| !reach.readable.contains(&node_id)) {
+                continue;
+            }
+            for stored in manager.vault_reports(request.store_id, &doc_id.as_str()).map_err(to_rpc_error)? {
+                reports.push(VaultReport { doc_id: doc_id.clone(), device: stored.device, blob: URL_SAFE_NO_PAD.encode(stored.blob), at: stored.at });
+            }
+        }
+        Ok(VaultReportsResponse { reports })
     }
 
     // ── Cloud (Pimble Cloud account) API, docs/CRYPTO_CONTRACT.md ────────
@@ -5624,12 +5719,14 @@ impl PimbleApiServer for RpcHandler {
         pending: PendingSubscriptionSink,
         ext: &Extensions,
         store_id: StoreId,
+        options: Option<StoreSubscribeOptions>,
     ) -> SubscriptionResult {
         let principal = principal_of(ext);
         if let Err(e) = authorize(&principal, store_id, Access::Read) {
             pending.reject(e).await;
             return Ok(());
         }
+        let reports = options.unwrap_or_default().reports;
         // Unlike every other store-scoped RPC, `subscribeStoreChanges` works
         // on a vault store: it's how a live client hears `VaultAppended`
         // without re-fetching (docs/CRYPTO_CONTRACT.md).
@@ -5640,7 +5737,7 @@ impl PimbleApiServer for RpcHandler {
         // are when it is sent (`delivery_for`).
         let roots = scope_roots_of(&principal, store_id, Access::Read);
         let sink = pending.accept().await?;
-        self.subscriptions.write().await.add_store_sub(store_id, sink, roots);
+        self.subscriptions.write().await.add_store_sub(store_id, sink, roots, reports);
 
         Ok(())
     }

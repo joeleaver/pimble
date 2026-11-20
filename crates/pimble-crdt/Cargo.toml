@@ -17,6 +17,9 @@ yrs = { workspace = true }
 rinch-editor-core = { workspace = true, features = ["markdown"] }
 pulldown-cmark = { version = "0.12", default-features = false }
 rinch-editor-collab = { workspace = true }
+# The digest of a document's delete set in its state report
+# (`NodeDoc::delete_set_digest`, docs/CONVERGENCE_CONTRACT.md).
+sha2 = "0.10"
 
 [dev-dependencies]
 uuid = { workspace = true }

@@ -1989,6 +1989,7 @@ dependencies = [
  "rinch-editor-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
  "yrs",
@@ -2085,6 +2086,7 @@ name = "pimble-rpc"
 version = "0.28.7"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",

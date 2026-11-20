@@ -368,6 +368,18 @@ async fn run(
                     emit(&event_tx, &signal_ui, described(vault, event));
                 }
             }
+
+            // 3e. State reports (docs/CONVERGENCE_CONTRACT.md): answer what
+            //     other devices said they hold when it lacks something this
+            //     page holds, and say what this page holds once a document
+            //     has been quiet for a moment.
+            for store_id in vault.reports_due() {
+                let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+                    continue;
+                };
+                vault.exchange_reports(&client, store_id).await;
+                ran_anything = true;
+            }
             ran_anything
         };
         // 3d. What the vault said changed in a tree, shown now that it is

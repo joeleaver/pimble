@@ -82,6 +82,11 @@ pub struct ServerConfig {
     /// The version `serverInfo` reports. `None` is this build's; tests set an
     /// older one to see a newer client take the port over.
     pub reported_version: Option<String>,
+    /// Whether this server's vault links say what they hold of each document
+    /// and send the other devices what their reports lack
+    /// (docs/CONVERGENCE_CONTRACT.md wave 1). `true`; a test turns it off to
+    /// show the gap it closes.
+    pub vault_reports: bool,
 }
 
 impl Default for ServerConfig {
@@ -100,6 +105,7 @@ impl Default for ServerConfig {
             relay_dir: None,
             agents_path: None,
             reported_version: None,
+            vault_reports: true,
         }
     }
 }
@@ -261,6 +267,7 @@ impl PimbleServer {
         if let Some(every) = self.config.grant_check_interval {
             handler = handler.with_grant_check_interval(every);
         }
+        handler = handler.with_vault_reports(self.config.vault_reports);
         handler = handler.with_agents(agents);
         // The app's own server (loopback, tokenless, no JWT) hands over to a
         // newer one (docs/MCP_CONTRACT.md "Which server it talks to").

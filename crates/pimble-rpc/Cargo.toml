@@ -18,6 +18,8 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# When a state report was stored (`VaultReport::at`).
+chrono = { workspace = true }
 
 # Native: the workspace features, which include `server` — this crate's
 # `#[rpc(server, client)]` generates both halves of the API.

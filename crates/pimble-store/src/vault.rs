@@ -11,6 +11,7 @@
 //! <store>/vault/{doc_id}/log       # append-only: seq u64 | len u32 | [part] | blob
 //! <store>/vault/{doc_id}/snapshot  # seq u64 | blob, or seq u64 | "PP" | count u32 | group (16) | (len u32 | blob)*
 //! <store>/vault/{doc_id}/keys.json # the document's wrapped data keys, opaque here
+//! <store>/vault/{doc_id}/reports   # each device's sealed state report, opaque here
 //! <store>/scopes.json              # the store's published scope sets
 //! ```
 //!
@@ -40,11 +41,22 @@
 //! creates a document). Both are authorization metadata for the server's own
 //! use; neither is ciphertext, and neither says anything about a document's
 //! contents.
+//!
+//! **State reports** (docs/CONVERGENCE_CONTRACT.md section 1): beside a
+//! document's log, one slot per device (`reports`, a JSON map of device id to
+//! the sealed blob, base64, and when it was stored), overwritten by each new
+//! report from that device. What a report says (the state vector the device
+//! holds of the document) is sealed under the document's data key like any
+//! blob; the server keeps the latest per device and hands them back. Reports
+//! live in the document's directory, so they go when the document does.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chrono::{DateTime, Utc};
 use pimble_core::{BlobId, NodeId, StoreId, StoreKind, StoreManifest};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -71,6 +83,17 @@ pub fn set_limits_for_tests(blob: usize, log: u64) {
     BLOB_LIMIT.store(blob, std::sync::atomic::Ordering::SeqCst);
     LOG_LIMIT.store(log, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// The most a state report's blob may be (docs/CONVERGENCE_CONTRACT.md
+/// section 1): a report is a state vector, about 20 bytes per client that
+/// ever wrote the document, so this is a runaway guard only.
+pub const MAX_REPORT_BYTES: usize = 64 * 1024;
+/// The most devices a document keeps a report from; past it, the oldest
+/// report goes. A device that stopped reporting long ago (a replica removed,
+/// a browser cleared) is the one dropped.
+pub const MAX_REPORTS_PER_DOC: usize = 32;
+/// The longest device id a report may name (a UUID is 36).
+pub const MAX_DEVICE_ID_BYTES: usize = 64;
 
 fn blob_limit() -> usize {
     BLOB_LIMIT.load(std::sync::atomic::Ordering::SeqCst)
@@ -276,6 +299,25 @@ struct VaultDoc {
     /// The document's wrapped data keys as `keys.json` holds them (see the
     /// module doc), with the `dek_id` read out of them once at load.
     keys: Option<DocKeys>,
+    /// Each device's latest state report (see the module doc), as the
+    /// `reports` file holds them.
+    reports: HashMap<String, StoredReport>,
+}
+
+/// One device's state report of a document, as stored: the sealed blob and
+/// when it arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReport {
+    pub device: String,
+    pub blob: Vec<u8>,
+    pub at: DateTime<Utc>,
+}
+
+/// One slot of the `reports` file.
+#[derive(Serialize, Deserialize)]
+struct ReportRecord {
+    blob: String,
+    at: DateTime<Utc>,
 }
 
 /// `keys.json` as held in memory: the text verbatim, and the one field this
@@ -338,7 +380,7 @@ impl ScopesFile {
 
 impl VaultDoc {
     fn empty(dir: PathBuf) -> Self {
-        Self { dir, entries: Vec::new(), snapshot: None, head: 0, keys: None }
+        Self { dir, entries: Vec::new(), snapshot: None, head: 0, keys: None, reports: HashMap::new() }
     }
 
     /// Load a document's directory from disk, tolerating a truncated final
@@ -434,10 +476,44 @@ impl VaultDoc {
             Err(_) => None,
         };
 
-        Ok(Self { dir, entries, snapshot, head, keys })
+        let reports = Self::load_reports(&dir.join(Self::REPORTS_FILE)).await;
+
+        Ok(Self { dir, entries, snapshot, head, keys, reports })
     }
 
     const KEYS_FILE: &'static str = "keys.json";
+    const REPORTS_FILE: &'static str = "reports";
+
+    /// The `reports` file, or nothing when it is absent or does not parse
+    /// (with a warning): every device reports again at its next connect, so
+    /// a lost file costs one round of reports and never the document.
+    async fn load_reports(path: &Path) -> HashMap<String, StoredReport> {
+        let Ok(json) = fs::read_to_string(path).await else { return HashMap::new() };
+        let records: HashMap<String, ReportRecord> = match serde_json::from_str(&json) {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Vault reports file {:?} could not be parsed ({}); starting with none", path, e);
+                return HashMap::new();
+            }
+        };
+        records
+            .into_iter()
+            .filter_map(|(device, record)| {
+                let blob = STANDARD.decode(&record.blob).ok()?;
+                Some((device.clone(), StoredReport { device, blob, at: record.at }))
+            })
+            .collect()
+    }
+
+    async fn save_reports(&self) -> Result<()> {
+        let records: HashMap<&str, ReportRecord> = self
+            .reports
+            .iter()
+            .map(|(device, report)| (device.as_str(), ReportRecord { blob: STANDARD.encode(&report.blob), at: report.at }))
+            .collect();
+        atomic_write(&self.dir.join(Self::REPORTS_FILE), serde_json::to_vec(&records)?).await?;
+        Ok(())
+    }
 
     /// The bytes of one already-recorded log entry, read fresh from disk.
     async fn read_entry(&self, entry: &LogEntryMeta) -> Result<Vec<u8>> {
@@ -1003,6 +1079,42 @@ impl VaultStore {
     pub fn has_blobs(&self, doc_id: &str) -> bool {
         self.docs.get(doc_id).is_some_and(|doc| doc.head > 0 || doc.snapshot.is_some())
     }
+
+    // ── State reports (docs/CONVERGENCE_CONTRACT.md section 1) ───────────
+
+    /// Store `device`'s state report of `doc_id`, replacing the one it sent
+    /// before. Only for a document that has a log: a report is about what a
+    /// device holds of what the log carries, and a report must never be what
+    /// brings a document into being. Past [`MAX_REPORTS_PER_DOC`] devices,
+    /// the oldest report goes.
+    pub async fn set_report(&mut self, doc_id: &str, device: &str, blob: Vec<u8>, at: DateTime<Utc>) -> Result<()> {
+        if blob.len() > MAX_REPORT_BYTES {
+            return Err(StoreError::InvalidOperation(format!(
+                "a state report of {} bytes exceeds the limit of {} bytes",
+                blob.len(),
+                MAX_REPORT_BYTES
+            )));
+        }
+        if device.is_empty() || device.len() > MAX_DEVICE_ID_BYTES {
+            return Err(StoreError::InvalidOperation(format!("a device id must be 1 to {} bytes", MAX_DEVICE_ID_BYTES)));
+        }
+        if !self.has_blobs(doc_id) {
+            return Err(StoreError::InvalidOperation(format!("document {} has no log to report on", doc_id)));
+        }
+        let doc = self.docs.get_mut(doc_id).expect("a document with blobs is held");
+        doc.reports.insert(device.to_string(), StoredReport { device: device.to_string(), blob, at });
+        while doc.reports.len() > MAX_REPORTS_PER_DOC {
+            let Some(oldest) = doc.reports.values().min_by_key(|r| r.at).map(|r| r.device.clone()) else { break };
+            doc.reports.remove(&oldest);
+        }
+        doc.save_reports().await
+    }
+
+    /// Every device's latest report of `doc_id` (none for a document this
+    /// store does not hold). Order is unspecified.
+    pub fn reports(&self, doc_id: &str) -> Vec<StoredReport> {
+        self.docs.get(doc_id).map(|doc| doc.reports.values().cloned().collect()).unwrap_or_default()
+    }
 }
 
 /// One row of [`VaultStore::list_docs`].
@@ -1394,5 +1506,39 @@ mod tests {
         assert_eq!(listed[0].dek_id, Some(dek_id));
         assert_eq!(store.doc_keys("doc").unwrap().dek_id, dek_id);
         assert!(store.doc_keys("other").is_none());
+    }
+
+    /// A device's report is kept per document and overwritten by its next;
+    /// it survives a reopen; a document with no log takes none; a report over
+    /// the limit is refused; past the most devices, the oldest report goes.
+    #[tokio::test]
+    async fn state_reports_are_one_slot_per_device_beside_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pimble");
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        {
+            let mut store = VaultStore::create(&path, "V", None).await.unwrap();
+            assert!(store.set_report("doc", "dev-a", b"r".to_vec(), at(0)).await.is_err(), "no log, no report");
+            assert!(!store.has_doc("doc"), "a refused report brings no document into being");
+            store.append("doc", b"blob".to_vec()).await.unwrap();
+            store.set_report("doc", "dev-a", b"first".to_vec(), at(1)).await.unwrap();
+            store.set_report("doc", "dev-b", b"bee".to_vec(), at(2)).await.unwrap();
+            store.set_report("doc", "dev-a", b"second".to_vec(), at(3)).await.unwrap();
+            assert!(store.set_report("doc", "dev-c", vec![0u8; MAX_REPORT_BYTES + 1], at(4)).await.is_err(), "over the limit");
+            assert!(store.set_report("doc", "", b"x".to_vec(), at(4)).await.is_err(), "a device id is required");
+        }
+        let mut store = VaultStore::open(&path).await.unwrap();
+        let mut reports = store.reports("doc");
+        reports.sort_by(|a, b| a.device.cmp(&b.device));
+        assert_eq!(reports.iter().map(|r| (r.device.as_str(), r.blob.as_slice(), r.at)).collect::<Vec<_>>(), vec![("dev-a", &b"second"[..], at(3)), ("dev-b", &b"bee"[..], at(2))]);
+        assert_eq!(store.list_docs().len(), 1);
+
+        for i in 0..MAX_REPORTS_PER_DOC as i64 {
+            store.set_report("doc", &format!("dev-{i:02}"), b"x".to_vec(), at(10 + i)).await.unwrap();
+        }
+        let devices: HashSet<String> = store.reports("doc").into_iter().map(|r| r.device).collect();
+        assert_eq!(devices.len(), MAX_REPORTS_PER_DOC);
+        assert!(!devices.contains("dev-b") && !devices.contains("dev-a"), "the oldest reports went first");
+        assert!(devices.contains("dev-00"));
     }
 }

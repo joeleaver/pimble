@@ -1135,6 +1135,12 @@ pub enum StoreChangeKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         part: Option<VaultPart>,
     },
+    /// A device stored its state report of a vault document (`vaultReport`,
+    /// docs/CONVERGENCE_CONTRACT.md section 2): the sealed report rides here
+    /// (base64url) so a subscriber compares without asking. Sent only to a
+    /// subscriber that asked for reports (`StoreSubscribeOptions::reports`),
+    /// and to a share's member only for a document of their scope.
+    VaultReported { doc_id: VaultDocId, device: String, blob: String },
     /// The share rooted at `node_id` in this store changed state on this
     /// device (its key handover, its scope publishing, docs/NODE_DOCUMENT_CONTRACT.md
     /// section 5). Derived state: links never forward it.
@@ -1704,6 +1710,58 @@ pub struct VaultSetDocKeysRequest {
     pub store_id: StoreId,
     pub doc_id: VaultDocId,
     pub keys: VaultDocKeys,
+}
+
+// ── State reports (docs/CONVERGENCE_CONTRACT.md sections 1-2) ────────────
+
+/// `vaultReport`: what `device` holds of `doc_id`, sealed under the
+/// document's key (`pimble_rpc::vault::seal_report`), so the server stores
+/// ciphertext and overwrites the device's slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultReportRequest {
+    pub store_id: StoreId,
+    pub doc_id: VaultDocId,
+    /// The reporting device's id: a random id per linked replica or browser
+    /// page, never an account id.
+    pub device: String,
+    /// The sealed report, base64url like every vault blob.
+    pub blob: String,
+}
+
+/// `vaultReports`: the latest report of every device, for these documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultReportsRequest {
+    pub store_id: StoreId,
+    pub doc_ids: Vec<VaultDocId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultReportsResponse {
+    pub reports: Vec<VaultReport>,
+}
+
+/// One device's latest report of one document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultReport {
+    pub doc_id: VaultDocId,
+    pub device: String,
+    /// base64url, as it was sent.
+    pub blob: String,
+    /// When the server stored it.
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What a `subscribeStoreChanges` subscriber asks for beyond the default.
+///
+/// A `StoreChangeKind` a client does not know fails to deserialize there,
+/// which a vault link reads as a broken subscription. So a kind added since
+/// is sent only to a subscriber that says it reads it (2026-11-19: a desktop
+/// from before state reports would drop its connection at every report).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoreSubscribeOptions {
+    /// Send `VaultReported` notifications too (docs/CONVERGENCE_CONTRACT.md).
+    #[serde(default)]
+    pub reports: bool,
 }
 
 /// One share's scope on the hosted server: the documents under its root, as

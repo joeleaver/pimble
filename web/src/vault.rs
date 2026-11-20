@@ -68,6 +68,16 @@
 //! ([`VaultClient::endpoint_down`]), the store's row reads `owner offline`,
 //! and until it is back this page changes nothing of it. A store it never
 //! opened is listed from the account's own row of it and opens empty.
+//!
+//! **State reports** (docs/CONVERGENCE_CONTRACT.md, wave 1), as the desktop's
+//! link makes them: the page says, sealed, what it holds of each document
+//! (`vaultReport`, after every open and connect, and 5 s after the last change
+//! to a document), reads what every other device says (`vaultReports` then,
+//! `VaultReported` live), and appends the diff from any report that lacks
+//! something this page holds ([`VaultStore::answer_report`],
+//! `pimble_rpc::vault::Comparing`). The page's device id is kept in
+//! `localStorage`, so a reload reports into the same slot and never answers
+//! its own last report as another device's.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -479,6 +489,21 @@ struct VaultStore {
     /// was last told.
     held_back: HashMap<(NodeId, Side), String>,
     held_changed: bool,
+    /// Whether the server takes state reports, as this connection found
+    /// (docs/CONVERGENCE_CONTRACT.md wave 1).
+    reports_ok: bool,
+    /// When each document's report is due (the page's clock, ms): a debounce
+    /// after the last change to it.
+    report_due: HashMap<NodeId, f64>,
+    /// What the server holds of this page's reports, as this connection has
+    /// seen it: a report that says the same again is not sent.
+    reported: HashMap<NodeId, Vec<u8>>,
+    /// Which other devices' reports this page has answered, at which vector
+    /// (kept in `localStorage`, as the desktop keeps it in `devices.json`).
+    answered: protocol::Comparing,
+    /// Other devices' reports heard live and not answered yet: the document,
+    /// the device, the sealed report.
+    reports_in: Vec<(NodeId, String, String)>,
 }
 
 /// Which way a document is held back: what this page has not sent, or what
@@ -592,6 +617,9 @@ pub struct VaultClient {
     /// This client's id, as the server sees it, for recognising the
     /// notifications caused by this client's own appends.
     client_id: String,
+    /// The device id this page's state reports go out under (see the module
+    /// doc, "State reports").
+    device: String,
     stores: HashMap<StoreId, VaultStore>,
     /// What the accounts service says about each store this account has a
     /// grant on: its kind (the authority when the RPC `Store` does not carry
@@ -672,6 +700,7 @@ impl VaultClient {
         let (presence_tx, presence_rx) = unbounded();
         Self {
             client_id,
+            device: device_id(),
             stores: HashMap::new(),
             rows: HashMap::new(),
             waiting: HashMap::new(),
@@ -1235,6 +1264,7 @@ impl VaultClient {
                 tracing::warn!("Appending the repair of {} failed: {}", store_id, message);
             }
         }
+        self.compare_reports(client, store_id).await;
         Ok(())
     }
 
@@ -1346,6 +1376,9 @@ impl VaultClient {
                     tracing::warn!("Resending the document {} failed: {}", node_id, e);
                 }
             }
+
+            // And what every device holds, compared (docs/CONVERGENCE_CONTRACT.md).
+            self.compare_reports(client, store_id).await;
         }
         events
     }
@@ -1371,6 +1404,107 @@ impl VaultClient {
             events.extend(merged.events);
         }
         (events, structure)
+    }
+
+    // ── State reports (docs/CONVERGENCE_CONTRACT.md, wave 1) ────────────────
+
+    /// At an open or a connect: read every device's reports of the documents
+    /// this page holds and answer each that lacks something held here, then
+    /// say what this page holds of every one of them. A server from before
+    /// reports answers method-not-found, and the page goes on without them.
+    async fn compare_reports(&mut self, client: &Arc<PimbleClient>, store_id: StoreId) {
+        let held: Vec<NodeId> = {
+            let Some(store) = self.stores.get_mut(&store_id) else { return };
+            store.reports_ok = true;
+            store.reported.clear();
+            store.report_due.clear();
+            store.tree.ids().into_iter().filter(|id| store.heads.contains_key(id)).collect()
+        };
+        for batch in held.chunks(protocol::REPORTS_BATCH) {
+            match client.vault_reports(store_id, batch.iter().map(|id| VaultDocId::Node(*id)).collect()).await {
+                Ok(reports) => {
+                    for report in reports {
+                        if let VaultDocId::Node(node_id) = report.doc_id {
+                            self.answer_one(client, store_id, node_id, &report.device, &report.blob).await;
+                        }
+                    }
+                }
+                Err(e) if e.is_method_not_found() => {
+                    tracing::info!("Store {}: its server takes no state reports (an older Pimble); syncing without them", store_id);
+                    if let Some(store) = self.stores.get_mut(&store_id) {
+                        store.reports_ok = false;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("Reading the state reports of {} failed: {}", store_id, e);
+                    return;
+                }
+            }
+        }
+        self.send_reports(client, store_id, held).await;
+    }
+
+    /// The stores with reports to send or to answer now.
+    pub fn reports_due(&self) -> Vec<StoreId> {
+        let now = now_ms();
+        self.stores.iter().filter(|(_, store)| store.reports_waiting(now)).map(|(id, _)| *id).collect()
+    }
+
+    /// Answer the reports heard live since the last pass, and send the ones
+    /// whose debounce has run out.
+    pub async fn exchange_reports(&mut self, client: &Arc<PimbleClient>, store_id: StoreId) {
+        let (incoming, due) = {
+            let Some(store) = self.stores.get_mut(&store_id) else { return };
+            (std::mem::take(&mut store.reports_in), store.take_due_reports(now_ms()))
+        };
+        for (node_id, device, blob) in incoming {
+            self.answer_one(client, store_id, node_id, &device, &blob).await;
+        }
+        if !due.is_empty() {
+            self.send_reports(client, store_id, due).await;
+        }
+    }
+
+    /// One other device's report: when it lacks something this page holds,
+    /// append the diff from it.
+    async fn answer_one(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, device: &str, blob: &str) {
+        let own = self.device.clone();
+        let row = self.rows.get(&store_id).cloned();
+        let Some(store) = self.stores.get_mut(&store_id) else { return };
+        let Some((diff, reported)) = store.answer_report(store_id, &own, node_id, device, blob, row.as_ref()) else { return };
+        tracing::info!("Store {}: device {} lacks part of the document {} that this page holds; sending {} bytes", store_id, device, node_id, diff.len());
+        match self.append_prepared(client, store_id, node_id, &diff).await {
+            Ok(()) => {
+                if let Some(store) = self.stores.get_mut(&store_id) {
+                    store.answered_report(node_id, device, &reported);
+                }
+            }
+            Err(e) => tracing::warn!("Sending what device {} lacks of {} failed: {}", device, node_id, e),
+        }
+    }
+
+    /// Seal and send this page's reports of `nodes`, several at a time.
+    async fn send_reports(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, nodes: Vec<NodeId>) {
+        let sealed = {
+            let Some(store) = self.stores.get_mut(&store_id).filter(|store| store.reports_ok) else { return };
+            store.reports_for(store_id, nodes)
+        };
+        let device = self.device.clone();
+        for batch in sealed.chunks(protocol::REPORTS_IN_FLIGHT) {
+            let sent = futures::future::join_all(batch.iter().map(|(node_id, _, blob)| client.vault_report(store_id, VaultDocId::Node(*node_id), &device, blob.clone()))).await;
+            let Some(store) = self.stores.get_mut(&store_id) else { return };
+            for ((node_id, plaintext, _), result) in batch.iter().zip(sent) {
+                match result {
+                    Ok(()) => store.sent_report(*node_id, plaintext.clone()),
+                    Err(e) if e.is_method_not_found() => {
+                        store.reports_ok = false;
+                        return;
+                    }
+                    Err(e) => tracing::debug!("Store {}: the report of {} was not taken ({})", store_id, node_id, e),
+                }
+            }
+        }
     }
 
     // ── What an open store is still owed ────────────────────────────────────
@@ -1415,6 +1549,17 @@ impl VaultClient {
         events.extend(self.plugin_events());
         events.extend(self.open_presence());
         while let Ok(notification) = self.notices_rx.try_recv() {
+            // Another device's state report: answered by the backend loop,
+            // which has the connection to append with (`exchange_reports`).
+            if let StoreChangeKind::VaultReported { doc_id: VaultDocId::Node(node_id), device, blob } = &notification.change_kind {
+                if let Some(store) = self.stores.get_mut(&notification.store_id).filter(|store| store.reports_ok) {
+                    store.reports_in.push((*node_id, device.clone(), blob.clone()));
+                }
+                continue;
+            }
+            if matches!(notification.change_kind, StoreChangeKind::VaultReported { .. }) {
+                continue;
+            }
             let StoreChangeKind::VaultAppended { doc_id, seq, part } = &notification.change_kind else {
                 // A vault store emits nothing else, but forward anything that
                 // does arrive rather than swallowing it.
@@ -2328,7 +2473,7 @@ impl VaultClient {
         if !self.subscribed.insert(store_id) {
             return None;
         }
-        match client.subscribe_store_changes(store_id).await {
+        match client.subscribe_store_changes_with_reports(store_id).await {
             Ok(mut sub) => {
                 let tx = self.notices_tx.clone();
                 let signal = signal_ui.clone();
@@ -2593,6 +2738,7 @@ impl VaultStore {
     /// document's cursor. Nothing is repaired here; the caller runs
     /// [`VaultStore::repair_now`] once the whole pull is in.
     fn assemble(listed: Store, keys: StoreKeys, scope_roots: Vec<NodeId>, pulled: Vec<Pulled>) -> Self {
+        let listed_id = listed.id;
         let mut node_docs: HashMap<NodeId, NodeDoc> = HashMap::new();
         let mut docs: HashMap<NodeId, VaultDoc> = HashMap::new();
         let mut heads = HashMap::new();
@@ -2649,6 +2795,11 @@ impl VaultStore {
             parts: PartBuffer::default(),
             held_changed: !held_back.is_empty(),
             held_back,
+            reports_ok: false,
+            report_due: HashMap::new(),
+            reported: HashMap::new(),
+            answered: load_answered(listed_id),
+            reports_in: Vec::new(),
         }
     }
 
@@ -2753,6 +2904,7 @@ impl VaultStore {
         if !effect.changed {
             return Merged { events: Vec::new(), structure: false, wants_key: false };
         }
+        self.note_report_due(node_id, now_ms());
 
         let after = self.tree.shape(node_id);
         // A share made, or made again under another key, while this page was
@@ -2989,6 +3141,9 @@ impl VaultStore {
         self.keys.forget_documents();
         self.look.unread.clear();
         self.look.asked.clear();
+        self.reported.clear();
+        self.answered.forget();
+        save_answered(self.listed.id, &self.answered);
     }
 
     /// Whether this account may write `node_id`'s document, by the rule
@@ -3224,6 +3379,7 @@ impl VaultStore {
             return Err("that node's document is not held here".to_string());
         };
         let sent_sv = node_doc.state_vector();
+        self.note_report_due(node_id, now_ms());
         let resend = self.docs.entry(node_id).or_default().unsent;
         let payload = if resend {
             let known = self.docs[&node_id].known_sv.clone();
@@ -3377,6 +3533,94 @@ impl VaultStore {
 }
 
 /// The key a document's share marker names, when it carries one.
+impl VaultStore {
+    // ── State reports (docs/CONVERGENCE_CONTRACT.md, wave 1) ────────────────
+
+    /// A change to `node_id`, made here or merged from elsewhere: its report
+    /// is due a debounce from `now`.
+    fn note_report_due(&mut self, node_id: NodeId, now: f64) {
+        if self.reports_ok {
+            self.report_due.insert(node_id, now + protocol::REPORT_DEBOUNCE_MS as f64);
+        }
+    }
+
+    /// The documents whose reports are due at `now`, taken off the list.
+    fn take_due_reports(&mut self, now: f64) -> Vec<NodeId> {
+        let due: Vec<NodeId> = self.report_due.iter().filter(|(_, at)| **at <= now).map(|(id, _)| *id).collect();
+        for id in &due {
+            self.report_due.remove(id);
+        }
+        due
+    }
+
+    /// Whether anything about reports is waiting for the backend loop.
+    fn reports_waiting(&self, now: f64) -> bool {
+        !self.reports_in.is_empty() || self.report_due.values().any(|at| *at <= now)
+    }
+
+    /// This page's reports of `nodes`, sealed, each with its plaintext: only
+    /// documents the server holds (a report never creates one), only those
+    /// whose report the server does not hold as it is, and only those with a
+    /// key this page may seal under.
+    fn reports_for(&mut self, store_id: StoreId, nodes: Vec<NodeId>) -> Vec<(NodeId, Vec<u8>, String)> {
+        let mut out = Vec::new();
+        for node_id in nodes {
+            if !self.heads.contains_key(&node_id) {
+                continue;
+            }
+            let Some(doc) = self.tree.doc(node_id) else { continue };
+            let report = protocol::Report::of(doc);
+            let plaintext = report.encode();
+            if self.reported.get(&node_id) == Some(&plaintext) {
+                continue;
+            }
+            let Some((key_id, key)) = self.keys.encrypt_key(store_id, node_id) else { continue };
+            let sealed = protocol::seal_report(store_id, node_id, key_id, &key, &report);
+            out.push((node_id, plaintext, sealed));
+        }
+        out
+    }
+
+    /// The server stored this page's report of `node_id`.
+    fn sent_report(&mut self, node_id: NodeId, plaintext: Vec<u8>) {
+        self.reported.insert(node_id, plaintext);
+    }
+
+    /// Another device's report of `node_id` (`own` is this page's device):
+    /// the diff to append and the report it answers, when this page holds
+    /// something that report lacks (structs, or deletes of the same structs)
+    /// and has not answered that same
+    /// report already (`pimble_rpc::vault::Comparing`). A report that will not
+    /// open here, this page's own, and any report of a document this account
+    /// may only read ask nothing of it.
+    fn answer_report(&mut self, store_id: StoreId, own: &str, node_id: NodeId, device: &str, blob: &str, row: Option<&AccountStore>) -> Option<(Vec<u8>, protocol::Report)> {
+        let report = match self.keys.open_report(store_id, node_id, blob) {
+            Ok(report) => report,
+            Err(reason) => {
+                tracing::debug!("Store {}: device {}'s report of {} does not open here ({}); ignoring it", store_id, device, node_id, reason);
+                return None;
+            }
+        };
+        if device == own {
+            self.reported.insert(node_id, report.encode());
+            return None;
+        }
+        if !self.may_write(node_id, row) {
+            return None;
+        }
+        let doc = self.tree.doc(node_id)?;
+        let from = self.answered.owed(own, &node_id.to_string(), device, &protocol::Report::of(doc), &report)?;
+        let diff = doc.diff_since(&from).ok()?;
+        Some((diff, report))
+    }
+
+    /// `device`'s `reported` report of `node_id` was answered with an append.
+    fn answered_report(&mut self, node_id: NodeId, device: &str, reported: &protocol::Report) {
+        self.answered.answered(&node_id.to_string(), device, reported);
+        save_answered(self.listed.id, &self.answered);
+    }
+}
+
 fn share_key_id(shape: &DocShape) -> Option<KeyId> {
     shape.fields.as_ref().and_then(protocol::share_marker).map(|marker| marker.key_id)
 }
@@ -3506,6 +3750,11 @@ impl StoreKeys {
     /// document waits with (`pimble_rpc::vault::Unopened::reason`).
     fn decrypt_blob(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Result<Vec<u8>, String> {
         self.docs.open(store_id, node_id, encoded, &self.scope).map_err(|e| e.reason())
+    }
+
+    /// Open another device's state report of one document.
+    fn open_report(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Result<protocol::Report, String> {
+        self.docs.open_report(store_id, node_id, encoded, &self.scope).map_err(|e| e.reason())
     }
 
     /// Open every part of a group of one document, as the one update they
@@ -3657,6 +3906,62 @@ fn now_ms() -> f64 {
 fn now_ms() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64
 }
+
+/// The page's device id for state reports: kept in `localStorage`, so every
+/// load of this browser reports into one slot; a fresh one where storage is
+/// not to be had.
+#[cfg(target_arch = "wasm32")]
+fn device_id() -> String {
+    const KEY: &str = "pimble.vault-device";
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    if let Some(id) = storage.as_ref().and_then(|s| s.get_item(KEY).ok().flatten()).filter(|id| !id.is_empty() && id.len() <= 64) {
+        return id;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(storage) = storage {
+        let _ = storage.set_item(KEY, &id);
+    }
+    id
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn device_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn answered_key(store_id: StoreId) -> String {
+    format!("pimble.vault-answered.{store_id}")
+}
+
+/// Which reports this browser has answered in `store_id` (see
+/// [`VaultStore::answered`]); nothing where storage is not to be had.
+#[cfg(target_arch = "wasm32")]
+fn load_answered(store_id: StoreId) -> protocol::Comparing {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(&answered_key(store_id)).ok().flatten())
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_answered(_store_id: StoreId) -> protocol::Comparing {
+    protocol::Comparing::default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_answered(store_id: StoreId, answered: &protocol::Comparing) {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else { return };
+    if answered.is_empty() {
+        let _ = storage.remove_item(&answered_key(store_id));
+    } else if let Ok(json) = serde_json::to_string(answered) {
+        let _ = storage.set_item(&answered_key(store_id), &json);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_answered(_store_id: StoreId, _answered: &protocol::Comparing) {}
 
 /// About 120 characters around the match, or the start of the text.
 fn snippet_around(text: &str, at: Option<usize>) -> String {
@@ -5870,5 +6175,137 @@ mod tests {
         let undelete = BackendCommand::UndeleteNode { store_id, node_id: NodeId::new() };
         let refused = refuse_write(&client, store_id, &undelete).expect("a reader may not undelete either");
         assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));
+    }
+
+    // ── State reports (docs/CONVERGENCE_CONTRACT.md, wave 1) ────────────────
+
+    /// Two pages of one store, as two devices: the same scope keys, the same
+    /// documents, reporting.
+    fn two_pages(peer: &Tree) -> (VaultStore, VaultStore) {
+        let mut a = opened(peer);
+        let mut b = VaultStore::assemble(listed(peer.root()), same_keys(&a), Vec::new(), pull_of(peer));
+        a.reports_ok = true;
+        b.reports_ok = true;
+        (a, b)
+    }
+
+    /// The 2026-11-19 gap, in the browser: page A holds an edit the server
+    /// never got. Page B's report lacks it, so A answers with exactly what B
+    /// lacks; once B holds it, its report asks nothing more; the same report
+    /// is never answered twice; a page's own report is only noted.
+    #[test]
+    fn a_report_that_lacks_what_this_page_holds_is_answered_once() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let (mut a, mut b) = two_pages(&peer);
+        // An edit A made and never appended.
+        a.tree.set_title(root, "Twelve structs", T1).unwrap();
+
+        let sealed = b.reports_for(store_id, vec![root]);
+        assert_eq!(sealed.len(), 1, "B reports the document the server holds");
+        let (_, plaintext, blob) = sealed[0].clone();
+        b.sent_report(root, plaintext);
+        assert!(b.reports_for(store_id, vec![root]).is_empty(), "a report the server holds as it is is not sent again");
+
+        let (diff, reported) = a.answer_report(store_id, "device-a", root, "device-b", &blob, None).expect("B lacks what A holds");
+        b.tree.apply_update(root, &diff).unwrap();
+        assert_eq!(b.tree.get_node_info(root).unwrap().title, "Twelve structs", "the answer is what B lacked");
+        a.answered_report(root, "device-b", &reported);
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &blob, None).is_none(), "the same report is not answered twice");
+
+        let (_, _, again) = b.reports_for(store_id, vec![root]).pop().expect("B's vector moved: a new report");
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &again, None).is_none(), "equal now: nothing owed");
+        assert!(b.answer_report(store_id, "device-b", root, "device-a", &again, None).is_none(), "and nothing the other way");
+
+        // A page's own report, read back at a connect, says what the server
+        // holds of it and asks nothing.
+        let mut fresh = VaultStore::assemble(listed(root), same_keys(&a), Vec::new(), pull_of(&peer));
+        fresh.reports_ok = true;
+        assert!(fresh.answer_report(store_id, "device-b", root, "device-b", &blob, None).is_none());
+        assert!(fresh.reported.contains_key(&root));
+
+        // A document the server has never seen is never reported: a report
+        // must not be what creates it.
+        let x = NodeId::new();
+        b.tree.add_node(x, Some(root), Place::Last, "document", "x", T2).unwrap();
+        assert!(b.reports_for(store_id, vec![x]).is_empty());
+        // A report that does not open here asks nothing.
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", "not a blob", None).is_none());
+    }
+
+    /// A page that may only read the document answers no report: a reader's
+    /// page never appends. It still reports.
+    #[test]
+    fn a_readers_page_reports_and_answers_nothing() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let (mut a, mut b) = two_pages(&peer);
+        a.tree.set_title(root, "Held here only", T1).unwrap();
+        let reader = row(vec![grant(None, "reader", "Vault")], None);
+        let (_, _, blob) = b.reports_for(store_id, vec![root]).pop().expect("a reader's page reports");
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &blob, Some(&reader)).is_none());
+        let editor = row(vec![grant(None, "editor", "Vault")], None);
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &blob, Some(&editor)).is_some());
+    }
+
+    /// A document's report is due a debounce after the last change to it,
+    /// merged from elsewhere or made here, and only once reports are on.
+    #[test]
+    fn a_report_is_due_a_debounce_after_the_last_change() {
+        let (mut peer, root) = origin();
+        let store_id = StoreId::new();
+        let mut page = opened(&peer);
+        let edit = peer.set_title(root, "Elsewhere", T1).unwrap();
+        page.merge(store_id, root, vec![(Mark::One(2), Ok(edit.touched[0].1.clone()))], true, None);
+        assert!(page.report_due.is_empty(), "nothing is due before the server is known to take reports");
+
+        page.reports_ok = true;
+        let edit = peer.set_title(root, "Elsewhere again", T2).unwrap();
+        let before = now_ms();
+        page.merge(store_id, root, vec![(Mark::One(3), Ok(edit.touched[0].1.clone()))], true, None);
+        assert!(page.take_due_reports(before).is_empty(), "not before the debounce");
+        assert!(!page.reports_waiting(before));
+        let after = now_ms() + protocol::REPORT_DEBOUNCE_MS as f64 + 1.0;
+        assert!(page.reports_waiting(after));
+        assert_eq!(page.take_due_reports(after), vec![root]);
+        assert!(page.report_due.is_empty());
+
+        // A change made here counts the same.
+        let local = page.tree.set_title(root, "Here", T2).unwrap();
+        page.prepare(store_id, root, &local.touched[0].1).unwrap();
+        assert!(page.report_due.contains_key(&root));
+    }
+
+    /// Two pages holding the same structs and different deletes: page B's copy
+    /// missed a delete A holds. Their vectors are equal, the delete digests
+    /// tell them apart, each answers the other once, and both end with the
+    /// delete and equal reports.
+    #[test]
+    fn a_delete_one_page_missed_is_answered_by_its_digest() {
+        let (mut peer, root) = origin();
+        let store_id = StoreId::new();
+        peer.set_title(root, "A title to delete", T1).unwrap();
+        let (mut a, mut b) = two_pages(&peer);
+        // A delete-only update: what a peer's delete carries when it brings
+        // no structs.
+        let mut scratch = NodeDoc::load(&a.tree.doc(root).unwrap().save()).unwrap();
+        scratch.set_title("", T2).unwrap();
+        let deletes = scratch.diff_since(&scratch.state_vector()).unwrap();
+        a.tree.apply_update(root, &deletes).unwrap();
+        assert_eq!(a.tree.doc(root).unwrap().state_vector(), b.tree.doc(root).unwrap().state_vector(), "a delete moves no clock");
+        assert_ne!(a.tree.doc(root).unwrap().delete_set_digest(), b.tree.doc(root).unwrap().delete_set_digest());
+
+        let (_, _, a_blob) = a.reports_for(store_id, vec![root]).pop().unwrap();
+        let (_, _, b_blob) = b.reports_for(store_id, vec![root]).pop().unwrap();
+        let (to_b, b_report) = a.answer_report(store_id, "device-a", root, "device-b", &b_blob, None).expect("A holds a delete B lacks");
+        let (to_a, a_report) = b.answer_report(store_id, "device-b", root, "device-a", &a_blob, None).expect("and B cannot tell whose set is larger");
+        b.tree.apply_update(root, &to_b).unwrap();
+        a.tree.apply_update(root, &to_a).unwrap();
+        a.answered_report(root, "device-b", &b_report);
+        b.answered_report(root, "device-a", &a_report);
+        assert_eq!(a.tree.doc(root).unwrap().delete_set_digest(), b.tree.doc(root).unwrap().delete_set_digest(), "both hold the union");
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &b_blob, None).is_none(), "the same report is not answered twice");
+        let (_, _, b_now) = b.reports_for(store_id, vec![root]).pop().expect("B reports what it holds now");
+        assert!(a.answer_report(store_id, "device-a", root, "device-b", &b_now, None).is_none(), "equal now");
     }
 }

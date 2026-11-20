@@ -193,6 +193,19 @@ pub trait PimbleApi {
     #[method(name = "vaultListDocs", with_extensions)]
     async fn vault_list_docs(&self, request: VaultListDocsRequest) -> Result<VaultListDocsResponse, ErrorObjectOwned>;
 
+    /// Store a device's sealed state report of a vault document, replacing
+    /// the one it sent before (docs/CONVERGENCE_CONTRACT.md section 1), and
+    /// announce it to the store's subscribers that asked for reports
+    /// (`VaultReported`). Reader: a reader's device needs what it lacks too.
+    #[method(name = "vaultReport", with_extensions)]
+    async fn vault_report(&self, request: VaultReportRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Every device's latest state report of the named vault documents
+    /// (docs/CONVERGENCE_CONTRACT.md section 2). Reader; a share's member is
+    /// answered for the documents of their scope only.
+    #[method(name = "vaultReports", with_extensions)]
+    async fn vault_reports(&self, request: VaultReportsRequest) -> Result<VaultReportsResponse, ErrorObjectOwned>;
+
     // ========================================================================
     // Edit Operations (collaborative editing)
     // ========================================================================
@@ -242,9 +255,11 @@ pub trait PimbleApi {
 
     /// Subscribe to changes in a store's tree structure and metadata.
     /// Notifications are sent whenever nodes are created, deleted, moved, or
-    /// have metadata updated. Read.
+    /// have metadata updated. Read. `options` may be left out (every caller
+    /// from before 2026-11-19 sends the store id alone, and an older server
+    /// ignores it): see [`StoreSubscribeOptions`].
     #[subscription(name = "subscribeStoreChanges" => "storeChanged", unsubscribe = "unsubscribeStoreChanges", item = StoreChangedNotification, with_extensions)]
-    async fn subscribe_store_changes(&self, store_id: StoreId) -> SubscriptionResult;
+    async fn subscribe_store_changes(&self, store_id: StoreId, options: Option<StoreSubscribeOptions>) -> SubscriptionResult;
 
     /// Subscribe to changes in a specific node's content.
     /// Notifications are sent whenever the node's content document is

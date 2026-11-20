@@ -850,3 +850,91 @@ async fn delete_vault_store_removes_an_open_vault_and_nothing_else() {
     admin.delete_vault_store(vault_id).await.expect_err("twice is an error, not a second removal");
     assert!(plain_path.join("manifest.json").exists());
 }
+
+// ── State reports (docs/CONVERGENCE_CONTRACT.md, wave 1) ─────────────────
+
+/// The next notification on `sub` within `within`, `None` when none came.
+async fn next_within(
+    sub: &mut jsonrpsee::core::client::Subscription<pimble_rpc::StoreChangedNotification>,
+    within: Duration,
+) -> Option<pimble_rpc::StoreChangedNotification> {
+    tokio::time::timeout(within, sub.next()).await.ok().flatten().map(|n| n.expect("the notification deserializes"))
+}
+
+#[tokio::test]
+async fn a_report_is_one_slot_per_device_and_reaches_only_who_asked_for_reports() {
+    let (_server, client) = start_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
+    let doc = VaultDocId::Node(NodeId::new());
+    client.vault_append(store_id, doc.clone(), b64(b"a blob")).await.unwrap();
+
+    let mut asked = client.subscribe_store_changes_with_reports(store_id).await.unwrap();
+    let mut plain = client.subscribe_store_changes(store_id).await.unwrap();
+
+    client.vault_report(store_id, doc.clone(), "device-a", b64(b"a's first")).await.unwrap();
+    client.vault_report(store_id, doc.clone(), "device-b", b64(b"b's")).await.unwrap();
+    client.vault_report(store_id, doc.clone(), "device-a", b64(b"a's second")).await.unwrap();
+
+    let mut reports = client.vault_reports(store_id, vec![doc.clone(), VaultDocId::Node(NodeId::new())]).await.unwrap();
+    reports.sort_by(|a, b| a.device.cmp(&b.device));
+    assert_eq!(
+        reports.iter().map(|r| (r.doc_id.clone(), r.device.as_str(), r.blob.as_str())).collect::<Vec<_>>(),
+        vec![(doc.clone(), "device-a", b64(b"a's second").as_str()), (doc.clone(), "device-b", b64(b"b's").as_str())],
+        "the latest report of each device, overwritten in its slot; a document with none answers none"
+    );
+
+    let notif = next_within(&mut asked, Duration::from_secs(2)).await.expect("a subscriber that asked hears the report");
+    match notif.change_kind {
+        StoreChangeKind::VaultReported { doc_id, device, blob } => {
+            assert_eq!((doc_id, device.as_str(), blob), (doc.clone(), "device-a", b64(b"a's first")));
+        }
+        other => panic!("expected VaultReported, got {:?}", other),
+    }
+    assert!(next_within(&mut plain, Duration::from_millis(500)).await.is_none(), "a subscriber that did not ask is sent no kind it may not read");
+
+    // Refusals: a document with no log, the retired tree document, a report
+    // over the limit, no device. Nothing of them is stored.
+    let empty = VaultDocId::Node(NodeId::new());
+    assert!(client.vault_report(store_id, empty.clone(), "device-a", b64(b"x")).await.is_err(), "no log, no report");
+    assert!(!client.vault_list_docs(store_id).await.unwrap().iter().any(|d| d.doc_id == empty), "a refused report brings no document into being");
+    assert!(client.vault_report(store_id, VaultDocId::Tree, "device-a", b64(b"x")).await.is_err());
+    let too_big = vec![7u8; pimble_store::MAX_REPORT_BYTES + 1];
+    let err = client.vault_report(store_id, doc.clone(), "device-c", b64(&too_big)).await.expect_err("over the size limit");
+    assert!(err.to_string().contains("exceeds the limit"), "got: {err}");
+    assert!(client.vault_report(store_id, doc.clone(), "", b64(b"x")).await.is_err(), "a device id is required");
+    client.vault_report(store_id, doc.clone(), "device-c", b64(&vec![7u8; pimble_store::MAX_REPORT_BYTES])).await.expect("at the limit is taken");
+    assert_eq!(client.vault_reports(store_id, vec![doc.clone()]).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn reports_stay_inside_a_members_scope_and_a_reader_reports_too() {
+    let v = SharedVault::start().await;
+    let (store_id, share_root, inside, outside) = (v.store_id, v.share_root, v.inside, v.outside);
+    let editor = v.member("bob", &[(share_root, "editor")]).await;
+    let reader = v.member("carol", &[(share_root, "reader")]).await;
+    let mut reader_sub = reader.subscribe_store_changes_with_reports(store_id).await.unwrap();
+
+    editor.vault_report(store_id, VaultDocId::Node(inside), "bob-device", b64(b"bob's")).await.expect("a report in scope");
+    reader.vault_report(store_id, VaultDocId::Node(inside), "carol-device", b64(b"carol's")).await.expect("a reader reports: what it lacks reaches it only if it says so");
+    refused_as_no_grant(editor.vault_report(store_id, VaultDocId::Node(outside), "bob-device", b64(b"no")).await, "a report outside the scope");
+    refused_as_no_grant(editor.vault_report(store_id, VaultDocId::Node(NodeId::new()), "bob-device", b64(b"no")).await, "a report of a document that does not exist");
+
+    v.admin.vault_report(store_id, VaultDocId::Node(outside), "alice-device", b64(b"outside")).await.unwrap();
+    let devices = |reports: Vec<pimble_rpc::VaultReport>| reports.into_iter().map(|r| (r.doc_id, r.device)).collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        devices(editor.vault_reports(store_id, vec![VaultDocId::Node(inside), VaultDocId::Node(outside)]).await.unwrap()),
+        [(VaultDocId::Node(inside), "bob-device".to_string()), (VaultDocId::Node(inside), "carol-device".to_string())].into_iter().collect(),
+        "a member is answered for their scope and nothing else"
+    );
+    assert_eq!(v.admin.vault_reports(store_id, vec![VaultDocId::Node(outside)]).await.unwrap().len(), 1, "the owner reads every report");
+
+    // What the reader hears: its own report and bob's, never the one outside.
+    let mut heard = Vec::new();
+    while let Some(notif) = next_within(&mut reader_sub, Duration::from_millis(700)).await {
+        if let StoreChangeKind::VaultReported { doc_id, device, .. } = notif.change_kind {
+            heard.push((doc_id, device));
+        }
+    }
+    assert_eq!(heard, vec![(VaultDocId::Node(inside), "bob-device".to_string()), (VaultDocId::Node(inside), "carol-device".to_string())]);
+}

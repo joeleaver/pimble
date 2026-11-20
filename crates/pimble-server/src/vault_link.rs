@@ -55,6 +55,20 @@
 //!   than `pimble_rpc::vault::PART_BYTES` goes as parts when the remote takes
 //!   them (`VaultListDocsResponse::parts`), and a group that arrives in parts
 //!   is applied once every part is here (`pimble_rpc::vault::PartBuffer`).
+//! - **State reports** (docs/CONVERGENCE_CONTRACT.md, wave 1): the twin
+//!   cannot say what it holds, so the devices say what they hold. After the
+//!   reconcile, and 5 s after the last change to a document
+//!   (`pimble_rpc::vault::REPORT_DEBOUNCE_MS`), the link seals the
+//!   document's state vector and delete digest under its key and stores it
+//!   in this device's slot (`vaultReport`; the device id is kept in
+//!   `devices.json`, outside the store's folder, `crate::devices`). At
+//!   connect it reads every device's reports of the documents it holds
+//!   (`vaultReports`), and live it hears each new one (`VaultReported`):
+//!   where this device holds something a report lacks, it appends the diff
+//!   from that report (`pimble_rpc::vault::Comparing`). This is what heals a
+//!   wrong `pushed_sv` (2026-11-19: twelve structs that never left one
+//!   device). A remote from before reports answers method-not-found, and the
+//!   link carries on without them.
 //! - **What waits** ([`Waiting`]): a document the link holds back, for any
 //!   reason (an update the remote would not take, a blob no key opens, parts
 //!   made by a newer Pimble), is listed with a sentence that says why, and
@@ -694,10 +708,8 @@ async fn connect_and_sync(
     // between the pull and the subscription would otherwise be seen by
     // neither. Anything the pull already applied arrives again here and
     // merges to nothing.
-    let mut remote_sub = client
-        .subscribe_store_changes(store_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", endpoint, e))?;
+    let subscribed = if progress.reports_enabled { client.subscribe_store_changes_with_reports(store_id).await } else { client.subscribe_store_changes(store_id).await };
+    let mut remote_sub = subscribed.map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", endpoint, e))?;
 
     // Whatever changed locally while no connection was up is not pushed as
     // the deltas it arrived as (the link was not there to push them in
@@ -753,9 +765,18 @@ async fn connect_and_sync(
     let mut announce_by = matches!(endpoint, LinkEndpoint::RelayFace).then(|| tokio::time::Instant::now() + ANNOUNCE_WAIT);
     let mut announce_check = tokio::time::interval(ANNOUNCE_CHECK_EVERY);
 
+    // What the other devices say they hold, answered, and then what this one
+    // holds, said (docs/CONVERGENCE_CONTRACT.md sections 1-2).
+    compare_at_connect(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
+
     loop {
         flush_waiting(handler, link, progress).await;
+        let next_report = progress.next_report_due();
         tokio::select! {
+            _ = tokio::time::sleep_until(next_report.unwrap_or_else(tokio::time::Instant::now)), if next_report.is_some() => {
+                let due = progress.take_due_reports();
+                send_reports(handler, &client, store_id, key_id, due, progress).await?;
+            }
             _ = announce_check.tick(), if announce_by.is_some() => {
                 let waited_out = announce_by.is_some_and(|by| tokio::time::Instant::now() >= by);
                 if waited_out || crate::share::settled(handler, store_id).await {
@@ -766,7 +787,7 @@ async fn connect_and_sync(
             item = remote_sub.next() => {
                 match item {
                     Some(Ok(notif)) => {
-                        handle_remote_notification(handler, &client, store_id, link_id, notif, &echoes, progress).await?;
+                        handle_remote_notification(handler, &client, store_id, key_id, link_id, notif, &echoes, progress).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
@@ -780,6 +801,7 @@ async fn connect_and_sync(
                         // a member's create and another device's move change
                         // what is under a share as much as an edit made here.
                         shares.upkeep.note(store_id, &local_change);
+                        progress.note_report_due(store_id, &local_change);
                         let doc = changed_doc(store_id, link_id, &local_change);
                         if let Err(e) = forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &echoes, progress).await {
                             // Taken off the channel and not delivered: the
@@ -1164,6 +1186,32 @@ struct Progress {
     parts: PartBuffer,
     /// The documents held back, and why (shared with the handle).
     waiting: Waiting,
+    /// Whether this server's links report and compare at all
+    /// (`ServerConfig::vault_reports`).
+    reports_enabled: bool,
+    /// Whether the remote takes state reports, as this connection found.
+    reports_ok: bool,
+    /// When each document's report is due: 5 s after the last change to it.
+    report_due: HashMap<String, tokio::time::Instant>,
+    /// What the remote holds of this device's reports, as this connection has
+    /// seen it (read back at connect, then what it stored): a report that
+    /// says the same again is not sent.
+    reported: HashMap<String, Vec<u8>>,
+    /// This computer's device id in the store, for its state reports
+    /// (docs/CONVERGENCE_CONTRACT.md section 1): random, kept in
+    /// `devices.json` outside the store's folder (`crate::devices`), so two
+    /// computers syncing one folder through Dropbox are two devices. Never
+    /// the account id.
+    device: String,
+    /// Which other devices' reports this computer has answered with an
+    /// append, at which vector and delete digest (`pimble_rpc::vault::Comparing`):
+    /// kept beside the device id, so a report that never moves (a replica
+    /// removed) is answered once and not at every connect. Forgotten with
+    /// the logs.
+    answered: protocol::Comparing,
+    answered_unsaved: bool,
+    devices: Arc<crate::devices::Devices>,
+    store_id: StoreId,
 }
 
 /// What the link knows of the remote's documents and their data keys
@@ -1236,6 +1284,8 @@ impl Progress {
                 .ok()
                 .and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
         };
+        let devices = handler.devices();
+        let entry = devices.entry(store_id).await;
         let file = match &path {
             Some(path) => match tokio::fs::read_to_string(path).await {
                 Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
@@ -1257,7 +1307,53 @@ impl Progress {
             sizes: HashMap::new(),
             parts: PartBuffer::default(),
             waiting: Waiting::default(),
+            reports_enabled: handler.vault_reports(),
+            reports_ok: false,
+            report_due: HashMap::new(),
+            reported: HashMap::new(),
+            device: entry.device,
+            answered: entry.answered,
+            answered_unsaved: false,
+            devices,
+            store_id,
         }
+    }
+
+    /// `device`'s report of `doc` was answered at `reported`.
+    fn note_answered(&mut self, doc: &str, device: &str, reported: &protocol::Report) {
+        self.answered.answered(doc, device, reported);
+        self.answered_unsaved = true;
+    }
+
+    /// A change to a document, whoever made it (this device, or another's
+    /// applied here): its report is due a debounce from now.
+    fn note_report_due(&mut self, store_id: StoreId, change: &LocalChange) {
+        if !self.reports_ok {
+            return;
+        }
+        let LocalChange::Store(notif) = change else { return };
+        if notif.store_id != store_id {
+            return;
+        }
+        if let Some(node_id) = document_of(&notif.change_kind) {
+            let due = tokio::time::Instant::now() + Duration::from_millis(protocol::REPORT_DEBOUNCE_MS);
+            self.report_due.insert(VaultDocId::Node(node_id).as_str(), due);
+        }
+    }
+
+    /// The soonest report due, if any.
+    fn next_report_due(&self) -> Option<tokio::time::Instant> {
+        self.report_due.values().min().copied()
+    }
+
+    /// The documents whose reports are due now, taken off the list.
+    fn take_due_reports(&mut self) -> Vec<VaultDocId> {
+        let now = tokio::time::Instant::now();
+        let due: Vec<String> = self.report_due.iter().filter(|(_, at)| **at <= now).map(|(doc, _)| doc.clone()).collect();
+        due.into_iter().filter_map(|doc| {
+            self.report_due.remove(&doc);
+            VaultDocId::parse(&doc)
+        }).collect()
     }
 
     fn cursor(&mut self, doc_id: &VaultDocId) -> &mut VaultCursor {
@@ -1275,6 +1371,8 @@ impl Progress {
         self.file.dirty.clear();
         self.file.dirty_all = true;
         self.file.rekeying.clear();
+        self.answered.forget();
+        self.answered_unsaved = true;
         self.cursors.clear();
         self.snapshot_seqs.clear();
         self.keyring = Keyring::default();
@@ -1368,6 +1466,10 @@ impl Progress {
 
     /// Best effort, like `record_last_seq`: bookkeeping, never fatal.
     async fn save_if_unsaved(&mut self) {
+        if self.answered_unsaved {
+            self.devices.set_answered(self.store_id, &self.answered).await;
+            self.answered_unsaved = false;
+        }
         if !self.unsaved {
             return;
         }
@@ -1397,6 +1499,8 @@ impl Progress {
 /// holds. Called when a store is unlinked or linked elsewhere.
 pub(crate) async fn forget_progress(handler: &RpcHandler, store_id: StoreId) {
     let progress = Progress::load(handler, store_id).await;
+    // What was answered was answered in that twin's logs.
+    handler.devices().set_answered(store_id, &protocol::Comparing::default()).await;
     if let Some(path) = progress.path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1426,6 +1530,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
         StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::VaultAppended { .. }
+        | StoreChangeKind::VaultReported { .. }
         | StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
@@ -1803,15 +1908,23 @@ async fn apply_unit_locally(
 
 // ── Remote -> local (live) ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_remote_notification(
     handler: &RpcHandler,
     client: &PimbleClient,
     store_id: StoreId,
+    key_id: Uuid,
     link_id: &str,
     notif: StoreChangedNotification,
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
+    if let StoreChangeKind::VaultReported { doc_id, device, blob } = &notif.change_kind {
+        if progress.reports_ok {
+            answer_report(handler, client, store_id, key_id, link_id, doc_id, device, blob, echoes, progress).await?;
+        }
+        return Ok(());
+    }
     let StoreChangeKind::VaultAppended { doc_id, seq, part } = &notif.change_kind else {
         // A vault store only ever produces `VaultAppended`; anything else
         // reaching here would be a plain store's kinds, which can't happen
@@ -1915,13 +2028,7 @@ async fn forward_local_change(
     // arrives here is this replica's own upkeep (a repair). It stays here,
     // marked, and goes out if the role ever changes. A commenter's
     // discussions go out (docs/DISCUSSIONS_CONTRACT.md section 7).
-    let pushes = {
-        let manager = handler.store_manager_handle();
-        let manager = manager.read().await;
-        let access = manager.store_access(store_id);
-        access.allows_write() || (access.allows_comment() && matches!(&doc_id, VaultDocId::Node(id) if manager.is_discussion(store_id, *id)))
-    };
-    if !pushes {
+    if !may_push(handler, store_id, &doc_id).await {
         progress.mark_dirty(&doc_id);
         return Ok(());
     }
@@ -1937,6 +2044,17 @@ async fn forward_local_change(
         }
     }
     Ok(())
+}
+
+/// Whether this replica sends changes to `doc_id` at all: held as an editor
+/// or the owner, or as a commenter for a discussion. A reader's replica never
+/// appends (the local server refuses a reader's writes; what changes here is
+/// its own upkeep).
+async fn may_push(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId) -> bool {
+    let manager = handler.store_manager_handle();
+    let manager = manager.read().await;
+    let access = manager.store_access(store_id);
+    access.allows_write() || (access.allows_comment() && matches!(doc_id, VaultDocId::Node(id) if manager.is_discussion(store_id, *id)))
 }
 
 /// Whether an append went out.
@@ -2308,6 +2426,189 @@ async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: 
     }
     debug!("Vault link for store {} uploaded a snapshot for doc {:?} up to seq {} ({} part(s))", store_id, doc_id, upto_seq, sealed.len());
     Ok(true)
+}
+
+// ── State reports and comparing (docs/CONVERGENCE_CONTRACT.md, wave 1) ────
+
+/// What this device holds of `node_id` now; `None` when it does not hold it.
+async fn report_of(handler: &RpcHandler, store_id: StoreId, node_id: NodeId) -> Option<protocol::Report> {
+    let manager = handler.store_manager_handle();
+    let manager = manager.read().await;
+    let tree = manager.tree(store_id).ok()?;
+    tree.doc(node_id).map(protocol::Report::of)
+}
+
+/// The documents this replica holds that the remote holds too: the ones it
+/// reports on and compares.
+async fn held_on_both(handler: &RpcHandler, store_id: StoreId, progress: &Progress) -> Vec<VaultDocId> {
+    let manager = handler.store_manager_handle();
+    let manager = manager.read().await;
+    manager
+        .doc_ids(store_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(VaultDocId::Node)
+        .filter(|doc_id| progress.keyring.remote_docs.contains(&doc_id.as_str()))
+        .collect()
+}
+
+/// At connect, once the reconcile is done: read every device's reports of
+/// the documents this replica holds and answer each that lacks something
+/// held here, then report every document whose report the remote does not
+/// already hold as it is. A remote from before reports answers
+/// method-not-found, and the link goes on as it did before them.
+async fn compare_at_connect(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    key_id: Uuid,
+    link_id: &str,
+    echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
+) -> anyhow::Result<()> {
+    progress.reported.clear();
+    progress.report_due.clear();
+    progress.reports_ok = progress.reports_enabled;
+    if !progress.reports_ok {
+        return Ok(());
+    }
+    let held = held_on_both(handler, store_id, progress).await;
+    for batch in held.chunks(protocol::REPORTS_BATCH) {
+        let reports = match client.vault_reports(store_id, batch.to_vec()).await {
+            Ok(reports) => reports,
+            Err(e) if e.is_method_not_found() => {
+                info!("Vault link for store {}: the remote takes no state reports (an older Pimble server); syncing without them", store_id);
+                progress.reports_ok = false;
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("remote vaultReports failed: {}", e)),
+        };
+        for report in reports {
+            answer_report(handler, client, store_id, key_id, link_id, &report.doc_id, &report.device, &report.blob, echoes, progress).await?;
+        }
+    }
+    send_reports(handler, client, store_id, key_id, held, progress).await?;
+    progress.save_if_unsaved().await;
+    Ok(())
+}
+
+/// Seal and store this device's report of each of `docs` that the remote
+/// holds and whose report it does not already hold as it is now, several at
+/// a time. A document with no key this device may seal under is not
+/// reported; one the remote will not take a report of is left; anything else
+/// that fails is the connection's.
+async fn send_reports(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, key_id: Uuid, docs: Vec<VaultDocId>, progress: &mut Progress) -> anyhow::Result<()> {
+    if !progress.reports_ok {
+        return Ok(());
+    }
+    let mut sealed: Vec<(VaultDocId, Vec<u8>, String)> = Vec::new();
+    for doc_id in docs {
+        let VaultDocId::Node(node_id) = doc_id else { continue };
+        let doc = doc_id.as_str();
+        // Never a document the remote lacks: sealing one would make it a
+        // data key, and a report is no way to create a document.
+        if !progress.keyring.remote_docs.contains(&doc) {
+            continue;
+        }
+        let Some(report) = report_of(handler, store_id, node_id).await else { continue };
+        let plaintext = report.encode();
+        if progress.reported.get(&doc) == Some(&plaintext) {
+            continue;
+        }
+        let (seal_key_id, key) = match seal_plan(handler, client, store_id, &doc_id, key_id, progress).await {
+            Ok(Seal::With { key_id, key }) => (key_id, key),
+            Ok(_) => continue,
+            Err(e) => {
+                debug!("Vault link for store {} doc {:?}: not reported ({})", store_id, doc_id, e);
+                continue;
+            }
+        };
+        let blob = protocol::seal_report(store_id, node_id, seal_key_id, &key, &report);
+        sealed.push((doc_id, plaintext, blob));
+    }
+    let device = progress.device.clone();
+    for batch in sealed.chunks(protocol::REPORTS_IN_FLIGHT) {
+        let sent = futures::future::join_all(batch.iter().map(|(doc_id, _, blob)| client.vault_report(store_id, doc_id.clone(), &device, blob.clone()))).await;
+        for ((doc_id, plaintext, _), result) in batch.iter().zip(sent) {
+            match result {
+                Ok(()) => {
+                    progress.reported.insert(doc_id.as_str(), plaintext.clone());
+                }
+                Err(e) if e.is_method_not_found() => {
+                    info!("Vault link for store {}: the remote takes no state reports (an older Pimble server); syncing without them", store_id);
+                    progress.reports_ok = false;
+                    return Ok(());
+                }
+                Err(e @ pimble_client::ClientError::Server { .. }) => {
+                    debug!("Vault link for store {} doc {:?}: the remote would not take its report ({})", store_id, doc_id, e);
+                }
+                Err(e) => return Err(anyhow::anyhow!("remote vaultReport for {:?} failed: {}", doc_id, e)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Another device's report of `doc_id` (read at connect, or heard live):
+/// when this device holds something it lacks, and has not answered that
+/// same report already, append the diff from it
+/// (`pimble_rpc::vault::Comparing`). A report that will not open here is
+/// ignored, and so is this device's own (beyond noting what the remote holds
+/// of it). A reader's replica answers nothing: it never appends.
+#[allow(clippy::too_many_arguments)]
+async fn answer_report(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    key_id: Uuid,
+    link_id: &str,
+    doc_id: &VaultDocId,
+    device: &str,
+    blob: &str,
+    echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
+) -> anyhow::Result<()> {
+    let VaultDocId::Node(node_id) = doc_id else { return Ok(()) };
+    let doc = doc_id.as_str();
+    let scope = handler.keystore().store_keys(store_id).await;
+    let report = match progress.keyring.docs.open_report(store_id, *node_id, blob, &scope) {
+        Ok(report) => report,
+        Err(e) => {
+            debug!("Vault link for store {} doc {:?}: device {}'s report does not open here ({}); ignoring it", store_id, doc_id, device, e);
+            return Ok(());
+        }
+    };
+    if device == progress.device {
+        progress.reported.insert(doc, report.encode());
+        return Ok(());
+    }
+    if !may_push(handler, store_id, doc_id).await {
+        return Ok(());
+    }
+    let Some(local) = report_of(handler, store_id, *node_id).await else { return Ok(()) };
+    let Some(from) = progress.answered.owed(&progress.device, &doc, device, &local, &report) else { return Ok(()) };
+    let (_, diff) = doc_diff(handler, store_id, doc_id, &from).await?;
+    if !progress.parts_ok && diff.len() > MAX_CATCH_UP_BLOB {
+        progress.mark_dirty(doc_id);
+        progress.waiting.hold(doc_id, Side::Send, protocol::TOO_LARGE_FOR_REMOTE);
+        return Ok(());
+    }
+    info!(
+        "Vault link for store {} doc {:?}: device {} lacks part of what this device holds ({}); sending {} bytes",
+        store_id,
+        doc_id,
+        device,
+        pimble_crdt::describe_state_vector(&report.state_vector),
+        diff.len()
+    );
+    match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await? {
+        Appended::Yes => {
+            progress.advance(doc_id, &diff);
+            progress.note_answered(&doc, device, &report);
+        }
+        Appended::Refused => progress.mark_dirty(doc_id),
+    }
+    Ok(())
 }
 
 // ── What share upkeep works through (crate::share) ───────────────────────

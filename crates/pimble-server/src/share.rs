@@ -543,7 +543,8 @@ impl Upkeep {
             | StoreChangeKind::ShareStateChanged { .. }
             | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::PeopleChanged
-            | StoreChangeKind::VaultAppended { .. } => return,
+            | StoreChangeKind::VaultAppended { .. }
+            | StoreChangeKind::VaultReported { .. } => return,
         }
         self.retry_wait = UPKEEP_RETRY;
         let first = *self.first_noted.get_or_insert(now);

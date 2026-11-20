@@ -231,6 +231,8 @@ impl RelayHost {
             agents_path: None,
             // Reports this build's version, and hands over to nobody.
             reported_version: None,
+            // A face links nothing; it serves reports all the same.
+            vault_reports: true,
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;

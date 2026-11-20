@@ -1634,6 +1634,7 @@ name = "pimble-rpc"
 version = "0.28.7"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",
