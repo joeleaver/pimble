@@ -334,3 +334,21 @@ its storage (store folders on the desktop, the page's memory and `localStorage` 
 browser). Wave 3's randomized fault test then runs the one engine both apps ship, which is
 what makes the guarantee hold in the browser as much as on the desktop. Sequenced after
 docs/STORE_FOLDERS_CONTRACT.md, which changes where the desktop keeps the link's state.
+
+## When "out of step" is shown (Joe, 2026-11-20)
+
+A mark on a note means something there needs someone, and it says what. Of the three
+reasons (wave 2):
+
+1. **Another device holds changes this one lacks.** Shown, with the step: "Will's device
+   holds changes this one doesn't have yet. They'll arrive when Will opens Pimble."
+2. **This device could not send its changes.** Shown, with the step (sign in again, get
+   online, whatever stopped the send).
+3. **It waits for earlier changes no device has sent.** Not shown on the note: nobody can
+   do anything about it. Logged (diagnostics see it), and a quiet line in Properties ("Some
+   changes from Will's device on Oct 26 never arrived"). If any device holds them, wave 1's
+   comparing sends them by itself; if none does, after 24 hours the waiting part is set
+   aside (section 5) and that line says what was set aside.
+
+Found on "Shared Pimble Notes": a big warning for Will's arrows of 2026-10-26, on a canvas
+the note no longer shows, that no device holds. Built in wave 3.
