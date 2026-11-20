@@ -237,6 +237,10 @@ pub struct Stub {
     pub inner: Mutex<StubInner>,
     /// The members endpoints answer 503 while set: "the service is unreachable".
     pub members_down: AtomicBool,
+    /// `/token` answers 401 "invalid session" while set: the session expired.
+    pub refuse_sessions: AtomicBool,
+    /// How many times `/token` was asked.
+    pub token_calls: std::sync::atomic::AtomicUsize,
 }
 
 pub type StubState = Arc<Stub>;
@@ -334,7 +338,11 @@ pub async fn stub_me_keys(State(state): State<StubState>, headers: HeaderMap) ->
 /// The token as the accounts service mints it: a role for a store held
 /// whole, a role per shared root for one held by shares, and the whole
 /// store winning where an account holds both.
-pub async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+pub async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    state.token_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if state.refuse_sessions.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized", "message": "invalid session" }))));
+    }
     let (token, rpc_url) = {
         let s = state.inner.lock().unwrap();
         let account = s.account_of(&headers);
@@ -352,7 +360,7 @@ pub async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap)
         let token = make_jwt(&s.signing_key, &s.kid, &s.issuer, &account.user_id, &account.email, &stores_claim);
         (token, s.h_rpc_url.clone())
     };
-    Json(json!({ "token": token, "exp": chrono::Utc::now().timestamp() + 300, "rpc_url": rpc_url }))
+    Ok(Json(json!({ "token": token, "exp": chrono::Utc::now().timestamp() + 300, "rpc_url": rpc_url })))
 }
 
 pub async fn stub_list_stores(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
@@ -868,6 +876,8 @@ pub async fn spawn_env() -> Env {
             share_names: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
+        refuse_sessions: AtomicBool::new(false),
+        token_calls: std::sync::atomic::AtomicUsize::new(0),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

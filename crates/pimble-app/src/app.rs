@@ -1132,6 +1132,12 @@ fn server_part(status: &str, addr: &str) -> StatusPart {
 
 /// The Pimble Cloud part: who is signed in and how this computer's
 /// connections to Pimble Cloud are doing (`pimble_rpc::CloudConnection`).
+/// Pimble Cloud refused this computer's session: the Account page offers to
+/// sign in again, the status bar says so.
+fn sign_in_expired(store: AppStore) -> bool {
+    store.cloud_connection.with(|c| c.as_ref().is_some_and(|c| c.session_expired))
+}
+
 fn cloud_part(signed_in: bool, email: &str, connection: Option<&pimble_rpc::CloudConnection>) -> StatusPart {
     use pimble_rpc::CloudReach;
     if !signed_in {
@@ -1140,6 +1146,11 @@ fn cloud_part(signed_in: bool, email: &str, connection: Option<&pimble_rpc::Clou
     let Some(c) = connection else {
         return StatusPart { light: Light::Quiet, detail: email.to_string(), tooltip: format!("Signed in as {email}.") };
     };
+    // Pimble Cloud refused the session: say so where the email was, and the
+    // part opens the Account page as it always does.
+    if c.session_expired {
+        return StatusPart { light: Light::Bad, detail: "sign-in expired".to_string(), tooltip: c.sentence.clone() };
+    }
     let (light, word) = match c.reach {
         CloudReach::Idle => (Light::Quiet, None),
         CloudReach::Connected => (Light::Good, None),
@@ -3610,8 +3621,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // open so the person sees it worked.
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         let sign_in = move || {
-            let url = untracked(|| store.account_modal_url.get()).trim().to_string();
-            let email = untracked(|| store.account_modal_email.get()).trim().to_string();
+            // Signing in again after an expiry: what the page shows filled in
+            // is the account's own.
+            let again = untracked(|| sign_in_expired(store));
+            let or_account = |typed: String, account: String| if typed.trim().is_empty() && again { account } else { typed };
+            let url = or_account(untracked(|| store.account_modal_url.get()), untracked(|| store.cloud_url.get())).trim().to_string();
+            let email = or_account(untracked(|| store.account_modal_email.get()), untracked(|| store.cloud_email.get())).trim().to_string();
             let password = untracked(|| store.account_modal_password.get());
             if url.is_empty() || email.is_empty() || password.is_empty() {
                 store.account_modal_error.set("Fill in the service URL, email and password.".to_string());
@@ -3660,10 +3675,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
                     }
 
-                    // The sign-in face.
-                    if !store.cloud_signed_in.get() {
+                    // The sign-in face: signed out, or signed in with a
+                    // session Pimble Cloud refused (it expired).
+                    if !store.cloud_signed_in.get() || sign_in_expired(store) {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            if sign_in_expired(store) {
+                                div {
+                                    style: "font-size: 13px;",
+                                    {|| format!("Your sign-in as {} expired. Sign in again to sync your hosted and shared stores; your notes are all here, and edits made meanwhile go once you do.", store.cloud_email.get())}
+                                }
+                            }
 
                             TextInput {
                                 label: "Service URL",
@@ -3675,7 +3698,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             TextInput {
                                 label: "Email",
                                 placeholder: "you@example.com",
-                                value_fn: move || store.account_modal_email.get(),
+                                value_fn: move || {
+                                    let typed = store.account_modal_email.get();
+                                    if typed.is_empty() && sign_in_expired(store) { store.cloud_email.get() } else { typed }
+                                },
                                 oninput: move |val: String| store.account_modal_email.set(val),
                             }
 
@@ -3699,7 +3725,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
 
                     // The signed-in face.
-                    if store.cloud_signed_in.get() {
+                    if store.cloud_signed_in.get() && !sign_in_expired(store) {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
 
@@ -5209,13 +5235,16 @@ mod tests {
     fn the_cloud_part_says_who_and_how_it_is_doing() {
         use pimble_rpc::{CloudConnection, CloudReach};
         assert_eq!(cloud_part(false, "", None).detail, "sign in");
-        let connected = CloudConnection { reach: CloudReach::Connected, sentence: "Connected to pimble.app.".into() };
+        let connected = CloudConnection { reach: CloudReach::Connected, sentence: "Connected to pimble.app.".into(), session_expired: false };
         let part = cloud_part(true, "joe@example.com", Some(&connected));
         assert_eq!((part.light, part.detail.as_str()), (Light::Good, "joe@example.com"));
         assert_eq!(part.tooltip, "Signed in as joe@example.com. Connected to pimble.app.");
-        let offline = CloudConnection { reach: CloudReach::Offline, sentence: "Not everything here can reach pimble.app.".into() };
+        let offline = CloudConnection { reach: CloudReach::Offline, sentence: "Not everything here can reach pimble.app.".into(), session_expired: false };
         let part = cloud_part(true, "joe@example.com", Some(&offline));
         assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "joe@example.com · offline"));
+        let expired = CloudConnection { reach: CloudReach::Offline, sentence: "Your sign-in to pimble.app expired.".into(), session_expired: true };
+        let part = cloud_part(true, "joe@example.com", Some(&expired));
+        assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "sign-in expired"));
         // A server too old to say: the account alone.
         assert_eq!(cloud_part(true, "joe@example.com", None).light, Light::Quiet);
     }

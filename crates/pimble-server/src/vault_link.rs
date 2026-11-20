@@ -175,6 +175,8 @@ const CURSOR_VERSION: u32 = 1;
 /// limit (256 MiB since 0.26.1): one refused blob must not take the link
 /// down, and the document waits with a sentence. A remote that takes parts
 /// has no such limit.
+/// While the sign-in is expired, how often a link looks for a new one.
+const SIGN_IN_CHECK: Duration = Duration::from_secs(5);
 const MAX_CATCH_UP_BLOB: usize = 200 * 1024 * 1024;
 /// JSON-RPC code of "upload a snapshot before appending more"
 /// (`pimble_rpc::RpcError::SnapshotRequired`).
@@ -401,6 +403,16 @@ async fn run_loop(handler: RpcHandler, endpoint: LinkEndpoint, key_id: Uuid, lin
             shares.upkeep.link_down(&handler, store_id).await;
             progress.parts.clear();
             flush_waiting(&handler, &link, &progress).await;
+            if e.is::<SessionExpired>() {
+                // Said once, by `connect`; until someone signs in, the link
+                // only gathers what changes here, checking every few seconds
+                // whether a sign-in came.
+                while handler.keystore().session_expired() {
+                    note_local_changes_for(&mut local_rx, &mut progress, store_id, &link_id, SIGN_IN_CHECK).await;
+                }
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
             if owner_offline {
                 debug!("Vault link for store {}: its owner's computer is offline ({}); trying again later", store_id, e);
             } else {
@@ -498,6 +510,20 @@ impl std::fmt::Display for OwnerOffline {
 
 impl std::error::Error for OwnerOffline {}
 
+/// Pimble Cloud refused the account's session: the link waits for a sign-in
+/// rather than asking again every 30 seconds (2026-11-19: 58 refusals in a
+/// quarter of an hour, and the status bar still said "Signed in").
+#[derive(Debug)]
+pub(crate) struct SessionExpired;
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the Pimble Cloud sign-in expired; nothing is tried again until someone signs in")
+    }
+}
+
+impl std::error::Error for SessionExpired {}
+
 /// Wait out a backoff, recording which documents change locally meanwhile.
 async fn note_local_changes_for(
     local_rx: &mut broadcast::Receiver<LocalChange>,
@@ -562,9 +588,21 @@ async fn connect(
         .account()
         .await
         .ok_or_else(|| anyhow::anyhow!("no Pimble Cloud account is signed in"))?;
-    let minted = crate::cloud::mint_token(&account.url, &account.session)
-        .await
-        .map_err(|e| anyhow::anyhow!("minting a cloud token from {} failed: {}", account.url, e))?;
+    if handler.keystore().session_expired() {
+        return Err(anyhow::Error::new(SessionExpired));
+    }
+    let minted = match crate::cloud::mint_token(&account.url, &account.session).await {
+        Ok(minted) => minted,
+        Err(e) if e.status() == Some(401) => {
+            if !handler.keystore().session_expired() {
+                handler.keystore().mark_session_expired();
+                warn!("Pimble Cloud at {} refused this computer's sign-in (it expired, or was signed out elsewhere): sign in again to sync", account.url);
+                handler.cloud_changed();
+            }
+            return Err(anyhow::Error::new(SessionExpired));
+        }
+        Err(e) => return Err(anyhow::anyhow!("minting a cloud token from {} failed: {}", account.url, e)),
+    };
     let (url, token, via_relay) = match endpoint {
         LinkEndpoint::RelayFace => {
             let url = handler

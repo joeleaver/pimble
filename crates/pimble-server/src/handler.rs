@@ -1687,6 +1687,14 @@ impl RpcHandler {
                 stores.push((state, owner_offline));
             }
         }
+        if self.keystore.session_expired() {
+            // Said first and alone: nothing else works until a sign-in.
+            return Some(pimble_rpc::CloudConnection {
+                reach: pimble_rpc::CloudReach::Offline,
+                sentence: format!("Your sign-in to {host} expired. Sign in again (Account) to sync your hosted and shared stores; until then edits wait here, and the people you share with cannot reach this computer."),
+                session_expired: true,
+            });
+        }
         Some(describe_cloud(&host, &self.relay.tunnel_state(), &stores))
     }
 
@@ -6008,7 +6016,7 @@ fn describe_cloud(host: &str, tunnel: &crate::relay_face::TunnelState, stores: &
         CloudReach::Offline => format!("Not everything here can reach {host}."),
     };
     said.insert(0, lead);
-    CloudConnection { reach, sentence: said.join(" ") }
+    CloudConnection { reach, sentence: said.join(" "), session_expired: false }
 }
 
 #[cfg(test)]

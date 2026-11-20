@@ -88,6 +88,10 @@ pub struct SignedInAccount {
 pub struct Keystore {
     path: PathBuf,
     data: RwLock<KeystoreData>,
+    /// Pimble Cloud refused the session (it expired, or was signed out
+    /// elsewhere): nothing that needs it is tried again until a sign-in.
+    /// In memory: a restart tries once, and learns it again.
+    expired: std::sync::atomic::AtomicBool,
 }
 
 impl Keystore {
@@ -114,12 +118,22 @@ impl Keystore {
             }
         };
         crate::diagnostics::set_account(data.account.as_ref().map(|a| a.user_id.clone()));
-        Self { path, data: RwLock::new(data) }
+        Self { path, data: RwLock::new(data), expired: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// Persist a fresh sign-in, replacing any previous account (a store key
     /// saved under a previous account is left in place — it's keyed by
     /// store id and key id, not by account).
+    /// Pimble Cloud answered that the session is no longer valid.
+    pub fn mark_session_expired(&self) {
+        self.expired.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the signed-in account's session was refused since sign-in.
+    pub fn session_expired(&self) -> bool {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub async fn sign_in(
         &self,
         url: String,
@@ -131,6 +145,7 @@ impl Keystore {
         let snapshot = {
             let mut data = self.data.write().await;
             crate::diagnostics::set_account(Some(user_id.clone()));
+            self.expired.store(false, std::sync::atomic::Ordering::SeqCst);
             data.account = Some(AccountSession {
                 url,
                 email,
@@ -153,6 +168,7 @@ impl Keystore {
             let mut data = self.data.write().await;
             data.account = None;
             crate::diagnostics::set_account(None);
+            self.expired.store(false, std::sync::atomic::Ordering::SeqCst);
             data.clone()
         };
         self.write_atomic(&snapshot).await

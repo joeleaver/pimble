@@ -1263,6 +1263,11 @@ pub struct CloudConnection {
     /// What it means, in a sentence or two: what is connected, or what
     /// cannot be reached and what that stops.
     pub sentence: String,
+    /// Pimble Cloud refused the account's session (it expired, or was
+    /// signed out elsewhere): the app says "sign-in expired" and offers to
+    /// sign in again. Nothing that needs the session is tried until then.
+    #[serde(default)]
+    pub session_expired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
