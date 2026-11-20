@@ -335,6 +335,14 @@ fn relay_dir_beside(replicas_dir: &std::path::Path) -> PathBuf {
     replicas_dir.parent().map(|parent| parent.join("relay")).unwrap_or_else(|| replicas_dir.join("relay"))
 }
 
+/// Where each local store keeps this computer's own state
+/// (docs/STORE_FOLDERS_CONTRACT.md rule 1): `stores`, beside the replicas
+/// directory, so `<data dir>/pimble/stores/<store id>/` by default and inside
+/// a test's temp directory whenever its replicas are.
+pub(crate) fn state_root_beside(replicas_dir: &std::path::Path) -> PathBuf {
+    replicas_dir.parent().map(|parent| parent.join("stores")).unwrap_or_else(|| replicas_dir.join("stores"))
+}
+
 /// The directory a server creates replicas in unless
 /// [`crate::ServerConfig::replicas_dir`] says otherwise: `<data dir>/
 /// pimble/replicas/`. A store inside it is a replica
@@ -470,7 +478,7 @@ pub(crate) enum Repair {
 /// next to the existing `notify_store_change`/`notify_node_content_change`
 /// calls (never over the WebSocket). `Upsert` and `Remove` are applied
 /// immediately; `ContentChanged` is debounced per node.
-enum IndexEvent {
+pub(crate) enum IndexEvent {
     /// A node's metadata, tree position, or existence changed (created,
     /// title/tags edited, or moved — moving re-upserts the node with its new
     /// `parent`). Applied immediately: cheap and infrequent relative to
@@ -782,7 +790,7 @@ fn judge_move_source(manager: &StoreManager, reach: &Option<Reach>, store_id: St
 /// What the index does about a derived kind. A tombstone is removed; a
 /// content change goes through the per-node debounce; everything else is an
 /// upsert, which skips a node that is not there to index.
-fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
+pub(crate) fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
     match kind {
         StoreChangeKind::NodeCreated { node_id, .. }
         | StoreChangeKind::NodeMoved { node_id, .. }
@@ -1214,6 +1222,11 @@ pub struct RpcHandler {
     /// Which pictures each document names, per its state vector
     /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
     pictures: Arc<crate::pictures::PictureRefs>,
+    /// One folder task per plain store open here (docs/STORE_FOLDERS_CONTRACT.md
+    /// rule 3, `crate::folder_watch`): its folder watched, merged, announced.
+    folders: Arc<std::sync::Mutex<HashMap<StoreId, crate::folder_watch::FolderTask>>>,
+    /// The other computers each open store's folder names (rule 5).
+    computers: Arc<std::sync::Mutex<HashMap<StoreId, Vec<pimble_core::OtherComputer>>>>,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1315,6 +1328,8 @@ impl RpcHandler {
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
             app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
+            folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1415,6 +1430,21 @@ impl RpcHandler {
         self.out_of_step_after
     }
 
+    /// The folder task of each plain store open here (`crate::folder_watch`).
+    pub(crate) fn folders(&self) -> &std::sync::Mutex<HashMap<StoreId, crate::folder_watch::FolderTask>> {
+        &self.folders
+    }
+
+    /// The other computers each store's folder names (`crate::folder_watch`).
+    pub(crate) fn computers(&self) -> &std::sync::Mutex<HashMap<StoreId, Vec<pimble_core::OtherComputer>>> {
+        &self.computers
+    }
+
+    /// The Pimble version this server reports.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+
     pub(crate) fn devices(&self) -> Arc<crate::devices::Devices> {
         Arc::clone(&self.devices)
     }
@@ -1434,6 +1464,9 @@ impl RpcHandler {
     /// directory).
     pub(crate) fn mark_replica(&self, store: &mut pimble_core::Store) {
         store.is_replica = store.local_path().map_or(false, |p| p.starts_with(self.replicas_dir.as_path()));
+        // And, on every `Store` it returns, the other computers that open
+        // the store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 5).
+        store.also_open_on = self.also_open_on(store.id);
     }
 
     /// The guard every store-scoped RPC but the four vault ones needs
@@ -2421,6 +2454,11 @@ impl RpcHandler {
     /// each store in turn. At most one flush task runs at a time; edits that
     /// arrive after the drain (a narrow race) simply schedule a fresh task
     /// on their own next call.
+    /// [`RpcHandler::schedule_content_flush`], for the folder watch.
+    pub(crate) fn schedule_flush(&self, store_id: StoreId) {
+        self.schedule_content_flush(store_id);
+    }
+
     fn schedule_content_flush(&self, store_id: StoreId) {
         self.flush_debouncer.pending.lock().unwrap().stores.insert(store_id);
         self.ensure_flush_scheduled();
@@ -2573,7 +2611,7 @@ impl RpcHandler {
     /// the bytes instead of refetching. `ContentUpdated` also reaches the
     /// node's own subscribers (the editor), carrying the same bytes as its
     /// operation.
-    async fn broadcast_document_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>, update_b64: Option<String>) {
+    pub(crate) async fn broadcast_document_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>, update_b64: Option<String>) {
         let delivery = self.delivery_for(store_id, &kind).await;
         let store_notif = StoreChangedNotification {
             store_id,
@@ -2831,7 +2869,7 @@ impl RpcHandler {
     /// A store with indexing not (yet) available (index open/rebuild failed)
     /// silently has no handle and this is a no-op — search over that store
     /// just returns nothing until the next successful open.
-    async fn enqueue_index_event(&self, store_id: StoreId, event: IndexEvent) {
+    pub(crate) async fn enqueue_index_event(&self, store_id: StoreId, event: IndexEvent) {
         let indexes = self.indexes.read().await;
         if let Some(handle) = indexes.get(&store_id) {
             // An unbounded channel only fails to send if the receiving task
@@ -2841,11 +2879,19 @@ impl RpcHandler {
     }
 
     /// The directory a store's search index lives in:
-    /// `<store dir>/index/rhypedb/`. Only local stores have one.
+    /// `<state dir>/index/rhypedb/`, this computer's own and never in the
+    /// store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1: two computers
+    /// opening one folder through a sync tool wrote one index, lock contention
+    /// at best, seen 2026-11-18). Only local stores have one.
     async fn index_dir_for(&self, store_id: StoreId) -> anyhow::Result<PathBuf> {
-        let store = self.store_manager.read().await.get_store_info(store_id)?;
+        let manager = self.store_manager.read().await;
+        let store = manager.get_store_info(store_id)?;
         match store.location {
-            StoreLocation::Local { path } => Ok(path.join("index").join("rhypedb")),
+            StoreLocation::Local { path } => match manager.state_dir(store_id) {
+                Some(state_dir) => Ok(state_dir.join("index").join("rhypedb")),
+                // A manager without a state root (never a server's).
+                None => Ok(path.join("index").join("rhypedb")),
+            },
             StoreLocation::Remote { .. } | StoreLocation::Mounted { .. } => {
                 anyhow::bail!("store {} has no local directory; it has no local search index", store_id)
             }
@@ -3018,6 +3064,7 @@ impl RpcHandler {
                     warn!("Failed to open search index for newly opened store {}: {}", store_id, e);
                 }
             }
+            self.watch_folder(store_id).await;
             let sync_config = {
                 let manager = self.store_manager.read().await;
                 manager.read_sync_config(store_id).await.ok().flatten()
@@ -3973,6 +4020,7 @@ impl PimbleApiServer for RpcHandler {
                 warn!("Failed to open search index for store {}: {}", created_id, e);
             }
         }
+        self.watch_folder(created_id).await;
 
         let rpc_url = self.link_hosted_store(created_id, &account, key_id, &held_as).await?;
         self.ensure_vault_link_started(created_id, LinkEndpoint::Remote(rpc_url), key_id).await;
@@ -4185,6 +4233,9 @@ impl PimbleApiServer for RpcHandler {
                 warn!("Failed to open search index for store {}: {}", store_id, e);
             }
         }
+        if request.kind == StoreKind::Plain {
+            self.watch_folder(store_id).await;
+        }
 
         Ok(CreateStoreResponse {
             store_id,
@@ -4231,6 +4282,9 @@ impl PimbleApiServer for RpcHandler {
                 warn!("Failed to open search index for store {}: {}", store_id, e);
             }
         }
+        // Its folder is watched for what other computers write into it
+        // (docs/STORE_FOLDERS_CONTRACT.md rule 3).
+        self.watch_folder(store_id).await;
 
         // Start the store's sync or vault link from `sync.json`, if present
         // (docs/SYNC_CONTRACT.md decision 7; docs/CRYPTO_CONTRACT.md for
@@ -4281,6 +4335,7 @@ impl PimbleApiServer for RpcHandler {
         // to report on. Its entries as a mount *source* stay — the next
         // resolution reopens it.
         self.forget_mounting_store(request.store_id);
+        self.unwatch_folder(request.store_id);
 
         let mut manager = self.store_manager.write().await;
         manager
@@ -5363,6 +5418,7 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let path = store.local_path().cloned();
+        let state_dir = self.store_manager.read().await.state_dir(request.store_id);
 
         // Closes exactly as `closeStore` does (it already stops the link
         // too), so `removeReplica` inherits whatever `closeStore` does to
@@ -5373,6 +5429,12 @@ impl PimbleApiServer for RpcHandler {
         // request behind it to have attached one in the first place.
         self.close_store(&service_extensions(), CloseStoreRequest { store_id: request.store_id }).await?;
 
+        // This computer's state for the replica goes with it
+        // (docs/STORE_FOLDERS_CONTRACT.md rule 1): its index, its link's
+        // positions. Derived or meaningless without the replica; best effort.
+        if let Some(state_dir) = state_dir {
+            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+        }
         if let Some(path) = path {
             if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                 // The store is already closed and unlinked at this point,

@@ -142,9 +142,14 @@ impl PimbleServer {
 
     /// Create a new server with custom configuration
     pub fn with_config(config: ServerConfig) -> Self {
+        let state_root = crate::handler::state_root_beside(&config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir));
         Self {
             config,
-            store_manager: Arc::new(RwLock::new(StoreManager::new())),
+            // Each store's per-computer state (its index, its link's read
+            // positions) lives beside the replicas directory, outside the
+            // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1), and so
+            // inside a test's temp directory whenever its replicas are.
+            store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root))),
             handle: None,
             handler: None,
             local_addr: None,
@@ -304,6 +309,9 @@ impl PimbleServer {
         // Then what is shared from this computer: the tunnel, so no member
         // is piped to a face that is going, and the face.
         if let Some(handler) = self.handler.take() {
+            // The folder watches too, for the same reason: each is a task
+            // that merges into the stores this server holds.
+            handler.stop_folder_watches();
             handler.stop_links().await;
             handler.relay().stop().await;
         }

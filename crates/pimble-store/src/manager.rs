@@ -12,7 +12,7 @@ const MAX_MOUNT_DEPTH: usize = 16;
 
 use crate::blobs::BlobStore;
 use crate::error::{Result, StoreError};
-use crate::local::{peek_manifest_kind, LocalStore, NodeRemoval, SyncConfig};
+use crate::local::{peek_manifest, FolderMerge, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
 use crate::vault::{DocKeys, VaultDocSummary, VaultStore};
 
@@ -49,17 +49,72 @@ pub struct StoreManager {
     /// stores (search index, `listStores`, subscriptions) without diffing
     /// `list_stores()` before and after.
     newly_opened: Vec<StoreId>,
+    /// Where each local store keeps this computer's own state, under
+    /// `<state root>/<store id>/` (docs/STORE_FOLDERS_CONTRACT.md rule 1):
+    /// `<data dir>/pimble/stores` for a server, a temp directory in a test.
+    /// `None` (a manager made with [`StoreManager::new`]) keeps the old
+    /// single-file layout in the store's folder.
+    state_root: Option<std::path::PathBuf>,
 }
 
 impl StoreManager {
-    /// Create a new store manager
+    /// Create a new store manager with no state root (see
+    /// [`StoreManager::with_state_root`]).
     pub fn new() -> Self {
         Self {
             local_stores: HashMap::new(),
             vault_stores: HashMap::new(),
             registry: StoreRegistry::new(),
             newly_opened: Vec::new(),
+            state_root: None,
         }
+    }
+
+    /// A store manager whose local stores keep this computer's state under
+    /// `state_root` (docs/STORE_FOLDERS_CONTRACT.md rule 1).
+    pub fn with_state_root(state_root: impl Into<std::path::PathBuf>) -> Self {
+        Self { state_root: Some(state_root.into()), ..Self::new() }
+    }
+
+    /// The state root, when there is one.
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
+    }
+
+    /// Local store `store_id`'s state directory (`<state root>/<store id>/`):
+    /// where its search index, its link's read positions, `vault-link.json`
+    /// and `people.json` live. `None` for a store not open as a local one, or
+    /// a manager with no state root.
+    pub fn state_dir(&self, store_id: StoreId) -> Option<std::path::PathBuf> {
+        self.local(store_id).ok()?.state_dir().map(Path::to_path_buf)
+    }
+
+    /// Merge what changed in local store `store_id`'s folder at `paths`
+    /// (`LocalStore::absorb_folder_paths`, docs/STORE_FOLDERS_CONTRACT.md
+    /// rules 3 and 4).
+    pub async fn absorb_folder_paths(&mut self, store_id: StoreId, paths: &[std::path::PathBuf]) -> Result<()> {
+        self.local_mut(store_id)?.absorb_folder_paths(paths).await
+    }
+
+    /// What merges from local store `store_id`'s folder changed, not yet
+    /// announced (`LocalStore::take_folder_merges`). Empty for any other.
+    pub fn take_folder_merges(&mut self, store_id: StoreId) -> Vec<FolderMerge> {
+        self.local_mut(store_id).map(|s| s.take_folder_merges()).unwrap_or_default()
+    }
+
+    /// Whether local store `store_id` has merges from its folder to announce.
+    pub fn has_folder_merges(&self, store_id: StoreId) -> bool {
+        self.local(store_id).is_ok_and(|s| s.has_folder_merges())
+    }
+
+    /// Whether local store `store_id` has anything not yet written.
+    pub fn has_unwritten(&self, store_id: StoreId) -> bool {
+        self.local(store_id).is_ok_and(|s| s.has_unwritten())
+    }
+
+    /// The folder of local store `store_id`.
+    pub fn local_path(&self, store_id: StoreId) -> Option<std::path::PathBuf> {
+        self.local(store_id).ok().map(|s| s.path.clone())
     }
 
     /// Create a new `Plain` local store with a freshly generated id. See
@@ -90,10 +145,13 @@ impl StoreManager {
 
         let id = match kind {
             StoreKind::Plain => {
-                let store = match store_id {
+                let mut store = match store_id {
                     Some(id) => LocalStore::create_with_id(path, name, id).await?,
                     None => LocalStore::create(path, name).await?,
                 };
+                if let Some(root) = &self.state_root {
+                    store.set_state_root(root);
+                }
                 let id = store.id;
                 self.local_stores.insert(id, store);
                 id
@@ -134,7 +192,10 @@ impl StoreManager {
                 id, open.path.display()
             )));
         }
-        let store = LocalStore::create_replica(path, id, name, root_node_id).await?;
+        let mut store = LocalStore::create_replica(path, id, name, root_node_id).await?;
+        if let Some(root) = &self.state_root {
+            store.set_state_root(root);
+        }
         let id = store.id;
         self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
         self.local_stores.insert(id, store);
@@ -146,11 +207,20 @@ impl StoreManager {
     /// `kind` decides which; docs/CRYPTO_CONTRACT.md).
     pub async fn open_local_store(&mut self, path: impl AsRef<Path>) -> Result<StoreId> {
         let path = path.as_ref();
-        let kind = peek_manifest_kind(path).await?;
+        let manifest = peek_manifest(path).await?;
 
-        let id = match kind {
+        let id = match manifest.kind {
             StoreKind::Plain => {
-                let store = LocalStore::open(path).await?;
+                // Already open: not opened a second time. Opening merges and
+                // removes conflict copies and may move state out of the
+                // folder (docs/STORE_FOLDERS_CONTRACT.md), none of which a
+                // throwaway second copy of an open store may do.
+                if self.is_open(manifest.id) {
+                    self.registry.register(manifest.id, StoreEndpoint::Local { path: path.to_path_buf() });
+                    info!("Store {} is already open", manifest.id);
+                    return Ok(manifest.id);
+                }
+                let store = LocalStore::open_in(path, self.state_root.as_deref()).await?;
                 let id = store.id;
                 self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
                 if self.is_open(id) {
@@ -228,6 +298,7 @@ impl StoreManager {
                 relay: pimble_core::RelaySide::None,
                 waiting: Vec::new(),
                 out_of_step: Vec::new(),
+                also_open_on: Vec::new(),
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -251,6 +322,7 @@ impl StoreManager {
                 relay: pimble_core::RelaySide::None,
                 waiting: Vec::new(),
                 out_of_step: Vec::new(),
+                also_open_on: Vec::new(),
             });
         }
         Err(StoreError::StoreNotFound(store_id))
@@ -563,7 +635,10 @@ impl StoreManager {
             )));
         }
         let root = scope_roots.first().copied().unwrap_or_else(NodeId::new);
-        let store = LocalStore::create_replica_with_scope(path, id, name, root, scope_roots).await?;
+        let mut store = LocalStore::create_replica_with_scope(path, id, name, root, scope_roots).await?;
+        if let Some(root) = &self.state_root {
+            store.set_state_root(root);
+        }
         let id = store.id;
         self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
         self.local_stores.insert(id, store);

@@ -18,6 +18,10 @@ use tracing::{debug, info, warn};
 use crate::blobs::BlobStore;
 use crate::error::{Result, StoreError};
 
+mod folder;
+pub use folder::{classify_node_file, conflict_copy_name, ConflictStyle, FolderMerge, NodeFile};
+use folder::content_hash;
+
 /// Which kind of link `<store>/sync.json` describes (docs/CRYPTO_CONTRACT.md
 /// "Pimble server, the desktop side"): `Sync` is the plain replica link
 /// (`crate` re-exports nothing here — the running link is
@@ -45,9 +49,15 @@ impl SyncMode {
     }
 }
 
-/// A store's replica sync link, persisted as `<store>/sync.json`
-/// (docs/SYNC_CONTRACT.md decision 7). Present exactly when the store is
-/// linked to a remote twin.
+/// A store's replica sync link (docs/SYNC_CONTRACT.md decision 7). Present
+/// exactly when the store is linked to a remote twin.
+///
+/// Persisted in two places (docs/STORE_FOLDERS_CONTRACT.md rule 1, Joe
+/// 2026-11-19): what every computer opening the store's folder shares (the
+/// remote, the mode, the access) in the folder's `sync.json`, and what is one
+/// computer's (`last_sync`, `last_seq`: `LocalStore::PER_COMPUTER_KEYS`) in
+/// `link.json` in that computer's state directory. Callers read and write the
+/// whole of it; `LocalStore::read_sync_config`/`write_sync_config` split it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     pub remote: RemoteEndpoint,
@@ -120,12 +130,37 @@ pub struct NodeRemoval {
     pub removed: Vec<NodeId>,
 }
 
+/// What `load_node_docs` found in `nodes/`.
+#[derive(Default)]
+struct LoadedDocs {
+    docs: HashMap<NodeId, NodeDoc>,
+    /// The hash of each loaded document's bytes (`LocalStore::disk_hashes`).
+    hashes: HashMap<NodeId, u64>,
+    /// Conflict copies, each with the node it is a copy of.
+    conflicts: Vec<(NodeId, PathBuf)>,
+}
+
+/// A JSON file's value, `None` when it is absent or does not parse.
+async fn read_json(path: &Path) -> Option<serde_json::Value> {
+    let json = fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&json).ok()
+}
+
 /// Write a file atomically: write to a `.tmp` sibling, then rename into place.
 /// This prevents empty/corrupt files if the process is killed mid-write.
-async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("tmp");
+/// The sibling's name is new every time (`<stem>.<random>.tmp`): two
+/// processes may write one folder (docs/STORE_FOLDERS_CONTRACT.md), and a
+/// shared `<id>.tmp` let one rename the other's half-written bytes into
+/// place. It never ends in `.yrs`, so nothing takes it for a document or a
+/// sync tool's conflict copy.
+pub(crate) async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let tmp_path = path.with_extension(format!("{}.tmp", &unique[..12]));
     fs::write(&tmp_path, data).await?;
-    fs::rename(&tmp_path, path).await?;
+    if let Err(e) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -147,12 +182,16 @@ fn extend(edit: &mut TreeEdit, more: TreeEdit) {
 /// (docs/CRYPTO_CONTRACT.md) — `StoreManager::open_local_store` reads this
 /// first to decide which one to construct.
 pub async fn peek_manifest_kind(path: impl AsRef<Path>) -> Result<pimble_core::StoreKind> {
+    Ok(peek_manifest(path).await?.kind)
+}
+
+/// A store directory's whole manifest, read without opening the store.
+pub async fn peek_manifest(path: impl AsRef<Path>) -> Result<StoreManifest> {
     let manifest_path = path.as_ref().join(LocalStore::MANIFEST_FILE);
     let manifest_json = fs::read_to_string(&manifest_path)
         .await
         .map_err(|_| StoreError::InvalidPath(format!("No manifest found at {}", manifest_path.display())))?;
-    let manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
-    Ok(manifest.kind)
+    Ok(serde_json::from_str(&manifest_json)?)
 }
 
 /// A local store backed by the filesystem
@@ -171,10 +210,19 @@ pub async fn peek_manifest_kind(path: impl AsRef<Path>) -> Result<pimble_core::S
 /// │   └── {hash}.{ext}
 /// ├── blobs/              # Pictures the text names (docs/IMAGES_CONTRACT.md),
 /// │   └── {blob id}       # each written once and never changed; see `BlobStore`
-/// ├── index/              # Search index (derived, disposable)
-/// ├── sync.json           # Replica sync link, when linked
-/// └── vault-link.json     # What the hosted twin is known to hold, when vault-linked
+/// ├── computers/          # Which computers open this folder, one file each
+/// │   └── {id}.json       # (docs/STORE_FOLDERS_CONTRACT.md rule 5, the server's)
+/// └── sync.json           # Replica sync link, when linked: the part every
+///                         # computer opening the folder shares
 /// ```
+///
+/// What belongs to one computer is not in the folder
+/// (docs/STORE_FOLDERS_CONTRACT.md rule 1): a store opened with a state root
+/// keeps it in `<state root>/<store id>/` (`<data dir>/pimble/stores/<id>/`
+/// for the server): `link.json` (the link's read positions and last sync),
+/// `vault-link.json`, `people.json` and `index/`. A store opened without one
+/// (a bare `LocalStore`: the importer, a test) keeps the single-file layout of
+/// before 2026-11-19.
 pub struct LocalStore {
     /// Store ID
     pub id: StoreId,
@@ -213,6 +261,30 @@ pub struct LocalStore {
     /// The store's pictures (`blobs/`), which no document holds: a handle
     /// over the directory, cloned out by whoever reads or writes one.
     blobs: BlobStore,
+
+    /// Where this computer's own state for the store lives
+    /// (`<state root>/<store id>/`, docs/STORE_FOLDERS_CONTRACT.md rule 1);
+    /// `None` for a bare store, which keeps the old single-file layout.
+    state_dir: Option<PathBuf>,
+
+    /// For each `nodes/<id>.yrs`, a hash of the bytes this process last read
+    /// from it or wrote to it (docs/STORE_FOLDERS_CONTRACT.md rules 2 and 3):
+    /// a file whose bytes hash to anything else was written by another
+    /// computer (through a sync tool) or another process, and is merged
+    /// before it is written over. Also how the folder watch tells this
+    /// process's own writes from everyone else's.
+    disk_hashes: HashMap<NodeId, u64>,
+
+    /// The manifest as this process last read or wrote it: the base of the
+    /// field-by-field merge with what another computer wrote since.
+    manifest_base: StoreManifest,
+    /// A hash of `manifest.json`'s bytes as last read or written here.
+    manifest_hash: Option<u64>,
+
+    /// What merging files from the folder changed in held documents, not
+    /// yet announced (`take_folder_merges`): the server sends each on as it
+    /// sends a peer's update.
+    folder_merges: Vec<FolderMerge>,
 }
 
 /// The part of [`SyncConfig`] the store keeps in memory.
@@ -242,6 +314,16 @@ impl LocalStore {
     const INDEX_DIR: &'static str = "index";
     const MANIFEST_FILE: &'static str = "manifest.json";
     const SYNC_CONFIG_FILE: &'static str = "sync.json";
+    /// The folder's record of the computers that open it
+    /// (docs/STORE_FOLDERS_CONTRACT.md rule 5). Its presence also says that a
+    /// Pimble that keeps per-computer state outside the folder has opened it.
+    pub const COMPUTERS_DIR: &'static str = "computers";
+    /// This computer's part of the link, in the state directory.
+    const LINK_STATE_FILE: &'static str = "link.json";
+    /// The keys of `sync.json` that are one computer's, not the store's
+    /// (docs/STORE_FOLDERS_CONTRACT.md rule 1): kept in `link.json` in the
+    /// state directory, never in the folder.
+    const PER_COMPUTER_KEYS: [&'static str; 2] = ["last_sync", "last_seq"];
     /// The previous layout's tree document. Present exactly in a store the
     /// migration has not run on yet; retired under the name below once it
     /// has (docs/NODE_DOCUMENT_CONTRACT.md section 3).
@@ -277,7 +359,6 @@ impl LocalStore {
         fs::create_dir_all(&path).await?;
         fs::create_dir(path.join(Self::NODES_DIR)).await?;
         fs::create_dir(path.join(Self::ASSETS_DIR)).await?;
-        fs::create_dir(path.join(Self::INDEX_DIR)).await?;
 
         // Create root node ID
         let root_node_id = NodeId::new();
@@ -290,7 +371,7 @@ impl LocalStore {
 
         // Write manifest
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        fs::write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
 
         // The root folder is the store's first document.
         let tree = Tree::new(root_node_id, &name, &now()).map_err(StoreError::from)?;
@@ -299,10 +380,15 @@ impl LocalStore {
             id: manifest.id,
             blobs: BlobStore::new(manifest.id, &path),
             path,
+            manifest_base: manifest.clone(),
+            manifest_hash: Some(content_hash(manifest_json.as_bytes())),
             manifest,
             tree,
             dirty: HashSet::from([root_node_id]),
             link_access: Default::default(),
+            state_dir: None,
+            disk_hashes: HashMap::new(),
+            folder_merges: Vec::new(),
         };
 
         store.flush().await?;
@@ -360,7 +446,6 @@ impl LocalStore {
         fs::create_dir_all(&path).await?;
         fs::create_dir(path.join(Self::NODES_DIR)).await?;
         fs::create_dir(path.join(Self::ASSETS_DIR)).await?;
-        fs::create_dir(path.join(Self::INDEX_DIR)).await?;
 
         let now = Utc::now();
         let manifest = StoreManifest {
@@ -376,27 +461,72 @@ impl LocalStore {
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        fs::write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
 
         let store = Self {
             id: manifest.id,
             blobs: BlobStore::new(manifest.id, &path),
             path,
+            manifest_base: manifest.clone(),
+            manifest_hash: Some(content_hash(manifest_json.as_bytes())),
             manifest,
             tree: Tree::from_docs(root_node_id, HashMap::new()),
             dirty: HashSet::new(),
             link_access: Default::default(),
+            state_dir: None,
+            disk_hashes: HashMap::new(),
+            folder_merges: Vec::new(),
         };
 
         info!("Created replica store '{}' ({}) at {:?}", name, id, store.path);
         Ok(store)
     }
 
-    /// Read `<store>/sync.json`, if present.
-    pub async fn read_sync_config(&self) -> Result<Option<SyncConfig>> {
-        Self::read_sync_config_at(&self.path).await
+    /// Keep this computer's own state for the store under `state_root`
+    /// (`<state root>/<store id>/`, docs/STORE_FOLDERS_CONTRACT.md rule 1).
+    /// What [`StoreManager`](crate::StoreManager) does for every store it
+    /// creates; [`LocalStore::open_in`] takes the root for an existing one,
+    /// whose per-computer state may need moving out of the folder first.
+    pub fn set_state_root(&mut self, state_root: &Path) {
+        self.state_dir = Some(state_root.join(self.id.to_string()));
     }
 
+    /// This computer's state directory for the store, when it has one.
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state_dir.as_deref()
+    }
+
+    /// Read the store's link: the folder's `sync.json` (what every computer
+    /// opening the folder shares: the remote, the mode, the access) with this
+    /// computer's own part (`link.json` in the state directory: read
+    /// positions, last sync) laid over it. Per-computer keys found in the
+    /// folder's file are never this computer's once it has a state directory:
+    /// an older Pimble on another computer wrote them
+    /// (docs/STORE_FOLDERS_CONTRACT.md rule 1).
+    pub async fn read_sync_config(&self) -> Result<Option<SyncConfig>> {
+        let path = self.path.join(Self::SYNC_CONFIG_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = fs::read_to_string(&path).await?;
+        let mut value: serde_json::Value = serde_json::from_str(&json)?;
+        if let (Some(state_dir), serde_json::Value::Object(map)) = (&self.state_dir, &mut value) {
+            for key in Self::PER_COMPUTER_KEYS {
+                map.remove(key);
+            }
+            if let Some(serde_json::Value::Object(state)) = read_json(&state_dir.join(Self::LINK_STATE_FILE)).await {
+                for (key, v) in state {
+                    if Self::PER_COMPUTER_KEYS.contains(&key.as_str()) {
+                        map.insert(key, v);
+                    }
+                }
+            }
+        }
+        Ok(Some(serde_json::from_value(value)?))
+    }
+
+    /// `sync.json` in `store_path` alone, for what the store keeps in memory
+    /// at open (the access, which every computer shares).
     async fn read_sync_config_at(store_path: &Path) -> Result<Option<SyncConfig>> {
         let path = store_path.join(Self::SYNC_CONFIG_FILE);
         if !path.exists() {
@@ -407,19 +537,69 @@ impl LocalStore {
         Ok(Some(config))
     }
 
-    /// Write `<store>/sync.json`, replacing any existing content.
+    /// Write the store's link, replacing what was there: the shared part to
+    /// the folder's `sync.json` only when it differs from what the file holds
+    /// (a link records its read position on every append, and each of those
+    /// rewriting a file in a synced folder would be a write for every other
+    /// computer to merge), this computer's part to `link.json` in the state
+    /// directory. Without a state directory, the whole of it to `sync.json`.
     pub async fn write_sync_config(&self, config: &SyncConfig) -> Result<()> {
-        let json = serde_json::to_string_pretty(config)?;
-        atomic_write(&self.path.join(Self::SYNC_CONFIG_FILE), json).await?;
+        let folder_path = self.path.join(Self::SYNC_CONFIG_FILE);
+        let Some(state_dir) = &self.state_dir else {
+            let json = serde_json::to_string_pretty(config)?;
+            atomic_write(&folder_path, json).await?;
+            *self.link_access.write().unwrap() = LinkAccess::of(config);
+            return Ok(());
+        };
+        let mut shared = serde_json::to_value(config)?;
+        let mut state = serde_json::Map::new();
+        if let serde_json::Value::Object(map) = &mut shared {
+            for key in Self::PER_COMPUTER_KEYS {
+                if let Some(v) = map.remove(key) {
+                    state.insert(key.to_string(), v);
+                }
+            }
+        }
+        let on_disk = read_json(&folder_path).await.map(|mut v| {
+            if let serde_json::Value::Object(map) = &mut v {
+                for key in Self::PER_COMPUTER_KEYS {
+                    map.remove(key);
+                }
+            }
+            v
+        });
+        if on_disk.as_ref() != Some(&shared) {
+            atomic_write(&folder_path, serde_json::to_string_pretty(&shared)?).await?;
+        }
+        let state_path = state_dir.join(Self::LINK_STATE_FILE);
+        if state.is_empty() {
+            if state_path.exists() {
+                fs::remove_file(&state_path).await?;
+            }
+        } else {
+            let state = serde_json::Value::Object(state);
+            if read_json(&state_path).await.as_ref() != Some(&state) {
+                fs::create_dir_all(state_dir).await?;
+                atomic_write(&state_path, serde_json::to_string_pretty(&state)?).await?;
+            }
+        }
         *self.link_access.write().unwrap() = LinkAccess::of(config);
         Ok(())
     }
 
-    /// Delete `<store>/sync.json` if present (unlinking the store).
+    /// Delete the store's link (unlinking it): the folder's `sync.json`, for
+    /// every computer that opens the folder (Joe, 2026-11-19: they are one
+    /// store with one remote), and this computer's part.
     pub async fn clear_sync_config(&self) -> Result<()> {
         let path = self.path.join(Self::SYNC_CONFIG_FILE);
         if path.exists() {
             fs::remove_file(&path).await?;
+        }
+        if let Some(state_dir) = &self.state_dir {
+            let state_path = state_dir.join(Self::LINK_STATE_FILE);
+            if state_path.exists() {
+                fs::remove_file(&state_path).await?;
+            }
         }
         *self.link_access.write().unwrap() = Default::default();
         Ok(())
@@ -546,12 +726,9 @@ impl LocalStore {
         if ended == self.manifest.ended_roots {
             return Ok(false);
         }
-        let mut manifest = self.manifest.clone();
-        manifest.ended_roots = ended;
-        manifest.modified_at = Utc::now();
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
-        self.manifest = manifest;
+        self.manifest.ended_roots = ended;
+        self.manifest.modified_at = Utc::now();
+        self.write_manifest().await?;
         Ok(true)
     }
 
@@ -581,9 +758,7 @@ impl LocalStore {
         }
         self.manifest.scope_roots.push(root);
         self.manifest.modified_at = Utc::now();
-        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
-        Ok(())
+        self.write_manifest().await
     }
 
     /// Rename a partial replica. Its name is this device's own label for the
@@ -596,9 +771,7 @@ impl LocalStore {
         }
         self.manifest.name = name.to_string();
         self.manifest.modified_at = Utc::now();
-        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
-        Ok(())
+        self.write_manifest().await
     }
 
     /// Open an existing local store: every node document is loaded, a store
@@ -608,6 +781,16 @@ impl LocalStore {
     /// section 2: repair runs at open). Manifest versions other than the
     /// previous and the current one are refused: nothing older is migrated.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(path, None).await
+    }
+
+    /// [`LocalStore::open`], keeping this computer's own state for the store
+    /// under `state_root` (`<state root>/<store id>/`,
+    /// docs/STORE_FOLDERS_CONTRACT.md rule 1): what the folder still holds of
+    /// it is moved out first, once (see `folder::migrate_per_computer_state`).
+    /// Conflict copies a sync tool left in `nodes/` are merged into their
+    /// documents and removed (rule 4).
+    pub async fn open_in(path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         // Read manifest
@@ -621,6 +804,8 @@ impl LocalStore {
 
         let manifest_json = fs::read_to_string(&manifest_path).await?;
         let mut manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
+        let manifest_base = manifest.clone();
+        let manifest_hash = Some(content_hash(manifest_json.as_bytes()));
 
         let previous_layout = manifest.version == Self::PREVIOUS_MANIFEST_VERSION;
         if !previous_layout && manifest.version != StoreManifest::CURRENT_VERSION {
@@ -630,9 +815,16 @@ impl LocalStore {
             });
         }
 
+        let state_dir = state_root.map(|root| root.join(manifest.id.to_string()));
+        if let Some(state_dir) = &state_dir {
+            folder::migrate_per_computer_state(&path, state_dir, manifest.id).await;
+        }
+
         let nodes_dir = path.join(Self::NODES_DIR);
         fs::create_dir_all(&nodes_dir).await?;
-        let mut docs = Self::load_node_docs(&nodes_dir).await?;
+        folder::sweep_stale_temporaries(&nodes_dir).await;
+        let loaded = Self::load_node_docs(&nodes_dir).await?;
+        let mut docs = loaded.docs;
 
         // The previous layout's tree document, when it is still there, is
         // written into the node documents before anything else happens.
@@ -669,7 +861,18 @@ impl LocalStore {
             manifest,
             dirty,
             link_access: std::sync::RwLock::new(link_access),
+            state_dir,
+            disk_hashes: loaded.hashes,
+            manifest_base,
+            manifest_hash,
+            folder_merges: Vec::new(),
         };
+
+        // What a sync tool could not reconcile and kept beside the document
+        // (rule 4): merged in, the merged document written, the copy removed.
+        for (node_id, file) in loaded.conflicts {
+            store.absorb_conflict_file(node_id, &file).await?;
+        }
 
         // Nothing is mid-upload in a store that is only now opening: what an
         // abandoned picture upload left in `blobs/` goes.
@@ -704,6 +907,9 @@ impl LocalStore {
         if !store.dirty.is_empty() || previous_layout {
             store.flush().await?;
         }
+        // Nothing has seen this store yet, so nothing it merged at open is
+        // news to anyone.
+        store.folder_merges.clear();
 
         info!("Opened local store '{}' from {:?}", store.manifest.name, store.path);
         Ok(store)
@@ -713,28 +919,40 @@ impl LocalStore {
     /// name that is not a node id, an unfinished `.tmp`, bytes yrs cannot
     /// read) is skipped with a warning rather than failing the open: the
     /// store still opens, and a peer that holds the document sends it whole
-    /// on the next reconcile.
-    async fn load_node_docs(nodes_dir: &Path) -> Result<HashMap<NodeId, NodeDoc>> {
-        let mut docs = HashMap::new();
+    /// on the next reconcile. A sync tool's conflict copy of a document
+    /// (`classify_node_file`) is not loaded but named in `conflicts`, for
+    /// `open` to merge once the documents are in place.
+    async fn load_node_docs(nodes_dir: &Path) -> Result<LoadedDocs> {
+        let mut loaded = LoadedDocs::default();
         let mut entries = fs::read_dir(nodes_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let file = entry.path();
-            if file.extension().and_then(|e| e.to_str()) != Some("yrs") {
-                continue;
-            }
-            let Some(id) = file.file_stem().and_then(|s| s.to_str()).and_then(|s| NodeId::parse(s).ok()) else {
-                warn!("Skipping {:?}: not named by a node id", file);
-                continue;
+            let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
+            let id = match classify_node_file(name) {
+                NodeFile::Document(id) => id,
+                NodeFile::Conflict(id) => {
+                    loaded.conflicts.push((id, file));
+                    continue;
+                }
+                NodeFile::Other => {
+                    if name.ends_with(".yrs") {
+                        warn!("Skipping {:?}: not named by a node id", file);
+                    }
+                    continue;
+                }
             };
             let bytes = fs::read(&file).await?;
             match NodeDoc::load(&bytes) {
                 Ok(doc) => {
-                    docs.insert(id, doc);
+                    loaded.hashes.insert(id, content_hash(&bytes));
+                    loaded.docs.insert(id, doc);
                 }
                 Err(e) => warn!("Skipping node document {:?}: {}", file, e),
             }
         }
-        Ok(docs)
+        // In name order, so a run is the same run every time.
+        loaded.conflicts.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(loaded)
     }
 
     /// The migration of docs/NODE_DOCUMENT_CONTRACT.md section 3: for every
@@ -814,10 +1032,10 @@ impl LocalStore {
         }
         self.manifest.root_node_id = root_node_id;
         self.manifest.modified_at = Utc::now();
-        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
-
-        self.tree.reroot(root_node_id);
+        self.write_manifest().await?;
+        // The merge with what another computer wrote may have settled on
+        // another root; the tree follows the manifest.
+        self.tree.reroot(self.manifest.root_node_id);
         Ok(())
     }
 
@@ -1178,20 +1396,29 @@ impl LocalStore {
     }
 
     /// Flush all changes to disk: each dirty document's snapshot, written
-    /// atomically, then the manifest.
+    /// atomically after merging in whatever another computer put in its file
+    /// since this process last read or wrote it (docs/STORE_FOLDERS_CONTRACT.md
+    /// rule 2: a write never loses another computer's edit), then the
+    /// manifest when it changed.
+    ///
+    /// The manifest is not rewritten for its `modified_at` alone on every
+    /// flush any more (2026-11-19): in a synced folder each rewrite is a
+    /// change every other computer merges, and two computers rewriting it at
+    /// once is how a sync tool makes conflict copies. Its `modified_at`
+    /// follows the documents to within ten minutes.
     pub async fn flush(&mut self) -> Result<()> {
         let dirty: Vec<NodeId> = self.dirty.iter().copied().collect();
+        let wrote = !dirty.is_empty();
         for node_id in dirty {
-            if let Some(doc) = self.tree.doc(node_id) {
-                atomic_write(&self.node_doc_path(node_id), doc.save()).await?;
-            }
+            self.write_node(node_id).await?;
+            self.dirty.remove(&node_id);
         }
-        self.dirty.clear();
 
-        // Update manifest modified time
-        self.manifest.modified_at = Utc::now();
-        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        let stale = Utc::now() - chrono::Duration::minutes(10);
+        if self.manifest_changed() || (wrote && self.manifest_base.modified_at < stale) {
+            self.manifest.modified_at = Utc::now();
+            self.write_manifest().await?;
+        }
 
         debug!("Flushed store {} to disk", self.id);
         Ok(())

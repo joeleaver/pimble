@@ -1502,7 +1502,8 @@ async fn stopping_is_refused_while_a_share_stands_and_undoes_everything_after() 
     let sync = alice.get_store_sync_response(store_id).await.unwrap();
     assert!(sync.remote.is_none() && sync.relay == RelaySide::None && sync.sync_mode == StoreKind::Plain, "{sync:?}");
     assert!(!twin_dir(a_dir.path(), store_id).exists(), "the twin is deleted");
-    assert!(!store_dir.join("sync.json").exists() && !store_dir.join("vault-link.json").exists());
+    let state_dir = a_dir.path().join("stores").join(store_id.to_string());
+    assert!(!store_dir.join("sync.json").exists() && !state_dir.join("vault-link.json").exists() && !state_dir.join("link.json").exists());
     {
         let s = env.stub.inner.lock().unwrap();
         assert!(!s.stores.iter().any(|row| row.store_id == store_id.to_string()), "the accounts service's record is removed");

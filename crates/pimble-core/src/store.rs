@@ -154,6 +154,67 @@ pub struct Store {
     /// row. Missing in older serializations: none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_step: Vec<OutOfStep>,
+
+    /// The other computers that open this store's folder through a sync tool
+    /// (docs/STORE_FOLDERS_CONTRACT.md rule 5), from the folder's
+    /// `computers/` files, most recently seen first. Missing in older
+    /// serializations: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_open_on: Vec<OtherComputer>,
+}
+
+/// Another computer that opens a store's folder (docs/STORE_FOLDERS_CONTRACT.md
+/// rule 5): its name, when it last said it was there, and its Pimble.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtherComputer {
+    pub name: String,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub version: String,
+    /// Whether its Pimble is older than the one answering.
+    #[serde(default)]
+    pub older: bool,
+}
+
+impl OtherComputer {
+    /// "Also open on joe-desktop (seen 2 minutes ago); changes arrive
+    /// through the folder's sync."
+    pub fn sentence(&self, now: chrono::DateTime<chrono::Utc>) -> String {
+        format!("Also open on {} (seen {}); changes arrive through the folder's sync.", self.name, ago(now - self.last_seen))
+    }
+
+    /// For a computer running an older Pimble, the sentence that asks for it
+    /// to be updated; `None` otherwise.
+    pub fn update_sentence(&self) -> Option<String> {
+        self.older.then(|| {
+            format!(
+                "{} runs Pimble {}, which can write over changes made here in this folder. Please update Pimble on {}.",
+                self.name, self.version, self.name
+            )
+        })
+    }
+}
+
+/// "just now", "1 minute ago", "3 hours ago", "2 days ago".
+fn ago(elapsed: chrono::Duration) -> String {
+    let minutes = elapsed.num_minutes().max(0);
+    let plural = |n: i64, unit: &str| if n == 1 { format!("1 {unit} ago") } else { format!("{n} {unit}s ago") };
+    match minutes {
+        0 => "just now".to_string(),
+        m if m < 60 => plural(m, "minute"),
+        m if m < 60 * 24 => plural(m / 60, "hour"),
+        m => plural(m / (60 * 24), "day"),
+    }
+}
+
+/// Whether Pimble version `a` is older than `b` (dotted numbers; a part that
+/// does not parse counts as 0, and a version that says nothing is older than
+/// any that does).
+pub fn version_older(a: &str, b: &str) -> bool {
+    let parts = |v: &str| -> Vec<u64> { v.trim().trim_start_matches('v').split(['.', '-', '+']).take(3).map(|p| p.parse().unwrap_or(0)).collect() };
+    let (mut a, mut b) = (parts(a), parts(b));
+    a.resize(3, 0);
+    b.resize(3, 0);
+    a < b
 }
 
 /// One document a sync link is holding back, and why, in a sentence.
@@ -232,6 +293,7 @@ impl Store {
             relay: RelaySide::None,
             waiting: Vec::new(),
             out_of_step: Vec::new(),
+            also_open_on: Vec::new(),
         }
     }
 
@@ -254,6 +316,7 @@ impl Store {
             relay: RelaySide::None,
             waiting: Vec::new(),
             out_of_step: Vec::new(),
+            also_open_on: Vec::new(),
         }
     }
 
@@ -553,7 +616,7 @@ pub struct ConflictInfo {
 /// plus `store.yrs`, the tree as a document of its own) is migrated at open;
 /// there is no migration path from anything earlier, so such a store must
 /// be re-imported.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreManifest {
     /// Schema version. [`StoreManifest::CURRENT_VERSION`] once opened.
     pub version: u32,
@@ -628,6 +691,36 @@ impl StoreManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_computers_are_named_in_sentences() {
+        let now = chrono::Utc::now();
+        let seen = |minutes: i64, version: &str, older: bool| OtherComputer {
+            name: "joe-desktop".into(),
+            last_seen: now - chrono::Duration::minutes(minutes),
+            version: version.into(),
+            older,
+        };
+        assert_eq!(seen(2, "0.29.0", false).sentence(now), "Also open on joe-desktop (seen 2 minutes ago); changes arrive through the folder's sync.");
+        assert_eq!(seen(0, "0.29.0", false).sentence(now), "Also open on joe-desktop (seen just now); changes arrive through the folder's sync.");
+        assert!(seen(61, "0.29.0", false).sentence(now).contains("seen 1 hour ago"));
+        assert!(seen(3 * 24 * 60, "0.29.0", false).sentence(now).contains("seen 3 days ago"));
+        assert_eq!(seen(2, "0.29.0", false).update_sentence(), None);
+        assert_eq!(
+            seen(2, "0.28.8", true).update_sentence().as_deref(),
+            Some("joe-desktop runs Pimble 0.28.8, which can write over changes made here in this folder. Please update Pimble on joe-desktop.")
+        );
+    }
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(version_older("0.28.8", "0.28.9"));
+        assert!(version_older("0.9.0", "0.10.0"));
+        assert!(version_older("", "0.1.0"));
+        assert!(!version_older("0.28.9", "0.28.9"));
+        assert!(!version_older("v1.0.0", "0.99.99"));
+        assert!(!version_older("0.29.0-beta", "0.29.0"));
+    }
 
     fn partial(roots: Vec<NodeId>, ended: Vec<NodeId>) -> Store {
         let mut store = Store::new_local("Shared by ana@example.com", PathBuf::from("/tmp/replica.pimble"));

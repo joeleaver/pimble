@@ -1163,7 +1163,9 @@ pub(crate) async fn fetch_scope_keys(
 // The hosted twin stores ciphertext: it has no state vector to answer with,
 // so "what does the remote lack?" cannot be asked of it the way a plain sync
 // link asks. The link keeps the answer itself, per document, in
-// `<store>/vault-link.json`:
+// `vault-link.json` in the store's state directory (`<data dir>/pimble/
+// stores/<store id>/`, this computer's alone; in the store's folder before
+// 2026-11-19, docs/STORE_FOLDERS_CONTRACT.md rule 1):
 //
 // - `pushed_sv`: a state vector everything up to which is known to be on the
 //   remote. It advances with every update this link appends or pulls, and only
@@ -1355,10 +1357,11 @@ impl Progress {
         let path = {
             let manager = handler.store_manager_handle();
             let manager = manager.read().await;
-            manager
-                .get_store_info(store_id)
-                .ok()
-                .and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
+            // This computer's, in the store's state directory, never in the
+            // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1).
+            manager.state_dir(store_id).map(|dir| dir.join(Self::FILE_NAME)).or_else(|| {
+                manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
+            })
         };
         let devices = handler.devices();
         let entry = devices.entry(store_id).await;
@@ -1561,6 +1564,10 @@ impl Progress {
         };
         let tmp = path.with_extension("json.tmp");
         let written = async {
+            // The state directory is made on first use.
+            if let Some(dir) = path.parent() {
+                tokio::fs::create_dir_all(dir).await?;
+            }
             tokio::fs::write(&tmp, json).await?;
             tokio::fs::rename(&tmp, path).await
         }

@@ -245,7 +245,9 @@ async fn start_pimble_server(creds_dir: &Path, replicas_dir: &Path, service_toke
             addr: "127.0.0.1:0".parse().unwrap(),
             auth_token: Some(service_token.to_string()),
             credentials_path: Some(creds_dir.join("credentials.json")),
-            replicas_dir: Some(replicas_dir.to_path_buf()),
+            // A directory inside the temp one: what lives beside the
+            // replicas (state, devices) stays inside it too.
+            replicas_dir: Some(replicas_dir.join("replicas")),
             // Forward-compatible with fields agent B is concurrently adding
             // to `ServerConfig` (JWT verification, origin allowlist): this
             // service only exercises the pre-existing static-token mode.

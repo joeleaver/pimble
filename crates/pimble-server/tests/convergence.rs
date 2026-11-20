@@ -125,7 +125,9 @@ async fn make_the_gap_with(env: &Env, shared: &mut Shared, reports: bool, words:
     let held = state_vector_of(&shared.bob, store_id, inside).await;
     shared.bob_server.stop().await.unwrap();
 
-    let progress_path = bob_replica(shared).join("vault-link.json");
+    // Bob's computer's own state, outside the store's folder
+    // (docs/STORE_FOLDERS_CONTRACT.md rule 1).
+    let progress_path = shared.bob_dir.path().join("stores").join(shared.fx.store_id.to_string()).join("vault-link.json");
     let mut progress: serde_json::Value = serde_json::from_slice(&std::fs::read(&progress_path).expect("Bob's link keeps a progress file")).unwrap();
     progress["pushed_sv"][inside.to_string()] = serde_json::Value::String(STANDARD.encode(&held));
     progress["dirty"] = serde_json::json!([]);

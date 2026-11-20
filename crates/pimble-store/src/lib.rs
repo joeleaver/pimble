@@ -11,6 +11,7 @@ pub mod local;
 pub mod manager;
 pub mod registry;
 pub mod vault;
+pub mod watch;
 
 pub use blobs::*;
 pub use error::*;
@@ -18,3 +19,4 @@ pub use local::*;
 pub use manager::*;
 pub use registry::*;
 pub use vault::*;
+pub use watch::{watch_folder, FolderWatch};

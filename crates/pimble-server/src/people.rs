@@ -5,10 +5,12 @@
 //! messages and (later) presence frames name people by account id; this
 //! module is how this device turns an id into the name it goes by. The
 //! accounts service answers it (`GET /me/shares`, then `GET members` per
-//! scope), and the answer is kept beside the store as `people.json`, derived
-//! data rebuilt whenever it is asked again, so names still show offline.
-//! Nothing here is store content: the file is never synced, and deleting it
-//! loses nothing.
+//! scope), and the answer is kept in the store's state directory as
+//! `people.json`, derived data rebuilt whenever it is asked again, so names
+//! still show offline. Nothing here is store content: the file is never
+//! synced, and deleting it loses nothing. It is the signed-in account's view
+//! (its own name in each share), so it is this computer's and not the
+//! folder's (docs/STORE_FOLDERS_CONTRACT.md rule 1, decided 2026-11-19).
 
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc::{Person, ScopePeople, StorePeople};
@@ -22,7 +24,10 @@ const FILE_NAME: &str = "people.json";
 async fn file_of(handler: &RpcHandler, store_id: StoreId) -> Option<std::path::PathBuf> {
     let manager = handler.store_manager_handle();
     let manager = manager.read().await;
-    manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(FILE_NAME)))
+    manager
+        .state_dir(store_id)
+        .map(|dir| dir.join(FILE_NAME))
+        .or_else(|| manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(FILE_NAME))))
 }
 
 /// What this device last learned, empty when it never has.

@@ -794,7 +794,7 @@ async fn a_replica_from_before_the_progress_file_pushes_what_the_remote_lacks() 
     seed_content(&client_a, store_id, doc_id, "editor", "lost by the old link").await;
     tokio::time::sleep(Duration::from_millis(1000)).await; // the content flush debounce
     a.stop().await.unwrap();
-    let _ = std::fs::remove_file(a_path.join("vault-link.json"));
+    let _ = std::fs::remove_file(a_dir.path().join("stores").join(store_id.to_string()).join("vault-link.json"));
     env.relay.restore();
 
     let dir = a_dir.path();

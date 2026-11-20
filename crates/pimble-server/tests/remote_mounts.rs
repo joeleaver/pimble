@@ -82,7 +82,9 @@ async fn start_server(token: Option<&str>) -> Server {
         addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: token.map(String::from),
         credentials_path: Some(credentials.path().join("credentials.json")),
-        replicas_dir: Some(replicas.path().to_path_buf()),
+        // Inside the temp directory: each store's state lives beside the
+        // replicas (docs/STORE_FOLDERS_CONTRACT.md rule 1).
+        replicas_dir: Some(replicas.path().join("replicas")),
         ..Default::default()
     });
     server.start().await.expect("server starts");
@@ -96,7 +98,7 @@ async fn start_server(token: Option<&str>) -> Server {
         .expect("client connects");
 
     Server {
-        replicas_dir: replicas.path().to_path_buf(),
+        replicas_dir: replicas.path().join("replicas"),
         server,
         client,
         _replicas: replicas,
@@ -524,23 +526,26 @@ async fn a_mount_nothing_can_reach_reports_why() {
 async fn last_sync_persists_so_a_reopened_source_is_cached_not_connecting() {
     let mut f = setup_fixture().await;
 
-    // `sync.json` holds the link's `last_sync` and never a credential.
-    let sync_json: serde_json::Value = wait_until(Duration::from_secs(10), || async {
-        std::fs::read_to_string(f.b_replica_path.join("sync.json"))
+    // The link's `last_sync` is this computer's, kept outside the store's
+    // folder (`<state root>/<store id>/link.json`,
+    // docs/STORE_FOLDERS_CONTRACT.md rule 1), and `sync.json` never holds a
+    // credential.
+    let link_json = f.l.replicas_dir.parent().unwrap().join("stores").join(f.b_id.to_string()).join("link.json");
+    let link_state: serde_json::Value = wait_until(Duration::from_secs(10), || async {
+        std::fs::read_to_string(&link_json)
             .ok()
             .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
             .map(|v| v.get("last_sync").is_some())
             .unwrap_or(false)
     })
     .await
-    .then(|| {
-        let json = std::fs::read_to_string(f.b_replica_path.join("sync.json")).unwrap();
-        serde_json::from_str(&json).unwrap()
-    })
-    .expect("sync.json should record last_sync once the link has synced");
+    .then(|| serde_json::from_str(&std::fs::read_to_string(&link_json).unwrap()).unwrap())
+    .expect("link.json should record last_sync once the link has synced");
+    let sync_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f.b_replica_path.join("sync.json")).unwrap()).unwrap();
+    assert!(sync_json.get("last_sync").is_none(), "the folder's sync.json holds no per-computer state");
 
     assert_eq!(sync_json["remote"]["auth"]["method"], "none", "sync.json never stores a credential");
-    let persisted: chrono::DateTime<chrono::Utc> = sync_json["last_sync"]
+    let persisted: chrono::DateTime<chrono::Utc> = link_state["last_sync"]
         .as_str()
         .expect("last_sync is a timestamp string")
         .parse()

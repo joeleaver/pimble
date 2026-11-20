@@ -533,6 +533,15 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
         }
         out
     };
+    // Other computers that open the store's folder through a sync tool, and
+    // an older Pimble among them asked to be updated
+    // (docs/STORE_FOLDERS_CONTRACT.md rule 5).
+    let elsewhere = move || -> Vec<String> {
+        let Some((s, _)) = shown(store) else { return Vec::new() };
+        let Some(sig) = store.store_data.with(|map| map.get(&s).copied()) else { return Vec::new() };
+        let now = chrono::Utc::now();
+        sig.with(|st| st.also_open_on.iter().flat_map(|other| std::iter::once(other.sentence(now)).chain(other.update_sentence())).collect())
+    };
     let lives_in = rsx! {
         div {
             class: "pimble-properties__section",
@@ -556,6 +565,13 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                 class: "pimble-properties__through",
                 style: {move || if reached_through(store).is_some() { "" } else { "display: none;" }},
                 {move || reached_through(store).unwrap_or_default()}
+            }
+            for line in elsewhere() {
+                div {
+                    key: line.clone(),
+                    class: "pimble-properties__through",
+                    {line.clone()}
+                }
             }
         }
     };
