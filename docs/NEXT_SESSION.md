@@ -1,5 +1,12 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.7: Send Diagnostics, and diagnostics from the
+browser.** Diagnostics wave 3 (docs/DIAGNOSTICS_CONTRACT.md section 8): Help > "Send
+Diagnostics..." in both apps (logs, stores, a note; a report code to tell us), and the web
+app's records through the accounts service. All three waves built. Not yet seen live: the
+browser's records on pimble.app, and the Windows-only parts on a Windows machine (Will's
+records will show both).
+
 **2026-11-19 (session 78e7f30f): v0.28.6: a large change read whole.** The flaky
 `relay.rs` `a_twenty_megabyte_document...` was a real fault, about 2 runs in 3: a member
 joining just after a 20 MiB edit held part of it ("Part of a large change to it has not
