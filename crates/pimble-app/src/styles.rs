@@ -421,6 +421,29 @@ pub(crate) const APP_CSS: &str = "
     height: 0.75rem;
 }
 
+/* The mark on the row of a note out of step on this device
+   (docs/CONVERGENCE_CONTRACT.md section 4); the reason is its tooltip. */
+.pimble-tree__out-of-step {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    color: var(--rinch-color-orange-6);
+}
+.pimble-tree__out-of-step svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+/* The line at the top of a pane whose note is out of step. */
+.pimble-pane__out-of-step {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-surface);
+    border-left: 3px solid var(--rinch-color-orange-6);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
 /* What a store row says about a store someone shared with this account:
    who shared it and what it may do here. */
 .pimble-tree__shared-by {

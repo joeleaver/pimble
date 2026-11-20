@@ -770,6 +770,12 @@ pub struct GetStoreSyncResponse {
     /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<pimble_core::WaitingDoc>,
+    /// The documents out of step on this device (docs/CONVERGENCE_CONTRACT.md
+    /// section 4), mirroring `Store::out_of_step`. A change to the list is
+    /// announced as the link's state again (`SyncStateChanged`), as a change
+    /// to `waiting` is. Missing from an older server: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_of_step: Vec<pimble_core::OutOfStep>,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
@@ -1140,7 +1146,14 @@ pub enum StoreChangeKind {
     /// (base64url) so a subscriber compares without asking. Sent only to a
     /// subscriber that asked for reports (`StoreSubscribeOptions::reports`),
     /// and to a share's member only for a document of their scope.
-    VaultReported { doc_id: VaultDocId, device: String, blob: String },
+    VaultReported {
+        doc_id: VaultDocId,
+        device: String,
+        blob: String,
+        /// The sending device's account, as on `VaultReport::account`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
     /// The share rooted at `node_id` in this store changed state on this
     /// device (its key handover, its scope publishing, docs/NODE_DOCUMENT_CONTRACT.md
     /// section 5). Derived state: links never forward it.
@@ -1749,6 +1762,12 @@ pub struct VaultReport {
     pub blob: String,
     /// When the server stored it.
     pub at: chrono::DateTime<chrono::Utc>,
+    /// The account whose device sent it, as the server knew the caller
+    /// (`None` for the server's own operator): what lets a device name the
+    /// person whose device holds what it lacks (docs/CONVERGENCE_CONTRACT.md
+    /// section 4). Missing from a server before wave 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// What a `subscribeStoreChanges` subscriber asks for beyond the default.

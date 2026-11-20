@@ -335,6 +335,8 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
     // Why the node is not syncing, while its store's link holds it back
     // (docs/SYNC_LIMITS_CONTRACT.md, "Saying what waits").
     let waiting = move || shown(store).and_then(|(s, n)| store.waiting_reason(s, n)).map(|reason| format!("Waiting to sync. {reason}")).unwrap_or_default();
+    // Out of step on this device, since when and why (docs/CONVERGENCE_CONTRACT.md section 4).
+    let out_of_step = move || shown(store).and_then(|(s, n)| store.out_of_step_of(s, n)).map(|entry| crate::out_of_step::notice(&entry)).unwrap_or_default();
     let context = move || {
         let here = shown(store)?;
         store.properties_context.with(|c| c.clone().filter(|c| (c.store_id, c.node_id) == here))
@@ -722,6 +724,11 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                         class: "pimble-properties__note pimble-properties__waiting",
                         style: {move || if waiting().is_empty() { "display: none;" } else { "" }},
                         {move || waiting()}
+                    }
+                    div {
+                        class: "pimble-properties__note pimble-properties__out-of-step",
+                        style: {move || if out_of_step().is_empty() { "display: none;" } else { "" }},
+                        {move || out_of_step()}
                     }
                     {tags}
                     {fields}

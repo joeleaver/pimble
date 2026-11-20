@@ -109,6 +109,30 @@ pub fn continues_from(known: &[u8], update: &[u8]) -> Result<bool> {
     Ok(lower.iter().all(|(client, clock)| *clock <= known.get(client)))
 }
 
+/// A state vector's v1 encoding with its clients in ascending order. yrs
+/// encodes them in its map's order, which differs between two maps holding
+/// the same clocks, so two equal vectors could differ as bytes; every vector
+/// a document gives out is this one, so equal is equal everywhere (a
+/// convergence report's "already answered" record compares them as bytes).
+pub fn canonical_state_vector(sv: &yrs::StateVector) -> Vec<u8> {
+    fn var(out: &mut Vec<u8>, mut n: u64) {
+        while n >= 0x80 {
+            out.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    }
+    let mut clients: Vec<(u64, u32)> = sv.iter().map(|(c, k)| (c.get(), *k)).collect();
+    clients.sort_unstable();
+    let mut out = Vec::with_capacity(1 + clients.len() * 12);
+    var(&mut out, clients.len() as u64);
+    for (client, clock) in clients {
+        var(&mut out, client);
+        var(&mut out, clock as u64);
+    }
+    out
+}
+
 /// A v1 state vector for a log line: `client 5596…945 from 129, …`.
 pub fn describe_state_vector(state_vector: &[u8]) -> String {
     match yrs::StateVector::decode_v1(state_vector) {
@@ -154,5 +178,27 @@ mod state_vector_tests {
         // The peer never got the first update; the second alone proves nothing.
         let known = advance_state_vector(&empty_state_vector(), &second_only).unwrap();
         assert!(state_vector_exceeds(&doc.state_vector(), &known).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use yrs::updates::encoder::Encode;
+
+    #[test]
+    fn equal_vectors_encode_alike_and_decode_as_yrs_does() {
+        let mut a = yrs::StateVector::default();
+        let mut b = yrs::StateVector::default();
+        for (c, k) in [(5596681811603945u64, 129u32), (12, 7), (900, 1)] {
+            a.set_max(yrs::block::ClientID::new(c), k);
+        }
+        for (c, k) in [(900u64, 1u32), (5596681811603945, 129), (12, 7)] {
+            b.set_max(yrs::block::ClientID::new(c), k);
+        }
+        assert_eq!(canonical_state_vector(&a), canonical_state_vector(&b));
+        let back = yrs::StateVector::decode_v1(&canonical_state_vector(&a)).unwrap();
+        assert_eq!(back, a);
+        assert_eq!(yrs::StateVector::decode_v1(&a.encode_v1()).unwrap(), back);
     }
 }

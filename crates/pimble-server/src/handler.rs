@@ -1184,6 +1184,9 @@ pub struct RpcHandler {
     /// it with the other devices' reports (docs/CONVERGENCE_CONTRACT.md wave
     /// 1). Always, but for a test showing what happens without.
     vault_reports: bool,
+    /// How long a document's difference must last, with the link connected,
+    /// before it is out of step (docs/CONVERGENCE_CONTRACT.md section 4).
+    out_of_step_after: Duration,
     /// This computer's device id in each vault-linked store, and the reports
     /// it has answered (`crate::devices`, `devices.json` beside the replicas
     /// directory, never in a store's folder).
@@ -1300,6 +1303,7 @@ impl RpcHandler {
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
             grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
             vault_reports: true,
+            out_of_step_after: crate::vault_link::OUT_OF_STEP_AFTER,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(crate::devices::devices_path_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
@@ -1398,6 +1402,17 @@ impl RpcHandler {
 
     pub(crate) fn vault_reports(&self) -> bool {
         self.vault_reports
+    }
+
+    /// How long a difference lasts before it is out of step, in place of
+    /// five minutes (`ServerConfig::out_of_step_after`; tests shorten it).
+    pub fn with_out_of_step_after(mut self, after: Duration) -> Self {
+        self.out_of_step_after = after;
+        self
+    }
+
+    pub(crate) fn out_of_step_after(&self) -> Duration {
+        self.out_of_step_after
     }
 
     pub(crate) fn devices(&self) -> Arc<crate::devices::Devices> {
@@ -1793,6 +1808,7 @@ impl RpcHandler {
         store.sync_state = self.sync_state_of(store.id).await;
         (store.sync_mode, store.relay) = self.link_kind_of(store.id).await;
         store.waiting = self.waiting_of(store.id).await;
+        store.out_of_step = self.out_of_step_of(store.id).await;
     }
 
     /// The documents of `store_id` its vault link is holding back, and why
@@ -1800,6 +1816,13 @@ impl RpcHandler {
     /// with no vault link.
     pub(crate) async fn waiting_of(&self, store_id: StoreId) -> Vec<pimble_core::WaitingDoc> {
         self.vault_links.read().await.get(&store_id).map(|link| link.waiting()).unwrap_or_default()
+    }
+
+    /// The documents of `store_id` out of step on this device
+    /// (docs/CONVERGENCE_CONTRACT.md section 4). None for a store with no
+    /// vault link.
+    pub(crate) async fn out_of_step_of(&self, store_id: StoreId) -> Vec<pimble_core::OutOfStep> {
+        self.vault_links.read().await.get(&store_id).map(|link| link.out_of_step()).unwrap_or_default()
     }
 
     /// Start a sync link for `store_id` if one isn't already running.
@@ -3454,11 +3477,17 @@ impl PimbleApiServer for RpcHandler {
         }
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let blob = pimble_rpc::vault::decode_blob(&request.blob).map_err(invalid_params)?;
+        // Who sent it, as this server knows the caller: what lets the other
+        // devices name the person whose device it is (section 4).
+        let account = match &principal {
+            Principal::User { sub, .. } => Some(sub.clone()),
+            Principal::Service => None,
+        };
         {
             let mut manager = self.store_manager.write().await;
             self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Read)?;
             manager
-                .vault_set_report(request.store_id, &request.doc_id.as_str(), &request.device, blob.clone(), chrono::Utc::now())
+                .vault_set_report(request.store_id, &request.doc_id.as_str(), &request.device, blob.clone(), chrono::Utc::now(), account.clone())
                 .await
                 .map_err(|e| match e {
                     StoreError::InvalidOperation(message) => invalid_params(message),
@@ -3466,7 +3495,7 @@ impl PimbleApiServer for RpcHandler {
                 })?;
         }
         debug!("Vault report of store {} doc {:?} from device {}", request.store_id, request.doc_id, request.device);
-        let kind = StoreChangeKind::VaultReported { doc_id: request.doc_id.clone(), device: request.device.clone(), blob: URL_SAFE_NO_PAD.encode(&blob) };
+        let kind = StoreChangeKind::VaultReported { doc_id: request.doc_id.clone(), device: request.device.clone(), blob: URL_SAFE_NO_PAD.encode(&blob), account };
         let delivery = self.delivery_for(request.store_id, &kind).await;
         let notification = StoreChangedNotification { store_id: request.store_id, change_kind: kind, source_client_id: None, update: None };
         self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
@@ -3490,7 +3519,7 @@ impl PimbleApiServer for RpcHandler {
                 continue;
             }
             for stored in manager.vault_reports(request.store_id, &doc_id.as_str()).map_err(to_rpc_error)? {
-                reports.push(VaultReport { doc_id: doc_id.clone(), device: stored.device, blob: URL_SAFE_NO_PAD.encode(stored.blob), at: stored.at });
+                reports.push(VaultReport { doc_id: doc_id.clone(), device: stored.device, blob: URL_SAFE_NO_PAD.encode(stored.blob), at: stored.at, account: stored.account });
             }
         }
         Ok(VaultReportsResponse { reports })
@@ -4288,6 +4317,7 @@ impl PimbleApiServer for RpcHandler {
                 store.sync_state = self.sync_state_of(id).await;
                 (store.sync_mode, store.relay) = self.link_kind_of_locked(&manager, id).await;
                 store.waiting = self.waiting_of(id).await;
+                store.out_of_step = self.out_of_step_of(id).await;
                 self.mark_replica(&mut store);
                 Self::present_store_to(&principal, &mut store);
                 stores.push(store);
@@ -5257,7 +5287,8 @@ impl PimbleApiServer for RpcHandler {
         // `Service` only, and a store just linked or unlinked this way is
         // held whole: `sync.json` says `full` or is gone.
         let waiting = self.waiting_of(request.store_id).await;
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false, waiting })
+        let out_of_step = self.out_of_step_of(request.store_id).await;
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false, waiting, out_of_step })
     }
 
     async fn get_store_sync(
@@ -5283,7 +5314,8 @@ impl PimbleApiServer for RpcHandler {
 
         let owner_offline = self.vault_links.read().await.get(&request.store_id).is_some_and(|link| link.owner_offline());
         let waiting = self.waiting_of(request.store_id).await;
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline, waiting })
+        let out_of_step = self.out_of_step_of(request.store_id).await;
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline, waiting, out_of_step })
     }
 
     async fn list_remote_stores(

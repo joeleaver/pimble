@@ -1224,6 +1224,7 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
         // when it is their own connection.
         owner_offline: answer.owner_offline,
         waiting: answer.waiting,
+        out_of_step: answer.out_of_step,
     }
 }
 

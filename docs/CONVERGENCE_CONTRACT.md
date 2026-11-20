@@ -1,6 +1,8 @@
 # Convergence: devices compare what they hold (draft, 2026-11-19)
 
-Status: **decisions answered by Joe 2026-11-19** (below). Wave 1 is built (2026-11-19, not merged or released; "Built: wave 1" below); waves 2 and 3 are not.
+Status: **decisions answered by Joe 2026-11-19** (below). Wave 1 is built and released
+(0.28.8, "Built: wave 1" below); wave 2 is built (2026-11-19, not merged or released; "Built:
+wave 2" below); wave 3 is not.
 
 Joe, 2026-11-19: "this kind of de-sync can't be allowed to happen again, it ruins the whole
 point of the app."
@@ -218,3 +220,117 @@ device that is gone stay on the server until 32 newer devices push them out (ans
 then never again); a delete difference between devices whose vectors also differ the other way
 (each holds structs the other lacks) is settled by the struct exchange, whose diffs carry the
 delete sets too.
+
+## Built: wave 2 (2026-11-19, not merged or released)
+
+### Section 3, what is waited for: met by wave 1's comparing
+
+No request is needed. A document holding a parked update reports its state vector, and a
+state vector counts only integrated structs: it stops before the first missing clock of every
+client the parked update waits on (a client the reporter has never seen at all reads as clock 0,
+`state_vector_exceeds`). So any device that holds the missing structs has a vector beyond that
+report, and comparing makes it append the diff from it, which carries the missing structs and
+everything after them; the parked update is released by their arrival. `missing` stays in the
+report (wave 1) for wave 3's giving up. What no device holds integrated (the parked update's
+predecessors exist nowhere) cannot be asked for by anyone, and that is section 4's and 5's case:
+it is said, and in wave 3 given up. A parked update is not sent on by the device that parked it
+until it is released, so a gap no device can fill stays on the devices that received it.
+
+Test: `crates/pimble-server/tests/convergence.rs`
+`an_update_parked_behind_a_gap_is_filled_by_the_device_that_holds_it` (Bob's change never left
+his device while his link believed it had; a change built on it went out live and waits, parked,
+on Alice's device; her second device's report asks, and Bob, hearing it live, sends; both of
+Alice's devices release it).
+
+### Section 4, out of step, said
+
+**Definition** (the coordinator's, 2026-11-19, refined where noted). A document is out of step on
+a device when, for at least five minutes during which that device's link (or page) was connected,
+one of these has held without a break, judged in this order
+(`pimble_rpc::vault::out_of_step_reason`, the same function on the desktop and in the browser):
+
+1. it holds an update parked behind a gap (`NodeDoc::missing`): "Waits for earlier changes
+   another device has not sent.";
+2. another device's latest report from the last 30 days holds structs this device lacks: "Will's
+   device holds changes this one lacks." (Will's device, Your other device, or Another device);
+3. this device holds something another device's report lacks (structs, or deletes by the
+   digest), has not answered that report (no acknowledged append on record), and the remote is not
+   known to hold it (`pushed_sv`, or the document is marked after a refused send): "This device
+   holds changes Will's device lacks and could not send them."
+
+Refined from "the reports differ": what this device has sent, or knows the remote holds, and
+another device has not taken yet is that device's to take when it is back (it may be off for a
+week), and does not count; otherwise every note edited while one device is away would be out of
+step. A reader's surplus never counts: a reader sends nothing. A difference first seen at a
+judgment has lasted no time; the time since the previous judgment, while connected, is what adds
+up. It clears at the first judgment where none holds. Judged every fifth of the window (30 s for
+five minutes) on the desktop and every 30 s in the browser, only while connected.
+
+**Naming devices.** The server stamps each stored report with the sending account as it knew the
+caller (`VaultReport::account`, `VaultReported { account }`, the `reports` file's `account`; `None`
+for the server's operator). The desktop names it with the store's people list
+(`crate::people::cached`, `StorePeople::name_of`): "<name>'s device", "Your other device" for the
+signed-in account, "Another device" when no name is known. The browser holds no people list: it
+names this person's other devices and calls everyone else's another device.
+
+**Log.** A `warn` line when a document becomes out of step ("out of step since <time>: <reason>")
+and an `info` line when it is in step again; diagnostics carry both.
+
+**Server and RPC.** `pimble_core::OutOfStep { node_id, since, reason }`; `Store::out_of_step`
+and `GetStoreSyncResponse::out_of_step` (serde default, skipped when empty), filled from the
+vault link (`VaultLinkHandle::out_of_step`, kept in the link's `Waiting` beside what waits). A
+change to the list is announced exactly as a change to `waiting` is: the link's state again
+(`SyncStateChanged`), on which the app asks `getStoreSync`. `ServerConfig::out_of_step_after`
+(default five minutes) is the window; tests shorten it.
+
+**App** (`crates/pimble-app`, desktop and browser alike: both feed `StoreSyncChanged.out_of_step`
+into `AppStore::out_of_step`; `src/out_of_step.rs` holds the words):
+- the note's row in the explorer: a small warning mark after its label, the sentence as its
+  tooltip; the row's `TreeNodeData` label carries it (`out_of_step::row_snapshot`) and a change to
+  the list rebuilds the rows;
+- the pane showing the note (text, canvas, sheet, discussion): one line at its top, "Out of step
+  since 19 Nov 2026, 14:05: <reason>";
+- Properties: the same line under the access note;
+- never the store row.
+
+**MCP**: `get_node` adds `sync: Out of step since 2026-11-19 14:05 UTC: <reason>`.
+
+**Browser** (`web/src/vault.rs`): the same judgement over the reports it hears (`reports_heard`)
+and its documents' parked state, `VaultStore::judge_steps`, driven by the backend loop's step 3e
+(`steps_due`, `judge_steps`, `pause_steps` while the endpoint is down); the list rides the store's
+sync answer (`sync_event`) like what waits.
+
+**Tests**:
+- `crates/pimble-rpc/src/vault.rs` `out_of_step_reasons_name_whose_device_and_why`.
+- `crates/pimble-store/src/vault.rs` (a report keeps its sender's account),
+  `crates/pimble-server/tests/vault.rs` (a report names the caller's account; `None` for the
+  operator).
+- `crates/pimble-server/tests/convergence.rs`
+  `a_gap_no_device_can_fill_makes_the_note_out_of_step_on_both_until_it_is_filled`: both devices
+  get an update built on a change nobody holds; after the (test) window of 2 s both list the note
+  out of step with the parked reason and a `since` from when it began, the app's subscription hears
+  the change, and once the missing change arrives on one device both are in step again.
+- `crates/pimble-app/src/out_of_step.rs` (the pane's and the row's words, the row label).
+- `crates/pimble-mcp/src/tools.rs` `get_node_says_since_when_and_why`.
+- `web/src/vault.rs` `a_page_says_a_note_out_of_step_after_the_window_and_clears_it`,
+  `a_report_beyond_this_page_names_whose_device_holds_more`.
+
+**Known limits of wave 2**: a device whose own report and another's differ only in deletes that
+this device sent (answered) waits for that device to take them, without saying so; the browser
+cannot name other people's devices; the window counts this device's connected time, not the
+other device's.
+
+## Next: one sync engine for both apps (Joe, 2026-11-19: after the store-folder work)
+
+The desktop's encrypted link (`crates/pimble-server/src/vault_link.rs` and `share.rs`, about
+4,500 lines) and the browser's vault client (`web/src/vault.rs`, about 6,500) do the same
+job twice, and every change to how syncing works has been built twice and has drifted
+(wave 2 shipped with the browser unable to name devices it could have named). The shared
+rules in `pimble_rpc::vault` (comparing, out of step, sealing) are about 1,700 lines.
+
+The plan: one sync core, free of I/O (what to read, send, report, compare, retry, and when),
+in a crate both apps use, with each app supplying only its transport (the RPC client) and
+its storage (store folders on the desktop, the page's memory and `localStorage` in the
+browser). Wave 3's randomized fault test then runs the one engine both apps ship, which is
+what makes the guarantee hold in the browser as much as on the desktop. Sequenced after
+docs/STORE_FOLDERS_CONTRACT.md, which changes where the desktop keeps the link's state.

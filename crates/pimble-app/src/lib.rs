@@ -42,6 +42,7 @@ pub mod menus;
 pub mod metanodes;
 pub mod metanode_setup;
 pub mod nav;
+pub mod out_of_step;
 pub mod pane_view;
 pub mod panes;
 pub mod persistence;

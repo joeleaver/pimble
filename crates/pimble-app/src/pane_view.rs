@@ -242,6 +242,16 @@ fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
     !pane_access(store, pane).allows_write()
 }
 
+/// Whether the note the pane shows is out of step on this device, and why.
+fn pane_out_of_step(store: AppStore, pane: PaneId) -> Option<pimble_core::OutOfStep> {
+    let state = store.pane(pane);
+    let shown = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()).or_else(|| state.discussion.get())?;
+    if !(state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get()) {
+        return None;
+    }
+    store.out_of_step_of(shown.store_id, shown.node_id)
+}
+
 /// What this device may change of the pane's document: its store's access,
 /// narrowed by the node's own.
 fn pane_access(store: AppStore, pane: PaneId) -> pimble_core::StoreAccess {
@@ -540,6 +550,14 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 }
             }
 
+            // A note out of step on this device says so at the top of the
+            // pane that shows it, text, canvas or sheet alike
+            // (docs/CONVERGENCE_CONTRACT.md section 4).
+            div {
+                class: "pimble-pane__out-of-step",
+                style: {move || if pane_out_of_step(store, pane).is_some() { "" } else { "display: none;" }},
+                {move || pane_out_of_step(store, pane).map(|entry| crate::out_of_step::notice(&entry)).unwrap_or_default()}
+            }
             // The same sentence a refused write comes back with, so a
             // reader meets one wording everywhere.
             div {

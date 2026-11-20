@@ -24,13 +24,17 @@ use base64::Engine;
 use pimble_client::PimbleClient;
 use pimble_core::{NodeId, StoreId, SyncState};
 use pimble_crdt::NodeDoc;
-use pimble_rpc::{MemberRole, VaultDocId};
+use pimble_rpc::{EditOperation, MemberRole, StoreChangeKind, VaultDocId};
 use pimble_server::{PimbleServer, ServerConfig};
+
+/// How long a difference lasts before a test device says a note is out of
+/// step, in place of five minutes.
+const OUT_OF_STEP_AFTER: Duration = Duration::from_secs(2);
 
 /// A device whose vault links report and compare, or (as every device did
 /// before wave 1) do not.
 fn config(dir: &Path, reports: bool) -> ServerConfig {
-    ServerConfig { vault_reports: reports, ..device_config(dir) }
+    ServerConfig { vault_reports: reports, out_of_step_after: Some(OUT_OF_STEP_AFTER), ..device_config(dir) }
 }
 
 async fn start_device(dir: &Path, reports: bool) -> (PimbleServer, PimbleClient) {
@@ -54,6 +58,12 @@ async fn total_appends(env: &Env, store_id: StoreId) -> u64 {
 async fn state_vector_of(client: &PimbleClient, store_id: StoreId, node: NodeId) -> Vec<u8> {
     let (answers, _) = client.sync_nodes(store_id, &[(node, pimble_crdt::empty_state_vector())], false).await.expect("syncNodes answers");
     answers.into_iter().find(|(id, _, _)| *id == node).map(|(_, _, sv)| sv).expect("the node is held")
+}
+
+/// Whether two encoded state vectors say the same: the encoding's order of
+/// clients is not fixed, so equal vectors can differ as bytes.
+fn same_vector(a: &[u8], b: &[u8]) -> bool {
+    !pimble_crdt::state_vector_exceeds(a, b).unwrap_or(true) && !pimble_crdt::state_vector_exceeds(b, a).unwrap_or(true)
 }
 
 /// Alice's hosted store with its "Holiday" folder shared with Bob as an
@@ -97,10 +107,19 @@ fn bob_replica(shared: &Shared) -> PathBuf {
 /// edit: his link believes it was sent, and every other device never had it.
 /// Answers Bob's restarted device.
 async fn make_the_gap(env: &Env, shared: &mut Shared, reports: bool, words: &str) -> (PimbleServer, PimbleClient) {
+    make_the_gap_with(env, shared, reports, words, None).await
+}
+
+/// [`make_the_gap`] with the edit given as an update (whose text contains
+/// `words`) rather than made from `words`.
+async fn make_the_gap_with(env: &Env, shared: &mut Shared, reports: bool, words: &str, edit: Option<&[u8]>) -> (PimbleServer, PimbleClient) {
     let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
     env.relay.cut();
     assert!(wait_until(Duration::from_secs(10), || async { !is_synced(&shared.bob, store_id).await }).await, "Bob's link notices the network is gone");
-    seed_content(&shared.bob, store_id, inside, "bob-editor", words).await;
+    match edit {
+        Some(update) => apply(&shared.bob, store_id, inside, "bob-editor", update).await,
+        None => seed_content(&shared.bob, store_id, inside, "bob-editor", words).await,
+    }
     // The content flush and its `modified_at` stamp, both inside the vector.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let held = state_vector_of(&shared.bob, store_id, inside).await;
@@ -232,8 +251,13 @@ async fn delete_while_away(shared: &mut Shared, reports: bool) -> (PimbleServer,
     let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
     // Level first: each side's `modified_at` stamp is still on its way for a
     // moment after the fixture's edits, longer under load.
-    let level = wait_until(Duration::from_secs(30), || async { state_vector_of(&shared.bob, store_id, inside).await == state_vector_of(&shared.alice, store_id, inside).await }).await;
-    assert!(level, "Bob and Alice hold the same structs of the note");
+    let level = wait_until(Duration::from_secs(30), || async { same_vector(&state_vector_of(&shared.bob, store_id, inside).await, &state_vector_of(&shared.alice, store_id, inside).await) }).await;
+    assert!(
+        level,
+        "Bob and Alice hold the same structs of the note: Bob {}, Alice {}",
+        pimble_crdt::describe_state_vector(&state_vector_of(&shared.bob, store_id, inside).await),
+        pimble_crdt::describe_state_vector(&state_vector_of(&shared.alice, store_id, inside).await)
+    );
     shared.bob_server.stop().await.unwrap();
 
     let file = bob_replica(shared).join("nodes").join(format!("{inside}.yrs"));
@@ -294,4 +318,113 @@ async fn without_reports_a_delete_one_device_lacks_never_arrives() {
     let (_bob_server, _bob) = delete_while_away(&mut shared, false).await;
     let arrived = wait_until(Duration::from_secs(12), || async { !node_text(&shared.alice, store_id, inside).await.contains("socks") }).await;
     assert!(!arrived, "without reports nothing sends a delete that moved no clock");
+}
+
+// ── What is waited for, and out of step, said (wave 2) ───────────────────
+
+/// Apply `update` to `node` through `client`, as an editor's change.
+async fn apply(client: &PimbleClient, store_id: StoreId, node: NodeId, who: &str, update: &[u8]) {
+    let changes = STANDARD.encode(update);
+    client.apply_edit(store_id, node, who, EditOperation::IncrementalChanges { changes }).await.expect("the edit applies");
+}
+
+/// Two appends to `node`'s text as `client` holds it, the second built on the
+/// first (its paragraph comes after the first's): applied without the first,
+/// the second waits, parked.
+async fn two_appends(client: &PimbleClient, store_id: StoreId, node: NodeId, first: &str, second: &str) -> (Vec<u8>, Vec<u8>) {
+    let (answers, _) = client.sync_nodes(store_id, &[(node, pimble_crdt::empty_state_vector())], false).await.unwrap();
+    let (_, whole, _) = answers.into_iter().find(|(id, _, _)| *id == node).unwrap();
+    let mut doc = NodeDoc::load(&whole).unwrap();
+    let one = doc.append_markdown(first).unwrap();
+    let two = doc.append_markdown(second).unwrap();
+    (one, two)
+}
+
+/// Section 3, met by wave 1's comparing: Bob's update waits on every other
+/// device behind structs only Bob holds (the gap of 2026-11-19, then an edit
+/// built on it that went out live). A waiting document's vector stops
+/// before what it waits for, so Bob's is beyond any report of it, and he
+/// sends the diff the moment a report asks. Alice's device does not report,
+/// so the gap stands until her second device, which does, reports.
+#[tokio::test]
+async fn an_update_parked_behind_a_gap_is_filled_by_the_device_that_holds_it() {
+    let env = spawn_env().await;
+    let mut shared = shared_with_bob(&env, false, true).await;
+    let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
+    let (gap, on_top) = two_appends(&shared.bob, store_id, inside, "THE GAP", "BUILT ON THE GAP").await;
+    let (_bob_server, bob) = make_the_gap_with(&env, &mut shared, true, "THE GAP", Some(&gap)).await;
+    // Built on the gap, and sent live: everyone else parks it.
+    apply(&bob, store_id, inside, "bob-editor", &on_top).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let alice_text = node_text(&shared.alice, store_id, inside).await;
+    assert!(!alice_text.contains("THE GAP") && !alice_text.contains("BUILT ON THE GAP"), "Alice holds neither: the second waits behind the first, got {alice_text:?}");
+
+    let c_dir = tempfile::tempdir().unwrap();
+    let (_c_server, second_device) = start_device(c_dir.path(), true).await;
+    env.sign_in(&second_device, ALICE).await;
+    second_device.cloud_add_hosted_store(store_id).await.expect("Alice's second device adds the store");
+    let filled = wait_until(Duration::from_secs(20), || async {
+        let text = node_text(&second_device, store_id, inside).await;
+        text.contains("THE GAP") && text.contains("BUILT ON THE GAP")
+    })
+    .await;
+    assert!(filled, "the second device's report asks for what it waits on, got {:?}", node_text(&second_device, store_id, inside).await);
+    let first = wait_until(Duration::from_secs(10), || async {
+        let text = node_text(&shared.alice, store_id, inside).await;
+        text.contains("THE GAP") && text.contains("BUILT ON THE GAP")
+    })
+    .await;
+    assert!(first, "and the parked update is released on Alice's first device too");
+}
+
+async fn out_of_step_of(client: &PimbleClient, store_id: StoreId) -> Vec<pimble_core::OutOfStep> {
+    client.get_store_sync_response(store_id).await.map(|r| r.out_of_step).unwrap_or_default()
+}
+
+/// Section 4: a gap no device can fill. Both devices get an update built on a
+/// change nobody holds (made on a scratch copy and never sent: what a log
+/// that carries an edit and not the one before it hands everyone); it waits,
+/// parked, on both. A parked update moves no clock and is not sent on until
+/// it is released, so no report can ask anyone for the missing change.
+/// After the window both say the note is out of step, with the reason, and a
+/// notification tells the app; once the missing change arrives on one
+/// device, both are in step again.
+#[tokio::test]
+async fn a_gap_no_device_can_fill_makes_the_note_out_of_step_on_both_until_it_is_filled() {
+    let env = spawn_env().await;
+    let shared = shared_with_bob(&env, true, true).await;
+    let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
+    let mut alice_changes = shared.alice.subscribe_store_changes(store_id).await.unwrap();
+    assert!(out_of_step_of(&shared.alice, store_id).await.is_empty() && out_of_step_of(&shared.bob, store_id).await.is_empty(), "in step to begin with");
+
+    let (lost, waits) = two_appends(&shared.alice, store_id, inside, "NOBODY HOLDS THIS", "WAITS FOR IT").await;
+    apply(&shared.alice, store_id, inside, "alice-editor", &waits).await;
+    apply(&shared.bob, store_id, inside, "bob-editor", &waits).await;
+    assert!(!node_text(&shared.alice, store_id, inside).await.contains("WAITS FOR IT"), "parked on Alice");
+    assert!(!node_text(&shared.bob, store_id, inside).await.contains("WAITS FOR IT"), "and on Bob");
+
+    for (who, client) in [("Alice", &shared.alice), ("Bob", &shared.bob)] {
+        let marked = wait_until(Duration::from_secs(20), || async { out_of_step_of(client, store_id).await.iter().any(|o| o.node_id == inside) }).await;
+        assert!(marked, "{who}'s device says the note is out of step");
+        let entry = out_of_step_of(client, store_id).await.into_iter().find(|o| o.node_id == inside).unwrap();
+        assert_eq!(entry.reason, "Waits for earlier changes another device has not sent.", "{who}");
+        assert!(chrono::Utc::now() - entry.since >= chrono::Duration::from_std(OUT_OF_STEP_AFTER).unwrap(), "since when the difference began, not when it was said");
+        assert!(out_of_step_of(client, store_id).await.iter().all(|o| o.node_id == inside), "only that note");
+    }
+    let mut told = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !told && tokio::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(n))) = tokio::time::timeout(Duration::from_millis(200), alice_changes.next()).await {
+            told = matches!(n.change_kind, StoreChangeKind::SyncStateChanged { .. });
+        }
+    }
+    assert!(told, "the app hears the list changed (the link's state again) without asking");
+
+    apply(&shared.alice, store_id, inside, "alice-editor", &lost).await;
+    for (who, client) in [("Alice", &shared.alice), ("Bob", &shared.bob)] {
+        let text = wait_until(Duration::from_secs(15), || async { node_text(client, store_id, inside).await.contains("WAITS FOR IT") }).await;
+        assert!(text, "{who} has both once the missing change arrives");
+        let cleared = wait_until(Duration::from_secs(15), || async { out_of_step_of(client, store_id).await.is_empty() }).await;
+        assert!(cleared, "{who}'s device is in step again");
+    }
 }

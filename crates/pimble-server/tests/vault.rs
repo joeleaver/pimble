@@ -886,8 +886,9 @@ async fn a_report_is_one_slot_per_device_and_reaches_only_who_asked_for_reports(
 
     let notif = next_within(&mut asked, Duration::from_secs(2)).await.expect("a subscriber that asked hears the report");
     match notif.change_kind {
-        StoreChangeKind::VaultReported { doc_id, device, blob } => {
+        StoreChangeKind::VaultReported { doc_id, device, blob, account } => {
             assert_eq!((doc_id, device.as_str(), blob), (doc.clone(), "device-a", b64(b"a's first")));
+            assert_eq!(account, None, "the server's own operator is nobody's account");
         }
         other => panic!("expected VaultReported, got {:?}", other),
     }
@@ -928,6 +929,8 @@ async fn reports_stay_inside_a_members_scope_and_a_reader_reports_too() {
         "a member is answered for their scope and nothing else"
     );
     assert_eq!(v.admin.vault_reports(store_id, vec![VaultDocId::Node(outside)]).await.unwrap().len(), 1, "the owner reads every report");
+    let bobs = editor.vault_reports(store_id, vec![VaultDocId::Node(inside)]).await.unwrap().into_iter().find(|r| r.device == "bob-device").unwrap();
+    assert_eq!(bobs.account.as_deref(), Some("bob"), "a report names the account whose device sent it, as the server knew the caller");
 
     // What the reader hears: its own report and bob's, never the one outside.
     let mut heard = Vec::new();

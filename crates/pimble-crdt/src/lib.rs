@@ -36,4 +36,4 @@ pub use store_document::*;
 pub use links::{LinkRef, Resolved, Spot};
 pub use rules::{derive_changes, move_order, DeletedEntry, DocShape, LinkHop, LinkWalk, MoveRefused, NodeChange};
 pub use tree::{Cutting, CuttingNode, Planted, Tree, TreeEdit};
-pub use sync_util::{advance_state_vector, continues_from, describe_state_vector, empty_state_vector, state_vector_exceeds};
+pub use sync_util::{advance_state_vector, canonical_state_vector, continues_from, describe_state_vector, empty_state_vector, state_vector_exceeds};

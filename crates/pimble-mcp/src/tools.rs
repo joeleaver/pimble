@@ -157,6 +157,12 @@ fn crdt(e: CrdtError) -> String {
     ApiError::from(e).sentence()
 }
 
+/// What get_node says of a note out of step on this device
+/// (docs/CONVERGENCE_CONTRACT.md section 4): since when, in UTC, and why.
+fn out_of_step_line(entry: &pimble_core::OutOfStep) -> String {
+    entry.sentence(&entry.since.format("%Y-%m-%d %H:%M UTC").to_string())
+}
+
 /// A node's type as the person knows it: a `board` node is a canvas in the
 /// interface (docs/CANVAS_CONTRACT.md, "Glossary"); every other type is its own name.
 pub fn type_name(node: &Node) -> &str {
@@ -249,10 +255,14 @@ impl Pimble {
     /// kind of node it is when that matters.
     /// Why a node waits to sync, when its store's link holds it back: asked
     /// of the stores as they are now, not as last listed.
-    async fn waiting_reason(&self, addr: Addr) -> Option<String> {
-        let stores = self.api.stores().await.ok()?;
-        let store = stores.into_iter().find(|s| s.id == addr.store)?;
-        store.waiting.into_iter().find(|w| w.node_id == addr.node).map(|w| w.reason)
+    /// And whether it is out of step on this device (docs/CONVERGENCE_CONTRACT.md
+    /// section 4), since when and why.
+    async fn sync_notes(&self, addr: Addr) -> (Option<String>, Option<pimble_core::OutOfStep>) {
+        let Ok(stores) = self.api.stores().await else { return (None, None) };
+        let Some(store) = stores.into_iter().find(|s| s.id == addr.store) else { return (None, None) };
+        let waiting = store.waiting.into_iter().find(|w| w.node_id == addr.node).map(|w| w.reason);
+        let out_of_step = store.out_of_step.into_iter().find(|o| o.node_id == addr.node);
+        (waiting, out_of_step)
     }
 
     async fn node_header(&self, addr: Addr, node: &Node) -> String {
@@ -276,8 +286,12 @@ impl Pimble {
         }
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
         // Held back by its store's link, and why (docs/SYNC_LIMITS_CONTRACT.md).
-        if let Some(reason) = self.waiting_reason(addr).await {
+        let (waiting, out_of_step) = self.sync_notes(addr).await;
+        if let Some(reason) = waiting {
             out.push_str(&format!("sync: waiting. {reason} (Edits here are kept on this computer and go out once it syncs.)\n"));
+        }
+        if let Some(entry) = out_of_step {
+            out.push_str(&format!("sync: {}\n", out_of_step_line(&entry)));
         }
         match node.access {
             StoreAccess::Read => out.push_str("access: read-only\n"),
@@ -1429,5 +1443,17 @@ impl ServerHandler for Pimble {
         }
         let contents = ResourceContents::text(guide::text(), guide::URI).with_mime_type("text/markdown");
         Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![contents])))
+    }
+}
+
+#[cfg(test)]
+mod out_of_step_tests {
+    /// get_node's line for a note out of step: since when, and the reason the
+    /// app shows on the note.
+    #[test]
+    fn get_node_says_since_when_and_why() {
+        let since = chrono::DateTime::parse_from_rfc3339("2026-11-19T14:05:00Z").unwrap().with_timezone(&chrono::Utc);
+        let entry = pimble_core::OutOfStep { node_id: pimble_core::NodeId::new(), since, reason: "Waits for earlier changes another device has not sent.".into() };
+        assert_eq!(super::out_of_step_line(&entry), "Out of step since 2026-11-19 14:05 UTC: Waits for earlier changes another device has not sent.");
     }
 }

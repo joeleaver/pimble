@@ -838,6 +838,10 @@ pub struct AppStore {
     /// docs/SYNC_LIMITS_CONTRACT.md): the row's badge adds "· N notes
     /// waiting", and a waiting node's Properties panel shows its reason.
     pub waiting: Signal<HashMap<StoreId, Vec<pimble_core::WaitingDoc>>>,
+    /// The notes out of step on this device, per store
+    /// (docs/CONVERGENCE_CONTRACT.md section 4): shown on each note's row,
+    /// its pane and its Properties, never on the store row.
+    pub out_of_step: Signal<HashMap<StoreId, Vec<pimble_core::OutOfStep>>>,
 
     /// A sentence the server sent back refusing a command (`Forbidden`, e.g.
     /// a store shared read-only), shown in the status bar. Not an error
@@ -1170,6 +1174,7 @@ impl AppStore {
             stop_relay_modal_error: Signal::new(String::new()),
             owner_offline: Signal::new(HashSet::new()),
             waiting: Signal::new(HashMap::new()),
+            out_of_step: Signal::new(HashMap::new()),
             notice: Signal::new(String::new()),
             update_ready: Signal::new(None),
             about_open: Signal::new(false),
@@ -1525,6 +1530,28 @@ impl AppStore {
                 }
             });
         }
+    }
+
+    /// Record which notes of a store are out of step. Answers whether that
+    /// changed anything: the rows snapshot it, so the caller rebuilds them.
+    pub fn set_out_of_step(&self, store_id: StoreId, list: Vec<pimble_core::OutOfStep>) -> bool {
+        let held = untracked(|| self.out_of_step.with(|map| map.get(&store_id).cloned().unwrap_or_default()));
+        if held == list {
+            return false;
+        }
+        self.out_of_step.update(|map| {
+            if list.is_empty() {
+                map.remove(&store_id);
+            } else {
+                map.insert(store_id, list);
+            }
+        });
+        true
+    }
+
+    /// Whether, since when and why a note is out of step on this device.
+    pub fn out_of_step_of(&self, store_id: StoreId, node_id: NodeId) -> Option<pimble_core::OutOfStep> {
+        self.out_of_step.with(|map| map.get(&store_id).and_then(|docs| docs.iter().find(|o| o.node_id == node_id)).cloned())
     }
 
     /// Why a node waits to sync, when its store's link is holding it back.
@@ -2360,6 +2387,9 @@ impl AppStore {
             .map(|(source_store, source_node)| format!("{:?}", self.node_access(source_store, source_node)))
             .unwrap_or_default();
         let found_note = found_in.map(|(found, _, _)| format!("|found: {}", found.refusal)).unwrap_or_default();
+        // A note out of step says so on its row (docs/CONVERGENCE_CONTRACT.md
+        // section 4), snapshotted like everything else the row draws.
+        let out_of_step = crate::out_of_step::row_snapshot(self.out_of_step_of(child_store, child_id).as_ref());
         if let Some((found, metanode, metanode_row)) = found_in {
             FOUND_ROWS.with(|rows| {
                 rows.borrow_mut().insert(
@@ -2371,13 +2401,14 @@ impl AppStore {
         let tree_node = TreeNodeData::new(
             value.clone(),
             format!(
-                "{}|{}{}|{}|{}{}",
+                "{}|{}{}|{}|{}{}{}",
                 if paste { "paste" } else { "" },
                 access,
                 source_access,
                 if held_as_share { "theirs" } else { "" },
                 appearance,
-                found_note
+                found_note,
+                out_of_step
             ),
         );
 

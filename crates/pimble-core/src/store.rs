@@ -146,6 +146,14 @@ pub struct Store {
     /// syncing. Missing in older serializations: nothing waits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<WaitingDoc>,
+
+    /// The documents of this store that are out of step on this device
+    /// (docs/CONVERGENCE_CONTRACT.md section 4): what this device holds and
+    /// what the other devices say they hold have differed, and not closed,
+    /// for five minutes of connection. Shown on the note, never on the store
+    /// row. Missing in older serializations: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_of_step: Vec<OutOfStep>,
 }
 
 /// One document a sync link is holding back, and why, in a sentence.
@@ -153,6 +161,25 @@ pub struct Store {
 pub struct WaitingDoc {
     pub node_id: NodeId,
     pub reason: String,
+}
+
+/// One document out of step on this device (docs/CONVERGENCE_CONTRACT.md
+/// section 4): since when, and why, in a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutOfStep {
+    pub node_id: NodeId,
+    /// When the difference began (not when the five minutes ran out).
+    pub since: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+}
+
+impl OutOfStep {
+    /// The one line the app's pane and the MCP say: "Out of step since 14:05
+    /// on 19 November: <reason>". `since` is shown in the viewer's own time
+    /// zone by whoever calls this with it (`local`).
+    pub fn sentence(&self, local: &str) -> String {
+        format!("Out of step since {local}: {}", self.reason)
+    }
 }
 
 /// "1 note waiting", "3 notes waiting": what a store's badge adds while its
@@ -204,6 +231,7 @@ impl Store {
             ended_roots: Vec::new(),
             relay: RelaySide::None,
             waiting: Vec::new(),
+            out_of_step: Vec::new(),
         }
     }
 
@@ -225,6 +253,7 @@ impl Store {
             ended_roots: Vec::new(),
             relay: RelaySide::None,
             waiting: Vec::new(),
+            out_of_step: Vec::new(),
         }
     }
 

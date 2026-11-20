@@ -2263,6 +2263,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 None
             };
 
+            // A note out of step on this device says so on its row
+            // (docs/CONVERGENCE_CONTRACT.md section 4), the reason and since
+            // when as the tooltip. Drawn from the render-time snapshot: the
+            // row's data carries the mark (`out_of_step::row_snapshot`).
+            let out_of_step_mark: Option<NodeHandle> = match parsed {
+                Some((s_id, Some(n_id))) if !is_store_root => untracked(|| store.out_of_step_of(s_id, n_id)).map(|entry| {
+                    let mark = render_tabler_icon(__scope, TablerIcon::AlertTriangle, TablerIconStyle::Outline);
+                    rsx! {
+                        span {
+                            class: "pimble-tree__out-of-step",
+                            title: crate::out_of_step::row_tooltip(&entry),
+                            {mark}
+                        }
+                    }
+                }),
+                _ => None,
+            };
+
             // A found row's arrow at its end: it lives elsewhere, and the
             // tooltip says where (section 6).
             let found_arrow: Option<NodeHandle> = match &found {
@@ -2486,6 +2504,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
 
                     {share_badge}
+                    {out_of_step_mark}
                     {shared_by_note}
                     {found_arrow}
 

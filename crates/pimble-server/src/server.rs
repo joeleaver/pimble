@@ -87,6 +87,11 @@ pub struct ServerConfig {
     /// (docs/CONVERGENCE_CONTRACT.md wave 1). `true`; a test turns it off to
     /// show the gap it closes.
     pub vault_reports: bool,
+    /// How long a document's difference from what the other devices hold
+    /// must last, with the link connected, before it is out of step
+    /// (docs/CONVERGENCE_CONTRACT.md section 4). `None` is five minutes;
+    /// tests shorten it.
+    pub out_of_step_after: Option<std::time::Duration>,
 }
 
 impl Default for ServerConfig {
@@ -106,6 +111,7 @@ impl Default for ServerConfig {
             agents_path: None,
             reported_version: None,
             vault_reports: true,
+            out_of_step_after: None,
         }
     }
 }
@@ -268,6 +274,9 @@ impl PimbleServer {
             handler = handler.with_grant_check_interval(every);
         }
         handler = handler.with_vault_reports(self.config.vault_reports);
+        if let Some(after) = self.config.out_of_step_after {
+            handler = handler.with_out_of_step_after(after);
+        }
         handler = handler.with_agents(agents);
         // The app's own server (loopback, tokenless, no JWT) hands over to a
         // newer one (docs/MCP_CONTRACT.md "Which server it talks to").

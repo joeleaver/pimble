@@ -682,6 +682,9 @@ pub enum BackendEvent {
         /// waits"): the row's badge counts them, and the Properties panel of
         /// a waiting node shows its reason.
         waiting: Vec<pimble_core::WaitingDoc>,
+        /// The notes out of step on this device (docs/CONVERGENCE_CONTRACT.md
+        /// section 4): each one's row, pane and Properties say so.
+        out_of_step: Vec<pimble_core::OutOfStep>,
     },
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).

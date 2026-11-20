@@ -380,6 +380,21 @@ async fn run(
                 vault.exchange_reports(&client, store_id).await;
                 ran_anything = true;
             }
+            // And whether each note is in step (section 4), judged only while
+            // its endpoint is up: that is the time that counts.
+            for store_id in vault.steps_due() {
+                if endpoints.client_for(store_id).is_some_and(|c| c.is_connected()) {
+                    if vault.people_due(store_id) {
+                        match people_of(store_id).await {
+                            Ok(people) => vault.set_people(store_id, &people),
+                            Err(_) => vault.people_asked(store_id),
+                        }
+                    }
+                    vault.judge_steps(store_id);
+                } else {
+                    vault.pause_steps(store_id);
+                }
+            }
             ran_anything
         };
         // 3d. What the vault said changed in a tree, shown now that it is

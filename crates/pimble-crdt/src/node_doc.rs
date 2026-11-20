@@ -268,7 +268,7 @@ impl NodeDoc {
 
     /// This document's state vector, v1-encoded.
     pub fn state_vector(&self) -> Vec<u8> {
-        self.doc.transact().state_vector().encode_v1()
+        crate::sync_util::canonical_state_vector(&self.doc.transact().state_vector())
     }
 
     /// Everything this document has that a peer at `state_vector` lacks.
@@ -313,7 +313,7 @@ impl NodeDoc {
     pub fn missing(&self) -> Option<Vec<u8>> {
         let txn = self.doc.transact();
         let pending = txn.store().pending_update()?;
-        Some(pending.missing.encode_v1())
+        Some(crate::sync_util::canonical_state_vector(&pending.missing))
     }
 
     /// A digest of what this document has deleted, for a state report

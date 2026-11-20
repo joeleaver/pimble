@@ -503,8 +503,43 @@ struct VaultStore {
     answered: protocol::Comparing,
     /// Other devices' reports heard live and not answered yet: the document,
     /// the device, the sealed report.
-    reports_in: Vec<(NodeId, String, String)>,
+    reports_in: Vec<(NodeId, String, String, Option<String>)>,
+    /// What the other devices last said they hold of each document (document
+    /// -> device -> the report, its account, when it was stored, ms), as this
+    /// page has heard it: what says whether the document is in step
+    /// (docs/CONVERGENCE_CONTRACT.md section 4).
+    reports_heard: HashMap<NodeId, HashMap<String, (protocol::Report, Option<String>, f64)>>,
+    /// Who is who in the store's shares (account id -> the name they go by),
+    /// asked of the accounts service every [`PEOPLE_EVERY_MS`], so a note out
+    /// of step names whose device holds what ("Will's device"), as the
+    /// desktop's does. When it was last asked, ms.
+    people: HashMap<String, String>,
+    people_at: Option<f64>,
+    /// The documents that differ now: since when (ms), for how long while
+    /// connected (ms), why, and whether that has been said.
+    steps: HashMap<NodeId, StepCandidate>,
+    /// The documents out of step on this page, said in the store's sync
+    /// answer (`sync_event`) like what waits.
+    out_of_step: HashMap<NodeId, pimble_core::OutOfStep>,
+    /// When the documents were last judged (the page's clock, ms).
+    steps_judged_at: Option<f64>,
 }
+
+/// A document that differs from what the other devices hold.
+struct StepCandidate {
+    since_ms: f64,
+    held_ms: f64,
+    reason: String,
+    marked: bool,
+}
+
+/// How long a difference lasts, with the page connected, before a document
+/// is out of step.
+/// How often a store's people are asked again, for naming devices.
+const PEOPLE_EVERY_MS: f64 = 10.0 * 60.0 * 1000.0;
+const OUT_OF_STEP_AFTER_MS: f64 = (protocol::OUT_OF_STEP_AFTER_SECS * 1000) as f64;
+/// How often the page judges whether its documents are in step.
+const STEPS_EVERY_MS: f64 = 30_000.0;
 
 /// Which way a document is held back: what this page has not sent, or what
 /// it has not been able to read.
@@ -1418,6 +1453,7 @@ impl VaultClient {
             store.reports_ok = true;
             store.reported.clear();
             store.report_due.clear();
+            store.reports_heard.clear();
             store.tree.ids().into_iter().filter(|id| store.heads.contains_key(id)).collect()
         };
         for batch in held.chunks(protocol::REPORTS_BATCH) {
@@ -1425,7 +1461,7 @@ impl VaultClient {
                 Ok(reports) => {
                     for report in reports {
                         if let VaultDocId::Node(node_id) = report.doc_id {
-                            self.answer_one(client, store_id, node_id, &report.device, &report.blob).await;
+                            self.answer_one(client, store_id, node_id, &report.device, report.account.as_deref(), report.at.timestamp_millis() as f64, &report.blob).await;
                         }
                     }
                 }
@@ -1445,6 +1481,55 @@ impl VaultClient {
         self.send_reports(client, store_id, held).await;
     }
 
+    /// The stores whose documents are due to be judged in step or not
+    /// (docs/CONVERGENCE_CONTRACT.md section 4).
+    pub fn steps_due(&self) -> Vec<StoreId> {
+        let now = now_ms();
+        self.stores.iter().filter(|(_, store)| store.reports_ok && store.steps_judged_at.is_none_or(|at| now - at >= STEPS_EVERY_MS)).map(|(id, _)| *id).collect()
+    }
+
+    /// Judge one store's documents, its endpoint connected: the time since
+    /// the last judgment counts toward the window. What changed reaches the
+    /// UI with the store's sync answer, through `pump`.
+    pub fn judge_steps(&mut self, store_id: StoreId) {
+        let own = self.device.clone();
+        let own_account = crate::session::user_id();
+        let row = self.rows.get(&store_id).cloned();
+        let Some(store) = self.stores.get_mut(&store_id) else { return };
+        let now = now_ms();
+        let elapsed = store.steps_judged_at.map_or(0.0, |at| (now - at).min(2.0 * STEPS_EVERY_MS));
+        store.steps_judged_at = Some(now);
+        store.judge_steps(&own, own_account.as_deref(), row.as_ref(), now, elapsed, OUT_OF_STEP_AFTER_MS);
+    }
+
+    /// Whether the store's people are due to be asked again.
+    pub fn people_due(&self, store_id: StoreId) -> bool {
+        self.stores.get(&store_id).is_some_and(|s| s.people_at.is_none_or(|at| now_ms() - at >= PEOPLE_EVERY_MS))
+    }
+
+    /// Who is who in the store's shares, as the accounts service said.
+    pub fn set_people(&mut self, store_id: StoreId, people: &pimble_rpc::StorePeople) {
+        if let Some(store) = self.stores.get_mut(&store_id) {
+            store.people = people.scopes.iter().flat_map(|scope| scope.people.iter()).map(|p| (p.user_id.clone(), p.name.clone())).collect();
+            store.people_at = Some(now_ms());
+        }
+    }
+
+    /// Asked and failed: not again until the next round.
+    pub fn people_asked(&mut self, store_id: StoreId) {
+        if let Some(store) = self.stores.get_mut(&store_id) {
+            store.people_at = Some(now_ms());
+        }
+    }
+
+    /// The store's endpoint is down: the time until it is up again does not
+    /// count toward any document's window.
+    pub fn pause_steps(&mut self, store_id: StoreId) {
+        if let Some(store) = self.stores.get_mut(&store_id) {
+            store.steps_judged_at = Some(now_ms());
+        }
+    }
+
     /// The stores with reports to send or to answer now.
     pub fn reports_due(&self) -> Vec<StoreId> {
         let now = now_ms();
@@ -1458,8 +1543,8 @@ impl VaultClient {
             let Some(store) = self.stores.get_mut(&store_id) else { return };
             (std::mem::take(&mut store.reports_in), store.take_due_reports(now_ms()))
         };
-        for (node_id, device, blob) in incoming {
-            self.answer_one(client, store_id, node_id, &device, &blob).await;
+        for (node_id, device, blob, account) in incoming {
+            self.answer_one(client, store_id, node_id, &device, account.as_deref(), now_ms(), &blob).await;
         }
         if !due.is_empty() {
             self.send_reports(client, store_id, due).await;
@@ -1468,11 +1553,12 @@ impl VaultClient {
 
     /// One other device's report: when it lacks something this page holds,
     /// append the diff from it.
-    async fn answer_one(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, device: &str, blob: &str) {
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_one(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, device: &str, account: Option<&str>, at_ms: f64, blob: &str) {
         let own = self.device.clone();
         let row = self.rows.get(&store_id).cloned();
         let Some(store) = self.stores.get_mut(&store_id) else { return };
-        let Some((diff, reported)) = store.answer_report(store_id, &own, node_id, device, blob, row.as_ref()) else { return };
+        let Some((diff, reported)) = store.answer_report_from(store_id, &own, node_id, device, account, at_ms, blob, row.as_ref()) else { return };
         tracing::info!("Store {}: device {} lacks part of the document {} that this page holds; sending {} bytes", store_id, device, node_id, diff.len());
         match self.append_prepared(client, store_id, node_id, &diff).await {
             Ok(()) => {
@@ -1551,9 +1637,9 @@ impl VaultClient {
         while let Ok(notification) = self.notices_rx.try_recv() {
             // Another device's state report: answered by the backend loop,
             // which has the connection to append with (`exchange_reports`).
-            if let StoreChangeKind::VaultReported { doc_id: VaultDocId::Node(node_id), device, blob } = &notification.change_kind {
+            if let StoreChangeKind::VaultReported { doc_id: VaultDocId::Node(node_id), device, blob, account } = &notification.change_kind {
                 if let Some(store) = self.stores.get_mut(&notification.store_id).filter(|store| store.reports_ok) {
-                    store.reports_in.push((*node_id, device.clone(), blob.clone()));
+                    store.reports_in.push((*node_id, device.clone(), blob.clone(), account.clone()));
                 }
                 continue;
             }
@@ -1834,6 +1920,7 @@ impl VaultClient {
             relay: if self.is_relayed(store_id) { RelaySide::Member } else { RelaySide::None },
             owner_offline: self.owner_offline.contains(&store_id),
             waiting: self.stores.get(&store_id).map(VaultStore::waiting_list).unwrap_or_default(),
+            out_of_step: self.stores.get(&store_id).map(VaultStore::out_of_step_list).unwrap_or_default(),
         }
     }
 
@@ -2800,6 +2887,12 @@ impl VaultStore {
             reported: HashMap::new(),
             answered: load_answered(listed_id),
             reports_in: Vec::new(),
+            reports_heard: HashMap::new(),
+            people: HashMap::new(),
+            people_at: None,
+            steps: HashMap::new(),
+            out_of_step: HashMap::new(),
+            steps_judged_at: None,
         }
     }
 
@@ -3593,7 +3686,15 @@ impl VaultStore {
     /// report already (`pimble_rpc::vault::Comparing`). A report that will not
     /// open here, this page's own, and any report of a document this account
     /// may only read ask nothing of it.
+    #[cfg(test)]
     fn answer_report(&mut self, store_id: StoreId, own: &str, node_id: NodeId, device: &str, blob: &str, row: Option<&AccountStore>) -> Option<(Vec<u8>, protocol::Report)> {
+        self.answer_report_from(store_id, own, node_id, device, None, now_ms(), blob, row)
+    }
+
+    /// [`VaultStore::answer_report`] knowing whose device it is and when the
+    /// server stored the report: heard either way, for section 4.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_report_from(&mut self, store_id: StoreId, own: &str, node_id: NodeId, device: &str, account: Option<&str>, at_ms: f64, blob: &str, row: Option<&AccountStore>) -> Option<(Vec<u8>, protocol::Report)> {
         let report = match self.keys.open_report(store_id, node_id, blob) {
             Ok(report) => report,
             Err(reason) => {
@@ -3605,6 +3706,7 @@ impl VaultStore {
             self.reported.insert(node_id, report.encode());
             return None;
         }
+        self.reports_heard.entry(node_id).or_default().insert(device.to_string(), (report.clone(), account.map(str::to_string), at_ms));
         if !self.may_write(node_id, row) {
             return None;
         }
@@ -3618,6 +3720,77 @@ impl VaultStore {
     fn answered_report(&mut self, node_id: NodeId, device: &str, reported: &protocol::Report) {
         self.answered.answered(&node_id.to_string(), device, reported);
         save_answered(self.listed.id, &self.answered);
+    }
+
+    // ── Out of step, said (docs/CONVERGENCE_CONTRACT.md section 4) ─────────
+
+    /// Judge every document again at `now` (ms), `elapsed` (ms) of connected
+    /// time after the last judgment: a difference that has lasted `after`
+    /// makes a document out of step, and one that closes clears it at once
+    /// (`pimble_rpc::vault::out_of_step_reason`, the desktop link's
+    /// judgement). Answers whether the list changed; the store's sync answer
+    /// then says it again (`held_back_events`).
+    fn judge_steps(&mut self, own: &str, own_account: Option<&str>, row: Option<&AccountStore>, now: f64, elapsed: f64, after: f64) -> bool {
+        // The person's own other devices, and everyone else's by the name
+        // the store's people list gives them.
+        let people = &self.people;
+        let name = |account: Option<&str>| protocol::device_name(account, own_account, |id| people.get(id).cloned());
+        let mut reasons: HashMap<NodeId, String> = HashMap::new();
+        for node_id in self.tree.ids() {
+            let Some(doc) = self.tree.doc(node_id) else { continue };
+            let local = protocol::Report::of(doc);
+            let known = self.docs.get(&node_id).map(|d| (d.unsent, d.known_sv.clone()));
+            let unsent = match &known {
+                Some((unsent, known_sv)) => *unsent || pimble_crdt::state_vector_exceeds(&local.state_vector, known_sv).unwrap_or(true),
+                None => true,
+            };
+            let heard = self.reports_heard.get(&node_id).into_iter().flatten().map(|(device, (report, account, at))| (device.as_str(), report, account.as_deref(), ((now - at) / 86_400_000.0) as i64));
+            let pushes = self.may_write(node_id, row);
+            if let Some(reason) = protocol::out_of_step_reason(own, &node_id.to_string(), &local, doc.missing().is_some(), heard, &self.answered, unsent, pushes, &name) {
+                reasons.insert(node_id, reason);
+            }
+        }
+        let mut changed = false;
+        let since_of = |ms: f64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(chrono::Utc::now);
+        let gone: Vec<NodeId> = self.steps.keys().filter(|id| !reasons.contains_key(id)).copied().collect();
+        for node_id in gone {
+            if self.steps.remove(&node_id).is_some_and(|c| c.marked) {
+                tracing::info!("Store {}: the document {} is in step again", self.listed.id, node_id);
+                self.out_of_step.remove(&node_id);
+                changed = true;
+            }
+        }
+        for (node_id, reason) in reasons {
+            let candidate = match self.steps.entry(node_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let candidate = entry.into_mut();
+                    candidate.held_ms += elapsed;
+                    candidate
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(StepCandidate { since_ms: now, held_ms: 0.0, reason: reason.clone(), marked: false }),
+            };
+            let new_reason = candidate.reason != reason;
+            candidate.reason = reason;
+            if candidate.held_ms >= after && (!candidate.marked || new_reason) {
+                if !candidate.marked {
+                    tracing::warn!("Store {}: the document {} is out of step: {}", self.listed.id, node_id, candidate.reason);
+                }
+                candidate.marked = true;
+                self.out_of_step.insert(node_id, pimble_core::OutOfStep { node_id, since: since_of(candidate.since_ms), reason: candidate.reason.clone() });
+                changed = true;
+            }
+        }
+        if changed {
+            self.held_changed = true;
+        }
+        changed
+    }
+
+    /// The documents out of step, in a steady order.
+    fn out_of_step_list(&self) -> Vec<pimble_core::OutOfStep> {
+        let mut list: Vec<pimble_core::OutOfStep> = self.out_of_step.values().cloned().collect();
+        list.sort_by_key(|o| o.node_id.to_string());
+        list
     }
 }
 
@@ -6307,5 +6480,60 @@ mod tests {
         assert!(a.answer_report(store_id, "device-a", root, "device-b", &b_blob, None).is_none(), "the same report is not answered twice");
         let (_, _, b_now) = b.reports_for(store_id, vec![root]).pop().expect("B reports what it holds now");
         assert!(a.answer_report(store_id, "device-a", root, "device-b", &b_now, None).is_none(), "equal now");
+    }
+
+    // ── Out of step, said (docs/CONVERGENCE_CONTRACT.md section 4) ──────────
+
+    /// A page holding an update parked behind a gap says the note is out of
+    /// step once the window has passed (not before), with the reason and since
+    /// when the difference began, and in step again as soon as the gap fills.
+    #[test]
+    fn a_page_says_a_note_out_of_step_after_the_window_and_clears_it() {
+        let (peer, root) = origin();
+        let (mut page, _) = two_pages(&peer);
+        let mut scratch = NodeDoc::load(&page.tree.doc(root).unwrap().save()).unwrap();
+        let lost = scratch.append_markdown("nobody holds this").unwrap();
+        let waits = scratch.append_markdown("waits for it").unwrap();
+        page.tree.apply_update(root, &waits).unwrap();
+        assert!(page.tree.doc(root).unwrap().missing().is_some(), "parked");
+
+        let after = 1_000.0;
+        assert!(!page.judge_steps("me", None, None, 10_000.0, 0.0, after), "a difference just seen has lasted no time");
+        assert!(!page.judge_steps("me", None, None, 10_600.0, 600.0, after), "nor half the window");
+        page.held_changed = false;
+        assert!(page.judge_steps("me", None, None, 11_200.0, 600.0, after), "the window has passed");
+        let list = page.out_of_step_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].node_id, list[0].reason.as_str()), (root, protocol::PARKED_REASON));
+        assert_eq!(list[0].since.timestamp_millis(), 10_000, "since the difference began");
+        assert!(page.held_changed, "the store's sync answer says it again");
+        assert!(!page.judge_steps("me", None, None, 11_800.0, 600.0, after), "said once");
+
+        page.tree.apply_update(root, &lost).unwrap();
+        assert!(page.judge_steps("me", None, None, 12_400.0, 600.0, after), "filled: in step at once");
+        assert!(page.out_of_step_list().is_empty());
+    }
+
+    /// Another device's report holding what this page lacks makes the note out
+    /// of step, naming whose device as far as the page knows; this person's
+    /// own other device by that name.
+    #[test]
+    fn a_report_beyond_this_page_names_whose_device_holds_more() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let (mut a, mut b) = two_pages(&peer);
+        b.tree.set_title(root, "B holds more", T1).unwrap();
+        let (_, _, blob) = b.reports_for(store_id, vec![root]).pop().unwrap();
+        assert!(a.answer_report_from(store_id, "device-a", root, "device-b", Some("acct-me"), 0.0, &blob, None).is_none(), "nothing of A's to send");
+        a.judge_steps("device-a", Some("acct-me"), None, 1.0, 0.0, 10.0);
+        a.judge_steps("device-a", Some("acct-me"), None, 20.0, 19.0, 10.0);
+        assert_eq!(a.out_of_step_list()[0].reason, "Your other device holds changes this one lacks.");
+        a.answer_report_from(store_id, "device-a", root, "device-b", Some("acct-will"), 0.0, &blob, None);
+        a.judge_steps("device-a", Some("acct-me"), None, 40.0, 20.0, 10.0);
+        assert_eq!(a.out_of_step_list()[0].reason, "Another device holds changes this one lacks.", "no one is known by that account yet");
+        // The store's people, as the accounts service lists them: named.
+        a.people.insert("acct-will".to_string(), "Will".to_string());
+        a.judge_steps("device-a", Some("acct-me"), None, 60.0, 20.0, 10.0);
+        assert_eq!(a.out_of_step_list()[0].reason, "Will's device holds changes this one lacks.", "named as the desktop names it");
     }
 }

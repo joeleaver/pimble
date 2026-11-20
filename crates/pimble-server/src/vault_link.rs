@@ -206,6 +206,12 @@ pub(crate) const GRANT_CHECK_EVERY: Duration = Duration::from_secs(120);
 /// document a held list names and the scope did not hold yet, doubling up
 /// to [`MAX_AWAITED_POLL`] while nothing new arrives.
 const AWAITED_POLL: Duration = Duration::from_secs(5);
+/// How long a document's difference from what the other devices hold must
+/// last, with this link connected, before it is out of step
+/// (docs/CONVERGENCE_CONTRACT.md section 4), unless
+/// `ServerConfig::out_of_step_after` says otherwise.
+pub(crate) const OUT_OF_STEP_AFTER: Duration = Duration::from_secs(protocol::OUT_OF_STEP_AFTER_SECS);
+
 const MAX_AWAITED_POLL: Duration = Duration::from_secs(60);
 
 /// A running vault link for one store, mirroring [`crate::sync_link::SyncLinkHandle`]'s API.
@@ -231,6 +237,12 @@ impl VaultLinkHandle {
     /// (`GetStoreSyncResponse::waiting`).
     pub fn waiting(&self) -> Vec<WaitingDoc> {
         self.waiting.list()
+    }
+
+    /// The documents out of step on this device, each with since when and
+    /// why (`GetStoreSyncResponse::out_of_step`).
+    pub fn out_of_step(&self) -> Vec<pimble_core::OutOfStep> {
+        self.waiting.out_of_step_list()
     }
 
     pub fn state(&self) -> SyncState {
@@ -459,6 +471,11 @@ pub(crate) struct Waiting(Arc<Mutex<WaitingInner>>);
 #[derive(Default)]
 struct WaitingInner {
     docs: std::collections::BTreeMap<(String, Side), String>,
+    /// The documents out of step on this device (docs/CONVERGENCE_CONTRACT.md
+    /// section 4), kept here beside what waits because both are said the
+    /// same way: in `getStoreSync`, and announced as the link's state again
+    /// when they change.
+    out_of_step: std::collections::BTreeMap<String, pimble_core::OutOfStep>,
     changed: bool,
 }
 
@@ -497,6 +514,26 @@ impl Waiting {
 
     fn take_changed(&self) -> bool {
         std::mem::take(&mut self.0.lock().unwrap().changed)
+    }
+
+    fn set_out_of_step(&self, entry: pimble_core::OutOfStep) {
+        let mut inner = self.0.lock().unwrap();
+        let key = entry.node_id.to_string();
+        if inner.out_of_step.get(&key) != Some(&entry) {
+            inner.out_of_step.insert(key, entry);
+            inner.changed = true;
+        }
+    }
+
+    fn clear_out_of_step(&self, node_id: NodeId) {
+        let mut inner = self.0.lock().unwrap();
+        if inner.out_of_step.remove(&node_id.to_string()).is_some() {
+            inner.changed = true;
+        }
+    }
+
+    fn out_of_step_list(&self) -> Vec<pimble_core::OutOfStep> {
+        self.0.lock().unwrap().out_of_step.values().cloned().collect()
     }
 }
 
@@ -769,10 +806,19 @@ async fn connect_and_sync(
     // holds, said (docs/CONVERGENCE_CONTRACT.md sections 1-2).
     compare_at_connect(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
 
+    let steps_every = steps_every(handler.out_of_step_after());
+    let mut steps_tick = tokio::time::interval_at(tokio::time::Instant::now() + steps_every, steps_every);
+    let mut steps_last = tokio::time::Instant::now();
+
     loop {
         flush_waiting(handler, link, progress).await;
         let next_report = progress.next_report_due();
         tokio::select! {
+            _ = steps_tick.tick() => {
+                let now = tokio::time::Instant::now();
+                judge_steps(handler, store_id, progress, now - steps_last).await;
+                steps_last = now;
+            }
             _ = tokio::time::sleep_until(next_report.unwrap_or_else(tokio::time::Instant::now)), if next_report.is_some() => {
                 let due = progress.take_due_reports();
                 send_reports(handler, &client, store_id, key_id, due, progress).await?;
@@ -1212,6 +1258,36 @@ struct Progress {
     answered_unsaved: bool,
     devices: Arc<crate::devices::Devices>,
     store_id: StoreId,
+    /// What the other devices last said they hold of each document, as this
+    /// connection heard it (document -> device -> report).
+    heard: HashMap<String, HashMap<String, Heard>>,
+    /// The documents that differ now, each with since when, for how long
+    /// while connected, and why (section 4); the ones that have lasted
+    /// long enough are out of step (`Waiting::set_out_of_step`).
+    steps: HashMap<NodeId, Candidate>,
+}
+
+/// Who a report came from, and when the server stored it.
+#[derive(Clone, Copy)]
+struct HeardFrom<'a> {
+    device: &'a str,
+    account: Option<&'a str>,
+    at: DateTime<Utc>,
+}
+
+/// Another device's report of a document, as heard.
+struct Heard {
+    report: protocol::Report,
+    account: Option<String>,
+    at: DateTime<Utc>,
+}
+
+/// A document that differs from what the other devices hold.
+struct Candidate {
+    since: DateTime<Utc>,
+    held: Duration,
+    reason: String,
+    marked: bool,
 }
 
 /// What the link knows of the remote's documents and their data keys
@@ -1316,6 +1392,8 @@ impl Progress {
             answered_unsaved: false,
             devices,
             store_id,
+            heard: HashMap::new(),
+            steps: HashMap::new(),
         }
     }
 
@@ -1919,9 +1997,10 @@ async fn handle_remote_notification(
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    if let StoreChangeKind::VaultReported { doc_id, device, blob } = &notif.change_kind {
+    if let StoreChangeKind::VaultReported { doc_id, device, blob, account } = &notif.change_kind {
         if progress.reports_ok {
-            answer_report(handler, client, store_id, key_id, link_id, doc_id, device, blob, echoes, progress).await?;
+            let heard = HeardFrom { device, account: account.as_deref(), at: Utc::now() };
+            answer_report(handler, client, store_id, key_id, link_id, doc_id, heard, blob, echoes, progress).await?;
         }
         return Ok(());
     }
@@ -2468,6 +2547,7 @@ async fn compare_at_connect(
 ) -> anyhow::Result<()> {
     progress.reported.clear();
     progress.report_due.clear();
+    progress.heard.clear();
     progress.reports_ok = progress.reports_enabled;
     if !progress.reports_ok {
         return Ok(());
@@ -2484,7 +2564,8 @@ async fn compare_at_connect(
             Err(e) => return Err(anyhow::anyhow!("remote vaultReports failed: {}", e)),
         };
         for report in reports {
-            answer_report(handler, client, store_id, key_id, link_id, &report.doc_id, &report.device, &report.blob, echoes, progress).await?;
+            let heard = HeardFrom { device: &report.device, account: report.account.as_deref(), at: report.at };
+            answer_report(handler, client, store_id, key_id, link_id, &report.doc_id, heard, &report.blob, echoes, progress).await?;
         }
     }
     send_reports(handler, client, store_id, key_id, held, progress).await?;
@@ -2563,11 +2644,12 @@ async fn answer_report(
     key_id: Uuid,
     link_id: &str,
     doc_id: &VaultDocId,
-    device: &str,
+    from_device: HeardFrom<'_>,
     blob: &str,
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
+    let device = from_device.device;
     let VaultDocId::Node(node_id) = doc_id else { return Ok(()) };
     let doc = doc_id.as_str();
     let scope = handler.keystore().store_keys(store_id).await;
@@ -2582,6 +2664,13 @@ async fn answer_report(
         progress.reported.insert(doc, report.encode());
         return Ok(());
     }
+    // Heard, whatever comes of it: what tells whether the document is in
+    // step (section 4).
+    progress
+        .heard
+        .entry(doc.clone())
+        .or_default()
+        .insert(device.to_string(), Heard { report: report.clone(), account: from_device.account.map(str::to_string), at: from_device.at });
     if !may_push(handler, store_id, doc_id).await {
         return Ok(());
     }
@@ -2609,6 +2698,86 @@ async fn answer_report(
         Appended::Refused => progress.mark_dirty(doc_id),
     }
     Ok(())
+}
+
+// ── Out of step, said (docs/CONVERGENCE_CONTRACT.md section 4) ───────────
+
+/// Why `node_id` differs from what the other devices hold, when it does
+/// (`pimble_rpc::vault::out_of_step_reason`, the browser's judgement too).
+/// What this device holds counts as unsent while the remote is not known to
+/// hold it (`pushed_sv`) or a send of it was refused (marked).
+fn reason_for(doc: &pimble_crdt::NodeDoc, heard: Option<&HashMap<String, Heard>>, progress: &Progress, doc_id: &VaultDocId, pushes: bool, names: &dyn Fn(Option<&str>) -> String, now: DateTime<Utc>) -> Option<String> {
+    let local = protocol::Report::of(doc);
+    let doc_key = doc_id.as_str();
+    let unsent = progress.is_dirty(doc_id) || pimble_crdt::state_vector_exceeds(&local.state_vector, &progress.known(doc_id)).unwrap_or(true);
+    let heard = heard.into_iter().flatten().map(|(device, h)| (device.as_str(), &h.report, h.account.as_deref(), (now - h.at).num_days()));
+    protocol::out_of_step_reason(&progress.device, &doc_key, &local, doc.missing().is_some(), heard, &progress.answered, unsent, pushes, names)
+}
+
+/// Judge every document again, `elapsed` after the last time, with the
+/// link connected: a difference that has lasted `ServerConfig::out_of_step_after`
+/// of connected time makes the document out of step (a warning in the log,
+/// and the list `getStoreSync` carries), and one that closes clears it at
+/// once (an info line).
+async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Progress, elapsed: Duration) {
+    let after = handler.out_of_step_after();
+    let now = Utc::now();
+    let people = crate::people::cached(handler, store_id).await;
+    let own_account = handler.keystore().account().await.map(|account| account.user_id);
+    let names = |account: Option<&str>| protocol::device_name(account, own_account.as_deref(), |id| people.name_of(id, None).map(str::to_string));
+    let reasons: HashMap<NodeId, String> = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        let Ok(tree) = manager.tree(store_id) else { return };
+        let access = manager.store_access(store_id);
+        let mut reasons = HashMap::new();
+        for node_id in tree.list_node_ids() {
+            let Some(doc) = tree.doc(node_id) else { continue };
+            let doc_id = VaultDocId::Node(node_id);
+            let pushes = access.allows_write() || (access.allows_comment() && manager.is_discussion(store_id, node_id));
+            if let Some(reason) = reason_for(doc, progress.heard.get(&doc_id.as_str()), progress, &doc_id, pushes, &names, now) {
+                reasons.insert(node_id, reason);
+            }
+        }
+        reasons
+    };
+    progress.steps.retain(|node_id, candidate| {
+        if reasons.contains_key(node_id) {
+            return true;
+        }
+        if candidate.marked {
+            info!("Vault link for store {} doc {}: in step again (it was out of step since {})", store_id, node_id, candidate.since.to_rfc3339());
+            progress.waiting.clear_out_of_step(*node_id);
+        }
+        false
+    });
+    for (node_id, reason) in reasons {
+        // A difference first seen now has lasted no time yet: the time since
+        // the last judgment was before it was seen.
+        let candidate = match progress.steps.entry(node_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let candidate = entry.into_mut();
+                candidate.held += elapsed;
+                candidate
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Candidate { since: now, held: Duration::ZERO, reason: reason.clone(), marked: false }),
+        };
+        let changed = candidate.reason != reason;
+        candidate.reason = reason;
+        if candidate.held >= after && (!candidate.marked || changed) {
+            if !candidate.marked {
+                warn!("Vault link for store {} doc {}: out of step since {}: {}", store_id, node_id, candidate.since.to_rfc3339(), candidate.reason);
+            }
+            candidate.marked = true;
+            progress.waiting.set_out_of_step(pimble_core::OutOfStep { node_id, since: candidate.since, reason: candidate.reason.clone() });
+        }
+    }
+}
+
+/// How often a connected link judges whether its documents are in step: a
+/// fifth of the window, between a tenth of a second and half a minute.
+fn steps_every(after: Duration) -> Duration {
+    (after / 5).clamp(Duration::from_millis(100), Duration::from_secs(30))
 }
 
 // ── What share upkeep works through (crate::share) ───────────────────────

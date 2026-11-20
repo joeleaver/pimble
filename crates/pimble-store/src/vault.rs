@@ -311,6 +311,8 @@ pub struct StoredReport {
     pub device: String,
     pub blob: Vec<u8>,
     pub at: DateTime<Utc>,
+    /// The account whose device sent it, when the server knew one.
+    pub account: Option<String>,
 }
 
 /// One slot of the `reports` file.
@@ -318,6 +320,8 @@ pub struct StoredReport {
 struct ReportRecord {
     blob: String,
     at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
 }
 
 /// `keys.json` as held in memory: the text verbatim, and the one field this
@@ -500,7 +504,7 @@ impl VaultDoc {
             .into_iter()
             .filter_map(|(device, record)| {
                 let blob = STANDARD.decode(&record.blob).ok()?;
-                Some((device.clone(), StoredReport { device, blob, at: record.at }))
+                Some((device.clone(), StoredReport { device, blob, at: record.at, account: record.account }))
             })
             .collect()
     }
@@ -509,7 +513,7 @@ impl VaultDoc {
         let records: HashMap<&str, ReportRecord> = self
             .reports
             .iter()
-            .map(|(device, report)| (device.as_str(), ReportRecord { blob: STANDARD.encode(&report.blob), at: report.at }))
+            .map(|(device, report)| (device.as_str(), ReportRecord { blob: STANDARD.encode(&report.blob), at: report.at, account: report.account.clone() }))
             .collect();
         atomic_write(&self.dir.join(Self::REPORTS_FILE), serde_json::to_vec(&records)?).await?;
         Ok(())
@@ -1087,7 +1091,7 @@ impl VaultStore {
     /// device holds of what the log carries, and a report must never be what
     /// brings a document into being. Past [`MAX_REPORTS_PER_DOC`] devices,
     /// the oldest report goes.
-    pub async fn set_report(&mut self, doc_id: &str, device: &str, blob: Vec<u8>, at: DateTime<Utc>) -> Result<()> {
+    pub async fn set_report(&mut self, doc_id: &str, device: &str, blob: Vec<u8>, at: DateTime<Utc>, account: Option<String>) -> Result<()> {
         if blob.len() > MAX_REPORT_BYTES {
             return Err(StoreError::InvalidOperation(format!(
                 "a state report of {} bytes exceeds the limit of {} bytes",
@@ -1102,7 +1106,7 @@ impl VaultStore {
             return Err(StoreError::InvalidOperation(format!("document {} has no log to report on", doc_id)));
         }
         let doc = self.docs.get_mut(doc_id).expect("a document with blobs is held");
-        doc.reports.insert(device.to_string(), StoredReport { device: device.to_string(), blob, at });
+        doc.reports.insert(device.to_string(), StoredReport { device: device.to_string(), blob, at, account });
         while doc.reports.len() > MAX_REPORTS_PER_DOC {
             let Some(oldest) = doc.reports.values().min_by_key(|r| r.at).map(|r| r.device.clone()) else { break };
             doc.reports.remove(&oldest);
@@ -1518,23 +1522,24 @@ mod tests {
         let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
         {
             let mut store = VaultStore::create(&path, "V", None).await.unwrap();
-            assert!(store.set_report("doc", "dev-a", b"r".to_vec(), at(0)).await.is_err(), "no log, no report");
+            assert!(store.set_report("doc", "dev-a", b"r".to_vec(), at(0), None).await.is_err(), "no log, no report");
             assert!(!store.has_doc("doc"), "a refused report brings no document into being");
             store.append("doc", b"blob".to_vec()).await.unwrap();
-            store.set_report("doc", "dev-a", b"first".to_vec(), at(1)).await.unwrap();
-            store.set_report("doc", "dev-b", b"bee".to_vec(), at(2)).await.unwrap();
-            store.set_report("doc", "dev-a", b"second".to_vec(), at(3)).await.unwrap();
-            assert!(store.set_report("doc", "dev-c", vec![0u8; MAX_REPORT_BYTES + 1], at(4)).await.is_err(), "over the limit");
-            assert!(store.set_report("doc", "", b"x".to_vec(), at(4)).await.is_err(), "a device id is required");
+            store.set_report("doc", "dev-a", b"first".to_vec(), at(1), Some("acct-a".into())).await.unwrap();
+            store.set_report("doc", "dev-b", b"bee".to_vec(), at(2), Some("acct-b".into())).await.unwrap();
+            store.set_report("doc", "dev-a", b"second".to_vec(), at(3), None).await.unwrap();
+            assert!(store.set_report("doc", "dev-c", vec![0u8; MAX_REPORT_BYTES + 1], at(4), None).await.is_err(), "over the limit");
+            assert!(store.set_report("doc", "", b"x".to_vec(), at(4), None).await.is_err(), "a device id is required");
         }
         let mut store = VaultStore::open(&path).await.unwrap();
         let mut reports = store.reports("doc");
         reports.sort_by(|a, b| a.device.cmp(&b.device));
         assert_eq!(reports.iter().map(|r| (r.device.as_str(), r.blob.as_slice(), r.at)).collect::<Vec<_>>(), vec![("dev-a", &b"second"[..], at(3)), ("dev-b", &b"bee"[..], at(2))]);
+        assert_eq!(reports[1].account.as_deref(), Some("acct-b"), "the sender's account is kept with its report");
         assert_eq!(store.list_docs().len(), 1);
 
         for i in 0..MAX_REPORTS_PER_DOC as i64 {
-            store.set_report("doc", &format!("dev-{i:02}"), b"x".to_vec(), at(10 + i)).await.unwrap();
+            store.set_report("doc", &format!("dev-{i:02}"), b"x".to_vec(), at(10 + i), None).await.unwrap();
         }
         let devices: HashSet<String> = store.reports("doc").into_iter().map(|r| r.device).collect();
         assert_eq!(devices.len(), MAX_REPORTS_PER_DOC);

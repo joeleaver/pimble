@@ -1142,6 +1142,87 @@ impl Comparing {
     }
 }
 
+// ── Out of step, said (docs/CONVERGENCE_CONTRACT.md section 4) ──────────────
+
+/// How long a document's difference must last, with the device connected,
+/// before it is out of step.
+pub const OUT_OF_STEP_AFTER_SECS: u64 = 5 * 60;
+/// A report older than this says nothing about whether a document is in
+/// step: its device has not been heard from in a month.
+pub const REPORTS_COUNT_FOR_DAYS: i64 = 30;
+/// A document holds an update parked behind a gap.
+pub const PARKED_REASON: &str = "Waits for earlier changes another device has not sent.";
+
+/// Whose device a report came from, as a person reads it: the name the
+/// account goes by in the store's shares (`name_of`), this person's own other
+/// device, or another device when nobody's name is known.
+pub fn device_name(account: Option<&str>, own_account: Option<&str>, name_of: impl Fn(&str) -> Option<String>) -> String {
+    match account {
+        Some(account) if Some(account) == own_account => "Your other device".to_string(),
+        Some(account) => name_of(account).filter(|name| !name.trim().is_empty()).map(|name| format!("{name}'s device")).unwrap_or_else(|| "Another device".to_string()),
+        None => "Another device".to_string(),
+    }
+}
+
+/// "Will's device holds changes this one lacks."
+pub fn lacks_here(name: &str) -> String {
+    format!("{name} holds changes this one lacks.")
+}
+
+/// "This device holds changes Will's device lacks and could not send them."
+pub fn could_not_send(name: &str) -> String {
+    let whose = match name {
+        "Your other device" => "your other device".to_string(),
+        "Another device" => "another device".to_string(),
+        other => other.to_string(),
+    };
+    format!("This device holds changes {whose} lacks and could not send them.")
+}
+
+/// Why a document differs from what the other devices hold, when it does
+/// (section 4), the same judgement on the desktop's link and in the browser.
+/// `local` is what this device holds; `heard` the other devices' latest
+/// reports, each with its account and how many days old it is; `answered`
+/// this device's record; `unsent` whether the remote is not known to hold
+/// all this device holds (or a send of it failed); `pushes` whether this
+/// device sends changes to the document at all (a reader's never does).
+///
+/// In order: an update parked behind a gap; a report holding structs this
+/// device lacks; something this device holds that a report lacks, has not
+/// been able to send, and the remote is not known to hold. What this device
+/// has sent and another has not taken yet is that device's to take (it may
+/// be off), so it does not count.
+pub fn out_of_step_reason<'a>(
+    own: &str,
+    doc: &str,
+    local: &Report,
+    parked: bool,
+    heard: impl IntoIterator<Item = (&'a str, &'a Report, Option<&'a str>, i64)>,
+    answered: &Comparing,
+    unsent: bool,
+    pushes: bool,
+    name: impl Fn(Option<&str>) -> String,
+) -> Option<String> {
+    if parked {
+        return Some(PARKED_REASON.to_string());
+    }
+    let mut fresh: Vec<(&str, &Report, Option<&str>)> = heard.into_iter().filter(|(_, _, _, days)| *days <= REPORTS_COUNT_FOR_DAYS).map(|(d, r, a, _)| (d, r, a)).collect();
+    fresh.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, report, account) in &fresh {
+        if pimble_crdt::state_vector_exceeds(&report.state_vector, &local.state_vector).unwrap_or(false) {
+            return Some(lacks_here(&name(*account)));
+        }
+    }
+    if pushes && unsent {
+        for (device, report, account) in &fresh {
+            if answered.owed(own, doc, device, local, report).is_some() {
+                return Some(could_not_send(&name(*account)));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1550,5 +1631,39 @@ mod tests {
         assert_eq!(twice.delete_set_digest(), halves.delete_set_digest());
         let reloaded = pimble_crdt::NodeDoc::load(&twice.save()).unwrap();
         assert_eq!(reloaded.delete_set_digest(), twice.delete_set_digest(), "saving and loading keeps the digest");
+    }
+
+    /// The reasons a document is out of step, in their order, and the names
+    /// a person reads.
+    #[test]
+    fn out_of_step_reasons_name_whose_device_and_why() {
+        use super::*;
+        let mut base = pimble_crdt::NodeDoc::new();
+        base.replace_plain_text("one").unwrap();
+        let mut ahead = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
+        ahead.replace_plain_text("two").unwrap();
+        let (b, a) = (Report::of(&base), Report::of(&ahead));
+        let name_of = |id: &str| (id == "will").then(|| "Will".to_string());
+        let name = |account: Option<&str>| device_name(account, Some("me"), name_of);
+        let none = Comparing::default();
+        assert_eq!(name(Some("will")), "Will's device");
+        assert_eq!(name(Some("me")), "Your other device");
+        assert_eq!(name(Some("stranger")), "Another device");
+        assert_eq!(name(None), "Another device");
+
+        let reason = |local: &Report, parked: bool, heard: Vec<(&'static str, &Report, Option<&'static str>, i64)>, unsent: bool, pushes: bool| {
+            out_of_step_reason("dev-me", "doc", local, parked, heard, &none, unsent, pushes, name)
+        };
+        assert_eq!(reason(&a, true, vec![], false, true).as_deref(), Some(PARKED_REASON));
+        assert_eq!(reason(&b, false, vec![("dev-will", &a, Some("will"), 0)], false, true).as_deref(), Some("Will's device holds changes this one lacks."));
+        assert_eq!(reason(&b, false, vec![("dev-will", &a, Some("will"), 31)], false, true), None, "a report a month old says nothing");
+        assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], true, true).as_deref(), Some("This device holds changes Will's device lacks and could not send them."));
+        assert_eq!(reason(&a, false, vec![("dev-x", &b, None, 0)], true, true).as_deref(), Some("This device holds changes another device lacks and could not send them."));
+        assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], false, true), None, "sent, and the remote holds it: Will's device's to take");
+        assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], true, false), None, "a reader sends nothing");
+        let mut answered = Comparing::default();
+        answered.answered("doc", "dev-will", &b);
+        assert_eq!(out_of_step_reason("dev-me", "doc", &a, false, vec![("dev-will", &b, Some("will"), 0)], &answered, true, true, name), None, "answered: sent");
+        assert_eq!(reason(&a, false, vec![("dev-will", &a, Some("will"), 0)], true, true), None, "equal: in step");
     }
 }

@@ -227,6 +227,7 @@ impl StoreManager {
                 // A placeholder like `sync_mode`: `RpcHandler::link_kind_of`.
                 relay: pimble_core::RelaySide::None,
                 waiting: Vec::new(),
+                out_of_step: Vec::new(),
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -249,6 +250,7 @@ impl StoreManager {
                 ended_roots: Vec::new(),
                 relay: pimble_core::RelaySide::None,
                 waiting: Vec::new(),
+                out_of_step: Vec::new(),
             });
         }
         Err(StoreError::StoreNotFound(store_id))
@@ -386,9 +388,9 @@ impl StoreManager {
     }
 
     /// Store `device`'s state report of `doc_id` (see [`VaultStore::set_report`]).
-    pub async fn vault_set_report(&mut self, store_id: StoreId, doc_id: &str, device: &str, blob: Vec<u8>, at: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    pub async fn vault_set_report(&mut self, store_id: StoreId, doc_id: &str, device: &str, blob: Vec<u8>, at: chrono::DateTime<chrono::Utc>, account: Option<String>) -> Result<()> {
         let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
-        store.set_report(doc_id, device, blob, at).await
+        store.set_report(doc_id, device, blob, at, account).await
     }
 
     /// Every device's latest state report of `doc_id` in vault store `store_id`.
