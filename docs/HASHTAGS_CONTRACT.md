@@ -118,3 +118,14 @@ entered tags (`node.tags`, the existing Array) are untouched by anything in the 
   editor's document after this window's typing rests, the API's after another device's edit).
 - Canvases, sheets' cells and plugin data are not read for hashtags (as the contract says).
 
+
+## Next: hashtags look like hashtags in the text (Joe, 2026-11-20)
+
+Joe: "hashtags need some formatting or something. I'm afraid to pill-ize them because that
+changes inline editing." So no pill and nothing in the document: a rinch editor plugin
+(`Plugin::decorations`, inline decorations, as `presence/text.rs` draws carets) marks each
+hashtag's range with a class, found by the same scanner as the tags (`pimble_crdt::hashtags`, code
+skipped), recomputed per changed block. The style changes color only (the theme's accent, both
+schemes), never padding, border, weight or size, so the text lays out exactly as before and the
+caret, selection, typing and deleting are unchanged. Ctrl+click on a hashtag searches for that tag
+(as Ctrl+click follows a link). Desktop and browser alike. Queued after docs/STARTUP_CONTRACT.md.
