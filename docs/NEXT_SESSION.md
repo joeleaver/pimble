@@ -1,5 +1,14 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.6: a large change read whole.** The flaky
+`relay.rs` `a_twenty_megabyte_document...` was a real fault, about 2 runs in 3: a member
+joining just after a 20 MiB edit held part of it ("Part of a large change to it has not
+arrived yet") until a reconnect. A paged `vaultFetch` counts entries (`skip`), so a snapshot
+stored between two pages (the log compacted right after the large append) shifted them.
+Now every page carries `snapshot_seq` and `PimbleClient::vault_fetch` starts again when it
+changes, and a document read incomplete is read again shortly (`keyring.unread`), like one
+waiting for its key. 6 of 6 runs pass.
+
 **2026-11-19 (session 78e7f30f): v0.28.5: sign-ins that last, and no repair loops.** (1) A
 Pimble Cloud session lasts 30 days from its last use, not from sign-in (Joe's desktop lost
 its sign-in on day 30, silently). (2) A refused session stops every link until someone
