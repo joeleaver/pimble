@@ -922,7 +922,7 @@ impl Pimble {
             None => Vec::new(),
         };
         let limit = p.limit.unwrap_or(20).clamp(1, 50);
-        let mut results = self.api.search(&p.query, only, p.semantic, limit).await?;
+        let mut results = self.api.search(&p.query, only.clone(), p.semantic, limit).await?;
         // Unscoped: the store this session last worked in first, its hits in
         // their own order, then everyone else's in theirs.
         let mut favored = None;
@@ -934,10 +934,26 @@ impl Pimble {
                 favored = Some(store);
             }
         }
+        // A store searched whose index is still on its way may be missing
+        // notes (docs/STARTUP_CONTRACT.md): said first.
+        let indexing: Vec<String> = self
+            .api
+            .stores()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.index.is_indexing() && (only.is_empty() || only.contains(&s.id)))
+            .map(|s| s.name)
+            .collect();
+        let note = pimble_core::IndexState::search_note(&indexing);
         if results.is_empty() {
-            return Ok(format!("Nothing matches \"{}\".", p.query));
+            return Ok(if note.is_empty() { format!("Nothing matches \"{}\".", p.query) } else { format!("Nothing matches \"{}\". {note}", p.query) });
         }
         let mut out = String::new();
+        if !note.is_empty() {
+            out.push_str(&note);
+            out.push('\n');
+        }
         if let Some(store) = favored {
             let name = self
                 .api

@@ -1231,6 +1231,20 @@ impl PimbleClient {
         Ok(response.results)
     }
 
+    /// [`PimbleClient::search`]'s whole answer: the results and the stores
+    /// searched that are still being indexed (`SearchResponse::indexing`,
+    /// docs/STARTUP_CONTRACT.md).
+    pub async fn search_response(
+        &self,
+        query: impl Into<String>,
+        stores: Vec<StoreId>,
+        semantic: bool,
+        limit: usize,
+    ) -> Result<pimble_rpc::SearchResponse> {
+        let request = SearchRequest { query: query.into(), stores, semantic, limit };
+        self.client.search(request).await.map_err(rpc_error)
+    }
+
     /// The nodes of `store_id` whose text links to `node_id` (`backlinks`).
     pub async fn backlinks(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<NodeId>> {
         self.client

@@ -543,6 +543,7 @@ impl Upkeep {
             | StoreChangeKind::ShareStateChanged { .. }
             | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::PeopleChanged
+        | StoreChangeKind::IndexStateChanged { .. }
             | StoreChangeKind::VaultAppended { .. }
             | StoreChangeKind::VaultReported { .. } => return,
         }

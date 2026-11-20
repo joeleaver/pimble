@@ -44,9 +44,7 @@ fn long_note() -> (String, Vec<(String, String)>) {
 async fn outlines_sections_and_split_note_on_a_long_note() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());
@@ -116,9 +114,7 @@ async fn outlines_sections_and_split_note_on_a_long_note() {
 async fn search_says_where_and_puts_the_last_store_first() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());

@@ -26,9 +26,7 @@ fn line<'a>(read: &'a str, prefix: &str) -> Option<&'a str> {
 async fn get_node_and_set_tags_know_the_text_tags() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());

@@ -446,6 +446,65 @@ pub(crate) const APP_CSS: &str = "
 
 /* What a store row says about a store someone shared with this account:
    who shared it and what it may do here. */
+/* Starting up (docs/STARTUP_CONTRACT.md): a saved store still opening, its
+   search index on its way, children slow to come, the status bar waiting. */
+.pimble-tree__opening, .pimble-tree__indexing {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    opacity: 0.6;
+    cursor: default;
+    white-space: nowrap;
+}
+.pimble-tree__opening--failed {
+    color: var(--rinch-color-red-6);
+    opacity: 0.9;
+}
+.pimble-tree__opening-spinner {
+    display: inline-flex;
+    margin-left: 6px;
+}
+.pimble-tree__opening-spinner .rinch-loader,
+.pimble-tree__children-loading .rinch-loader,
+.pimble-status-bar__spinner .rinch-loader {
+    width: 0.625rem;
+    height: 0.625rem;
+    color: var(--rinch-color-dimmed);
+}
+.pimble-tree__opening-spinner .rinch-loader__oval,
+.pimble-tree__children-loading .rinch-loader__oval,
+.pimble-status-bar__spinner .rinch-loader__oval {
+    border-width: 1.5px;
+    /* The whole ring faintly, its turning quarter in full: a quarter alone
+       read as a parenthesis at this size. */
+    border-color: rgba(128, 128, 128, 0.35);
+    border-top-color: currentColor;
+}
+/* Where the chevron goes: positioned against the row (the label is not a
+   containing block), on the spacer rinch draws for a row with no children. */
+.rinch-tree__label > .pimble-tree__children-loading {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0.875rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+.pimble-status-bar__spinner {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 6px;
+}
+.pimble-search-results__indexing {
+    padding: 6px 4px;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
 .pimble-tree__shared-by {
     margin-left: 6px;
     font-size: 10px;

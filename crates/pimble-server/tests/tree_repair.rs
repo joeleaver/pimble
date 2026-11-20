@@ -6,11 +6,14 @@
 //! directly (there is no RPC for it — it is a repair-time diagnostic, not part
 //! of the client-facing protocol).
 
+mod isolated;
+
 use std::time::Duration;
 
 use base64::Engine;
 use pimble_core::{AuthMethod, Node, NodeId, Place, RemoteEndpoint, ShareMarker, StoreId, SyncState};
-use pimble_server::{PimbleServer, ServerConfig};
+use pimble_server::PimbleServer;
+use isolated::TempServer;
 use pimble_store::LocalStore;
 
 /// Poll `cond` every 50ms until it returns `true` or `timeout` elapses.
@@ -34,8 +37,8 @@ where
 
 /// Start a `PimbleServer` bound to an OS-assigned loopback port and return it
 /// plus a `PimbleClient` already connected to it.
-async fn start_server() -> (PimbleServer, pimble_client::PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+async fn start_server() -> (TempServer, pimble_client::PimbleClient) {
+    let mut server = TempServer::isolated();
     server.start().await.expect("server starts");
     let client = pimble_client::PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)
@@ -59,8 +62,8 @@ async fn validate_tree(server: &PimbleServer, store_id: StoreId) -> Vec<pimble_c
 /// replica of it. Returns the two servers/clients, the shared store, root,
 /// and the two folder ids.
 async fn setup_synced_pair_with_two_folders(a_path: &std::path::Path) -> (
-    PimbleServer, pimble_client::PimbleClient,
-    PimbleServer, pimble_client::PimbleClient,
+    TempServer, pimble_client::PimbleClient,
+    TempServer, pimble_client::PimbleClient,
     StoreId, NodeId, NodeId, NodeId,
     tempfile::TempDir,
 ) {
@@ -261,7 +264,7 @@ async fn a_partial_replicas_tampered_parent_id_never_unlists_a_node_its_folder_s
     let dir = tempfile::tempdir().unwrap();
     let (store_id, scope_root, child) = partial_replica_with_shared_child(dir.path()).await;
 
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+    let mut server = TempServer::isolated();
     server.start().await.expect("server starts");
     let client = pimble_client::PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     let opened = client.open_store(dir.path().join("partial.pimble")).await.expect("the partial replica opens");

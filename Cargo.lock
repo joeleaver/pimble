@@ -5296,6 +5296,7 @@ version = "0.28.12"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "dirs",
  "ed25519-dalek",
  "futures",
  "js-sys",

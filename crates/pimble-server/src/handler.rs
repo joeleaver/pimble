@@ -50,7 +50,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobId, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
     OpenInAppRequest, OpenInAppResponse,
@@ -506,6 +506,29 @@ struct IndexHandle {
     debounce_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
+/// A store's index on its way (docs/STARTUP_CONTRACT.md): the channel its
+/// events queue on until [`RpcHandler::open_index_in_background`] installs
+/// it, numbered so that an open outlived by a close (and a reopen) knows it
+/// is not wanted any more.
+struct PendingIndex {
+    generation: u64,
+    tx: mpsc::UnboundedSender<IndexEvent>,
+    rx: Option<mpsc::UnboundedReceiver<IndexEvent>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+static NEXT_INDEX_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long a locked index is retried quietly before the store's row says
+/// another program holds it, and how often: a server handing over lets go
+/// within a second.
+const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const INDEX_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+/// After that, how often it is tried again, for as long as the store is open.
+const INDEX_LOCK_RETRY_HELD: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often a rebuild says how far it is.
+const INDEX_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Owns one store's [`SearchIndex`] and reduces the store's mutations
 /// (`IndexEvent`s) into `upsert`/`remove` calls on it. One instance is
 /// spawned as a tokio task per open store.
@@ -805,6 +828,7 @@ pub(crate) fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::PeopleChanged
+        | StoreChangeKind::IndexStateChanged { .. }
         | StoreChangeKind::VaultAppended { .. }
         | StoreChangeKind::VaultReported { .. } => Vec::new(),
     }
@@ -1121,7 +1145,8 @@ fn named_by(kind: &StoreChangeKind) -> Named {
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
-        | StoreChangeKind::PeopleChanged => Named::Nothing,
+        | StoreChangeKind::PeopleChanged
+        | StoreChangeKind::IndexStateChanged { .. } => Named::Nothing,
     }
 }
 
@@ -1140,6 +1165,16 @@ pub struct RpcHandler {
     /// One open `SearchIndex` per open store, under `<store dir>/index/rhypedb/`.
     /// Opened when a store opens, closed (removed) when it closes.
     indexes: Arc<RwLock<HashMap<StoreId, IndexHandle>>>,
+    /// The indexes on their way: opened (and rebuilt when they must be) in
+    /// the background after their store answered its open
+    /// (docs/STARTUP_CONTRACT.md).
+    pending_indexes: Arc<Mutex<HashMap<StoreId, PendingIndex>>>,
+    /// What each open store's index is doing (`IndexState`); a store with
+    /// no entry is ready, or has no index here.
+    index_states: Arc<Mutex<HashMap<StoreId, IndexState>>>,
+    /// One lock per store being loaded outside the manager's lock, so two
+    /// opens of one store never load it twice (`openStore`).
+    loading: Arc<tokio::sync::Mutex<HashMap<StoreId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Whether every `SearchIndex::open` call below should ask for semantic
     /// search. `true` unless `PimbleServer::start`'s model warm-up (see
     /// `warm_embedding_model` there) failed — a failure means the model
@@ -1148,6 +1183,10 @@ pub struct RpcHandler {
     /// re-fails) the same download per store. `false` here makes every store
     /// open keyword-only instead; it never disables an already-open index.
     semantic_available: bool,
+    /// The embedding model's warm-up, when the server started it beside
+    /// itself rather than before (docs/STARTUP_CONTRACT.md "Built"): an index
+    /// open waits for its answer, nothing else does.
+    semantic_warmup: Option<(tokio::sync::watch::Receiver<Option<bool>>, Arc<tokio::sync::Notify>)>,
     /// One running [`SyncLinkHandle`] per replica-linked store
     /// (docs/SYNC_CONTRACT.md). Populated by `openStore` (from `sync.json`)
     /// and `setStoreSync`/`addRemoteStore`; removed (after `stop()`) by
@@ -1259,6 +1298,14 @@ impl RpcHandler {
         Self::with_semantic_available(store_manager, true)
     }
 
+    /// Like [`RpcHandler::new`], but with every per-computer path under `dir`
+    /// as [`crate::ServerConfig::in_dir`] lays them out: what a test builds a
+    /// handler with, so it never reads or writes the real config or data
+    /// directories. `dir` must outlive the handler.
+    pub fn in_dir(store_manager: Arc<RwLock<StoreManager>>, dir: &std::path::Path) -> Self {
+        Self::with_all_paths(store_manager, true, dir.join("credentials.json"), dir.join("replicas"), dir.join("keys.json"))
+    }
+
     /// Like [`RpcHandler::new`], but with `semantic_available` set
     /// explicitly (see that field's doc comment) instead of defaulting to
     /// `true`. Used by `PimbleServer::start` after its own warm-up attempt;
@@ -1313,7 +1360,11 @@ impl RpcHandler {
             flush_debouncer: Arc::new(FlushDebouncer::default()),
             repairs: Arc::new(RepairDebouncer::default()),
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            pending_indexes: Arc::new(Mutex::new(HashMap::new())),
+            index_states: Arc::new(Mutex::new(HashMap::new())),
+            loading: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             semantic_available,
+            semantic_warmup: None,
             links: Arc::new(RwLock::new(HashMap::new())),
             credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
             mounts: Arc::new(Mutex::new(MountTracking::default())),
@@ -1338,6 +1389,31 @@ impl RpcHandler {
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
             folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The embedding model warms up beside the server: index opens wait for
+    /// `warmup` to say whether semantic search is available.
+    /// `wanted` starts it: the first index open asks.
+    pub fn with_semantic_warmup(mut self, warmup: tokio::sync::watch::Receiver<Option<bool>>, wanted: Arc<tokio::sync::Notify>) -> Self {
+        self.semantic_warmup = Some((warmup, wanted));
+        self
+    }
+
+    /// Whether indexes open with semantic search: the warm-up's answer once
+    /// it has one, else what the handler was made with.
+    async fn semantic(&self) -> bool {
+        match &self.semantic_warmup {
+            Some((rx, wanted)) => {
+                wanted.notify_one();
+                let mut rx = rx.clone();
+                let answer = match rx.wait_for(|answer| answer.is_some()).await {
+                    Ok(answer) => answer.unwrap_or(false),
+                    Err(_) => false,
+                };
+                answer
+            }
+            None => self.semantic_available,
         }
     }
 
@@ -2904,6 +2980,12 @@ impl RpcHandler {
             // An unbounded channel only fails to send if the receiving task
             // has ended (e.g. a race with `closeStore`); harmless to drop.
             let _ = handle.events.send(event);
+            return;
+        }
+        // An index on its way (docs/STARTUP_CONTRACT.md): queued, and taken
+        // in order once it is installed, after its rebuild if it has one.
+        if let Some(pending) = self.pending_indexes.lock().unwrap().get(&store_id) {
+            let _ = pending.tx.send(event);
         }
     }
 
@@ -2936,6 +3018,18 @@ impl RpcHandler {
     /// it, and `rebuild_store_index` calls `shutdown_index` explicitly).
     async fn install_index_handle(&self, store_id: StoreId, index: Arc<SearchIndex>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        self.install_index_handle_with(store_id, index, tx, rx).await;
+    }
+
+    /// [`Self::install_index_handle`] with the channel the index's events
+    /// were already queued on while it was on its way (`PendingIndex`).
+    async fn install_index_handle_with(
+        &self,
+        store_id: StoreId,
+        index: Arc<SearchIndex>,
+        tx: mpsc::UnboundedSender<IndexEvent>,
+        rx: mpsc::UnboundedReceiver<IndexEvent>,
+    ) {
         let debounce_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let indexer = Arc::new(StoreIndexer {
             store_id,
@@ -2977,35 +3071,218 @@ impl RpcHandler {
         while tasks.join_next().await.is_some() {}
     }
 
-    /// Walk every node in `store_id` from its root (mount nodes are indexed
-    /// themselves but not descended into — their children belong to another
-    /// store) and upsert each into `index`. Returns the count indexed.
-    async fn reindex_all_nodes(&self, store_id: StoreId, index: &SearchIndex) -> anyhow::Result<usize> {
+    /// Every node of `store_id` to index, in walk order from its root (mount
+    /// nodes are indexed themselves but not descended into: their children
+    /// belong to another store), read from the documents alone, under the
+    /// manager's lock once and briefly.
+    async fn nodes_to_index(&self, store_id: StoreId) -> anyhow::Result<Vec<NodeId>> {
         let manager = self.store_manager.read().await;
         let root_id = manager.root_node_id(store_id)?;
+        let tree = manager.tree(store_id)?;
         // A freshly added remote store has a root id in its manifest but no
         // documents until its first reconcile: nothing to index yet, and not
         // an error. The reconcile's updates feed the index.
-        if !manager.tree(store_id)?.has_node(root_id) {
-            return Ok(0);
-        }
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
         let mut stack = vec![root_id];
-        let mut count = 0usize;
         while let Some(node_id) = stack.pop() {
-            let node = manager.get_node(store_id, node_id)?;
-            let index_node = build_index_node(store_id, &node);
-            index.upsert(&index_node)?;
-            count += 1;
-            if !node.is_mount() {
-                stack.extend(node.children.iter().copied());
+            if !seen.insert(node_id) {
+                continue;
+            }
+            let Some(doc) = tree.doc(node_id) else { continue };
+            ids.push(node_id);
+            let is_mount = doc.fields().is_ok_and(|f| f.node_type == pimble_core::node_types::MOUNT);
+            if !is_mount {
+                let mut children = doc.children();
+                children.reverse();
+                stack.extend(children);
             }
         }
-        Ok(count)
+        Ok(ids)
+    }
+
+    /// Upsert every node of `store_id` into `index`, a batch at a time: the
+    /// manager's lock is held only to read a batch, and the index is written
+    /// on a blocking thread, so edits and every other store go on meanwhile
+    /// (the rebuild that held a store's open for ten seconds, 2026-11-20).
+    /// How far it is is announced now and then (`IndexState::Rebuilding`);
+    /// `wanted` is asked
+    /// between batches and `None` answers that it stopped being wanted (the
+    /// store closed). Returns the count indexed.
+    async fn reindex_in_batches(
+        &self,
+        store_id: StoreId,
+        index: &Arc<SearchIndex>,
+        wanted: &(dyn Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<Option<usize>> {
+        const BATCH: usize = 32;
+        let ids = self.nodes_to_index(store_id).await?;
+        let total = ids.len();
+        self.announce_index_state(store_id, IndexState::Rebuilding { done: 0, total }).await;
+        let mut done = 0usize;
+        let mut said = std::time::Instant::now();
+        for batch in ids.chunks(BATCH) {
+            if !wanted() {
+                return Ok(None);
+            }
+            let nodes: Vec<IndexNode> = {
+                let manager = self.store_manager.read().await;
+                batch.iter().filter_map(|id| manager.get_node(store_id, *id).ok()).map(|node| build_index_node(store_id, &node)).collect()
+            };
+            let index = Arc::clone(index);
+            tokio::task::spawn_blocking(move || -> pimble_search::Result<()> {
+                for node in &nodes {
+                    index.upsert(node)?;
+                }
+                Ok(())
+            })
+            .await??;
+            done += batch.len();
+            if said.elapsed() >= INDEX_PROGRESS_EVERY {
+                said = std::time::Instant::now();
+                self.announce_index_state(store_id, IndexState::Rebuilding { done, total }).await;
+            }
+        }
+        Ok(Some(done))
+    }
+
+    /// What `store_id`'s index is doing on this device (ready when it has
+    /// none here).
+    pub(crate) fn index_state_of(&self, store_id: StoreId) -> IndexState {
+        self.index_states.lock().unwrap().get(&store_id).cloned().unwrap_or_default()
+    }
+
+    /// Record `state` for `store_id`'s index and tell its subscribers when
+    /// it changed (`IndexStateChanged`).
+    async fn announce_index_state(&self, store_id: StoreId, state: IndexState) {
+        let changed = self.index_states.lock().unwrap().insert(store_id, state.clone()).as_ref() != Some(&state);
+        if changed {
+            self.notify_store_change(store_id, StoreChangeKind::IndexStateChanged { state }, None).await;
+        }
+    }
+
+    /// Whether the index open numbered `generation` is still the one
+    /// `store_id` waits for (it closed, or closed and opened again, if not).
+    fn index_open_wanted(&self, store_id: StoreId, generation: u64) -> bool {
+        self.pending_indexes.lock().unwrap().get(&store_id).is_some_and(|p| p.generation == generation)
     }
 
     /// Open (or rebuild, if missing or schema-stale) `store_id`'s search
-    /// index and install it. Called when a store opens; logs and leaves the
-    /// store without a search index on failure rather than failing the open.
+    /// index in the background and install it when it is ready
+    /// (docs/STARTUP_CONTRACT.md "Search never holds a store's opening"): a
+    /// store answers its open as soon as its documents are open. Until the
+    /// index is installed its events queue (`PendingIndex`), search says the
+    /// store is still being indexed, and its state is announced as it moves
+    /// (`IndexStateChanged`). Never fails the open; a failure leaves the
+    /// store unsearchable, said as `IndexState::Unavailable`.
+    async fn start_index_open(&self, store_id: StoreId) {
+        // Claimed under the lock first, then checked against what is
+        // installed: an open installs before it lets go of its claim, so no
+        // claim and no index means neither is on its way.
+        let generation = NEXT_INDEX_OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = self.pending_indexes.lock().unwrap();
+            if pending.contains_key(&store_id) {
+                return;
+            }
+            let (tx, rx) = mpsc::unbounded_channel();
+            pending.insert(store_id, PendingIndex { generation, tx, rx: Some(rx), task: None });
+        }
+        if self.indexes.read().await.contains_key(&store_id) {
+            let mut pending = self.pending_indexes.lock().unwrap();
+            if pending.get(&store_id).is_some_and(|p| p.generation == generation) {
+                pending.remove(&store_id);
+            }
+            return;
+        }
+        self.announce_index_state(store_id, IndexState::Opening).await;
+        let handler = self.clone();
+        let task = tokio::spawn(async move { handler.open_index_in_background(store_id, generation).await });
+        if let Some(pending) = self.pending_indexes.lock().unwrap().get_mut(&store_id).filter(|p| p.generation == generation) {
+            pending.task = Some(task);
+        }
+    }
+
+    async fn open_index_in_background(&self, store_id: StoreId, generation: u64) {
+        let wanted = || self.index_open_wanted(store_id, generation);
+        match self.open_index_for_store(store_id, &wanted).await {
+            Ok(Some(index)) => {
+                let channel = {
+                    let mut pending = self.pending_indexes.lock().unwrap();
+                    match pending.get_mut(&store_id) {
+                        Some(p) if p.generation == generation => p.rx.take().map(|rx| (p.tx.clone(), rx)),
+                        _ => None,
+                    }
+                };
+                let Some((tx, rx)) = channel else {
+                    debug!("Store {} closed while its search index opened; letting it go", store_id);
+                    return;
+                };
+                // Installed before the pending entry goes, so an event sent
+                // between the two finds one or the other (one channel).
+                self.install_index_handle_with(store_id, Arc::new(index), tx, rx).await;
+                self.pending_indexes.lock().unwrap().remove(&store_id);
+                self.announce_index_state(store_id, IndexState::Ready).await;
+            }
+            Ok(None) => debug!("Store {} closed while its search index opened; stopped", store_id),
+            Err(e) => {
+                warn!("Search index for store {} could not be opened: {}", store_id, e);
+                if self.index_open_wanted(store_id, generation) {
+                    self.pending_indexes.lock().unwrap().remove(&store_id);
+                    self.announce_index_state(store_id, IndexState::Unavailable { reason: e.to_string() }).await;
+                }
+            }
+        }
+    }
+
+    /// Open `index_dir`'s index, waiting while another program (or another
+    /// open in this one) holds it (docs/STARTUP_CONTRACT.md "A locked index
+    /// is waited for, not rebuilt over"): briefly at first, then, said as
+    /// `IndexState::Held`, every second for as long as the store is wanted.
+    /// `Ok(None)`: it stopped being wanted. The inner error is any other
+    /// failure to open.
+    async fn open_waiting_for_lock(
+        &self,
+        store_id: StoreId,
+        index_dir: &std::path::Path,
+        wanted: &(dyn Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<Option<Result<SearchIndex, SearchError>>> {
+        let started = std::time::Instant::now();
+        let mut held = false;
+        loop {
+            if !wanted() {
+                return Ok(None);
+            }
+            let (dir, semantic) = (index_dir.to_path_buf(), self.semantic().await);
+            match tokio::task::spawn_blocking(move || SearchIndex::open(&dir, semantic)).await? {
+                Ok(index) => {
+                    if held {
+                        info!("Search index for store {} was let go; opened it", store_id);
+                    }
+                    return Ok(Some(Ok(index)));
+                }
+                Err(e) if e.is_locked() => {
+                    if !held && started.elapsed() >= INDEX_LOCK_WAIT {
+                        held = true;
+                        warn!("Search index for store {} is held by another program ({}); opening it again when it lets go, never rebuilding over it", store_id, e);
+                        self.announce_index_state(store_id, IndexState::Held).await;
+                    }
+                    tokio::time::sleep(if held { INDEX_LOCK_RETRY_HELD } else { INDEX_LOCK_RETRY }).await;
+                }
+                Err(e) => return Ok(Some(Err(e))),
+            }
+        }
+    }
+
+    /// Open (or rebuild, if missing or schema-stale) `store_id`'s search
+    /// index, for [`Self::start_index_open`]; `Ok(None)` when it stopped
+    /// being wanted on the way.
+    ///
+    /// A locked index is waited for and never deleted
+    /// ([`Self::open_waiting_for_lock`]): before 2026-11-20 the open-failure
+    /// fallback below also caught "data directory is locked", deleted the
+    /// directory another live process held, and rebuilt every index after
+    /// a hand-over (about ten seconds a store, each inside its open).
     ///
     /// Schema drift is detected by diffing `SCHEMA_HASH_FILE`'s content
     /// before vs. after a successful [`SearchIndex::open`] call, rather than
@@ -3018,7 +3295,7 @@ impl RpcHandler {
     /// Before/after diffing sidesteps needing to replicate that gate:
     /// whatever `open` just wrote is definitionally correct for this build,
     /// whether or not `semantic` ends up honored.
-    async fn open_index_for_store(&self, store_id: StoreId) -> anyhow::Result<()> {
+    async fn open_index_for_store(&self, store_id: StoreId, wanted: &(dyn Fn() -> bool + Send + Sync)) -> anyhow::Result<Option<SearchIndex>> {
         let index_dir = self.index_dir_for(store_id).await?;
         let hash_path = index_dir.join(pimble_search::SCHEMA_HASH_FILE);
         let old_hash = std::fs::read_to_string(&hash_path).ok();
@@ -3031,49 +3308,93 @@ impl RpcHandler {
         // (docs/history/HARDENING_CONTRACT.md decision 12).
         let mut forced_rebuild = false;
 
-        let index = match SearchIndex::open(&index_dir, self.semantic_available) {
-            Ok(index) => index,
-            Err(e) => {
+        let index = match self.open_waiting_for_lock(store_id, &index_dir, wanted).await? {
+            None => return Ok(None),
+            Some(Ok(index)) => Some(index),
+            Some(Err(e)) => {
                 // `Database::open` couldn't tolerate whatever is on disk
-                // (typically a schema mismatch from an older build): wipe
-                // the directory and start fresh rather than fail the store
-                // open over a derived, rebuildable index.
+                // (typically a schema mismatch from an older build), and
+                // nothing holds it: wipe the directory and start fresh
+                // rather than leave the store unsearchable over a derived,
+                // rebuildable index.
                 warn!(
                     "Search index open failed for store {} ({}); rebuilding the index from scratch",
                     store_id, e
                 );
-                if index_dir.exists() {
-                    std::fs::remove_dir_all(&index_dir)?;
-                }
                 forced_rebuild = true;
-                SearchIndex::open(&index_dir, self.semantic_available)?
+                None
             }
         };
 
         let new_hash = std::fs::read_to_string(&hash_path).ok();
         let needs_rebuild = forced_rebuild || old_hash.is_none() || old_hash != new_hash;
+        if !needs_rebuild {
+            return Ok(index);
+        }
 
-        let index = if needs_rebuild {
-            // `SearchIndex::clear()` deletes `Node`s in scan order without
-            // regard for `Node.parent` still referencing an as-yet-undeleted
-            // parent, and rhypedb's delete-restrict policy rejects that
-            // (`delete denied: Node:N is referenced by Node.parent`) —
-            // reported upstream (see report to Agent A/team lead). Route
-            // around it: drop this handle (releasing its file lock) and
-            // recreate the directory from scratch instead of calling
-            // `clear()` on a populated index.
-            drop(index);
+        // `SearchIndex::clear()` deletes `Node`s in scan order without
+        // regard for `Node.parent` still referencing an as-yet-undeleted
+        // parent, and rhypedb's delete-restrict policy rejects that
+        // (`delete denied: Node:N is referenced by Node.parent`) —
+        // reported upstream (see report to Agent A/team lead). Route
+        // around it: drop this handle (releasing its file lock) and
+        // recreate the directory from scratch instead of calling
+        // `clear()` on a populated index.
+        drop(index);
+        if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;
-            let fresh = SearchIndex::open(&index_dir, self.semantic_available)?;
-            let count = self.reindex_all_nodes(store_id, &fresh).await?;
-            info!("Rebuilt search index for store {}: {} node(s) indexed", store_id, count);
-            fresh
-        } else {
-            index
+        }
+        let fresh = match self.open_waiting_for_lock(store_id, &index_dir, wanted).await? {
+            None => return Ok(None),
+            Some(opened) => Arc::new(opened?),
         };
+        let Some(count) = self.reindex_in_batches(store_id, &fresh, wanted).await? else {
+            return Ok(None);
+        };
+        info!("Rebuilt search index for store {}: {} node(s) indexed", store_id, count);
+        // Only this task holds it now: the batches' blocking threads are done.
+        match Arc::try_unwrap(fresh) {
+            Ok(index) => Ok(Some(index)),
+            Err(_) => anyhow::bail!("the rebuilt index of store {store_id} is still held elsewhere"),
+        }
+    }
 
-        self.install_index_handle(store_id, Arc::new(index)).await;
-        Ok(())
+    /// Stop `store_id`'s index work: an open on its way stops at its next
+    /// step, an installed index is shut down completely, and its state is
+    /// forgotten. Its directory's lock is let go once this returns, but for
+    /// an open on its way, whose task is awaited for at most a few seconds.
+    async fn release_index(&self, store_id: StoreId) {
+        let task = self.pending_indexes.lock().unwrap().remove(&store_id).and_then(|p| p.task);
+        if let Some(task) = task {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        }
+        if let Some(handle) = self.indexes.write().await.remove(&store_id) {
+            Self::shutdown_index(handle).await;
+        }
+        self.index_states.lock().unwrap().remove(&store_id);
+    }
+
+    /// Close every store this server holds, writing what it holds and
+    /// letting go of every search index's lock, before a hand-over frees the
+    /// port (docs/STARTUP_CONTRACT.md "Hand-over releases everything"): the
+    /// process that handed over keeps running (`pimble-mcp` joins the new
+    /// server as a client), and until 2026-11-20 its indexes stayed open, so
+    /// the app found every one locked and rebuilt it.
+    pub(crate) async fn release_all_stores(&self) {
+        let open: Vec<StoreId> = {
+            let indexed: Vec<StoreId> = self.indexes.read().await.keys().copied().collect();
+            let pending: Vec<StoreId> = self.pending_indexes.lock().unwrap().keys().copied().collect();
+            indexed.into_iter().chain(pending).collect()
+        };
+        for store_id in open {
+            self.release_index(store_id).await;
+        }
+        let mut manager = self.store_manager.write().await;
+        for store_id in manager.list_stores() {
+            if let Err(e) = manager.close_store(store_id).await {
+                warn!("Handing over: store {} could not be closed cleanly: {}", store_id, e);
+            }
+        }
     }
 
     /// Give every store in `store_ids` what `openStore` gives one: a search
@@ -3088,11 +3409,7 @@ impl RpcHandler {
     /// mount reads `Live` while nothing flows.
     async fn adopt_newly_opened(&self, store_ids: Vec<StoreId>) {
         for store_id in store_ids {
-            if !self.indexes.read().await.contains_key(&store_id) {
-                if let Err(e) = self.open_index_for_store(store_id).await {
-                    warn!("Failed to open search index for newly opened store {}: {}", store_id, e);
-                }
-            }
+            self.start_index_open(store_id).await;
             self.watch_folder(store_id).await;
             let sync_config = {
                 let manager = self.store_manager.read().await;
@@ -3171,17 +3488,17 @@ impl RpcHandler {
     /// nothing can land a background upsert mid-delete — before the
     /// directory is removed (docs/history/HARDENING_CONTRACT.md decision 12).
     async fn rebuild_store_index(&self, store_id: StoreId) -> anyhow::Result<usize> {
-        if let Some(handle) = self.indexes.write().await.remove(&store_id) {
-            Self::shutdown_index(handle).await;
-        }
+        // An open on its way stops first: this rebuild replaces it.
+        self.release_index(store_id).await;
 
         let index_dir = self.index_dir_for(store_id).await?;
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;
         }
-        let index = Arc::new(SearchIndex::open(&index_dir, self.semantic_available)?);
-        let count = self.reindex_all_nodes(store_id, &index).await?;
+        let index = Arc::new(SearchIndex::open(&index_dir, self.semantic().await)?);
+        let count = self.reindex_in_batches(store_id, &index, &|| true).await?.unwrap_or(0);
         self.install_index_handle(store_id, index).await;
+        self.announce_index_state(store_id, IndexState::Ready).await;
         Ok(count)
     }
 }
@@ -3701,6 +4018,10 @@ impl PimbleApiServer for RpcHandler {
             if let Err(e) = handler.store_manager.write().await.flush_all().await {
                 tracing::warn!("Handing over: a document could not be written: {}", e);
             }
+            // Every store closed and every index let go before the port is
+            // free: the newer server opens the same stores the moment it can
+            // bind (docs/STARTUP_CONTRACT.md "Hand-over releases everything").
+            handler.release_all_stores().await;
             let _ = handle.stop();
             info!("Pimble server stopped for a newer one");
         });
@@ -4045,11 +4366,7 @@ impl PimbleApiServer for RpcHandler {
             }
         };
 
-        if !self.indexes.read().await.contains_key(&created_id) {
-            if let Err(e) = self.open_index_for_store(created_id).await {
-                warn!("Failed to open search index for store {}: {}", created_id, e);
-            }
-        }
+        self.start_index_open(created_id).await;
         self.watch_folder(created_id).await;
 
         let rpc_url = self.link_hosted_store(created_id, &account, key_id, &held_as).await?;
@@ -4258,10 +4575,8 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
 
         // A vault store has no search index at all (docs/CRYPTO_CONTRACT.md).
-        if request.kind == StoreKind::Plain && !self.indexes.read().await.contains_key(&store_id) {
-            if let Err(e) = self.open_index_for_store(store_id).await {
-                warn!("Failed to open search index for store {}: {}", store_id, e);
-            }
+        if request.kind == StoreKind::Plain {
+            self.start_index_open(store_id).await;
         }
         if request.kind == StoreKind::Plain {
             self.watch_folder(store_id).await;
@@ -4280,6 +4595,27 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "openStore")?;
         info!("Opening store at {:?}", request.path);
+
+        // A plain store's documents are read outside the manager's lock, so
+        // the saved stores open side by side and nothing else waits on them
+        // (docs/STARTUP_CONTRACT.md "The saved stores open side by side");
+        // one lock per store keeps two opens of it from loading it twice.
+        let manifest = pimble_store::peek_manifest(&request.path).await.map_err(to_rpc_error)?;
+        if manifest.kind == StoreKind::Plain {
+            let guard = {
+                let mut loading = self.loading.lock().await;
+                Arc::clone(loading.entry(manifest.id).or_default())
+            };
+            let _loading = guard.lock().await;
+            let (open, state_root) = {
+                let manager = self.store_manager.read().await;
+                (manager.is_open(manifest.id), manager.state_root().map(std::path::Path::to_path_buf))
+            };
+            if !open {
+                let loaded = pimble_store::LocalStore::open_in(&request.path, state_root.as_deref()).await.map_err(to_rpc_error)?;
+                self.store_manager.write().await.adopt_local_store(&request.path, loaded);
+            }
+        }
 
         let mut manager = self.store_manager.write().await;
         let store_id = manager
@@ -4304,14 +4640,10 @@ impl PimbleApiServer for RpcHandler {
         let sync_config = manager.read_sync_config(store_id).await.map_err(to_rpc_error)?;
 
         drop(manager);
-        // `open_local_store` returns the id of an already-open store as-is
-        // (no-op); skip re-opening its index so we never call
-        // `SearchIndex::open` twice concurrently on the same directory.
-        if !self.indexes.read().await.contains_key(&store_id) {
-            if let Err(e) = self.open_index_for_store(store_id).await {
-                warn!("Failed to open search index for store {}: {}", store_id, e);
-            }
-        }
+        // Its search index opens in the background (docs/STARTUP_CONTRACT.md
+        // "Search never holds a store's opening"); an already-open store's
+        // index, installed or on its way, is left as it is.
+        self.start_index_open(store_id).await;
         // Its folder is watched for what other computers write into it
         // (docs/STORE_FOLDERS_CONTRACT.md rule 3).
         self.watch_folder(store_id).await;
@@ -4339,6 +4671,7 @@ impl PimbleApiServer for RpcHandler {
 
         self.describe_link(&mut store).await;
         self.mark_replica(&mut store);
+        store.index = self.index_state_of(store_id);
         self.record_stores_soon();
 
         Ok(OpenStoreResponse { store })
@@ -4382,9 +4715,7 @@ impl PimbleApiServer for RpcHandler {
         // still holds this store's `Arc<SearchIndex>`, so a reopen right
         // after this response never meets a second live handle on the same
         // rhypedb directory.
-        if let Some(handle) = self.indexes.write().await.remove(&request.store_id) {
-            Self::shutdown_index(handle).await;
-        }
+        self.release_index(request.store_id).await;
 
         Ok(EmptyResponse {})
     }
@@ -4403,6 +4734,7 @@ impl PimbleApiServer for RpcHandler {
                 (store.sync_mode, store.relay) = self.link_kind_of_locked(&manager, id).await;
                 store.waiting = self.waiting_of(id).await;
                 store.out_of_step = self.out_of_step_of(id).await;
+                store.index = self.index_state_of(id);
                 self.mark_replica(&mut store);
                 Self::present_store_to(&principal, &mut store);
                 stores.push(store);
@@ -5373,7 +5705,7 @@ impl PimbleApiServer for RpcHandler {
         // held whole: `sync.json` says `full` or is gone.
         let waiting = self.waiting_of(request.store_id).await;
         let out_of_step = self.out_of_step_of(request.store_id).await;
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false, waiting, out_of_step })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false, waiting, out_of_step, index: self.index_state_of(request.store_id) })
     }
 
     async fn get_store_sync(
@@ -5400,7 +5732,8 @@ impl PimbleApiServer for RpcHandler {
         let owner_offline = self.vault_links.read().await.get(&request.store_id).is_some_and(|link| link.owner_offline());
         let waiting = self.waiting_of(request.store_id).await;
         let out_of_step = self.out_of_step_of(request.store_id).await;
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline, waiting, out_of_step })
+        let index = self.index_state_of(request.store_id);
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline, waiting, out_of_step, index })
     }
 
     async fn list_remote_stores(
@@ -5919,7 +6252,10 @@ impl PimbleApiServer for RpcHandler {
         // silently searches nothing there instead of leaking whether it
         // exists.
         let store_ids: Vec<StoreId> = if request.stores.is_empty() {
-            let open: Vec<StoreId> = self.indexes.read().await.keys().copied().collect();
+            // Every open store with an index here, installed or on its way
+            // (one still opening is named in `indexing`, below).
+            let mut open: Vec<StoreId> = self.indexes.read().await.keys().copied().collect();
+            open.extend(self.index_states.lock().unwrap().keys().filter(|id| !open.contains(id)).copied().collect::<Vec<_>>());
             readable(&principal, open.iter())
         } else {
             readable(&principal, request.stores.iter())
@@ -5941,6 +6277,9 @@ impl PimbleApiServer for RpcHandler {
         };
 
         let mut hits: Vec<(StoreId, pimble_search::SearchHit)> = Vec::new();
+        // The stores searched whose index is still on its way: results may
+        // be incomplete, and the answer says which (docs/STARTUP_CONTRACT.md).
+        let indexing: Vec<StoreId> = store_ids.iter().filter(|id| self.index_state_of(**id).is_indexing()).copied().collect();
         {
             let indexes = self.indexes.read().await;
             for store_id in &store_ids {
@@ -6002,7 +6341,7 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let total = results.len();
-        Ok(SearchResponse { results, total })
+        Ok(SearchResponse { results, total, indexing })
     }
 
     async fn backlinks(

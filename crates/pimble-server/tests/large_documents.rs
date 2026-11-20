@@ -7,6 +7,8 @@
 //! for answers of at most `SYNC_ANSWER_BYTES`, so a large document travels
 //! alone (`max_bytes`, `deferred`).
 
+mod isolated;
+
 use std::sync::Arc;
 
 use base64::Engine;
@@ -14,7 +16,8 @@ use pimble_board::{brush, Board, NewStroke, Stamp};
 use pimble_core::{node_types, NodeId};
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{CreateNodeRequest, CreateStoreRequest, EditOperation, NodeStateVector, PimbleApiServer, SyncNodesRequest, MAX_MESSAGE_BYTES, SYNC_ANSWER_BYTES};
-use pimble_server::{PimbleServer, RpcHandler, ServerConfig};
+use pimble_server::RpcHandler;
+use isolated::TempServer;
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 
@@ -48,8 +51,8 @@ fn dabbed_canvas(dabs: usize) -> Vec<u8> {
     doc.save()
 }
 
-async fn start_server() -> (PimbleServer, pimble_client::PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+async fn start_server() -> (TempServer, pimble_client::PimbleClient) {
+    let mut server = TempServer::isolated();
     server.start().await.expect("server starts");
     let client = pimble_client::PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)
@@ -97,8 +100,8 @@ async fn a_canvas_past_ten_megabytes_loads_for_a_fresh_client() {
 #[tokio::test]
 async fn sync_nodes_defers_what_passes_max_bytes() {
     let manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(manager);
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(manager, dir.path());
     let ext = pimble_server::service_extensions();
     let made = handler
         .create_store(&ext, CreateStoreRequest { kind: Default::default(), store_id: None, path: dir.path().join("s.pimble"), name: "S".into() })

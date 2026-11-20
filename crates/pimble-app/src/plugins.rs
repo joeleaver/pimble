@@ -1355,7 +1355,10 @@ mod place {
         let spawned = std::thread::Builder::new().name("pimble-plugins".into()).spawn(move || {
             let (registry, changed) = scan(&dir);
             tracing::info!("plugins: {} loaded and {} refused from {}", registry.plugins.len(), registry.refused.len(), dir.display());
-            rinch::core::reactive::run_on_main_thread(move || swapped(registry, &changed));
+            rinch::core::reactive::run_on_main_thread(move || {
+                crate::startup::mark("plugins loaded");
+                swapped(registry, &changed)
+            });
             watch(dir);
         });
         if let Err(e) = spawned {

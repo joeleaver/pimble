@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-11-20: startup built, not committed or released** (docs/STARTUP_CONTRACT.md "Built").
+A hand-over now closes stores and lets go of indexes; a locked index is waited for, never
+rebuilt over; indexes open in the background (`IndexState`, "indexing N notes" on the row,
+search says which stores are still indexing); stores load side by side; the account, opens and
+restored rows (`LoadChildren`) no longer wait in line; plugins' compiled modules are cached;
+the model warms up when an index first wants it; opening rows, spinners and "connecting..." in
+the status bar. Fixture start on the busy machine: ready in 0.7-0.9 s (was 2.1-9.5 s); the log
+has `startup: ... at +N ms` lines. Next: look at it on Joe's desktop after a pimble-mcp
+hand-over (the log should show no "Rebuilt search index").
+
 **2026-11-19 (session 78e7f30f): v0.28.9: convergence wave 2.** "Out of step" on the note
 (row mark, pane line, Properties, MCP; names whose device), canonical state vector
 encoding (`pimble_crdt::canonical_state_vector`). Next, in order: docs/STORE_FOLDERS_CONTRACT.md

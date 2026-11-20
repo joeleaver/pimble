@@ -97,6 +97,11 @@ pub enum BackendCommand {
     /// `Shown`.
     Rejudge { store_id: StoreId, node_ids: Vec<NodeId> },
     GetChildren { store_id: StoreId, node_id: NodeId },
+    /// The children of several nodes of one store at once, each answered as
+    /// its own `ChildrenLoaded` as soon as it is in: a store's root and the
+    /// rows this device left expanded, asked together when it opens instead
+    /// of one level per round trip (docs/STARTUP_CONTRACT.md "Built").
+    LoadChildren { store_id: StoreId, nodes: Vec<NodeId> },
     /// Merge `update` (a yrs update of the node's document) through
     /// `applyEdit` and answer `NodeContentUpdated` or `Error`: for a caller
     /// that must know the write landed (the importer, the editor seeding an
@@ -508,6 +513,14 @@ pub enum BackendEvent {
     // Store events
     StoreCreated { store_id: StoreId, root_node_id: NodeId },
     StoreOpened { store: Store },
+    /// `OpenStore` of `path` failed: its row says why
+    /// (docs/STARTUP_CONTRACT.md "A store that fails to open says why on its
+    /// row").
+    StoreOpenFailed { path: String, message: String },
+    /// A store's search index changed state on its device: the answer to
+    /// `GetStoreSync` carries it, so a change to ready that happened before
+    /// the store's subscription is never missed (docs/STARTUP_CONTRACT.md).
+    IndexStateChanged { store_id: StoreId, state: pimble_core::IndexState },
     StoreClosed { store_id: StoreId },
     /// Answer to `ListStores`: every store the server currently has open.
     StoresListed { stores: Vec<Store> },

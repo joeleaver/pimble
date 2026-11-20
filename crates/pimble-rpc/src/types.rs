@@ -776,6 +776,12 @@ pub struct GetStoreSyncResponse {
     /// to `waiting` is. Missing from an older server: none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_step: Vec<pimble_core::OutOfStep>,
+    /// How the store's search index is doing on this device, mirroring
+    /// `Store::index` (docs/STARTUP_CONTRACT.md): asked after subscribing,
+    /// so a client never misses the change to ready. Missing from an older
+    /// server: ready.
+    #[serde(default, skip_serializing_if = "pimble_core::IndexState::is_ready")]
+    pub index: pimble_core::IndexState,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
@@ -842,6 +848,11 @@ pub struct SearchResultItem {
 pub struct SearchResponse {
     pub results: Vec<SearchResultItem>,
     pub total: usize,
+    /// The stores searched whose index is not ready yet (opening, being
+    /// built, held by another program): their results may be incomplete
+    /// (docs/STARTUP_CONTRACT.md). Missing from an older server: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexing: Vec<StoreId>,
 }
 
 /// Request for what links to `node_id` in `store_id` (`backlinks`).
@@ -1177,6 +1188,10 @@ pub enum StoreChangeKind {
     /// list; docs/PRESENCE_CONTRACT.md section 3). Derived state: links
     /// never forward it.
     PeopleChanged,
+    /// This store's search index on this device changed state: opening,
+    /// being built, held by another program, ready (docs/STARTUP_CONTRACT.md).
+    /// Derived state: links never forward it.
+    IndexStateChanged { state: pimble_core::IndexState },
 }
 
 impl From<pimble_crdt::NodeChange> for StoreChangeKind {

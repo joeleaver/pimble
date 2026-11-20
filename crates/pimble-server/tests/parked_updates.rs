@@ -18,8 +18,8 @@ use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 
 async fn new_handler_with_node() -> (RpcHandler, StoreId, NodeId, tempfile::TempDir) {
-    let handler = RpcHandler::new(Arc::new(RwLock::new(StoreManager::new())));
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(Arc::new(RwLock::new(StoreManager::new())), dir.path());
     let store = handler
         .create_store(&pimble_server::service_extensions(), CreateStoreRequest { kind: Default::default(), store_id: None, path: dir.path().join("test.pimble"), name: "Test".into() })
         .await
@@ -108,8 +108,8 @@ fn a_document_says_what_its_parked_update_waits_for() {
 #[tokio::test]
 async fn a_repair_another_device_keeps_undoing_slows_down() {
     let manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(manager.clone());
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(manager.clone(), dir.path());
     let ext = pimble_server::service_extensions();
     let store = handler
         .create_store(&ext, CreateStoreRequest { kind: Default::default(), store_id: None, path: dir.path().join("t.pimble"), name: "T".into() })

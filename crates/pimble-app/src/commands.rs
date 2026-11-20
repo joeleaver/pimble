@@ -68,6 +68,15 @@ pub fn error_message(e: &ApiError) -> String {
     }
 }
 
+/// A server's own error as a person reads it: its message, without the
+/// JSON-RPC code around it.
+fn error_message_client(e: &pimble_client::ClientError) -> String {
+    match e {
+        pimble_client::ClientError::Server { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn failed(e: ApiError) -> Option<BackendEvent> {
     Some(BackendEvent::Error { message: error_message(&e) })
 }
@@ -233,6 +242,19 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Ok(node) => Some(BackendEvent::NodeLoaded { store_id, node }),
             Err(e) => failed(e),
         },
+
+        C::LoadChildren { store_id, nodes } => {
+            use futures::StreamExt;
+            let listings = nodes.into_iter().map(|node_id| async move { (node_id, api.listing(Addr::new(store_id, node_id)).await) });
+            let mut answers = futures::stream::iter(listings).buffer_unordered(8);
+            while let Some((node_id, answer)) = answers.next().await {
+                match answer {
+                    Ok((children_store_id, children)) => ctx.emit(BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id, children }),
+                    Err(e) => tracing::info!("The children of {node_id} in store {store_id} could not be read: {}", error_message(&e)),
+                }
+            }
+            None
+        }
 
         C::GetChildren { store_id, node_id } => match api.listing(Addr::new(store_id, node_id)).await {
             Ok((children_store_id, children)) => Some(BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id, children }),
@@ -803,7 +825,7 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             };
             match c.open_store(&path).await {
                 Ok(store) => Some(BackendEvent::StoreOpened { store }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+                Err(e) => Some(BackendEvent::StoreOpenFailed { path, message: error_message_client(&e) }),
             }
         }
 
@@ -952,7 +974,10 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.get_store_sync_response(store_id).await {
-                Ok(answer) => Some(store_sync_changed(store_id, answer)),
+                Ok(answer) => {
+                    ctx.emit(BackendEvent::IndexStateChanged { store_id, state: answer.index.clone() });
+                    Some(store_sync_changed(store_id, answer))
+                }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

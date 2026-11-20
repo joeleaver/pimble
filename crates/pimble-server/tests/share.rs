@@ -1316,14 +1316,10 @@ async fn sharing_against_the_real_accounts_service() {
     let cloud_url = format!("http://127.0.0.1:{proxy_port}");
     let issuer = format!("{cloud_url}/api/v1");
     let mut h = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(h_token.clone()),
         jwks_url: Some(format!("{issuer}/.well-known/jwks.json").parse().unwrap()),
         jwt_issuer: Some(issuer),
-        keystore_path: Some(h_dir.path().join("keys.json")),
-        credentials_path: Some(h_dir.path().join("credentials.json")),
-        replicas_dir: Some(h_dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(h_dir.path())
     });
     h.start().await.expect("H starts");
     let h_url = format!("http://{}", h.addr());

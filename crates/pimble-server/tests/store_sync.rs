@@ -24,9 +24,9 @@ const T0: &str = "2026-09-18T10:00:00Z";
 /// for the test's duration).
 async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::TempDir) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(store_manager);
-
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(store_manager, dir.path());
+
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler

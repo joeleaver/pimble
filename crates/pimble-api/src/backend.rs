@@ -378,6 +378,7 @@ pub fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::PeopleChanged
+        | StoreChangeKind::IndexStateChanged { .. }
         | StoreChangeKind::VaultAppended { .. }
         | StoreChangeKind::VaultReported { .. } => None,
     }

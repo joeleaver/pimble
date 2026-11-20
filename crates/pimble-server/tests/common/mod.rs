@@ -110,14 +110,7 @@ pub async fn put_on_canvas(client: &PimbleClient, store_id: StoreId, node_id: No
 pub const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 pub fn device_config(dir: &Path) -> ServerConfig {
-    ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.join("keys.json")),
-        credentials_path: Some(dir.join("credentials.json")),
-        replicas_dir: Some(dir.join("replicas")),
-        share_sweep_interval: Some(SWEEP_EVERY),
-        ..Default::default()
-    }
+    ServerConfig { share_sweep_interval: Some(SWEEP_EVERY), ..ServerConfig::in_dir(dir) }
 }
 
 /// A fresh desktop-side `PimbleServer` (plain, tokenless, loopback) with
@@ -889,14 +882,10 @@ pub async fn spawn_env() -> Env {
 
     let h_service_token = "h-service-token".to_string();
     let mut h = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(h_service_token.clone()),
         jwks_url: Some(jwks_url.parse().unwrap()),
         jwt_issuer: Some(issuer),
-        keystore_path: Some(h_dir.path().join("keys.json")),
-        credentials_path: Some(h_dir.path().join("credentials.json")),
-        replicas_dir: Some(h_dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(h_dir.path())
     });
     h.start().await.expect("H starts");
 

@@ -88,9 +88,7 @@ mod tests {
         let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
             addr: format!("127.0.0.1:{port}").parse().unwrap(),
             auth_token: Some(token.to_string()),
-            credentials_path: Some(dir.path().join("credentials.json")),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         (server, dir)

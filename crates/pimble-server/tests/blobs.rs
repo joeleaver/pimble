@@ -7,6 +7,8 @@
 
 mod common;
 
+mod isolated;
+
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -18,6 +20,7 @@ use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, BlobId, BlobUrl, NodeId, StoreAccess, StoreId, StoreKind, IMAGE_TOO_LARGE, MAX_IMAGE_BYTES, NOT_AN_IMAGE};
 use pimble_rpc::{PimbleApiClient, PutBlobRequest, BLOB_CHUNK_BYTES, BLOB_NOT_HERE};
 use pimble_server::{PimbleServer, ServerConfig};
+use isolated::TempServer;
 use serde_json::json;
 
 const MIB: usize = 1024 * 1024;
@@ -310,7 +313,7 @@ const ISSUER: &str = "https://issuer.example/v1";
 /// A hosted plain store with a shared folder and a document outside it, and
 /// the service client that set it up.
 struct Hosted {
-    _server: PimbleServer,
+    _server: TempServer,
     _dir: tempfile::TempDir,
     url: String,
     sk: SigningKey,
@@ -325,12 +328,11 @@ impl Hosted {
     async fn start() -> Self {
         let sk = fresh_signing_key();
         let jwks_url = spawn_jwks(&sk, "kid-1").await;
-        let mut server = PimbleServer::with_config(ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
+        let mut server = TempServer::with_config(|dir| ServerConfig {
             auth_token: Some("admin-secret".into()),
             jwks_url: Some(jwks_url.parse().unwrap()),
             jwt_issuer: Some(ISSUER.into()),
-            ..Default::default()
+            ..ServerConfig::in_dir(dir)
         });
         server.start().await.unwrap();
         let url = format!("http://{}", server.addr());

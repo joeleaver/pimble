@@ -23,7 +23,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self { handler: RpcHandler::new(Arc::new(RwLock::new(StoreManager::new()))), _dir: tempfile::tempdir().unwrap() }
+        let dir = tempfile::tempdir().unwrap();
+        Self { handler: RpcHandler::in_dir(Arc::new(RwLock::new(StoreManager::new())), dir.path()), _dir: dir }
     }
 
     async fn store(&self, name: &str) -> (StoreId, NodeId) {

@@ -13,6 +13,8 @@
 //! `relinking_two_already_synced_servers_produces_no_notifications` runs two
 //! real `PimbleServer`s end to end, like `sync.rs`.
 
+mod isolated;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +25,8 @@ use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest, NodeStateVector,
     PimbleApiServer, StoreChangeKind, StoreChangedNotification, SyncNodesRequest,
 };
-use pimble_server::{PimbleServer, RpcHandler, ServerConfig};
+use pimble_server::RpcHandler;
+use isolated::TempServer;
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 
@@ -36,15 +39,16 @@ const PAST_FLUSH_DEBOUNCE: Duration = Duration::from_millis(1_200);
 /// store/node ids, and the `TempDir` guard.
 async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::TempDir) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(store_manager);
-
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(store_manager, dir.path());
+
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
         .create_store(&pimble_server::service_extensions(), CreateStoreRequest { kind: Default::default(), store_id: None, path: store_path, name: "Test Store".into() })
         .await
         .unwrap();
+    index_ready(&handler, create_resp.store_id).await;
     let node_resp = handler
         .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: create_resp.store_id,
@@ -229,8 +233,8 @@ where
     }
 }
 
-async fn start_server() -> (PimbleServer, pimble_client::PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+async fn start_server() -> (TempServer, pimble_client::PimbleClient) {
+    let mut server = TempServer::isolated();
     server.start().await.expect("server starts");
     let client = pimble_client::PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)
@@ -330,4 +334,19 @@ async fn relinking_two_already_synced_servers_produces_no_notifications() {
     let b_doc_after = client_b.get_node(store_id, doc_id).await.unwrap().metadata.modified_at;
     assert_eq!(a_doc_before, a_doc_after, "A's untouched node must keep its modified_at across a no-op relink");
     assert_eq!(b_doc_before, b_doc_after, "B's untouched node must keep its modified_at across a no-op relink");
+}
+
+/// Wait until `store_id`'s search index, opened in the background, is ready
+/// (docs/STARTUP_CONTRACT.md), so its state changes are not among the
+/// notifications a test counts.
+async fn index_ready(handler: &RpcHandler, store_id: StoreId) {
+    use pimble_rpc::PimbleApiServer as _;
+    for _ in 0..400 {
+        let state = handler.get_store_sync(&pimble_server::service_extensions(), pimble_rpc::GetStoreSyncRequest { store_id }).await.unwrap().index;
+        if state.is_ready() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the store's index never became ready");
 }

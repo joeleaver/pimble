@@ -47,12 +47,7 @@ async fn edit(client: &PimbleClient, store: StoreId, node: NodeId, text: &str) -
 async fn fixture() -> Fixture {
     let dir = TempDir::new().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        credentials_path: Some(dir.path().join("credentials.json")),
-        keystore_path: Some(dir.path().join("keys.json")),
-        replicas_dir: Some(dir.path().join("replicas")),
-        agents_path: Some(dir.path().join("agents.json")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let service = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("service connects");

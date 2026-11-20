@@ -161,6 +161,83 @@ pub struct Store {
     /// serializations: none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_open_on: Vec<OtherComputer>,
+
+    /// How this store's search index is doing on this device
+    /// (docs/STARTUP_CONTRACT.md): a store answers its open before its index
+    /// is ready, and its row says "indexing" until it is. Missing in older
+    /// serializations (and for a store with no index here): ready.
+    #[serde(default, skip_serializing_if = "IndexState::is_ready")]
+    pub index: IndexState,
+}
+
+/// How a store's search index is doing on this device
+/// (docs/STARTUP_CONTRACT.md "Search never holds a store's opening").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IndexState {
+    /// Searchable (and the state of a store that has no index here).
+    #[default]
+    Ready,
+    /// Being opened.
+    Opening,
+    /// Being built from the store's notes: `done` of `total` so far.
+    Rebuilding { done: usize, total: usize },
+    /// Another program on this computer holds it (a Pimble server that is
+    /// handing over): it is opened again when that one lets go, never
+    /// rebuilt over.
+    Held,
+    /// It could not be opened: the sentence that says why. Search skips the
+    /// store until "Rebuild search index".
+    Unavailable { reason: String },
+}
+
+impl IndexState {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, IndexState::Ready)
+    }
+
+    /// Whether search over the store may miss notes because its index is
+    /// still on its way (not ready, and not given up on).
+    pub fn is_indexing(&self) -> bool {
+        matches!(self, IndexState::Opening | IndexState::Rebuilding { .. } | IndexState::Held)
+    }
+
+    /// The quiet words on the store's row while its index is on its way:
+    /// "indexing 484 notes", "indexing 120 of 484 notes", "opening search";
+    /// empty when there is nothing to say.
+    pub fn row_words(&self) -> String {
+        let notes = |n: usize| if n == 1 { "1 note".to_string() } else { format!("{n} notes") };
+        match self {
+            IndexState::Ready => String::new(),
+            IndexState::Opening => "opening search".to_string(),
+            IndexState::Rebuilding { done: 0, total } => format!("indexing {}", notes(*total)),
+            IndexState::Rebuilding { done, total } => format!("indexing {done} of {}", notes(*total)),
+            IndexState::Held => "search waiting".to_string(),
+            IndexState::Unavailable { .. } => "search unavailable".to_string(),
+        }
+    }
+
+    /// The row's tooltip for the same.
+    pub fn row_tooltip(&self) -> String {
+        match self {
+            IndexState::Ready => String::new(),
+            IndexState::Opening => "Opening this store's search index. Search may miss its notes until it is open.".to_string(),
+            IndexState::Rebuilding { .. } => "Building this store's search index. Search may miss its notes until it is done.".to_string(),
+            IndexState::Held => "Another Pimble program on this computer still holds this store's search index. It opens as soon as that program lets go.".to_string(),
+            IndexState::Unavailable { reason } => format!("This store's search index could not be opened: {reason}. View > Rebuild search index tries again."),
+        }
+    }
+
+    /// What a search covering stores still being indexed says above its
+    /// results: "Personal is still being indexed; results may be
+    /// incomplete." Empty for none.
+    pub fn search_note(names: &[String]) -> String {
+        match names {
+            [] => String::new(),
+            [one] => format!("{one} is still being indexed; results may be incomplete."),
+            [init @ .., last] => format!("{} and {last} are still being indexed; results may be incomplete.", init.join(", ")),
+        }
+    }
 }
 
 /// Another computer that opens a store's folder (docs/STORE_FOLDERS_CONTRACT.md
@@ -337,6 +414,7 @@ impl Store {
             waiting: Vec::new(),
             out_of_step: Vec::new(),
             also_open_on: Vec::new(),
+            index: IndexState::Ready,
         }
     }
 
@@ -360,6 +438,7 @@ impl Store {
             waiting: Vec::new(),
             out_of_step: Vec::new(),
             also_open_on: Vec::new(),
+            index: IndexState::Ready,
         }
     }
 
@@ -733,6 +812,35 @@ impl StoreManifest {
 
 #[cfg(test)]
 mod tests {
+    /// docs/STARTUP_CONTRACT.md: what a store row and a search say while a
+    /// store's index is on its way, and that an older server's store (no
+    /// `index`) reads as ready.
+    #[test]
+    fn index_states_say_what_they_are() {
+        use super::IndexState;
+        assert_eq!(IndexState::Rebuilding { done: 0, total: 484 }.row_words(), "indexing 484 notes");
+        assert_eq!(IndexState::Rebuilding { done: 120, total: 484 }.row_words(), "indexing 120 of 484 notes");
+        assert_eq!(IndexState::Rebuilding { done: 0, total: 1 }.row_words(), "indexing 1 note");
+        assert_eq!(IndexState::Held.row_words(), "search waiting");
+        assert_eq!(IndexState::Ready.row_words(), "");
+        assert!(IndexState::Held.is_indexing() && IndexState::Opening.is_indexing());
+        assert!(!IndexState::Unavailable { reason: "x".into() }.is_indexing());
+        assert_eq!(IndexState::search_note(&["Personal".into()]), "Personal is still being indexed; results may be incomplete.");
+        assert_eq!(
+            IndexState::search_note(&["Personal".into(), "Family".into(), "Work".into()]),
+            "Personal, Family and Work are still being indexed; results may be incomplete."
+        );
+        assert_eq!(IndexState::search_note(&[]), "");
+        let mut store = super::Store::new_local("Notes", "/tmp/n.pimble".into());
+        let json = serde_json::to_value(&store).unwrap();
+        assert!(json.get("index").is_none(), "ready is not written");
+        store.index = IndexState::Rebuilding { done: 3, total: 9 };
+        let back: super::Store = serde_json::from_value(serde_json::to_value(&store).unwrap()).unwrap();
+        assert_eq!(back.index, store.index);
+        let older: super::Store = serde_json::from_value(json).unwrap();
+        assert!(older.index.is_ready());
+    }
+
     use super::*;
 
     #[test]

@@ -240,9 +240,20 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
         rejudge(store, store_id);
     }
 
+    // The roots' children and every row of this store this device left
+    // expanded, asked for together and answered as each is in
+    // (docs/STARTUP_CONTRACT.md "Built": one level per round trip, in line
+    // behind everything else, took seconds a level on a busy machine).
     for &root_id in &roots {
         store.expanded.update(|e| { e.insert((store_id, root_id)); });
-        store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+    }
+    let mut load: Vec<NodeId> = roots.clone();
+    load.extend(untracked(|| store.expanded.with(|e| e.iter().filter(|(s, n)| *s == store_id && !roots.contains(n)).map(|(_, n)| *n).collect::<Vec<_>>())));
+    for &node_id in &load {
+        store.children_asked(store_id, node_id);
+    }
+    store.send(BackendCommand::LoadChildren { store_id, nodes: load });
+    for &root_id in &roots {
         // The root node itself: a whole store's row takes its icon and colour
         // from it, and a share's root is a row that needs its own label.
         store.send(BackendCommand::GetNode { store_id, node_id: root_id });
@@ -285,8 +296,8 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
         }
     }
 
-    // Persist open store paths
-    save_app_state_file(&store.all_store_local_paths());
+    // Persist open store paths (and the saved ones still opening).
+    save_app_state_file(&store.store_paths_to_save());
 
     // Structural change
     store.bump_tree_structure();
@@ -363,8 +374,9 @@ fn take_children(store: AppStore, list_store: StoreId, parent_id: NodeId, childr
         store.upsert_node(children_store_id, child.clone());
         // A row left expanded on this device opens again: its children are
         // fetched as soon as it is here.
-        if store.is_expanded(children_store_id, child.id) && !store.has_children_loaded(children_store_id, child.id) {
+        if store.is_expanded(children_store_id, child.id) && !store.has_children_loaded(children_store_id, child.id) && !store.children_on_their_way(children_store_id, child.id) {
             store.send(BackendCommand::GetChildren { store_id: children_store_id, node_id: child.id });
+            store.children_asked(children_store_id, child.id);
         }
         // A mount's state is the server's (derived from its source's link),
         // asked once; its changes arrive as `MountStateChanged`.
@@ -640,6 +652,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
         match event {
             BackendEvent::Connected { server_addr, client_id } => {
                 tracing::info!("Connected to backend at {} (client_id: {})", server_addr, client_id);
+                crate::startup::mark("connected");
                 store.connection.set(ConnectionState::Connected);
                 store.connection_status.set("Connected".to_string());
                 store.server_addr.set(server_addr.clone());
@@ -657,19 +670,28 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     });
                 }
 
+                // Whether the server's keystore holds a signed-in account
+                // (a sign-in survives an app restart), for the status bar
+                // and the Account modal's face (docs/DESKTOP_ACCOUNT_CONTRACT.md
+                // decision 7). Asked first, beside the opens and not behind
+                // them (docs/STARTUP_CONTRACT.md): until it answers the
+                // status bar says "connecting...".
+                store.cloud_answer.set(crate::state::CloudAnswer::Waiting);
+                store.send(BackendCommand::CloudStatus);
+
                 // Auto-open previously loaded stores. On a reconnect this is
                 // the same list (every open store is persisted there), so
                 // the new server ends up holding what the old one held; the
                 // tree keeps its store ids and refreshes from `StoreOpened`.
+                // Each has its row at once, "opening...", until it opens or
+                // says why not; they open side by side.
                 let saved_paths = load_app_state_file();
-                store.backend.with(|b| {
-                    if let Some(backend) = b {
-                        for path in saved_paths {
-                            tracing::info!("Auto-opening saved store: {}", path);
-                            backend.send(BackendCommand::OpenStore { path });
-                        }
-                    }
-                });
+                for path in saved_paths {
+                    crate::startup::opening();
+                    tracing::info!("Auto-opening saved store: {}", path);
+                    store.begin_opening(&path);
+                    store.send(BackendCommand::OpenStore { path });
+                }
 
                 // Documents were being edited across the reconnect, and any
                 // delta sent during the gap was lost. Commands run in order,
@@ -680,18 +702,24 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // are the API's to make again (`Pimble::watch`, when each
                 // store's `StoreOpened` subscribes it).
                 crate::doc_session::reconnected(store);
-
-                // Whether the server's keystore holds a signed-in account
-                // (a sign-in survives an app restart), for the status bar
-                // and the Account modal's face (docs/DESKTOP_ACCOUNT_CONTRACT.md
-                // decision 7).
-                store.send(BackendCommand::CloudStatus);
             }
 
             BackendEvent::Disconnected => {
                 tracing::info!("Disconnected from backend");
                 store.connection.set(ConnectionState::Disconnected);
                 store.connection_status.set("Disconnected".to_string());
+                // The account is asked again on the next connection; until
+                // then nothing is known of it, which is not "disconnected".
+                store.cloud_answer.set(crate::state::CloudAnswer::Waiting);
+            }
+
+            BackendEvent::StoreOpenFailed { path, message } => {
+                tracing::warn!("Store {} could not be opened: {}", path, message);
+                store.opening_failed(path, message);
+            }
+
+            BackendEvent::IndexStateChanged { store_id, state } => {
+                store.set_index_state(*store_id, state.clone());
             }
 
             BackendEvent::Failed { asked, message } => {
@@ -755,10 +783,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::StoreOpened { store: opened_store } => {
                 tracing::info!("Store opened: {}", opened_store.name);
+                crate::startup::mark(&format!("store {} open", opened_store.name));
                 let store_id = opened_store.id;
                 let root_id = opened_store.root_node_id;
 
                 register_opened_store(store, tree_state, opened_store);
+                if let Some(path) = opened_store.local_path() {
+                    store.finish_opening(&path.to_string_lossy());
+                }
                 // "Add Here" in Settings > Shares: the row becomes "Open".
                 if untracked(|| crate::settings::showing(store, crate::settings::Section::Shares)) {
                     store.send(BackendCommand::CloudListShares);
@@ -865,6 +897,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // store (the mount's source store when `parent_id` is a
                 // mount point, `store_id` otherwise, decision 1).
                 take_children(store, *store_id, *parent_id, *children_store_id, children);
+                store.children_arrived(*store_id, *parent_id);
                 // A query metanode's row shows what it finds after these.
                 crate::metanodes::children_loaded(store, *store_id, *parent_id);
                 store.bump_tree_structure();
@@ -1158,7 +1191,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         continue;
                     }
                 }
-                tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
+                // An index's progress is said several times a second while it
+                // is built: not a line each.
+                if !matches!(change_kind, pimble_rpc::StoreChangeKind::IndexStateChanged { .. }) {
+                    tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
+                }
                 use pimble_rpc::StoreChangeKind;
                 match change_kind {
                     // What these did to the tree arrives as `Shown`, read
@@ -1225,6 +1262,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                     StoreChangeKind::PeopleChanged => {
                         store.send(BackendCommand::GetPeople { store_id: *store_id });
+                    }
+                    StoreChangeKind::IndexStateChanged { state } => {
+                        store.set_index_state(*store_id, state.clone());
                     }
                     StoreChangeKind::VaultAppended { .. } | StoreChangeKind::VaultReported { .. } => {
                         // Encrypted-store blobs are handled by the vault client
@@ -1482,6 +1522,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     crate::boards::set_author(None, None);
                 }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
+                store.cloud_answer.set(crate::state::CloudAnswer::Answered);
+                crate::startup::mark("account answered");
                 store.cloud_signed_in.set(*signed_in);
                 if !*signed_in {
                     store.cloud_connection.set(None);
@@ -1516,6 +1558,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         store.account_modal_error.set(message.clone());
                     }
                     CloudOp::Status => {
+                        // The status bar says "disconnected" now: asking
+                        // actually failed (docs/STARTUP_CONTRACT.md).
+                        store.cloud_answer.set(crate::state::CloudAnswer::Failed(message.clone()));
                         // Asked on every connect; only worth a line in the
                         // modal when the modal is there to show it.
                         if untracked(|| crate::app::account_showing(store)) {
@@ -1719,6 +1764,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
         }
     }
+    crate::startup::check(store);
 }
 
 #[cfg(test)]
@@ -1741,6 +1787,16 @@ mod tests {
         (store, event_tx, cmd_rx)
     }
 
+    /// Whether `c` asks for `node`'s children: alone, or with others when a
+    /// store opens (`LoadChildren`).
+    fn asks_children(c: &BackendCommand, node: NodeId) -> bool {
+        match c {
+            BackendCommand::GetChildren { node_id, .. } => *node_id == node,
+            BackendCommand::LoadChildren { nodes, .. } => nodes.contains(&node),
+            _ => false,
+        }
+    }
+
     fn pump(store: AppStore) {
         process_backend_events(store, UseTreeReturn::new(UseTreeOptions::default()));
     }
@@ -1752,6 +1808,50 @@ mod tests {
             name: name.to_string(),
             state: SyncState::Syncing,
         }
+    }
+
+    /// docs/STARTUP_CONTRACT.md, as the events say it: a store that fails to
+    /// open says why on its row, one that opens takes its row's place, a
+    /// store's index state reaches its row (from `getStoreSync` and from its
+    /// notifications), and the account part waits, answers or fails.
+    #[test]
+    fn starting_up_is_said_as_it_happens() {
+        use crate::state::CloudAnswer;
+        let (store, events, _commands) = store_with_events();
+        assert_eq!(store.cloud_answer.get(), CloudAnswer::Waiting, "connecting... until the server answers");
+
+        store.begin_opening("/tmp/a.pimble");
+        store.begin_opening("/tmp/b.pimble");
+        events.send(BackendEvent::StoreOpenFailed { path: "/tmp/b.pimble".into(), message: "No such store.".into() }).unwrap();
+        let mut opened = pimble_core::Store::new_local("A", "/tmp/a.pimble".into());
+        opened.index = pimble_core::IndexState::Opening;
+        let store_id = opened.id;
+        events.send(BackendEvent::StoreOpened { store: opened }).unwrap();
+        pump(store);
+        let left: Vec<crate::state::OpeningStore> = store.opening_stores.get();
+        assert_eq!(left.len(), 1, "the opened store's row is its own now: {left:?}");
+        assert_eq!((left[0].path.as_str(), left[0].error.as_deref()), ("/tmp/b.pimble", Some("No such store.")));
+        let index = || store.get_store_signal(store_id).unwrap().with(|s| s.index.clone());
+        assert_eq!(index(), pimble_core::IndexState::Opening);
+
+        events.send(BackendEvent::IndexStateChanged { store_id, state: pimble_core::IndexState::Rebuilding { done: 0, total: 9 } }).unwrap();
+        pump(store);
+        assert_eq!(index().row_words(), "indexing 9 notes");
+        events
+            .send(BackendEvent::RemoteStoreChange { store_id, change_kind: pimble_rpc::StoreChangeKind::IndexStateChanged { state: pimble_core::IndexState::Ready }, source_client_id: None })
+            .unwrap();
+        pump(store);
+        assert!(index().is_ready());
+
+        events.send(BackendEvent::CloudError { op: CloudOp::Status, message: "connection refused".into() }).unwrap();
+        pump(store);
+        assert_eq!(store.cloud_answer.get(), CloudAnswer::Failed("connection refused".into()));
+        events.send(BackendEvent::CloudStatusChanged { signed_in: false, email: None, user_id: None, url: None }).unwrap();
+        pump(store);
+        assert_eq!(store.cloud_answer.get(), CloudAnswer::Answered);
+        events.send(BackendEvent::Disconnected).unwrap();
+        pump(store);
+        assert_eq!(store.cloud_answer.get(), CloudAnswer::Waiting, "a lost connection is not \"disconnected\" from Pimble Cloud");
     }
 
     /// The answer to every sharing request but "Stop sharing" moves the modal
@@ -2069,7 +2169,7 @@ mod tests {
         assert!(!store.store_access(store_id).allows_write());
         assert!(store.owner_offline.with(|set| set.contains(&store_id)));
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == placeholder)));
+        assert!(asked.iter().any(|c| asks_children(c, placeholder)));
 
         // The owner's computer is back: the share's root, and an editor's access.
         let recipes = NodeId::new();
@@ -2090,7 +2190,7 @@ mod tests {
         assert!(!store.owner_offline.with(|set| set.contains(&store_id)));
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
         assert!(
-            asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == recipes)),
+            asked.iter().any(|c| asks_children(c, recipes)),
             "the share's root was never fetched: the row would stay empty until a reload"
         );
     }
@@ -2254,7 +2354,7 @@ mod tests {
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
         for root in [recipes, trips] {
             assert!(
-                asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == root)),
+                asked.iter().any(|c| asks_children(c, root)),
                 "no children asked for {root}"
             );
             assert!(
@@ -2274,7 +2374,7 @@ mod tests {
         assert_eq!(store.shown_roots(store_id), vec![recipes, trips, walks]);
         assert!(commands
             .try_iter()
-            .any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if node_id == walks)));
+            .any(|c| asks_children(&c, walks)));
     }
 
     /// A store with two shared roots and a document under each, all loaded,
@@ -2704,8 +2804,8 @@ mod tests {
         assert_eq!(store.notice.get(), "");
         assert_eq!(store.shown_roots(store_id), vec![recipes]);
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == recipes)));
-        assert!(!asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } | BackendCommand::GetNode { node_id, .. } if *node_id == trips)));
+        assert!(asked.iter().any(|c| asks_children(c, recipes)));
+        assert!(!asked.iter().any(|c| asks_children(c, trips) || matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == trips)));
 
         // The same store told again with the root it was showing ended: that
         // one was on the screen, so it is said.

@@ -21,10 +21,14 @@ use pimble_server::{PimbleServer, ServerConfig};
 #[tokio::test]
 async fn add_remote_store_with_no_path_uses_the_default_replica_directory() {
     let fake_data_home = tempfile::tempdir().unwrap();
+    let fake_config_home = tempfile::tempdir().unwrap();
     // Safe: this test binary is its own process (see the module doc), so no
-    // other test observes this override.
+    // other test observes this override. The config directory too: both
+    // servers run on the defaults this test is about, so their keystore,
+    // saved credentials and agents file resolve under it, never the real one.
     unsafe {
         std::env::set_var("XDG_DATA_HOME", fake_data_home.path());
+        std::env::set_var("XDG_CONFIG_HOME", fake_config_home.path());
     }
 
     let mut server_b = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });

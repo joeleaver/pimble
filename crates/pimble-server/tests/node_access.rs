@@ -77,11 +77,7 @@ fn held_as(access: StoreAccess, read_only_roots: Vec<NodeId>) -> SyncConfig {
 
 async fn start_device(dir: &std::path::Path) -> (PimbleServer, PimbleClient) {
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.join("keys.json")),
-        credentials_path: Some(dir.join("credentials.json")),
-        replicas_dir: Some(dir.join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     server.start().await.expect("local server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");

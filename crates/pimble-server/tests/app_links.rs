@@ -16,11 +16,7 @@ async fn a_link_goes_to_the_oldest_window_listening() {
     let addr = format!("127.0.0.1:{port}");
     let mut server = PimbleServer::with_config(ServerConfig {
         addr: addr.parse().unwrap(),
-        credentials_path: Some(dir.path().join("credentials.json")),
-        keystore_path: Some(dir.path().join("keys.json")),
-        replicas_dir: Some(dir.path().join("replicas")),
-        agents_path: Some(dir.path().join("agents.json")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.unwrap();
     let url = format!("http://{addr}");

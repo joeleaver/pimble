@@ -1039,9 +1039,7 @@ mod server_tests {
     async fn start() -> (PimbleServer, Pimble, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let mut server = PimbleServer::with_config(ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");

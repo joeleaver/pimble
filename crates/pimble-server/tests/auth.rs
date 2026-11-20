@@ -12,16 +12,18 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, Place};
-use pimble_server::{PimbleServer, ServerConfig};
+use pimble_server::ServerConfig;
+
+mod isolated;
+use isolated::TempServer;
 use serde_json::json;
 
 /// Start a `PimbleServer` bound to an OS-assigned loopback port with
 /// `auth_token`.
-async fn start_server(auth_token: Option<&str>) -> PimbleServer {
-    let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+async fn start_server(auth_token: Option<&str>) -> TempServer {
+    let mut server = TempServer::with_config(|dir| ServerConfig {
         auth_token: auth_token.map(String::from),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     server.start().await.expect("server starts");
     server
@@ -121,14 +123,13 @@ fn make_jwt_with_claims(
 /// Start a server with both a static token (the accounts-service "Service"
 /// credential used to set up stores in these tests, per "static token still
 /// works alongside a JWT verifier") and a JWT verifier against `jwks_url`.
-async fn start_jwt_server(auth_token: &str, jwks_url: &str, issuer: &str, allowed_origins: Vec<String>) -> PimbleServer {
-    let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+async fn start_jwt_server(auth_token: &str, jwks_url: &str, issuer: &str, allowed_origins: Vec<String>) -> TempServer {
+    let mut server = TempServer::with_config(|dir| ServerConfig {
         auth_token: Some(auth_token.to_string()),
         jwks_url: Some(jwks_url.parse().unwrap()),
         jwt_issuer: Some(issuer.to_string()),
         allowed_origins,
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     server.start().await.expect("server starts");
     server
@@ -219,14 +220,14 @@ async fn a_request_with_an_origin_header_is_refused_even_with_the_right_token() 
 #[tokio::test]
 async fn start_refuses_a_non_loopback_address_without_a_token_but_succeeds_with_one() {
     let mut without_token =
-        PimbleServer::with_config(ServerConfig { addr: "0.0.0.0:0".parse().unwrap(), ..Default::default() });
+        TempServer::with_config(|dir| ServerConfig { addr: "0.0.0.0:0".parse().unwrap(), ..ServerConfig::in_dir(dir) });
     let err = without_token.start().await.expect_err("binding 0.0.0.0 without a token must be refused");
     assert!(err.to_string().to_lowercase().contains("token"), "the refusal should explain why: {}", err);
 
-    let mut with_token = PimbleServer::with_config(ServerConfig {
+    let mut with_token = TempServer::with_config(|dir| ServerConfig {
         addr: "0.0.0.0:0".parse().unwrap(),
         auth_token: Some("secret".into()),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     with_token.start().await.expect("binding 0.0.0.0 with a token must succeed");
     with_token.stop().await.expect("stops cleanly");
@@ -234,18 +235,16 @@ async fn start_refuses_a_non_loopback_address_without_a_token_but_succeeds_with_
 
 #[tokio::test]
 async fn start_refuses_an_empty_or_whitespace_only_token_even_on_loopback() {
-    let mut empty = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+    let mut empty = TempServer::with_config(|dir| ServerConfig {
         auth_token: Some(String::new()),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     let err = empty.start().await.expect_err("an empty auth_token must be refused, even on loopback");
     assert!(err.to_string().to_lowercase().contains("empty"), "got: {}", err);
 
-    let mut whitespace = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+    let mut whitespace = TempServer::with_config(|dir| ServerConfig {
         auth_token: Some("   ".into()),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     whitespace.start().await.expect_err("a whitespace-only auth_token must be refused too");
 }
@@ -375,10 +374,9 @@ async fn access_token_query_parameter_authenticates_a_websocket_connection() {
 async fn origin_allowlist_admits_one_origin_and_refuses_another() {
     use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 
-    let mut with_allowlist = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+    let mut with_allowlist = TempServer::with_config(|dir| ServerConfig {
         allowed_origins: vec!["https://good.example".to_string()],
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     with_allowlist.start().await.expect("server starts");
     let ws_url = format!("ws://{}", with_allowlist.addr());
@@ -487,7 +485,7 @@ fn create_edit(title: &str, parent: pimble_core::NodeId) -> pimble_rpc::EditOper
 /// A plain store with a shared folder and something outside it, a server in
 /// JWT mode in front of it, and the service client that set it up.
 struct SharedStore {
-    _server: PimbleServer,
+    _server: TempServer,
     _dir: tempfile::TempDir,
     url: String,
     sk: SigningKey,
@@ -806,7 +804,7 @@ async fn a_returned_node_says_what_its_caller_may_change_of_it() {
 /// up: `transplantNode`'s "between stores" half needs two, unlike
 /// [`SharedStore`]'s one.
 struct TwoStores {
-    _server: PimbleServer,
+    _server: TempServer,
     _dir: tempfile::TempDir,
     admin: PimbleClient,
     sk: SigningKey,

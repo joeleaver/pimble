@@ -25,9 +25,9 @@ const PAST_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_500);
 /// for the test's duration so the directory isn't cleaned up early).
 async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_core::NodeId, tempfile::TempDir) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(store_manager);
-
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(store_manager, dir.path());
+
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
@@ -55,6 +55,28 @@ async fn set_text(
         .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "seed".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
+}
+
+/// What `store_id`'s index is doing, as `getStoreSync` says.
+async fn index_state(handler: &RpcHandler, store_id: pimble_core::StoreId) -> pimble_core::IndexState {
+    handler
+        .get_store_sync(&pimble_server::service_extensions(), pimble_rpc::GetStoreSyncRequest { store_id })
+        .await
+        .unwrap()
+        .index
+}
+
+/// Wait (up to `within`) until `store_id`'s index is ready; whether it got
+/// there.
+async fn wait_index_ready(handler: &RpcHandler, store_id: pimble_core::StoreId, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if index_state(handler, store_id).await.is_ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
 }
 
 async fn search(handler: &RpcHandler, query: &str, stores: Vec<pimble_core::StoreId>) -> pimble_rpc::SearchResponse {
@@ -301,6 +323,8 @@ async fn reopening_a_store_preserves_its_search_index() {
 
     handler.close_store(&pimble_server::service_extensions(), CloseStoreRequest { store_id }).await.unwrap();
     handler.open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: store_path }).await.unwrap();
+    // The index opens in the background (docs/STARTUP_CONTRACT.md).
+    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(10)).await, "the index opened again");
 
     let after = search(&handler, "persistent", vec![store_id]).await;
     assert_eq!(
@@ -363,4 +387,65 @@ async fn a_board_node_starts_with_its_board_and_its_words_are_found() {
     assert_eq!(response.results.len(), 1, "got {:?}", response.results);
     assert_eq!(response.results[0].node_id, node_id);
     assert_eq!(response.results[0].node_type, pimble_core::node_types::BOARD);
+}
+
+
+/// docs/STARTUP_CONTRACT.md: a store whose index another program holds
+/// answers its open at once, says so (`Held`), is named by search as still
+/// being indexed, and opens its index the moment it is let go: never
+/// rebuilt over (the directory, and what it found, are the same after).
+#[tokio::test]
+async fn a_locked_index_is_waited_for_and_never_rebuilt() {
+    use std::os::unix::fs::MetadataExt;
+    let (handler, store_id, root_id, dir) = new_handler_with_store().await;
+    let store_path = dir.path().join("test.pimble");
+    let doc_id = handler
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
+            store_id,
+            parent_id: Some(root_id),
+            node_type: "document".into(),
+            title: "Lighthouse".into(),
+            content: None,
+            custom: Default::default(),
+            place: Default::default(),
+        })
+        .await
+        .unwrap()
+        .node_id;
+    set_text(&handler, store_id, doc_id, "keepers of the lamp").await;
+    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(10)).await);
+    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
+    assert_eq!(search(&handler, "lamp", vec![store_id]).await.results.len(), 1);
+    handler.close_store(&pimble_server::service_extensions(), CloseStoreRequest { store_id }).await.unwrap();
+
+    // Another program holds the index (as pimble-mcp's server did after a
+    // hand-over, 2026-11-20).
+    let index_dir = store_path.join("index").join("rhypedb");
+    let inode = std::fs::metadata(index_dir.join("LOCK")).unwrap().ino();
+    // The handler's own schema (semantic when this build has it).
+    let holder = pimble_search::SearchIndex::open(&index_dir, true).unwrap();
+
+    let started = std::time::Instant::now();
+    let opened = handler.open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: store_path.clone() }).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1), "the open answers without its index: {:?}", started.elapsed());
+    assert!(opened.store.index.is_indexing(), "{:?}", opened.store.index);
+    let answer = search(&handler, "lamp", Vec::new()).await;
+    assert_eq!(answer.indexing, vec![store_id], "search says the store is still being indexed");
+    assert!(answer.results.is_empty());
+
+    // Still held after the quiet wait: said, and not rebuilt over.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while index_state(&handler, store_id).await != pimble_core::IndexState::Held {
+        assert!(tokio::time::Instant::now() < deadline, "the store says its index is held: {:?}", index_state(&handler, store_id).await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(std::fs::metadata(index_dir.join("LOCK")).unwrap().ino(), inode, "nothing deleted the held directory");
+
+    // Let go: it opens, as it was.
+    drop(holder);
+    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(5)).await, "opened once let go");
+    assert_eq!(std::fs::metadata(index_dir.join("LOCK")).unwrap().ino(), inode, "the same index, not a rebuilt one");
+    let found = search(&handler, "lamp", vec![store_id]).await;
+    assert_eq!(found.results.len(), 1, "what it held is found");
+    assert!(found.indexing.is_empty());
 }

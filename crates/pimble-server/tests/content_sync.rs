@@ -24,9 +24,9 @@ use tokio::sync::RwLock;
 /// duration so the directory isn't cleaned up early).
 async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_core::NodeId, tempfile::TempDir) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(store_manager);
-
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(store_manager, dir.path());
+
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler

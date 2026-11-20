@@ -12,14 +12,7 @@ use pimble_server::{local, PimbleServer, ServerConfig};
 use tempfile::TempDir;
 
 fn config(dir: &TempDir, addr: &str) -> ServerConfig {
-    ServerConfig {
-        addr: addr.parse().unwrap(),
-        credentials_path: Some(dir.path().join("credentials.json")),
-        keystore_path: Some(dir.path().join("keys.json")),
-        replicas_dir: Some(dir.path().join("replicas")),
-        agents_path: Some(dir.path().join("agents.json")),
-        ..Default::default()
-    }
+    ServerConfig { addr: addr.parse().unwrap(), ..ServerConfig::in_dir(dir.path()) }
 }
 
 /// The only test here that sets the environment (`PIMBLE_APP_ADDR` and the

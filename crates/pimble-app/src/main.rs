@@ -139,6 +139,7 @@ fn main() {
             .init();
     }
 
+    pimble_app::startup::began();
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application

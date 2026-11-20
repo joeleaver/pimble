@@ -448,9 +448,7 @@ mod against_a_server {
         super::set_plugins_dir(plugins);
 
         let mut server = PimbleServer::with_config(ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let url = format!("http://{}", server.addr());

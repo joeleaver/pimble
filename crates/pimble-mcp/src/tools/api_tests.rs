@@ -30,9 +30,7 @@ fn link_in(answer: &str) -> String {
 async fn links_paths_discussions_and_mounts_as_the_app_has_them() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());
@@ -78,10 +76,7 @@ async fn moves_and_deletes_are_judged_before_they_are_sent() {
     use pimble_api::plan;
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        agents_path: Some(dir.path().join("agents.json")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());
@@ -143,9 +138,7 @@ async fn moves_and_deletes_are_judged_before_they_are_sent() {
 async fn metanodes_are_set_described_and_listed() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());
@@ -198,9 +191,7 @@ async fn metanodes_are_set_described_and_listed() {
 async fn a_query_metanode_is_set_and_lists_its_finds() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());

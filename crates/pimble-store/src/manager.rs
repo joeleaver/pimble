@@ -247,6 +247,22 @@ impl StoreManager {
         Ok(id)
     }
 
+    /// Take a plain store loaded outside the manager's lock
+    /// (`LocalStore::open_in` with [`StoreManager::state_root`]) as open, as
+    /// [`StoreManager::open_local_store`] would have: the server reads a
+    /// store's documents without holding the manager, so several stores open
+    /// side by side (docs/STARTUP_CONTRACT.md). A store already open keeps
+    /// the copy it has, and the loaded one is dropped.
+    pub fn adopt_local_store(&mut self, path: impl AsRef<Path>, store: LocalStore) -> StoreId {
+        let id = store.id;
+        self.registry.register(id, StoreEndpoint::Local { path: path.as_ref().to_path_buf() });
+        if !self.is_open(id) {
+            self.local_stores.insert(id, store);
+            self.newly_opened.push(id);
+        }
+        id
+    }
+
     /// Drain and return the list of stores opened since the last call to
     /// this method. See the [`StoreManager::newly_opened`] field doc for why
     /// this exists.
@@ -299,6 +315,7 @@ impl StoreManager {
                 waiting: Vec::new(),
                 out_of_step: Vec::new(),
                 also_open_on: Vec::new(),
+                index: pimble_core::IndexState::Ready,
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -323,6 +340,7 @@ impl StoreManager {
                 waiting: Vec::new(),
                 out_of_step: Vec::new(),
                 also_open_on: Vec::new(),
+                index: pimble_core::IndexState::Ready,
             });
         }
         Err(StoreError::StoreNotFound(store_id))

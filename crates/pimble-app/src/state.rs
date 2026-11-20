@@ -739,6 +739,24 @@ pub struct AppStore {
     /// in (`BackendEvent::CloudConnectionChanged`); `None` until the server
     /// says, and from a server too old to.
     pub cloud_connection: Signal<Option<pimble_rpc::CloudConnection>>,
+    /// Whether the server has answered what account it holds since this
+    /// connection was made (docs/STARTUP_CONTRACT.md "Said"): until it has,
+    /// the status bar says "connecting..." with a spinner, never
+    /// "disconnected" or "sign in".
+    pub cloud_answer: Signal<CloudAnswer>,
+    /// The saved stores asked to open and not open yet, each a row of its
+    /// own in the explorer from the start (docs/STARTUP_CONTRACT.md "Each
+    /// saved store has its row at once").
+    pub opening_stores: Signal<Vec<OpeningStore>>,
+    /// The branches whose children were asked for and have taken longer
+    /// than `SLOW_CHILDREN_MS`: their rows show a spinner where the chevron
+    /// goes (docs/STARTUP_CONTRACT.md "Children loading").
+    pub slow_children: Signal<HashSet<(StoreId, NodeId)>>,
+    /// The branches whose children were asked for and have not arrived: a
+    /// row that appears expanded is not asked for again while its store's
+    /// first load is on its way, and the start is "ready" when this empties
+    /// (`startup::check`).
+    pub children_pending: Signal<HashSet<(StoreId, NodeId)>>,
 
     // "Account..." modal (Account menu, the status bar, and "Host on Pimble
     // Cloud..." with nothing signed in). One modal, two faces: the sign-in
@@ -1140,6 +1158,10 @@ impl AppStore {
             cloud_signed_in: Signal::new(false),
             cloud_email: Signal::new(String::new()),
             cloud_connection: Signal::new(None),
+            cloud_answer: Signal::new(CloudAnswer::Waiting),
+            opening_stores: Signal::new(Vec::new()),
+            slow_children: Signal::new(HashSet::new()),
+            children_pending: Signal::new(HashSet::new()),
             cloud_url: Signal::new(String::new()),
             settings: Signal::new(None),
             account_modal_url: Signal::new(String::new()),
@@ -1947,6 +1969,143 @@ impl AppStore {
     }
 
     /// Check if children have been loaded for a parent.
+    /// A saved store is asked to open: its row shows at once, "opening...",
+    /// unless a store from that folder is open already.
+    pub fn begin_opening(&self, path: &str) {
+        let open = self.all_store_local_paths().iter().any(|p| p == path);
+        if open {
+            return;
+        }
+        let known = untracked(|| self.opening_stores.with(|list| list.iter().any(|o| o.path == path)));
+        if known {
+            self.opening_stores.update(|list| {
+                if let Some(o) = list.iter_mut().find(|o| o.path == path) {
+                    o.error = None;
+                }
+            });
+        } else {
+            self.opening_stores.update(|list| list.push(OpeningStore::new(path)));
+        }
+        self.bump_tree_structure();
+    }
+
+    /// The store from `path` opened: its opening row goes (the store's own
+    /// row takes its place).
+    pub fn finish_opening(&self, path: &str) {
+        let known = untracked(|| self.opening_stores.with(|list| list.iter().any(|o| o.path == path)));
+        if known {
+            self.opening_stores.update(|list| list.retain(|o| o.path != path));
+            self.bump_tree_structure();
+        }
+    }
+
+    /// The store from `path` did not open: its row says why.
+    pub fn opening_failed(&self, path: &str, why: &str) {
+        let known = untracked(|| self.opening_stores.with(|list| list.iter().any(|o| o.path == path)));
+        if !known {
+            self.opening_stores.update(|list| list.push(OpeningStore::new(path)));
+        }
+        self.opening_stores.update(|list| {
+            if let Some(o) = list.iter_mut().find(|o| o.path == path) {
+                o.error = Some(why.to_string());
+            }
+        });
+        self.bump_tree_structure();
+    }
+
+    /// The opening store whose row is `value`, if it is one.
+    pub fn opening_row(&self, value: &str) -> Option<OpeningStore> {
+        let path = value.strip_prefix(OPENING_ROW)?;
+        untracked(|| self.opening_stores.with(|list| list.iter().find(|o| o.path == path).cloned()))
+    }
+
+    /// A store's search index changed state (docs/STARTUP_CONTRACT.md): its
+    /// row's "indexing" words follow the store's own signal.
+    pub fn set_index_state(&self, store_id: StoreId, state: pimble_core::IndexState) {
+        if let Some(sig) = self.get_store_signal(store_id) {
+            if untracked(|| sig.with(|s| s.index != state)) {
+                sig.update(|s| s.index = state);
+            }
+        }
+    }
+
+    /// What a search over `stores` (every open store when empty) says above
+    /// its results while some of them are still being indexed: "Personal is
+    /// still being indexed; results may be incomplete."
+    pub fn search_indexing_note(&self, stores: &[StoreId]) -> String {
+        // Tracked: the search panel's note follows each store's index.
+        let names: Vec<String> = self.store_ids.with(|ids| {
+            ids.iter()
+                .filter(|id| stores.is_empty() || stores.contains(id))
+                .filter_map(|id| self.store_data.with(|map| map.get(id).copied()))
+                .filter_map(|sig| sig.with(|s| s.index.is_indexing().then(|| s.name.clone())))
+                .collect()
+        });
+        pimble_core::IndexState::search_note(&names)
+    }
+
+    /// Children of `(store_id, node_id)` were asked for: after
+    /// `SLOW_CHILDREN_MS` without them, its row shows a spinner.
+    pub fn children_asked(&self, store_id: StoreId, node_id: NodeId) {
+        let new = untracked(|| self.children_pending.with(|set| !set.contains(&(store_id, node_id))));
+        if new {
+            self.children_pending.update(|set| {
+                set.insert((store_id, node_id));
+            });
+        }
+        let store = *self;
+        rinch::core::reactive::unowned(|| {
+            let _ = rinch::prelude::set_timeout(SLOW_CHILDREN_MS as u32, move || store.children_slow(store_id, node_id));
+        });
+    }
+
+    /// `SLOW_CHILDREN_MS` passed since children of `(store_id, node_id)`
+    /// were asked for: if they have not arrived, its row shows a spinner.
+    pub fn children_slow(&self, store_id: StoreId, node_id: NodeId) {
+        if self.has_children_loaded(store_id, node_id) {
+            return;
+        }
+        let new = untracked(|| self.slow_children.with(|set| !set.contains(&(store_id, node_id))));
+        if new {
+            self.slow_children.update(|set| {
+                set.insert((store_id, node_id));
+            });
+            self.bump_tree_structure();
+        }
+    }
+
+    /// Children of `(store_id, node_id)` arrived: no spinner.
+    pub fn children_arrived(&self, store_id: StoreId, node_id: NodeId) {
+        let pending = untracked(|| self.children_pending.with(|set| set.contains(&(store_id, node_id))));
+        if pending {
+            self.children_pending.update(|set| {
+                set.remove(&(store_id, node_id));
+            });
+        }
+        let was = untracked(|| self.slow_children.with(|set| set.contains(&(store_id, node_id))));
+        if was {
+            self.slow_children.update(|set| {
+                set.remove(&(store_id, node_id));
+            });
+        }
+    }
+
+    /// Whether children of `(store_id, node_id)` were asked for and are on
+    /// their way.
+    pub fn children_on_their_way(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        untracked(|| self.children_pending.with(|set| set.contains(&(store_id, node_id))))
+    }
+
+    /// Whether any branch's children are on their way.
+    pub fn children_pending_any(&self) -> bool {
+        untracked(|| self.children_pending.with(|set| !set.is_empty()))
+    }
+
+    /// Whether `(store_id, node_id)`'s row shows the children spinner.
+    pub fn children_loading(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        untracked(|| self.slow_children.with(|set| set.contains(&(store_id, node_id)))) && !self.has_children_loaded(store_id, node_id)
+    }
+
     pub fn has_children_loaded(&self, store_id: StoreId, node_id: NodeId) -> bool {
         untracked(|| self.children_of.with(|map| map.contains_key(&(store_id, node_id))))
     }
@@ -1968,6 +2127,29 @@ impl AppStore {
                 })
             }).collect()
         })
+    }
+
+    /// The open-store list to save: the open stores and the saved ones
+    /// still opening, in the saved order (`persistence::store_rank`). With
+    /// the stores opening side by side, saving only the open ones as each
+    /// opened would forget the rest if Pimble closed mid-start. A store that
+    /// could not open is left out, as before (decided in
+    /// docs/STARTUP_CONTRACT.md "Built").
+    pub fn store_paths_to_save(&self) -> Vec<String> {
+        let mut paths = self.all_store_local_paths();
+        let opening: Vec<String> = untracked(|| self.opening_stores.with(|list| list.iter().filter(|o| o.error.is_none()).map(|o| o.path.clone()).collect()));
+        for path in opening {
+            if paths.contains(&path) {
+                continue;
+            }
+            let rank = crate::persistence::store_rank(&path);
+            let at = rank.and_then(|rank| paths.iter().position(|p| crate::persistence::store_rank(p).is_none_or(|r| r > rank)));
+            match at {
+                Some(at) => paths.insert(at, path),
+                None => paths.push(path),
+            }
+        }
+        paths
     }
 
     /// Update mount info for a node. Call this whenever a node is inserted into the cache.
@@ -2239,7 +2421,22 @@ impl AppStore {
         let paste = self.mount_source.with(|s| s.is_some());
         FOUND_ROWS.with(|rows| rows.borrow_mut().clear());
         let mut result = Vec::new();
+        // The saved stores still opening, each a row in its saved place
+        // (docs/STARTUP_CONTRACT.md); the label carries what the row draws.
+        let mut opening: Vec<(Option<usize>, TreeNodeData)> = self.opening_stores.with(|list| {
+            list.iter()
+                .map(|o| {
+                    let rank = crate::persistence::store_rank(&o.path);
+                    (rank, TreeNodeData::new(format!("{OPENING_ROW}{}", o.path), format!("{}|{}", o.name, o.error.clone().unwrap_or_default())))
+                })
+                .collect()
+        });
         for &sid in &store_ids {
+            // An opening row placed before this store goes first.
+            let store_rank = self.store_data.with(|map| map.get(&sid).map(|sig| sig.with(crate::persistence::store_order_key))).and_then(|k| crate::persistence::store_rank(&k));
+            while let Some(i) = opening.iter().position(|(r, _)| matches!((r, store_rank), (Some(r), Some(sr)) if *r < sr) || (r.is_some() && store_rank.is_none())) {
+                result.push(opening.remove(i).1);
+            }
             let store_info = self.store_data.with(|map| {
                 map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id, s.roots.clone(), s.ended_roots.clone())))
             });
@@ -2282,12 +2479,16 @@ impl AppStore {
             // anything goes off, "Remove Replica..." stays).
             let roots_key: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
             let ended_key: Vec<String> = ended_roots.iter().map(|r| r.to_string()).collect();
+            // A whole store's root children slow to come: the store row
+            // draws the spinner where its chevron goes (docs/STARTUP_CONTRACT.md).
+            let loading = roots.is_empty() && self.children_loading(sid, root_id);
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
                 format!(
-                    "{store_name} (linked: {linked}, relay: {relay:?}, paste: {paste}, {access}, {root_appearance}, roots: {}, ended: {})",
+                    "{store_name} (linked: {linked}, relay: {relay:?}, paste: {paste}, {access}, {root_appearance}, roots: {}, ended: {}{})",
                     roots_key.join(","),
-                    ended_key.join(",")
+                    ended_key.join(","),
+                    if loading { ", loading" } else { "" }
                 ),
             );
             // A whole store's row stands for its root: the root's children hang
@@ -2315,6 +2516,7 @@ impl AppStore {
                 result.push(store_node.with_children(children));
             }
         }
+        result.extend(opening.into_iter().map(|(_, row)| row));
         result
     }
 
@@ -2405,17 +2607,23 @@ impl AppStore {
                 )
             });
         }
+        // Children asked for and slow to come: the row draws a spinner where
+        // its chevron goes (docs/STARTUP_CONTRACT.md "Children loading"),
+        // and has no placeholder child meanwhile, so rinch draws the spacer
+        // the spinner sits on.
+        let loading = self.children_loading(child_store, child_id);
         let tree_node = TreeNodeData::new(
             value.clone(),
             format!(
-                "{}|{}{}|{}|{}{}{}",
+                "{}|{}{}|{}|{}{}{}{}",
                 if paste { "paste" } else { "" },
                 access,
                 source_access,
                 if held_as_share { "theirs" } else { "" },
                 appearance,
                 found_note,
-                out_of_step
+                out_of_step,
+                if loading { "|loading" } else { "" }
             ),
         );
 
@@ -2467,6 +2675,8 @@ impl AppStore {
 
         if has_children {
             tree_node.with_children(children_data)
+        } else if loading {
+            tree_node
         } else if is_mount && !has_loaded_children {
             let placeholder = TreeNodeData::new(
                 format!("mount_loading_{}_{}{}", child_store, child_id, suffix),
@@ -2555,6 +2765,61 @@ pub fn parse_tree_value(value: &str) -> Option<(StoreId, Option<NodeId>)> {
         None
     }
 }
+
+/// Whether the server said what account it holds (`AppStore::cloud_answer`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CloudAnswer {
+    /// Asked, or about to be: "connecting...".
+    #[default]
+    Waiting,
+    /// Answered (`CloudStatusChanged`).
+    Answered,
+    /// Asking failed, with why: "disconnected".
+    Failed(String),
+}
+
+/// A saved store asked to open and not open yet (`AppStore::opening_stores`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningStore {
+    /// The folder, as the saved list names it.
+    pub path: String,
+    /// What its row says until it opens: the folder's name less `.pimble`.
+    pub name: String,
+    /// Why it did not open, once it did not.
+    pub error: Option<String>,
+}
+
+impl OpeningStore {
+    pub fn new(path: &str) -> Self {
+        let file = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+        let name = file.strip_suffix(".pimble").map(str::to_string).unwrap_or(file);
+        Self { path: path.to_string(), name, error: None }
+    }
+
+    /// What its row says beside the name: "opening..." or why not.
+    pub fn row_words(&self) -> String {
+        match &self.error {
+            None => "opening...".to_string(),
+            Some(_) => "could not open".to_string(),
+        }
+    }
+
+    /// The row's tooltip.
+    pub fn row_tooltip(&self) -> String {
+        match &self.error {
+            None => format!("Opening {}.", self.path),
+            Some(why) => format!("{} could not be opened: {why}", self.path),
+        }
+    }
+}
+
+/// The tree value of an opening store's row: never a store's or a node's
+/// (`parse_tree_value` names neither for it).
+pub const OPENING_ROW: &str = "opening_";
+
+/// How long a branch's children may take before its row shows a spinner,
+/// so a fast load does not flicker (docs/STARTUP_CONTRACT.md).
+pub const SLOW_CHILDREN_MS: u64 = 150;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum ConnectionState {
@@ -2733,6 +2998,86 @@ mod tests {
     /// here turns off), so sharing from this computer and stopping both have
     /// to change the row's data, and `set_store_relay` says when they did
     /// (docs/RELAY_CONTRACT.md; CLAUDE.md "Hardening", the row data rule).
+    /// docs/STARTUP_CONTRACT.md: a saved store asked to open has its row at
+    /// once, named from its folder, saying "opening..."; one that fails says
+    /// why on the same row (its data carries the error, so the row is drawn
+    /// again); one that opens leaves the opening row for its own.
+    #[test]
+    fn a_saved_store_has_its_row_while_it_opens_and_says_why_if_it_cannot() {
+        let (app, _, _) = store_with_a_child();
+        app.begin_opening("/home/me/Dropbox/Personal.pimble");
+        app.begin_opening("/tmp/notes.pimble"); // open already: no second row
+        let rows = untracked(|| app.build_tree_data_structural());
+        let values: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert_eq!(rows[1].value, format!("{OPENING_ROW}/home/me/Dropbox/Personal.pimble"));
+        let opening = app.opening_row(&rows[1].value).expect("the row is an opening store's");
+        assert_eq!(opening.name, "Personal");
+        assert_eq!(opening.row_words(), "opening...");
+        assert!(parse_tree_value(&rows[1].value).is_none(), "no store or node acts on it");
+        assert!(app.store_paths_to_save().contains(&"/home/me/Dropbox/Personal.pimble".to_string()), "a store still opening stays in the saved list");
+
+        app.opening_failed("/home/me/Dropbox/Personal.pimble", "The folder is not there.");
+        let failed = untracked(|| app.build_tree_data_structural());
+        assert_ne!(rows[1].label, failed[1].label, "the row is drawn again with why");
+        let opening = app.opening_row(&failed[1].value).unwrap();
+        assert_eq!(opening.row_words(), "could not open");
+        assert_eq!(opening.row_tooltip(), "/home/me/Dropbox/Personal.pimble could not be opened: The folder is not there.");
+        assert!(!app.store_paths_to_save().contains(&"/home/me/Dropbox/Personal.pimble".to_string()), "one that could not open is not saved");
+
+        // Asked again (a reconnect) it is opening again; once open, its row goes.
+        app.begin_opening("/home/me/Dropbox/Personal.pimble");
+        assert_eq!(app.opening_row(&failed[1].value).unwrap().error, None);
+        app.finish_opening("/home/me/Dropbox/Personal.pimble");
+        assert_eq!(untracked(|| app.build_tree_data_structural()).len(), 1);
+    }
+
+    /// A branch whose children are slow (past `SLOW_CHILDREN_MS`) is drawn
+    /// with no placeholder child, so rinch draws the spacer the spinner sits
+    /// on, and its data says so; when they arrive it is an ordinary row.
+    #[test]
+    fn a_branch_slow_to_load_shows_a_spinner_until_its_children_arrive() {
+        let (app, store_id, child_id) = store_with_a_child();
+        let mut child = untracked(|| app.get_node_signal(store_id, child_id).unwrap().get());
+        let grandchild = Node::document("Soup");
+        child.children = vec![grandchild.id];
+        app.upsert_node(store_id, child);
+        let row = |app: &AppStore| untracked(|| app.build_tree_data_structural())[0].children[0].clone();
+        let before = row(&app);
+        assert_eq!(before.children.len(), 1, "an unloaded branch has its placeholder");
+
+        app.children_slow(store_id, child_id);
+        assert!(app.children_loading(store_id, child_id));
+        let loading = row(&app);
+        assert!(loading.children.is_empty(), "no placeholder while the spinner shows");
+        assert!(loading.label.ends_with("|loading"), "{}", loading.label);
+
+        app.set_children(store_id, child_id, vec![(store_id, grandchild.id)]);
+        app.children_arrived(store_id, child_id);
+        assert!(!app.children_loading(store_id, child_id));
+        let loaded = row(&app);
+        assert!(!loaded.label.contains("loading"));
+
+        // Children already there are never slow.
+        app.children_slow(store_id, child_id);
+        assert!(!app.children_loading(store_id, child_id));
+    }
+
+    /// A store's index state rides its own signal (the row's words follow it
+    /// without a rebuild), and a search over it says it is still indexed.
+    #[test]
+    fn a_store_being_indexed_says_so_on_its_row_and_in_search() {
+        let (app, store_id, _) = store_with_a_child();
+        assert_eq!(app.search_indexing_note(&[]), "");
+        app.set_index_state(store_id, pimble_core::IndexState::Rebuilding { done: 0, total: 484 });
+        let words = untracked(|| app.get_store_signal(store_id).unwrap().with(|s| s.index.row_words()));
+        assert_eq!(words, "indexing 484 notes");
+        assert_eq!(app.search_indexing_note(&[]), "Notes is still being indexed; results may be incomplete.");
+        assert_eq!(app.search_indexing_note(&[StoreId::new()]), "", "a search not covering it says nothing");
+        app.set_index_state(store_id, pimble_core::IndexState::Ready);
+        assert_eq!(app.search_indexing_note(&[store_id]), "");
+    }
+
     #[test]
     fn store_row_data_carries_the_relay_side() {
         let (app, store_id, _) = store_with_a_child();

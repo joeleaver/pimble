@@ -79,13 +79,11 @@ async fn start_server(token: Option<&str>) -> Server {
     let replicas = tempfile::tempdir().unwrap();
     let credentials = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: token.map(String::from),
         credentials_path: Some(credentials.path().join("credentials.json")),
         // Inside the temp directory: each store's state lives beside the
         // replicas (docs/STORE_FOLDERS_CONTRACT.md rule 1).
-        replicas_dir: Some(replicas.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(replicas.path())
     });
     server.start().await.expect("server starts");
 

@@ -82,11 +82,7 @@ async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId,
 async fn start_local_server() -> (PimbleServer, PimbleClient, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.path().join("keys.json")),
-        credentials_path: Some(dir.path().join("credentials.json")),
-        replicas_dir: Some(dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("local server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
@@ -512,14 +508,10 @@ async fn spawn_env() -> Env {
 
     let h_service_token = "h-service-token".to_string();
     let mut h = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(h_service_token.clone()),
         jwks_url: Some(jwks_url.parse().unwrap()),
         jwt_issuer: Some(issuer),
-        keystore_path: Some(h_dir.path().join("keys.json")),
-        credentials_path: Some(h_dir.path().join("credentials.json")),
-        replicas_dir: Some(h_dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(h_dir.path())
     });
     h.start().await.expect("H starts");
 
@@ -799,11 +791,7 @@ async fn a_replica_from_before_the_progress_file_pushes_what_the_remote_lacks() 
 
     let dir = a_dir.path();
     let mut a2 = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.join("keys.json")),
-        credentials_path: Some(dir.join("credentials.json")),
-        replicas_dir: Some(dir.join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     a2.start().await.expect("restarted server starts");
     let client_a2 = PimbleClient::connect(format!("http://{}", a2.addr())).await.unwrap();
@@ -890,11 +878,7 @@ async fn adopting_a_hosted_replica_starts_no_plain_link_beside_its_vault_link() 
 
     let dir = b_dir.path();
     let mut b2 = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.join("keys.json")),
-        credentials_path: Some(dir.join("credentials.json")),
-        replicas_dir: Some(dir.join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     b2.start().await.expect("restarted server starts");
     let client_b2 = PimbleClient::connect(format!("http://{}", b2.addr())).await.expect("client connects to restarted server");
@@ -1156,11 +1140,7 @@ async fn restarting_a_server_resumes_the_vault_link_without_losing_or_duplicatin
     // use) — `openStore` should restart the vault link from `sync.json`.
     let dir = a_dir.path();
     let mut a2 = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.join("keys.json")),
-        credentials_path: Some(dir.join("credentials.json")),
-        replicas_dir: Some(dir.join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     a2.start().await.expect("restarted server starts");
     let client_a2 = PimbleClient::connect(format!("http://{}", a2.addr())).await.expect("client connects to restarted server");
@@ -1471,11 +1451,7 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
     // nothing moved the share's root.
     b.stop().await.unwrap();
     let mut b = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(b_dir.path().join("keys.json")),
-        credentials_path: Some(b_dir.path().join("credentials.json")),
-        replicas_dir: Some(b_dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(b_dir.path())
     });
     b.start().await.unwrap();
     let bob = PimbleClient::connect(format!("http://{}", b.addr())).await.unwrap();
@@ -1720,14 +1696,10 @@ async fn interop_with_the_real_accounts_service() {
     let jwks_url = format!("{issuer}/.well-known/jwks.json");
 
     let mut h = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(h_token.clone()),
         jwks_url: Some(jwks_url.parse().unwrap()),
         jwt_issuer: Some(issuer),
-        keystore_path: Some(h_dir.path().join("keys.json")),
-        credentials_path: Some(h_dir.path().join("credentials.json")),
-        replicas_dir: Some(h_dir.path().join("replicas")),
-        ..Default::default()
+        ..ServerConfig::in_dir(h_dir.path())
     });
     h.start().await.expect("H starts");
     let h_addr = h.addr();

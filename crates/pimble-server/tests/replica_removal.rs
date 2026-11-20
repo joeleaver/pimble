@@ -45,9 +45,13 @@ async fn start_server() -> (PimbleServer, PimbleClient) {
 #[tokio::test]
 async fn remove_replica_refuses_ordinary_stores_and_removes_replicas() {
     let fake_data_home = tempfile::tempdir().unwrap();
-    // Safe: this test binary is its own process (see the module doc).
+    let fake_config_home = tempfile::tempdir().unwrap();
+    // Safe: this test binary is its own process (see the module doc). The
+    // config directory too, so the default keystore, saved credentials and
+    // agents file are never the real ones.
     unsafe {
         std::env::set_var("XDG_DATA_HOME", fake_data_home.path());
+        std::env::set_var("XDG_CONFIG_HOME", fake_config_home.path());
     }
 
     let (mut server_b, client_b) = start_server().await;

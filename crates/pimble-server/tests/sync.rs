@@ -37,7 +37,13 @@ where
 /// Start a `PimbleServer` bound to an OS-assigned loopback port and return
 /// it plus a `PimbleClient` already connected to it.
 async fn start_server() -> (PimbleServer, PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+    // Each server its own data directory: two servers in one process holding
+    // the same store (a store and its replica) would otherwise share its
+    // search index's directory, and since 2026-11-20 a held index is waited
+    // for, never wiped and rebuilt (docs/STARTUP_CONTRACT.md); before, the
+    // replica's open deleted the other's index and this test passed by it.
+    let data = std::env::temp_dir().join(format!("pimble-sync-test-{}", uuid::Uuid::new_v4()));
+    let mut server = PimbleServer::with_config(ServerConfig::in_dir(&data));
     server.start().await.expect("server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)
@@ -353,14 +359,19 @@ async fn a_node_created_and_edited_on_remote_is_searchable_locally_after_sync() 
     let node_id = client_b.create_node(store_id, Some(root_id), "document", "Quokka Doc").await.unwrap();
     seed_content(&client_b, store_id, node_id, "client-b", "quokka").await;
 
-    let found = wait_until(Duration::from_secs(5), || async {
+    // The replica's index opens in the background, after the embedding
+    // model's warm-up, which waits for the first index to want it
+    // (docs/STARTUP_CONTRACT.md): longer than the content debounce alone.
+    let found = wait_until(Duration::from_secs(20), || async {
         client_a
             .search("quokka", vec![store_id], false, 10)
             .await
             .map(|results| results.iter().any(|r| r.node_id == node_id))
             .unwrap_or(false)
     }).await;
-    assert!(found, "a node created and edited on B should be searchable on A once synced");
+    let index = client_a.get_store_sync_response(store_id).await.map(|r| r.index);
+    let listed = client_a.search_response("quokka", vec![store_id], false, 10).await;
+    assert!(found, "a node created and edited on B should be searchable on A once synced (A's index: {index:?}, answer: {listed:?})");
 }
 
 // ── 8. Restart ───────────────────────────────────────────────────────

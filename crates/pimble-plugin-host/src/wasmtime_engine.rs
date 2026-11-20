@@ -369,6 +369,51 @@ impl GuestEngine for WasmGuest {
     }
 }
 
+/// Where compiled plugins are kept between runs: `<cache dir>/pimble/plugins/`.
+fn compiled_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PIMBLE_PLUGIN_CACHE") {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::cache_dir().map(|d| d.join("pimble").join("plugins"))
+}
+
+/// `bytes` compiled for the one engine, from the cache when this exact module
+/// was compiled by this exact wasmtime before (docs/STARTUP_CONTRACT.md:
+/// compiling the three bundled viewers took about 8 s of a start on a busy
+/// machine, 2026-11-20). The cache is keyed by the module's SHA-256 and the
+/// engine's compatibility hash, written atomically, and lives in this user's
+/// own cache directory; anything unreadable there is compiled again.
+fn compiled(bytes: &[u8]) -> wasmtime::Result<Module> {
+    use sha2::{Digest, Sha256};
+    use std::hash::{Hash, Hasher};
+    let Some(dir) = compiled_cache_dir() else { return Module::new(engine(), bytes) };
+    let digest = Sha256::digest(bytes);
+    let mut compat = std::collections::hash_map::DefaultHasher::new();
+    engine().precompile_compatibility_hash().hash(&mut compat);
+    let name: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}-{:016x}.cwasm", compat.finish()));
+    if path.exists() {
+        // SAFETY: the file is one this function wrote with `Module::serialize`
+        // for an engine of the same compatibility hash, in the user's own
+        // cache directory; wasmtime checks its header and version.
+        match unsafe { Module::deserialize_file(engine(), &path) } {
+            Ok(module) => return Ok(module),
+            Err(e) => tracing::info!("plugins: the compiled copy {} was not usable ({e}); compiling again", path.display()),
+        }
+    }
+    let started = std::time::Instant::now();
+    let module = Module::new(engine(), bytes)?;
+    tracing::info!("plugins: compiled a module in {:.1}s", started.elapsed().as_secs_f64());
+    if let Ok(serialized) = module.serialize() {
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, serialized).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(module)
+}
+
 /// How long one guest turn may run before the plugin is stopped.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(2);
 
@@ -384,7 +429,7 @@ pub fn load_file(path: &Path, budget: Duration) -> Result<Plugin, (Option<Manife
 /// [`load_file`] for a module already in memory.
 pub fn load_bytes(path: &Path, bytes: &[u8], budget: Duration) -> Result<Plugin, (Option<Manifest>, String)> {
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-    let module = Module::new(engine(), bytes)
+    let module = compiled(bytes)
         .map_err(|e| (None, format!("The plugin {file} is not a WebAssembly module Pimble can run: {}.", first_line(&e))))?;
     let mut guest = WasmGuest::new(&module, 0, budget).map_err(|f| (None, f.sentence(&file)))?;
     let bytes = match guest.call(Call::Describe) {

@@ -47,6 +47,10 @@ pub fn server_url() -> String {
 }
 
 const MAX_CONNECT_ATTEMPTS: u32 = 6;
+/// How often, and how long apart, a server that agreed to hand over is
+/// looked at again before its waits count as attempts (about 6 s).
+const MAX_HANDING_OVER_WAITS: u32 = 40;
+const HANDING_OVER_WAIT_MS: u64 = 150;
 const BASE_RETRY_MS: u64 = 250;
 /// Upper bound on probing an existing server. A foreign listener on our port
 /// (anything that accepts TCP but never speaks JSON-RPC) must fail fast.
@@ -220,7 +224,13 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
     let url = server_url();
     let attempts = if join_only { MAX_CONNECT_ATTEMPTS + 4 } else { MAX_CONNECT_ATTEMPTS };
 
-    for attempt in 0..attempts {
+    // A server handing over writes everything, closes its stores and lets
+    // go of their indexes before it frees the port (docs/STARTUP_CONTRACT.md
+    // "Hand-over releases everything"): waiting for it is not a failed
+    // attempt, up to a bound.
+    let mut handing_over_waits = 0u32;
+    let mut attempt = 0u32;
+    while attempt < attempts {
         // First, try connecting to an existing server (another Pimble instance),
         // verifying it is really ours with a cheap call. Bounded by PROBE_TIMEOUT.
         match tokio::time::timeout(PROBE_TIMEOUT, probe(&url, &addr)).await {
@@ -229,9 +239,15 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
                 return Ok((client, None));
             }
             Ok(Some(Found::TooOld(sentence))) => return Err(sentence),
-            Ok(Some(Found::HandingOver)) => {
+            Ok(Some(Found::HandingOver)) if handing_over_waits < MAX_HANDING_OVER_WAITS => {
                 // Give it a moment to write everything and free the port.
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                handing_over_waits += 1;
+                tokio::time::sleep(Duration::from_millis(HANDING_OVER_WAIT_MS)).await;
+                continue;
+            }
+            Ok(Some(Found::HandingOver)) => {
+                tokio::time::sleep(Duration::from_millis(HANDING_OVER_WAIT_MS)).await;
+                attempt += 1;
                 continue;
             }
             Ok(None) => {}
@@ -243,6 +259,7 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
 
         if join_only {
             tokio::time::sleep(Duration::from_millis(BASE_RETRY_MS * 2)).await;
+            attempt += 1;
             continue;
         }
 
@@ -289,6 +306,7 @@ async fn connect_or_start(join_only: bool) -> Result<(PimbleClient, Option<Pimbl
             tracing::debug!("Retrying connection in {:?} (attempt {})", delay, attempt + 1);
             tokio::time::sleep(delay).await;
         }
+        attempt += 1;
     }
 
     Err(format!(

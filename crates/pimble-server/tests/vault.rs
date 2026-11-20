@@ -6,6 +6,8 @@
 //! and relays opaque blobs, so plain byte strings stand in for ciphertext
 //! throughout these tests.
 
+mod isolated;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -15,13 +17,14 @@ use ed25519_dalek::{Signer, SigningKey};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreId, StoreKind};
 use pimble_rpc::{StoreChangeKind, VaultDocId};
-use pimble_server::{PimbleServer, ServerConfig};
+use pimble_server::ServerConfig;
+use isolated::TempServer;
 use serde_json::json;
 
 /// Start a `PimbleServer` bound to an OS-assigned loopback port and return
 /// it plus a `PimbleClient` already connected to it (mirrors `tests/sync.rs`).
-async fn start_server() -> (PimbleServer, PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+async fn start_server() -> (TempServer, PimbleClient) {
+    let mut server = TempServer::isolated();
     server.start().await.expect("server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)
@@ -109,13 +112,12 @@ fn make_jwt_with_claims(
     format!("{signing_input}.{sig_b64}")
 }
 
-async fn start_jwt_server(auth_token: &str, jwks_url: &str, issuer: &str) -> PimbleServer {
-    let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
+async fn start_jwt_server(auth_token: &str, jwks_url: &str, issuer: &str) -> TempServer {
+    let mut server = TempServer::with_config(|dir| ServerConfig {
         auth_token: Some(auth_token.to_string()),
         jwks_url: Some(jwks_url.parse().unwrap()),
         jwt_issuer: Some(issuer.to_string()),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir)
     });
     server.start().await.expect("server starts");
     server
@@ -531,7 +533,7 @@ async fn listed_nodes(client: &PimbleClient, store_id: StoreId) -> std::collecti
 /// A vault store with a published share and a document outside it, behind
 /// a server in JWT mode.
 struct SharedVault {
-    server: PimbleServer,
+    server: TempServer,
     dir: tempfile::TempDir,
     url: String,
     sk: SigningKey,

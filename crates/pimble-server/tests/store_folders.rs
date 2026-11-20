@@ -18,12 +18,7 @@ use tempfile::TempDir;
 /// A server whose every path is inside `dir` (a computer of its own).
 async fn computer(dir: &TempDir) -> (PimbleServer, PimbleClient) {
     let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        keystore_path: Some(dir.path().join("keys.json")),
-        credentials_path: Some(dir.path().join("credentials.json")),
-        replicas_dir: Some(dir.path().join("replicas")),
-        agents_path: Some(dir.path().join("agents.json")),
-        ..Default::default()
+        ..ServerConfig::in_dir(dir.path())
     });
     server.start().await.expect("server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
@@ -152,6 +147,13 @@ async fn an_older_pimble_on_another_computer_is_named() {
     let own: Vec<_> = std::fs::read_dir(path.join("computers")).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(own.len(), 2, "this computer says it is there too: {own:?}");
     assert!(!path.join("index").exists(), "the search index is not in the folder");
+    // It opens in the background (docs/STARTUP_CONTRACT.md).
+    for _ in 0..200 {
+        if client.get_store_sync_response(store.id).await.unwrap().index.is_ready() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert!(dir.path().join("stores").join(store.id.to_string()).join("index").exists(), "it is in this computer's state directory");
     server.stop().await.unwrap();
 }

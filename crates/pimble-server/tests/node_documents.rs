@@ -41,8 +41,8 @@ async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::Tem
 /// test that reads a tree or makes a replica directly.
 async fn new_handler_with_store_and_manager() -> (RpcHandler, StoreId, NodeId, tempfile::TempDir, Arc<RwLock<StoreManager>>) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(Arc::clone(&store_manager));
     let dir = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(Arc::clone(&store_manager), dir.path());
     let create_resp = handler
         .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
             kind: Default::default(),
@@ -52,6 +52,7 @@ async fn new_handler_with_store_and_manager() -> (RpcHandler, StoreId, NodeId, t
         })
         .await
         .unwrap();
+    index_ready(&handler, create_resp.store_id).await;
     (handler, create_resp.store_id, create_resp.root_node_id, dir, store_manager)
 }
 
@@ -369,4 +370,19 @@ async fn move_nodes_keeps_their_order_and_refuses_all_or_nothing() {
     assert!(refused.is_err());
     assert_eq!(children_of(&handler, store_id, c).await, Vec::<NodeId>::new(), "nothing moved");
     assert_eq!(children_of(&handler, store_id, root_id).await, top);
+}
+
+/// Wait until `store_id`'s search index, opened in the background, is ready
+/// (docs/STARTUP_CONTRACT.md), so its state changes are not among the
+/// notifications a test counts.
+async fn index_ready(handler: &RpcHandler, store_id: StoreId) {
+    use pimble_rpc::PimbleApiServer as _;
+    for _ in 0..400 {
+        let state = handler.get_store_sync(&pimble_server::service_extensions(), pimble_rpc::GetStoreSyncRequest { store_id }).await.unwrap().index;
+        if state.is_ready() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the store's index never became ready");
 }

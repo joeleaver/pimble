@@ -252,6 +252,26 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
         // What only the server's operator does goes over the connection
         // itself; asking for it here connects again first if it closed.
         let host = local.client().await.ok();
+        // The saved stores open side by side, and the account is asked
+        // beside them, never behind them (docs/STARTUP_CONTRACT.md): each a
+        // task of its own, answered when it is done. Every other command
+        // keeps its turn in the line.
+        let name = command_name(&cmd);
+        if matches!(cmd, BackendCommand::OpenStore { .. } | BackendCommand::CloudStatus | BackendCommand::LoadChildren { .. }) {
+            let (api, event_tx, signal_ui, client_id) = (api.clone(), event_tx.clone(), signal_ui.clone(), client_id.clone());
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let ctx = Context { api: &api, host, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
+                if let Some(event) = process_command(&ctx, cmd).await {
+                    let _ = event_tx.try_send(event);
+                    signal_ui();
+                }
+                said_if_slow(&name, started, None);
+            });
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let waiting = cmd_rx.len();
         let ctx = Context { api: &api, host, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
         // An import is many commands, each answered as the UI's own would be
         // (docs/IMPORT_CONTRACT.md).
@@ -270,11 +290,34 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
             let _ = event_tx.try_send(event);
             signal_ui();
         }
+        said_if_slow(&name, started, Some(waiting));
     }
 
     // The window closed: only a server this process started is stopped.
     local.shut_down().await;
 }
+
+/// A command's name for the log: its variant.
+fn command_name(cmd: &BackendCommand) -> String {
+    let full = format!("{cmd:?}");
+    full.split([' ', '{', '(']).next().unwrap_or_default().to_string()
+}
+
+/// A command that took a while says so in the log, with how many waited
+/// behind it (docs/STARTUP_CONTRACT.md: what a slow start was spent on is in
+/// the log, for diagnostics too).
+fn said_if_slow(name: &str, started: std::time::Instant, waiting: Option<usize>) {
+    let took = started.elapsed();
+    if took >= SLOW_COMMAND {
+        match waiting {
+            Some(n) => tracing::info!("command {name} took {} ms ({n} waiting behind it)", took.as_millis()),
+            None => tracing::info!("command {name} took {} ms (beside the line)", took.as_millis()),
+        }
+    }
+}
+
+/// What counts as a slow command.
+const SLOW_COMMAND: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// `process_command`, as `crate::import` asks it.
 struct Desktop<'a, 'b> {
@@ -300,11 +343,7 @@ mod import_tests {
     async fn imports_land_under_the_chosen_node() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = PimbleServer::with_config(ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            keystore_path: Some(dir.path().join("keys.json")),
-            credentials_path: Some(dir.path().join("credentials.json")),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..ServerConfig::in_dir(dir.path())
         });
         server.start().await.unwrap();
         let c = std::sync::Arc::new(PimbleClient::connect(format!("http://{}", server.addr())).await.unwrap());

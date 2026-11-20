@@ -1056,6 +1056,15 @@ fn search_field(store: AppStore, key: &str, pick: fn(&SearchRow) -> String) -> S
     item.map(|item| search_rows(store, vec![item]).first().map(pick).unwrap_or_default()).unwrap_or_default()
 }
 
+/// What the search panel says above its results while a store it searched
+/// is still being indexed; nothing while no search is shown.
+fn search_indexing_note(store: AppStore) -> String {
+    if store.search_results.with(|state| matches!(state, SearchState::Idle)) {
+        return String::new();
+    }
+    store.search_indexing_note(&[])
+}
+
 /// What the search panel says in place of a list, if anything.
 fn search_message(store: AppStore) -> String {
     store.search_results.with(|state| match state {
@@ -1107,6 +1116,61 @@ impl StatusPart {
             Light::Quiet => "pimble-status-bar__dot",
         }
     }
+
+    /// Whether the part is waiting on something: it shows a small spinner
+    /// in place of its dot (docs/STARTUP_CONTRACT.md "Said").
+    fn spinning(&self) -> bool {
+        self.light == Light::Waiting
+    }
+}
+
+/// The row of a saved store still opening, or one that did not open
+/// (docs/STARTUP_CONTRACT.md "Each saved store has its row at once"): the
+/// store row's look, a spinner while it opens, and why not once it did not.
+fn opening_row_view(__scope: &mut RenderScope, opening: &crate::state::OpeningStore) -> NodeHandle {
+    let icon_el = render_tabler_icon(__scope, if opening.error.is_some() { TablerIcon::DatabaseX } else { TablerIcon::Database }, TablerIconStyle::Outline);
+    let failed = opening.error.is_some();
+    let words = opening.row_words();
+    let tooltip = opening.row_tooltip();
+    let name = opening.name.clone();
+    rsx! {
+        span {
+            class: "rinch-tree__label",
+            style: "flex: 1; min-width: 0; display: inline-flex; align-items: center;",
+            title: tooltip,
+            span { class: "rinch-tree__icon", {icon_el} }
+            span {
+                style: "cursor: default; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.03em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.7;",
+                {name}
+            }
+            span {
+                class: "pimble-tree__opening-spinner",
+                style: if failed { "display: none;" } else { "" },
+                Loader { size: "xs" }
+            }
+            span {
+                class: if failed { "pimble-tree__opening pimble-tree__opening--failed" } else { "pimble-tree__opening" },
+                {words}
+            }
+        }
+    }
+}
+
+/// The Pimble Cloud part as the status bar shows it: "connecting..." until
+/// the server has said what account it holds, "disconnected" only once
+/// asking failed, and [`cloud_part`] after (docs/STARTUP_CONTRACT.md).
+fn cloud_status_part(answer: &crate::state::CloudAnswer, signed_in: bool, email: &str, connection: Option<&pimble_rpc::CloudConnection>) -> StatusPart {
+    use crate::state::CloudAnswer;
+    match answer {
+        CloudAnswer::Waiting => StatusPart { light: Light::Waiting, detail: "connecting...".to_string(), tooltip: "Asking Pimble's server which Pimble Cloud account is signed in.".to_string() },
+        CloudAnswer::Failed(why) => StatusPart { light: Light::Bad, detail: "disconnected".to_string(), tooltip: format!("Pimble's server could not say which account is signed in: {why}") },
+        CloudAnswer::Answered => cloud_part(signed_in, email, connection),
+    }
+}
+
+/// The Pimble Cloud part now, read from the store (tracked).
+fn cloud_part_now(store: AppStore) -> StatusPart {
+    cloud_status_part(&store.cloud_answer.get(), store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref())
 }
 
 /// What the first part is: Pimble's server on this computer, or in the
@@ -1933,6 +1997,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     // The rows open as this device left them (`views.rs`): rinch's set
     // holds their tree values, `AppStore::expanded` the nodes, whose children
     // are fetched as each row arrives (`ChildrenLoaded`).
+    // The saved stores have their rows from the first frame, "opening...",
+    // not from the moment the server answers (docs/STARTUP_CONTRACT.md).
+    for path in crate::persistence::load_app_state_file() {
+        store.begin_opening(&path);
+    }
     let remembered = crate::views::expanded();
     store.expanded.update(|e| {
         e.extend(remembered.iter().filter_map(|value| match parse_tree_value(value) {
@@ -1993,6 +2062,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     // Set up event processing via thread-local so run_on_main_thread
     // can trigger it without capturing non-Send types. (No autosave loop
     // needed — the collab session persists edits live.)
+    crate::startup::mark("window built");
     EVENT_PROCESSOR.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
             process_backend_events(store, tree_state);
@@ -2061,6 +2131,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     let needs_fetch = !store.has_children_loaded(s_id, nid);
                     if needs_fetch {
                         store.send(BackendCommand::GetChildren { store_id: s_id, node_id: nid });
+                        store.children_asked(s_id, nid);
                     }
                 }
             }
@@ -2091,6 +2162,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // Custom render_node with per-node reactive Effects for label/icon/mount
         let render_node_fn: RenderTreeNode = Rc::new(move |payload: &RenderTreeNodePayload, __scope: &mut RenderScope| {
             let node_value = payload.node.value.clone();
+            // A saved store still opening (docs/STARTUP_CONTRACT.md): its
+            // name from the saved list, a spinner and "opening...", or why
+            // it did not open. A snapshot: its data carries the error.
+            if let Some(opening) = store.opening_row(&node_value) {
+                return opening_row_view(__scope, &opening);
+            }
             let is_store_root = node_value.starts_with("store_");
             let has_children = payload.has_children;
 
@@ -2326,6 +2403,44 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 None
             };
 
+            // While a store's search index opens or is built, its row says
+            // so, quietly (docs/STARTUP_CONTRACT.md "Indexing is said where
+            // search is"): reactive on the store's own signal, no rebuild.
+            let index_note: Option<NodeHandle> = if is_store_root {
+                let words = move || store_sig.map(|sig| sig.with(|s| s.index.row_words())).unwrap_or_default();
+                Some(rsx! {
+                    span {
+                        class: "pimble-tree__indexing",
+                        style: {move || if words().is_empty() { "display: none;" } else { "" }},
+                        title: {move || store_sig.map(|sig| sig.with(|s| s.index.row_tooltip())).unwrap_or_default()},
+                        {move || words()}
+                    }
+                })
+            } else {
+                None
+            };
+
+            // Children asked for and slow to come: a spinner where the
+            // chevron goes (the row's data has no children meanwhile, so
+            // rinch drew its spacer there). A snapshot: the data carries it.
+            let loading_children = match parsed {
+                Some((s_id, Some(n_id))) => store.children_loading(s_id, n_id),
+                Some((s_id, None)) => store.store_row_node(s_id).is_some_and(|root| store.children_loading(s_id, root)) && store.get_store_signal(s_id).is_some_and(|sig| untracked(|| sig.with(|s| s.roots.is_empty()))),
+                None => false,
+            };
+            let children_spinner: Option<NodeHandle> = if loading_children && !has_children {
+                Some(rsx! {
+                    span {
+                        class: "pimble-tree__children-loading",
+                        style: format!("left: calc(var(--tree-level-offset) * {level});"),
+                        title: "Loading...",
+                        Loader { size: "xs" }
+                    }
+                })
+            } else {
+                None
+            };
+
             let nv_submit = node_value.clone();
 
             // This row's own locally-computed label (see `AppStore::live_label`):
@@ -2503,9 +2618,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }}
                     }
 
+                    {children_spinner}
                     {share_badge}
                     {out_of_step_mark}
                     {shared_by_note}
+                    {index_note}
                     {found_arrow}
 
                     // Who else has the note open (docs/PRESENCE_CONTRACT.md
@@ -2859,6 +2976,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     class: "pimble-search-results__message",
                     style: {move || if search_message(store).is_empty() { "display: none;" } else { "" }},
                     {move || search_message(store)}
+                }
+                // A store the search covers is still being indexed: its notes
+                // may be missing (docs/STARTUP_CONTRACT.md "Indexing is said
+                // where search is").
+                div {
+                    class: "pimble-search-results__indexing",
+                    style: {move || if search_indexing_note(store).is_empty() { "display: none;" } else { "" }},
+                    {move || search_indexing_note(store)}
                 }
                 // The results, keyed by node, and each row's text read from
                 // the current results: a keystroke that keeps a note among
@@ -4648,7 +4773,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         div {
                             class: "pimble-status-bar__part",
                             title: {move || server_part(&store.connection_status.get(), &store.server_addr.get()).tooltip},
-                            span { class: {move || server_part(&store.connection_status.get(), &store.server_addr.get()).dot_class()} }
+                            span {
+                                class: {move || server_part(&store.connection_status.get(), &store.server_addr.get()).dot_class()},
+                                style: {move || if server_part(&store.connection_status.get(), &store.server_addr.get()).spinning() { "display: none;" } else { "" }},
+                            }
+                            span {
+                                class: "pimble-status-bar__spinner",
+                                style: {move || if server_part(&store.connection_status.get(), &store.server_addr.get()).spinning() { "" } else { "display: none;" }},
+                                Loader { size: "xs" }
+                            }
                             span { class: "pimble-status-bar__name", {server_part_name()} }
                             span { class: "pimble-status-bar__detail", {move || server_part(&store.connection_status.get(), &store.server_addr.get()).detail} }
                         }
@@ -4664,11 +4797,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         if CAN_ADMINISTER_STORES {
                             div {
                                 class: "pimble-status-bar__part pimble-status-bar__part--button",
-                                title: {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).tooltip},
+                                title: {move || cloud_part_now(store).tooltip},
                                 onclick: move || open_account_modal(store, ""),
-                                span { class: {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).dot_class()} }
+                                span {
+                                    class: {move || cloud_part_now(store).dot_class()},
+                                    style: {move || if cloud_part_now(store).spinning() { "display: none;" } else { "" }},
+                                }
+                                span {
+                                    class: "pimble-status-bar__spinner",
+                                    style: {move || if cloud_part_now(store).spinning() { "" } else { "display: none;" }},
+                                    Loader { size: "xs" }
+                                }
                                 span { class: "pimble-status-bar__name", "Pimble Cloud" }
-                                span { class: "pimble-status-bar__detail", {move || cloud_part(store.cloud_signed_in.get(), &store.cloud_email.get(), store.cloud_connection.get().as_ref()).detail} }
+                                span { class: "pimble-status-bar__detail", {move || cloud_part_now(store).detail} }
                             }
                         }
 
@@ -4936,7 +5077,7 @@ pub fn run(renderer: Renderer) {
 mod tests {
     use super::{
         hosted_store_label, host_to_share, member_role_text, member_status_text, open_share_modal, open_stop_relay_modal,
-        account_showing, badge_with_waiting, cloud_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
+        account_showing, badge_with_waiting, cloud_part, cloud_status_part, server_part, share_from_this_computer, sync_badge_text, Light, MOUNT_NOTE,
     };
     use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
     use crate::state::{AppStore, ShareFace};
@@ -5269,11 +5410,23 @@ mod tests {
         assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "sign-in expired"));
         // A server too old to say: the account alone.
         assert_eq!(cloud_part(true, "joe@example.com", None).light, Light::Quiet);
+
+        // docs/STARTUP_CONTRACT.md: until the server answers, "connecting..."
+        // with a spinner (never "sign in" or "disconnected"); "disconnected"
+        // only once asking failed; the account once answered.
+        use crate::state::CloudAnswer;
+        let waiting = cloud_status_part(&CloudAnswer::Waiting, false, "", None);
+        assert_eq!((waiting.detail.as_str(), waiting.spinning()), ("connecting...", true));
+        let failed = cloud_status_part(&CloudAnswer::Failed("connection refused".into()), false, "", None);
+        assert_eq!((failed.detail.as_str(), failed.light, failed.spinning()), ("disconnected", Light::Bad, false));
+        assert!(failed.tooltip.ends_with("connection refused"));
+        assert_eq!(cloud_status_part(&CloudAnswer::Answered, true, "joe@example.com", Some(&connected)), cloud_part(true, "joe@example.com", Some(&connected)));
     }
 
     #[test]
     fn the_server_part_reads_the_connection_status() {
         assert_eq!(server_part("Connected", "127.0.0.1:7462").light, Light::Good);
+        assert!(server_part("Disconnected", "127.0.0.1:7462").spinning(), "connecting shows the spinner");
         assert_eq!(server_part("Disconnected", "127.0.0.1:7462").detail, "connecting");
         let part = server_part("Error: refused", "127.0.0.1:7462");
         assert_eq!((part.light, part.detail.as_str()), (Light::Bad, "refused"));

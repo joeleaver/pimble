@@ -126,6 +126,26 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// A loopback server on a free port that keeps every per-computer path
+    /// under `dir`: replicas (`dir/replicas`, so each store's state root is
+    /// `dir/stores`), the relay twins (`dir/relay`), the keystore, the saved
+    /// credentials and the agents file. What every test starts from
+    /// (`..ServerConfig::in_dir(dir)`), so no test reads or writes the real
+    /// config or data directories; `dir` must outlive the server.
+    pub fn in_dir(dir: &std::path::Path) -> Self {
+        Self {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            credentials_path: Some(dir.join("credentials.json")),
+            replicas_dir: Some(dir.join("replicas")),
+            keystore_path: Some(dir.join("keys.json")),
+            relay_dir: Some(dir.join("relay")),
+            agents_path: Some(dir.join("agents.json")),
+            ..Default::default()
+        }
+    }
+}
+
 /// The Pimble server
 pub struct PimbleServer {
     config: ServerConfig,
@@ -273,12 +293,28 @@ impl PimbleServer {
         self.local_addr = Some(local_addr);
 
         // A relay face holds vault twins only, and a vault has no index.
-        let semantic_available = if self.face { false } else { warm_up_embedding_model().await };
+        // The model warms up when the first index wants it, not before the
+        // server listens (docs/STARTUP_CONTRACT.md "Built": it took up to a
+        // second before the app could connect, and loading it busies every
+        // core): only an index open waits for it, and indexes open in the
+        // background after their stores have answered.
+        let (warmed, warmup) = tokio::sync::watch::channel(None);
+        let wanted = Arc::new(tokio::sync::Notify::new());
+        if self.face {
+            let _ = warmed.send(Some(false));
+        } else {
+            let wanted = Arc::clone(&wanted);
+            tokio::spawn(async move {
+                wanted.notified().await;
+                let _ = warmed.send(Some(warm_up_embedding_model().await));
+            });
+        }
+        let semantic_available = false;
 
         let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
         let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
         let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
-        let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
+        let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path).with_semantic_warmup(warmup, wanted);
         if let Some(relay_dir) = self.config.relay_dir.clone() {
             handler = handler.with_relay_dir(relay_dir);
         }

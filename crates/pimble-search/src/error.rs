@@ -46,8 +46,21 @@ pub enum SearchError {
     #[error("full-text index is still building ({done} of {total} objects indexed)")]
     IndexBuilding { done: u64, total: u64 },
 
+    /// Another process (or another open in this one) holds the index
+    /// directory's lock. Never a reason to rebuild over it: the holder is
+    /// alive and may be writing (docs/STARTUP_CONTRACT.md).
+    #[error("search index is locked: {0}")]
+    Locked(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl SearchError {
+    /// Whether opening failed only because something else holds the index.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, SearchError::Locked(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SearchError>;

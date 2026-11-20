@@ -242,16 +242,14 @@ async fn start_pimble_server(creds_dir: &Path, replicas_dir: &Path, service_toke
     let mut last_err = None;
     for attempt in 1..=MAX_PORT_ATTEMPTS {
         let mut pimble_server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
             auth_token: Some(service_token.to_string()),
             credentials_path: Some(creds_dir.join("credentials.json")),
             // A directory inside the temp one: what lives beside the
             // replicas (state, devices) stays inside it too.
-            replicas_dir: Some(replicas_dir.join("replicas")),
             // Forward-compatible with fields agent B is concurrently adding
             // to `ServerConfig` (JWT verification, origin allowlist): this
             // service only exercises the pre-existing static-token mode.
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(replicas_dir)
         });
         match pimble_server.start().await {
             Ok(()) => return pimble_server,

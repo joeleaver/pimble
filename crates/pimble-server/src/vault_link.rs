@@ -1845,7 +1845,8 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
-        | StoreChangeKind::PeopleChanged => None,
+        | StoreChangeKind::PeopleChanged
+        | StoreChangeKind::IndexStateChanged { .. } => None,
     }
 }
 

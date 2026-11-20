@@ -4985,9 +4985,7 @@ mod tests {
     async fn layers_take_a_clip_and_release_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let url = format!("http://{}", server.addr());
@@ -5038,9 +5036,7 @@ mod tests {
     async fn soft_edges_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let url = format!("http://{}", server.addr());
@@ -5087,9 +5083,7 @@ mod tests {
     async fn paint_lays_pictures_into_a_paint_layer() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let url = format!("http://{}", server.addr());
@@ -5160,9 +5154,7 @@ mod tests {
     async fn symbols_and_scatters_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            replicas_dir: Some(dir.path().join("replicas")),
-            ..Default::default()
+            ..pimble_server::ServerConfig::in_dir(dir.path())
         });
         server.start().await.expect("server starts");
         let url = format!("http://{}", server.addr());

@@ -4,13 +4,16 @@
 //! credentials store write, using a temp `credentials_path` so this test
 //! never touches the real config directory.
 
+mod isolated;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, RemoteEndpoint, SyncState};
 use pimble_server::credentials::{origin_of, CredentialStore};
-use pimble_server::{PimbleServer, ServerConfig};
+use isolated::TempServer;
+use pimble_server::ServerConfig;
 
 /// Poll `cond` every 50ms until it returns `true` or `timeout` elapses.
 /// Returns whether it converged in time.
@@ -31,12 +34,14 @@ where
     }
 }
 
-async fn start_server(auth_token: Option<&str>, credentials_path: Option<PathBuf>) -> PimbleServer {
-    let mut server = PimbleServer::with_config(ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        auth_token: auth_token.map(String::from),
-        credentials_path,
-        ..Default::default()
+async fn start_server(auth_token: Option<&str>, credentials_path: Option<PathBuf>) -> TempServer {
+    let mut server = TempServer::with_config(|dir| {
+        let isolated = ServerConfig::in_dir(dir);
+        ServerConfig {
+            auth_token: auth_token.map(String::from),
+            credentials_path: credentials_path.or(isolated.credentials_path.clone()),
+            ..isolated
+        }
     });
     server.start().await.expect("server starts");
     server

@@ -59,6 +59,7 @@ impl Affected {
             | StoreChangeKind::ShareStateChanged { .. }
             | StoreChangeKind::SharesEnded { .. }
             | StoreChangeKind::PeopleChanged
+            | StoreChangeKind::IndexStateChanged { .. }
             | StoreChangeKind::VaultAppended { .. }
             | StoreChangeKind::VaultReported { .. } => Self::default(),
         }

@@ -1015,6 +1015,9 @@ pub(crate) fn map_engine_err(e: EngineError) -> SearchError {
         }
         EngineError::FulltextQuery(msg) => SearchError::Query(msg),
         EngineError::ModelUnavailable(msg) => SearchError::ModelUnavailable(msg),
+        // rhypedb-storage's `DataDirLocked`, which the engine wraps and does
+        // not re-export: told apart by its message.
+        other if other.to_string().contains("data directory is locked") => SearchError::Locked(other.to_string()),
         other => SearchError::Engine(other.to_string()),
     }
 }
@@ -1078,6 +1081,19 @@ mod tests {
     }
 
     use super::*;
+
+    /// A second open of an index that is open is refused as `Locked`, the
+    /// one error the server waits on and never rebuilds over
+    /// (docs/STARTUP_CONTRACT.md); once the first lets go it opens.
+    #[test]
+    fn a_held_index_is_locked_until_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open(dir.path(), false).unwrap();
+        let second = SearchIndex::open(dir.path(), false);
+        assert!(matches!(&second, Err(e) if e.is_locked()), "{:?}", second.err());
+        drop(first);
+        assert!(SearchIndex::open(dir.path(), false).is_ok());
+    }
 
     #[test]
     fn a_hit_at_distance_0_9_is_dropped() {

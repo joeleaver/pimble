@@ -18,10 +18,13 @@ use tokio::sync::RwLock;
 /// A fresh `RpcHandler` plus the `Arc<RwLock<StoreManager>>` backing it, so
 /// a test can flush stores directly (simulating a clean shutdown) or open
 /// its own fresh manager over the same directories (simulating a restart).
-fn new_handler() -> (RpcHandler, Arc<RwLock<StoreManager>>) {
+/// The `TempDir` holds the handler's own keystore, credentials and replicas;
+/// keep it as long as the handler.
+fn new_handler() -> (RpcHandler, Arc<RwLock<StoreManager>>, tempfile::TempDir) {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(Arc::clone(&store_manager));
-    (handler, store_manager)
+    let home = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(Arc::clone(&store_manager), home.path());
+    (handler, store_manager, home)
 }
 
 /// Create a local store at `path` and return its id and root node id.
@@ -57,7 +60,7 @@ async fn create_doc(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, 
 /// node's children, addressed by the source store's id.
 #[tokio::test]
 async fn get_children_on_a_mount_resolves_to_the_source_store() {
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
@@ -94,7 +97,7 @@ async fn get_children_on_a_mount_resolves_to_the_source_store() {
 /// is the source store's directory.
 #[tokio::test]
 async fn get_mount_state_is_live_with_source_path_set() {
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let b_path = dir_b.path().join("b.pimble");
@@ -139,7 +142,7 @@ async fn restart_resolves_mount_via_source_path_hint() {
     let b_path = dir_b.path().join("b.pimble");
 
     let (a_store, mount_node_id, b_store, b_doc) = {
-        let (handler, store_manager) = new_handler();
+        let (handler, store_manager, _home) = new_handler();
         let (a_store, a_root) = create_store(&handler, &a_path, "A").await;
         let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
         let b_doc = create_doc(&handler, b_store, b_root, "B Doc").await;
@@ -164,7 +167,7 @@ async fn restart_resolves_mount_via_source_path_hint() {
 
     // Fresh manager/handler over the same directories, as if the process
     // restarted. Only the mounting store is opened.
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     handler
         .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
         .await
@@ -203,7 +206,7 @@ async fn mount_source_directory_gone_is_unavailable() {
     let b_moved_path = dir_b.path().join("b-moved.pimble");
 
     let (a_store, mount_node_id) = {
-        let (handler, store_manager) = new_handler();
+        let (handler, store_manager, _home) = new_handler();
         let (a_store, a_root) = create_store(&handler, &a_path, "A").await;
         let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
 
@@ -228,7 +231,7 @@ async fn mount_source_directory_gone_is_unavailable() {
     // resolves it, and the source_path hint points nowhere.
     std::fs::rename(&b_path, &b_moved_path).unwrap();
 
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     handler
         .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
         .await
@@ -256,7 +259,7 @@ async fn mount_source_directory_gone_is_unavailable() {
 /// rejected.
 #[tokio::test]
 async fn mounting_back_into_the_mounting_store_is_rejected_as_a_cycle() {
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
@@ -295,7 +298,7 @@ async fn mounting_back_into_the_mounting_store_is_rejected_as_a_cycle() {
 /// mount resolves one level at a time.
 #[tokio::test]
 async fn nested_mounts_resolve_one_level_at_a_time() {
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let dir_c = tempfile::tempdir().unwrap();
@@ -369,7 +372,8 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
 #[tokio::test]
 async fn create_mount_notifies_a_store_changes_subscriber() {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
-    let handler = RpcHandler::new(store_manager);
+    let home = tempfile::tempdir().unwrap();
+    let handler = RpcHandler::in_dir(store_manager, home.path());
     let mut module = handler.into_rpc();
     // Every call below goes through jsonrpsee's in-process dispatch (no HTTP
     // edge, so no `AuthMiddleware` ever ran); give it the same
@@ -435,7 +439,7 @@ async fn create_mount_notifies_a_store_changes_subscriber() {
 /// 8. `createNode` with a mount node as parent is an error.
 #[tokio::test]
 async fn create_node_under_a_mount_is_an_error() {
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
@@ -493,7 +497,7 @@ async fn deleting_a_mount_node_persists_after_restart() {
     let b_path = dir_b.path().join("b.pimble");
 
     let (a_store, a_root, mount_node_id) = {
-        let (handler, _store_manager) = new_handler();
+        let (handler, _store_manager, _home) = new_handler();
         let (a_store, a_root) = create_store(&handler, &a_path, "A").await;
         let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
 
@@ -524,7 +528,7 @@ async fn deleting_a_mount_node_persists_after_restart() {
 
     // Fresh manager/handler over the same directory, as if the process
     // restarted with no clean shutdown.
-    let (handler, _store_manager) = new_handler();
+    let (handler, _store_manager, _home) = new_handler();
     handler
         .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
         .await

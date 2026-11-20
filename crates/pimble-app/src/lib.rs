@@ -62,6 +62,7 @@ pub mod personal;
 pub mod places;
 pub mod properties;
 pub mod views;
+pub mod startup;
 pub mod presence;
 pub mod text_boards;
 pub mod toolbar;

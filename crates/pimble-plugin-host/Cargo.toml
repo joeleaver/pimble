@@ -31,6 +31,8 @@ wasmtime-wasi = { workspace = true, optional = true }
 # Running a plugin's tools for an agent with no window (`tools`): one thread,
 # a LocalSet, its API calls answered as they finish.
 tokio = { workspace = true, optional = true }
+# Where compiled plugins are cached between runs (`wasmtime_engine::compiled`).
+dirs = { version = "6", optional = true }
 # The browser's engine (wave 3): the page's own `WebAssembly`, reached through
 # js-sys, with imports made of wasm-bindgen closures.
 wasm-bindgen = { version = "0.2", optional = true }
@@ -39,7 +41,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [features]
 default = []
-wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tokio"]
+wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tokio", "dep:dirs"]
 # `pimble-plugin-index`, which the Release workflow runs to write the library's
 # index from the built plugins.
 index-tool = ["wasm-host"]
