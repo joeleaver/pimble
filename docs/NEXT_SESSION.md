@@ -1,5 +1,12 @@
 # Next session: start here
 
+**2026-11-19 (session 78e7f30f): v0.28.9: convergence wave 2.** "Out of step" on the note
+(row mark, pane line, Properties, MCP; names whose device), canonical state vector
+encoding (`pimble_crdt::canonical_state_vector`). Next, in order: docs/STORE_FOLDERS_CONTRACT.md
+(one store folder on several computers, merge what is on disk), convergence wave 3 (the
+randomized fault test; dropping what nobody holds after 24 h), then one sync engine for both
+apps (docs/CONVERGENCE_CONTRACT.md "Next"). The new marks have not been looked at on screen.
+
 **2026-11-19 (session 78e7f30f): v0.28.8: convergence wave 1.** Devices of an encrypted
 store report, sealed, what they hold of each document (state vector and delete-set
 digest), and send what another's report lacks (docs/CONVERGENCE_CONTRACT.md "Built: wave
