@@ -11,6 +11,7 @@ pub mod cloud;
 pub mod credentials;
 mod devices;
 pub mod error;
+pub mod faults;
 mod folder_watch;
 mod fs_util;
 pub mod handler;

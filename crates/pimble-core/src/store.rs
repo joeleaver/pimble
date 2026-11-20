@@ -229,17 +229,60 @@ pub struct WaitingDoc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutOfStep {
     pub node_id: NodeId,
-    /// When the difference began (not when the five minutes ran out).
+    /// When the difference began (not when the five minutes ran out); for
+    /// [`OutOfStepKind::SetAside`], when what waited was set aside.
     pub since: chrono::DateTime<chrono::Utc>,
     pub reason: String,
+    /// Which of the reasons it is, which decides where it is said (Joe,
+    /// 2026-11-20: a mark on a note only when someone can act). Absent in an
+    /// entry from a Pimble before wave 3, which is read as shown.
+    #[serde(default)]
+    pub kind: OutOfStepKind,
 }
 
+/// Why a document is out of step (docs/CONVERGENCE_CONTRACT.md, "When 'out of
+/// step' is shown"). The first two are shown on the note (its row, its pane,
+/// its Properties, the MCP); the last two only in its Properties and the MCP,
+/// quietly: nobody can do anything about them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutOfStepKind {
+    /// Another device holds changes this one lacks.
+    #[default]
+    Behind,
+    /// This device holds changes another lacks and could not send them.
+    Unsent,
+    /// It waits for earlier changes no device has sent.
+    Waiting,
+    /// What waited for changes no device holds was set aside (section 5).
+    SetAside,
+}
+
+/// What a Pimble before wave 3 said of a parked update: an entry of an older
+/// server carrying it is quiet like [`OutOfStepKind::Waiting`].
+const PARKED_BEFORE_WAVE_3: &str = "Waits for earlier changes another device has not sent.";
+
 impl OutOfStep {
-    /// The one line the app's pane and the MCP say: "Out of step since 14:05
-    /// on 19 November: <reason>". `since` is shown in the viewer's own time
-    /// zone by whoever calls this with it (`local`).
-    pub fn sentence(&self, local: &str) -> String {
-        format!("Out of step since {local}: {}", self.reason)
+    /// Whether the note shows it: a mark on its row and a line at the top of
+    /// its pane. Every kind is said in its Properties and by the MCP.
+    pub fn is_shown(&self) -> bool {
+        matches!(self.kind, OutOfStepKind::Behind | OutOfStepKind::Unsent) && self.reason != PARKED_BEFORE_WAVE_3
+    }
+
+    /// The one line the app and the MCP say. Shown kinds: "Out of step since
+    /// 19 Nov 2026, 14:05: <reason>". Quiet ones: "Some changes from another
+    /// device never arrived (waiting since 26 Oct 2026)." and "Some changes
+    /// from another device never arrived and were set aside on 27 Oct 2026."
+    /// `when` is `since` as the caller shows it (the viewer's own time zone,
+    /// or UTC for the MCP).
+    pub fn sentence(&self, when: &str) -> String {
+        let bare = self.reason.trim_end_matches('.');
+        match self.kind {
+            OutOfStepKind::Waiting => format!("{bare} (waiting since {when})."),
+            OutOfStepKind::SetAside => format!("{bare} on {when}."),
+            _ if self.reason == PARKED_BEFORE_WAVE_3 => format!("{bare} (waiting since {when})."),
+            OutOfStepKind::Behind | OutOfStepKind::Unsent => format!("Out of step since {when}: {}", self.reason),
+        }
     }
 }
 

@@ -316,6 +316,27 @@ impl NodeDoc {
         Some(crate::sync_util::canonical_state_vector(&pending.missing))
     }
 
+    /// Set aside what waits parked in this document
+    /// (docs/CONVERGENCE_CONTRACT.md section 5): the parked update and any
+    /// deletes waiting with it are dropped, and the document holds exactly
+    /// what it had integrated. Answers what the dropped update waited for
+    /// (as [`NodeDoc::missing`] said it), or `None` when nothing was parked.
+    ///
+    /// Nothing integrated changes: the state vector and the delete digest are
+    /// what they were, so no peer is sent anything because of it. What is
+    /// dropped is gone from this document's saved bytes too ([`NodeDoc::save`]
+    /// carries a parked update, which is why a document loaded again parks it
+    /// again until it is set aside). Should what it waited for ever arrive,
+    /// the device that holds it sends everything after this document's
+    /// vector, the set-aside structs included.
+    pub fn set_aside_parked(&mut self) -> Option<Vec<u8>> {
+        use yrs::WriteTxn;
+        let missing = self.missing()?;
+        let mut txn = self.doc.transact_mut();
+        txn.prune_pending();
+        Some(missing)
+    }
+
     /// A digest of what this document has deleted, for a state report
     /// (docs/CONVERGENCE_CONTRACT.md): two documents with one state vector
     /// differ only if their delete sets do, and a state vector says nothing of
@@ -2161,6 +2182,48 @@ mod tests {
     use super::*;
     use crate::ContentDoc;
     use serde_json::json;
+
+    /// docs/CONVERGENCE_CONTRACT.md section 5, as yrs carries it: a parked
+    /// update rides along in `save` (so a document loaded again, or a
+    /// snapshot made from it, parks it again), never in a diff; setting it
+    /// aside drops it from both and changes nothing integrated; and should
+    /// what it waited for come after all, the device holding it sends it all.
+    #[test]
+    fn a_parked_update_rides_in_save_until_it_is_set_aside() {
+        let mut maker = NodeDoc::from_plain_text("one").unwrap();
+        let base = maker.save();
+        let lost = maker.append_markdown("NOBODY HOLDS THIS").unwrap();
+        let waits = maker.append_markdown("WAITS FOR IT").unwrap();
+        let _ = lost;
+
+        let mut here = NodeDoc::load(&base).unwrap();
+        here.apply_update(&waits).unwrap();
+        let missing = here.missing().expect("parked behind what never came");
+        let (sv, digest) = (here.state_vector(), here.delete_set_digest());
+        assert!(!here.text().contains("WAITS FOR IT"));
+
+        // A snapshot of it (`save`) carries the parked update; a reader of
+        // that snapshot parks it again. A diff does not carry it.
+        let reread = NodeDoc::load(&here.save()).unwrap();
+        assert_eq!(reread.missing().as_deref(), Some(missing.as_slice()), "a document loaded again parks it again");
+        let from_diff = NodeDoc::load(&here.diff_since(&crate::empty_state_vector()).unwrap()).unwrap();
+        assert_eq!(from_diff.missing(), None, "a diff never carries what is parked");
+
+        assert_eq!(here.set_aside_parked().as_deref(), Some(missing.as_slice()));
+        assert_eq!(here.missing(), None);
+        assert_eq!(here.state_vector(), sv, "nothing integrated changed");
+        assert_eq!(here.delete_set_digest(), digest);
+        assert_eq!(here.set_aside_parked(), None, "nothing left to set aside");
+        let after = NodeDoc::load(&here.save()).unwrap();
+        assert_eq!(after.missing(), None, "and it is gone from the saved bytes: a snapshot made now holds only what is integrated");
+        assert_eq!(after.state_vector(), sv);
+
+        // The maker comes back after all: what it sends from this vector
+        // carries the lost change and the one set aside.
+        here.apply_update(&maker.diff_since(&here.state_vector()).unwrap()).unwrap();
+        assert!(here.text().contains("NOBODY HOLDS THIS") && here.text().contains("WAITS FOR IT"), "got {:?}", here.text());
+        assert_eq!(here.missing(), None);
+    }
 
     /// A note with a canvas in its text is rewritten through Markdown with the
     /// picture kept (docs/MCP_CONTRACT.md: pictures go back in by their

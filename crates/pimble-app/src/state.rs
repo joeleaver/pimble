@@ -1554,6 +1554,13 @@ impl AppStore {
         self.out_of_step.with(|map| map.get(&store_id).and_then(|docs| docs.iter().find(|o| o.node_id == node_id)).cloned())
     }
 
+    /// [`AppStore::out_of_step_of`] when the note shows it (its row's mark,
+    /// its pane's line): only what someone can act on (Joe, 2026-11-20).
+    /// Properties says every kind.
+    pub fn out_of_step_shown(&self, store_id: StoreId, node_id: NodeId) -> Option<pimble_core::OutOfStep> {
+        self.out_of_step_of(store_id, node_id).filter(|entry| entry.is_shown())
+    }
+
     /// Why a node waits to sync, when its store's link is holding it back.
     pub fn waiting_reason(&self, store_id: StoreId, node_id: NodeId) -> Option<String> {
         self.waiting.with(|map| map.get(&store_id).and_then(|docs| docs.iter().find(|w| w.node_id == node_id)).map(|w| w.reason.clone()))

@@ -240,9 +240,18 @@ impl VaultLinkHandle {
     }
 
     /// The documents out of step on this device, each with since when and
-    /// why (`GetStoreSyncResponse::out_of_step`).
-    pub fn out_of_step(&self) -> Vec<pimble_core::OutOfStep> {
-        self.waiting.out_of_step_list()
+    /// why (`GetStoreSyncResponse::out_of_step`). What this device could not
+    /// send says the step that fits what stopped it, as the link knows it
+    /// now (Joe, 2026-11-20): `session_expired` is the keystore's word.
+    pub fn out_of_step(&self, session_expired: bool) -> Vec<pimble_core::OutOfStep> {
+        let step = if session_expired {
+            Some(protocol::STEP_SIGN_IN)
+        } else if matches!(self.state(), SyncState::Offline) {
+            Some(protocol::STEP_ONLINE)
+        } else {
+            None
+        };
+        self.waiting.out_of_step_list(step)
     }
 
     pub fn state(&self) -> SyncState {
@@ -516,24 +525,33 @@ impl Waiting {
         std::mem::take(&mut self.0.lock().unwrap().changed)
     }
 
-    fn set_out_of_step(&self, entry: pimble_core::OutOfStep) {
+    /// The documents out of step now, all of them: a list that differs from
+    /// the one held is announced.
+    fn set_out_of_step_all(&self, entries: std::collections::BTreeMap<String, pimble_core::OutOfStep>) {
         let mut inner = self.0.lock().unwrap();
-        let key = entry.node_id.to_string();
-        if inner.out_of_step.get(&key) != Some(&entry) {
-            inner.out_of_step.insert(key, entry);
+        if inner.out_of_step != entries {
+            inner.out_of_step = entries;
             inner.changed = true;
         }
     }
 
-    fn clear_out_of_step(&self, node_id: NodeId) {
-        let mut inner = self.0.lock().unwrap();
-        if inner.out_of_step.remove(&node_id.to_string()).is_some() {
-            inner.changed = true;
-        }
-    }
-
-    fn out_of_step_list(&self) -> Vec<pimble_core::OutOfStep> {
-        self.0.lock().unwrap().out_of_step.values().cloned().collect()
+    /// The list, each "could not send" with its step: `step` when the link
+    /// knows one for the whole store (signed out, offline), else what the
+    /// document's own send is held back by.
+    fn out_of_step_list(&self, step: Option<&str>) -> Vec<pimble_core::OutOfStep> {
+        let inner = self.0.lock().unwrap();
+        inner
+            .out_of_step
+            .values()
+            .cloned()
+            .map(|mut entry| {
+                if entry.kind == pimble_core::OutOfStepKind::Unsent {
+                    let held = inner.docs.get(&(VaultDocId::Node(entry.node_id).as_str(), Side::Send)).map(String::as_str);
+                    entry.reason = protocol::with_step(&entry.reason, step.or(held));
+                }
+                entry
+            })
+            .collect()
     }
 }
 
@@ -634,6 +652,9 @@ async fn connect(
     ask_first: bool,
     on_the_way: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<PimbleClient> {
+    if handler.link_faults().is_some_and(|faults| faults.is_offline()) {
+        return Err(anyhow::anyhow!("this device has no network (a fault the test injected)"));
+    }
     let account = handler
         .keystore()
         .account()
@@ -736,7 +757,11 @@ async fn connect_and_sync(
     // Who is who in the store's shares, beside the connection rather than
     // in its way (docs/PRESENCE_CONTRACT.md section 3).
     spawn_people_refresh(handler, store_id);
-    let client = Arc::new(connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?);
+    let mut client = connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?;
+    if let Some(bytes) = handler.link_faults().and_then(|faults| faults.page_bytes()) {
+        client.set_vault_page_bytes(bytes);
+    }
+    let client = Arc::new(client);
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
     progress.keyring.forget_remote();
@@ -809,6 +834,14 @@ async fn connect_and_sync(
     let steps_every = steps_every(handler.out_of_step_after());
     let mut steps_tick = tokio::time::interval_at(tokio::time::Instant::now() + steps_every, steps_every);
     let mut steps_last = tokio::time::Instant::now();
+    // A test's faults (`crate::faults`): this device's network going away
+    // is noticed within a tick.
+    let faults_on = handler.link_faults().is_some();
+    let mut fault_tick = tokio::time::interval(Duration::from_millis(100));
+    // What a lost notification would have brought (wave 3, found by the
+    // fault test): asked again every so often, never only at a reconnect.
+    let recheck_every = if faults_on { RECHECK_EVERY_UNDER_FAULTS } else { RECHECK_EVERY };
+    let mut recheck_tick = tokio::time::interval_at(tokio::time::Instant::now() + recheck_every, recheck_every);
 
     loop {
         flush_waiting(handler, link, progress).await;
@@ -818,6 +851,7 @@ async fn connect_and_sync(
                 let now = tokio::time::Instant::now();
                 judge_steps(handler, store_id, progress, now - steps_last).await;
                 steps_last = now;
+                settle_parked(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
             }
             _ = tokio::time::sleep_until(next_report.unwrap_or_else(tokio::time::Instant::now)), if next_report.is_some() => {
                 let due = progress.take_due_reports();
@@ -830,8 +864,20 @@ async fn connect_and_sync(
                     announce_by = None;
                 }
             }
+            _ = recheck_tick.tick() => {
+                recheck(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
+            }
+            _ = fault_tick.tick(), if faults_on => {
+                if handler.link_faults().is_some_and(|faults| faults.is_offline()) {
+                    progress.save_if_unsaved().await;
+                    return Err(anyhow::anyhow!("this device lost its network (a fault the test injected)"));
+                }
+            }
             item = remote_sub.next() => {
                 match item {
+                    Some(Ok(_)) if handler.link_faults().is_some_and(|faults| faults.take_dropped_notification()) => {
+                        debug!("Vault link for store {}: a notification from the remote was lost (a fault the test injected)", store_id);
+                    }
                     Some(Ok(notif)) => {
                         handle_remote_notification(handler, &client, store_id, key_id, link_id, notif, &echoes, progress).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
@@ -906,8 +952,23 @@ async fn connect_and_sync(
                         if !progress.keyring.remote_docs.contains(&doc_id.as_str()) {
                             continue;
                         }
-                        if let Err(e) = push_full(handler, &client, store_id, doc_id, key_id, link_id, &echoes, progress).await {
-                            warn!("Vault link for store {}: sending node {} again failed: {}", store_id, id, e);
+                        // Once per state: a document sent again whole and
+                        // still as it was is in the log already, whole, for
+                        // whoever lacks it. A loop that cannot settle (a gap
+                        // nobody can fill) asked again every ten minutes and
+                        // got the same bytes each time (wave 3).
+                        let state = report_of(handler, store_id, id).await.map(|r| r.encode());
+                        if state.is_some() && progress.resent.get(&doc_id.as_str()) == state.as_ref() {
+                            debug!("Vault link for store {}: node {} was sent again whole as it is now already; not again", store_id, id);
+                            continue;
+                        }
+                        match push_full(handler, &client, store_id, doc_id.clone(), key_id, link_id, &echoes, progress).await {
+                            Ok(()) => {
+                                if let Some(state) = state {
+                                    progress.resent.insert(doc_id.as_str(), state);
+                                }
+                            }
+                            Err(e) => warn!("Vault link for store {}: sending node {} again failed: {}", store_id, id, e),
                         }
                     }
                     continue;
@@ -1265,8 +1326,160 @@ struct Progress {
     heard: HashMap<String, HashMap<String, Heard>>,
     /// The documents that differ now, each with since when, for how long
     /// while connected, and why (section 4); the ones that have lasted
-    /// long enough are out of step (`Waiting::set_out_of_step`).
+    /// long enough are out of step (`Waiting::set_out_of_step_all`).
     steps: HashMap<NodeId, Candidate>,
+    /// What waits parked here and since when, and what was set aside
+    /// (section 5): this computer's, in the store's state directory.
+    convergence: Convergence,
+    /// How long after a change a document's report goes.
+    report_debounce: Duration,
+    /// What each document was last sent again whole as (its report), so a
+    /// repair loop that cannot settle sends the same thing once
+    /// (docs/CONVERGENCE_CONTRACT.md wave 3: 2026-11-20, a device re-sent one
+    /// document four times on a gap nobody could fill).
+    resent: HashMap<String, Vec<u8>>,
+    /// The (what the remote was known to hold, what this device held) of each
+    /// document's last catch-up: the same pair again is the same diff again.
+    caught_up: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    /// Each document's head as the remote last listed it (the reconcile, or
+    /// the last [`recheck`]).
+    listed_heads: HashMap<String, u64>,
+}
+
+// ── What waits parked here, and what was set aside (section 5) ──────────
+
+/// `convergence.json` in the store's state directory
+/// (`<data dir>/pimble/stores/<store id>/`, this computer's alone, never in the
+/// store's folder nor in a document): when each parked update was first
+/// seen waiting for what it waits for, which is what makes the 24 hours
+/// survive a restart, and the record of what was set aside.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct ConvergenceFile {
+    #[serde(default)]
+    parked: std::collections::BTreeMap<String, ParkedSince>,
+    #[serde(default)]
+    set_aside: std::collections::BTreeMap<String, Vec<protocol::SetAsideRecord>>,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ParkedSince {
+    /// What it waits for, base64 of the canonical vector.
+    missing: String,
+    since: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct Convergence {
+    path: Option<PathBuf>,
+    file: ConvergenceFile,
+    unsaved: bool,
+}
+
+impl Convergence {
+    const FILE_NAME: &'static str = "convergence.json";
+
+    async fn load(path: Option<PathBuf>) -> Self {
+        let file = match &path {
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+                    warn!("Vault link: unreadable {} ({}); starting over", path.display(), e);
+                    ConvergenceFile::default()
+                }),
+                Err(_) => ConvergenceFile::default(),
+            },
+            None => ConvergenceFile::default(),
+        };
+        Self { path, file, unsaved: false }
+    }
+
+    /// `doc` waits for `missing` now: since when it has (now, if it waited
+    /// for something else or nothing before).
+    fn waiting_since(&mut self, doc: &str, missing: &[u8], now: DateTime<Utc>) -> DateTime<Utc> {
+        let encoded = STANDARD.encode(missing);
+        match self.file.parked.get(doc) {
+            Some(held) if held.missing == encoded => held.since,
+            _ => {
+                self.file.parked.insert(doc.to_string(), ParkedSince { missing: encoded, since: now });
+                self.unsaved = true;
+                now
+            }
+        }
+    }
+
+    /// `doc` waits for nothing now.
+    fn not_waiting(&mut self, doc: &str) {
+        if self.file.parked.remove(doc).is_some() {
+            self.unsaved = true;
+        }
+    }
+
+    /// The 24 hours of `doc` start again (a device that reported holds what
+    /// it waits for).
+    fn restart(&mut self, doc: &str, now: DateTime<Utc>) {
+        if let Some(held) = self.file.parked.get_mut(doc) {
+            held.since = now;
+            self.unsaved = true;
+        }
+    }
+
+    /// Whether an update of `doc` waiting for exactly `missing` was set
+    /// aside here before.
+    fn set_aside_before(&self, doc: &str, missing: &[u8]) -> bool {
+        self.file.set_aside.get(doc).is_some_and(|records| records.iter().any(|r| r.missing_bytes().as_deref() == Some(missing)))
+    }
+
+    fn record_set_aside(&mut self, doc: &str, record: protocol::SetAsideRecord) {
+        self.file.parked.remove(doc);
+        let records = self.file.set_aside.entry(doc.to_string()).or_default();
+        if !records.iter().any(|r| r.missing == record.missing) {
+            records.push(record);
+        }
+        self.unsaved = true;
+    }
+
+    /// What this device set aside of `doc`, as its reports say it.
+    fn aside_of(&self, doc: &str) -> Vec<Vec<u8>> {
+        self.file.set_aside.get(doc).map(|records| records.iter().filter_map(|r| r.missing_bytes()).collect()).unwrap_or_default()
+    }
+
+    /// The latest set-aside of `doc`, while its Properties still say it.
+    fn latest_set_aside(&self, doc: &str, now: DateTime<Utc>) -> Option<&protocol::SetAsideRecord> {
+        self.file
+            .set_aside
+            .get(doc)
+            .and_then(|records| records.iter().max_by_key(|r| r.at))
+            .filter(|r| (now - r.at).num_days() < protocol::SET_ASIDE_SAID_FOR_DAYS)
+    }
+
+    async fn save_if_unsaved(&mut self) {
+        if !self.unsaved {
+            return;
+        }
+        let Some(path) = &self.path else {
+            self.unsaved = false;
+            return;
+        };
+        let json = match serde_json::to_string(&self.file) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Vault link: could not encode {}: {}", Self::FILE_NAME, e);
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = async {
+            if let Some(dir) = path.parent() {
+                tokio::fs::create_dir_all(dir).await?;
+            }
+            tokio::fs::write(&tmp, json).await?;
+            tokio::fs::rename(&tmp, path).await
+        }
+        .await;
+        match written {
+            Ok(()) => self.unsaved = false,
+            Err(e) => debug!("Vault link: could not write {}: {}", path.display(), e),
+        }
+    }
 }
 
 /// Who a report came from, and when the server stored it.
@@ -1289,6 +1502,7 @@ struct Candidate {
     since: DateTime<Utc>,
     held: Duration,
     reason: String,
+    kind: pimble_core::OutOfStepKind,
     marked: bool,
 }
 
@@ -1354,15 +1568,20 @@ impl Progress {
     const FILE_NAME: &'static str = "vault-link.json";
 
     async fn load(handler: &RpcHandler, store_id: StoreId) -> Self {
-        let path = {
+        let (path, convergence_path) = {
             let manager = handler.store_manager_handle();
             let manager = manager.read().await;
             // This computer's, in the store's state directory, never in the
             // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1).
-            manager.state_dir(store_id).map(|dir| dir.join(Self::FILE_NAME)).or_else(|| {
+            let state_dir = manager.state_dir(store_id);
+            let path = state_dir.as_ref().map(|dir| dir.join(Self::FILE_NAME)).or_else(|| {
                 manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
-            })
+            });
+            // Only ever in the state directory: without one, in memory.
+            (path, state_dir.map(|dir| dir.join(Convergence::FILE_NAME)))
         };
+        let convergence = Convergence::load(convergence_path).await;
+        let report_debounce = handler.link_faults().and_then(|f| f.report_debounce()).unwrap_or(Duration::from_millis(protocol::REPORT_DEBOUNCE_MS));
         let devices = handler.devices();
         let entry = devices.entry(store_id).await;
         let file = match &path {
@@ -1397,6 +1616,11 @@ impl Progress {
             store_id,
             heard: HashMap::new(),
             steps: HashMap::new(),
+            convergence,
+            report_debounce,
+            resent: HashMap::new(),
+            caught_up: HashMap::new(),
+            listed_heads: HashMap::new(),
         }
     }
 
@@ -1417,7 +1641,7 @@ impl Progress {
             return;
         }
         if let Some(node_id) = document_of(&notif.change_kind) {
-            let due = tokio::time::Instant::now() + Duration::from_millis(protocol::REPORT_DEBOUNCE_MS);
+            let due = tokio::time::Instant::now() + self.report_debounce;
             self.report_due.insert(VaultDocId::Node(node_id).as_str(), due);
         }
     }
@@ -1547,6 +1771,7 @@ impl Progress {
 
     /// Best effort, like `record_last_seq`: bookkeeping, never fatal.
     async fn save_if_unsaved(&mut self) {
+        self.convergence.save_if_unsaved().await;
         if self.answered_unsaved {
             self.devices.set_answered(self.store_id, &self.answered).await;
             self.answered_unsaved = false;
@@ -1728,6 +1953,7 @@ async fn full_reconcile(
         if let Some(dek_id) = doc.dek_id {
             progress.keyring.note_listed(&doc.doc_id, dek_id);
         }
+        progress.listed_heads.insert(doc.doc_id.as_str(), doc.head);
         remote_heads.insert(doc.doc_id, doc.head);
     }
 
@@ -2316,6 +2542,10 @@ async fn append_blob(
         }
         Err(e) => return Err(anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e)),
     };
+    // A test's fault: the remote stored it, and the answer never came back.
+    if handler.link_faults().is_some_and(|faults| faults.take_lost_answer()) {
+        return Err(anyhow::anyhow!("the connection dropped before the answer to an append of {:?} came (a fault the test injected)", doc_id));
+    }
     let seq = answer.seq;
     let first = answer.first_seq.unwrap_or(seq);
     for one in first..=seq {
@@ -2338,7 +2568,12 @@ async fn append_blob(
 
     // Stamped only with a number this device has read *through*
     // (`snapshot_due_by`): a snapshot deletes every log entry at or below it.
-    if protocol::snapshot_due_by(seq, progress.snapshot_seq(&doc_id), progress.cursor(&doc_id), sizes) {
+    let snapshot_seq = progress.snapshot_seq(&doc_id);
+    let due_by_fault = handler
+        .link_faults()
+        .and_then(|faults| faults.snapshot_every())
+        .is_some_and(|every| seq.saturating_sub(snapshot_seq) >= every && progress.cursor(&doc_id).applied_through() == seq);
+    if due_by_fault || protocol::snapshot_due_by(seq, snapshot_seq, progress.cursor(&doc_id), sizes) {
         if upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, seq, progress).await? {
             progress.note_snapshot(&doc_id, seq);
         }
@@ -2415,6 +2650,13 @@ async fn catch_up(
     if !ahead && !progress.is_dirty(&doc_id) {
         return Ok(());
     }
+    // The same gap as last time, from the same place: what was sent then is
+    // in the log, and sending it again changes nothing for anyone (wave 3: a
+    // gap nobody can fill made a device send the same catch-up again).
+    if progress.caught_up.get(&doc_id.as_str()) == Some(&(known.clone(), local_sv.clone())) && !progress.is_dirty(&doc_id) {
+        debug!("Vault link for store {} doc {:?}: this catch-up was sent already; not again", store_id, doc_id);
+        return Ok(());
+    }
     let (local_sv, diff) = doc_diff(handler, store_id, &doc_id, &known).await?;
     if !progress.parts_ok && diff.len() > MAX_CATCH_UP_BLOB {
         progress.mark_dirty(&doc_id);
@@ -2423,6 +2665,7 @@ async fn catch_up(
     info!("Vault link for store {} doc {:?}: the remote lacks part of it after a live append; sending {} bytes to fill the gap", store_id, doc_id, diff.len());
     match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await? {
         Appended::Yes => {
+            progress.caught_up.insert(doc_id.as_str(), (known, local_sv.clone()));
             progress.set_known(&doc_id, &local_sv);
             progress.clear_dirty(&doc_id);
         }
@@ -2599,6 +2842,9 @@ async fn send_reports(handler: &RpcHandler, client: &PimbleClient, store_id: Sto
             continue;
         }
         let Some(report) = report_of(handler, store_id, node_id).await else { continue };
+        // What this device set aside of it, so a device holding the same
+        // parked update sets it aside too (section 5).
+        let report = report.with_aside(progress.convergence.aside_of(&doc));
         let plaintext = report.encode();
         if progress.reported.get(&doc) == Some(&plaintext) {
             continue;
@@ -2707,13 +2953,84 @@ async fn answer_report(
     Ok(())
 }
 
+/// How often a connected link asks again what a notification it never got
+/// would have told it ([`recheck`]).
+const RECHECK_EVERY: Duration = Duration::from_secs(60);
+/// The same under a test's faults (`crate::faults`), so a run settles in seconds.
+const RECHECK_EVERY_UNDER_FAULTS: Duration = Duration::from_secs(2);
+
+/// What a lost notification would have brought, asked for again (wave 3,
+/// found by the fault test). A `VaultAppended` that never reached this link
+/// leaves the document behind its log until the next append to it or the
+/// next reconnect, and a `VaultReported` that never came leaves another
+/// device's lack unanswered just as long; a connection can last all day.
+/// So every [`RECHECK_EVERY`]: the remote's listing, and every document whose
+/// head moved since it was last listed and that this device has not read
+/// through is read from its cursor; then every device's reports again, each
+/// answered as at a connect (what was answered once is not answered again,
+/// so this sends nothing that has not changed).
+#[allow(clippy::too_many_arguments)]
+async fn recheck(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, key_id: Uuid, link_id: &str, echoes: &Arc<EchoTracker>, progress: &mut Progress) -> anyhow::Result<()> {
+    let listing = client.vault_list_docs_response(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
+    if listing.epoch.is_some() && listing.epoch != progress.file.epoch {
+        // The twin was built again: the next connect reads it from the start.
+        return Err(anyhow::anyhow!("the remote's logs changed under this connection"));
+    }
+    let mut behind = false;
+    for doc in listing.docs {
+        if doc.doc_id == VaultDocId::Tree {
+            continue;
+        }
+        let key = doc.doc_id.as_str();
+        let moved = progress.listed_heads.insert(key.clone(), doc.head) != Some(doc.head);
+        if moved && doc.head > progress.cursor(&doc.doc_id).applied_through() {
+            info!("Vault link for store {} doc {:?}: the log holds entries this device never heard of (through {}); reading them", store_id, doc.doc_id, doc.head);
+            pull_doc(handler, client, store_id, &doc.doc_id, link_id, progress).await?;
+            behind = true;
+        }
+    }
+    if behind {
+        handler.schedule_repair(store_id);
+    }
+    if !progress.reports_ok {
+        return Ok(());
+    }
+    let held = held_on_both(handler, store_id, progress).await;
+    for batch in held.chunks(protocol::REPORTS_BATCH) {
+        let reports = match client.vault_reports(store_id, batch.to_vec()).await {
+            Ok(reports) => reports,
+            Err(e) if e.is_method_not_found() => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("remote vaultReports failed: {}", e)),
+        };
+        for report in reports {
+            let heard = HeardFrom { device: &report.device, account: report.account.as_deref(), at: report.at };
+            answer_report(handler, client, store_id, key_id, link_id, &report.doc_id, heard, &report.blob, echoes, progress).await?;
+        }
+    }
+    // And this device's own, where the remote's is not what it holds now (a
+    // report that did not go through).
+    send_reports(handler, client, store_id, key_id, held, progress).await?;
+    progress.save_if_unsaved().await;
+    Ok(())
+}
+
 // ── Out of step, said (docs/CONVERGENCE_CONTRACT.md section 4) ───────────
 
 /// Why `node_id` differs from what the other devices hold, when it does
-/// (`pimble_rpc::vault::out_of_step_reason`, the browser's judgement too).
+/// (`pimble_rpc::vault::out_of_step_reason`, the browser's judgement too),
+/// and which kind of reason it is.
 /// What this device holds counts as unsent while the remote is not known to
 /// hold it (`pushed_sv`) or a send of it was refused (marked).
-fn reason_for(doc: &pimble_crdt::NodeDoc, heard: Option<&HashMap<String, Heard>>, progress: &Progress, doc_id: &VaultDocId, pushes: bool, names: &dyn Fn(Option<&str>) -> String, now: DateTime<Utc>) -> Option<String> {
+#[allow(clippy::too_many_arguments)]
+fn reason_for(
+    doc: &pimble_crdt::NodeDoc,
+    heard: Option<&HashMap<String, Heard>>,
+    progress: &Progress,
+    doc_id: &VaultDocId,
+    pushes: bool,
+    names: &dyn Fn(Option<&str>) -> protocol::Whose,
+    now: DateTime<Utc>,
+) -> Option<(pimble_core::OutOfStepKind, String)> {
     let local = protocol::Report::of(doc);
     let doc_key = doc_id.as_str();
     let unsent = progress.is_dirty(doc_id) || pimble_crdt::state_vector_exceeds(&local.state_vector, &progress.known(doc_id)).unwrap_or(true);
@@ -2725,19 +3042,24 @@ fn reason_for(doc: &pimble_crdt::NodeDoc, heard: Option<&HashMap<String, Heard>>
 /// link connected: a difference that has lasted `ServerConfig::out_of_step_after`
 /// of connected time makes the document out of step (a warning in the log,
 /// and the list `getStoreSync` carries), and one that closes clears it at
-/// once (an info line).
+/// once (an info line). A document waiting parked is said with since when it
+/// has waited (kept across restarts, `convergence.json`), and one whose
+/// parked update was set aside says so for a month (section 5).
 async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Progress, elapsed: Duration) {
     let after = handler.out_of_step_after();
     let now = Utc::now();
     let people = crate::people::cached(handler, store_id).await;
     let own_account = handler.keystore().account().await.map(|account| account.user_id);
-    let names = |account: Option<&str>| protocol::device_name(account, own_account.as_deref(), |id| people.name_of(id, None).map(str::to_string));
-    let reasons: HashMap<NodeId, String> = {
+    let names = |account: Option<&str>| protocol::whose(account, own_account.as_deref(), |id| people.name_of(id, None).map(str::to_string));
+    let (reasons, parked) = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
         let Ok(tree) = manager.tree(store_id) else { return };
         let access = manager.store_access(store_id);
-        let mut reasons = HashMap::new();
+        let mut reasons: HashMap<NodeId, (pimble_core::OutOfStepKind, String)> = HashMap::new();
+        // Every document held, tombstones too: what is set aside is judged
+        // over all of them (`settle_parked`).
+        let parked: HashMap<NodeId, Vec<u8>> = manager.doc_ids(store_id).unwrap_or_default().into_iter().filter_map(|id| tree.doc(id).and_then(|d| d.missing()).map(|m| (id, m))).collect();
         for node_id in tree.list_node_ids() {
             let Some(doc) = tree.doc(node_id) else { continue };
             let doc_id = VaultDocId::Node(node_id);
@@ -2746,19 +3068,29 @@ async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Pro
                 reasons.insert(node_id, reason);
             }
         }
-        reasons
+        (reasons, parked)
     };
+    // Since when each parked update has waited for what it waits for: the
+    // 24 hours of section 5 count from here, across restarts.
+    let gone: Vec<String> = progress.convergence.file.parked.keys().filter(|doc| NodeId::parse(doc).map_or(true, |id| !parked.contains_key(&id))).cloned().collect();
+    for doc in gone {
+        progress.convergence.not_waiting(&doc);
+    }
+    let mut waiting_since: HashMap<NodeId, DateTime<Utc>> = HashMap::new();
+    for (node_id, missing) in &parked {
+        waiting_since.insert(*node_id, progress.convergence.waiting_since(&VaultDocId::Node(*node_id).as_str(), missing, now));
+    }
+
     progress.steps.retain(|node_id, candidate| {
         if reasons.contains_key(node_id) {
             return true;
         }
         if candidate.marked {
             info!("Vault link for store {} doc {}: in step again (it was out of step since {})", store_id, node_id, candidate.since.to_rfc3339());
-            progress.waiting.clear_out_of_step(*node_id);
         }
         false
     });
-    for (node_id, reason) in reasons {
+    for (node_id, (kind, reason)) in reasons {
         // A difference first seen now has lasted no time yet: the time since
         // the last judgment was before it was seen.
         let candidate = match progress.steps.entry(node_id) {
@@ -2767,18 +3099,148 @@ async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Pro
                 candidate.held += elapsed;
                 candidate
             }
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Candidate { since: now, held: Duration::ZERO, reason: reason.clone(), marked: false }),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Candidate { since: now, held: Duration::ZERO, reason: reason.clone(), kind, marked: false }),
         };
-        let changed = candidate.reason != reason;
         candidate.reason = reason;
-        if candidate.held >= after && (!candidate.marked || changed) {
-            if !candidate.marked {
-                warn!("Vault link for store {} doc {}: out of step since {}: {}", store_id, node_id, candidate.since.to_rfc3339(), candidate.reason);
-            }
+        candidate.kind = kind;
+        if candidate.held >= after && !candidate.marked {
+            // Every kind is logged: diagnostics see what the note does not say.
+            warn!("Vault link for store {} doc {}: out of step since {}: {}", store_id, node_id, candidate.since.to_rfc3339(), candidate.reason);
             candidate.marked = true;
-            progress.waiting.set_out_of_step(pimble_core::OutOfStep { node_id, since: candidate.since, reason: candidate.reason.clone() });
         }
     }
+    let mut list: std::collections::BTreeMap<String, pimble_core::OutOfStep> = std::collections::BTreeMap::new();
+    for (node_id, candidate) in progress.steps.iter().filter(|(_, c)| c.marked) {
+        let since = match candidate.kind {
+            pimble_core::OutOfStepKind::Waiting => waiting_since.get(node_id).copied().unwrap_or(candidate.since),
+            _ => candidate.since,
+        };
+        list.insert(node_id.to_string(), pimble_core::OutOfStep { node_id: *node_id, since, reason: candidate.reason.clone(), kind: candidate.kind });
+    }
+    // What was set aside, said quietly where nothing else is said of the note.
+    for (doc, _) in progress.convergence.file.set_aside.iter() {
+        let Ok(node_id) = NodeId::parse(doc) else { continue };
+        if list.contains_key(doc) || parked.contains_key(&node_id) {
+            continue;
+        }
+        if let Some(record) = progress.convergence.latest_set_aside(doc, now) {
+            list.insert(doc.clone(), pimble_core::OutOfStep { node_id, since: record.at, reason: protocol::SET_ASIDE_REASON.to_string(), kind: pimble_core::OutOfStepKind::SetAside });
+        }
+    }
+    progress.waiting.set_out_of_step_all(list);
+}
+
+/// Section 5, what cannot be had: every parked update that has waited
+/// `ServerConfig::set_aside_after` (24 hours) with every device that reported
+/// the document lacking what it waits for, or that another device's report
+/// says it set aside, or that this device set aside before and has parked
+/// again (read again from a log or snapshot that still carried it), is
+/// dropped from the document. The log says what was set aside, the record
+/// (`convergence.json`) feeds the note's Properties, this device reports
+/// again at once (saying what it set aside), and a snapshot through what it
+/// has read takes the entry that carried it out of the log, so no fresh
+/// reader parks it again. Only with reports working: without them nobody can
+/// say who holds what.
+#[allow(clippy::too_many_arguments)]
+async fn settle_parked(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, key_id: Uuid, link_id: &str, echoes: &Arc<EchoTracker>, progress: &mut Progress) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let after = chrono::Duration::from_std(handler.set_aside_after()).unwrap_or_else(|_| chrono::Duration::seconds(protocol::SET_ASIDE_AFTER_SECS));
+    let parked: Vec<(NodeId, Vec<u8>)> = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        let Ok(tree) = manager.tree(store_id) else { return Ok(()) };
+        manager.doc_ids(store_id).unwrap_or_default().into_iter().filter_map(|id| tree.doc(id).and_then(|d| d.missing()).map(|m| (id, m))).collect()
+    };
+    for (node_id, missing) in parked {
+        let doc_id = VaultDocId::Node(node_id);
+        let doc = doc_id.as_str();
+        let why = if progress.convergence.set_aside_before(&doc, &missing) {
+            "set aside here before"
+        } else {
+            if !progress.reports_ok {
+                continue;
+            }
+            let since = progress.convergence.waiting_since(&doc, &missing, now);
+            let heard = progress.heard.get(&doc).into_iter().flatten().map(|(_, h)| (&h.report, (now - h.at).num_days()));
+            match protocol::set_aside_due(&missing, since, now, after, heard) {
+                protocol::SetAsideDue::Held => {
+                    progress.convergence.restart(&doc, now);
+                    continue;
+                }
+                protocol::SetAsideDue::Wait => continue,
+                protocol::SetAsideDue::Waited => "it waited the whole time",
+                protocol::SetAsideDue::SetAsideElsewhere => "another device set it aside",
+            }
+        };
+        let since = progress.convergence.file.parked.get(&doc).map(|p| p.since);
+        let dropped = {
+            let manager = handler.store_manager_handle();
+            let mut manager = manager.write().await;
+            let dropped = manager.tree_mut(store_id).ok().and_then(|tree| tree.doc_mut(node_id)).and_then(|d| d.set_aside_parked());
+            if dropped.is_some() {
+                let _ = manager.mark_dirty(store_id, node_id);
+            }
+            dropped
+        };
+        let Some(dropped) = dropped else { continue };
+        handler.schedule_content_flush(store_id);
+        let whose = "another device";
+        if why == "set aside here before" {
+            info!("Vault link for store {} doc {}: set aside again an update this device set aside before, waiting for {} ({}'s changes)", store_id, node_id, pimble_crdt::describe_state_vector(&dropped), whose);
+        } else {
+            warn!(
+                "Vault link for store {} doc {}: set aside an update from {} that waited since {} for changes no device that reported holds ({}): {}",
+                store_id,
+                node_id,
+                whose,
+                since.map(|s| s.to_rfc3339()).unwrap_or_else(|| "now".into()),
+                pimble_crdt::describe_state_vector(&dropped),
+                why
+            );
+            progress.convergence.record_set_aside(&doc, protocol::SetAsideRecord::new(&dropped, now));
+        }
+        progress.convergence.not_waiting(&doc);
+        if progress.reports_ok {
+            progress.report_due.insert(doc.clone(), tokio::time::Instant::now());
+        }
+        if let Err(e) = snapshot_after_set_aside(handler, client, store_id, key_id, link_id, &doc_id, echoes, progress).await {
+            warn!("Vault link for store {} doc {}: the snapshot after setting aside failed ({}); the log still carries what was set aside", store_id, node_id, e);
+        }
+    }
+    progress.save_if_unsaved().await;
+    Ok(())
+}
+
+/// Take what was set aside out of the log: a snapshot of the document as it
+/// is now, through every entry this device has read (`applied_through`: the
+/// entry that carried the set-aside update is one of them, dealt with). When
+/// nothing newer than the snapshot held is there to stamp, a change that
+/// changes nothing (the diff from this document's own vector: no structs,
+/// its delete set) is appended first, so the new snapshot replaces the old
+/// one that may carry it. Only on a device that writes the document.
+#[allow(clippy::too_many_arguments)]
+async fn snapshot_after_set_aside(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, key_id: Uuid, link_id: &str, doc_id: &VaultDocId, echoes: &Arc<EchoTracker>, progress: &mut Progress) -> anyhow::Result<()> {
+    if !progress.keyring.remote_docs.contains(&doc_id.as_str()) || !may_push(handler, store_id, doc_id).await {
+        return Ok(());
+    }
+    if progress.cursor(doc_id).applied_through() <= progress.snapshot_seq(doc_id) {
+        let VaultDocId::Node(node_id) = doc_id else { return Ok(()) };
+        let own = {
+            let manager = handler.store_manager_handle();
+            let manager = manager.read().await;
+            manager.node_state_vector(store_id, *node_id).map_err(|e| anyhow::anyhow!("{}", e))?
+        };
+        let (_, nothing_new) = doc_diff(handler, store_id, doc_id, &own).await?;
+        if append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &nothing_new, echoes, progress).await? != Appended::Yes {
+            return Ok(());
+        }
+    }
+    let upto = progress.cursor(doc_id).applied_through();
+    if upto > progress.snapshot_seq(doc_id) && upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, upto, progress).await? {
+        progress.note_snapshot(doc_id, upto);
+        info!("Vault link for store {} doc {:?}: a snapshot through seq {} takes what was set aside out of the log", store_id, doc_id, upto);
+    }
+    Ok(())
 }
 
 /// How often a connected link judges whether its documents are in step: a

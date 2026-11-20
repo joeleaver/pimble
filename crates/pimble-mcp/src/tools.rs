@@ -159,8 +159,14 @@ fn crdt(e: CrdtError) -> String {
 
 /// What get_node says of a note out of step on this device
 /// (docs/CONVERGENCE_CONTRACT.md section 4): since when, in UTC, and why.
+/// Every kind, the ones the app says only in Properties worded as there
+/// (wave 3), with the day.
 fn out_of_step_line(entry: &pimble_core::OutOfStep) -> String {
-    entry.sentence(&entry.since.format("%Y-%m-%d %H:%M UTC").to_string())
+    let when = match entry.kind {
+        pimble_core::OutOfStepKind::Waiting | pimble_core::OutOfStepKind::SetAside => entry.since.format("%Y-%m-%d").to_string(),
+        _ => entry.since.format("%Y-%m-%d %H:%M UTC").to_string(),
+    };
+    entry.sentence(&when)
 }
 
 /// A node's type as the person knows it: a `board` node is a canvas in the
@@ -1453,7 +1459,13 @@ mod out_of_step_tests {
     #[test]
     fn get_node_says_since_when_and_why() {
         let since = chrono::DateTime::parse_from_rfc3339("2026-11-19T14:05:00Z").unwrap().with_timezone(&chrono::Utc);
-        let entry = pimble_core::OutOfStep { node_id: pimble_core::NodeId::new(), since, reason: "Waits for earlier changes another device has not sent.".into() };
-        assert_eq!(super::out_of_step_line(&entry), "Out of step since 2026-11-19 14:05 UTC: Waits for earlier changes another device has not sent.");
+        let behind = "Will's device holds changes this one doesn't have yet. They'll arrive when Will opens Pimble.";
+        let entry = pimble_core::OutOfStep { node_id: pimble_core::NodeId::new(), since, reason: behind.into(), kind: pimble_core::OutOfStepKind::Behind };
+        assert_eq!(super::out_of_step_line(&entry), format!("Out of step since 2026-11-19 14:05 UTC: {behind}"));
+        // What nobody can act on: worded as Properties words it.
+        let waiting = pimble_core::OutOfStep { reason: pimble_rpc::vault::WAITING_REASON.into(), kind: pimble_core::OutOfStepKind::Waiting, ..entry.clone() };
+        assert_eq!(super::out_of_step_line(&waiting), "Some changes from another device never arrived (waiting since 2026-11-19).");
+        let aside = pimble_core::OutOfStep { reason: pimble_rpc::vault::SET_ASIDE_REASON.into(), kind: pimble_core::OutOfStepKind::SetAside, ..entry };
+        assert_eq!(super::out_of_step_line(&aside), "Some changes from another device never arrived and were set aside on 2026-11-19.");
     }
 }

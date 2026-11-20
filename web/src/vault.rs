@@ -523,6 +523,15 @@ struct VaultStore {
     out_of_step: HashMap<NodeId, pimble_core::OutOfStep>,
     /// When the documents were last judged (the page's clock, ms).
     steps_judged_at: Option<f64>,
+    /// What each document's parked update waits for and since when this page
+    /// first saw it wait for that (ms), for the quiet line in its Properties
+    /// (docs/CONVERGENCE_CONTRACT.md section 5). The page's life only.
+    parked_since: HashMap<NodeId, (Vec<u8>, f64)>,
+    /// What this page set aside of each document, for the page's life. A page
+    /// never sets aside on its own (it lives minutes, not the 24 hours): only
+    /// what another device's report says it set aside, or what this page set
+    /// aside before and parked again (decided 2026-11-20, building wave 3).
+    set_aside: HashMap<NodeId, Vec<protocol::SetAsideRecord>>,
 }
 
 /// A document that differs from what the other devices hold.
@@ -530,6 +539,7 @@ struct StepCandidate {
     since_ms: f64,
     held_ms: f64,
     reason: String,
+    kind: pimble_core::OutOfStepKind,
     marked: bool,
 }
 
@@ -2893,6 +2903,8 @@ impl VaultStore {
             steps: HashMap::new(),
             out_of_step: HashMap::new(),
             steps_judged_at: None,
+            parked_since: HashMap::new(),
+            set_aside: HashMap::new(),
         }
     }
 
@@ -3662,7 +3674,8 @@ impl VaultStore {
                 continue;
             }
             let Some(doc) = self.tree.doc(node_id) else { continue };
-            let report = protocol::Report::of(doc);
+            let aside = self.set_aside.get(&node_id).map(|records| records.iter().filter_map(|r| r.missing_bytes()).collect::<Vec<_>>()).unwrap_or_default();
+            let report = protocol::Report::of(doc).with_aside(aside);
             let plaintext = report.encode();
             if self.reported.get(&node_id) == Some(&plaintext) {
                 continue;
@@ -3731,14 +3744,19 @@ impl VaultStore {
     /// judgement). Answers whether the list changed; the store's sync answer
     /// then says it again (`held_back_events`).
     fn judge_steps(&mut self, own: &str, own_account: Option<&str>, row: Option<&AccountStore>, now: f64, elapsed: f64, after: f64) -> bool {
+        let mut changed = self.settle_parked(now);
         // The person's own other devices, and everyone else's by the name
         // the store's people list gives them.
         let people = &self.people;
-        let name = |account: Option<&str>| protocol::device_name(account, own_account, |id| people.get(id).cloned());
-        let mut reasons: HashMap<NodeId, String> = HashMap::new();
+        let name = |account: Option<&str>| protocol::whose(account, own_account, |id| people.get(id).cloned());
+        let mut reasons: HashMap<NodeId, (pimble_core::OutOfStepKind, String)> = HashMap::new();
+        let mut parked: HashMap<NodeId, Vec<u8>> = HashMap::new();
         for node_id in self.tree.ids() {
             let Some(doc) = self.tree.doc(node_id) else { continue };
             let local = protocol::Report::of(doc);
+            if let Some(missing) = &local.missing {
+                parked.insert(node_id, missing.clone());
+            }
             let known = self.docs.get(&node_id).map(|d| (d.unsent, d.known_sv.clone()));
             let unsent = match &known {
                 Some((unsent, known_sv)) => *unsent || pimble_crdt::state_vector_exceeds(&local.state_vector, known_sv).unwrap_or(true),
@@ -3750,35 +3768,54 @@ impl VaultStore {
                 reasons.insert(node_id, reason);
             }
         }
-        let mut changed = false;
+        // Since when each parked update has waited for what it waits for.
+        self.parked_since.retain(|id, (missing, _)| parked.get(id) == Some(missing));
+        for (node_id, missing) in parked {
+            self.parked_since.entry(node_id).or_insert((missing, now));
+        }
         let since_of = |ms: f64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(chrono::Utc::now);
         let gone: Vec<NodeId> = self.steps.keys().filter(|id| !reasons.contains_key(id)).copied().collect();
         for node_id in gone {
             if self.steps.remove(&node_id).is_some_and(|c| c.marked) {
                 tracing::info!("Store {}: the document {} is in step again", self.listed.id, node_id);
-                self.out_of_step.remove(&node_id);
-                changed = true;
             }
         }
-        for (node_id, reason) in reasons {
+        for (node_id, (kind, reason)) in reasons {
             let candidate = match self.steps.entry(node_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let candidate = entry.into_mut();
                     candidate.held_ms += elapsed;
                     candidate
                 }
-                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(StepCandidate { since_ms: now, held_ms: 0.0, reason: reason.clone(), marked: false }),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(StepCandidate { since_ms: now, held_ms: 0.0, reason: reason.clone(), kind, marked: false }),
             };
-            let new_reason = candidate.reason != reason;
             candidate.reason = reason;
-            if candidate.held_ms >= after && (!candidate.marked || new_reason) {
-                if !candidate.marked {
-                    tracing::warn!("Store {}: the document {} is out of step: {}", self.listed.id, node_id, candidate.reason);
-                }
+            candidate.kind = kind;
+            if candidate.held_ms >= after && !candidate.marked {
+                tracing::warn!("Store {}: the document {} is out of step: {}", self.listed.id, node_id, candidate.reason);
                 candidate.marked = true;
-                self.out_of_step.insert(node_id, pimble_core::OutOfStep { node_id, since: since_of(candidate.since_ms), reason: candidate.reason.clone() });
-                changed = true;
             }
+        }
+        let mut list: HashMap<NodeId, pimble_core::OutOfStep> = HashMap::new();
+        for (node_id, candidate) in self.steps.iter().filter(|(_, c)| c.marked) {
+            let since_ms = match candidate.kind {
+                pimble_core::OutOfStepKind::Waiting => self.parked_since.get(node_id).map(|(_, at)| *at).unwrap_or(candidate.since_ms),
+                _ => candidate.since_ms,
+            };
+            list.insert(*node_id, pimble_core::OutOfStep { node_id: *node_id, since: since_of(since_ms), reason: candidate.reason.clone(), kind: candidate.kind });
+        }
+        // What this page set aside, said quietly where nothing else is.
+        for (node_id, records) in &self.set_aside {
+            if list.contains_key(node_id) || self.parked_since.contains_key(node_id) {
+                continue;
+            }
+            if let Some(record) = records.iter().max_by_key(|r| r.at) {
+                list.insert(*node_id, pimble_core::OutOfStep { node_id: *node_id, since: record.at, reason: protocol::SET_ASIDE_REASON.to_string(), kind: pimble_core::OutOfStepKind::SetAside });
+            }
+        }
+        if list != self.out_of_step {
+            self.out_of_step = list;
+            changed = true;
         }
         if changed {
             self.held_changed = true;
@@ -3786,9 +3823,62 @@ impl VaultStore {
         changed
     }
 
-    /// The documents out of step, in a steady order.
+    /// Section 5 in the browser: a parked update is set aside when another
+    /// device's report says it set aside one waiting for exactly the same
+    /// (and no device that reported holds any of it), or when this page set
+    /// it aside before and parked it again. A page never gives up on its own:
+    /// it does not live the 24 hours, and the device that does takes the
+    /// log entry away with a snapshot. Answers whether anything was set aside.
+    fn settle_parked(&mut self, now: f64) -> bool {
+        let mut any = false;
+        let ids: Vec<NodeId> = self.tree.ids();
+        for node_id in ids {
+            let Some(missing) = self.tree.doc(node_id).and_then(|d| d.missing()) else { continue };
+            let before = self.set_aside.get(&node_id).is_some_and(|records| records.iter().any(|r| r.missing_bytes().as_deref() == Some(missing.as_slice())));
+            let elsewhere = || {
+                let heard = self.reports_heard.get(&node_id).into_iter().flatten().map(|(_, (report, _, at))| (report, ((now - at) / 86_400_000.0) as i64));
+                // The page's own clock never decides: only another device's word.
+                let never = chrono::Duration::MAX;
+                protocol::set_aside_due(&missing, chrono::Utc::now(), chrono::Utc::now(), never, heard) == protocol::SetAsideDue::SetAsideElsewhere
+            };
+            if !before && !elsewhere() {
+                continue;
+            }
+            let Some(dropped) = self.tree.doc_mut(node_id).and_then(|d| d.set_aside_parked()) else { continue };
+            tracing::warn!(
+                "Store {}: set aside an update of the document {} from another device, waiting for {} ({})",
+                self.listed.id,
+                node_id,
+                pimble_crdt::describe_state_vector(&dropped),
+                if before { "this page set it aside before" } else { "another device set it aside" }
+            );
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now as i64).unwrap_or_else(chrono::Utc::now);
+            let records = self.set_aside.entry(node_id).or_default();
+            let record = protocol::SetAsideRecord::new(&dropped, at);
+            if !records.iter().any(|r| r.missing == record.missing) {
+                records.push(record);
+            }
+            self.parked_since.remove(&node_id);
+            self.note_report_due(node_id, now - protocol::REPORT_DEBOUNCE_MS as f64);
+            any = true;
+        }
+        any
+    }
+
+    /// The documents out of step, in a steady order; what this page could
+    /// not send with what holds its send back, when that is known.
     fn out_of_step_list(&self) -> Vec<pimble_core::OutOfStep> {
-        let mut list: Vec<pimble_core::OutOfStep> = self.out_of_step.values().cloned().collect();
+        let mut list: Vec<pimble_core::OutOfStep> = self
+            .out_of_step
+            .values()
+            .cloned()
+            .map(|mut entry| {
+                if entry.kind == pimble_core::OutOfStepKind::Unsent {
+                    entry.reason = protocol::with_step(&entry.reason, self.held_back.get(&(entry.node_id, Side::Send)).map(String::as_str));
+                }
+                entry
+            })
+            .collect();
         list.sort_by_key(|o| o.node_id.to_string());
         list
     }
@@ -6504,7 +6594,8 @@ mod tests {
         assert!(page.judge_steps("me", None, None, 11_200.0, 600.0, after), "the window has passed");
         let list = page.out_of_step_list();
         assert_eq!(list.len(), 1);
-        assert_eq!((list[0].node_id, list[0].reason.as_str()), (root, protocol::PARKED_REASON));
+        assert_eq!((list[0].node_id, list[0].reason.as_str(), list[0].kind), (root, protocol::WAITING_REASON, pimble_core::OutOfStepKind::Waiting));
+        assert!(!list[0].is_shown(), "nobody can act on it: said only in Properties (Joe, 2026-11-20)");
         assert_eq!(list[0].since.timestamp_millis(), 10_000, "since the difference began");
         assert!(page.held_changed, "the store's sync answer says it again");
         assert!(!page.judge_steps("me", None, None, 11_800.0, 600.0, after), "said once");
@@ -6527,13 +6618,77 @@ mod tests {
         assert!(a.answer_report_from(store_id, "device-a", root, "device-b", Some("acct-me"), 0.0, &blob, None).is_none(), "nothing of A's to send");
         a.judge_steps("device-a", Some("acct-me"), None, 1.0, 0.0, 10.0);
         a.judge_steps("device-a", Some("acct-me"), None, 20.0, 19.0, 10.0);
-        assert_eq!(a.out_of_step_list()[0].reason, "Your other device holds changes this one lacks.");
+        assert_eq!(a.out_of_step_list()[0].reason, "Your other device holds changes this one doesn't have yet. They'll arrive when you open Pimble there.");
+        assert!(a.out_of_step_list()[0].is_shown());
         a.answer_report_from(store_id, "device-a", root, "device-b", Some("acct-will"), 0.0, &blob, None);
         a.judge_steps("device-a", Some("acct-me"), None, 40.0, 20.0, 10.0);
-        assert_eq!(a.out_of_step_list()[0].reason, "Another device holds changes this one lacks.", "no one is known by that account yet");
+        assert_eq!(
+            a.out_of_step_list()[0].reason,
+            "Another device holds changes this one doesn't have yet. They'll arrive when that device is online again.",
+            "no one is known by that account yet"
+        );
         // The store's people, as the accounts service lists them: named.
         a.people.insert("acct-will".to_string(), "Will".to_string());
         a.judge_steps("device-a", Some("acct-me"), None, 60.0, 20.0, 10.0);
-        assert_eq!(a.out_of_step_list()[0].reason, "Will's device holds changes this one lacks.", "named as the desktop names it");
+        assert_eq!(a.out_of_step_list()[0].reason, "Will's device holds changes this one doesn't have yet. They'll arrive when Will opens Pimble.", "named as the desktop names it");
+    }
+
+    /// Section 5 in the browser (decided 2026-11-20, building wave 3): a page
+    /// never gives up on its own, however long it waits; it sets a parked
+    /// update aside when another device's report says that device set aside
+    /// one waiting for exactly the same, says so quietly, and says it in its
+    /// own report; one it set aside and parks again goes at once; and a
+    /// device that reported holding what it waits for keeps it.
+    #[test]
+    fn a_page_sets_aside_only_what_another_device_set_aside() {
+        let (peer, root) = origin();
+        let store_id = StoreId::new();
+        let (mut a, mut b) = two_pages(&peer);
+        let base = a.tree.doc(root).unwrap().save();
+        let mut scratch = NodeDoc::load(&base).unwrap();
+        let _lost = scratch.append_markdown("nobody holds this").unwrap();
+        let waits = scratch.append_markdown("waits for it").unwrap();
+        a.tree.apply_update(root, &waits).unwrap();
+        b.tree.apply_update(root, &waits).unwrap();
+        let missing = a.tree.doc(root).unwrap().missing().unwrap();
+
+        // A day of judging, and nothing is given up on the page's own word.
+        a.judge_steps("device-a", None, None, 0.0, 0.0, 10.0);
+        a.judge_steps("device-a", None, None, 90_000_000.0, 600.0, 10.0);
+        assert!(a.tree.doc(root).unwrap().missing().is_some(), "a page never sets aside on its own");
+
+        // B set it aside (a desktop's 24 hours, say): its report says so.
+        b.set_aside.insert(root, vec![protocol::SetAsideRecord::new(&missing, chrono::Utc::now())]);
+        let (_, _, blob) = b.reports_for(store_id, vec![root]).pop().unwrap();
+        a.answer_report_from(store_id, "device-a", root, "device-b", None, 90_000_000.0, &blob, None);
+        assert!(a.judge_steps("device-a", None, None, 90_000_600.0, 600.0, 10.0), "the list changed");
+        assert_eq!(a.tree.doc(root).unwrap().missing(), None, "set aside, on another device's word");
+        let list = a.out_of_step_list();
+        assert_eq!((list.len(), list[0].kind, list[0].reason.as_str()), (1, pimble_core::OutOfStepKind::SetAside, protocol::SET_ASIDE_REASON));
+        assert!(!list[0].is_shown(), "quiet");
+        let (_, plaintext, _) = a.reports_for(store_id, vec![root]).pop().unwrap();
+        assert_eq!(protocol::Report::decode(&plaintext).unwrap().aside, vec![missing.clone()], "and its own report says so");
+
+        // Read again from a log that still carries it: set aside at once.
+        a.tree.apply_update(root, &waits).unwrap();
+        assert!(a.tree.doc(root).unwrap().missing().is_some());
+        a.judge_steps("device-a", None, None, 90_001_200.0, 600.0, 10.0);
+        assert_eq!(a.tree.doc(root).unwrap().missing(), None, "parked again, set aside again");
+
+        // A device that holds what it waits for keeps a page from giving up.
+        let page = |keys_of: &VaultStore| {
+            let mut page = VaultStore::assemble(listed(peer.root()), same_keys(keys_of), Vec::new(), pull_of(&peer));
+            page.reports_ok = true;
+            page
+        };
+        let mut c = page(&a);
+        c.tree.apply_update(root, &waits).unwrap();
+        let mut holder = page(&a);
+        holder.tree.apply_update(root, &scratch.diff_since(&holder.tree.doc(root).unwrap().state_vector()).unwrap()).unwrap();
+        let (_, _, holds) = holder.reports_for(store_id, vec![root]).pop().unwrap();
+        c.answer_report_from(store_id, "device-c", root, "device-b", None, 0.0, &blob, None);
+        c.answer_report_from(store_id, "device-c", root, "device-h", None, 0.0, &holds, None);
+        c.judge_steps("device-c", None, None, 1.0, 0.0, 10.0);
+        assert!(c.tree.doc(root).unwrap().missing().is_some(), "held by a device that reported: kept");
     }
 }

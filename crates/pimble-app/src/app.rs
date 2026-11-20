@@ -2268,7 +2268,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // when as the tooltip. Drawn from the render-time snapshot: the
             // row's data carries the mark (`out_of_step::row_snapshot`).
             let out_of_step_mark: Option<NodeHandle> = match parsed {
-                Some((s_id, Some(n_id))) if !is_store_root => untracked(|| store.out_of_step_of(s_id, n_id)).map(|entry| {
+                Some((s_id, Some(n_id))) if !is_store_root => untracked(|| store.out_of_step_shown(s_id, n_id)).map(|entry| {
                     let mark = render_tabler_icon(__scope, TablerIcon::AlertTriangle, TablerIconStyle::Outline);
                     rsx! {
                         span {

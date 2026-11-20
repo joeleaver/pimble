@@ -234,6 +234,8 @@ impl RelayHost {
             // A face links nothing; it serves reports all the same.
             vault_reports: true,
             out_of_step_after: None,
+            set_aside_after: None,
+            link_faults: None,
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;

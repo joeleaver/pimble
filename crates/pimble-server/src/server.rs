@@ -92,6 +92,14 @@ pub struct ServerConfig {
     /// (docs/CONVERGENCE_CONTRACT.md section 4). `None` is five minutes;
     /// tests shorten it.
     pub out_of_step_after: Option<std::time::Duration>,
+    /// How long a parked update waits, with every reporting device lacking
+    /// what it waits for, before it is set aside (docs/CONVERGENCE_CONTRACT.md
+    /// section 5). `None` is 24 hours; tests shorten it.
+    pub set_aside_after: Option<std::time::Duration>,
+    /// Faults a test injects into this server's vault links
+    /// (`crate::faults`). `None` outside the fault test.
+    #[doc(hidden)]
+    pub link_faults: Option<std::sync::Arc<crate::faults::LinkFaults>>,
 }
 
 impl Default for ServerConfig {
@@ -112,6 +120,8 @@ impl Default for ServerConfig {
             reported_version: None,
             vault_reports: true,
             out_of_step_after: None,
+            set_aside_after: None,
+            link_faults: None,
         }
     }
 }
@@ -281,6 +291,12 @@ impl PimbleServer {
         handler = handler.with_vault_reports(self.config.vault_reports);
         if let Some(after) = self.config.out_of_step_after {
             handler = handler.with_out_of_step_after(after);
+        }
+        if let Some(after) = self.config.set_aside_after {
+            handler = handler.with_set_aside_after(after);
+        }
+        if let Some(faults) = self.config.link_faults.clone() {
+            handler = handler.with_link_faults(faults);
         }
         handler = handler.with_agents(agents);
         // The app's own server (loopback, tokenless, no JWT) hands over to a

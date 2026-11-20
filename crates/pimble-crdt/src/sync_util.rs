@@ -86,7 +86,6 @@ pub fn empty_state_vector() -> Vec<u8> {
 /// and claiming them would make a later diff skip structs the peer never got;
 /// leaving the vector behind only makes a later diff carry a little extra.
 pub fn advance_state_vector(known: &[u8], update: &[u8]) -> Result<Vec<u8>> {
-    use yrs::updates::encoder::Encode;
     let mut known = yrs::StateVector::decode_v1(known).map_err(|e| CrdtError::Yrs(e.to_string()))?;
     let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
     let lower = update.state_vector_lower();
@@ -96,7 +95,11 @@ pub fn advance_state_vector(known: &[u8], update: &[u8]) -> Result<Vec<u8>> {
             known.set_max(*client, *end);
         }
     }
-    Ok(known.encode_v1())
+    // Canonical, like every vector a document gives out, so an advanced
+    // vector and a document's own compare as bytes (the web's
+    // `a_new_epoch_makes_the_page_forget_what_it_read` failed now and then
+    // on the order of two clients).
+    Ok(canonical_state_vector(&known))
 }
 
 /// Whether `update` continues from `known` for every client it carries (its
@@ -153,6 +156,16 @@ pub fn state_vector_exceeds(local: &[u8], known: &[u8]) -> Result<bool> {
     let local = yrs::StateVector::decode_v1(local).map_err(|e| CrdtError::Yrs(e.to_string()))?;
     let known = yrs::StateVector::decode_v1(known).map_err(|e| CrdtError::Yrs(e.to_string()))?;
     Ok(local.iter().any(|(client, clock)| *clock > known.get(client)))
+}
+
+/// Whether a document at `state_vector` holds any struct a parked update
+/// waiting for `missing` waits for (both v1): for some client of `missing`,
+/// its clock is beyond the first one missing. A device whose vector stops at
+/// or before every one of them lacks all of what is waited for.
+pub fn holds_any_of(state_vector: &[u8], missing: &[u8]) -> Result<bool> {
+    let held = yrs::StateVector::decode_v1(state_vector).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let missing = yrs::StateVector::decode_v1(missing).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    Ok(missing.iter().any(|(client, clock)| held.get(client) > *clock))
 }
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
 # Convergence: devices compare what they hold (draft, 2026-11-19)
 
-Status: **decisions answered by Joe 2026-11-19** (below). Wave 1 is built and released
-(0.28.8, "Built: wave 1" below); wave 2 is built (2026-11-19, not merged or released; "Built:
-wave 2" below); wave 3 is not.
+Status: **decisions answered by Joe 2026-11-19 and 2026-11-20** (below). Waves 1 and 2 are
+built and released (0.28.8, 0.28.9; "Built: wave 1", "Built: wave 2"); wave 3 is built
+(2026-11-20, not merged or released; "Built: wave 3" below): the display rule of 2026-11-20,
+section 5's setting aside, and the randomized fault test.
 
 Joe, 2026-11-19: "this kind of de-sync can't be allowed to happen again, it ruins the whole
 point of the app."
@@ -95,7 +96,7 @@ are swept the way `three_replicas_converge`'s are. A failing seed replays.
    the comparison. The web vault client the same.
    See "Built: wave 1" below.
 2. Requests for what is waited for, "out of step" said in the log and the app (3-4).
-3. The randomized fault test (Proving it), and the giving up (5) once Joe decides it.
+3. The randomized fault test (Proving it), and the giving up (5). See "Built: wave 3" below.
 
 ## Decisions (Joe, 2026-11-19)
 
@@ -319,6 +320,197 @@ sync answer (`sync_event`) like what waits.
 this device sent (answered) waits for that device to take them, without saying so; the browser
 cannot name other people's devices; the window counts this device's connected time, not the
 other device's.
+
+## Built: wave 3 (2026-11-20, not merged or released)
+
+### A. A mark on a note only when someone can act (Joe, 2026-11-20)
+
+**The kinds.** `pimble_core::OutOfStep` has a `kind` (`OutOfStepKind`, serde default, so an entry
+from an older server still reads): `behind` (another device holds changes this one lacks),
+`unsent` (this device could not send), `waiting` (an update waits for changes no device has sent),
+`set_aside` (what waited was set aside, section 5). `OutOfStep::is_shown` is true for the first
+two only; an older server's entry carrying wave 2's parked wording reads as quiet too.
+`OutOfStep::sentence` words each kind: "Out of step since <when>: <reason>" for the shown ones,
+"Some changes from another device never arrived (waiting since 26 Oct 2026)." and "Some changes
+from another device never arrived and were set aside on 27 Oct 2026." for the quiet ones.
+
+**The judgement** (`pimble_rpc::vault::out_of_step_reason`, desktop and browser) answers the kind
+with the reason, and now judges what someone can act on first: a report beyond this device
+(`behind`), then what this device could not send (`unsent`), and only then a parked update
+(`waiting`). **Decided here**: the order changed; before, a parked update was said first and hid a
+device that did hold the missing changes.
+
+**Words** (`pimble_rpc::vault`: `Whose`, `whose`, `lacks_here`, `could_not_send`, `with_step`):
+- "Will's device holds changes this one doesn't have yet. They'll arrive when Will opens Pimble.";
+  "Your other device ... They'll arrive when you open Pimble there."; "Another device ... They'll
+  arrive when that device is online again." (**Decided here**, the third, which Joe's wording did
+  not cover.)
+- "This device holds changes Will's device doesn't have, and couldn't send them." followed by the
+  step, added when the list is read (`VaultLinkHandle::out_of_step(session_expired)`): "Sign in
+  again to send them." while the keystore's session is expired; "They'll go when this computer is
+  back online." while the link is offline; otherwise the sentence the document's send is held back
+  with (`Waiting`, e.g. "Waiting for its key: ..."); otherwise nothing more. The browser adds the
+  held-back sentence only: its endpoint being down can mean the owner's computer is off, and the
+  online step would then be wrong (**Decided here**).
+- Waiting: `WAITING_REASON`, always "another device". **Decided here**: whose cannot be derived
+  honestly. Every device holding the parked update reports the same vector, and no report says
+  which device made the structs it lacks.
+
+**Where it is said** (`crates/pimble-app`, both apps): the row's mark and the pane's line read
+`AppStore::out_of_step_shown` (shown kinds only; `out_of_step::row_snapshot` adds nothing for a
+quiet one); Properties reads `out_of_step_of` and says every kind, the quiet ones with the day
+(`out_of_step::since_text`). The MCP's `get_node` keeps a `sync:` line for every kind, the quiet
+ones worded as Properties words them, with the UTC day. The `warn` line is logged for every kind
+when it is marked, as before.
+
+### B. Section 5, setting aside what no device holds
+
+**The rule** (`pimble_rpc::vault::set_aside_due`, shared): a parked update waiting for `missing`
+is `Held` while any report from the last 30 days holds a struct it waits for
+(`pimble_crdt::holds_any_of`: a clock beyond the first missing one); `SetAsideElsewhere` when a
+report says that device set aside an update waiting for exactly `missing`; `Waited` once it has
+waited `after` (24 hours, `SET_ASIDE_AFTER_SECS`; `ServerConfig::set_aside_after` in tests) since
+it was first seen waiting for exactly that; else `Wait`. A `Held` restarts the 24 hours. An
+undecodable vector reads as holding: setting aside is the one step that loses something.
+
+**Dropping** (`NodeDoc::set_aside_parked`): yrs's `prune_pending` drops the parked update and its
+pending deletes. Nothing integrated changes (state vector and delete digest stay), so no peer is
+sent anything because of it. As yrs carries pending updates, `save` (and so every snapshot and
+every `.yrs` file) includes them, merged into the whole state; a diff (`encode_diff`) never does;
+a document loaded from a save parks them again (`a_parked_update_rides_in_save_until_it_is_set_aside`).
+After setting aside, the saved bytes hold only what is integrated. Should the missing changes
+ever come, the device that holds them sends everything beyond this device's vector, the
+set-aside structs included.
+
+**Desktop** (`crates/pimble-server/src/vault_link.rs`, `settle_parked`, run with each judgment
+while connected, only with reports working): since when each parked update has waited, and the
+record of what was set aside, live in `convergence.json` in the store's state directory
+(`<data dir>/pimble/stores/<store id>/`, this computer's, never in the store's folder nor in a
+document), so the 24 hours survive restarts. When one is set aside: the document is marked dirty
+and flushed; a `warn` line says what was set aside (the clients and clocks it waited for), since
+when, whose ("another device") and why; a `SetAsideRecord { missing, waited_for, at, whose }` is
+kept; the document's report goes at once, carrying `aside` (below); and a snapshot is stamped
+through `applied_through` (the entry that carried the update is one of the entries read, so it is
+dealt with), after appending a change that changes nothing (the diff from the document's own
+vector) when there is nothing newer than the held snapshot to stamp, so the new snapshot replaces
+one that may carry it. That takes the entry out of the log, and a fresh reader never parks it
+again. An update this device set aside before and parks again (from a log or a snapshot that
+still carried it, or another computer's copy of the folder) is set aside at once, logged at
+`info`. Properties says `set_aside` for 30 days (`SET_ASIDE_SAID_FOR_DAYS`), unless something
+else is said of the note.
+
+**Reports say what was set aside**: `Report::aside`, wire `aside: [<base64 missing>]`, omitted
+when empty (an older reader ignores it). **Decided here**: a device holding a parked update that
+waits for exactly what another device's report says it set aside sets it aside at once
+(`SetAsideElsewhere`), rather than every device waiting its own 24 hours, and never while a
+reporting device holds some of it.
+
+**Browser** (`web/src/vault.rs`, `VaultStore::settle_parked`, run in `judge_steps`). **Decided
+here**: a page never sets aside on its own word: it lives minutes, not the 24 hours. It sets aside
+what another device's report says it set aside (and nobody holds), and what it set aside before
+and parks again; it says so quietly, and its own report carries `aside`. Its record and since
+when are for the page's life. It relies on the desktop's snapshot to take the entry out of the
+log; a page that stamps a snapshot while still holding the update puts it back in the snapshot,
+and the next reader sets it aside again from the reports.
+
+**Known limits**: a snapshot is stamped only through `applied_through`; when a gap holds the
+cursor below the entry that carried the update, the entry stays until a later snapshot covers it
+(fresh readers park it and set it aside again from the reports). The 24 hours count wall time
+since first seen, not connected time; a holder heard after a long time offline still restarts them.
+
+### The fix the coordinator named: resending on a gap nobody can fill
+
+Will's device sent one document again four times. The repeats came through two paths that send
+whole or catch-up states without asking whether the same was sent already: a repair loop that
+cannot settle (a list another device holds differently, which a gap nobody can fill keeps
+different) asks every ten minutes for its documents to go out again whole
+(`ShareCommand::Resend`), and `catch_up` after a live append. Both now remember what they sent:
+`Progress::resent` (the document's report when it last went out whole) and `Progress::caught_up`
+(the pair of the remote's known vector and this device's vector of the last catch-up); the same
+state again is not sent again (logged at `debug`). What was sent is in the log for whoever lacks it.
+
+### C. The randomized fault test
+
+`crates/pimble-server/tests/link_faults.rs` `three_devices_converge_through_faults`: Alice's
+computer (the owner, hosting the store, its folder shared), Alice's second computer (the whole
+store) and Bob's (an editor of the share, a partial replica), over the sharing harness
+(`tests/common`: the stub accounts service, the hosted server in JWT mode, the cuttable relay)
+and real vault links. Twenty steps of random edits (single, and two devices editing one document
+at once), with faults between them, injected through `ServerConfig::link_faults`
+(`crates/pimble-server/src/faults.rs`, `LinkFaults`, `None` outside the test):
+
+- an append stored by the server whose answer is lost (`lose_answers`; the link sees its
+  connection fail after the server took it), and half the time the device stopped right after
+  and started again from its files;
+- a device stopped and started again with its `vault-link.json` deleted, put back from an older
+  copy, or kept;
+- snapshots every three appends (`set_snapshot_every`) while every device reads logs in pages of
+  400 bytes (`set_page_bytes`, `PimbleClient::set_vault_page_bytes`), so snapshots land between
+  pages;
+- notifications lost (`drop_notifications`), one device's network gone for a few steps
+  (`set_offline`), every connection cut (the relay), and the owner's computer away for a few steps;
+- reports a moment after a change (`set_report_debounce`), so a run settles in seconds.
+
+After the steps, with everyone online: within 90 s every document on every device that holds it
+has the same state vector and delete digest, nothing waits parked, every edit made in the run is
+in it; then no device appends anything for three seconds, and no device says anything out of
+step. `PIMBLE_LINK_SEEDS=1,5` replays seeds (their choices, not their timing), `=N` runs 0..N,
+two by default; `PIMBLE_LINK_PARALLEL=4` runs four at a time.
+
+**Desktop links only.** The browser's vault client joins this test after the one-sync-engine work
+("Next" below): then the test drives the engine both apps ship.
+
+**Bugs it found**, each fixed:
+
+1. **A lost append notification left a document behind its log for the whole connection**
+   (seeds 90 and 176 of the first 200-seed sweep: Bob lacked one struct of a shared note for the
+   full 90 s, every device online). A link learned of an entry only from its `VaultAppended`; when
+   that never came, nothing read the log again until the next append to that document or the next
+   reconnect, and no other device sent it either: each had answered Bob's unchanged report once
+   already (`Comparing`), and the entry was in the log, where the sender rightly believed it was.
+   Fixed by `vault_link::recheck`: every 60 s while connected (`RECHECK_EVERY`; 2 s under a test's
+   faults) the link lists the remote's documents, and reads from its cursor every document whose
+   head moved since it was last listed and that it has not read through.
+2. **A lost report notification left what a device heard stale** (seeds 32, 118 and 174: notes
+   said out of step, "could not send" and "holds changes this one doesn't have yet", after every
+   device agreed, and a device's lack could go unanswered for the connection). `heard` was
+   refreshed only by `VaultReported` and at connect. `recheck` also reads every device's reports
+   again (answering each as at a connect; what was answered once is not answered again, so it
+   sends nothing new), and sends this device's own where the remote's is not what it holds now
+   (a report whose send failed was dropped before).
+
+The five seeds replayed pass with both fixes, and the sweep below.
+
+Found beside it, running the web crate's tests: `pimble_crdt::advance_state_vector` encoded in
+yrs's map order, so an advanced `known_sv`/`pushed_sv` and a document's own (canonical, wave 2)
+vector could hold the same clocks and differ as bytes (`a_new_epoch_makes_the_page_forget_what_it_read`
+failed now and then). It now answers the canonical encoding too.
+
+**Known limits of the test**: a device's stop is the server's own (`stop`, which flushes its
+documents), so a crash that loses the last document writes is not made; edits are text appends
+(no moves, creates or deletes of nodes: the tree's convergence has its own randomized test);
+seeds replay their choices, not their timing. The browser's vault client has the same exposure
+to a lost notification (it reads logs and reports again only at a connect) and is not fixed
+here: it joins the test, and gets the recheck, with the one sync engine.
+
+### Tests
+
+- `crates/pimble-crdt/src/node_doc.rs` `a_parked_update_rides_in_save_until_it_is_set_aside`.
+- `crates/pimble-rpc/src/vault.rs` `out_of_step_reasons_name_whose_device_and_why` (kinds, order,
+  words, steps), `a_parked_update_is_set_aside_only_when_nobody_holds_what_it_waits_for`.
+- `crates/pimble-app/src/out_of_step.rs` `changes_nobody_sent_are_said_quietly_and_only_in_properties`
+  and the two earlier ones, reworded.
+- `crates/pimble-mcp/src/tools.rs` `get_node_says_since_when_and_why` (every kind).
+- `web/src/vault.rs` `a_page_sets_aside_only_what_another_device_set_aside`, and the two wave 2
+  tests reworded.
+- `crates/pimble-server/tests/convergence.rs` `a_gap_nobody_can_fill_is_set_aside_and_leaves_the_log`
+  (since when it waited survives a restart, in the state directory and not the store's folder;
+  both devices set it aside and say it quietly; the record says what it waited for; in step; a
+  device reading the store afresh does not park it), and the wave 2 gap test now expects the quiet
+  kind.
+- `crates/pimble-server/tests/link_faults.rs` `three_devices_converge_through_faults`, swept over
+  200 seeds (0..200, four at a time, 761 s): all converged. The first sweep, before the fixes
+  above, failed 5 of 200.
 
 ## Next: one sync engine for both apps (Joe, 2026-11-19: after the store-folder work)
 

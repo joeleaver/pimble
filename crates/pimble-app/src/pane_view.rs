@@ -249,7 +249,7 @@ fn pane_out_of_step(store: AppStore, pane: PaneId) -> Option<pimble_core::OutOfS
     if !(state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get()) {
         return None;
     }
-    store.out_of_step_of(shown.store_id, shown.node_id)
+    store.out_of_step_shown(shown.store_id, shown.node_id)
 }
 
 /// What this device may change of the pane's document: its store's access,

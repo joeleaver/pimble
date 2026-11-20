@@ -1195,6 +1195,12 @@ pub struct RpcHandler {
     /// How long a document's difference must last, with the link connected,
     /// before it is out of step (docs/CONVERGENCE_CONTRACT.md section 4).
     out_of_step_after: Duration,
+    /// How long a parked update waits, every reporting device lacking what it
+    /// waits for, before it is set aside (docs/CONVERGENCE_CONTRACT.md
+    /// section 5).
+    set_aside_after: Duration,
+    /// Faults a test injects into the vault links (`crate::faults`).
+    link_faults: Option<Arc<crate::faults::LinkFaults>>,
     /// This computer's device id in each vault-linked store, and the reports
     /// it has answered (`crate::devices`, `devices.json` beside the replicas
     /// directory, never in a store's folder).
@@ -1317,6 +1323,8 @@ impl RpcHandler {
             grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
             vault_reports: true,
             out_of_step_after: crate::vault_link::OUT_OF_STEP_AFTER,
+            set_aside_after: Duration::from_secs(pimble_rpc::vault::SET_ASIDE_AFTER_SECS as u64),
+            link_faults: None,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(crate::devices::devices_path_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
@@ -1428,6 +1436,27 @@ impl RpcHandler {
 
     pub(crate) fn out_of_step_after(&self) -> Duration {
         self.out_of_step_after
+    }
+
+    /// How long a parked update waits before it is set aside, in place of 24
+    /// hours (`ServerConfig::set_aside_after`; tests shorten it).
+    pub fn with_set_aside_after(mut self, after: Duration) -> Self {
+        self.set_aside_after = after;
+        self
+    }
+
+    pub(crate) fn set_aside_after(&self) -> Duration {
+        self.set_aside_after
+    }
+
+    /// Faults for the vault links to take (`crate::faults`; the fault test).
+    pub fn with_link_faults(mut self, faults: Arc<crate::faults::LinkFaults>) -> Self {
+        self.link_faults = Some(faults);
+        self
+    }
+
+    pub(crate) fn link_faults(&self) -> Option<&crate::faults::LinkFaults> {
+        self.link_faults.as_deref()
     }
 
     /// The folder task of each plain store open here (`crate::folder_watch`).
@@ -1855,7 +1884,7 @@ impl RpcHandler {
     /// (docs/CONVERGENCE_CONTRACT.md section 4). None for a store with no
     /// vault link.
     pub(crate) async fn out_of_step_of(&self, store_id: StoreId) -> Vec<pimble_core::OutOfStep> {
-        self.vault_links.read().await.get(&store_id).map(|link| link.out_of_step()).unwrap_or_default()
+        self.vault_links.read().await.get(&store_id).map(|link| link.out_of_step(self.keystore.session_expired())).unwrap_or_default()
     }
 
     /// Start a sync link for `store_id` if one isn't already running.
@@ -2459,7 +2488,7 @@ impl RpcHandler {
         self.schedule_content_flush(store_id);
     }
 
-    fn schedule_content_flush(&self, store_id: StoreId) {
+    pub(crate) fn schedule_content_flush(&self, store_id: StoreId) {
         self.flush_debouncer.pending.lock().unwrap().stores.insert(store_id);
         self.ensure_flush_scheduled();
     }
@@ -3666,6 +3695,7 @@ impl PimbleApiServer for RpcHandler {
         // as `PimbleServer::stop` does, then the port freed.
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            handler.stop_folder_watches();
             handler.stop_links().await;
             handler.relay().stop().await;
             if let Err(e) = handler.store_manager.write().await.flush_all().await {

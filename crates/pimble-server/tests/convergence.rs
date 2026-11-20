@@ -34,7 +34,13 @@ const OUT_OF_STEP_AFTER: Duration = Duration::from_secs(2);
 /// A device whose vault links report and compare, or (as every device did
 /// before wave 1) do not.
 fn config(dir: &Path, reports: bool) -> ServerConfig {
-    ServerConfig { vault_reports: reports, out_of_step_after: Some(OUT_OF_STEP_AFTER), ..device_config(dir) }
+    ServerConfig { vault_reports: reports, out_of_step_after: Some(OUT_OF_STEP_AFTER), set_aside_after: SET_ASIDE_AFTER.with(|a| a.get()), ..device_config(dir) }
+}
+
+thread_local! {
+    /// How long a parked update waits before it is set aside on the devices
+    /// a test starts on this thread, in place of 24 hours (`None`: 24 hours).
+    static SET_ASIDE_AFTER: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 async fn start_device(dir: &Path, reports: bool) -> (PimbleServer, PimbleClient) {
@@ -409,7 +415,8 @@ async fn a_gap_no_device_can_fill_makes_the_note_out_of_step_on_both_until_it_is
         let marked = wait_until(Duration::from_secs(20), || async { out_of_step_of(client, store_id).await.iter().any(|o| o.node_id == inside) }).await;
         assert!(marked, "{who}'s device says the note is out of step");
         let entry = out_of_step_of(client, store_id).await.into_iter().find(|o| o.node_id == inside).unwrap();
-        assert_eq!(entry.reason, "Waits for earlier changes another device has not sent.", "{who}");
+        assert_eq!((entry.reason.as_str(), entry.kind), (pimble_rpc::vault::WAITING_REASON, pimble_core::OutOfStepKind::Waiting), "{who}");
+        assert!(!entry.is_shown(), "{who}: nobody can act on it, so only its Properties say it (Joe, 2026-11-20)");
         assert!(chrono::Utc::now() - entry.since >= chrono::Duration::from_std(OUT_OF_STEP_AFTER).unwrap(), "since when the difference began, not when it was said");
         assert!(out_of_step_of(client, store_id).await.iter().all(|o| o.node_id == inside), "only that note");
     }
@@ -428,5 +435,85 @@ async fn a_gap_no_device_can_fill_makes_the_note_out_of_step_on_both_until_it_is
         assert!(text, "{who} has both once the missing change arrives");
         let cleared = wait_until(Duration::from_secs(15), || async { out_of_step_of(client, store_id).await.is_empty() }).await;
         assert!(cleared, "{who}'s device is in step again");
+    }
+}
+
+// ── What cannot be had, set aside (wave 3, section 5) ─────────────────────
+
+/// What a device's computer keeps of the store's convergence
+/// (`convergence.json` in its state directory, never in the store's folder).
+fn convergence_file(dir: &Path, store_id: StoreId) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(dir.join("stores").join(store_id.to_string()).join("convergence.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Section 5: an update parked behind a change nobody holds is set aside
+/// once it has waited (a test's few seconds for the 24 hours) with every
+/// device that reported lacking that change. Since when it waited survives
+/// a restart (kept in the state directory, not the store's folder); each
+/// device says it quietly in the note's Properties; the document is in step
+/// from what everyone holds; and a snapshot took the entry that carried it
+/// out of the log, so a device that reads the store afresh never parks it.
+#[tokio::test]
+async fn a_gap_nobody_can_fill_is_set_aside_and_leaves_the_log() {
+    SET_ASIDE_AFTER.with(|a| a.set(Some(Duration::from_secs(10))));
+    let env = spawn_env().await;
+    let mut shared = shared_with_bob(&env, true, true).await;
+    let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
+    let (_lost, waits) = two_appends(&shared.alice, store_id, inside, "NOBODY HOLDS THIS", "WAITS FOR IT").await;
+    apply(&shared.alice, store_id, inside, "alice-editor", &waits).await;
+    apply(&shared.bob, store_id, inside, "bob-editor", &waits).await;
+    let parked_at = chrono::Utc::now();
+
+    // Bob's computer notes since when it waits, and keeps it across a restart.
+    let noted = wait_until(Duration::from_secs(10), || async { convergence_file(shared.bob_dir.path(), store_id).is_some_and(|f| f["parked"][inside.to_string()]["since"].is_string()) }).await;
+    assert!(noted, "Bob's computer keeps since when the note waits");
+    assert!(!contains_bytes_recursive(&bob_replica(&shared), b"convergence"), "nothing of it is in the store's folder");
+    let since_before = convergence_file(shared.bob_dir.path(), store_id).unwrap()["parked"][inside.to_string()]["since"].as_str().unwrap().to_string();
+    shared.bob_server.stop().await.unwrap();
+    let (_bob_server, bob) = start_device(shared.bob_dir.path(), true).await;
+    bob.open_store(bob_replica(&shared)).await.expect("Bob's replica opens again");
+    assert!(wait_until(Duration::from_secs(15), || is_synced(&bob, store_id)).await, "Bob's link is up again");
+    assert!(wait_until(Duration::from_secs(5), || async { held_parked(&bob, store_id, inside).await }).await, "still parked on Bob's after the restart");
+    let since_after = convergence_file(shared.bob_dir.path(), store_id).unwrap()["parked"][inside.to_string()]["since"].as_str().map(str::to_string);
+    assert_eq!(since_after.as_deref(), Some(since_before.as_str()), "the 24 hours count from when it began, not from the restart");
+
+    for (who, client) in [("Alice", &shared.alice), ("Bob", &bob)] {
+        let aside = wait_until(Duration::from_secs(40), || async {
+            out_of_step_of(client, store_id).await.iter().any(|o| o.node_id == inside && o.kind == pimble_core::OutOfStepKind::SetAside)
+        })
+        .await;
+        assert!(aside, "{who}'s device set it aside and says so, got {:?}", out_of_step_of(client, store_id).await);
+        let entry = out_of_step_of(client, store_id).await.into_iter().find(|o| o.node_id == inside).unwrap();
+        assert_eq!(entry.reason, pimble_rpc::vault::SET_ASIDE_REASON);
+        assert!(!entry.is_shown(), "{who}: quiet, in Properties only");
+        assert!(entry.since >= parked_at, "{who}: when it was set aside");
+        assert!(!held_parked(client, store_id, inside).await, "{who}: nothing waits parked any more");
+        assert!(!node_text(client, store_id, inside).await.contains("WAITS FOR IT"), "{who}: what waited is not shown");
+    }
+    let record = convergence_file(shared.bob_dir.path(), store_id).unwrap();
+    assert!(record["set_aside"][inside.to_string()][0]["waited_for"].as_str().is_some_and(|w| w.contains("client")), "the record says what it waited for: {record}");
+    assert!(record["parked"].get(inside.to_string()).is_none(), "and it waits for nothing now");
+
+    // In step from what everyone holds.
+    let level = wait_until(Duration::from_secs(15), || async { same_vector(&state_vector_of(&bob, store_id, inside).await, &state_vector_of(&shared.alice, store_id, inside).await) }).await;
+    assert!(level, "both hold the same");
+
+    // A device that reads the store afresh: the log no longer carries it.
+    let c_dir = tempfile::tempdir().unwrap();
+    let (_c_server, second) = start_device(c_dir.path(), true).await;
+    env.sign_in(&second, ALICE).await;
+    second.cloud_add_hosted_store(store_id).await.expect("Alice's second device adds the store");
+    assert!(wait_until(Duration::from_secs(20), || async { node_text(&second, store_id, inside).await.contains("socks and a map") }).await, "it pulls the note");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!held_parked(&second, store_id, inside).await, "a fresh reader never parks what was set aside: the snapshot took it out of the log");
+    SET_ASIDE_AFTER.with(|a| a.set(None));
+}
+
+/// Whether `client`'s copy of `node` holds an update parked.
+async fn held_parked(client: &PimbleClient, store_id: StoreId, node: NodeId) -> bool {
+    match client.get_node(store_id, node).await {
+        Ok(node) => NodeDoc::load(&node.content).map(|d| d.missing().is_some()).unwrap_or(false),
+        Err(_) => false,
     }
 }

@@ -992,6 +992,12 @@ pub struct Report {
     /// `NodeDoc::missing`, yrs v1: what a parked update waits for. Said in
     /// wave 1 and acted on in wave 2 (section 3).
     pub missing: Option<Vec<u8>>,
+    /// What this device set aside (section 5): the `missing` vectors of the
+    /// parked updates it dropped because no device held what they waited
+    /// for. Another device holding a parked update that waits for exactly
+    /// one of these sets it aside too, at once (wave 3). Empty in a report
+    /// from before wave 3.
+    pub aside: Vec<Vec<u8>>,
 }
 
 /// A report's plaintext: small, versioned JSON. A newer version may add
@@ -1005,12 +1011,20 @@ struct ReportWire {
     ds: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     missing: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aside: Vec<String>,
 }
 
 impl Report {
     /// What `doc` holds now.
     pub fn of(doc: &pimble_crdt::NodeDoc) -> Self {
-        Self { state_vector: doc.state_vector(), deletes: Some(doc.delete_set_digest()), missing: doc.missing() }
+        Self { state_vector: doc.state_vector(), deletes: Some(doc.delete_set_digest()), missing: doc.missing(), aside: Vec::new() }
+    }
+
+    /// The same, saying what this device set aside of the document.
+    pub fn with_aside(mut self, aside: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.aside = aside.into_iter().collect();
+        self
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1019,6 +1033,7 @@ impl Report {
             sv: STANDARD.encode(&self.state_vector),
             ds: self.deletes.map(|d| STANDARD.encode(d)),
             missing: self.missing.as_ref().map(|m| STANDARD.encode(m)),
+            aside: self.aside.iter().map(|m| STANDARD.encode(m)).collect(),
         };
         serde_json::to_vec(&wire).expect("a report always encodes")
     }
@@ -1043,7 +1058,10 @@ impl Report {
             ),
             None => None,
         };
-        Ok(Self { state_vector, deletes, missing })
+        // One that will not decode is left out: it only ever lets another
+        // device set aside sooner, never later.
+        let aside = wire.aside.iter().filter_map(|m| STANDARD.decode(m).ok()).collect();
+        Ok(Self { state_vector, deletes, missing, aside })
     }
 }
 
@@ -1150,48 +1168,106 @@ pub const OUT_OF_STEP_AFTER_SECS: u64 = 5 * 60;
 /// A report older than this says nothing about whether a document is in
 /// step: its device has not been heard from in a month.
 pub const REPORTS_COUNT_FOR_DAYS: i64 = 30;
-/// A document holds an update parked behind a gap.
-pub const PARKED_REASON: &str = "Waits for earlier changes another device has not sent.";
+/// A document holds an update parked behind a gap no device has filled: said
+/// quietly, in its Properties and by the MCP (Joe, 2026-11-20). Whose the
+/// changes were is not known honestly (no report says which device made the
+/// structs it lacks; every device holding the parked update reports the same
+/// vector), so it is always "another device" (decided 2026-11-20, building
+/// wave 3).
+pub const WAITING_REASON: &str = "Some changes from another device never arrived.";
+/// What waited was set aside (section 5).
+pub const SET_ASIDE_REASON: &str = "Some changes from another device never arrived and were set aside.";
+/// The step for changes this device could not send while its sign-in has
+/// expired.
+pub const STEP_SIGN_IN: &str = "Sign in again to send them.";
+/// The step while this device is offline.
+pub const STEP_ONLINE: &str = "They'll go when this computer is back online.";
 
-/// Whose device a report came from, as a person reads it: the name the
-/// account goes by in the store's shares (`name_of`), this person's own other
-/// device, or another device when nobody's name is known.
-pub fn device_name(account: Option<&str>, own_account: Option<&str>, name_of: impl Fn(&str) -> Option<String>) -> String {
-    match account {
-        Some(account) if Some(account) == own_account => "Your other device".to_string(),
-        Some(account) => name_of(account).filter(|name| !name.trim().is_empty()).map(|name| format!("{name}'s device")).unwrap_or_else(|| "Another device".to_string()),
-        None => "Another device".to_string(),
+/// Whose device a report came from: this person's own other device, a
+/// person's by the name the store's shares give them, or nobody known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Whose {
+    Own,
+    Person(String),
+    Unknown,
+}
+
+impl Whose {
+    /// "Your other device", "Will's device", "Another device".
+    pub fn device(&self) -> String {
+        match self {
+            Whose::Own => "Your other device".to_string(),
+            Whose::Person(name) => format!("{name}'s device"),
+            Whose::Unknown => "Another device".to_string(),
+        }
     }
 }
 
-/// "Will's device holds changes this one lacks."
-pub fn lacks_here(name: &str) -> String {
-    format!("{name} holds changes this one lacks.")
+/// Whose device `account` is, as a person reads it: the name the account goes
+/// by in the store's shares (`name_of`), this person's own other device, or
+/// nobody known.
+pub fn whose(account: Option<&str>, own_account: Option<&str>, name_of: impl Fn(&str) -> Option<String>) -> Whose {
+    match account {
+        Some(account) if Some(account) == own_account => Whose::Own,
+        Some(account) => name_of(account).filter(|name| !name.trim().is_empty()).map(Whose::Person).unwrap_or(Whose::Unknown),
+        None => Whose::Unknown,
+    }
 }
 
-/// "This device holds changes Will's device lacks and could not send them."
-pub fn could_not_send(name: &str) -> String {
-    let whose = match name {
-        "Your other device" => "your other device".to_string(),
-        "Another device" => "another device".to_string(),
-        other => other.to_string(),
+/// [`whose`], as the device's name.
+pub fn device_name(account: Option<&str>, own_account: Option<&str>, name_of: impl Fn(&str) -> Option<String>) -> String {
+    whose(account, own_account, name_of).device()
+}
+
+/// "Will's device holds changes this one doesn't have yet. They'll arrive
+/// when Will opens Pimble." (Joe, 2026-11-20: shown with the step.)
+pub fn lacks_here(whose: &Whose) -> String {
+    let when = match whose {
+        Whose::Own => "you open Pimble there".to_string(),
+        Whose::Person(name) => format!("{name} opens Pimble"),
+        Whose::Unknown => "that device is online again".to_string(),
     };
-    format!("This device holds changes {whose} lacks and could not send them.")
+    format!("{} holds changes this one doesn't have yet. They'll arrive when {when}.", whose.device())
+}
+
+/// "This device holds changes Will's device doesn't have, and couldn't send
+/// them." The step that fits what stopped the send follows it
+/// ([`with_step`]), when it is known.
+pub fn could_not_send(whose: &Whose) -> String {
+    let other = match whose {
+        Whose::Own => "your other device".to_string(),
+        Whose::Person(name) => format!("{name}'s device"),
+        Whose::Unknown => "another device".to_string(),
+    };
+    format!("This device holds changes {other} doesn't have, and couldn't send them.")
+}
+
+/// `reason` with `step` after it, when there is one.
+pub fn with_step(reason: &str, step: Option<&str>) -> String {
+    match step.map(str::trim).filter(|step| !step.is_empty()) {
+        Some(step) => format!("{reason} {step}"),
+        None => reason.to_string(),
+    }
 }
 
 /// Why a document differs from what the other devices hold, when it does
-/// (section 4), the same judgement on the desktop's link and in the browser.
+/// (section 4), the same judgement on the desktop's link and in the browser,
+/// with which kind it is (wave 3: the kind decides where it is said).
 /// `local` is what this device holds; `heard` the other devices' latest
 /// reports, each with its account and how many days old it is; `answered`
 /// this device's record; `unsent` whether the remote is not known to hold
 /// all this device holds (or a send of it failed); `pushes` whether this
 /// device sends changes to the document at all (a reader's never does).
 ///
-/// In order: an update parked behind a gap; a report holding structs this
-/// device lacks; something this device holds that a report lacks, has not
-/// been able to send, and the remote is not known to hold. What this device
-/// has sent and another has not taken yet is that device's to take (it may
-/// be off), so it does not count.
+/// In order, what someone can act on first (Joe, 2026-11-20): a report
+/// holding structs this device lacks; something this device holds that a
+/// report lacks, has not been able to send, and the remote is not known to
+/// hold; and only then an update parked behind a gap, which nobody can do
+/// anything about. What this device has sent and another has not taken yet
+/// is that device's to take (it may be off), so it does not count. Before
+/// wave 3 the parked update came first, and a note whose missing changes
+/// another device did hold said nothing of whose they were.
+#[allow(clippy::too_many_arguments)]
 pub fn out_of_step_reason<'a>(
     own: &str,
     doc: &str,
@@ -1201,27 +1277,99 @@ pub fn out_of_step_reason<'a>(
     answered: &Comparing,
     unsent: bool,
     pushes: bool,
-    name: impl Fn(Option<&str>) -> String,
-) -> Option<String> {
-    if parked {
-        return Some(PARKED_REASON.to_string());
-    }
+    name: impl Fn(Option<&str>) -> Whose,
+) -> Option<(pimble_core::OutOfStepKind, String)> {
+    use pimble_core::OutOfStepKind;
     let mut fresh: Vec<(&str, &Report, Option<&str>)> = heard.into_iter().filter(|(_, _, _, days)| *days <= REPORTS_COUNT_FOR_DAYS).map(|(d, r, a, _)| (d, r, a)).collect();
     fresh.sort_by(|a, b| a.0.cmp(b.0));
     for (_, report, account) in &fresh {
         if pimble_crdt::state_vector_exceeds(&report.state_vector, &local.state_vector).unwrap_or(false) {
-            return Some(lacks_here(&name(*account)));
+            return Some((OutOfStepKind::Behind, lacks_here(&name(*account))));
         }
     }
     if pushes && unsent {
         for (device, report, account) in &fresh {
             if answered.owed(own, doc, device, local, report).is_some() {
-                return Some(could_not_send(&name(*account)));
+                return Some((OutOfStepKind::Unsent, could_not_send(&name(*account))));
             }
         }
     }
+    if parked {
+        return Some((OutOfStepKind::Waiting, WAITING_REASON.to_string()));
+    }
     None
 }
+
+// ── What cannot be had (docs/CONVERGENCE_CONTRACT.md section 5) ─────────────
+
+/// How long a parked update waits, with every reporting device lacking what
+/// it waits for, before it is set aside (Joe, 2026-11-19).
+pub const SET_ASIDE_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// Whether a parked update waiting for `missing` is due to be set aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAsideDue {
+    /// A device that reported holds some of what it waits for: it is not
+    /// given up, and its 24 hours start again (comparing sends it, and
+    /// "out of step" says whose device holds it meanwhile).
+    Held,
+    /// Not yet.
+    Wait,
+    /// It has waited 24 hours with every reporting device lacking it.
+    Waited,
+    /// Another device already set aside an update waiting for exactly this:
+    /// at once, rather than another 24 hours.
+    SetAsideElsewhere,
+}
+
+/// Judge one parked update: `missing` is what it waits for
+/// (`NodeDoc::missing`), `waiting_since` when this device first saw it wait
+/// for exactly that, `heard` the other devices' latest reports with how many
+/// days old each is. A report a month old says nothing (as for section 4).
+/// `after` is the 24 hours ([`SET_ASIDE_AFTER_SECS`]; tests shorten it).
+pub fn set_aside_due<'a>(missing: &[u8], waiting_since: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>, after: chrono::Duration, heard: impl IntoIterator<Item = (&'a Report, i64)>) -> SetAsideDue {
+    let fresh: Vec<&Report> = heard.into_iter().filter(|(_, days)| *days <= REPORTS_COUNT_FOR_DAYS).map(|(r, _)| r).collect();
+    // An undecodable vector reads as holding: giving up is the one step that
+    // loses something, so a doubt keeps the update.
+    if fresh.iter().any(|report| pimble_crdt::holds_any_of(&report.state_vector, missing).unwrap_or(true)) {
+        return SetAsideDue::Held;
+    }
+    if fresh.iter().any(|report| report.aside.iter().any(|aside| aside.as_slice() == missing)) {
+        return SetAsideDue::SetAsideElsewhere;
+    }
+    if now - waiting_since >= after {
+        return SetAsideDue::Waited;
+    }
+    SetAsideDue::Wait
+}
+
+/// One update set aside, as the device that set it aside keeps it (the
+/// desktop in its store state directory, the browser for the page's life):
+/// what it waited for, when it was set aside, and whose it was when that is
+/// known (never yet: see [`WAITING_REASON`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SetAsideRecord {
+    /// The `missing` vector, base64 of yrs v1.
+    pub missing: String,
+    /// For a person and the log: `client 5596… from 129`.
+    pub waited_for: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whose: Option<String>,
+}
+
+impl SetAsideRecord {
+    pub fn new(missing: &[u8], at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self { missing: STANDARD.encode(missing), waited_for: pimble_crdt::describe_state_vector(missing), at, whose: None }
+    }
+
+    pub fn missing_bytes(&self) -> Option<Vec<u8>> {
+        STANDARD.decode(&self.missing).ok()
+    }
+}
+
+/// How long a note's Properties say what was set aside of it.
+pub const SET_ASIDE_SAID_FOR_DAYS: i64 = 30;
 
 #[cfg(test)]
 mod tests {
@@ -1518,7 +1666,7 @@ mod tests {
         let report = Report::of(&doc);
         assert_eq!(Report::decode(&report.encode()).unwrap(), report);
         assert!(report.deletes.is_some(), "a report says what its document deleted");
-        let with_missing = Report { state_vector: report.state_vector.clone(), deletes: None, missing: Some(pimble_crdt::empty_state_vector()) };
+        let with_missing = Report { state_vector: report.state_vector.clone(), deletes: None, missing: Some(pimble_crdt::empty_state_vector()), aside: vec![pimble_crdt::empty_state_vector()] };
         assert_eq!(Report::decode(&with_missing.encode()).unwrap(), with_missing);
 
         let sealed = seal_report(store_id, node_id, key_id, &key, &report);
@@ -1559,7 +1707,7 @@ mod tests {
         assert_eq!(kept, comparing, "what was answered is kept as it was");
         comparing.forget();
         assert!(comparing.owed("me", "doc", "other", &ahead, &behind).is_some(), "logs built again: compared from the start");
-        let broken = Report { state_vector: vec![0xff, 0xff, 0xff], deletes: None, missing: None };
+        let broken = Report { state_vector: vec![0xff, 0xff, 0xff], deletes: None, missing: None, aside: Vec::new() };
         assert_eq!(comparing.owed("me", "doc", "other", &ahead, &broken), None, "a vector that will not decode asks nothing");
     }
 
@@ -1633,37 +1781,94 @@ mod tests {
         assert_eq!(reloaded.delete_set_digest(), twice.delete_set_digest(), "saving and loading keeps the digest");
     }
 
-    /// The reasons a document is out of step, in their order, and the names
-    /// a person reads.
+    /// The reasons a document is out of step, in their order (what someone
+    /// can act on first), their kinds, and the words a person reads.
     #[test]
     fn out_of_step_reasons_name_whose_device_and_why() {
         use super::*;
+        use pimble_core::OutOfStepKind::*;
         let mut base = pimble_crdt::NodeDoc::new();
         base.replace_plain_text("one").unwrap();
         let mut ahead = pimble_crdt::NodeDoc::load(&base.save()).unwrap();
         ahead.replace_plain_text("two").unwrap();
         let (b, a) = (Report::of(&base), Report::of(&ahead));
         let name_of = |id: &str| (id == "will").then(|| "Will".to_string());
-        let name = |account: Option<&str>| device_name(account, Some("me"), name_of);
+        let name = |account: Option<&str>| whose(account, Some("me"), name_of);
         let none = Comparing::default();
-        assert_eq!(name(Some("will")), "Will's device");
-        assert_eq!(name(Some("me")), "Your other device");
-        assert_eq!(name(Some("stranger")), "Another device");
-        assert_eq!(name(None), "Another device");
+        assert_eq!(device_name(Some("will"), Some("me"), name_of), "Will's device");
+        assert_eq!(device_name(Some("me"), Some("me"), name_of), "Your other device");
+        assert_eq!(device_name(Some("stranger"), Some("me"), name_of), "Another device");
+        assert_eq!(device_name(None, Some("me"), name_of), "Another device");
 
         let reason = |local: &Report, parked: bool, heard: Vec<(&'static str, &Report, Option<&'static str>, i64)>, unsent: bool, pushes: bool| {
             out_of_step_reason("dev-me", "doc", local, parked, heard, &none, unsent, pushes, name)
         };
-        assert_eq!(reason(&a, true, vec![], false, true).as_deref(), Some(PARKED_REASON));
-        assert_eq!(reason(&b, false, vec![("dev-will", &a, Some("will"), 0)], false, true).as_deref(), Some("Will's device holds changes this one lacks."));
+        assert_eq!(reason(&a, true, vec![], false, true), Some((Waiting, WAITING_REASON.to_string())));
+        let behind = Some((Behind, "Will's device holds changes this one doesn't have yet. They'll arrive when Will opens Pimble.".to_string()));
+        assert_eq!(reason(&b, false, vec![("dev-will", &a, Some("will"), 0)], false, true), behind);
+        assert_eq!(reason(&b, true, vec![("dev-will", &a, Some("will"), 0)], false, true), behind, "parked, and a device holds more: that is what someone can act on");
+        assert_eq!(
+            reason(&b, false, vec![("dev-me2", &a, Some("me"), 0)], false, true).map(|(_, r)| r).as_deref(),
+            Some("Your other device holds changes this one doesn't have yet. They'll arrive when you open Pimble there.")
+        );
         assert_eq!(reason(&b, false, vec![("dev-will", &a, Some("will"), 31)], false, true), None, "a report a month old says nothing");
-        assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], true, true).as_deref(), Some("This device holds changes Will's device lacks and could not send them."));
-        assert_eq!(reason(&a, false, vec![("dev-x", &b, None, 0)], true, true).as_deref(), Some("This device holds changes another device lacks and could not send them."));
+        assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], true, true), Some((Unsent, "This device holds changes Will's device doesn't have, and couldn't send them.".to_string())));
+        assert_eq!(reason(&a, false, vec![("dev-x", &b, None, 0)], true, true).map(|(_, r)| r).as_deref(), Some("This device holds changes another device doesn't have, and couldn't send them."));
         assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], false, true), None, "sent, and the remote holds it: Will's device's to take");
         assert_eq!(reason(&a, false, vec![("dev-will", &b, Some("will"), 0)], true, false), None, "a reader sends nothing");
         let mut answered = Comparing::default();
         answered.answered("doc", "dev-will", &b);
         assert_eq!(out_of_step_reason("dev-me", "doc", &a, false, vec![("dev-will", &b, Some("will"), 0)], &answered, true, true, name), None, "answered: sent");
         assert_eq!(reason(&a, false, vec![("dev-will", &a, Some("will"), 0)], true, true), None, "equal: in step");
+        assert_eq!(with_step(&could_not_send(&Whose::Own), Some(STEP_SIGN_IN)), "This device holds changes your other device doesn't have, and couldn't send them. Sign in again to send them.");
+        assert_eq!(with_step("Reason.", None), "Reason.");
+    }
+
+    /// Section 5: a parked update is set aside after 24 hours in which every
+    /// device that reported lacked what it waits for; at once when another
+    /// device already set aside the same; never while a device that reported
+    /// holds some of it (the clock starts again), and a month-old report says
+    /// nothing. A report says what its device set aside, and an older reader
+    /// still reads it.
+    #[test]
+    fn a_parked_update_is_set_aside_only_when_nobody_holds_what_it_waits_for() {
+        use super::*;
+        let mut maker = pimble_crdt::NodeDoc::from_plain_text("one").unwrap();
+        let base = maker.save();
+        let _lost = maker.append_markdown("LOST").unwrap();
+        let waits = maker.append_markdown("WAITS").unwrap();
+        let mut parked = pimble_crdt::NodeDoc::load(&base).unwrap();
+        parked.apply_update(&waits).unwrap();
+        let missing = parked.missing().unwrap();
+        let lacking = Report::of(&parked);
+        let holding = Report::of(&maker);
+        let other_lacking = Report::of(&pimble_crdt::NodeDoc::load(&base).unwrap());
+
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-10-26T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let hours = |h: i64| t0 + chrono::Duration::hours(h);
+        let day = chrono::Duration::seconds(SET_ASIDE_AFTER_SECS);
+        assert_eq!(set_aside_due(&missing, t0, hours(23), day, vec![(&lacking, 0), (&other_lacking, 0)]), SetAsideDue::Wait);
+        assert_eq!(set_aside_due(&missing, t0, hours(24), day, vec![(&lacking, 0), (&other_lacking, 0)]), SetAsideDue::Waited);
+        assert_eq!(set_aside_due(&missing, t0, hours(24), day, vec![]), SetAsideDue::Waited, "nobody else reported: nobody holds it");
+        assert_eq!(set_aside_due(&missing, t0, hours(48), day, vec![(&lacking, 0), (&holding, 3)]), SetAsideDue::Held, "a device that reported holds it");
+        assert_eq!(set_aside_due(&missing, t0, hours(48), day, vec![(&holding, 31)]), SetAsideDue::Waited, "a report a month old says nothing");
+        let aside = lacking.clone().with_aside([missing.clone()]);
+        assert_eq!(set_aside_due(&missing, t0, hours(1), day, vec![(&aside, 0)]), SetAsideDue::SetAsideElsewhere);
+        assert_eq!(set_aside_due(&missing, t0, hours(1), day, vec![(&aside, 0), (&holding, 0)]), SetAsideDue::Held, "set aside elsewhere, held here: kept");
+        let other = lacking.clone().with_aside([pimble_crdt::empty_state_vector()]);
+        assert_eq!(set_aside_due(&missing, t0, hours(1), day, vec![(&other, 0)]), SetAsideDue::Wait, "something else set aside");
+
+        assert_eq!(Report::decode(&aside.encode()).unwrap(), aside, "a report says what was set aside");
+        #[derive(serde::Deserialize)]
+        struct Older {
+            sv: String,
+        }
+        let older: Older = serde_json::from_slice(&aside.encode()).unwrap();
+        assert!(!older.sv.is_empty(), "a reader from before wave 3 still reads the vector");
+        assert!(!String::from_utf8(Report::of(&parked).encode()).unwrap().contains("aside"), "nothing said when nothing was set aside");
+
+        let record = SetAsideRecord::new(&missing, hours(24));
+        assert_eq!(record.missing_bytes().as_deref(), Some(missing.as_slice()));
+        assert!(record.waited_for.contains("client"), "{}", record.waited_for);
     }
 }

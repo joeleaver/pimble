@@ -47,6 +47,10 @@ use crate::error::{ClientError, Result};
 pub struct PimbleClient {
     client: RpcClient,
     base_url: Url,
+    /// How large a page of a vault log `vault_fetch` asks for
+    /// (`pimble_rpc::VAULT_FETCH_PAGE_BYTES`; a fault test makes it small so
+    /// a read spans many pages).
+    vault_page_bytes: u64,
 }
 
 /// `url` with `access_token=<token>` added to its query, which is how a
@@ -166,7 +170,14 @@ impl PimbleClient {
         // ever logged.
         debug!("Connected to Pimble server at {}", base_url);
 
-        Ok(Self { client, base_url })
+        Ok(Self { client, base_url, vault_page_bytes: pimble_rpc::VAULT_FETCH_PAGE_BYTES })
+    }
+
+    /// Read vault logs in pages of at most `bytes` from now on (at least one
+    /// entry a page, whatever its size). For tests that need a read to span
+    /// pages (docs/CONVERGENCE_CONTRACT.md, "Proving it").
+    pub fn set_vault_page_bytes(&mut self, bytes: u64) {
+        self.vault_page_bytes = bytes.max(1);
     }
 
     /// Open the WebSocket to `ws_url`, carrying `auth` in a request header.
@@ -1435,7 +1446,7 @@ impl PimbleClient {
         'again: for _ in 0..3 {
             let mut fetched = self
                 .client
-                .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip: 0 })
+                .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(self.vault_page_bytes), skip: 0 })
                 .await
                 .map_err(rpc_error)?;
             let snapshot_seq = fetched.snapshot_seq;
@@ -1443,7 +1454,7 @@ impl PimbleClient {
             while fetched.more {
                 let page = self
                     .client
-                    .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(pimble_rpc::VAULT_FETCH_PAGE_BYTES), skip })
+                    .vault_fetch(VaultFetchRequest { store_id, doc_id: doc_id.clone(), after_seq, max_bytes: Some(self.vault_page_bytes), skip })
                     .await
                     .map_err(rpc_error)?;
                 if page.snapshot_seq != snapshot_seq {
