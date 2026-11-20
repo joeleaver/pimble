@@ -787,6 +787,12 @@ pub(crate) const APP_CSS: &str = "
     background: var(--rinch-color-surface);
 }
 
+/* A tag from a #hashtag in the note's text (docs/HASHTAGS_CONTRACT.md). */
+.pimble-properties__chip-mark {
+    color: var(--rinch-color-dimmed);
+    margin-right: 1px;
+}
+
 .pimble-properties__empty {
     color: var(--rinch-color-dimmed);
 }

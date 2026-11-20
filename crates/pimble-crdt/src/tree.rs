@@ -309,8 +309,12 @@ impl Tree {
     /// The stored fields of a live node (what [`Tree::get_node_info`] is
     /// built from), for [`NodeFields::into_node`]: an error for an id that is
     /// not held, not initialised or deleted.
+    /// The text tags are read here (docs/HASHTAGS_CONTRACT.md): the rest of
+    /// the tree's reads leave them out.
     pub fn live_fields(&self, id: NodeId) -> Result<NodeFields> {
-        self.require_node(id)
+        let mut fields = self.require_node(id)?;
+        fields.text_tags = self.docs[&id].text_tags();
+        Ok(fields)
     }
 
     /// The undeleted, held children of `id` in stored order, each once: the
@@ -377,7 +381,7 @@ impl Tree {
     /// docs/PARAGRAPHS_CONTRACT.md). Copied once, when the node is made: a
     /// parent changed later changes none of its children.
     fn inherited_from(&self, parent: NodeId) -> Vec<(String, serde_json::Value)> {
-        let Some(fields) = self.docs.get(&parent).and_then(|doc| doc.fields().ok()) else { return Vec::new() };
+        let Some(fields) = self.docs.get(&parent).and_then(|doc| doc.stored_fields().ok()) else { return Vec::new() };
         pimble_core::custom_keys::INHERITED
             .iter()
             .filter_map(|key| fields.custom.get(*key).map(|value| (key.to_string(), value.clone())))
@@ -457,7 +461,7 @@ impl Tree {
             .docs
             .iter()
             .filter(|(_, doc)| doc.attached_to() == Some(host) && doc.is_live())
-            .map(|(&id, doc)| (doc.fields().map(|f| f.created_at).unwrap_or_default(), id))
+            .map(|(&id, doc)| (doc.stored_fields().map(|f| f.created_at).unwrap_or_default(), id))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_string().cmp(&b.1.to_string())));
         out.into_iter().map(|(_, id)| id).collect()
@@ -641,6 +645,13 @@ impl Tree {
         self.node_edit(id, |d, txn| d.write_tags(txn, tags, now))
     }
 
+    /// Set a node's tags to `wanted` as [`NodeDoc::set_all_tags`] does: the
+    /// entered tags written, each #hashtag of the text left out removed from
+    /// the text (docs/HASHTAGS_CONTRACT.md).
+    pub fn set_all_tags(&mut self, id: NodeId, wanted: &[String], now: &str) -> Result<TreeEdit> {
+        self.node_edit(id, |d, txn| d.write_all_tags(txn, wanted, now))
+    }
+
     pub fn set_custom(&mut self, id: NodeId, key: &str, value: &serde_json::Value, now: &str) -> Result<TreeEdit> {
         self.node_edit(id, |d, txn| d.write_custom(txn, key, value, now))
     }
@@ -786,7 +797,7 @@ impl Tree {
         let mut nodes = Vec::with_capacity(members.len());
         for (index, &member) in members.iter().enumerate() {
             let doc = &self.docs[&member];
-            let fields = doc.fields()?;
+            let fields = doc.stored_fields()?;
             let mut custom = fields.custom;
             custom.remove(SHARE);
             // Every member but the first was reached from the node its
@@ -822,7 +833,7 @@ impl Tree {
         for (index, &member) in members.iter().enumerate() {
             for attachment in self.attachments_of(member) {
                 let doc = &self.docs[&attachment];
-                let fields = doc.fields()?;
+                let fields = doc.stored_fields()?;
                 let mut custom = fields.custom;
                 custom.remove(SHARE);
                 nodes.push(CuttingNode {
@@ -1285,7 +1296,7 @@ impl Tree {
 
     /// The fields of a held, initialised document (tombstoned or not).
     fn fields_of(&self, id: NodeId) -> Option<NodeFields> {
-        self.docs.get(&id).and_then(|doc| doc.fields().ok())
+        self.docs.get(&id).and_then(|doc| doc.stored_fields().ok())
     }
 
     /// The fields of a node, or an error saying why `id` is not one.
@@ -1294,7 +1305,7 @@ impl Tree {
             return Err(CrdtError::KeyNotFound(format!("node {id}")));
         };
         let fields = doc
-            .fields()
+            .stored_fields()
             .map_err(|_| CrdtError::KeyNotFound(format!("node {id} (document not initialised)")))?;
         if fields.deleted_at.is_some() {
             return Err(CrdtError::KeyNotFound(format!("node {id} (deleted)")));

@@ -437,8 +437,41 @@ fn schedule_label_refresh(store: AppStore, pane: PaneId, store_id: StoreId, node
         if let Some(label) = compute_live_label(store, store_id, node_id, &editor(holder)) {
             store.live_label_signal((store_id, node_id)).set_if_changed(Some(label));
         }
+        refresh_text_tags(store, store_id, node_id, &editor(holder));
     });
     LABEL_REFRESH.with(|pending| { pending.borrow_mut().insert((store_id, node_id), timeout); });
+}
+
+/// The node's tags follow the #hashtags typed in this window
+/// (docs/HASHTAGS_CONTRACT.md): this window's own edits are not shown back
+/// to it, so once typing rests the node's signal takes its tags, which tags
+/// are in the text, and the text they were read from (what Properties counts
+/// a text tag's places in) from the editor's document. Nothing is written
+/// unless they changed, and nothing is read while neither the text nor the
+/// node has a `#` to speak of.
+fn refresh_text_tags(store: AppStore, store_id: StoreId, node_id: NodeId, handle: &EditorHandle) {
+    let Some(sig) = store.get_node_signal(store_id, node_id) else { return };
+    let (old_text, old_content) = untracked(|| sig.with(|n| (n.metadata.text_tags.clone(), n.content.clone())));
+    if old_text.is_empty() && !doc_text(handle).contains('#') {
+        return;
+    }
+    let Some(snapshot) = handle.collab_snapshot() else { return };
+    let Ok(doc) = pimble_crdt::NodeDoc::load(&snapshot) else { return };
+    // The entered tags from the document itself: an editor's document holds
+    // the node's whole document, its `node` root included.
+    let Ok(mut fields) = doc.stored_fields() else { return };
+    fields.text_tags = doc.text_tags();
+    let counts = doc.text_tag_counts();
+    let old_counts = pimble_crdt::NodeDoc::load(&old_content).map(|d| d.text_tag_counts()).unwrap_or_default();
+    if fields.text_tags == old_text && counts == old_counts {
+        return;
+    }
+    let tags = fields.all_tags();
+    sig.update(|n| {
+        n.metadata.tags = tags;
+        n.metadata.text_tags = fields.text_tags;
+        n.content = snapshot;
+    });
 }
 
 /// Compute `node_id`'s tree label from the editor's live document, mirroring

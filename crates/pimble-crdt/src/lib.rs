@@ -18,6 +18,7 @@ pub mod blobs;
 pub mod blocks;
 pub mod content_doc;
 pub mod error;
+pub mod hashtags;
 pub mod links;
 pub mod markdown;
 pub mod node_doc;

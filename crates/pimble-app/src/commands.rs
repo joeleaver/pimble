@@ -352,12 +352,15 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                         doc.set_custom(custom_keys::PARAGRAPHS, &serde_json::Value::String(value.to_string()), now)?;
                     }
                     // Made on the tags as the document has them now, so a
-                    // tag someone else added meanwhile stays.
+                    // tag someone else added meanwhile stays. They are the
+                    // entered tags and the #hashtags in the text: taking off
+                    // one in the text removes it from the text, and adding a
+                    // tag adds an entered one (docs/HASHTAGS_CONTRACT.md).
                     if let Some(change) = tags {
-                        let before = doc.fields()?.tags;
+                        let before = doc.fields()?.all_tags();
                         let after = change.apply(&before);
                         if after != before {
-                            doc.set_tags(&after, now)?;
+                            doc.set_all_tags(&after, now)?;
                         }
                     }
                     Ok(())

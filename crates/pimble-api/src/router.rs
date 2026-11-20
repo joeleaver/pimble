@@ -181,6 +181,7 @@ fn empty_folder(node_id: NodeId, title: &str) -> Node {
             created_at: now,
             modified_at: now,
             tags: Vec::new(),
+            text_tags: Vec::new(),
             custom: HashMap::new(),
             fields: Vec::new(),
             metanode: None,

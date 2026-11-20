@@ -6125,6 +6125,23 @@ mod tests {
         assert!(indexed.text.contains("far away"), "the words are indexed as ever");
     }
 
+    /// docs/HASHTAGS_CONTRACT.md: the index's tags follow the node's, the
+    /// #hashtags in its text among them, read from the document each time it
+    /// is indexed (so a content edit, already reindexed, brings them).
+    #[test]
+    fn the_index_takes_the_text_tags_with_the_entered_ones() {
+        let root = NodeId::new();
+        let mut tree = Tree::new(root, "Store", T0).unwrap();
+        let x = NodeId::new();
+        tree.add_node(x, Some(root), pimble_core::Place::Last, "document", "Garden", T0).unwrap();
+        tree.set_tags(x, &["Outdoors".into()], T0).unwrap();
+        let mut doc = NodeDoc::load(&tree.doc(x).unwrap().save()).unwrap();
+        let update = doc.replace_content_markdown("Plant #marigold and #outdoors, not `#code`.").unwrap();
+        tree.apply_update(x, &update).unwrap();
+        let indexed = build_index_node(StoreId::new(), &tree.node(x).unwrap());
+        assert_eq!(indexed.tags, vec!["Outdoors".to_string(), "marigold".to_string()]);
+    }
+
     #[test]
     fn coalesce_edit_merges_a_documents_transactions_into_one_update() {
         let root = NodeId::new();

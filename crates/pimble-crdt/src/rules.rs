@@ -65,7 +65,7 @@ impl Tree {
     /// The shape of `id`'s document, `None` when the tree holds none: read
     /// before and after a merge for [`derive_changes`].
     pub fn shape(&self, id: NodeId) -> Option<DocShape> {
-        self.doc(id).map(|doc| DocShape { fields: doc.fields().ok(), children: doc.children() })
+        self.doc(id).map(|doc| DocShape { fields: doc.stored_fields().ok(), children: doc.children() })
     }
 }
 
@@ -171,7 +171,7 @@ impl Tree {
             if roots.contains(&cur) && !reached.contains(&cur) {
                 reached.push(cur);
             }
-            match self.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id.or(f.attached_to)) {
+            match self.doc(cur).and_then(|d| d.stored_fields().ok()).and_then(|f| f.parent_id.or(f.attached_to)) {
                 Some(parent) if self.doc(parent).is_some() => cur = parent,
                 _ => break,
             }
@@ -196,7 +196,7 @@ impl Tree {
                 if roots.contains(&cur) {
                     top = Some(cur);
                 }
-                match self.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id) {
+                match self.doc(cur).and_then(|d| d.stored_fields().ok()).and_then(|f| f.parent_id) {
                     Some(parent) if self.doc(parent).is_some() => cur = parent,
                     _ => break,
                 }
@@ -253,7 +253,7 @@ impl Tree {
             // Only a node's list is repaired (a tombstone keeps its own for
             // an undelete), so only a node's list can ask for a removal.
             let awaited = group.iter().filter(|id| self.has_node(**id)).filter_map(|id| self.doc(*id)).any(|doc| {
-                doc.children().into_iter().any(|child| !self.doc(child).is_some_and(|held| held.fields().is_ok()))
+                doc.children().into_iter().any(|child| !self.doc(child).is_some_and(|held| held.stored_fields().is_ok()))
             });
             if awaited {
                 tracing::debug!("Scope {} lists a document not held yet; not repairing it now", top);
@@ -404,7 +404,7 @@ impl Tree {
         let mut live: Vec<NodeId> = Vec::new();
         let mut tombstones: Vec<(NodeId, NodeFields)> = Vec::new();
         for id in self.ids() {
-            let Some(fields) = self.doc(id).and_then(|doc| doc.fields().ok()) else { continue };
+            let Some(fields) = self.doc(id).and_then(|doc| doc.stored_fields().ok()) else { continue };
             if fields.deleted_at.is_some() {
                 tombstones.push((id, fields));
             } else if fields.attached_to.is_none() {
@@ -428,7 +428,7 @@ impl Tree {
         // Most recent first.
         top.sort_by(|(_, a), (_, b)| b.deleted_at.cmp(&a.deleted_at));
 
-        let title_of = |id: NodeId| self.doc(id).and_then(|d| d.fields().ok()).map(|f| f.title);
+        let title_of = |id: NodeId| self.doc(id).and_then(|d| d.stored_fields().ok()).map(|f| f.title);
         let mut out: Vec<DeletedEntry> = top
             .into_iter()
             .map(|(id, fields)| DeletedEntry {
@@ -474,7 +474,7 @@ impl Tree {
     /// document whose `node` root has not arrived is not a node yet. What
     /// the caller may reach is its own to judge first.
     pub fn link_hop(&self, store_id: StoreId, node_id: NodeId, partial: bool) -> LinkHop {
-        match self.doc(node_id).map(|doc| doc.fields()) {
+        match self.doc(node_id).map(|doc| doc.stored_fields()) {
             None if !partial => LinkHop::Done(LinkResolution::Missing),
             None => LinkHop::Done(LinkResolution::NoAccess),
             Some(Err(_)) => LinkHop::Done(LinkResolution::Missing),

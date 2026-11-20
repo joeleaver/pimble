@@ -246,6 +246,63 @@ fn edit_tag(store: AppStore, s: StoreId, n: NodeId, change: TagEdit) {
     store.send(BackendCommand::SetNodeAppearance { store_id: s, node_id: n, icon: None, color: None, background: None, tags: Some(change), paragraphs: None });
 }
 
+/// One tag chip: the tag, and when it is a #hashtag in the node's text, how
+/// many places the text writes it (docs/HASHTAGS_CONTRACT.md "Where it shows").
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Chip {
+    pub tag: String,
+    pub in_text: Option<usize>,
+    /// [`Chip::tooltip`], kept apart so the chip's attributes each take
+    /// their own field.
+    pub tip: String,
+    /// What the × says when hovered.
+    pub remove_tip: String,
+}
+
+impl Chip {
+    /// What the chip says when hovered.
+    pub(crate) fn tooltip(&self) -> String {
+        match self.in_text {
+            Some(n) => format!(
+                "From the text: #{} ({n} {}). \u{d7} removes it from the text.",
+                self.tag,
+                if n == 1 { "place" } else { "places" }
+            ),
+            None => "Remove this tag".to_string(),
+        }
+    }
+}
+
+/// The chips of a node: every tag, each text tag with its places in `content`
+/// (the node's document; counted only when it has text tags).
+pub(crate) fn chips(tags: &[String], text_tags: &[String], content: &[u8]) -> Vec<Chip> {
+    let counts = if text_tags.is_empty() {
+        Vec::new()
+    } else {
+        pimble_crdt::NodeDoc::load(content).map(|d| d.text_tag_counts()).unwrap_or_default()
+    };
+    let same = pimble_crdt::hashtags::same_tag;
+    tags.iter()
+        .map(|tag| {
+            let in_text = text_tags
+                .iter()
+                .any(|t| same(t, tag))
+                .then(|| counts.iter().find(|(t, _)| same(t, tag)).map_or(1, |(_, n)| *n));
+            let mut chip = Chip { tag: tag.clone(), in_text, tip: String::new(), remove_tip: String::new() };
+            chip.tip = chip.tooltip();
+            chip.remove_tip = if in_text.is_some() { "Remove it from the text".into() } else { "Remove this tag".into() };
+            chip
+        })
+        .collect()
+}
+
+/// The chips of `(s, n)` as this window has them, tracked.
+fn node_chips(store: AppStore, node: Option<(StoreId, NodeId)>) -> Vec<Chip> {
+    let Some((s, n)) = node else { return Vec::new() };
+    let Some(sig) = store.node_data.with(|map| map.get(&(s, n)).copied()) else { return Vec::new() };
+    sig.with(|node| chips(&node.metadata.tags, &node.metadata.text_tags, &node.content))
+}
+
 /// What the panel shows of a node from its own signal.
 #[derive(Debug, Clone, PartialEq)]
 struct Shown {
@@ -365,17 +422,23 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
             div { class: "pimble-properties__heading", "Tags" }
             div {
                 class: "pimble-properties__chips",
-                for tag in node().map(|n| n.tags).unwrap_or_default() {
+                for chip in node_chips(store, shown(store)) {
                     span {
-                        key: tag.clone(),
+                        key: format!("{}#{}", chip.tag, chip.in_text.map_or(0, |n| n)),
                         class: "pimble-properties__chip",
-                        {tag.clone()}
+                        title: chip.tip.clone(),
+                        span {
+                            class: "pimble-properties__chip-mark",
+                            style: if chip.in_text.is_some() { "" } else { "display: none;" },
+                            "#"
+                        }
+                        {chip.tag.clone()}
                         span {
                             class: "pimble-properties__chip-remove",
                             style: {move || if writable() { "" } else { "display: none;" }},
-                            title: "Remove this tag",
+                            title: chip.remove_tip.clone(),
                             onclick: {
-                                let tag = tag.clone();
+                                let tag = chip.tag.clone();
                                 move || {
                                     if let Some((s, n)) = untracked(|| shown(store)) {
                                         edit_tag(store, s, n, TagEdit::Remove(tag.clone()));
@@ -863,6 +926,24 @@ mod tests {
         assert_eq!(suggestions(&used, &[], "ta"), tags(&["Tax", "Taxes", "Important"]));
         assert_eq!(suggestions(&used, &tags(&["tax"]), "TA"), tags(&["Taxes", "Important"]), "a tag the node has is not offered, in any case");
         assert!(suggestions(&used, &[], "  ").is_empty(), "nothing typed offers nothing");
+    }
+
+    #[test]
+    fn text_tags_are_marked_with_their_places() {
+        let mut doc = pimble_crdt::NodeDoc::new();
+        doc.init("document", "Note", None, "2026-11-20T10:00:00Z").unwrap();
+        doc.replace_content_markdown("About #Pimble and #pimble, and #home.").unwrap();
+        let node = doc.fields().unwrap().into_node(NodeId::new());
+        let chips = chips(&node.metadata.tags, &node.metadata.text_tags, &doc.save());
+        assert_eq!(chips.iter().map(|c| (c.tag.as_str(), c.in_text)).collect::<Vec<_>>(), [("Pimble", Some(2)), ("home", Some(1))]);
+        assert_eq!(chips[0].tooltip(), "From the text: #Pimble (2 places). \u{d7} removes it from the text.");
+        let entered = chips_of_entered();
+        assert_eq!(entered[0].in_text, None);
+        assert_eq!(entered[0].tooltip(), "Remove this tag");
+    }
+
+    fn chips_of_entered() -> Vec<Chip> {
+        chips(&tags(&["Tax"]), &[], &[])
     }
 
     #[test]

@@ -567,7 +567,8 @@ impl Pimble {
             if fields.deleted_at.is_some() {
                 continue;
             }
-            for tag in fields.tags {
+            // Entered tags and #hashtags in the text alike (docs/HASHTAGS_CONTRACT.md).
+            for tag in fields.all_tags() {
                 let tag = tag.trim().to_string();
                 if !tag.is_empty() && seen.insert(tag.to_lowercase()) {
                     out.push(tag);

@@ -123,13 +123,21 @@ impl Matcher {
         Some(Matcher { conditions, today })
     }
 
-    /// Whether every condition holds for the node `fields` describes.
+    /// Whether every condition holds for the node `fields` describes. Its
+    /// tags are the entered ones in `fields` and the #hashtags in `doc`'s
+    /// text (docs/HASHTAGS_CONTRACT.md), read only when a tag condition asks
+    /// and the entered tags did not answer it.
     pub fn matches(&self, doc: &NodeDoc, fields: &NodeFields) -> bool {
         let mut text: Option<String> = None;
+        let mut text_tags: Option<Vec<String>> = None;
+        let mut tagged = |tag: &str| {
+            fields.tags.iter().chain(&fields.text_tags).any(|t| tag_key(t) == tag)
+                || (fields.text_tags.is_empty() && text_tags.get_or_insert_with(|| doc.text_tags()).iter().any(|t| tag_key(t) == tag))
+        };
         self.conditions.iter().all(|c| match c {
             Prepared::Nothing => false,
-            Prepared::Tag(tag) => fields.tags.iter().any(|t| tag_key(t) == *tag),
-            Prepared::NoTag(tag) => !fields.tags.iter().any(|t| tag_key(t) == *tag),
+            Prepared::Tag(tag) => tagged(tag),
+            Prepared::NoTag(tag) => !tagged(tag),
             Prepared::Type(t) => is_type(fields, t),
             Prepared::Field { name, is, value } => self.field_holds(fields, name, *is, value.as_ref()),
             Prepared::Text(words) => {
@@ -234,5 +242,24 @@ mod tests {
         let mon = Value::read("2026-11-09", today()).unwrap();
         assert_eq!(fri.compare(&mon), Some(Ordering::Less));
         assert_eq!(fri.compare(&Value::Number(3.0)), None);
+    }
+    /// A tag condition holds for a #hashtag in the text as for an entered
+    /// tag, in any case, whether the fields read the text or not
+    /// (docs/HASHTAGS_CONTRACT.md).
+    #[test]
+    fn a_tag_condition_finds_a_hashtag_in_the_text() {
+        let query = |c: Condition| Query::Match { within: None, all: vec![c], order: Order::default(), descending: false, limit: 50 };
+        let tagged = Matcher::of(&query(Condition::Tag { tag: "#Waiting".into() }), today()).unwrap();
+        let untagged = Matcher::of(&query(Condition::NoTag { no_tag: "waiting".into() }), today()).unwrap();
+        let mut doc = NodeDoc::new();
+        doc.init("document", "Note", None, "2026-11-04T10:00:00Z").unwrap();
+        doc.replace_content_markdown("Still #waiting on the plumber.").unwrap();
+        for fields in [doc.fields().unwrap(), doc.stored_fields().unwrap()] {
+            assert!(tagged.matches(&doc, &fields));
+            assert!(!untagged.matches(&doc, &fields));
+        }
+        doc.replace_content_markdown("Done, `#waiting` no more.").unwrap();
+        assert!(!tagged.matches(&doc, &doc.fields().unwrap()));
+        assert!(untagged.matches(&doc, &doc.stored_fields().unwrap()));
     }
 }

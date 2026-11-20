@@ -880,7 +880,12 @@ async fn a_query_metanode_finds_nodes_after_its_own_children() {
             update: None,
         })
     };
-    assert!(!forest.touched_by(&content(projects)), "a tag match does not read content");
+    // A tag can be a #hashtag in the text (docs/HASHTAGS_CONTRACT.md), so a
+    // tag match reads content; a type match does not.
+    assert!(forest.touched_by(&content(projects)), "a tag match reads content");
+    api.set_metanode(at, Some("list"), Some(&finds(vec![C::Type { node_type: "board".into() }]))).await.unwrap();
+    let by_type = api.metanode_source(at).await.unwrap();
+    assert!(!by_type.touched_by(&content(projects)), "a type match does not read content");
     api.set_metanode(at, Some("list"), Some(&finds(vec![C::Text { text: "x".into() }]))).await.unwrap();
     let by_text = api.metanode_source(at).await.unwrap();
     assert!(by_text.touched_by(&content(projects)));

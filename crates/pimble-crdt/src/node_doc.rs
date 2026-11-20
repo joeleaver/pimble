@@ -125,7 +125,13 @@ pub struct NodeFields {
     pub became: Option<PimbleUrl>,
     /// On an attachment: the node it belongs to (see `ATTACHED_TO`).
     pub attached_to: Option<NodeId>,
+    /// The entered tags: what `node.tags` stores (docs/HASHTAGS_CONTRACT.md).
     pub tags: Vec<String>,
+    /// The #hashtags in the node's text, each once as first written, in the
+    /// order they first appear: worked out from the content when read, never
+    /// stored. Empty from [`NodeDoc::stored_fields`], which does not read the
+    /// text.
+    pub text_tags: Vec<String>,
     pub custom: HashMap<String, serde_json::Value>,
     /// The node's fields, name and value as typed, ordered by name.
     pub fields: Vec<(String, String)>,
@@ -143,6 +149,10 @@ impl NodeFields {
     /// reader of a document, on every side, reads them the same way
     /// ([`parse_timestamp`]). What wants the content or the children reads
     /// the tree for them (`Tree::get_children`, `NodeDoc::save`).
+    ///
+    /// The node's tags are the entered tags and then the text tags no
+    /// entered tag already is (docs/HASHTAGS_CONTRACT.md "Where it shows"),
+    /// and `metadata.text_tags` says which tags are in the text.
     pub fn into_node(self, id: NodeId) -> Node {
         Node {
             id,
@@ -152,7 +162,8 @@ impl NodeFields {
                 title: self.title,
                 created_at: parse_timestamp(&self.created_at),
                 modified_at: parse_timestamp(&self.modified_at),
-                tags: self.tags,
+                tags: crate::hashtags::union(&self.tags, &self.text_tags),
+                text_tags: self.text_tags,
                 custom: self.custom,
                 fields: self.fields,
                 metanode: Metanode::from_stored(self.metanode_viewer.as_deref(), self.metanode_source.as_deref()),
@@ -164,6 +175,14 @@ impl NodeFields {
             attachments: 0,
             access: StoreAccess::Full,
         }
+    }
+}
+
+impl NodeFields {
+    /// Every tag of the node: the entered tags, then the text tags no entered
+    /// tag already is (what `into_node` puts in `metadata.tags`).
+    pub fn all_tags(&self) -> Vec<String> {
+        crate::hashtags::union(&self.tags, &self.text_tags)
     }
 }
 
@@ -986,9 +1005,81 @@ impl NodeDoc {
     /// `parent_id` this crate cannot parse reads as absent, so garbage in that
     /// field makes a detached node (which repair puts under the root), never
     /// a node the tree cannot read.
+    ///
+    /// `text_tags` is read from the content (docs/HASHTAGS_CONTRACT.md);
+    /// [`NodeDoc::stored_fields`] skips that walk.
     pub fn fields(&self) -> Result<NodeFields> {
         let txn = self.doc.transact();
+        let mut fields = self.read_fields(&txn)?;
+        fields.text_tags = crate::hashtags::tags_in(&txn, &self.content);
+        Ok(fields)
+    }
+
+    /// [`NodeDoc::fields`] without reading the text: `text_tags` empty. For
+    /// what reads a node's place and stored keys only (the tree's walks,
+    /// repair, the notifications a merge derives), where a walk of every
+    /// document's text would be wasted.
+    pub fn stored_fields(&self) -> Result<NodeFields> {
+        let txn = self.doc.transact();
         self.read_fields(&txn)
+    }
+
+    /// The #hashtags in the content, each once as first written, in the order
+    /// they first appear (docs/HASHTAGS_CONTRACT.md "What counts as a
+    /// hashtag"): not in code blocks or inline code.
+    pub fn text_tags(&self) -> Vec<String> {
+        let txn = self.doc.transact();
+        crate::hashtags::tags_in(&txn, &self.content)
+    }
+
+    /// How many times each text tag is written in the content, as
+    /// [`NodeDoc::text_tags`] names them: what Properties says of one.
+    pub fn text_tag_counts(&self) -> Vec<(String, usize)> {
+        let txn = self.doc.transact();
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for tag in crate::hashtags::all_in(&txn, &self.content) {
+            match out.iter_mut().find(|(t, _)| crate::hashtags::same_tag(t, &tag)) {
+                Some((_, n)) => *n += 1,
+                None => out.push((tag, 1)),
+            }
+        }
+        out
+    }
+
+    /// Delete every occurrence of the hashtag `tag` (any case) from the text,
+    /// each with one adjacent space (docs/HASHTAGS_CONTRACT.md "Removing
+    /// one"): plain deletions of the text runs, so the edit merges with
+    /// anyone typing. Answers how many occurrences went (0 changes nothing).
+    pub fn remove_hashtag(&mut self, tag: &str) -> Result<usize> {
+        let tag = tag.trim().trim_start_matches('#').trim().to_string();
+        if tag.is_empty() {
+            return Ok(0);
+        }
+        let (removed, _) = self.edit(|d, txn| Ok(crate::hashtags::remove(txn, &d.content, std::slice::from_ref(&tag))))?;
+        Ok(removed)
+    }
+
+    /// Set the node's tags to `wanted` (docs/HASHTAGS_CONTRACT.md "Removing
+    /// one"): the entered tags become the ones still wanted plus each new one
+    /// (a text tag is never copied into them), and each text tag left out of
+    /// `wanted` is removed from the text as [`NodeDoc::remove_hashtag`]
+    /// removes one. One transaction; nothing is written when nothing differs.
+    pub fn set_all_tags(&mut self, wanted: &[String], now: &str) -> Result<()> {
+        self.edit_node(|d, txn| d.write_all_tags(txn, wanted, now)).map(|_| ())
+    }
+
+    /// [`NodeDoc::set_all_tags`] in a transaction of the caller's.
+    pub(crate) fn write_all_tags(&self, txn: &mut TransactionMut, wanted: &[String], now: &str) -> Result<()> {
+        let fields = self.read_fields(&*txn)?;
+        let text = crate::hashtags::tags_in(&*txn, &self.content);
+        let (entered, remove) = crate::hashtags::split_wanted(wanted, &fields.tags, &text);
+        if entered != fields.tags {
+            self.write_tags(txn, &entered, now)?;
+        }
+        if crate::hashtags::remove(txn, &self.content, &remove) > 0 {
+            self.stamp_modified(txn, now);
+        }
+        Ok(())
     }
 
     pub fn set_title(&mut self, title: &str, now: &str) -> Result<()> {
@@ -1686,6 +1777,7 @@ impl NodeDoc {
             became: get(BECAME).and_then(|s| PimbleUrl::parse(&s)),
             attached_to: get(ATTACHED_TO).and_then(|s| NodeId::parse(&s).ok()),
             tags,
+            text_tags: Vec::new(),
             custom,
             fields,
             metanode_viewer: get(VIEWER_KEY),
@@ -2402,6 +2494,7 @@ mod tests {
             became: None,
             attached_to: None,
             tags: vec!["a".into(), "b".into()],
+            text_tags: Vec::new(),
             custom: HashMap::from([
                 ("icon".to_string(), json!("star")),
                 ("nested".to_string(), json!({"x": [1, 2, {"y": null}]})),

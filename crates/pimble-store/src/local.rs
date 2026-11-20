@@ -1175,8 +1175,19 @@ impl LocalStore {
                 edit.touched.push((node_id, node.content.clone()));
             }
         }
-        if !node.metadata.tags.is_empty() {
-            extend(&mut edit, self.tree.set_tags(node_id, &node.metadata.tags, &now).map_err(StoreError::from)?);
+        // A #hashtag of the content is a tag already, never an entered one
+        // (docs/HASHTAGS_CONTRACT.md): a node read and created again keeps
+        // its text tags in its text.
+        let text_tags = self.tree.doc(node_id).map(|doc| doc.text_tags()).unwrap_or_default();
+        let entered: Vec<String> = node
+            .metadata
+            .tags
+            .iter()
+            .filter(|t| !text_tags.iter().any(|x| pimble_crdt::hashtags::same_tag(x, t)))
+            .cloned()
+            .collect();
+        if !entered.is_empty() {
+            extend(&mut edit, self.tree.set_tags(node_id, &entered, &now).map_err(StoreError::from)?);
         }
         for (key, value) in &node.metadata.custom {
             extend(&mut edit, self.tree.set_custom(node_id, key, value, &now).map_err(StoreError::from)?);
@@ -1362,8 +1373,12 @@ impl LocalStore {
         if info.title != metadata.title {
             extend(&mut edit, self.tree.set_title(node_id, &metadata.title, &now).map_err(StoreError::from)?);
         }
-        if info.tags != metadata.tags {
-            extend(&mut edit, self.tree.set_tags(node_id, &metadata.tags, &now).map_err(StoreError::from)?);
+        // `metadata.tags` is every tag, the #hashtags in the text among them
+        // (docs/HASHTAGS_CONTRACT.md): the entered ones are written, and a
+        // text tag left out is removed from the text.
+        let all_tags = self.tree.live_fields(node_id).map(|f| f.all_tags()).unwrap_or_else(|_| info.tags.clone());
+        if all_tags != metadata.tags {
+            extend(&mut edit, self.tree.set_all_tags(node_id, &metadata.tags, &now).map_err(StoreError::from)?);
         }
         for (key, value) in &metadata.custom {
             if info.custom.get(key) != Some(value) {

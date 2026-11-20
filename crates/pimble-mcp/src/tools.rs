@@ -29,6 +29,8 @@ mod discussion_tools;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
+mod hashtags_tests;
+#[cfg(test)]
 mod large_notes_tests;
 #[cfg(test)]
 mod presence_tests;
@@ -281,6 +283,10 @@ impl Pimble {
         );
         if !node.metadata.tags.is_empty() {
             out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));
+        }
+        if !node.metadata.text_tags.is_empty() {
+            let written: Vec<String> = node.metadata.text_tags.iter().map(|t| format!("#{t}")).collect();
+            out.push_str(&format!("tags from the text: {}\n", written.join(", ")));
         }
         if !node.metadata.fields.is_empty() {
             let fields: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("{n} = {v}")).collect();
@@ -574,7 +580,8 @@ pub struct RenameParams {
 pub struct SetTagsParams {
     /// The node.
     pub node: String,
-    /// The node's tags, replacing the ones it has.
+    /// The node's tags, replacing the ones it has. A #hashtag in its text left
+    /// out of this list is removed from the text.
     pub tags: Vec<String>,
 }
 
@@ -1219,13 +1226,31 @@ impl Pimble {
         Ok(format!("Renamed {} to \"{title}\".", addr.link()))
     }
 
-    /// Set a node's tags (replacing the ones it has).
+    /// Set a node's tags (replacing the ones it has). A node's tags are the
+    /// ones entered for it and the #hashtags in its text: get_node lists both.
+    /// A #hashtag kept in the list stays in the text and is not entered again;
+    /// one left out of the list is removed from the text, every occurrence.
     #[tool(name = "set_tags")]
     async fn set_tags(&self, Parameters(p): Parameters<SetTagsParams>) -> Result<String, String> {
         let addr = self.resolve(&p.node).await?;
         let tags: Vec<String> = p.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
-        self.edit(addr, |doc| doc.set_tags(&tags, &pimble_api::now()).map_err(crdt)).await?;
-        Ok(format!("Tagged {}: {}.", addr.link(), if tags.is_empty() { "(none)".into() } else { tags.join(", ") }))
+        // The entered tags; a #hashtag of the text left out of the list is
+        // removed from the text (docs/HASHTAGS_CONTRACT.md).
+        let mut removed: Vec<String> = Vec::new();
+        self.edit(addr, |doc| {
+            let before = doc.text_tags();
+            doc.set_all_tags(&tags, &pimble_api::now()).map_err(crdt)?;
+            let after = doc.text_tags();
+            removed = before.into_iter().filter(|t| !after.iter().any(|a| pimble_crdt::hashtags::same_tag(a, t))).collect();
+            Ok(())
+        })
+        .await?;
+        let mut out = format!("Tagged {}: {}.", addr.link(), if tags.is_empty() { "(none)".into() } else { tags.join(", ") });
+        if !removed.is_empty() {
+            let written: Vec<String> = removed.iter().map(|t| format!("#{t}")).collect();
+            out.push_str(&format!(" Removed from the text: {}.", written.join(", ")));
+        }
+        Ok(out)
     }
 
     /// Move a node (or several, with `nodes`) under a new parent, in its store or

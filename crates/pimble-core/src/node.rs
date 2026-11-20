@@ -137,6 +137,7 @@ impl Node {
                 created_at: now,
                 modified_at: now,
                 tags: Vec::new(),
+                text_tags: Vec::new(),
                 custom: HashMap::new(),
                 fields: Vec::new(),
                 metanode: None,
@@ -319,8 +320,16 @@ pub struct NodeMetadata {
     /// When the node was last modified
     pub modified_at: DateTime<Utc>,
 
-    /// Tags for categorization and search
+    /// Tags for categorization and search: the tags entered for the node,
+    /// then the #hashtags in its text that no entered tag already is
+    /// (docs/HASHTAGS_CONTRACT.md). Only the entered ones are stored.
     pub tags: Vec<String>,
+
+    /// Which of `tags` are #hashtags in the node's text, each once as first
+    /// written: worked out from the text when the node is read, never stored.
+    /// A tag both entered and in the text is listed here too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_tags: Vec<String>,
 
     /// Custom metadata fields
     pub custom: HashMap<String, serde_json::Value>,

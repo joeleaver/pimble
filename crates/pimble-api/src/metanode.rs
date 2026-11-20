@@ -71,8 +71,8 @@ pub struct Forest {
     /// The stores a match looked in: any node changing there may change
     /// what it finds.
     pub(crate) scanned: Vec<StoreId>,
-    /// Whether what a match finds depends on node content (a text or links
-    /// condition, or the last-changed order), so a content edit counts.
+    /// Whether what a match finds depends on node content (a text, links or
+    /// tag condition, or the last-changed order), so a content edit counts.
     reads_content: bool,
 }
 
@@ -249,7 +249,8 @@ impl Pimble {
         let reads_content = match &source.query {
             Query::Match { all, order, .. } => {
                 matches!(order, pimble_core::metanode::Order::Modified)
-                    || all.iter().any(|c| matches!(c, Condition::Text { .. } | Condition::LinksTo { .. }))
+                    // A tag can be a #hashtag in the text (docs/HASHTAGS_CONTRACT.md).
+                    || all.iter().any(|c| matches!(c, Condition::Text { .. } | Condition::LinksTo { .. } | Condition::Tag { .. } | Condition::NoTag { .. }))
             }
             _ => false,
         };
@@ -313,7 +314,7 @@ impl Pimble {
                         }
                         let doc = if child.content.is_empty() { self.doc(addr).await.ok() } else { NodeDoc::load(&child.content).ok() };
                         let Some(doc) = doc else { continue };
-                        let Ok(fields) = doc.fields() else { continue };
+                        let Ok(fields) = doc.stored_fields() else { continue };
                         if child.node_type != node_types::MOUNT {
                             stack.push(addr);
                         }
@@ -336,7 +337,7 @@ impl Pimble {
                 }
                 for id in h.tree.get_children(at).unwrap_or_default() {
                     let Some(doc) = h.tree.doc(id) else { continue };
-                    let Ok(fields) = doc.fields() else { continue };
+                    let Ok(fields) = doc.stored_fields() else { continue };
                     if fields.node_type != node_types::MOUNT {
                         stack.push(id);
                     }
