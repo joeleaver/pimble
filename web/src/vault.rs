@@ -4287,18 +4287,21 @@ mod tests {
         assert_eq!(store.children_of(q).unwrap(), vec![x]);
         assert!(store.children_of(p).unwrap().is_empty());
 
-        // Judged after each update it would have written something: after
-        // P's removal alone, x is listed nowhere, and repair's answer is to
-        // append it to P again, an edit that then travels. On the live path
-        // the merge itself never repairs; it only says a repair is wanted,
-        // and by the time the debounce fires the rest of the edit is in.
+        // Judged after each update: after P's removal alone, x is listed
+        // nowhere. Before 0.28.5 repair's answer was to append it to P again,
+        // an edit that then travelled; now P's own document records that x
+        // left (`left:`, docs/MOVE_CONTRACT.md "Repair"), so x is a copy
+        // older than its parent's and nothing is decided about it. On the
+        // live path the merge itself never repairs either; it only says a
+        // repair is wanted, and by the time the debounce fires the rest of
+        // the edit is in.
         let mut half = before_the_move;
         let store_id = StoreId::new();
         let (id, update) = &edit.touched[0];
         assert_eq!(*id, p, "the old parent's list goes first");
         let merged = half.merge(store_id, *id, vec![(Mark::One(2), Ok(update.clone()))], false, None);
         assert!(merged.structure, "flagged for the debounced repair");
-        assert!(!half.tree.validate_tree().is_empty(), "half a move is inconsistent");
+        assert!(half.tree.validate_tree().is_empty(), "half a move leaves nothing to repair: P says x left");
         assert!(half.repair_due.is_none(), "the merge itself schedules nothing");
         for (id, update) in &edit.touched[1..] {
             half.merge(store_id, *id, vec![(Mark::One(2), Ok(update.clone()))], false, None);
