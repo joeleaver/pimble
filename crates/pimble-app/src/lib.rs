@@ -35,6 +35,7 @@ pub mod commands;
 pub mod editor;
 pub mod events;
 pub mod fields;
+pub mod hashtags;
 pub mod import;
 pub mod link_picker;
 pub mod links;

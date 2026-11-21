@@ -129,3 +129,48 @@ skipped), recomputed per changed block. The style changes color only (the theme'
 schemes), never padding, border, weight or size, so the text lays out exactly as before and the
 caret, selection, typing and deleting are unchanged. Ctrl+click on a hashtag searches for that tag
 (as Ctrl+click follows a link). Desktop and browser alike. Queued after docs/STARTUP_CONTRACT.md.
+
+### Built (2026-11-20)
+
+- **`pimble-crdt`**: `hashtags::scan` and its `Found { start, end, tag }` are public, the one rule
+  for both the tags and the coloring: a textblock's characters with inline code and inline atoms
+  masked in, char ranges (`start..end`, the `#` included) out.
+- **`pimble-app` `hashtags.rs`**: `HashtagsPlugin`, added to every pane's editor after the
+  presence plugin. Its state keeps the ranges per top-level block; after an edit only the
+  top-level blocks that are not the same node as before are scanned again (rinch shares every
+  block an edit did not touch: the test checks the untouched block's answer is the same `Rc`), a
+  transaction that changes no text costs nothing, and a block with no `#` in its runs costs a look
+  at its strings. Code blocks are skipped, text under the `code` mark is masked, an image or hard
+  break is one masked place. `decorations` hands out one `Inline` decoration with class
+  `pimble-hashtag` per range.
+- **Style** (`styles.rs` `EDITOR_CSS`): `color` only, the link colors (`--rinch-primary-color-6`
+  light, `-4` dark). Checked on screen: the words of a line start at the same pixel columns with
+  the coloring as without it (the previous binary on the same note), and the caret, typing inside
+  a hashtag, Backspace and a selection across one behave as in plain text.
+- **Ctrl+click** (Cmd on macOS; either in the browser, which does not know the platform):
+  `hashtags::clicked`, called from the pane's `onmouseup` beside `text_boards::pane_mouseup`. The
+  press has placed the caret, so the hashtag is the one at the caret (from its `#` to right after
+  its last character, `hashtag_at`), and only when the selection is empty, the caret is under the
+  pointer (so a press on the strip or below the text is not one), the caret is not in a link, and
+  no link was followed by this press (`hashtags::link_followed`, set from `on_link_click`). It runs
+  `app::search_for("#tag")`: the search box shows the query and the results panel replaces the
+  tree, as if typed, Escape clearing it.
+
+#### Decided here
+
+- **The search is for `#tag` in the full text.** Search does not read tags at all (the index's
+  `tags` are edges nothing queries; `title`, `text` and `headings` are what is searched), and the
+  analyzer drops the `#`, so the search finds every note whose words hold the tag: every note
+  with that hashtag (its text holds it), and notes that only use the word (stemmed: `#garden`
+  also finds "gardening").
+- **The same color as links**: both are "Ctrl+click goes somewhere".
+
+#### Known limits
+
+- A tag only entered (in Properties, never written in the text) is not found by the Ctrl+click
+  search; a tag condition on a metanode finds tagged notes exactly. Searching tags properly needs
+  the index to query its `Tag` edges (a schema change: every index rebuilt).
+- Ctrl+click needs the press to place the caret; checked on the desktop. The browser build
+  compiles (`web/`, wasm32) and takes the same path, but was not driven in a browser here.
+- The caret-under-the-pointer test allows 40 px sideways, so a Ctrl+click just past a hashtag at
+  the end of a line can still search for it.

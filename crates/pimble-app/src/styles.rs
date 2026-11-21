@@ -4076,6 +4076,16 @@ pub(crate) const EDITOR_CSS: &str = "
     text-decoration: underline;
 }
 
+/* Hashtags (docs/HASHTAGS_CONTRACT.md): the accent, as links are, and nothing
+   else: no padding, border, weight or size, so the text lays out as before and
+   the caret, selection and typing are untouched. Ctrl/Cmd+click searches. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-hashtag {
+    color: var(--rinch-primary-color-6);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-hashtag {
+    color: var(--rinch-primary-color-4);
+}
+
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] code {
     background: var(--rinch-color-option-hover);
     color: #e06c75;

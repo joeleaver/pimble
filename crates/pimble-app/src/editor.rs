@@ -56,6 +56,8 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));
                 // Other people's selections (docs/PRESENCE_CONTRACT.md section 4).
                 handle.add_plugin(std::rc::Rc::new(crate::presence::text::PresencePlugin));
+                // Hashtags colored in the text (docs/HASHTAGS_CONTRACT.md).
+                handle.add_plugin(std::rc::Rc::new(crate::hashtags::HashtagsPlugin));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).
@@ -172,6 +174,8 @@ pub(crate) fn start_editing(
         }
         store.link_from.set(Some(pane));
         crate::links::follow_href(store, &click.link.href);
+        // The release that ends this press is not a hashtag's click.
+        crate::hashtags::link_followed();
         true
     });
     handle.on_link_hover(move |hover| crate::links::hover_link(store, hover));

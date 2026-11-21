@@ -927,6 +927,25 @@ fn clear_search(store: AppStore) {
     clear_keyboard_interceptor();
 }
 
+/// Search for `query` as if it had been typed into the search box (a
+/// Ctrl/Cmd+click on a hashtag in the text, docs/HASHTAGS_CONTRACT.md): the
+/// box shows it, the results panel replaces the tree, and Escape clears it.
+pub(crate) fn search_for(store: AppStore, query: String) {
+    let was_empty = untracked(|| store.search_query.get()).is_empty();
+    store.search_query.set(query.clone());
+    if was_empty && !query.is_empty() {
+        // As `oninput` installs it: only while the box is non-empty.
+        set_keyboard_interceptor(move |data| {
+            if data.key == "Escape" {
+                run_on_main_thread(move || clear_search(store));
+                return true;
+            }
+            false
+        });
+    }
+    schedule_search(store, query);
+}
+
 /// Debounce search-as-you-type by 250ms (per the step 5 contract) and dispatch
 /// a `BackendCommand::Search` over every open store when the timer fires.
 fn schedule_search(store: AppStore, query: String) {

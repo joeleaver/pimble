@@ -37,9 +37,10 @@ const ATOM: char = '\u{FFFC}';
 const OPENERS: &[char] = &['(', '[', '{', '"', '\'', '\u{201C}', '\u{2018}', '\u{00AB}', '\u{2039}', '<', '\u{00BF}', '\u{00A1}'];
 
 /// A hashtag found in one run of characters: the `#` at `start` and the tag's
-/// last character before `end` (char indexes), and the tag without `#`.
+/// last character before `end` (char indexes, so `start..end` is the hashtag
+/// with its `#`), and the tag without `#`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Found {
+pub struct Found {
     pub start: usize,
     pub end: usize,
     pub tag: String,
@@ -53,7 +54,13 @@ fn continues(c: char) -> bool {
 /// The hashtags in `chars`, where `masked[i]` says character `i` is not text
 /// a hashtag can use (inline code, an atom's placeholder): it ends a hashtag
 /// and is never part of one, and a `#` may follow it.
-pub(crate) fn scan(chars: &[char], masked: &[bool]) -> Vec<Found> {
+///
+/// This is the one rule of what a hashtag is: the tags of a node's yrs text
+/// are read with it, and so is what the editor colors as a hashtag
+/// (`pimble-app`'s `hashtags.rs`, over the editor's own document), each
+/// passing one textblock's characters with its inline code and inline atoms
+/// masked. A `#` at index 0 counts as at the start of the textblock.
+pub fn scan(chars: &[char], masked: &[bool]) -> Vec<Found> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -335,6 +342,30 @@ mod tests {
         assert_eq!(scan(&chars, &[true, true, false, false, false, false])[0].tag, "tag");
         let chars: Vec<char> = "#tagxy".chars().collect();
         assert_eq!(scan(&chars, &[false, false, false, false, true, true])[0].tag, "tag");
+    }
+
+    #[test]
+    fn ranges_cover_the_hash_and_the_tag_only() {
+        let ranges = |text: &str, masked: Option<Vec<bool>>| {
+            let chars: Vec<char> = text.chars().collect();
+            let masked = masked.unwrap_or_else(|| vec![false; chars.len()]);
+            scan(&chars, &masked).into_iter().map(|f| (f.start, f.end, f.tag)).collect::<Vec<_>>()
+        };
+        let r = |start, end, tag: &str| (start, end, tag.to_string());
+        assert_eq!(ranges("#a b #cd.", None), [r(0, 2, "a"), r(5, 8, "cd")]);
+        // A trailing `-` or `/` is left outside the range; punctuation too.
+        assert_eq!(ranges("(#tag-) #x/", None), [r(1, 5, "tag"), r(8, 10, "x")]);
+        // Char indexes, not bytes: a wide character before counts as one.
+        assert_eq!(ranges("日本 #café!", None), [r(3, 8, "café")]);
+        // Inline code (masked) is skipped; a hashtag after it still counts.
+        let text = "see #code then #real";
+        let mut masked = vec![false; text.chars().count()];
+        for m in &mut masked[4..9] {
+            *m = true;
+        }
+        assert_eq!(ranges(text, Some(masked)), [r(15, 20, "real")]);
+        // An atom (masked, one place) may come right before one.
+        assert_eq!(ranges("\u{FFFC}#pic", Some(vec![true, false, false, false, false])), [r(1, 5, "pic")]);
     }
 
     #[test]

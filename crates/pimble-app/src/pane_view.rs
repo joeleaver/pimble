@@ -467,6 +467,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 // A click on a board embedded in the text opens it; a
                 // double-click on a picture marks it up.
                 crate::text_boards::pane_mouseup(store, pane);
+                // Ctrl/Cmd+click on a hashtag searches for it.
+                crate::hashtags::clicked(store, pane);
             },
 
             div {
