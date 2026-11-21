@@ -140,6 +140,16 @@ fn insert_entries(store: AppStore) -> Vec<MenuEntry> {
     entries
 }
 
+/// Edit > Text Color: "Default" and the palette, the toolbar's swatches in
+/// their order.
+fn text_color_entries(store: AppStore) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::item("Default", "", move || crate::text_color::apply(store, None))];
+    for swatch in crate::text_color::PALETTE {
+        entries.push(MenuEntry::item(swatch.label, "", move || crate::text_color::apply(store, Some(swatch.light))));
+    }
+    entries
+}
+
 fn file_entries(store: AppStore) -> Vec<MenuEntry> {
     let mut entries = vec![MenuEntry::Sub { label: "New", entries: new_entries(store) }, MenuEntry::Separator];
 
@@ -234,6 +244,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // group, the same list (`toolbar::inserts`). With no note there, or
         // one this device may only read, it says so.
         MenuEntry::Sub { label: "Insert", entries: insert_entries(store) },
+        // The toolbar's Text Color swatches (docs/TEXT_COLOR_CONTRACT.md).
+        MenuEntry::Sub { label: "Text Color", entries: text_color_entries(store) },
         // Nodes, where the explorer's "+" makes them: File > New's list.
         MenuEntry::Sub { label: "New", entries: new_entries(store) },
         // The focused pane's note drawn with no gap between paragraphs, or

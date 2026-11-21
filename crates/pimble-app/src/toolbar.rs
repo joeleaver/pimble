@@ -35,6 +35,10 @@ thread_local! {
     static WATCHING: Cell<bool> = const { Cell::new(false) };
     /// Whether the focused pane's caret is in a table: the Table group shows.
     static IN_TABLE: RefCell<Option<Signal<bool>>> = const { RefCell::new(None) };
+    /// The text color at the focused pane's selection (the stored value,
+    /// `None` for the default), and whether its caret is in a code block,
+    /// which takes no color (docs/TEXT_COLOR_CONTRACT.md).
+    static TEXT_COLOR: RefCell<Option<(Signal<Option<String>>, Signal<bool>)>> = const { RefCell::new(None) };
 }
 
 /// How often the watcher re-reads the editor state. Cursor moves fire no
@@ -69,6 +73,11 @@ fn refresh_active_bits(pane: PaneId) {
     }
     if let Some(in_table) = IN_TABLE.with(|t| *t.borrow()).filter(|s| s.is_alive()) {
         in_table.set_if_changed(editor(pane).in_node_type("table"));
+    }
+    if let Some((color, in_code)) = TEXT_COLOR.with(|t| *t.borrow()).filter(|(c, k)| c.is_alive() && k.is_alive()) {
+        let state = editor(pane).state();
+        color.set_if_changed(crate::text_color::current_color(&state));
+        in_code.set_if_changed(crate::text_color::in_code_block(&state));
     }
 }
 
@@ -113,6 +122,8 @@ enum Cmd {
     Insert(Insert),
     /// A discussion at the caret, drawn in the margin.
     Discuss,
+    /// The Text Color button: it opens its swatches (`render_color_btn`).
+    TextColor,
 }
 
 /// What goes into a note's text at the caret.
@@ -222,6 +233,7 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::Underline, "Underline (Ctrl+U)", Cmd::ToggleWrap("u"), ActiveCheck::Mark("u")),
                 b(TablerIcon::Strikethrough, "Strikethrough", Cmd::ToggleWrap("s"), ActiveCheck::Mark("s")),
                 b(TablerIcon::Code, "Inline Code", Cmd::ToggleWrap("code"), ActiveCheck::Mark("code")),
+                b(TablerIcon::TextColor, "Text Color", Cmd::TextColor, ActiveCheck::None),
                 b(TablerIcon::ClearFormatting, "Clear Formatting", Cmd::ClearFormatting, ActiveCheck::None),
             ],
             in_table_only: false,
@@ -359,6 +371,8 @@ fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
             crate::discussions::start_here(store);
             return;
         }
+        // Its own button opens the swatches; nothing runs from here.
+        Cmd::TextColor => return,
         Cmd::ToggleWrap(tag) => {
             let name = match *tag {
                 "strong" => "toggleBold",
@@ -449,6 +463,8 @@ pub(crate) fn render_pimble_toolbar(
     BUTTON_ACTIVE.with(|b| *b.borrow_mut() = (0..count).map(|_| Signal::new(false)).collect());
     let in_table = Signal::new(false);
     IN_TABLE.with(|t| *t.borrow_mut() = Some(in_table));
+    let text_color = (Signal::new(None::<String>), Signal::new(false));
+    TEXT_COLOR.with(|t| *t.borrow_mut() = Some(text_color));
     // The buttons follow the focus: a click in another pane, or its editor
     // taking the keyboard, re-reads them from that pane's editor.
     let _ = rinch::Effect::new(move || {
@@ -483,7 +499,11 @@ pub(crate) fn render_pimble_toolbar(
         };
         let row = rsx! { div { class: "pimble-toolbar__buttons" } };
         for btn_def in group.buttons {
-            let btn = render_btn(__scope, store, bit, btn_def);
+            let btn = if matches!(btn_def.cmd, Cmd::TextColor) {
+                render_color_btn(__scope, store, btn_def, text_color)
+            } else {
+                render_btn(__scope, store, bit, btn_def)
+            };
             row.append_child(&btn);
             bit += 1;
         }
@@ -524,6 +544,97 @@ fn render_btn(
             span {
                 style: "width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;",
                 {icon_el}
+            }
+        }
+    }
+}
+
+/// The Text Color button (docs/TEXT_COLOR_CONTRACT.md section 4): the icon
+/// over a bar in the color at the selection, as the current theme shows it,
+/// opening "Default" and the palette, each drawn in the current theme's shade
+/// and named in its tooltip. A swatch colors the selection (or what is typed
+/// next at a caret) and closes; Escape or a click outside closes. Dimmed in a
+/// code block, which takes no color.
+fn render_color_btn(
+    __scope: &mut RenderScope,
+    store: AppStore,
+    def: BtnDef,
+    (current, in_code): (Signal<Option<String>>, Signal<bool>),
+) -> NodeHandle {
+    use crate::text_color::{shown_color, PALETTE};
+    let open = Signal::new(false);
+    let icon_el = render_tabler_icon(__scope, def.icon, TablerIconStyle::Outline);
+    let dark = move || store.dark_mode.get();
+    // "Default" first, then the palette: (label, stored color, shade per theme).
+    let mut choices: Vec<(&'static str, Option<&'static str>, Option<(&'static str, &'static str)>)> = vec![("Default", None, None)];
+    choices.extend(PALETTE.iter().map(|s| (s.label, Some(s.light), Some((s.light, s.dark)))));
+    let swatches: Vec<NodeHandle> = choices
+        .into_iter()
+        .map(|(label, color, shades)| {
+            let shade = move || match shades {
+                Some((light, dark_shade)) => if dark() { dark_shade } else { light }.to_string(),
+                None => "var(--rinch-color-text)".to_string(),
+            };
+            rsx! {
+                div {
+                    class: {move || {
+                        let on = current.with(|c| match (c, color) {
+                            (None, None) => true,
+                            (Some(c), Some(stored)) => crate::text_color::palette_entry(c).is_some_and(|e| e.light == stored),
+                            _ => false,
+                        });
+                        if on { "pimble-tc-swatch pimble-tc-swatch--on" } else { "pimble-tc-swatch" }
+                    }},
+                    title: label,
+                    style: {move || format!("color: {};", shade())},
+                    onclick: move || {
+                        open.set(false);
+                        crate::text_color::apply(store, color);
+                    },
+                    span { class: "pimble-tc-swatch__letter", "A" }
+                    span { class: "pimble-tc-swatch__bar" }
+                }
+            }
+        })
+        .collect();
+
+    rsx! {
+        div {
+            style: {move || if in_code.get() { "opacity: 0.4; pointer-events: none;" } else { "" }},
+            Popover {
+                opened_fn: move || open.get(),
+                onclose: move || {
+                    open.set(false);
+                    editor(TARGET.with(Cell::get)).focus();
+                },
+                position: "bottom-start",
+                close_on_click_outside: true,
+                close_on_escape: true,
+                z_index: 300,
+                PopoverTarget {
+                    div {
+                        title: def.tooltip,
+                        style: {move || btn_style(open.get())},
+                        onclick: move || open.set(!untracked(|| open.get())),
+                        span {
+                            class: "pimble-tc-button",
+                            {icon_el}
+                            span {
+                                class: "pimble-tc-button__bar",
+                                style: {move || match current.get() {
+                                    Some(c) => format!("background: {};", shown_color(&c, dark())),
+                                    None => "background: transparent;".to_string(),
+                                }},
+                            }
+                        }
+                    }
+                }
+                PopoverDropdown {
+                    div {
+                        class: "pimble-tc-swatches",
+                        {swatches}
+                    }
+                }
             }
         }
     }

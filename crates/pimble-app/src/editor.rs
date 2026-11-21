@@ -58,6 +58,8 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::presence::text::PresencePlugin));
                 // Hashtags colored in the text (docs/HASHTAGS_CONTRACT.md).
                 handle.add_plugin(std::rc::Rc::new(crate::hashtags::HashtagsPlugin));
+                // Colored text legible in either theme (docs/TEXT_COLOR_CONTRACT.md).
+                handle.add_plugin(std::rc::Rc::new(crate::text_color::TextColorPlugin));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).

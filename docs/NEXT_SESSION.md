@@ -1,5 +1,11 @@
 # Next session: start here
 
+**2026-11-21: text color built, not committed or released** (docs/TEXT_COLOR_CONTRACT.md).
+A Text Color button in the toolbar's Text group and Edit > Text Color: Default and nine
+colors stored as the light shade in rinch's `text_color` mark; `TextColorPlugin` shows each
+in the current theme's shade, and shows a pasted color that would not read (black on dark,
+near-white on light) as the nearest palette shade or as ordinary text.
+
 **2026-11-20: startup built, not committed or released** (docs/STARTUP_CONTRACT.md "Built").
 A hand-over now closes stores and lets go of indexes; a locked index is waited for, never
 rebuilt over; indexes open in the background (`IndexState`, "indexing N notes" on the row,

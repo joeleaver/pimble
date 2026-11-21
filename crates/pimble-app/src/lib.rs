@@ -52,6 +52,7 @@ pub mod protocol;
 pub mod rinch_editor;
 pub mod state;
 pub mod styles;
+pub mod text_color;
 pub mod sheets;
 pub mod settings;
 pub mod shortcuts;

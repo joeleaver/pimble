@@ -58,6 +58,59 @@ pub(crate) const APP_CSS: &str = "
     gap: 2px;
 }
 
+/* The Text Color button and its swatches (docs/TEXT_COLOR_CONTRACT.md section 4). */
+.pimble-tc-button {
+    position: relative;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.pimble-tc-button__bar {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    bottom: -3px;
+    height: 3px;
+    border-radius: 1px;
+}
+.pimble-tc-swatches {
+    display: grid;
+    grid-template-columns: repeat(5, 28px);
+    gap: 4px;
+}
+.pimble-tc-swatch {
+    width: 28px;
+    height: 28px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+}
+.pimble-tc-swatch:hover {
+    background: var(--rinch-color-option-hover);
+}
+.pimble-tc-swatch--on {
+    border-color: var(--rinch-primary-color-6);
+}
+.pimble-tc-swatch__letter {
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 16px;
+}
+.pimble-tc-swatch__bar {
+    width: 16px;
+    height: 3px;
+    border-radius: 1px;
+    background: currentColor;
+}
+
 .pimble-toolbar__label {
     font-size: 9px;
     line-height: 11px;
@@ -4084,6 +4137,76 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-hashtag {
     color: var(--rinch-primary-color-4);
+}
+
+/* Text color (docs/TEXT_COLOR_CONTRACT.md, text_color.rs). The stored color is the
+   mark's inline color, on the mark's span; the decoration's span inside it carries
+   `pimble-tc` and, where the stored color would not read on this theme (always for a
+   palette color), `pimble-tc-fix-light`/`-dark` with the palette class to show
+   instead. Color only, so nothing lays out differently. A hashtag in colored text
+   takes the text's color: first the rule that hands it back, then the palette rules,
+   which outrank or follow it. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-hashtag.pimble-tc,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-hashtag.pimble-tc {
+    color: inherit;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-neutral,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-neutral {
+    color: var(--rinch-color-text);
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-gray {
+    color: #6b7280;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-red {
+    color: #c92a2a;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-orange {
+    color: #c2410c;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-yellow {
+    color: #a16207;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-green {
+    color: #2b7a3b;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-teal {
+    color: #0f766e;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-blue {
+    color: #1971c2;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-purple {
+    color: #7c3aed;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme=\"dark\"]) .pimble-tc-fix-light.pimble-tc-pink {
+    color: #c2255c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-gray {
+    color: #a8adb7;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-red {
+    color: #ff8787;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-orange {
+    color: #ffa94d;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-yellow {
+    color: #ffd43b;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-green {
+    color: #69db7c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-teal {
+    color: #38d9a9;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-blue {
+    color: #74c0fc;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-purple {
+    color: #b197fc;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-tc-fix-dark.pimble-tc-pink {
+    color: #f783ac;
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] code {
