@@ -138,6 +138,44 @@ The status bar says what the tool in hand does whenever a canvas is focused (a c
 canvas being edited over its note), for every tool: until v3 it said so only for the tools with
 nothing to set and with nothing selected, so most of the time it said nothing.
 
+## One row (2026-11-21, v4)
+
+Joe: "fix the toolbar wrapping in narrow windows." Every toolbar (text, canvas, sheet) is one row
+at any width (`toolbar_fit.rs`). Widths are measured with rinch's bounds signals on both the
+desktop and the browser: the row's own box, and each group's box as it last showed, with its
+label and without. As the room shrinks, first every group's label goes (the row gets shorter),
+then whole groups fold, lowest priority first, into a trailing More (three dots) dropdown that
+lists each folded group's label over the same buttons, acting and showing state as the row's do
+(a second copy of the group's buttons over the same state). The rule is `toolbar_fit::fit`
+(tested); 6 px are kept spare so a group does not flicker in and out.
+
+Priorities (first to fold first):
+- Text: Insert (Edit > Insert has all of it), Discuss, History (Ctrl+Z), Table, Paragraph,
+  Text last.
+- Canvas: People, Snap, Export, History, View last. Canvas (Edit/Done) and the selection's
+  own group never fold. While the selection's group shows, View is also the percentage alone
+  (its menu holds every View command), as before.
+- Sheet: Sheet (Add Table), History, Table, Column, Row last.
+
+Checked at window widths 700 (text, canvas and sheet fold; More opened on text and canvas; H2
+and the grid toggled from inside More), 900, 1100, and 1100 at 150% zoom (one row, labels on).
+The More menu stacks each group's label over its buttons so it stays no wider than the widest
+group: the panes' area clips what reaches past its left edge.
+
+## Embedded items (2026-11-21, v4)
+
+Joe: "for the canvas and other embedded things, remove/hide buttons that don't make sense for
+the embedded view. Like the grid options, and maybe People." An item selected inside a note and
+not being edited shows only what acts on it where it sits:
+
+- A picture or an embedded canvas selected: Canvas (Edit Canvas), Export, History (the note's).
+  View, Snap and People show only on an open canvas; the v2 behavior of opening the canvas
+  when one of them was clicked is gone (they are not there to click). Once it is being edited,
+  the full canvas set shows, as before.
+- A sheet selected in a note (its atom, or a cell): Row, Column, Table, History. The Sheet group
+  (Add Table, Add Summary Table) is the only part that makes sense only in a sheet node's pane
+  and is hidden in text (since v2): a table goes into text with Insert > Sheet.
+
 ## History: the toolbar for canvases (2026-11-21; built the same day)
 
 Joe, 2026-11-21, pointing at a canvas whose toolbar showed the text buttons dimmed while the
@@ -219,8 +257,8 @@ groups when the selection leaves it.
   tooltip, on a canvas that began empty; Import SVG dims ("Edit the canvas to import SVG into
   it."), since it writes into the open canvas. File names are the note's title.
 - **Snap** toggles the per-viewer settings directly.
-- **View** and **People** open the canvas (as Edit Canvas does), wait for its first fit, then
-  do what they say. The percentage shows the zoom the canvas would open at: fitted into the
+- **View** and **People** opened the canvas first (until v4, "Embedded items": now they
+  show only on an open canvas). The percentage shows the zoom the canvas would open at: fitted into the
   pane's text area with a 24 pixel margin, never above 100% (`boards::present`'s rule);
   "Fit" while that cannot be told (the picture not here yet, the pane with no size yet).
 - **History** is the note's undo and redo while the picture is only selected (deleting or

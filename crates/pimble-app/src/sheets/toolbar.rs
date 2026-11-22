@@ -84,23 +84,6 @@ fn button(
     }
 }
 
-fn group(
-    __scope: &mut RenderScope,
-    label: &'static str,
-    shown: impl Fn() -> bool + Copy + 'static,
-    writable: impl Fn() -> bool + Copy + 'static,
-    buttons: Vec<NodeHandle>,
-) -> NodeHandle {
-    rsx! {
-        div {
-            class: "pimble-toolbar__group",
-            style: {move || if !shown() { "display: none;" } else if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
-            div { class: "pimble-toolbar__buttons", {buttons} }
-            div { class: "pimble-toolbar__label", {label} }
-        }
-    }
-}
-
 /// The toolbar, rendered once; it follows the focused pane.
 pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let focused = move || store.focused_pane.get();
@@ -131,11 +114,11 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
     let can_row = move |by: i32| move || aim().is_some_and(|a| a.row().is_some_and(|r| moving::row_can_step(&a.table, r, by)));
     let can_col = move |by: i32| move || aim().is_some_and(|a| a.col().is_some_and(|c| moving::col_can_step(&a.table, c, by)));
 
-    let sheet = vec![
+    let sheet = move |__scope: &mut RenderScope| vec![
         button(__scope, TablerIcon::TablePlus, "Add Table", always, never, move || add_table(store, untracked(focused))),
         button(__scope, TablerIcon::MathFunction, "Add Summary Table", always, never, move || add_summary(store, untracked(focused))),
     ];
-    let row = vec![
+    let row = move |__scope: &mut RenderScope| vec![
         button(__scope, TablerIcon::RowInsertBottom, "Add Row", has_table, never, with_aim(|store, pane, aim| {
             // The new-row line's first column a person types in.
             if let Some(col) = aim.table.columns.iter().find(|c| !c.computed) {
@@ -159,7 +142,7 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
             }
         })),
     ];
-    let column = vec![
+    let column = move |__scope: &mut RenderScope| vec![
         button(__scope, TablerIcon::ColumnInsertRight, "Add Column", has_table, never, with_aim(|store, pane, aim| open_column(store, pane, &aim.table.id, None))),
         button(__scope, TablerIcon::Adjustments, "Column Settings", has_col, never, with_aim(|store, pane, aim| {
             if let Some(col) = aim.col() {
@@ -196,7 +179,7 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
             }
         })),
     ];
-    let table = vec![
+    let table = move |__scope: &mut RenderScope| vec![
         button(__scope, TablerIcon::Sum, "Add Summary Row", has_table, never, with_aim(|store, pane, aim| add_summary_row(store, pane, &aim.table.id))),
         button(
             __scope,
@@ -214,7 +197,7 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
             store.pane(pane).sheet_ui.last.set(None);
         })),
     ];
-    let history = vec![
+    let history = move |__scope: &mut RenderScope| vec![
         button(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", always, never, move || {
             undo(store, untracked(focused), false);
         }),
@@ -223,19 +206,17 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
         }),
     ];
 
-    let groups = vec![
+    // One row at any width (docs/TOOLBAR_CONTRACT.md "One row"): Sheet
+    // folds first, then History (Ctrl+Z), Table, Column; Row last.
+    use crate::toolbar_fit::Slot;
+    let slots = vec![
         // In a note's text a new table goes in with Insert > Sheet, where
         // the caret is; Add Table would put one nowhere in the text.
-        group(__scope, "Sheet", move || !in_text(), writable, sheet),
-        group(__scope, "Row", always, writable, row),
-        group(__scope, "Column", always, writable, column),
-        group(__scope, "Table", always, writable, table),
-        group(__scope, "History", always, writable, history),
+        Slot::new("Sheet", Some(1), move || !in_text(), writable, sheet),
+        Slot::new("Row", Some(5), always, writable, row),
+        Slot::new("Column", Some(4), always, writable, column),
+        Slot::new("Table", Some(3), always, writable, table),
+        Slot::new("History", Some(2), always, writable, history),
     ];
-    rsx! {
-        div {
-            class: "pimble-toolbar",
-            {groups}
-        }
-    }
+    crate::toolbar_fit::render(__scope, "pimble-toolbar", slots, || {})
 }

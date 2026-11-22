@@ -68,6 +68,7 @@ pub mod startup;
 pub mod presence;
 pub mod text_boards;
 pub mod toolbar;
+pub mod toolbar_fit;
 #[cfg(feature = "native")]
 pub mod update;
 /// The Ed25519 key releases are signed with, the raw 32 bytes in base64

@@ -1,5 +1,10 @@
 # Next session: start here
 
+**2026-11-21: one-row toolbars and embedded sets, not committed or released**
+(docs/TOOLBAR_CONTRACT.md "One row", "Embedded items"): text, canvas and sheet toolbars never
+wrap (labels go, then groups fold into More by priority, from measured widths, `toolbar_fit.rs`);
+a picture or embedded canvas selected in a note shows Canvas, Export and History only.
+
 **2026-11-21: the main toolbar follows the selected item, not committed or released**
 (docs/TOOLBAR_CONTRACT.md, the file renamed from CANVAS_TOOLBAR_CONTRACT.md). One rule
 (`toolbar::which`) over every pane and selection; embedded canvases get the canvas toolbar and

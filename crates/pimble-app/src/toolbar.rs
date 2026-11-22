@@ -564,46 +564,51 @@ pub(crate) fn render_pimble_toolbar(
     });
     watch_toolbar();
 
-    let toolbar = rsx! {
-        div {
-            class: "editor-toolbar pimble-toolbar",
-        }
+    // One row at any width (docs/TOOLBAR_CONTRACT.md "One row"): groups
+    // fold into More, Insert first (Edit > Insert has it all), then Discuss,
+    // History (Ctrl+Z), Table, Paragraph; Text last.
+    let priority = |label: &str| match label {
+        "Insert" => 1,
+        "Discuss" => 2,
+        "History" => 3,
+        "Table" => 4,
+        "Paragraph" => 5,
+        _ => 6,
     };
-
     // Each button's index into `BUTTON_ACTIVE`, counted the way `fingerprint`
     // flattens the groups.
-    let mut bit = 0u32;
-    for group in groups {
+    let mut first_bit = 0u32;
+    let mut slots = Vec::new();
+    for (gi, group) in groups.into_iter().enumerate() {
         let (in_table_only, for_commenters) = (group.in_table_only, group.for_commenters);
-        let element = rsx! {
-            div {
-                class: "pimble-toolbar__group",
-                style: {move || if in_table_only && !in_table.get() {
-                    "display: none;"
-                } else if usable() || (for_commenters && commentable()) {
-                    ""
-                } else {
-                    "opacity: 0.4; pointer-events: none;"
-                }},
-            }
+        let bits = first_bit;
+        first_bit += group.buttons.len() as u32;
+        let build = move |__scope: &mut RenderScope| -> Vec<NodeHandle> {
+            let group = button_groups().into_iter().nth(gi).expect("the group");
+            let mut bit = bits;
+            group
+                .buttons
+                .into_iter()
+                .map(|btn_def| {
+                    let btn = if matches!(btn_def.cmd, Cmd::TextColor) {
+                        render_color_btn(__scope, store, btn_def, text_color)
+                    } else {
+                        render_btn(__scope, store, bit, btn_def)
+                    };
+                    bit += 1;
+                    btn
+                })
+                .collect()
         };
-        let row = rsx! { div { class: "pimble-toolbar__buttons" } };
-        for btn_def in group.buttons {
-            let btn = if matches!(btn_def.cmd, Cmd::TextColor) {
-                render_color_btn(__scope, store, btn_def, text_color)
-            } else {
-                render_btn(__scope, store, bit, btn_def)
-            };
-            row.append_child(&btn);
-            bit += 1;
-        }
-        let label = rsx! { div { class: "pimble-toolbar__label", {group.label} } };
-        element.append_child(&row);
-        element.append_child(&label);
-        toolbar.append_child(&element);
+        slots.push(crate::toolbar_fit::Slot::new(
+            group.label,
+            Some(priority(group.label)),
+            move || !in_table_only || in_table.get(),
+            move || usable() || (for_commenters && commentable()),
+            build,
+        ));
     }
-
-    toolbar
+    crate::toolbar_fit::render(__scope, "editor-toolbar pimble-toolbar", slots, || {})
 }
 
 fn render_btn(

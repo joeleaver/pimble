@@ -29,7 +29,9 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-toolbar {
     display: flex;
-    flex-wrap: wrap;
+    /* One row at any width (toolbar_fit.rs): groups fold into More instead. */
+    flex-wrap: nowrap;
+    min-width: 0;
     align-items: flex-start;
     gap: 4px 0;
     padding: 4px 8px 2px 8px;
@@ -51,6 +53,38 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-toolbar__group:first-child {
     border-left: none;
+}
+
+.pimble-toolbar__group {
+    flex-shrink: 0;
+}
+
+/* More: the groups that did not fit, each a row with its label. */
+.pimble-toolbar__more {
+    flex-shrink: 0;
+    padding: 0 4px;
+    border-left: 1px solid var(--rinch-color-border);
+}
+.pimble-toolbar__more-menu {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+/* Each folded group: its label over its buttons, so the menu is no wider
+   than the widest group and stays over the panes, which clip it. */
+.pimble-toolbar__more-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+}
+.pimble-toolbar__more-label {
+    font-size: 9px;
+    line-height: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
 }
 
 .pimble-toolbar__buttons {
