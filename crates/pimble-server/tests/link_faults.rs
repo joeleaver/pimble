@@ -5,8 +5,19 @@
 //! - an append the server stored whose answer never came back
 //!   (`LinkFaults::lose_answers`), and a device stopped right after one,
 //!   started again from its files;
-//! - `vault-link.json` deleted, or put back from an older copy, while the
-//!   device is stopped;
+//! - the link's record of what the remote holds (the `vault` section of
+//!   `sync-state.json`, `vault-link.json` before) deleted, or put back from an
+//!   older copy, while the device is stopped;
+//! - a device crashed: its disk as of the moment (copied while it runs, the
+//!   state directory before the store's folder, so a read position is never
+//!   copied newer than a document written before it), stopped without its
+//!   final writes counting, and started again from that copy. Right after,
+//!   with every other device answering no reports, it must get back from the
+//!   log alone every change it held before the crash
+//!   (docs/ONE_CODEBASE_CONTRACT.md wave 0: before it, a read position was
+//!   written at once and its document 750 ms later, and a crash in between
+//!   lost those changes from the device for good while the others healed it
+//!   only while they were online);
 //! - snapshots stored every few appends while the others read the logs in
 //!   pages a few hundred bytes long, so a snapshot lands between two pages;
 //! - notifications lost, one device's network gone, every connection cut
@@ -68,8 +79,8 @@ struct Device {
     offline_for: u32,
     /// Steps left stopped (the owner away); 0 when running.
     away_for: u32,
-    /// An older copy of its `vault-link.json`, to put back.
-    older_progress: Option<Vec<u8>>,
+    /// An older copy of its record of what the remote holds, to put back.
+    older_progress: Option<serde_json::Value>,
 }
 
 impl Device {
@@ -81,8 +92,28 @@ impl Device {
         self.client.as_ref().expect("a running device")
     }
 
-    fn progress_file(&self, store_id: StoreId) -> PathBuf {
-        self.dir.path().join("stores").join(store_id.to_string()).join("vault-link.json")
+    fn state_dir(&self, store_id: StoreId) -> PathBuf {
+        self.dir.path().join("stores").join(store_id.to_string())
+    }
+
+    /// The link's record of what the remote holds: the `vault` section of
+    /// `sync-state.json`.
+    fn progress(&self, store_id: StoreId) -> Option<serde_json::Value> {
+        let bytes = std::fs::read(self.state_dir(store_id).join("sync-state.json")).ok()?;
+        let mut record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        record.get_mut("vault").map(serde_json::Value::take)
+    }
+
+    /// Replace (or with `None`, remove) that section, the device stopped.
+    fn put_progress(&self, store_id: StoreId, section: Option<serde_json::Value>) {
+        let path = self.state_dir(store_id).join("sync-state.json");
+        let Some(mut record) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return };
+        let Some(map) = record.as_object_mut() else { return };
+        match section {
+            Some(section) => map.insert("vault".to_string(), section),
+            None => map.remove("vault"),
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
     async fn start(&mut self) {
@@ -99,6 +130,59 @@ impl Device {
         if let Some(mut server) = self.server.take() {
             server.stop().await.expect("a device stops");
         }
+    }
+
+    /// Crash: the disk as of now, and nothing written after it. The device's
+    /// directory is copied while it runs, its state directory first and the
+    /// rest (the store's folder) after: every file is written whole (a
+    /// rename), and a read position written after its document is then never
+    /// copied newer than the document. The derived search index is left out
+    /// and built again. The server is stopped, and what its stop wrote is
+    /// thrown away for the copy.
+    async fn crash(&mut self) {
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(&self.dir.path().join("stores"), &copy.path().join("stores"));
+        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
+            if entry.file_name() != "stores" {
+                copy_tree(&entry.path(), &copy.path().join(entry.file_name()));
+            }
+        }
+        self.stop().await;
+        // Anything the stopped server still had in flight lands before the
+        // copy goes back.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        for entry in std::fs::read_dir(copy.path()).unwrap().flatten() {
+            std::fs::rename(entry.path(), self.dir.path().join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// Copy `from` to `to` as it is now, a file at a time, leaving out search
+/// indexes and whatever vanishes while it is copied (a temporary renamed
+/// into place).
+fn copy_tree(from: &Path, to: &Path) {
+    let Ok(meta) = std::fs::metadata(from) else { return };
+    if meta.is_dir() {
+        if from.file_name().is_some_and(|n| n == "index") {
+            return;
+        }
+        let _ = std::fs::create_dir_all(to);
+        let Ok(entries) = std::fs::read_dir(from) else { return };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            copy_tree(&entry.path(), &to.join(entry.file_name()));
+        }
+    } else if !from.extension().is_some_and(|e| e == "tmp") {
+        let _ = std::fs::copy(from, to);
     }
 }
 
@@ -164,6 +248,99 @@ async fn disagreement(devices: &[Device], store_id: StoreId, all_docs: &[NodeId]
         }
     }
     None
+}
+
+/// The crash fault (see the module doc): `devices[i]`, once its own edits are
+/// on the remote, hears another device's change and crashes within the
+/// content flush's debounce; started again from its disk as it was, with
+/// every other device answering no reports, it must hold again within a bound
+/// every marker it held just before the crash, from the log alone.
+#[allow(clippy::too_many_arguments)]
+async fn crash_step(
+    devices: &mut [Device],
+    i: usize,
+    store_id: StoreId,
+    seed: u64,
+    step: usize,
+    rng: &mut StdRng,
+    markers: &mut std::collections::HashMap<NodeId, Vec<String>>,
+    log: &mut Vec<String>,
+    relay_cut_for: u32,
+) -> Result<(), String> {
+    // Connected, so that what it made itself is on the remote: an edit a
+    // crash takes before it left the device is lost by the crash, which is not
+    // what this checks.
+    if !devices[i].running() || devices[i].away_for > 0 || devices[i].offline_for > 0 || relay_cut_for > 0 {
+        return Ok(());
+    }
+    if !wait_until(Duration::from_secs(15), || async { synced(devices[i].client(), store_id).await }).await {
+        log.push(format!("{step}: {} not connected; no crash", devices[i].name));
+        return Ok(());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Another device's change, applied here right before the crash.
+    let others: Vec<usize> = (0..devices.len()).filter(|j| *j != i && devices[*j].running()).collect();
+    if !others.is_empty() {
+        let j = others[rng.random_range(0..others.len())];
+        let shared: Vec<NodeId> = devices[j].docs.iter().copied().filter(|d| devices[i].docs.contains(d)).collect();
+        let doc = shared[rng.random_range(0..shared.len())];
+        let marker = format!("seed{seed}-step{step}-{}-before-a-crash", devices[j].name);
+        if edit(devices[j].client(), store_id, doc, devices[j].name, &marker).await {
+            markers.entry(doc).or_default().push(marker);
+            log.push(format!("{step}: {} edits {doc}", devices[j].name));
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(rng.random_range(50..500))).await;
+    // What it holds now, of every marker made so far.
+    let mut held_before: Vec<(NodeId, String)> = Vec::new();
+    for &doc in &devices[i].docs {
+        let text = node_text(devices[i].client(), store_id, doc).await;
+        for marker in markers.get(&doc).into_iter().flatten() {
+            if text.contains(marker.as_str()) {
+                held_before.push((doc, marker.clone()));
+            }
+        }
+    }
+    devices[i].crash().await;
+    log.push(format!("{step}: {} crashed holding {} markers", devices[i].name, held_before.len()));
+    for (j, device) in devices.iter().enumerate() {
+        if j != i {
+            device.faults.set_deaf_to_reports(true);
+        }
+    }
+    devices[i].start().await;
+    let client = devices[i].client();
+    let back = wait_until(Duration::from_secs(30), || async {
+        if !synced(client, store_id).await {
+            return false;
+        }
+        for (doc, marker) in &held_before {
+            if !node_text(client, store_id, *doc).await.contains(marker.as_str()) {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    for device in devices.iter() {
+        device.faults.set_deaf_to_reports(false);
+    }
+    if !back {
+        let mut lacking = Vec::new();
+        for (doc, marker) in &held_before {
+            if !node_text(devices[i].client(), store_id, *doc).await.contains(marker.as_str()) {
+                lacking.push(format!("{marker:?} in {doc}"));
+            }
+        }
+        return Err(format!(
+            "after its crash {} never got back from the log what it held before it (synced: {}): {}",
+            devices[i].name,
+            synced(devices[i].client(), store_id).await,
+            lacking.join(", ")
+        ));
+    }
+    log.push(format!("{step}: {} back after its crash, everything it held there again", devices[i].name));
+    Ok(())
 }
 
 async fn total_appends(env: &Env, store_id: StoreId) -> u64 {
@@ -328,19 +505,18 @@ async fn run(seed: u64) -> Result<String, String> {
             }
             // Stopped and started again from its files, its record of what
             // the remote holds deleted, put back from an older copy, or kept.
-            70..=81 => {
+            70..=75 => {
                 if devices[i].running() && devices[i].away_for == 0 {
-                    let path = devices[i].progress_file(store_id);
                     devices[i].stop().await;
                     let what = match rng.random_range(0..3) {
                         0 => {
-                            let _ = std::fs::remove_file(&path);
-                            "its vault-link.json deleted"
+                            devices[i].put_progress(store_id, None);
+                            "its record of what the remote holds deleted"
                         }
-                        1 => match &devices[i].older_progress {
+                        1 => match devices[i].older_progress.clone() {
                             Some(older) => {
-                                std::fs::write(&path, older).unwrap();
-                                "its vault-link.json put back from an older copy"
+                                devices[i].put_progress(store_id, Some(older));
+                                "its record of what the remote holds put back from an older copy"
                             }
                             None => "its files kept",
                         },
@@ -348,6 +524,14 @@ async fn run(seed: u64) -> Result<String, String> {
                     };
                     devices[i].start().await;
                     log.push(format!("{step}: {} restarted, {what}", devices[i].name));
+                }
+            }
+            // Crashed right after another device's change reached it, and
+            // started again from its disk as it was.
+            76..=81 => {
+                if let Err(why) = crash_step(&mut devices, i, store_id, seed, step, &mut rng, &mut markers, &mut log, relay_cut_for).await {
+                    let summary = format!("seed {seed}: {} steps", log.len());
+                    return Err(format!("{summary}\n{why}\nsteps:\n  {}", log.join("\n  ")));
                 }
             }
             // The owner's computer away for a few steps.
@@ -360,8 +544,8 @@ async fn run(seed: u64) -> Result<String, String> {
             }
             // A copy of a device's record to put back later.
             87..=94 => {
-                if let Ok(bytes) = std::fs::read(devices[i].progress_file(store_id)) {
-                    devices[i].older_progress = Some(bytes);
+                if let Some(section) = devices[i].progress(store_id) {
+                    devices[i].older_progress = Some(section);
                 }
             }
             _ => {}
@@ -389,7 +573,8 @@ async fn run(seed: u64) -> Result<String, String> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     let (lost, dropped) = devices.iter().map(|d| d.faults.happened()).fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
-    let summary = format!("seed {seed}: {} steps, {lost} answers lost, {dropped} notifications dropped", log.len());
+    let crashes = log.iter().filter(|line| line.contains(" crashed ")).count();
+    let summary = format!("seed {seed}: {} steps, {lost} answers lost, {dropped} notifications dropped, {crashes} crashes", log.len());
     if let Some(why) = last {
         return Err(format!("{summary}\nnot converged within {:?}: {why}\nsteps:\n  {}", SETTLE_WITHIN, log.join("\n  ")));
     }

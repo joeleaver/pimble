@@ -1107,7 +1107,7 @@ impl DocKeys {
 /// what it was sent, or one that is not there (a replica removed, a browser
 /// cleared), and sending it again changes nothing. An answer is an append the
 /// remote acknowledged, so it is in the log for good (a snapshot holds it
-/// too), which is why this record may be kept (the desktop's `devices.json`,
+/// too), which is why this record may be kept (the desktop's `sync-state.json`,
 /// the browser's `localStorage`) and is forgotten only with the logs
 /// themselves (a twin built again). Without that, every connect of every device would answer
 /// a removed replica's last report again, for every document changed since

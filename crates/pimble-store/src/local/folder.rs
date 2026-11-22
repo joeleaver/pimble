@@ -155,7 +155,8 @@ pub(crate) fn merge_manifests(base: &StoreManifest, ours: &StoreManifest, theirs
 /// Move what the folder still holds of one computer's state into
 /// `state_dir`, once (docs/STORE_FOLDERS_CONTRACT.md rule 1): `sync.json`'s
 /// per-computer keys (into `link.json`), `vault-link.json`, `people.json` and
-/// `index/`.
+/// `index/`. The link's files then go into the one record
+/// (`crate::sync_state::migrate`, run right after this).
 ///
 /// Whose state is it? The computer that kept it in the folder ran an older
 /// Pimble. When no newer Pimble has opened the folder yet (it has no
@@ -172,6 +173,9 @@ pub(crate) fn merge_manifests(base: &StoreManifest, ours: &StoreManifest, theirs
 pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Path, store_id: StoreId) {
     let computers = store_path.join(LocalStore::COMPUTERS_DIR);
     let first = !computers.exists();
+    // This computer's own link state, once it has the one record
+    // (`crate::sync_state`): whatever the folder holds then is not its.
+    let has_record = crate::sync_state::path(state_dir).exists();
 
     // `sync.json`'s per-computer keys.
     let sync_path = store_path.join(LocalStore::SYNC_CONFIG_FILE);
@@ -184,7 +188,7 @@ pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Pa
         }
         if !state.is_empty() {
             let state_path = state_dir.join(LocalStore::LINK_STATE_FILE);
-            if first && !state_path.exists() {
+            if first && !state_path.exists() && !has_record {
                 let moved = async {
                     fs::create_dir_all(state_dir).await?;
                     atomic_write(&state_path, serde_json::to_string_pretty(&serde_json::Value::Object(state))?).await?;
@@ -212,7 +216,7 @@ pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Pa
             info!("Store {}: {} in the folder belongs to an older Pimble on another computer; left alone", store_id, name);
             continue;
         }
-        if to.exists() {
+        if to.exists() || (name == "vault-link.json" && has_record) {
             // This computer already has its own; the folder's is a leftover.
             remove_path(&from).await;
             continue;

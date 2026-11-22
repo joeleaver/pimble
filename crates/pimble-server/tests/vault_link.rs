@@ -786,7 +786,12 @@ async fn a_replica_from_before_the_progress_file_pushes_what_the_remote_lacks() 
     seed_content(&client_a, store_id, doc_id, "editor", "lost by the old link").await;
     tokio::time::sleep(Duration::from_millis(1000)).await; // the content flush debounce
     a.stop().await.unwrap();
-    let _ = std::fs::remove_file(a_dir.path().join("stores").join(store_id.to_string()).join("vault-link.json"));
+    // What the link knew of the remote (the `vault` section of its record) is lost.
+    let record_path = a_dir.path().join("stores").join(store_id.to_string()).join("sync-state.json");
+    if let Some(mut record) = std::fs::read(&record_path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) {
+        record.as_object_mut().unwrap().remove("vault");
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
     env.relay.restore();
 
     let dir = a_dir.path();

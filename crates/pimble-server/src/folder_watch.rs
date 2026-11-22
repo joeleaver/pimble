@@ -51,7 +51,7 @@ pub(crate) fn folder_source(store_id: StoreId) -> String {
 }
 
 /// The name a computer goes by in a folder's `computers/`: derived from its
-/// device id in the store (`devices.json`), never the id itself, which the
+/// device id in the store (`crate::devices`), never the id itself, which the
 /// convergence reports use and which stays out of the store's folder
 /// (docs/CONVERGENCE_CONTRACT.md, 2026-11-19). The same device id gives the
 /// same name every time, and no computer can take it for its own.
@@ -230,7 +230,7 @@ impl RpcHandler {
 
     /// Write this computer's `computers/<presence id>.json` into the folder.
     async fn write_presence(&self, store_id: StoreId, path: &Path) {
-        let device = presence_id(&self.devices().entry(store_id).await.device);
+        let device = presence_id(&self.device_entry(store_id).await.device);
         let file = ComputerFile { device: device.clone(), name: computer_name(), last_seen: Utc::now(), version: self.version().to_string() };
         let dir = path.join(pimble_store::LocalStore::COMPUTERS_DIR);
         let written = async {
@@ -247,7 +247,7 @@ impl RpcHandler {
 
     /// Read the other computers' `computers/` files, for `Store::also_open_on`.
     async fn read_presence(&self, store_id: StoreId, path: &Path) {
-        let own = presence_id(&self.devices().entry(store_id).await.device);
+        let own = presence_id(&self.device_entry(store_id).await.device);
         let mut others = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(path.join(pimble_store::LocalStore::COMPUTERS_DIR)).await {
             while let Ok(Some(entry)) = entries.next_entry().await {

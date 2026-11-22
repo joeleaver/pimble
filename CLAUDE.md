@@ -479,7 +479,7 @@ store-name question). Pimble Cloud holds ciphertext only.
   SignOut/Status/HostStore/ListHostedStores/AddHostedStore`; `VaultLink` (mode `vault` in
   `sync.json`, per-document `last_seq`) pulls, decrypts and applies blobs, encrypts and
   appends local updates, drops echoes by seq, snapshots every 200 appends; it keeps its
-  local-change subscription across disconnects and records in `<store>/vault-link.json`
+  local-change subscription across disconnects and records in the store's `sync-state.json` (`vault` section, in `<data dir>/pimble/stores/<store id>/`; docs/ONE_CODEBASE_CONTRACT.md wave 0)
   what the remote is known to hold (a state vector per document, advanced only by
   updates that continue from it) plus the documents that changed while it was down, and
   every reconnect pushes what the remote lacks (the hosted twin is ciphertext and cannot

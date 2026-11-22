@@ -10,6 +10,7 @@ pub mod error;
 pub mod local;
 pub mod manager;
 pub mod registry;
+pub mod sync_state;
 pub mod vault;
 pub mod watch;
 

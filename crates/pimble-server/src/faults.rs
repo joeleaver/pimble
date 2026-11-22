@@ -21,6 +21,12 @@
 //!   so a read spans many pages and a snapshot can land between two.
 //! - [`LinkFaults::set_report_debounce`]: reports go this soon after a change
 //!   rather than 5 s, so a test settles in seconds.
+//! - [`LinkFaults::set_deaf_to_reports`]: the link answers no other device's
+//!   report (it still hears and sends its own), so what another device lacks
+//!   reaches it only through the log. The crash test turns it on for every
+//!   other device while a device that crashed catches up: what it read before
+//!   the crash must come back from the log alone
+//!   (docs/ONE_CODEBASE_CONTRACT.md wave 0).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -33,6 +39,7 @@ pub struct LinkFaults {
     snapshot_every: AtomicU64,
     page_bytes: AtomicU64,
     report_debounce_ms: AtomicU64,
+    deaf_to_reports: AtomicBool,
     /// How many of each fault actually happened, for a test to say what it
     /// exercised.
     lost: AtomicU32,
@@ -75,6 +82,15 @@ impl LinkFaults {
     /// Reports go `after` a change (zero: the usual 5 s).
     pub fn set_report_debounce(&self, after: Duration) {
         self.report_debounce_ms.store(after.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Answer no other device's report while `deaf` (see the module doc).
+    pub fn set_deaf_to_reports(&self, deaf: bool) {
+        self.deaf_to_reports.store(deaf, Ordering::SeqCst);
+    }
+
+    pub(crate) fn deaf_to_reports(&self) -> bool {
+        self.deaf_to_reports.load(Ordering::SeqCst)
     }
 
     /// How many answers were lost and notifications dropped so far.

@@ -1241,8 +1241,8 @@ pub struct RpcHandler {
     /// Faults a test injects into the vault links (`crate::faults`).
     link_faults: Option<Arc<crate::faults::LinkFaults>>,
     /// This computer's device id in each vault-linked store, and the reports
-    /// it has answered (`crate::devices`, `devices.json` beside the replicas
-    /// directory, never in a store's folder).
+    /// it has answered (`crate::devices`: the `device` section of each store's
+    /// `sync-state.json` in its state directory, never in a store's folder).
     devices: Arc<crate::devices::Devices>,
     /// This device's AI agents (docs/AGENTS_CONTRACT.md), on the app's own
     /// server; `None` elsewhere, where the agent RPCs answer that there are
@@ -1377,7 +1377,7 @@ impl RpcHandler {
             set_aside_after: Duration::from_secs(pimble_rpc::vault::SET_ASIDE_AFTER_SECS as u64),
             link_faults: None,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
-            devices: Arc::new(crate::devices::Devices::new(crate::devices::devices_path_beside(&replicas_dir))),
+            devices: Arc::new(crate::devices::Devices::new()),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -1552,6 +1552,13 @@ impl RpcHandler {
 
     pub(crate) fn devices(&self) -> Arc<crate::devices::Devices> {
         Arc::clone(&self.devices)
+    }
+
+    /// This computer's device entry in `store_id` (`crate::devices`), kept in
+    /// the store's record in its state directory.
+    pub(crate) async fn device_entry(&self, store_id: StoreId) -> crate::devices::DeviceEntry {
+        let state_dir = self.store_manager.read().await.state_dir(store_id);
+        self.devices.entry(store_id, state_dir.as_deref()).await
     }
 
     /// Where `addRemoteStore` places a replica when the caller passes
@@ -2799,6 +2806,11 @@ impl RpcHandler {
                 );
             }
             if !effect.changed {
+                // Parked: nothing to announce, but the document (which
+                // carries it) is written like any change.
+                if missing.is_some() {
+                    self.schedule_content_flush(store_id);
+                }
                 return Ok(effect);
             }
             // The merge let a parked update in: what is sent on (to every

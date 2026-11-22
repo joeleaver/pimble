@@ -1,21 +1,26 @@
 //! This computer's device id in each vault-linked store, and the record of
 //! which other devices' state reports it has answered
-//! (docs/CONVERGENCE_CONTRACT.md, wave 1): `<data dir>/pimble/devices.json`,
-//! a map of store id to both, beside the replicas directory.
+//! (docs/CONVERGENCE_CONTRACT.md, wave 1): the `device` section of the store's
+//! `sync-state.json` in its state directory (`pimble_store::sync_state`,
+//! docs/ONE_CODEBASE_CONTRACT.md decision 7). Until 2026-11-22 it was one
+//! server-wide `devices.json` beside the replicas directory, a map of store
+//! id to both; each store's entry is carried into its record when the store
+//! first opens with this version, and that file is never written again.
 //!
 //! Not in the store's folder (decided 2026-11-19): a store lives where its
 //! person keeps it, often a Dropbox folder, and two computers syncing one
 //! `.pimble` folder would share whatever it holds. A device id shared that
 //! way makes the two computers one device to the reports, so each ignores
 //! what the other says it holds, which is exactly the comparison reports are
-//! for. One file per computer, created on first use.
+//! for.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 use pimble_core::StoreId;
 use pimble_rpc::vault::Comparing;
-use tokio::sync::Mutex;
+use pimble_store::sync_state;
+use serde_json::{Map, Value};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -30,85 +35,66 @@ pub(crate) struct DeviceEntry {
     pub answered: Comparing,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct DevicesFile {
-    #[serde(default)]
-    stores: HashMap<String, DeviceEntry>,
+impl DeviceEntry {
+    /// The entry in a record, when it has a usable one.
+    /// An `answered` that does not read is forgotten (each report is answered
+    /// once more), never the device id with it.
+    pub(crate) fn of(record: &Map<String, Value>) -> Option<Self> {
+        let section = record.get(sync_state::DEVICE)?;
+        let device = section.get("device")?.as_str().filter(|d| !d.is_empty())?.to_string();
+        let answered = section.get("answered").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
+        Some(Self { device, answered })
+    }
+
+    /// Write this entry into a record.
+    pub(crate) fn put(&self, record: &mut Map<String, Value>) {
+        match serde_json::to_value(self) {
+            Ok(value) => {
+                record.insert(sync_state::DEVICE.to_string(), value);
+            }
+            Err(e) => warn!("Could not encode a device entry: {}", e),
+        }
+    }
 }
 
-/// `devices.json`, read once and written whenever an entry changes. Every
-/// link of this server goes through the one instance, so two stores' links
-/// never write over each other.
+/// The entries, read from and written to each store's record. A store with
+/// no state directory (none on a server, which always has a state root)
+/// keeps its entry in memory for the life of the process.
+#[derive(Default)]
 pub(crate) struct Devices {
-    path: PathBuf,
-    file: Mutex<Option<DevicesFile>>,
-}
-
-/// Where `devices.json` lives for a server whose replicas are in
-/// `replicas_dir`: beside it, so `<data dir>/pimble/devices.json` by default,
-/// and inside a test's temp directory whenever its replicas are.
-pub(crate) fn devices_path_beside(replicas_dir: &std::path::Path) -> PathBuf {
-    replicas_dir.parent().map(|parent| parent.join("devices.json")).unwrap_or_else(|| replicas_dir.join("devices.json"))
+    memory: tokio::sync::Mutex<HashMap<StoreId, DeviceEntry>>,
 }
 
 impl Devices {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path, file: Mutex::new(None) }
-    }
-
-    async fn loaded<'a>(&self, slot: &'a mut Option<DevicesFile>) -> &'a mut DevicesFile {
-        if slot.is_none() {
-            let file = match tokio::fs::read_to_string(&self.path).await {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-                    warn!("{} could not be read ({}); this computer's device ids start again", self.path.display(), e);
-                    DevicesFile::default()
-                }),
-                Err(_) => DevicesFile::default(),
-            };
-            *slot = Some(file);
-        }
-        slot.as_mut().expect("loaded above")
-    }
-
-    async fn save(&self, file: &DevicesFile) {
-        let json = match serde_json::to_vec_pretty(file) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!("Could not encode {}: {}", self.path.display(), e);
-                return;
-            }
-        };
-        let path = self.path.clone();
-        let written = tokio::task::spawn_blocking(move || crate::fs_util::write_atomic_0600(&path, &json)).await;
-        if !matches!(written, Ok(Ok(()))) {
-            warn!("Could not write {}", self.path.display());
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     /// `store_id`'s entry, made (with a fresh device id) the first time.
-    pub(crate) async fn entry(&self, store_id: StoreId) -> DeviceEntry {
-        let mut slot = self.file.lock().await;
-        let file = self.loaded(&mut slot).await;
-        let key = store_id.to_string();
-        if let Some(entry) = file.stores.get(&key).filter(|entry| !entry.device.is_empty()) {
-            return entry.clone();
+    pub(crate) async fn entry(&self, store_id: StoreId, state_dir: Option<&Path>) -> DeviceEntry {
+        let fresh = || {
+            let entry = DeviceEntry { device: Uuid::new_v4().to_string(), answered: Comparing::default() };
+            info!("Store {}: this computer reports as device {}", store_id, entry.device);
+            entry
+        };
+        let Some(state_dir) = state_dir else {
+            return self.memory.lock().await.entry(store_id).or_insert_with(fresh).clone();
+        };
+        let made = sync_state::update(state_dir, |record| match DeviceEntry::of(record) {
+            Some(entry) => entry,
+            None => {
+                let entry = fresh();
+                entry.put(record);
+                entry
+            }
+        })
+        .await;
+        match made {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("Store {}: could not keep this computer's device id in {} ({}); it lasts until the server stops", store_id, state_dir.display(), e);
+                self.memory.lock().await.entry(store_id).or_insert_with(fresh).clone()
+            }
         }
-        let entry = DeviceEntry { device: Uuid::new_v4().to_string(), answered: Comparing::default() };
-        info!("Store {}: this computer reports as device {}", store_id, entry.device);
-        file.stores.insert(key, entry.clone());
-        self.save(file).await;
-        entry
-    }
-
-    /// Record which reports this computer has answered in `store_id`.
-    pub(crate) async fn set_answered(&self, store_id: StoreId, answered: &Comparing) {
-        let mut slot = self.file.lock().await;
-        let file = self.loaded(&mut slot).await;
-        let Some(entry) = file.stores.get_mut(&store_id.to_string()) else { return };
-        if &entry.answered == answered {
-            return;
-        }
-        entry.answered = answered.clone();
-        self.save(file).await;
     }
 }

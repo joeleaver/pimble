@@ -133,12 +133,14 @@ async fn make_the_gap_with(env: &Env, shared: &mut Shared, reports: bool, words:
 
     // Bob's computer's own state, outside the store's folder
     // (docs/STORE_FOLDERS_CONTRACT.md rule 1).
-    let progress_path = shared.bob_dir.path().join("stores").join(shared.fx.store_id.to_string()).join("vault-link.json");
-    let mut progress: serde_json::Value = serde_json::from_slice(&std::fs::read(&progress_path).expect("Bob's link keeps a progress file")).unwrap();
+    // The `vault` section of its record (docs/ONE_CODEBASE_CONTRACT.md decision 7).
+    let record_path = shared.bob_dir.path().join("stores").join(shared.fx.store_id.to_string()).join("sync-state.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path).expect("Bob's link keeps a record")).unwrap();
+    let progress = &mut record["vault"];
     progress["pushed_sv"][inside.to_string()] = serde_json::Value::String(STANDARD.encode(&held));
     progress["dirty"] = serde_json::json!([]);
     progress["dirty_all"] = serde_json::Value::Bool(false);
-    std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
 
     env.relay.restore();
     let (server, bob) = start_device(shared.bob_dir.path(), reports).await;
@@ -287,8 +289,8 @@ async fn delete_while_away(shared: &mut Shared, reports: bool) -> (PimbleServer,
 /// Two devices that differ only by a delete: one state vector, two delete
 /// sets. The digest in the reports tells them apart, each sends the other
 /// what it holds from the other's vector, and both end with the delete.
-/// Also: the device id is this computer's, in `devices.json` beside the
-/// replicas, and nothing of it is in the store's folder.
+/// Also: the device id is this computer's, in the store's record in its state
+/// directory, and nothing of it is in the store's folder.
 #[tokio::test]
 async fn a_delete_one_device_lacks_reaches_it_through_the_delete_digest() {
     let env = spawn_env().await;
@@ -299,8 +301,8 @@ async fn a_delete_one_device_lacks_reaches_it_through_the_delete_digest() {
         "both devices report the note"
     );
 
-    let devices: serde_json::Value = serde_json::from_slice(&std::fs::read(shared.bob_dir.path().join("devices.json")).expect("devices.json beside the replicas")).unwrap();
-    let device = devices["stores"][store_id.to_string()]["device"].as_str().expect("Bob's device id in the store").to_string();
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(shared.bob_dir.path().join("stores").join(store_id.to_string()).join("sync-state.json")).expect("the store's record in Bob's state directory")).unwrap();
+    let device = record["device"]["device"].as_str().expect("Bob's device id in the store").to_string();
     let reporters: Vec<String> = env.h_admin.vault_reports(store_id, vec![VaultDocId::Node(inside)]).await.unwrap().into_iter().map(|r| r.device).collect();
     assert!(reporters.contains(&device), "Bob reports under that id");
     assert!(!contains_bytes_recursive(&bob_replica(&shared), device.as_bytes()), "nothing of the device id is in the store's folder");
@@ -441,10 +443,12 @@ async fn a_gap_no_device_can_fill_makes_the_note_out_of_step_on_both_until_it_is
 // ── What cannot be had, set aside (wave 3, section 5) ─────────────────────
 
 /// What a device's computer keeps of the store's convergence
-/// (`convergence.json` in its state directory, never in the store's folder).
+/// (the `convergence` section of `sync-state.json` in its state directory,
+/// never in the store's folder).
 fn convergence_file(dir: &Path, store_id: StoreId) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(dir.join("stores").join(store_id.to_string()).join("convergence.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = std::fs::read(dir.join("stores").join(store_id.to_string()).join("sync-state.json")).ok()?;
+    let mut record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    record.get_mut("convergence").map(serde_json::Value::take)
 }
 
 /// Section 5: an update parked behind a change nobody holds is set aside

@@ -525,20 +525,17 @@ async fn last_sync_persists_so_a_reopened_source_is_cached_not_connecting() {
     let mut f = setup_fixture().await;
 
     // The link's `last_sync` is this computer's, kept outside the store's
-    // folder (`<state root>/<store id>/link.json`,
-    // docs/STORE_FOLDERS_CONTRACT.md rule 1), and `sync.json` never holds a
-    // credential.
-    let link_json = f.l.replicas_dir.parent().unwrap().join("stores").join(f.b_id.to_string()).join("link.json");
+    // folder (the `link` section of `<state root>/<store id>/sync-state.json`,
+    // docs/STORE_FOLDERS_CONTRACT.md rule 1, docs/ONE_CODEBASE_CONTRACT.md
+    // decision 7), and `sync.json` never holds a credential.
+    let record_json = f.l.replicas_dir.parent().unwrap().join("stores").join(f.b_id.to_string()).join("sync-state.json");
+    let link_of = |json: String| serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|mut v| v.get_mut("link").map(serde_json::Value::take));
     let link_state: serde_json::Value = wait_until(Duration::from_secs(10), || async {
-        std::fs::read_to_string(&link_json)
-            .ok()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .map(|v| v.get("last_sync").is_some())
-            .unwrap_or(false)
+        std::fs::read_to_string(&record_json).ok().and_then(link_of).map(|v| v.get("last_sync").is_some()).unwrap_or(false)
     })
     .await
-    .then(|| serde_json::from_str(&std::fs::read_to_string(&link_json).unwrap()).unwrap())
-    .expect("link.json should record last_sync once the link has synced");
+    .then(|| link_of(std::fs::read_to_string(&record_json).unwrap()).unwrap())
+    .expect("sync-state.json should record last_sync once the link has synced");
     let sync_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f.b_replica_path.join("sync.json")).unwrap()).unwrap();
     assert!(sync_json.get("last_sync").is_none(), "the folder's sync.json holds no per-computer state");
 

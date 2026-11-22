@@ -18,8 +18,9 @@
 //! migrated node documents.
 //!
 //! - **At start** (and after every reconnect): `vaultListDocs`, then for
-//!   every node document the remote already has, `vaultFetch` from
-//!   `sync.json`'s remembered `last_seq` for that document, decrypt every
+//!   every node document the remote already has, `vaultFetch` from the
+//!   remembered `last_seq` for that document (`sync-state.json`, written only
+//!   once the documents it covers are on the disk), decrypt every
 //!   snapshot/update with [`pimble_crypto::Blob::decrypt`] (the key looked
 //!   up in the keystore by the blob's own key id — logged and skipped, not
 //!   fatal, on an unknown one) and apply it locally through the handler's
@@ -60,8 +61,8 @@
 //!   reconcile, and 5 s after the last change to a document
 //!   (`pimble_rpc::vault::REPORT_DEBOUNCE_MS`), the link seals the
 //!   document's state vector and delete digest under its key and stores it
-//!   in this device's slot (`vaultReport`; the device id is kept in
-//!   `devices.json`, outside the store's folder, `crate::devices`). At
+//!   in this device's slot (`vaultReport`; the device id is kept in the
+//!   store's `sync-state.json`, outside the store's folder, `crate::devices`). At
 //!   connect it reads every device's reports of the documents it holds
 //!   (`vaultReports`), and live it hears each new one (`VaultReported`):
 //!   where this device holds something a report lacks, it appends the diff
@@ -167,6 +168,8 @@ use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
+use pimble_store::sync_state;
+
 use crate::handler::{LocalChange, Repair, RpcHandler};
 use crate::share::{ShareCommand, Upkeep};
 
@@ -180,7 +183,7 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(20);
 const ANNOUNCE_CHECK_EVERY: Duration = Duration::from_millis(250);
 /// `ProgressFile::cursor_version` once a replica's cursors are gap-aware. A
-/// file below it (or none) was written when `sync.json`'s `last_seq` meant "the
+/// record below it (or none) was written when `last_seq` meant "the
 /// highest number seen", which may sit beyond an entry that never arrived; one
 /// full refetch of every document settles it.
 const CURSOR_VERSION: u32 = 1;
@@ -195,8 +198,13 @@ const MAX_CATCH_UP_BLOB: usize = 200 * 1024 * 1024;
 /// JSON-RPC code of "upload a snapshot before appending more"
 /// (`pimble_rpc::RpcError::SnapshotRequired`).
 const SNAPSHOT_REQUIRED: i32 = -32006;
-/// How often the live loop writes `vault-link.json` when it has changed.
+/// How often the live loop writes the link's state (`sync-state.json`) when
+/// it has changed.
 const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
+/// How soon after a cursor moves it is written (with its documents put on the
+/// disk first): past the content flush's debounce, so usually there is
+/// nothing left to write but the cursor.
+const CURSOR_SAVE_AFTER: Duration = Duration::from_secs(1);
 /// How often a connected link asks the accounts service whether the
 /// account's grant on the store is still what this connection was made
 /// with (see [`grant_shape`]), unless `ServerConfig::grant_check_interval`
@@ -846,7 +854,13 @@ async fn connect_and_sync(
     loop {
         flush_waiting(handler, link, progress).await;
         let next_report = progress.next_report_due();
+        let cursor_save = progress.cursor_save_due;
         tokio::select! {
+            // Read positions, a moment after they moved, behind their
+            // documents (`Progress::save_if_unsaved`).
+            _ = tokio::time::sleep_until(cursor_save.unwrap_or_else(tokio::time::Instant::now)), if cursor_save.is_some() => {
+                progress.save_if_unsaved().await;
+            }
             _ = steps_tick.tick() => {
                 let now = tokio::time::Instant::now();
                 judge_steps(handler, store_id, progress, now - steps_last).await;
@@ -1223,10 +1237,11 @@ pub(crate) async fn fetch_scope_keys(
 //
 // The hosted twin stores ciphertext: it has no state vector to answer with,
 // so "what does the remote lack?" cannot be asked of it the way a plain sync
-// link asks. The link keeps the answer itself, per document, in
-// `vault-link.json` in the store's state directory (`<data dir>/pimble/
-// stores/<store id>/`, this computer's alone; in the store's folder before
-// 2026-11-19, docs/STORE_FOLDERS_CONTRACT.md rule 1):
+// link asks. The link keeps the answer itself, per document, in the `vault`
+// section of `sync-state.json` in the store's state directory (`<data dir>/
+// pimble/stores/<store id>/`, this computer's alone; `vault-link.json` before
+// 2026-11-22, in the store's folder before 2026-11-19,
+// docs/STORE_FOLDERS_CONTRACT.md rule 1):
 //
 // - `pushed_sv`: a state vector everything up to which is known to be on the
 //   remote. It advances with every update this link appends or pulls, and only
@@ -1246,7 +1261,7 @@ pub(crate) async fn fetch_scope_keys(
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ProgressFile {
-    /// Which logs the rest of this file (and `sync.json`'s `last_seq`) is
+    /// Which logs the rest of this section (and `link.last_seq`) is
     /// about: `vaultListDocs`'s `epoch` as last read. `None` in a file from
     /// before epochs, and for a remote that names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1271,15 +1286,36 @@ struct ProgressFile {
 }
 
 struct Progress {
-    path: Option<PathBuf>,
+    /// The store's state directory, where the link's state is one record
+    /// (`pimble_store::sync_state`, `sync-state.json`). `None` keeps it in
+    /// memory (a store with no state directory; never on a server).
+    state_dir: Option<PathBuf>,
+    /// Whose documents the cursors are about, to put them on the disk before
+    /// a cursor that covers changes to them is written.
+    manager: Arc<tokio::sync::RwLock<pimble_store::StoreManager>>,
     file: ProgressFile,
     unsaved: bool,
     /// How far into each document's log this device has read without a gap.
-    /// Rebuilt at every reconcile from `sync.json`'s `last_seq`, which holds
+    /// Rebuilt at every reconcile from [`Progress::last_seq`], which holds
     /// exactly `VaultCursor::applied_through` (a restart loses only the
     /// entries noted beyond a gap, which are fetched again and merge to
     /// nothing).
     cursors: HashMap<String, VaultCursor>,
+    /// Each document's `applied_through` as this process has applied it: what
+    /// the next reconcile reads from. Written to the record's `link.last_seq`
+    /// only after the documents whose cursor moved are on the disk
+    /// ([`Progress::save_if_unsaved`]), so a crash between applying an entry
+    /// and writing its document can never leave a cursor past what the disk
+    /// holds (docs/ONE_CODEBASE_CONTRACT.md wave 0: before it, the cursor was
+    /// written at once and the document 750 ms later, and a crash in between
+    /// left entries "read" that this device never held again).
+    last_seq: HashMap<String, u64>,
+    /// What the record holds of `last_seq`.
+    last_seq_saved: HashMap<String, u64>,
+    /// When the cursors that moved are written (a moment after the first
+    /// one moved, by which time the content flush has usually written their
+    /// documents already).
+    cursor_save_due: Option<tokio::time::Instant>,
     /// Each document's snapshot number as last known, for deciding when the
     /// next one is due.
     snapshot_seqs: HashMap<String, u64>,
@@ -1307,8 +1343,8 @@ struct Progress {
     /// says the same again is not sent.
     reported: HashMap<String, Vec<u8>>,
     /// This computer's device id in the store, for its state reports
-    /// (docs/CONVERGENCE_CONTRACT.md section 1): random, kept in
-    /// `devices.json` outside the store's folder (`crate::devices`), so two
+    /// (docs/CONVERGENCE_CONTRACT.md section 1): random, kept in the record's
+    /// `device` section outside the store's folder (`crate::devices`), so two
     /// computers syncing one folder through Dropbox are two devices. Never
     /// the account id.
     device: String,
@@ -1319,7 +1355,6 @@ struct Progress {
     /// the logs.
     answered: protocol::Comparing,
     answered_unsaved: bool,
-    devices: Arc<crate::devices::Devices>,
     store_id: StoreId,
     /// What the other devices last said they hold of each document, as this
     /// connection heard it (document -> device -> report).
@@ -1348,7 +1383,8 @@ struct Progress {
 
 // ── What waits parked here, and what was set aside (section 5) ──────────
 
-/// `convergence.json` in the store's state directory
+/// The `convergence` section of `sync-state.json` (`convergence.json` before
+/// 2026-11-22) in the store's state directory
 /// (`<data dir>/pimble/stores/<store id>/`, this computer's alone, never in the
 /// store's folder nor in a document): when each parked update was first
 /// seen waiting for what it waits for, which is what makes the 24 hours
@@ -1370,26 +1406,23 @@ struct ParkedSince {
 
 #[derive(Default)]
 struct Convergence {
-    path: Option<PathBuf>,
     file: ConvergenceFile,
     unsaved: bool,
 }
 
 impl Convergence {
-    const FILE_NAME: &'static str = "convergence.json";
-
-    async fn load(path: Option<PathBuf>) -> Self {
-        let file = match &path {
-            Some(path) => match tokio::fs::read_to_string(path).await {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-                    warn!("Vault link: unreadable {} ({}); starting over", path.display(), e);
-                    ConvergenceFile::default()
-                }),
-                Err(_) => ConvergenceFile::default(),
-            },
+    /// From the record's `convergence` section (`convergence.json` before
+    /// 2026-11-22), saved with the rest of the link's state
+    /// ([`Progress::save_if_unsaved`]).
+    fn of(section: Option<&serde_json::Value>) -> Self {
+        let file = match section {
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                warn!("Vault link: unreadable {} section ({}); starting over", sync_state::CONVERGENCE, e);
+                ConvergenceFile::default()
+            }),
             None => ConvergenceFile::default(),
         };
-        Self { path, file, unsaved: false }
+        Self { file, unsaved: false }
     }
 
     /// `doc` waits for `missing` now: since when it has (now, if it waited
@@ -1451,35 +1484,6 @@ impl Convergence {
             .filter(|r| (now - r.at).num_days() < protocol::SET_ASIDE_SAID_FOR_DAYS)
     }
 
-    async fn save_if_unsaved(&mut self) {
-        if !self.unsaved {
-            return;
-        }
-        let Some(path) = &self.path else {
-            self.unsaved = false;
-            return;
-        };
-        let json = match serde_json::to_string(&self.file) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!("Vault link: could not encode {}: {}", Self::FILE_NAME, e);
-                return;
-            }
-        };
-        let tmp = path.with_extension("json.tmp");
-        let written = async {
-            if let Some(dir) = path.parent() {
-                tokio::fs::create_dir_all(dir).await?;
-            }
-            tokio::fs::write(&tmp, json).await?;
-            tokio::fs::rename(&tmp, path).await
-        }
-        .await;
-        match written {
-            Ok(()) => self.unsaved = false,
-            Err(e) => debug!("Vault link: could not write {}: {}", path.display(), e),
-        }
-    }
 }
 
 /// Who a report came from, and when the server stored it.
@@ -1565,40 +1569,41 @@ impl Keyring {
 }
 
 impl Progress {
-    const FILE_NAME: &'static str = "vault-link.json";
-
     async fn load(handler: &RpcHandler, store_id: StoreId) -> Self {
-        let (path, convergence_path) = {
-            let manager = handler.store_manager_handle();
+        let manager = handler.store_manager_handle();
+        let (state_dir, last_seq) = {
             let manager = manager.read().await;
             // This computer's, in the store's state directory, never in the
             // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1).
-            let state_dir = manager.state_dir(store_id);
-            let path = state_dir.as_ref().map(|dir| dir.join(Self::FILE_NAME)).or_else(|| {
-                manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
-            });
-            // Only ever in the state directory: without one, in memory.
-            (path, state_dir.map(|dir| dir.join(Convergence::FILE_NAME)))
+            let last_seq = match manager.read_sync_config(store_id).await {
+                Ok(Some(config)) => config.last_seq,
+                _ => HashMap::new(),
+            };
+            (manager.state_dir(store_id), last_seq)
         };
-        let convergence = Convergence::load(convergence_path).await;
+        let record = match &state_dir {
+            Some(dir) => sync_state::read(dir).await,
+            None => serde_json::Map::new(),
+        };
+        let convergence = Convergence::of(record.get(sync_state::CONVERGENCE));
         let report_debounce = handler.link_faults().and_then(|f| f.report_debounce()).unwrap_or(Duration::from_millis(protocol::REPORT_DEBOUNCE_MS));
-        let devices = handler.devices();
-        let entry = devices.entry(store_id).await;
-        let file = match &path {
-            Some(path) => match tokio::fs::read_to_string(path).await {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-                    warn!("Vault link for store {}: unreadable {} ({}); starting over", store_id, Self::FILE_NAME, e);
-                    ProgressFile::default()
-                }),
-                Err(_) => ProgressFile::default(),
-            },
+        let entry = handler.devices().entry(store_id, state_dir.as_deref()).await;
+        let file = match record.get(sync_state::VAULT) {
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                warn!("Vault link for store {}: unreadable {} section ({}); starting over", store_id, sync_state::VAULT, e);
+                ProgressFile::default()
+            }),
             None => ProgressFile::default(),
         };
         Self {
-            path,
+            state_dir,
+            manager,
             file,
             unsaved: false,
             cursors: HashMap::new(),
+            last_seq_saved: last_seq.clone(),
+            last_seq,
+            cursor_save_due: None,
             snapshot_seqs: HashMap::new(),
             keyring: Keyring::default(),
             parts_ok: false,
@@ -1612,7 +1617,6 @@ impl Progress {
             device: entry.device,
             answered: entry.answered,
             answered_unsaved: false,
-            devices,
             store_id,
             heard: HashMap::new(),
             steps: HashMap::new(),
@@ -1671,7 +1675,7 @@ impl Progress {
     /// all forgotten. Every document is read from the start (a merge
     /// repeated is nothing) and offered whole (what the remote already has
     /// of it merges to nothing there).
-    async fn forget_remote_logs(&mut self, handler: &RpcHandler, store_id: StoreId) {
+    async fn forget_remote_logs(&mut self, store_id: StoreId) {
         self.file.pushed_sv.clear();
         self.file.dirty.clear();
         self.file.dirty_all = true;
@@ -1682,16 +1686,31 @@ impl Progress {
         self.snapshot_seqs.clear();
         self.keyring = Keyring::default();
         self.unsaved = true;
-        let manager = handler.store_manager_handle();
-        let manager = manager.read().await;
-        if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
-            if !config.last_seq.is_empty() {
-                config.last_seq.clear();
-                if let Err(e) = manager.write_sync_config(store_id, &config).await {
-                    warn!("Vault link for store {}: could not forget where the old logs were read to: {}", store_id, e);
-                }
-            }
+        self.last_seq.clear();
+        // Forgetting goes on the disk at once: nothing has to be flushed
+        // before a cursor goes back.
+        self.save_if_unsaved().await;
+        if !self.last_seq_saved.is_empty() {
+            warn!("Vault link for store {}: could not forget where the old logs were read to; they are read from there until it can", store_id);
         }
+    }
+
+    /// `doc_id`'s cursor moved: what it has been read through is kept, and
+    /// written a moment from now (after its document is on the disk).
+    fn note_cursor(&mut self, doc_id: &VaultDocId) {
+        let applied_through = self.cursor(doc_id).applied_through();
+        let key = doc_id.as_str();
+        if self.last_seq.get(&key).copied().unwrap_or(0) == applied_through {
+            return;
+        }
+        self.last_seq.insert(key, applied_through);
+        self.cursor_save_due.get_or_insert_with(|| tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+    }
+
+    /// Where `doc_id`'s log has been read to without a gap, as this process
+    /// knows it (0 when never).
+    fn last_seq(&self, doc_id: &VaultDocId) -> u64 {
+        self.last_seq.get(&doc_id.as_str()).copied().unwrap_or(0)
     }
 
     fn snapshot_seq(&self, doc_id: &VaultDocId) -> u64 {
@@ -1769,50 +1788,114 @@ impl Progress {
         }
     }
 
-    /// Best effort, like `record_last_seq`: bookkeeping, never fatal.
+    /// Write what changed of the link's state, as one atomic, durable write of
+    /// the record (`pimble_store::sync_state`): the `vault`, `convergence`
+    /// and `device` sections, and the cursors (`link.last_seq`). A cursor that
+    /// moved forward is written only after its document is on the disk
+    /// (`StoreManager::flush_nodes_durably`); when that fails the cursors stay
+    /// as the record had them, which only means reading again. Best effort:
+    /// bookkeeping, never fatal.
     async fn save_if_unsaved(&mut self) {
-        self.convergence.save_if_unsaved().await;
-        if self.answered_unsaved {
-            self.devices.set_answered(self.store_id, &self.answered).await;
-            self.answered_unsaved = false;
-        }
-        if !self.unsaved {
+        let cursors_moved = self.last_seq != self.last_seq_saved;
+        if !(self.unsaved || self.convergence.unsaved || self.answered_unsaved || cursors_moved) {
             return;
         }
-        let Some(path) = &self.path else { return };
-        let json = match serde_json::to_string(&self.file) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!("Vault link: could not encode {}: {}", Self::FILE_NAME, e);
-                return;
-            }
+        let Some(state_dir) = self.state_dir.clone() else {
+            // Kept in memory only.
+            self.unsaved = false;
+            self.convergence.unsaved = false;
+            self.answered_unsaved = false;
+            self.last_seq_saved = self.last_seq.clone();
+            self.cursor_save_due = None;
+            return;
         };
-        let tmp = path.with_extension("json.tmp");
-        let written = async {
-            // The state directory is made on first use.
-            if let Some(dir) = path.parent() {
-                tokio::fs::create_dir_all(dir).await?;
+        let mut cursors = cursors_moved.then(|| self.last_seq.clone());
+        if let Some(moved) = &cursors {
+            let forward: Vec<NodeId> = moved
+                .iter()
+                .filter(|(doc, seq)| self.last_seq_saved.get(*doc).is_none_or(|saved| saved < *seq))
+                .filter_map(|(doc, _)| match VaultDocId::parse(doc) {
+                    Some(VaultDocId::Node(id)) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            if !forward.is_empty() {
+                if let Err(e) = self.manager.write().await.flush_nodes_durably(self.store_id, &forward).await {
+                    debug!("Vault link for store {}: its documents could not be put on the disk ({}); the read positions wait", self.store_id, e);
+                    cursors = None;
+                }
             }
-            tokio::fs::write(&tmp, json).await?;
-            tokio::fs::rename(&tmp, path).await
         }
+        let vault = self.unsaved.then(|| serde_json::to_value(&self.file));
+        let convergence = self.convergence.unsaved.then(|| serde_json::to_value(&self.convergence.file));
+        let answered = self.answered_unsaved.then(|| crate::devices::DeviceEntry { device: self.device.clone(), answered: self.answered.clone() });
+        let written = sync_state::update(&state_dir, |record| {
+            if let Some(Ok(vault)) = vault {
+                record.insert(sync_state::VAULT.to_string(), vault);
+            }
+            if let Some(Ok(convergence)) = convergence {
+                record.insert(sync_state::CONVERGENCE.to_string(), convergence);
+            }
+            if let Some(entry) = &answered {
+                entry.put(record);
+            }
+            if let Some(cursors) = &cursors {
+                let mut link = match record.remove(sync_state::LINK) {
+                    Some(serde_json::Value::Object(link)) => link,
+                    _ => serde_json::Map::new(),
+                };
+                if cursors.is_empty() {
+                    link.remove("last_seq");
+                } else if let Ok(value) = serde_json::to_value(cursors) {
+                    link.insert("last_seq".to_string(), value);
+                }
+                if !link.is_empty() {
+                    record.insert(sync_state::LINK.to_string(), serde_json::Value::Object(link));
+                }
+            }
+        })
         .await;
         match written {
-            Ok(()) => self.unsaved = false,
-            Err(e) => debug!("Vault link: could not write {}: {}", path.display(), e),
+            Ok(()) => {
+                self.unsaved = false;
+                self.convergence.unsaved = false;
+                self.answered_unsaved = false;
+                if let Some(cursors) = cursors {
+                    self.last_seq_saved = cursors;
+                }
+                self.cursor_save_due = (self.last_seq != self.last_seq_saved).then(|| tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+            }
+            Err(e) => {
+                debug!("Vault link for store {}: could not write {}: {}", self.store_id, sync_state::path(&state_dir).display(), e);
+                self.cursor_save_due = Some(tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+            }
         }
     }
 }
 
 /// Forget what the remote was known to hold: the store is no longer linked to
 /// that twin, and a record kept for one remote would overstate what another
-/// holds. Called when a store is unlinked or linked elsewhere.
+/// holds. Called when a store is unlinked or linked elsewhere: the record's
+/// `vault` and `convergence` sections go, the cursors (`link.last_seq`) with
+/// them, and what was answered (it was answered in that twin's logs); the
+/// device id stays.
 pub(crate) async fn forget_progress(handler: &RpcHandler, store_id: StoreId) {
-    let progress = Progress::load(handler, store_id).await;
-    // What was answered was answered in that twin's logs.
-    handler.devices().set_answered(store_id, &protocol::Comparing::default()).await;
-    if let Some(path) = progress.path {
-        let _ = tokio::fs::remove_file(path).await;
+    let state_dir = handler.store_manager_handle().read().await.state_dir(store_id);
+    let Some(state_dir) = state_dir else { return };
+    let forgotten = sync_state::update(&state_dir, |record| {
+        record.remove(sync_state::VAULT);
+        record.remove(sync_state::CONVERGENCE);
+        if let Some(serde_json::Value::Object(link)) = record.get_mut(sync_state::LINK) {
+            link.remove("last_seq");
+        }
+        if let Some(mut entry) = crate::devices::DeviceEntry::of(record) {
+            entry.answered = protocol::Comparing::default();
+            entry.put(record);
+        }
+    })
+    .await;
+    if let Err(e) = forgotten {
+        warn!("Store {}: could not forget what its last remote held: {}", store_id, e);
     }
 }
 
@@ -1850,46 +1933,6 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
     }
 }
 
-// ── sync.json's per-document last_seq ────────────────────────────────────
-
-/// Read `sync.json`'s remembered `last_seq` for `doc_id` (0 if unset or
-/// there's no `sync.json` at all — a defensive fallback; a vault-linked
-/// store always has one by the time a link starts).
-async fn read_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId) -> u64 {
-    let manager = handler.store_manager_handle();
-    let manager = manager.read().await;
-    match manager.read_sync_config(store_id).await {
-        Ok(Some(config)) => config.last_seq.get(&doc_id.as_str()).copied().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-/// Record how far `doc_id`'s log has been read without a gap
-/// (`VaultCursor::applied_through`), which is where the next connect fetches
-/// from. Best effort: a store closed or unlinked under us, or a write
-/// failure, is logged, never propagated (bookkeeping, not part of the
-/// protocol).
-async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, applied_through: u64) {
-    let manager = handler.store_manager_handle();
-    let manager = manager.read().await;
-    let mut config = match manager.read_sync_config(store_id).await {
-        Ok(Some(config)) => config,
-        Ok(None) => return,
-        Err(e) => {
-            debug!("Could not read sync.json for store {} to record last_seq: {}", store_id, e);
-            return;
-        }
-    };
-    let key = doc_id.as_str();
-    if config.last_seq.get(&key).copied().unwrap_or(0) == applied_through {
-        return;
-    }
-    config.last_seq.insert(key, applied_through);
-    if let Err(e) = manager.write_sync_config(store_id, &config).await {
-        warn!("Could not record last_seq for store {} doc {:?}: {}", store_id, doc_id, e);
-    }
-}
-
 // ── Full reconcile (link start) ──────────────────────────────────────────
 
 /// Pull every node document the remote lists, repair the tree once they are
@@ -1916,7 +1959,7 @@ async fn full_reconcile(
         match &progress.file.epoch {
             Some(read) if read != epoch => {
                 info!("Vault link for store {}: the remote's logs are not the ones this device read (its twin was built again); reading them from the start and offering every document again", store_id);
-                progress.forget_remote_logs(handler, store_id).await;
+                progress.forget_remote_logs(store_id).await;
                 progress.file.epoch = Some(epoch.clone());
             }
             Some(_) => {}
@@ -1947,7 +1990,7 @@ async fn full_reconcile(
             debug!("Vault link for store {}: skipping the retired tree document (head {})", store_id, doc.head);
             continue;
         }
-        let applied_through = if refetch_all { 0 } else { read_last_seq(handler, store_id, &doc.doc_id).await };
+        let applied_through = if refetch_all { 0 } else { progress.last_seq(&doc.doc_id) };
         progress.cursors.insert(doc.doc_id.as_str(), VaultCursor::starting_at(applied_through));
         progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
         progress.keyring.remote_docs.insert(doc.doc_id.as_str());
@@ -2020,8 +2063,12 @@ async fn full_reconcile(
             refused = true;
             continue;
         }
-        // A document's first blob is its whole state (`save`: what a diff
-        // from an empty vector leaves out, pending updates, rides along).
+        // A document's first blob is its whole integrated state: the diff from
+        // an empty vector (`known` is empty for an unseen document). An update
+        // parked here behind a gap is not in it: a parked update is not sent on
+        // by the device that parked it (docs/CONVERGENCE_CONTRACT.md wave 2);
+        // it came from a log, which still has it, and the device that holds
+        // what it waits for sends both. `push_full` sends the same.
         match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await? {
             Appended::Yes => {
                 progress.set_known(&doc_id, &local_sv);
@@ -2114,8 +2161,7 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
         Some(reason) => progress.waiting.hold(doc_id, Side::Read, reason),
         None => progress.waiting.clear(doc_id, Side::Read),
     }
-    let applied_through = progress.cursor(doc_id).applied_through();
-    record_last_seq(handler, store_id, doc_id, applied_through).await;
+    progress.note_cursor(doc_id);
     Ok(())
 }
 
@@ -2310,8 +2356,7 @@ async fn handle_remote_notification(
         Applying::Unreadable(reason) => progress.waiting.hold(doc_id, Side::Read, reason),
         Applying::Skipped => {}
     }
-    let applied_through = progress.cursor(doc_id).applied_through();
-    record_last_seq(handler, store_id, doc_id, applied_through).await;
+    progress.note_cursor(doc_id);
     Ok(())
 }
 
@@ -2558,8 +2603,7 @@ async fn append_blob(
         progress.keyring.docs.note_created(node_id, keys);
     }
     protocol::Mark::Span(first, seq).apply(progress.cursor(&doc_id));
-    let applied_through = progress.cursor(&doc_id).applied_through();
-    record_last_seq(handler, store_id, &doc_id, applied_through).await;
+    progress.note_cursor(&doc_id);
     progress.waiting.clear(&doc_id, Side::Send);
     let sizes = LogSizes::of(&answer);
     if let Some(sizes) = sizes {
@@ -2675,8 +2719,15 @@ async fn catch_up(
     Ok(())
 }
 
-/// Push a document's current full state as a fresh append (the fallback for a
-/// change with no update bytes to reuse).
+/// Push a document's current whole state as a fresh append (the fallback for a
+/// change with no update bytes to reuse, a document the remote has never seen,
+/// and a repair loop's `Resend`): everything it holds integrated, the diff from
+/// an empty vector, as the reconcile's first blob is. Never `save()`: that
+/// carries an update parked here behind a gap, which the device that parked it
+/// does not send on (docs/CONVERGENCE_CONTRACT.md wave 2; until 2026-11-22 this
+/// path sent it and the reconcile's did not). A snapshot is the one place a
+/// parked update rides (`full_doc_state`): it replaces the log entries that
+/// carried it.
 #[allow(clippy::too_many_arguments)]
 async fn push_full(
     handler: &RpcHandler,
@@ -2688,7 +2739,7 @@ async fn push_full(
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    let (local_sv, state) = full_doc_state(handler, store_id, &doc_id).await?;
+    let (local_sv, state) = doc_diff(handler, store_id, &doc_id, &pimble_crdt::empty_state_vector()).await?;
     match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes, progress).await? {
         Appended::Yes => {
             progress.set_known(&doc_id, &local_sv);
@@ -2928,6 +2979,11 @@ async fn answer_report(
     if !may_push(handler, store_id, doc_id).await {
         return Ok(());
     }
+    // A test's fault: this device answers nobody for now, so another device
+    // has only the log to read from (what a crash test checks).
+    if handler.link_faults().is_some_and(|faults| faults.deaf_to_reports()) {
+        return Ok(());
+    }
     let Some(local) = report_of(handler, store_id, *node_id).await else { return Ok(()) };
     let Some(from) = progress.answered.owed(&progress.device, &doc, device, &local, &report) else { return Ok(()) };
     let (_, diff) = doc_diff(handler, store_id, doc_id, &from).await?;
@@ -3044,7 +3100,7 @@ fn reason_for(
 /// of connected time makes the document out of step (a warning in the log,
 /// and the list `getStoreSync` carries), and one that closes clears it at
 /// once (an info line). A document waiting parked is said with since when it
-/// has waited (kept across restarts, `convergence.json`), and one whose
+/// has waited (kept across restarts, in `sync-state.json`), and one whose
 /// parked update was set aside says so for a month (section 5).
 async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Progress, elapsed: Duration) {
     let after = handler.out_of_step_after();
@@ -3137,7 +3193,7 @@ async fn judge_steps(handler: &RpcHandler, store_id: StoreId, progress: &mut Pro
 /// says it set aside, or that this device set aside before and has parked
 /// again (read again from a log or snapshot that still carried it), is
 /// dropped from the document. The log says what was set aside, the record
-/// (`convergence.json`) feeds the note's Properties, this device reports
+/// (`sync-state.json`'s `convergence`) feeds the note's Properties, this device reports
 /// again at once (saying what it set aside), and a snapshot through what it
 /// has read takes the entry that carried it out of the log, so no fresh
 /// reader parks it again. Only with reports working: without them nobody can

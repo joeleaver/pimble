@@ -82,8 +82,8 @@ impl StoreManager {
     }
 
     /// Local store `store_id`'s state directory (`<state root>/<store id>/`):
-    /// where its search index, its link's read positions, `vault-link.json`
-    /// and `people.json` live. `None` for a store not open as a local one, or
+    /// where its search index, its link's state (`sync-state.json`, one
+    /// record: `crate::sync_state`) and `people.json` live. `None` for a store not open as a local one, or
     /// a manager with no state root.
     pub fn state_dir(&self, store_id: StoreId) -> Option<std::path::PathBuf> {
         self.local(store_id).ok()?.state_dir().map(Path::to_path_buf)
@@ -891,6 +891,12 @@ impl StoreManager {
     /// Flush a store to disk
     pub async fn flush(&mut self, store_id: StoreId) -> Result<()> {
         self.local_mut(store_id)?.flush().await
+    }
+
+    /// Put documents `ids` of local store `store_id` on the disk now
+    /// (`LocalStore::flush_nodes_durably`).
+    pub async fn flush_nodes_durably(&mut self, store_id: StoreId, ids: &[NodeId]) -> Result<()> {
+        self.local_mut(store_id)?.flush_nodes_durably(ids).await
     }
 
     /// Flush all stores to disk

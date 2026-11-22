@@ -250,9 +250,15 @@ async fn per_computer_state_moves_out_once() {
     let folder: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("sync.json")).unwrap()).unwrap();
     assert!(folder.get("last_seq").is_none() && folder.get("last_sync").is_none(), "{folder}");
     assert_eq!(folder["mode"], "vault", "the shared part stays");
-    for moved in ["vault-link.json", "people.json", "index"] {
+    for moved in ["people.json", "index"] {
         assert!(!path.join(moved).exists() && state.join(moved).exists(), "{moved} moved out");
     }
+    // The link's state, then, into the one record (docs/ONE_CODEBASE_CONTRACT.md
+    // decision 7), the old file kept beside it.
+    assert!(!path.join("vault-link.json").exists() && state.join("vault-link.json.migrated").exists(), "vault-link.json moved out and folded in");
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sync-state.json")).unwrap()).unwrap();
+    assert_eq!(record["vault"], serde_json::json!({"pushed_sv": {}}), "{record}");
+    assert_eq!(record["link"]["last_seq"]["node:abc"], 7, "{record}");
     assert!(path.join("computers").is_dir());
 
     // Writing a read position touches this computer's file only.

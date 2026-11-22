@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft, nothing built.** Decisions taken so far are under "Decisions"; the rest
+Status: **draft; wave 0 built** (2026-11-22, not merged or released; see "Built: wave 0" at the end). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -452,3 +452,159 @@ Each below is decided as its recommendation says.
 9. **Plain replica links stay as they are** (`sync_link.rs`): they hold no belief about the
    remote, and in the browser they are simply the plain-store replicas of question 2.
    *Recommended*: yes.
+
+## Built: wave 0 (2026-11-22, not merged or released)
+
+Section 1's two bugs, and decision 7 with them. Desktop only (`pimble-store`, `pimble-server`).
+
+### Cursors only through what is on the disk
+
+**Before**: `record_last_seq` wrote a document's `last_seq` (to `link.json`) right after each
+apply (`pull_doc`, `handle_remote_notification`) and after each of this device's own appends
+(`append_blob`), while the document itself waited for the 750 ms content flush. A crash in
+between left a device "read through" entries its disk did not hold; nothing ever fetched them
+again, and only another device's answer to its report (while that device was online) healed it.
+
+**Now** (`crates/pimble-server/src/vault_link.rs`, `Progress`): a cursor that moves is noted in
+memory (`Progress::note_cursor`, `last_seq`) and written a moment later (`CURSOR_SAVE_AFTER`,
+1 s, a branch of the live loop; also with every other save) by `Progress::save_if_unsaved`,
+which first puts the documents of every cursor that moved forward on the disk
+(`StoreManager::flush_nodes_durably` -> `LocalStore::flush_nodes_durably`: written if dirty,
+each file and the `nodes/` directory synced) and only then writes the cursors, in the same
+atomic, durable write as the rest of the link's state. A failed flush keeps the record's
+older cursors (reading again is harmless). The reconcile reads cursors from memory
+(`Progress::last_seq`), loaded from the record when the link starts. A clean stop aborts the
+link task, so up to a second of cursors may be read again after a restart: entries that
+merge to nothing.
+
+**Checked for the same class** (link state that describes document contents, persisted
+ahead of the documents): `pushed_sv` (what the remote holds), `dirty` and `answered` (what
+was sent) describe the remote, which holds what they say whatever this disk lost; a lost
+local write makes them understate this device, never overstate the remote. `dirty` saved
+before its document only causes one more push. A set-aside record saved before its document
+reparks the update at the next open and sets it aside again at once, quietly. This device's
+own report can overstate after a crash, and is corrected at connect (`compare_at_connect`
+sends every report that differs from what is held). So the cursor was the one place; the
+own-append cursor (`append_blob`) was the same bug as the pulled one and goes the same way.
+
+### The first blob and `push_full`
+
+Wave 2's rule decides it: a parked update is not sent on by the device that parked it. The
+reconcile's first blob was already the diff from an empty vector; `push_full` (a live change
+with no bytes, a document the remote never saw reached from `push_update`, a repair loop's
+`Resend`) sent `save()`, which carries parked updates. It now sends the diff from an empty
+vector too, and the comment says so. Snapshots keep `save()` (`full_doc_state`): a snapshot
+replaces the log entries that carried a parked update, so it must carry it.
+
+### One record: `sync-state.json` (decision 7)
+
+`<data dir>/pimble/stores/<store id>/sync-state.json`, `crates/pimble-store/src/sync_state.rs`:
+
+```json
+{
+  "version": 1,
+  "link":        { "last_sync": "...", "last_seq": { "node:<id>": 12 } },
+  "device":      { "device": "<uuid>", "answered": { ... } },
+  "vault":       { "epoch": "...", "pushed_sv": { ... }, "dirty": [], "dirty_all": false, "cursor_version": 1, "rekeying": [] },
+  "convergence": { "parked": { ... }, "set_aside": { ... } }
+}
+```
+
+Each section holds exactly what its old file held. **What moved**: `link.json` -> `link`
+(written by `LocalStore::write_sync_config`/`clear_sync_config` for `last_sync`, by the vault
+link for `last_seq`); `vault-link.json` -> `vault`; `convergence.json` -> `convergence`; this
+store's entry of the server-wide `devices.json` -> `device` (`crate::devices` reads and writes
+it there; the folder watch's presence name comes from it too). **What did not move**: the
+folder's `sync.json` (remote, mode, `via_relay`, `vault_key_id`, access, roots: shared by every
+computer opening the folder), `people.json` (derived) and `index/`. Writes go through
+`sync_state::update`: one lock per file in the process, read, change one's own sections,
+write to a temporary, `fsync`, rename, `fsync` the directory. The vault link writes its
+sections in one such write. A record that does not parse is set aside as
+`sync-state.json.unreadable` and the link starts over (as an unreadable file did before).
+`forget_progress` (unlink, relink, a relay stopped or started) removes `vault`,
+`convergence`, `link.last_seq` and the answers, keeping the device id. A store with no state
+directory (a bare `LocalStore`; never on a server) keeps it all in memory.
+
+**Migration** (`sync_state::migrate`, run by `LocalStore::open_in` right after the folder's
+per-computer migration, once per store): with no record yet, the record is built from
+`link.json`, `vault-link.json`, `convergence.json` and the store's entry of `devices.json`
+(beside the state root) and written in one durable write; then each of the three old files
+still there is renamed `<name>.migrated` (`.migrated.2`, ... if taken; never written over,
+never deleted). With a record already there the old files are only renamed, never read: a
+crash between the write and the renames finishes at the next open with nothing read twice.
+Nothing to fold in (a store never linked) writes no record. An old file that does not parse
+is not carried and is kept, renamed. `devices.json` holds every store's entry: it is read at
+each store's migration and never written or renamed. The folder migration
+(`migrate_per_computer_state`) counts an existing record as "this computer has its own".
+
+### Proof
+
+`crates/pimble-server/tests/link_faults.rs` gains **a crash** (rolls 76-81, taken from the
+restart range): once the device is connected (its own edits on the remote), another device
+edits a document it holds, and 50-500 ms later (inside the flush debounce) the device's
+directory is copied while it runs, its state root first and the store's folder after (every
+file is written whole, so a cursor written after its document is never copied newer than the
+document), the server is stopped, what the stop wrote is thrown away, and the device starts
+from the copy (no search index: built again). Then, with every other device deaf to reports
+(`LinkFaults::set_deaf_to_reports`: the link hears reports and sends its own, and answers
+none), it must hold again within 30 s every marker it held just before the crash: from the
+log alone. The restart fault's "record of what the remote holds deleted / put back from an
+older copy" now acts on the record's `vault` section.
+
+- **Before the fix** (the original code, with only the deaf switch and this test added, in a
+  scratch worktree): seeds 0..12 failed on **1, 5, 7 and 11**, each with the crashed device
+  synced and lacking the change it held before the crash, e.g. seed 1: "after its crash
+  alice-2 never got back from the log what it held before it (synced: true):
+  "seed1-step2-bob-before-a-crash"".
+- **After**: seeds 1, 5, 7 and 11 converge (2, 2, 1 and 4 crashes); the sweep over 200 seeds
+  (`PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4`, 854 s, run twice: before and after the
+  parked-update fix below): all 200 converged both times, with 219 crashes
+  among them.
+
+Migration: `crates/pimble-store/tests/sync_state.rs`: a vault link's four files become one
+record (sections byte-for-byte the old values, old files renamed and kept, `devices.json` and
+the folder untouched, the store reads its link through the record, a later write keeps the
+other sections); a relay link; a plain link (only `link`); a store never linked (no record;
+linking it later writes the record, not the old files); runs once (a second open changes
+nothing; a file an older Pimble writes again is renamed `.migrated.2`, the record wins); a
+crash before the record (a half-written temporary) and a crash between the record and the
+renames (the record is not rebuilt) lose nothing; an unreadable old file is kept and not
+carried; state still in an older folder reaches the record in one open. Existing tests moved
+to the record: `store_folders.rs`, `convergence.rs`, `remote_mounts.rs`, `relay.rs`,
+`vault_link.rs`.
+
+### What a first run does to existing stores
+
+For every store that opens, in `<data dir>/pimble/stores/<store id>/`: `link.json`,
+`vault-link.json` and `convergence.json` (whichever exist) are folded into a new
+`sync-state.json` and renamed `link.json.migrated`, `vault-link.json.migrated`,
+`convergence.json.migrated`. `<data dir>/pimble/devices.json` is read, not changed. Nothing in
+any store's folder changes. Going back to an older version after that loses only positions
+and beliefs that heal (it reads every log once from the start and offers every document
+again); the device id survives because `devices.json` is untouched.
+
+### Found beyond the brief, fixed
+
+- **An update that only parks was never written** unless something else changed its
+  document: `LocalStore::apply_node_update` marked a document dirty only when something
+  integrated changed, and an update waiting behind a gap changes nothing integrated, though
+  the saved document carries it. With the cursor written behind its documents, that would have
+  let a cursor cover an entry the disk lacked: the same bug through another door. A parked
+  update now marks its document dirty and schedules the content flush
+  (`handler::apply_node_update_from`). Found by `convergence.rs`
+  `a_gap_nobody_can_fill_is_set_aside_and_leaves_the_log`, which until now passed because the
+  `modified_at` stamp of the debounced flush happened to dirty the document before its restart;
+  saving the link's state sooner moved the restart ahead of it. Test:
+  `pimble-store` `local::tests::a_parked_update_is_written`.
+
+### Found beyond the brief, not done
+
+- The hosted server's and the relay face's vault log appends are written and flushed but not
+  `fsync`ed before the append is answered. A process crash keeps them; a power loss could drop
+  the tail of a log after its answer, and the next append would reuse a sequence number that
+  readers already passed. Not changed here (the hosted server's write cost is Joe's call).
+- `CLAUDE.md`'s phase 2a paragraph still says the vault link "records in
+  `<store>/vault-link.json`"; it lives in `sync-state.json` in the state directory now.
+- Not done: the fault test's crash is the whole device's (a process crash); a crash between a
+  document's write and its `fsync` on power loss is not simulated. The browser's vault client
+  (`web/src/vault.rs`) keeps its cursors in memory and is unchanged (waves 4-5).

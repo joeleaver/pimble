@@ -56,7 +56,8 @@ impl SyncMode {
 /// 2026-11-19): what every computer opening the store's folder shares (the
 /// remote, the mode, the access) in the folder's `sync.json`, and what is one
 /// computer's (`last_sync`, `last_seq`: `LocalStore::PER_COMPUTER_KEYS`) in
-/// `link.json` in that computer's state directory. Callers read and write the
+/// the `link` section of `sync-state.json` in that computer's state directory
+/// (`crate::sync_state`; `link.json` before 2026-11-22). Callers read and write the
 /// whole of it; `LocalStore::read_sync_config`/`write_sync_config` split it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
@@ -219,8 +220,8 @@ pub async fn peek_manifest(path: impl AsRef<Path>) -> Result<StoreManifest> {
 /// What belongs to one computer is not in the folder
 /// (docs/STORE_FOLDERS_CONTRACT.md rule 1): a store opened with a state root
 /// keeps it in `<state root>/<store id>/` (`<data dir>/pimble/stores/<id>/`
-/// for the server): `link.json` (the link's read positions and last sync),
-/// `vault-link.json`, `people.json` and `index/`. A store opened without one
+/// for the server): `sync-state.json` (the link's state, one record:
+/// `crate::sync_state`), `people.json` and `index/`. A store opened without one
 /// (a bare `LocalStore`: the importer, a test) keeps the single-file layout of
 /// before 2026-11-19.
 pub struct LocalStore {
@@ -318,11 +319,13 @@ impl LocalStore {
     /// (docs/STORE_FOLDERS_CONTRACT.md rule 5). Its presence also says that a
     /// Pimble that keeps per-computer state outside the folder has opened it.
     pub const COMPUTERS_DIR: &'static str = "computers";
-    /// This computer's part of the link, in the state directory.
+    /// This computer's part of the link in the state directory before the
+    /// one record (`crate::sync_state`): what the folder migration still
+    /// moves out of an old folder, and the record's migration folds in.
     const LINK_STATE_FILE: &'static str = "link.json";
     /// The keys of `sync.json` that are one computer's, not the store's
-    /// (docs/STORE_FOLDERS_CONTRACT.md rule 1): kept in `link.json` in the
-    /// state directory, never in the folder.
+    /// (docs/STORE_FOLDERS_CONTRACT.md rule 1): kept in the `link` section of
+    /// `sync-state.json` in the state directory, never in the folder.
     const PER_COMPUTER_KEYS: [&'static str; 2] = ["last_sync", "last_seq"];
     /// The previous layout's tree document. Present exactly in a store the
     /// migration has not run on yet; retired under the name below once it
@@ -498,8 +501,8 @@ impl LocalStore {
 
     /// Read the store's link: the folder's `sync.json` (what every computer
     /// opening the folder shares: the remote, the mode, the access) with this
-    /// computer's own part (`link.json` in the state directory: read
-    /// positions, last sync) laid over it. Per-computer keys found in the
+    /// computer's own part (the `link` section of `sync-state.json` in the
+    /// state directory: read positions, last sync) laid over it. Per-computer keys found in the
     /// folder's file are never this computer's once it has a state directory:
     /// an older Pimble on another computer wrote them
     /// (docs/STORE_FOLDERS_CONTRACT.md rule 1).
@@ -514,7 +517,7 @@ impl LocalStore {
             for key in Self::PER_COMPUTER_KEYS {
                 map.remove(key);
             }
-            if let Some(serde_json::Value::Object(state)) = read_json(&state_dir.join(Self::LINK_STATE_FILE)).await {
+            if let Some(serde_json::Value::Object(state)) = crate::sync_state::read_section(state_dir, crate::sync_state::LINK).await {
                 for (key, v) in state {
                     if Self::PER_COMPUTER_KEYS.contains(&key.as_str()) {
                         map.insert(key, v);
@@ -541,8 +544,9 @@ impl LocalStore {
     /// the folder's `sync.json` only when it differs from what the file holds
     /// (a link records its read position on every append, and each of those
     /// rewriting a file in a synced folder would be a write for every other
-    /// computer to merge), this computer's part to `link.json` in the state
-    /// directory. Without a state directory, the whole of it to `sync.json`.
+    /// computer to merge), this computer's part to the `link` section of
+    /// `sync-state.json` in the state directory. Without a state directory,
+    /// the whole of it to `sync.json`.
     pub async fn write_sync_config(&self, config: &SyncConfig) -> Result<()> {
         let folder_path = self.path.join(Self::SYNC_CONFIG_FILE);
         let Some(state_dir) = &self.state_dir else {
@@ -571,17 +575,9 @@ impl LocalStore {
         if on_disk.as_ref() != Some(&shared) {
             atomic_write(&folder_path, serde_json::to_string_pretty(&shared)?).await?;
         }
-        let state_path = state_dir.join(Self::LINK_STATE_FILE);
-        if state.is_empty() {
-            if state_path.exists() {
-                fs::remove_file(&state_path).await?;
-            }
-        } else {
-            let state = serde_json::Value::Object(state);
-            if read_json(&state_path).await.as_ref() != Some(&state) {
-                fs::create_dir_all(state_dir).await?;
-                atomic_write(&state_path, serde_json::to_string_pretty(&state)?).await?;
-            }
+        let state = (!state.is_empty()).then_some(serde_json::Value::Object(state));
+        if state.is_some() || crate::sync_state::path(state_dir).exists() {
+            crate::sync_state::set_section(state_dir, crate::sync_state::LINK, state).await?;
         }
         *self.link_access.write().unwrap() = LinkAccess::of(config);
         Ok(())
@@ -596,9 +592,8 @@ impl LocalStore {
             fs::remove_file(&path).await?;
         }
         if let Some(state_dir) = &self.state_dir {
-            let state_path = state_dir.join(Self::LINK_STATE_FILE);
-            if state_path.exists() {
-                fs::remove_file(&state_path).await?;
+            if crate::sync_state::path(state_dir).exists() {
+                crate::sync_state::set_section(state_dir, crate::sync_state::LINK, None).await?;
             }
         }
         *self.link_access.write().unwrap() = Default::default();
@@ -818,6 +813,10 @@ impl LocalStore {
         let state_dir = state_root.map(|root| root.join(manifest.id.to_string()));
         if let Some(state_dir) = &state_dir {
             folder::migrate_per_computer_state(&path, state_dir, manifest.id).await;
+            // The link's state files of this computer, into one record
+            // (docs/ONE_CODEBASE_CONTRACT.md decision 7).
+            let devices = state_root.and_then(crate::sync_state::legacy_devices_path);
+            crate::sync_state::migrate(state_dir, manifest.id, devices.as_deref()).await;
         }
 
         let nodes_dir = path.join(Self::NODES_DIR);
@@ -1086,7 +1085,14 @@ impl LocalStore {
     /// any effect reports `structure`.
     pub fn apply_node_update(&mut self, node_id: NodeId, update: &[u8]) -> Result<NodeUpdateEffect> {
         let effect = self.tree.apply_update(node_id, update).map_err(StoreError::from)?;
-        if effect.changed {
+        // An update that only parks (it waits behind a gap) changes nothing
+        // integrated, but the saved document carries it: it has to reach the
+        // disk like any change. Before 2026-11-22 it did only when something
+        // else changed the document, so a restart could lose it after a
+        // link had recorded reading the entry that brought it
+        // (docs/ONE_CODEBASE_CONTRACT.md, "Built: wave 0").
+        let parked = !effect.changed && self.tree.doc(node_id).is_some_and(|doc| doc.missing().is_some());
+        if effect.changed || parked {
             self.dirty.insert(node_id);
         }
         Ok(effect)
@@ -1436,6 +1442,29 @@ impl LocalStore {
         }
 
         debug!("Flushed store {} to disk", self.id);
+        Ok(())
+    }
+
+    /// Put `ids` on the disk now: each one not written yet is written (as
+    /// [`LocalStore::flush`] writes it), and every one's file is synced, with
+    /// the directory holding them. What a link calls before it records that
+    /// it has read through changes to these documents
+    /// (docs/ONE_CODEBASE_CONTRACT.md wave 0): a read position is never
+    /// ahead of what the disk holds, so a crash can only make it read again.
+    /// A document this store does not hold is skipped.
+    pub async fn flush_nodes_durably(&mut self, ids: &[NodeId]) -> Result<()> {
+        for &node_id in ids {
+            if self.dirty.contains(&node_id) {
+                self.write_node(node_id).await?;
+                self.dirty.remove(&node_id);
+            }
+        }
+        for &node_id in ids {
+            if let Ok(file) = fs::File::open(self.node_doc_path(node_id)).await {
+                file.sync_all().await?;
+            }
+        }
+        crate::sync_state::sync_dir(&self.path.join(Self::NODES_DIR)).await;
         Ok(())
     }
 
@@ -1833,6 +1862,32 @@ mod tests {
         assert!(!store.list_node_ids().contains(&early_id));
         assert!(store.get_node(early_id).is_err());
         assert!(store.tree().validate_tree().is_empty(), "a content-only document is not a tree issue");
+    }
+
+    /// An update that only parks (it waits behind a gap) reaches the disk:
+    /// the saved document carries it (docs/ONE_CODEBASE_CONTRACT.md wave 0).
+    #[tokio::test]
+    async fn a_parked_update_is_written() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("test.pimble");
+        let mut store = LocalStore::create(&store_path, "Store").await.unwrap();
+        let root_id = store.root_node_id();
+        let (a_id, _) = store.create_node(Node::document("A"), Some(root_id)).unwrap();
+        store.flush().await.unwrap();
+
+        // Elsewhere, two changes one after the other; only the second comes.
+        let mut elsewhere = NodeDoc::load(&store.tree.doc(a_id).unwrap().save()).unwrap();
+        let _first = elsewhere.append_markdown("first").unwrap();
+        let second = elsewhere.append_markdown("second").unwrap();
+        let effect = store.apply_node_update(a_id, &second).unwrap();
+        assert!(!effect.changed, "nothing integrated changed");
+        assert!(store.tree.doc(a_id).unwrap().missing().is_some(), "it waits");
+        assert!(store.dirty.contains(&a_id), "but the document is to be written");
+        store.flush_nodes_durably(&[a_id]).await.unwrap();
+        drop(store);
+
+        let store = LocalStore::open(&store_path).await.unwrap();
+        assert!(store.tree.doc(a_id).unwrap().missing().is_some(), "still waiting after a restart, from the disk");
     }
 
     #[tokio::test]
