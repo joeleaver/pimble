@@ -1,51 +1,29 @@
 # Next session: start here
 
-**2026-11-21: one-row toolbars and embedded sets, not committed or released**
-(docs/TOOLBAR_CONTRACT.md "One row", "Embedded items"): text, canvas and sheet toolbars never
-wrap (labels go, then groups fold into More by priority, from measured widths, `toolbar_fit.rs`);
-a picture or embedded canvas selected in a note shows Canvas, Export and History only.
+**2026-11-22: v0.29.0 released and installed. Everything below this line up to 0.28.9 is
+committed and released** (0.28.10 to 0.29.0): text color (docs/TEXT_COLOR_CONTRACT.md),
+whole-window zoom (docs/ZOOM_CONTRACT.md), the toolbar that follows the selection, one-row
+toolbars and embedded items (docs/TOOLBAR_CONTRACT.md), startup (docs/STARTUP_CONTRACT.md),
+store folders rules 1-5 (docs/STORE_FOLDERS_CONTRACT.md), convergence wave 3
+(docs/CONVERGENCE_CONTRACT.md), and measuring on canvases (docs/MEASURE_CONTRACT.md: a scale
+per canvas, dimensions, labels, readouts, unit grid, MCP in real units; a switch, off until
+turned on).
 
-**2026-11-21: the main toolbar follows the selected item, not committed or released**
-(docs/TOOLBAR_CONTRACT.md, the file renamed from CANVAS_TOOLBAR_CONTRACT.md). One rule
-(`toolbar::which`) over every pane and selection; embedded canvases get the canvas toolbar and
-export; Edit Canvas / Done is one button; the floating bar over canvases is gone (its controls
-are the toolbar's contextual group, the tool hint is in the status bar).
+Open, in order:
 
-**2026-11-21: the canvas toolbar for a selected picture built, not committed or released**
-(docs/TOOLBAR_CONTRACT.md "Selected picture"): a picture selected in a note shows the
-canvas groups (a new Canvas group with Edit Canvas; Export on the picture directly; View and
-People open the canvas first; History is the note's until it opens).
+1. **The store-folder walk-through by hand** (two apps, one folder): the last item of
+   docs/STORE_FOLDERS_CONTRACT.md.
+2. **One sync engine for both apps** (docs/CONVERGENCE_CONTRACT.md "Next"): a contract first.
+3. **rinch is pinned to branch `zoom`** (rinch PR #2861) in every Cargo.toml and the root,
+   `web/` and `plugins/` locks; move back to `main` once Joe merges it.
+4. Not walked by hand: measuring's calibrate-by-drawing, typed sizes while drawing, and
+   measuring in the browser; the toolbar's More menu stays open after a press; a picture's
+   own controls can draw over a toolbar dropdown.
+5. Look at Joe's startup log after a pimble-mcp hand-over (no "Rebuilt search index").
 
-**2026-11-21: the canvas toolbar built, not committed or released**
-(docs/TOOLBAR_CONTRACT.md "Built"). A focused canvas (or a picture in text being marked
-up) swaps the text toolbar for View / Snap / People / Export / History (`boards/toolbar.rs`);
-the bottom-right strip is gone (the minimap stays there, toggled from View), undo and redo left
-the floating bar. Not walked: a read-only canvas, and Ctrl+wheel moving the percentage (the
-same signal the zoom buttons move).
-
-**2026-11-21: whole-window zoom built, not committed or released** (docs/ZOOM_CONTRACT.md).
-View > Zoom In / Zoom Out / Actual Size (Ctrl+= / Ctrl+- / Ctrl+0, plus Ctrl and + and the
-keypad), browser steps 50-300%, saved per device in `state.json` `zoom`, "125%" in the status
-bar while not actual size (click resets). The zoom is rinch's new `rinch::window::set_zoom`
-(PR from rinch branch `zoom`): **every rinch crate is pinned to branch `zoom`** in all
-Cargo.toml files and the root, `web/` and `plugins/` locks; move them back to `main` once
-the PR is merged. The web leaves zoom to the browser (the items say so; no keys taken).
-
-**2026-11-21: text color built, not committed or released** (docs/TEXT_COLOR_CONTRACT.md).
-A Text Color button in the toolbar's Text group and Edit > Text Color: Default and nine
-colors stored as the light shade in rinch's `text_color` mark; `TextColorPlugin` shows each
-in the current theme's shade, and shows a pasted color that would not read (black on dark,
-near-white on light) as the nearest palette shade or as ordinary text.
-
-**2026-11-20: startup built, not committed or released** (docs/STARTUP_CONTRACT.md "Built").
-A hand-over now closes stores and lets go of indexes; a locked index is waited for, never
-rebuilt over; indexes open in the background (`IndexState`, "indexing N notes" on the row,
-search says which stores are still indexing); stores load side by side; the account, opens and
-restored rows (`LoadChildren`) no longer wait in line; plugins' compiled modules are cached;
-the model warms up when an index first wants it; opening rows, spinners and "connecting..." in
-the status bar. Fixture start on the busy machine: ready in 0.7-0.9 s (was 2.1-9.5 s); the log
-has `startup: ... at +N ms` lines. Next: look at it on Joe's desktop after a pimble-mcp
-hand-over (the log should show no "Rebuilt search index").
+Cleaned 2026-11-22 (Joe's OK): 235 per-store state folders a test run left in
+`~/.local/share/pimble/stores/` on 2026-11-19/20 (before commit eb60d11's isolation guard),
+and every scratch copy of his stores.
 
 **2026-11-19 (session 78e7f30f): v0.28.9: convergence wave 2.** "Out of step" on the note
 (row mark, pane line, Properties, MCP; names whose device), canonical state vector
