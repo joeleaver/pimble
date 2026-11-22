@@ -1,5 +1,10 @@
 # Next session: start here
 
+**2026-11-21: the canvas toolbar for a selected picture built, not committed or released**
+(docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture"): a picture selected in a note shows the
+canvas groups (a new Canvas group with Edit Canvas; Export on the picture directly; View and
+People open the canvas first; History is the note's until it opens).
+
 **2026-11-21: the canvas toolbar built, not committed or released**
 (docs/CANVAS_TOOLBAR_CONTRACT.md "Built"). A focused canvas (or a picture in text being marked
 up) swaps the text toolbar for View / Snap / People / Export / History (`boards/toolbar.rs`);

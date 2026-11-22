@@ -61,3 +61,46 @@ strip goes.
 - Limits: a read-only canvas was not walked (no cheap fixture); Ctrl+wheel was not driven
   (the debug port has no Ctrl for a wheel), but it moves the same signal the buttons do. The
   web build compiles (shared code); it was not opened in a browser.
+
+## Selected picture (Joe, 2026-11-21; built the same day)
+
+Joe: "It would be nice if when we selected a picture embedded in a note, we also got the same
+toolbar." While the focused note's selection is exactly a canvas in its text (a picture of the
+store's, or a canvas that began empty; an embedded board node is not one, and keeps the text
+groups), the canvas groups show instead of the text groups, before any markup; back to the text
+groups when the selection leaves it.
+
+- **Canvas** (a first group, only for a canvas in a note's text): "Edit Canvas", what a
+  double-click does (`text_boards::mark_up_at`); active while the markup is open, and pressed
+  then it is Done.
+- **Export** acts on the picture without opening its canvas: the board in the note, or for a
+  picture not marked up yet the board its markup would start as, rendered whole (no selection
+  inside it). Save Original As saves the picture's own bytes and dims, with its reason as the
+  tooltip, on a canvas that began empty; Import SVG dims ("Edit the canvas to import SVG into
+  it."), since it writes into the open canvas. File names are the note's title.
+- **Snap** toggles the per-viewer settings directly.
+- **View** and **People** open the canvas (as Edit Canvas does), wait for its first fit, then
+  do what they say. The percentage shows the zoom the canvas would open at: fitted into the
+  pane's text area with a 24 pixel margin, never above 100% (`boards::present`'s rule);
+  "Fit" while that cannot be told (the picture not here yet, the pane with no size yet).
+- **History** is the note's undo and redo while the picture is only selected (deleting or
+  moving it is an edit of the text), the canvas's once it is open.
+- **Read-only note**: Export stays live; Snap, History and Edit Canvas dim, and so do View and
+  People, because on a selected picture they open the canvas and a reader cannot open one for
+  markup (the read-only refusal). On a read-only canvas that shows, View and People stay live
+  as before.
+
+Built: `crates/pimble-app/src/boards/toolbar.rs` (`Aim::Board` or `Aim::Picked`),
+`toolbar.rs` (`Picked`, `picked()`, refreshed by the toolbar's watcher from the focused pane's
+editor), `text_boards.rs` (`selected_canvas`, `raw_board`, `mark_up_at`), `boards/export.rs`
+(`copy_picked`, `save_picked`, `save_picked_original`, `flatten_picked`), `pane_view.rs`.
+Tests: a selection of exactly a picture (not a caret beside it, not an embed), the opening zoom.
+Walked on the desktop in both themes: selecting the picture, Save as PNG / SVG / Original
+from it (files right), zoom in from it (the canvas opens at 125%, Edit Canvas lit), Edit Canvas
+pressed again (back to the note, the picture still selected and the canvas groups still
+shown), the note's undo from the canvas History.
+
+Limits: after Done the picture is usually still selected, so the canvas groups stay until the
+selection moves (the rule, applied). A selected picture is noticed by the toolbar's 120 ms
+watcher, not at once. Save as PNG and Save Original As of a picture name the same file. The
+read-only case and the browser were not walked.

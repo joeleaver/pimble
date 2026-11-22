@@ -39,6 +39,24 @@ thread_local! {
     /// `None` for the default), and whether its caret is in a code block,
     /// which takes no color (docs/TEXT_COLOR_CONTRACT.md).
     static TEXT_COLOR: RefCell<Option<(Signal<Option<String>>, Signal<bool>)>> = const { RefCell::new(None) };
+    /// The canvas selected in the focused pane's text, if the selection is
+    /// exactly one (docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture").
+    static PICKED: RefCell<Option<Signal<Option<Picked>>>> = const { RefCell::new(None) };
+}
+
+/// A canvas selected in a pane's text: the pane, the position before the
+/// picture, its `src` and its board (`data-board`, none before it has one).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Picked {
+    pub pane: PaneId,
+    pub pos: usize,
+    pub src: String,
+    pub board: Option<String>,
+}
+
+/// The canvas selected in the focused pane's text, read reactively.
+pub(crate) fn picked() -> Option<Picked> {
+    PICKED.with(|p| *p.borrow()).filter(|s| s.is_alive()).and_then(|s| s.get())
 }
 
 /// How often the watcher re-reads the editor state. Cursor moves fire no
@@ -61,6 +79,10 @@ pub(crate) fn bump_toolbar(pane: PaneId) {
 /// Store pane `pane`'s current active states in the buttons, notifying only
 /// the buttons that flipped.
 fn refresh_active_bits(pane: PaneId) {
+    if let Some(picked) = PICKED.with(|p| *p.borrow()).filter(|s| s.is_alive()) {
+        let now = crate::text_boards::selected_canvas(pane).map(|(pos, src, board)| Picked { pane, pos, src, board });
+        picked.set_if_changed(now);
+    }
     let signals = BUTTON_ACTIVE.with(|b| b.borrow().clone());
     if signals.is_empty() {
         return;
@@ -465,6 +487,7 @@ pub(crate) fn render_pimble_toolbar(
     IN_TABLE.with(|t| *t.borrow_mut() = Some(in_table));
     let text_color = (Signal::new(None::<String>), Signal::new(false));
     TEXT_COLOR.with(|t| *t.borrow_mut() = Some(text_color));
+    PICKED.with(|p| *p.borrow_mut() = Some(Signal::new(None)));
     // The buttons follow the focus: a click in another pane, or its editor
     // taking the keyboard, re-reads them from that pane's editor.
     let _ = rinch::Effect::new(move || {

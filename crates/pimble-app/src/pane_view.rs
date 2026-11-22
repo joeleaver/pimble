@@ -745,9 +745,15 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     // The canvas's groups while it shows a canvas: a board node, or a
     // picture in its text being marked up (back to the text's on Done).
     let canvas_toolbar = crate::boards::render_canvas_toolbar(__scope, store);
+    // And while the focused note's selection is exactly a canvas in its
+    // text (docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture").
     let canvas_focused = move || {
-        let pane = store.pane(store.focused_pane.get());
-        pane.show_board.get() && !pane.show_discussion.get()
+        let focused = store.focused_pane.get();
+        let pane = store.pane(focused);
+        if pane.show_discussion.get() {
+            return false;
+        }
+        pane.show_board.get() || (pane.show_editor.get() && !pane.show_sheet.get() && crate::toolbar::picked().is_some_and(|p| p.pane == focused))
     };
     // The keyboard follows the pane focus, however it moved (a press in the
     // pane, a split, a close, the View menu): the focused pane's editor when

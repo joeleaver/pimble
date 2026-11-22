@@ -996,6 +996,44 @@ fn images(doc: &EditorNode) -> Vec<(usize, Attrs)> {
     out
 }
 
+/// The canvas in text pane `pane`'s selection is exactly (docs/CANVAS_TOOLBAR_CONTRACT.md
+/// "Selected picture"): a picture of the store's or a canvas that began empty, never an
+/// embedded board node or a web picture. Its position, `src` and `data-board`.
+pub(crate) fn selected_canvas(pane: PaneId) -> Option<(usize, String, Option<String>)> {
+    let state = crate::editor::editor(pane).state();
+    let (from, to) = (state.selection.from().0, state.selection.to().0);
+    if to != from + 1 {
+        return None;
+    }
+    selected_in(&state.doc, from)
+}
+
+/// The canvas atom at `pos` in `doc`, as [`selected_canvas`] answers it.
+fn selected_in(doc: &EditorNode, pos: usize) -> Option<(usize, String, Option<String>)> {
+    let (_, attrs) = images(doc).into_iter().find(|(at, _)| *at == pos)?;
+    let src = attrs.get_str("src")?.to_string();
+    let board = attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty()).map(str::to_string);
+    let canvas = BlobUrl::parse(&src).is_some() || (src == IN_TEXT_SRC && board.is_some());
+    canvas.then_some((pos, src, board))
+}
+
+/// A canvas of `node`'s text read whole, as this window holds it.
+pub(crate) fn raw_board(store_id: StoreId, node_id: NodeId, board: &str) -> Option<pimble_board::RawBoard> {
+    HOSTS.with(|hosts| {
+        let hosts = hosts.borrow();
+        let host = hosts.get(&(store_id, node_id))?;
+        Board::in_text(&host.doc, board).read()
+    })
+}
+
+/// "Mark Up..." on the picture at `pos` (`src`, its board) in pane `pane`'s
+/// text, as a double-click does: the board view over the text.
+pub(crate) fn mark_up_at(store: AppStore, pane: PaneId, pos: usize, src: &str, board: Option<String>) {
+    let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else { return };
+    store.pane(pane).picture.set(None);
+    crate::boards::start_markup(store, pane, active.store_id, active.node_id, src, pos, board);
+}
+
 /// The image in `doc` that is the picture `src` (with board `board`, or none)
 /// nearest to `hint`: a picture is found again by what it is, wherever typing
 /// has moved it.
@@ -1909,6 +1947,31 @@ mod tests {
 
     fn broadcasts(sent: &[BackendCommand], node: NodeId) -> usize {
         sent.iter().filter(|c| matches!(c, BackendCommand::BroadcastChanges { node_id, .. } if *node_id == node)).count()
+    }
+
+    /// The canvas toolbar's "Selected picture" (docs/CANVAS_TOOLBAR_CONTRACT.md):
+    /// a selection that is exactly a picture names it; a caret beside it, or
+    /// a selection reaching past it, does not; an embedded board node is not
+    /// a canvas in text.
+    #[test]
+    fn a_selection_of_exactly_a_picture_is_a_selected_canvas() {
+        use rinch_editor_core::{Pos, Selection};
+        let (store, _commands) = store_with_commands();
+        let pane = P[3];
+        let (_, _, src) = note_with_picture(store, pane);
+        let (pos, _) = atoms(pane).remove(0);
+        let h = crate::editor::editor(pane);
+        h.set_selection(Selection::node_at(&h.doc(), Pos(pos)).expect("the picture is selectable"));
+        assert_eq!(selected_canvas(pane), Some((pos, src.clone(), None)));
+        h.set_selection(Selection::cursor(Pos(pos)));
+        assert_eq!(selected_canvas(pane), None, "a caret before it");
+        h.set_selection(Selection::cursor(Pos(pos + 1)));
+        assert_eq!(selected_canvas(pane), None, "a caret after it");
+        let embed = BoardUrl::new(StoreId::new(), NodeId::new()).to_string();
+        assert!(h.insert_image(&embed, "board"));
+        let (embed_pos, _) = atoms(pane).into_iter().find(|(_, a)| a.get_str("src") == Some(embed.as_str())).unwrap();
+        h.set_selection(Selection::node_at(&h.doc(), Pos(embed_pos)).expect("the embed is selectable"));
+        assert_eq!(selected_canvas(pane), None, "an embedded board node");
     }
 
     /// "Mark Up..." on a picture (contract section 2): opening the board
