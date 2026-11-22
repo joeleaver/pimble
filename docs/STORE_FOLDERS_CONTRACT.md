@@ -219,4 +219,9 @@ panel shows both under "Lives in" for any node of the store.
   here at the next open, not live.
 - No periodic rescan: a change the watch misses (a filesystem that sends no events) is
   merged at this computer's next write of that document (rule 2) or the next open.
-- The two-computer walk-through of the app by hand is still to do.
+- The walk-through by hand (2026-11-22, passed): two release apps on one machine, each with
+  its own config, data directories and port, opened one scratch store folder. A note made
+  through one appeared in the other's explorer by itself; text typed in either showed in the
+  other within seconds; both typing at once ended with the same text in both, nothing lost;
+  after both quit, the folder held it all, with no conflict copies. Not covered: a real sync
+  tool between two computers (late or out-of-order file arrival is the randomized test's).

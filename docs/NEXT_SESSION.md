@@ -11,8 +11,7 @@ turned on).
 
 Open, in order:
 
-1. **The store-folder walk-through by hand** (two apps, one folder): the last item of
-   docs/STORE_FOLDERS_CONTRACT.md.
+1. ~~The store-folder walk-through by hand~~: passed 2026-11-22 (two apps, one folder).
 2. **One sync engine for both apps** (docs/CONVERGENCE_CONTRACT.md "Next"): a contract first.
 3. **rinch is pinned to branch `zoom`** (rinch PR #2861) in every Cargo.toml and the root,
    `web/` and `plugins/` locks; move back to `main` once Joe merges it.
