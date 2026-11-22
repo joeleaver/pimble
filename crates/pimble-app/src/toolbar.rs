@@ -623,7 +623,13 @@ fn render_color_btn(
                                 class: "pimble-tc-button__bar",
                                 style: {move || match current.get() {
                                     Some(c) => format!("background: {};", shown_color(&c, dark())),
-                                    None => "background: transparent;".to_string(),
+                                    // No color here: the palette as a band, so the
+                                    // button says "text color" at a glance (Joe).
+                                    None => {
+                                        let d = dark();
+                                        let stops: Vec<&str> = PALETTE.iter().filter(|s| s.label != "Gray").map(|s| if d { s.dark } else { s.light }).collect();
+                                        format!("background: linear-gradient(90deg, {});", stops.join(", "))
+                                    }
                                 }},
                             }
                         }
