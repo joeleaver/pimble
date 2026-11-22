@@ -725,9 +725,8 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
     // toolbar"), and has nothing to act on while that pane holds no document
     // or one this device may only read.
-    // A canvas pane shows nothing of the canvas in it (docs/DRAWING_CONTRACT.md
-    // section 4: the canvas's tools float over the canvas), so it dims as
-    // for a pane with no document.
+    // A canvas pane has its own groups (docs/CANVAS_TOOLBAR_CONTRACT.md),
+    // which take this toolbar's place, so a canvas never shows it.
     let usable = move || {
         let pane = store.focused_pane.get();
         store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get() && !editor_read_only(store, pane)
@@ -742,6 +741,13 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     let sheet_focused = move || {
         let pane = store.pane(store.focused_pane.get());
         pane.show_sheet.get() && !pane.show_board.get() && !pane.show_discussion.get()
+    };
+    // The canvas's groups while it shows a canvas: a board node, or a
+    // picture in its text being marked up (back to the text's on Done).
+    let canvas_toolbar = crate::boards::render_canvas_toolbar(__scope, store);
+    let canvas_focused = move || {
+        let pane = store.pane(store.focused_pane.get());
+        pane.show_board.get() && !pane.show_discussion.get()
     };
     // The keyboard follows the pane focus, however it moved (a press in the
     // pane, a split, a close, the View menu): the focused pane's editor when
@@ -764,8 +770,12 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
             div {
                 class: "pimble-editor__toolbar-wrap",
                 div {
-                    style: {move || if sheet_focused() { "display: none;" } else { "" }},
+                    style: {move || if sheet_focused() || canvas_focused() { "display: none;" } else { "" }},
                     {toolbar}
+                }
+                div {
+                    style: {move || if canvas_focused() { "" } else { "display: none;" }},
+                    {canvas_toolbar}
                 }
                 div {
                     style: {move || if sheet_focused() { "" } else { "display: none;" }},

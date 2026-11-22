@@ -1,5 +1,12 @@
 # Next session: start here
 
+**2026-11-21: the canvas toolbar built, not committed or released**
+(docs/CANVAS_TOOLBAR_CONTRACT.md "Built"). A focused canvas (or a picture in text being marked
+up) swaps the text toolbar for View / Snap / People / Export / History (`boards/toolbar.rs`);
+the bottom-right strip is gone (the minimap stays there, toggled from View), undo and redo left
+the floating bar. Not walked: a read-only canvas, and Ctrl+wheel moving the percentage (the
+same signal the zoom buttons move).
+
 **2026-11-21: whole-window zoom built, not committed or released** (docs/ZOOM_CONTRACT.md).
 View > Zoom In / Zoom Out / Actual Size (Ctrl+= / Ctrl+- / Ctrl+0, plus Ctrl and + and the
 keypad), browser steps 50-300%, saved per device in `state.json` `zoom`, "125%" in the status

@@ -1,5 +1,5 @@
 //! The navigator (docs/IMAGE_MARKUP_CONTRACT.md section 8): a second, small
-//! surface in the board's zoom corner (the map) showing the whole board (its visible
+//! surface in the board's bottom-right corner (the minimap) showing the whole board (its visible
 //! extent and wherever the view is), with the view's rectangle over it. A
 //! press or a drag on it moves the view there. It is re-rendered a moment
 //! after changes stop, never per pointer move.

@@ -1,6 +1,6 @@
 //! SVG in (docs/DRAWING_CONTRACT.md section 2, "SVG in"; "Built in wave 3
 //! (UI)"): SVG markup pasted while a canvas has the focus, an `.svg` file
-//! dropped on one, and "Import SVG..." in the zoom corner's menu, all through
+//! dropped on one, and "Import SVG..." in the toolbar's Export menu, all through
 //! `pimble_board::svg_in::parse` and `BoardTxn::import_svg`: centered at the
 //! pointer (a drop) or the view's middle, scaled down to fit the view, in the
 //! layer the tools draw in (a new "Vector 1" when there is none), selected.

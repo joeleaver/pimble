@@ -30,9 +30,11 @@
 //! * [`ui`]: the board view's DOM (the surface and what floats over it, the
 //!   panels: layers, meaning, frames);
 //! * [`rail`]: the floating chrome (docs/DRAWING_CONTRACT.md section 4): the
-//!   tool rail, the context bar, the color well, the zoom corner, its keys;
+//!   tool rail, the context bar, the color well, the minimap corner, its keys;
+//! * [`toolbar`]: the main toolbar's canvas groups (view, snap, people,
+//!   export, history; docs/CANVAS_TOOLBAR_CONTRACT.md);
 //! * [`layers`]: the layers panel, a tree of layers and groups;
-//! * [`nav`]: the navigator's own surface (the map in the zoom corner);
+//! * [`nav`]: the navigator's own surface (the minimap in the corner);
 //! * [`export`]: Copy Picture, Save Picture As, Save Original As, Flatten.
 //!
 //! Pictures on a board come from the same blob cache text pictures do
@@ -48,6 +50,7 @@ mod points;
 mod rail;
 mod stamp;
 mod svg_import;
+mod toolbar;
 mod tools;
 mod ui;
 
@@ -72,6 +75,7 @@ use crate::state::{ActiveEdit, AppStore};
 
 pub(crate) use paint::shared_cache as shared_paint_cache;
 pub(crate) use tools::delete_selected;
+pub(crate) use toolbar::render_canvas_toolbar;
 pub(crate) use ui::render_board;
 
 // ── Tools ───────────────────────────────────────────────────────────────────
@@ -578,8 +582,8 @@ impl LayerRow {
 }
 
 /// The one popup a board's floating chrome has open at a time: a rail
-/// flyout, the color well's picker, a menu of the context bar or the zoom
-/// corner, the layers panel's blend list. A press on the canvas closes it.
+/// flyout, the color well's picker, a menu of the context bar, the layers
+/// panel's blend list. A press on the canvas closes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Popup {
     #[default]
@@ -589,7 +593,6 @@ pub enum Popup {
     /// The context bar's "more" menu: forward, backward, front, back.
     Arrange,
     Align,
-    Export,
     Blend,
     /// The context bar's pickers, each a row under the bar.
     Width,

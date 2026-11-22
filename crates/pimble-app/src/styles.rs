@@ -120,6 +120,34 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
+/* The canvas's groups (boards/toolbar.rs, docs/CANVAS_TOOLBAR_CONTRACT.md):
+   the canvas zoom percentage as a button of its own width, and the
+   dropdowns' rows. */
+.pimble-ctb__zoom-button {
+    width: auto;
+    min-width: 48px;
+    padding: 0 4px;
+    box-sizing: border-box;
+}
+.pimble-ctb__zoom {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--rinch-color-text);
+    user-select: none;
+}
+.pimble-ctb__face {
+    display: inline-flex;
+    width: 18px;
+    height: 18px;
+    align-items: center;
+    justify-content: center;
+}
+.pimble-ctb__menu {
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+}
+
 /* ── Presence (presence.rs; the chips and dots are pimble-ui's) ── */
 
 /* Following someone, on a pane strip (presence/follow.rs). */
@@ -2685,7 +2713,7 @@ pub(crate) const APP_CSS: &str = "
 /* ── The canvas's floating chrome (docs/DRAWING_CONTRACT.md section 4) ──
    Everything floats over the canvas, which fills the pane: the tool rail
    and the color well on the left, the context bar at the top, the panels
-   and the zoom corner on the right. The columns let the pointer through to
+   and the minimap on the right. The columns let the pointer through to
    the canvas except where their boxes are. */
 .pimble-float {
     background: var(--rinch-color-body);
@@ -2883,14 +2911,6 @@ pub(crate) const APP_CSS: &str = "
     flex-direction: column;
     min-width: 200px;
     margin-top: 4px;
-}
-
-.pimble-board__menu--up {
-    position: absolute;
-    right: 0;
-    bottom: 100%;
-    margin-bottom: 4px;
-    z-index: 8;
 }
 
 .pimble-board__menu-item {
@@ -3259,26 +3279,6 @@ pub(crate) const APP_CSS: &str = "
     height: 128px;
     display: flex;
     overflow: hidden;
-}
-
-.pimble-board__zoombar {
-    display: flex;
-    align-items: center;
-    gap: 1px;
-    padding: 2px;
-}
-
-.pimble-board__zoombar .pimble-board-tool {
-    width: 26px;
-    height: 26px;
-}
-
-.pimble-board__zoom {
-    min-width: 44px;
-    text-align: center;
-    font-size: 12px;
-    cursor: pointer;
-    color: var(--rinch-color-text);
 }
 
 .pimble-board__bottom-center {

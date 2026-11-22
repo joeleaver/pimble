@@ -1,15 +1,14 @@
 //! The canvas's floating chrome (docs/DRAWING_CONTRACT.md section 4): the
 //! tool rail on the left with its flyouts, the context bar at the top (the
 //! tool's or the selection's options), the color well in the bottom left,
-//! and the zoom corner (zoom, view switches, export, the map) in the bottom
-//! right. Everything floats over the canvas, which fills the pane.
+//! and the minimap in the bottom right (its zoom, view switches and export
+//! are the main toolbar's, `super::toolbar`). Everything floats over the canvas, which fills the pane.
 //!
 //! The pure parts are tested here: the rail's slots and flyouts (every tool
 //! is on the rail exactly once), the faces flyouts remember, which controls
 //! the context bar offers for a tool or a selection, swapping the well's
 //! colors and the recent colors.
 
-use super::export::Format;
 use super::gradient;
 use super::paint;
 use super::tools::{Align2, Order};
@@ -575,7 +574,7 @@ pub(super) fn swap_colors(store: AppStore, pane: PaneId) {
 }
 
 /// Zoom pane `pane`'s board in or out about its middle.
-fn zoom_by(store: AppStore, pane: PaneId, factor: f32) {
+pub(super) fn zoom_by(store: AppStore, pane: PaneId, factor: f32) {
     let Some((w, h)) = with_session(pane, |s| s.view.size()) else { return };
     tools::zoom_about(store, pane, w as f32 / 2.0, h as f32 / 2.0, factor);
 }
@@ -1185,8 +1184,6 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let combine_btn = picker_button(__scope, ui, "Combine: union, subtract, intersect, exclude", Popup::Combine, "", combine_face);
     let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back, flip, outline stroke".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
     let align_btn = icon_button(__scope, TablerIcon::LayoutAlignCenter, "Align and distribute".to_string(), move || ui.popup.get() == Popup::Align, move || toggle(ui, Popup::Align));
-    let undo_btn = act(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |s, p| tools::undo(s, p, false));
-    let redo_btn = act(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |s, p| tools::undo(s, p, true));
 
     let align_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::LayoutAlignLeft, "Align Left", Box::new(|s, p| tools::align(s, p, Align2::Left))),
@@ -1361,7 +1358,6 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         {delete}
                         {arrange_btn}
                     }
-                    div { class: "pimble-board__ctx-group pimble-board__ctx-sep", {undo_btn} {redo_btn} }
                 }
             }
             div {
@@ -1843,54 +1839,24 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
     }
 }
 
-/// The zoom corner: the map, zoom, the view's switches (only here) and
-/// export.
-pub(super) fn render_zoom_corner(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
+/// The minimap in the bottom-right corner, shown while the toolbar's View
+/// group says so (docs/CANVAS_TOOLBAR_CONTRACT.md: its zoom, grid, snap,
+/// people and export controls are the main toolbar's now).
+pub(super) fn render_map_corner(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
     let st = store.board_style;
     let ui = store.pane(pane).board_ui;
     let nav_surface = nav::surface(store, pane);
-    let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
-    let zoom_out = icon_button(__scope, TablerIcon::ZoomOut, "Zoom out".to_string(), || false, move || zoom_by(store, pane, 1.0 / 1.25));
-    let zoom_in = icon_button(__scope, TablerIcon::ZoomIn, "Zoom in".to_string(), || false, move || zoom_by(store, pane, 1.25));
-    let fit_btn = act(__scope, TablerIcon::FocusCentered, "Fit", fit);
-    let map_btn = icon_button(__scope, TablerIcon::Map, "Show the map".to_string(), move || st.map.get(), move || st.map.update(|v| *v = !*v));
-    let grid_btn = icon_button(__scope, TablerIcon::LayoutGrid, "Show the grid (only here)".to_string(), move || st.grid.get(), move || {
-        let on = !untracked(|| st.grid.get());
-        st.grid.set(on);
-        set_grid(store, on);
-    });
-    let snap_btn = icon_button(__scope, TablerIcon::Magnet, "Snap to the grid (only here)".to_string(), move || st.snap.get(), move || st.snap.update(|v| *v = !*v));
-    let author_btn = icon_button(__scope, TablerIcon::Users, "Color by author (this pane only; hides nothing)".to_string(), move || ui.by_author.get(), move || {
-        let on = !untracked(|| ui.by_author.get());
-        set_color_by_author(store, pane, on);
-    });
-    let export_btn = icon_button(__scope, TablerIcon::Download, "Copy and save the canvas as a picture, or import SVG".to_string(), move || ui.popup.get() == Popup::Export, move || toggle(ui, Popup::Export));
-    let export_items: Vec<NodeHandle> = vec![
-        menu_item(__scope, store, pane, TablerIcon::ClipboardCopy, "Copy Picture (Ctrl+C)", Box::new(export::copy_picture)),
-        menu_item(__scope, store, pane, TablerIcon::Photo, "Save as PNG...", Box::new(|s, p| export::save_picture(s, p, Format::Png, false))),
-        menu_item(__scope, store, pane, TablerIcon::Photo, "Save as JPEG...", Box::new(|s, p| export::save_picture(s, p, Format::Jpeg, false))),
-        menu_item(__scope, store, pane, TablerIcon::FileExport, "Save as SVG...", Box::new(|s, p| export::save_picture(s, p, Format::Svg, false))),
-        menu_item(__scope, store, pane, TablerIcon::Eye, "Save with All Markup (PNG)...", Box::new(|s, p| export::save_picture(s, p, Format::Png, true))),
-        menu_item(__scope, store, pane, TablerIcon::PhotoDown, "Save Original As...", Box::new(export::save_original)),
-        menu_item(__scope, store, pane, TablerIcon::Stack2, "Flatten into New Canvas", Box::new(export::flatten)),
-        menu_item(__scope, store, pane, TablerIcon::FileVector, "Import SVG...", Box::new(super::svg_import::pick)),
-    ];
     rsx! {
         div {
             class: "pimble-board__corner",
+            style: {move || if st.map.get() { "" } else { "display: none;" }},
             onmouseenter: move || tools::pointer_off(store, pane),
             onmousedown: move || {
                 crate::pane_view::press_in_view();
                 keys_to(store, pane, Keys::Chrome);
             },
             div {
-                class: "pimble-float pimble-board__menu pimble-board__menu--up",
-                style: {move || if ui.popup.get() == Popup::Export { "" } else { "display: none;" }},
-                {export_items}
-            }
-            div {
                 class: "pimble-float pimble-board__map",
-                style: {move || if st.map.get() { "" } else { "display: none;" }},
                 RenderSurface { surface: Some(nav_surface) }
                 div {
                     class: "pimble-board__nav-view",
@@ -1899,24 +1865,6 @@ pub(super) fn render_zoom_corner(__scope: &mut RenderScope, store: AppStore, pan
                         None => "display: none;".to_string(),
                     }},
                 }
-            }
-            div {
-                class: "pimble-float pimble-board__zoombar",
-                {map_btn}
-                {zoom_out}
-                div {
-                    class: "pimble-board__zoom",
-                    title: "Actual size",
-                    onclick: move || actual_size(store, pane),
-                    {move || format!("{}%", ui.zoom.get())}
-                }
-                {zoom_in}
-                {fit_btn}
-                div { class: "pimble-board__ctx-sep" }
-                {grid_btn}
-                {snap_btn}
-                {author_btn}
-                {export_btn}
             }
         }
     }
