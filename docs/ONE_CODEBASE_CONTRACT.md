@@ -437,6 +437,15 @@ RPCs and shared views; a sans-I/O core for the links if a deterministic simulati
    one code base; its value is a deterministic simulation whose seeds replay timing too.
    *Recommended*: not now; revisit if the fault test's timing-dependent seeds start to
    cost us.
+   Joe asked (2026-11-22) whether it would prepare a mobile app, which he does not expect to
+   run its own server process. It would not: after waves 1-3 the server is a library, not
+   a process, and a phone app hosts it on a background thread in-process, a third host
+   beside the desktop's loopback WebSocket and the browser's worker. Mobile is the easier
+   host (a real filesystem, threads, native networking; rhypedb and the model run natively).
+   A sans-I/O core would only serve a mobile client that syncs without the server, which is
+   the browser's second copy again. Mobile's real constraint, a few seconds of background
+   time on iOS, is met by a bounded server call ("sync what is pending, save, stop"). The
+   adapters of wave 2 are designed with three hosts in mind.
 9. **Plain replica links stay as they are** (`sync_link.rs`): they hold no belief about the
    remote, and in the browser they are simply the plain-store replicas of question 2.
    *Recommended*: yes.
