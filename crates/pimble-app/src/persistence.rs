@@ -1,5 +1,6 @@
-//! State file persistence: the open stores, the theme choice, the explorer's
-//! width and the split view's layout, in `<config dir>/pimble/state.json`.
+//! State file persistence: the open stores, the theme choice, the window's
+//! zoom, the explorer's width and the split view's layout, in
+//! `<config dir>/pimble/state.json`.
 //!
 //! A web build has no config directory and no store paths to remember (its
 //! stores come from the account service's `listStores`), so those two calls
@@ -85,6 +86,19 @@ mod imp {
     pub(crate) fn save_dark_mode(dark: bool) {
         let mut state = read_state();
         state["dark_mode"] = serde_json::json!(dark);
+        write_state(&state);
+    }
+
+    /// The window's zoom on this device (docs/ZOOM_CONTRACT.md), actual
+    /// size when nothing is saved.
+    pub(crate) fn load_zoom() -> f64 {
+        read_state()["zoom"].as_f64().unwrap_or(1.0)
+    }
+
+    /// Save the zoom, keeping every other saved preference.
+    pub(crate) fn save_zoom(zoom: f64) {
+        let mut state = read_state();
+        state["zoom"] = serde_json::json!(zoom);
         write_state(&state);
     }
 
@@ -248,6 +262,14 @@ mod imp {
             let _ = storage.set_item(DARK_MODE_KEY, if dark { "true" } else { "false" });
         }
     }
+
+    /// The browser zooms the page itself and remembers its zoom per site
+    /// (docs/ZOOM_CONTRACT.md), so Pimble keeps none here.
+    pub(crate) fn load_zoom() -> f64 {
+        1.0
+    }
+
+    pub(crate) fn save_zoom(_zoom: f64) {}
 
     /// Where the order the person put the stores in lives in the browser
     /// (docs/TREE_CONTRACT.md "Reordering stores"): their ids, as JSON.
@@ -468,6 +490,7 @@ pub(crate) use imp::{
     load_app_state_file, load_dark_mode, load_personal, load_personal_sync, load_settings_section, load_shortcuts, load_sidebar_width, save_app_state_file,
     save_dark_mode, save_personal, save_personal_sync, save_settings_section, save_shortcuts, save_sidebar_width,
 };
+pub(crate) use imp::{load_zoom, save_zoom};
 pub(crate) use imp::{load_views_json, save_views_json};
 #[cfg(feature = "native")]
 pub(crate) use imp::{load_window, save_window};

@@ -4844,6 +4844,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                         div { style: "flex: 1;", }
 
+                        // The window's zoom while it is not actual size
+                        // (docs/ZOOM_CONTRACT.md); a click goes back to it.
+                        span {
+                            class: "pimble-status-bar__zoom",
+                            title: "Zoom. Click for actual size (Ctrl+0).",
+                            style: {|| if crate::zoom::is_actual(crate::zoom::current()) { "display: none;" } else { "" }},
+                            onclick: move || crate::zoom::actual_size(store),
+                            {|| crate::zoom::label(crate::zoom::current())}
+                        }
+
                         // A verified update is staged (docs/UPDATE_CONTRACT.md);
                         // nothing restarts until this is clicked.
                         if CAN_ADMINISTER_STORES {
@@ -5021,7 +5031,12 @@ pub(crate) fn bring_to_front() {
 pub fn run(renderer: Renderer) {
     use std::sync::Arc;
 
+    // The zoom this device saved, before the window is made, so the first
+    // frame is drawn at it; and the zoom keys the menu's chords do not cover
+    // (docs/ZOOM_CONTRACT.md).
+    crate::zoom::restore();
     let (store, app_component) = build_view();
+    crate::zoom::listen(store);
     crate::update::start(store);
     crate::diagnostics_ui::notice_once(store);
 

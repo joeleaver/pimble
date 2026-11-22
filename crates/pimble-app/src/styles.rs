@@ -4004,6 +4004,20 @@ pub(crate) const APP_CSS: &str = "
     text-decoration: underline;
 }
 
+/* The window's zoom while it is not actual size (docs/ZOOM_CONTRACT.md):
+   small and quiet; a click goes back to actual size. */
+.pimble-status-bar__zoom {
+    font-size: 11px;
+    margin-right: 10px;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+}
+
+.pimble-status-bar__zoom:hover {
+    color: var(--rinch-color-text);
+    text-decoration: underline;
+}
+
 /* A refusal the server sent back: not a broken connection, so it reads as a
    plain sentence rather than as the error badge. */
 .pimble-status-bar__notice {

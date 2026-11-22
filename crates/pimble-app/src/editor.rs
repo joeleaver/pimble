@@ -196,6 +196,12 @@ pub(crate) fn start_editing(
         if untracked(|| store.pane(pane).picture.with(Option::is_some)) {
             crate::links::later(move |store| crate::text_boards::scrolled(store, pane));
         }
+        // Ctrl and + and the keypad's zoom keys, which the menu's chords do
+        // not match and the editor hears before any app-wide listener
+        // (docs/ZOOM_CONTRACT.md).
+        if crate::zoom::on_alias(store, key.key, "", key.primary, key.alt) {
+            return true;
+        }
         let modified = key.primary || key.ctrl || key.meta || key.alt;
         crate::link_picker::key(store, &editor(pane), key.key, modified)
     });

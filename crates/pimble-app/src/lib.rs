@@ -83,6 +83,7 @@ pub mod plugin_calls;
 pub mod tree_drop;
 pub mod tree_keys;
 pub mod tree_view;
+pub mod zoom;
 
 /// The desktop backend: a background thread with a tokio runtime, an embedded
 /// [`pimble_server::PimbleServer`] and the WebSocket client that talks to it.

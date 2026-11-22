@@ -1,5 +1,13 @@
 # Next session: start here
 
+**2026-11-21: whole-window zoom built, not committed or released** (docs/ZOOM_CONTRACT.md).
+View > Zoom In / Zoom Out / Actual Size (Ctrl+= / Ctrl+- / Ctrl+0, plus Ctrl and + and the
+keypad), browser steps 50-300%, saved per device in `state.json` `zoom`, "125%" in the status
+bar while not actual size (click resets). The zoom is rinch's new `rinch::window::set_zoom`
+(PR from rinch branch `zoom`): **every rinch crate is pinned to branch `zoom`** in all
+Cargo.toml files and the root, `web/` and `plugins/` locks; move them back to `main` once
+the PR is merged. The web leaves zoom to the browser (the items say so; no keys taken).
+
 **2026-11-21: text color built, not committed or released** (docs/TEXT_COLOR_CONTRACT.md).
 A Text Color button in the toolbar's Text group and Edit > Text Color: Default and nine
 colors stored as the light shade in rinch's `text_color` mark; `TextColorPlugin` shows each

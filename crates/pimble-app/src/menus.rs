@@ -280,6 +280,13 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![
         MenuEntry::item("Toggle Dark Mode", "", move || crate::app::toggle_dark_mode(store)),
         MenuEntry::Separator,
+        // The whole window larger or smaller (docs/ZOOM_CONTRACT.md). The
+        // browser zooms the page with these keys itself, so there they are
+        // left to it, and the items say so.
+        MenuEntry::item("Zoom In", zoom_key(crate::zoom::ZOOM_IN_KEY), move || crate::zoom::zoom_in(store)),
+        MenuEntry::item("Zoom Out", zoom_key(crate::zoom::ZOOM_OUT_KEY), move || crate::zoom::zoom_out(store)),
+        MenuEntry::item("Actual Size", zoom_key(crate::zoom::ACTUAL_SIZE_KEY), move || crate::zoom::actual_size(store)),
+        MenuEntry::Separator,
         // The focused pane's node's tags, fields and place
         // (docs/PROPERTIES_CONTRACT.md): checked while open.
         MenuEntry::Check { label: "Properties", shortcut: "Alt+Enter", checked: store.properties_open },
@@ -314,6 +321,12 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         // docs/DISCUSSIONS_CONTRACT.md section 8: what is unread, everywhere.
         MenuEntry::item("Discussions...", "", move || crate::discussions::open_unread(store)),
     ]
+}
+
+/// A zoom item's key: the browser's own zoom keys are the page's, so the
+/// web build takes none of them.
+fn zoom_key(key: &'static str) -> &'static str {
+    if cfg!(feature = "native") { key } else { "" }
 }
 
 /// The spec as rinch menus, for a shell that has a menu bar.

@@ -1020,6 +1020,11 @@ struct Session {
     view: BoardView,
     /// Fitted to the visible extent once, the first time it showed a board.
     fitted: bool,
+    /// The scale (device pixels per CSS pixel) the view was last presented
+    /// at. The view's zoom is in device pixels, so a new scale (the window's
+    /// zoom, docs/ZOOM_CONTRACT.md, or a display with another scale) scales
+    /// it too, and the board keeps its own zoom as the person reads it.
+    presented_scale: f32,
     /// The camera this device left the board at (`views.rs`), taken instead
     /// of fitting the first time it shows.
     restore: Option<crate::views::Camera>,
@@ -1290,6 +1295,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         undo: None,
         view,
         fitted: false,
+        presented_scale: 0.0,
         restore: crate::views::camera(store_id, node_id),
         gesture: Gesture::Idle,
         selected: Vec::new(),
@@ -1552,6 +1558,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         undo: None,
         view,
         fitted: false,
+        presented_scale: 0.0,
         restore: None,
         gesture: Gesture::Idle,
         selected: Vec::new(),
@@ -2059,6 +2066,14 @@ fn present(pane: PaneId) {
     let writer = surface.writer();
     with_session(pane, |s| {
         s.view.resize(width, height);
+        // A new scale: the same board zoom (as a percentage of CSS pixels)
+        // at it, about the middle of the view.
+        if s.fitted && s.presented_scale > 0.0 && (scale - s.presented_scale).abs() > 1e-4 {
+            let center = s.view.center();
+            let zoom = s.view.zoom() * scale / s.presented_scale;
+            s.view.set_camera(center, zoom);
+        }
+        s.presented_scale = scale;
         if let Some(camera) = s.restore.take().filter(|_| !s.fitted) {
             // Where this device left it.
             s.view.set_camera(Point::new(camera.x, camera.y), camera.zoom * scale);
