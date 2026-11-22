@@ -407,7 +407,10 @@ RPCs and shared views; a sans-I/O core for the links if a deterministic simulati
    only on a new browser, after sign-out, or after "Forget This Browser"; "Don't remember
    this browser" keeps today's memory-only behavior. Section 7.
 
-## Questions for Joe
+## Questions answered (Joe, 2026-11-22: "yes all recommendations")
+
+Each below is decided as its recommendation says.
+
 
 1. **One server per browser through a leader tab** (Web Locks, a dedicated worker,
    `BroadcastChannel` to the other tabs), rather than a `SharedWorker` or a server per tab.
