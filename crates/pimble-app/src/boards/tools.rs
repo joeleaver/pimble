@@ -62,7 +62,7 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
         "Tab" => !primary && !key.alt,
         "x" | "X" if !primary && !key.alt => true,
         "Delete" | "Backspace" => selected || paint_selection,
-        "Escape" => active || paint_selection || super::stamp::editing(pane),
+        "Escape" => active || paint_selection || super::stamp::editing(pane) || with_session(pane, |s| s.markup.is_some()).unwrap_or(false),
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => selected,
         // Ctrl+V is the board's on the desktop; in the browser it is left to
         // the page, whose `paste` brings the clipboard's files
@@ -2919,6 +2919,11 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
         // Escape with nothing selected leaves a symbol being edited.
         "Escape" if super::stamp::editing(pane) && with_session(pane, |s| s.selected.is_empty() && matches!(s.gesture, Gesture::Idle)).unwrap_or(false) => {
             super::stamp::done(store, pane);
+        }
+        // Escape with nothing selected finishes marking up a picture in
+        // text, as Done does (docs/TOOLBAR_CONTRACT.md "Edit and Done").
+        "Escape" if with_session(pane, |s| s.markup.is_some() && s.selected.is_empty() && matches!(s.gesture, Gesture::Idle)).unwrap_or(false) => {
+            super::end_markup(store, pane);
         }
         "Escape" => {
             // Escape mid-gesture takes the gesture back, as a cancelled

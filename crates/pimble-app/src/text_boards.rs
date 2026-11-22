@@ -996,25 +996,61 @@ fn images(doc: &EditorNode) -> Vec<(usize, Attrs)> {
     out
 }
 
-/// The canvas in text pane `pane`'s selection is exactly (docs/CANVAS_TOOLBAR_CONTRACT.md
-/// "Selected picture"): a picture of the store's or a canvas that began empty, never an
-/// embedded board node or a web picture. Its position, `src` and `data-board`.
-pub(crate) fn selected_canvas(pane: PaneId) -> Option<(usize, String, Option<String>)> {
+/// What pane `pane`'s text selection is exactly, for the toolbar
+/// (docs/TOOLBAR_CONTRACT.md "Which toolbar"): a canvas (a picture of the
+/// store's, a canvas that began empty, an embedded canvas node), a sheet (a
+/// table of the note's, an embedded sheet node), or text (everything else).
+pub(crate) fn selected_item(store: AppStore, pane: PaneId) -> crate::toolbar::Item {
     let state = crate::editor::editor(pane).state();
     let (from, to) = (state.selection.from().0, state.selection.to().0);
     if to != from + 1 {
-        return None;
+        return crate::toolbar::Item::Text;
     }
-    selected_in(&state.doc, from)
+    item_at(store, pane, &state.doc, from)
 }
 
-/// The canvas atom at `pos` in `doc`, as [`selected_canvas`] answers it.
-fn selected_in(doc: &EditorNode, pos: usize) -> Option<(usize, String, Option<String>)> {
-    let (_, attrs) = images(doc).into_iter().find(|(at, _)| *at == pos)?;
-    let src = attrs.get_str("src")?.to_string();
+/// The atom at `pos` in `doc` as [`selected_item`] answers it.
+fn item_at(store: AppStore, pane: PaneId, doc: &EditorNode, pos: usize) -> crate::toolbar::Item {
+    use crate::toolbar::{Item, Picked};
+    let mut found = None;
+    doc.nodes_between(pos, pos + 1, &mut |node, at, _| {
+        if at == pos && found.is_none() && matches!(node.type_name(), "image" | "embed") {
+            found = Some((node.type_name().to_string(), node.attrs().clone()));
+        }
+        found.is_none()
+    });
+    let Some((kind, attrs)) = found else { return Item::Text };
+    if kind == "embed" {
+        if let Some(table) = attrs.get_str(crate::sheets::in_text::SHEET_ATTR).filter(|t| !t.is_empty()) {
+            return Item::Sheet(Some(table.to_string()));
+        }
+        return match crate::sheets::in_text::embedded_sheet(&attrs) {
+            Some((node, only)) => {
+                let first = || {
+                    let tables = untracked(|| store.pane(pane).sheet_ui.tables.get());
+                    tables.into_iter().find(|t| t.node == node).map(|t| t.id)
+                };
+                Item::Sheet(only.or_else(first))
+            }
+            None => Item::Text,
+        };
+    }
+    let Some(src) = attrs.get_str("src").map(str::to_string) else { return Item::Text };
     let board = attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty()).map(str::to_string);
-    let canvas = BlobUrl::parse(&src).is_some() || (src == IN_TEXT_SRC && board.is_some());
-    canvas.then_some((pos, src, board))
+    let embed = BoardUrl::parse(&src);
+    let canvas = embed.is_some() || BlobUrl::parse(&src).is_some() || (src == IN_TEXT_SRC && board.is_some());
+    if !canvas {
+        return Item::Text;
+    }
+    Item::Canvas(Picked { pane, pos, src, board, embed })
+}
+
+/// The canvas node an embed shows read whole, while this window holds it.
+pub(crate) fn embed_raw(url: &BoardUrl) -> Option<pimble_board::RawBoard> {
+    EMBEDS.with(|embeds| match &embeds.borrow().get(&(url.store, url.node))?.state {
+        EmbedState::Live { doc: Some(doc), .. } => Board::of_node(doc).read(),
+        _ => None,
+    })
 }
 
 /// A canvas of `node`'s text read whole, as this window holds it.
@@ -1029,6 +1065,10 @@ pub(crate) fn raw_board(store_id: StoreId, node_id: NodeId, board: &str) -> Opti
 /// "Mark Up..." on the picture at `pos` (`src`, its board) in pane `pane`'s
 /// text, as a double-click does: the board view over the text.
 pub(crate) fn mark_up_at(store: AppStore, pane: PaneId, pos: usize, src: &str, board: Option<String>) {
+    if let Some(url) = BoardUrl::parse(src) {
+        open_embed(store, pane, &url, false);
+        return;
+    }
     let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else { return };
     store.pane(pane).picture.set(None);
     crate::boards::start_markup(store, pane, active.store_id, active.node_id, src, pos, board);
@@ -1949,12 +1989,12 @@ mod tests {
         sent.iter().filter(|c| matches!(c, BackendCommand::BroadcastChanges { node_id, .. } if *node_id == node)).count()
     }
 
-    /// The canvas toolbar's "Selected picture" (docs/CANVAS_TOOLBAR_CONTRACT.md):
-    /// a selection that is exactly a picture names it; a caret beside it, or
-    /// a selection reaching past it, does not; an embedded board node is not
-    /// a canvas in text.
+    /// The toolbar's "Which toolbar" (docs/TOOLBAR_CONTRACT.md): a selection
+    /// that is exactly a picture or an embedded canvas node is a canvas; a
+    /// caret beside it, or text, is text.
     #[test]
-    fn a_selection_of_exactly_a_picture_is_a_selected_canvas() {
+    fn a_selection_of_exactly_a_canvas_is_a_canvas_item() {
+        use crate::toolbar::Item;
         use rinch_editor_core::{Pos, Selection};
         let (store, _commands) = store_with_commands();
         let pane = P[3];
@@ -1962,16 +2002,22 @@ mod tests {
         let (pos, _) = atoms(pane).remove(0);
         let h = crate::editor::editor(pane);
         h.set_selection(Selection::node_at(&h.doc(), Pos(pos)).expect("the picture is selectable"));
-        assert_eq!(selected_canvas(pane), Some((pos, src.clone(), None)));
+        match selected_item(store, pane) {
+            Item::Canvas(p) => assert_eq!((p.pos, p.src.as_str(), p.board, p.embed), (pos, src.as_str(), None, None)),
+            other => panic!("a picture is a canvas: {other:?}"),
+        }
         h.set_selection(Selection::cursor(Pos(pos)));
-        assert_eq!(selected_canvas(pane), None, "a caret before it");
+        assert_eq!(selected_item(store, pane), Item::Text, "a caret before it");
         h.set_selection(Selection::cursor(Pos(pos + 1)));
-        assert_eq!(selected_canvas(pane), None, "a caret after it");
-        let embed = BoardUrl::new(StoreId::new(), NodeId::new()).to_string();
-        assert!(h.insert_image(&embed, "board"));
-        let (embed_pos, _) = atoms(pane).into_iter().find(|(_, a)| a.get_str("src") == Some(embed.as_str())).unwrap();
+        assert_eq!(selected_item(store, pane), Item::Text, "a caret after it");
+        let url = BoardUrl::new(StoreId::new(), NodeId::new());
+        assert!(h.insert_image(&url.to_string(), "board"));
+        let (embed_pos, _) = atoms(pane).into_iter().find(|(_, a)| a.get_str("src") == Some(url.to_string().as_str())).unwrap();
         h.set_selection(Selection::node_at(&h.doc(), Pos(embed_pos)).expect("the embed is selectable"));
-        assert_eq!(selected_canvas(pane), None, "an embedded board node");
+        match selected_item(store, pane) {
+            Item::Canvas(p) => assert_eq!(p.embed, Some(url)),
+            other => panic!("an embedded canvas node is a canvas: {other:?}"),
+        }
     }
 
     /// "Mark Up..." on a picture (contract section 2): opening the board

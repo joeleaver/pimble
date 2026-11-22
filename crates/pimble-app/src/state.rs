@@ -1017,6 +1017,9 @@ pub struct PaneState {
     /// The picture in the pane's text the pointer is over, and what its
     /// floating controls show (section 5, "Showing and hiding markup").
     pub picture: Signal<Option<crate::text_boards::PictureHover>>,
+    /// What the pane's text has selected, which the main toolbar follows
+    /// (`crate::toolbar::which`).
+    pub item: Signal<crate::toolbar::Item>,
     /// Whether the pane shows a sheet node's tables (docs/SHEETS_CONTRACT.md
     /// section 1) instead of its editor, which stays mounted, hidden.
     pub show_sheet: Signal<bool>,
@@ -1061,6 +1064,7 @@ impl PaneState {
             board_ui: crate::boards::PaneUi::new(),
             markup: Signal::new(false),
             picture: Signal::new(None),
+            item: Signal::new(crate::toolbar::Item::Text),
             show_sheet: Signal::new(false),
             sheet: Signal::new(None),
             sheet_ui: crate::sheets::SheetUi::new(),

@@ -1,23 +1,23 @@
-//! The toolbar for canvases (docs/CANVAS_TOOLBAR_CONTRACT.md): it takes the
-//! text toolbar's place while the focused pane shows a canvas (a board node,
-//! or a picture in a note's text while its markup is being edited), and
-//! while the focused note's selection is exactly a canvas in its text
-//! ("Selected picture"), as the sheet's does for a sheet node. Still one
-//! toolbar, above the panes, for the focused pane (Joe, 2026-10-08): every
-//! button acts on the pane focused when it is pressed, and its state is read
-//! from that pane.
+//! The canvas groups of the main toolbar (docs/TOOLBAR_CONTRACT.md): shown
+//! while `toolbar::which` says the focused pane's selected item is a canvas
+//! (a canvas pane, a canvas being edited, or a picture or embedded canvas
+//! node selected in a note's text). Still one toolbar, above the panes, for
+//! the focused pane (Joe, 2026-10-08): every button acts on the pane focused
+//! when it is pressed, and its state is read from that pane.
 //!
-//! Groups, labeled like the text groups: Canvas (Edit Canvas; only for a
-//! canvas in a note's text), View (the minimap, zoom out, the canvas zoom
-//! percentage with Fit and 100%, zoom in, fit), Snap (grid, magnet), People
-//! (color by author), Export (one dropdown), History (undo, redo). On a
-//! canvas this device may only read, View, People and Export stay live and
-//! Snap and History dim.
+//! Groups, labeled like the text groups: Canvas (Edit Canvas, which is Done
+//! while the canvas is being edited), the selection's own group (named for
+//! what is selected, or for the tool in hand: what the floating bar over
+//! the canvas carried until 2026-11-21), View (the minimap, zoom out, the
+//! canvas zoom percentage with Fit and 100%, zoom in, fit), Snap (grid,
+//! magnet), People (color by author), Export (one dropdown), History (undo,
+//! redo). On a canvas this device may only read, View, People and Export
+//! stay live and the rest dim.
 //!
-//! On a selected picture (its canvas not open): Export acts on the picture
+//! On a selected picture or embedded canvas (not open): Export acts on it
 //! directly; Snap toggles the per-viewer settings; View, People and Edit
-//! Canvas open the canvas over the note (as a double-click does) and then do
-//! what they say; History is the note's own undo and redo.
+//! Canvas open it (a picture's canvas over the note, an embedded canvas node
+//! in the pane) and then do what they say; History is the note's own.
 
 use rinch::prelude::*;
 use rinch_tabler_icons::TablerIcon;
@@ -32,8 +32,15 @@ use crate::toolbar::Picked;
 /// live on a canvas this device may only read (the rule `render_canvas_toolbar`
 /// builds the groups by; on a selected picture of such a note, View and
 /// People dim too, since they open the canvas).
-pub(crate) const GROUPS: [(&str, bool); 6] =
-    [("Canvas", false), ("View", true), ("Snap", false), ("People", true), ("Export", true), ("History", false)];
+pub(crate) const GROUPS: [(&str, bool); 7] = [
+    ("Canvas", false),
+    ("Selection", false),
+    ("View", true),
+    ("Snap", false),
+    ("People", true),
+    ("Export", true),
+    ("History", false),
+];
 
 /// The canvas zoom as the toolbar shows it.
 pub(crate) fn zoom_label(zoom: f32) -> String {
@@ -62,7 +69,62 @@ fn aim(store: AppStore) -> Option<Aim> {
     if store.pane(pane).show_board.get() {
         return Some(Aim::Board(pane));
     }
-    crate::toolbar::picked().filter(|p| p.pane == pane).map(Aim::Picked)
+    crate::toolbar::picked(store, pane).map(Aim::Picked)
+}
+
+thread_local! {
+    /// Per pane: the canvas node it opened from an embed in its note's text
+    /// (`None` inside while it has not shown yet), which Done goes back from.
+    static FROM_EMBED: RefCell<[Option<Signal<Option<Option<(StoreId, NodeId)>>>>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+}
+
+fn from_embed(pane: PaneId) -> Option<Signal<Option<Option<(StoreId, NodeId)>>>> {
+    FROM_EMBED.with(|f| f.borrow()[pane.index()]).filter(|s| s.is_alive())
+}
+
+/// Open the selected canvas: a picture's over the note, an embedded canvas
+/// node in the pane (remembered, so Done goes back to the note).
+fn open_picked(store: AppStore, p: &Picked) {
+    if p.embed.is_some() {
+        if let Some(sig) = from_embed(p.pane) {
+            sig.set(Some(None));
+        }
+    }
+    crate::text_boards::mark_up_at(store, p.pane, p.pos, &p.src, p.board.clone());
+}
+
+/// What the Canvas group's one button is now.
+#[derive(Debug, Clone, PartialEq)]
+enum EditState {
+    /// A canvas selected in the text, not open: "Edit Canvas".
+    Edit,
+    /// A picture's canvas open over the note: "Done" goes back to the text.
+    DoneMarkup,
+    /// A symbol being edited: "Done" goes back to the canvas.
+    DoneSymbol(String),
+    /// A canvas node opened from an embed: "Done" goes back to the note.
+    DoneEmbed,
+    /// A canvas node opened any other way: no Canvas group.
+    None,
+}
+
+fn edit_state(store: AppStore) -> EditState {
+    match aim(store) {
+        Some(Aim::Picked(_)) => EditState::Edit,
+        Some(Aim::Board(pane)) => {
+            let state = store.pane(pane);
+            if let Some(name) = state.board_ui.editing_symbol.get() {
+                EditState::DoneSymbol(name)
+            } else if state.markup.get() {
+                EditState::DoneMarkup
+            } else if from_embed(pane).is_some_and(|s| matches!(s.get(), Some(Some(b)) if state.board.get().is_some_and(|h| (h.store_id, h.node_id) == b))) {
+                EditState::DoneEmbed
+            } else {
+                EditState::None
+            }
+        }
+        None => EditState::None,
+    }
 }
 
 /// Run `f` on the pane's canvas once it is open and fitted: at once for a
@@ -71,7 +133,7 @@ fn on_open_canvas(store: AppStore, f: impl FnOnce(AppStore, PaneId) + 'static) {
     match untracked(|| aim(store)) {
         Some(Aim::Board(pane)) => f(store, pane),
         Some(Aim::Picked(p)) => {
-            crate::text_boards::mark_up_at(store, p.pane, p.pos, &p.src, p.board.clone());
+            open_picked(store, &p);
             when_open(store, p.pane, Box::new(f), 0);
         }
         None => {}
@@ -81,10 +143,10 @@ fn on_open_canvas(store: AppStore, f: impl FnOnce(AppStore, PaneId) + 'static) {
 /// `f`, once pane `pane`'s canvas has a size and its first fit (a canvas
 /// that did not open, a read-only note's, gives up after two seconds).
 fn when_open(store: AppStore, pane: PaneId, f: Box<dyn FnOnce(AppStore, PaneId)>, tries: u32) {
-    let ready = with_session(pane, |s| s.fitted && s.view.size().0 > 1) == Some(true);
+    let ready = untracked(|| store.pane(pane).show_board.get()) && with_session(pane, |s| s.fitted && s.view.size().0 > 1) == Some(true);
     if ready {
         f(store, pane);
-    } else if tries < 100 {
+    } else if tries < 150 {
         let _ = set_timeout(20, move || when_open(store, pane, f, tries + 1));
     }
 }
@@ -212,11 +274,101 @@ fn shown_zoom(store: AppStore) -> String {
     }
 }
 
+/// The Canvas group's one button: "Edit Canvas" (a pencil) while the canvas
+/// is only selected, "Done" (a check, the primary color) while it is being
+/// edited (docs/TOOLBAR_CONTRACT.md "Edit and Done").
+fn edit_button(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    let state = move || edit_state(store);
+    let editing = move || !matches!(state(), EditState::Edit | EditState::None);
+    rsx! {
+        div {
+            class: {move || if editing() { "pimble-ctb__edit pimble-ctb__edit--done" } else { "pimble-ctb__edit" }},
+            title: {move || match state() {
+                EditState::Edit => "Edit Canvas (double-click)".to_string(),
+                EditState::DoneMarkup => "Done: back to the text (Escape)".to_string(),
+                EditState::DoneSymbol(name) => format!("Done editing the symbol \"{name}\" (Escape)"),
+                EditState::DoneEmbed => "Done: back to the note".to_string(),
+                EditState::None => String::new(),
+            }},
+            onclick: move || {
+                match untracked(state) {
+                    EditState::Edit => {
+                        if let Some(Aim::Picked(p)) = untracked(|| aim(store)) {
+                            open_picked(store, &p);
+                        }
+                    }
+                    EditState::DoneMarkup => {
+                        if let Some(Aim::Board(pane)) = untracked(|| aim(store)) {
+                            end_markup(store, pane);
+                        }
+                    }
+                    EditState::DoneSymbol(_) => {
+                        if let Some(Aim::Board(pane)) = untracked(|| aim(store)) {
+                            super::stamp::done(store, pane);
+                        }
+                    }
+                    EditState::DoneEmbed => {
+                        if let Some(Aim::Board(pane)) = untracked(|| aim(store)) {
+                            if let Some(sig) = from_embed(pane) {
+                                sig.set(None);
+                            }
+                            store.nav_step.set(Some(true));
+                        }
+                    }
+                    EditState::None => {}
+                }
+            },
+            span {
+                class: "pimble-ctb__face",
+                style: {move || if editing() { "display: none;" } else { "" }},
+                IconGlyph { name: TablerIcon::Pencil.name().to_string() }
+            }
+            span {
+                class: "pimble-ctb__face",
+                style: {move || if editing() { "" } else { "display: none;" }},
+                IconGlyph { name: TablerIcon::Check.name().to_string() }
+            }
+            span { class: "pimble-ctb__edit-label", {move || if editing() { "Done" } else { "Edit Canvas" }} }
+        }
+    }
+}
+
+/// The group for what is selected in pane `pane`'s canvas (or the tool in
+/// hand): the controls the floating bar carried, labeled with what they act
+/// on; their pickers open under the group, over the canvas.
+fn selection_group(__scope: &mut RenderScope, store: AppStore, pane: PaneId, live: impl Fn() -> bool + Copy + 'static) -> NodeHandle {
+    let (row, popups) = super::rail::render_context_bar(__scope, store, pane);
+    let shown = move || store.focused_pane.get() == pane && store.pane(pane).show_board.get() && super::rail::context_shown(store, pane);
+    rsx! {
+        div {
+            class: "pimble-toolbar__group pimble-ctb__selection",
+            style: {move || if !shown() { "display: none;" } else if live() { "" } else { "opacity: 0.4; pointer-events: none;" }},
+            {row}
+            div { class: "pimble-toolbar__label", {move || super::rail::context_label(store, pane)} }
+            {popups}
+        }
+    }
+}
+
 /// The canvas toolbar, rendered once; it follows the focused pane.
 pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let st = store.board_style;
     let focused = move || store.focused_pane.get();
     let now = move || untracked(|| aim(store));
+    // Which canvas node each pane opened from an embed, followed as its
+    // board changes: Done shows while it still shows that node.
+    for pane in PaneId::ALL {
+        let sig: Signal<Option<Option<(StoreId, NodeId)>>> = Signal::new(None);
+        FROM_EMBED.with(|f| f.borrow_mut()[pane.index()] = Some(sig));
+        let _ = rinch::Effect::new(move || {
+            let board = store.pane(pane).board.get().map(|h| (h.store_id, h.node_id));
+            untracked(|| match (sig.get(), board) {
+                (Some(None), Some(b)) => sig.set(Some(Some(b))),
+                (Some(Some(was)), now) if now != Some(was) => sig.set(None),
+                _ => {}
+            });
+        });
+    }
     let writable = move || match aim(store) {
         Some(Aim::Board(pane)) => store
             .pane(pane)
@@ -231,41 +383,49 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
         None => false,
     };
     let picked = move || matches!(aim(store), Some(Aim::Picked(_)));
-    let in_text = move || picked() || store.pane(focused()).markup.get();
-    // A selected picture's View and People open its canvas, which a note
-    // this device may only read cannot.
-    let opens = move || !picked() || writable();
+    // A selected picture's View, People and Edit Canvas open it: a picture's
+    // canvas cannot be opened for markup on a note this device may only
+    // read. An embedded canvas node opens to be looked at, whatever its note.
+    let opens = move || match aim(store) {
+        Some(Aim::Picked(p)) if p.embed.is_none() => writable(),
+        _ => true,
+    };
+    let canvas_shown = move || edit_state(store) != EditState::None;
     let always = || true;
     let never = || false;
 
-    // Canvas: open or close a canvas in text.
-    let canvas = vec![button(
-        __scope,
-        TablerIcon::Edit,
-        "Edit Canvas",
-        move || store.pane(focused()).markup.get(),
-        move || match now() {
-            Some(Aim::Board(pane)) => end_markup(store, pane),
-            Some(Aim::Picked(p)) => crate::text_boards::mark_up_at(store, p.pane, p.pos, &p.src, p.board.clone()),
-            None => {}
-        },
-    )];
+    let canvas = vec![edit_button(__scope, store)];
+    let selections: Vec<NodeHandle> = PaneId::ALL.into_iter().map(|pane| selection_group(__scope, store, pane, writable)).collect();
 
     // View.
     let zoom_open = Signal::new(false);
     let zoom_face = rsx! { span { class: "pimble-ctb__zoom", {move || shown_zoom(store)} } };
+    // While the selection's group shows, View is the percentage alone (its
+    // menu holds every View command), so the toolbar stays one row.
+    let compact = move || {
+        let pane = focused();
+        store.pane(pane).show_board.get() && super::rail::context_shown(store, pane)
+    };
+    let wide = move |__scope: &mut RenderScope, b: NodeHandle| rsx! { div { style: {move || if compact() { "display: none;" } else { "" }}, {b} } };
     let zoom_rows = vec![
         menu_row(__scope, zoom_open, TablerIcon::FocusCentered, "Fit", || None, move || on_open_canvas(store, fit)),
         menu_row(__scope, zoom_open, TablerIcon::ZoomReset, "100%", || None, move || on_open_canvas(store, actual_size)),
+        menu_row(__scope, zoom_open, TablerIcon::ZoomIn, "Zoom In", || None, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.25))),
+        menu_row(__scope, zoom_open, TablerIcon::ZoomOut, "Zoom Out", || None, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.0 / 1.25))),
+        menu_row(__scope, zoom_open, TablerIcon::Map, "Show or Hide the Minimap", || None, move || on_open_canvas(store, move |_, _| st.map.update(|v| *v = !*v))),
     ];
+    let map_btn = button(__scope, TablerIcon::Map, "Show the Minimap", move || st.map.get(), move || {
+        on_open_canvas(store, move |_, _| st.map.update(|v| *v = !*v))
+    });
+    let out_btn = button(__scope, TablerIcon::ZoomOut, "Zoom Out", never, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.0 / 1.25)));
+    let in_btn = button(__scope, TablerIcon::ZoomIn, "Zoom In", never, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.25)));
+    let fit_btn = button(__scope, TablerIcon::FocusCentered, "Fit", never, move || on_open_canvas(store, fit));
     let view = vec![
-        button(__scope, TablerIcon::Map, "Show the Minimap", move || st.map.get(), move || {
-            on_open_canvas(store, move |_, _| st.map.update(|v| *v = !*v))
-        }),
-        button(__scope, TablerIcon::ZoomOut, "Zoom Out", never, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.0 / 1.25))),
-        dropdown(__scope, "Canvas zoom", "pimble-ctb__zoom-button", zoom_open, zoom_face, zoom_rows),
-        button(__scope, TablerIcon::ZoomIn, "Zoom In", never, move || on_open_canvas(store, |s, p| zoom_by(s, p, 1.25))),
-        button(__scope, TablerIcon::FocusCentered, "Fit", never, move || on_open_canvas(store, fit)),
+        wide(__scope, map_btn),
+        wide(__scope, out_btn),
+        dropdown(__scope, "Canvas Zoom", "pimble-ctb__zoom-button", zoom_open, zoom_face, zoom_rows),
+        wide(__scope, in_btn),
+        wide(__scope, fit_btn),
     ];
 
     // Snap: per viewer, every canvas; no canvas needs to be open.
@@ -293,7 +453,7 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
     )];
 
     // Export: everything the canvas's export menu had; on a selected
-    // picture, the picture itself, its canvas left closed.
+    // picture or embedded canvas, that canvas itself, left closed.
     let export_open = Signal::new(false);
     let export_face = rsx! { span { class: "pimble-ctb__face", IconGlyph { name: TablerIcon::Download.name().to_string() } } };
     // An export: `board` on a canvas that shows, `picked` on a selected one.
@@ -306,7 +466,7 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
     };
     let on = || None;
     let original_off = move || match aim(store) {
-        Some(Aim::Picked(p)) => export::no_original(&p),
+        Some(Aim::Picked(p)) => export::no_original(store, &p),
         _ => None,
     };
     let import_off = move || picked().then_some("Edit the canvas to import SVG into it.");
@@ -334,15 +494,15 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
     ];
     let export = vec![dropdown(
         __scope,
-        "Copy and save the canvas as a picture, or import SVG",
+        "Copy and Save the Canvas as a Picture, or Import SVG",
         "pimble-ctb__export-button",
         export_open,
         export_face,
         export_rows,
     )];
 
-    // History: the canvas's, or the note's while its picture is merely
-    // selected (deleting or moving the picture is an edit of the text).
+    // History: the canvas's, or the note's while its canvas is merely
+    // selected (deleting or moving it is an edit of the text).
     let undo = move |redo: bool| {
         move || match now() {
             Some(Aim::Board(pane)) => tools::undo(store, pane, redo),
@@ -360,21 +520,22 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
         button(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", never, undo(true)),
     ];
 
-    let groups: Vec<NodeHandle> = vec![
-        group(__scope, GROUPS[0].0, in_text, writable, canvas),
-        group(__scope, GROUPS[1].0, always, opens, view),
-        group(__scope, GROUPS[2].0, always, writable, snap),
-        group(__scope, GROUPS[3].0, always, opens, people),
-        group(__scope, GROUPS[4].0, always, always, export),
-        group(__scope, GROUPS[5].0, always, writable, history),
-    ];
+    let mut groups: Vec<NodeHandle> = vec![group(__scope, GROUPS[0].0, canvas_shown, opens, canvas)];
+    groups.extend(selections);
+    groups.extend([
+        group(__scope, GROUPS[2].0, always, opens, view),
+        group(__scope, GROUPS[3].0, always, writable, snap),
+        group(__scope, GROUPS[4].0, always, opens, people),
+        group(__scope, GROUPS[5].0, always, always, export),
+        group(__scope, GROUPS[6].0, always, writable, history),
+    ]);
     rsx! {
         div {
             class: "pimble-toolbar pimble-ctb",
             // The canvas's letters keep working after a button here, as
             // they did after a press on the canvas's own chrome.
             onmousedown: move || {
-                let pane = untracked(focused);
+                let pane = untracked(|| store.focused_pane.get());
                 if untracked(|| store.pane(pane).show_board.get()) {
                     keys_to(store, pane, Keys::Chrome);
                 }
@@ -391,11 +552,28 @@ mod tests {
     #[test]
     fn the_groups_are_the_contracts() {
         let labels: Vec<&str> = GROUPS.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, ["Canvas", "View", "Snap", "People", "Export", "History"]);
+        assert_eq!(labels, ["Canvas", "Selection", "View", "Snap", "People", "Export", "History"]);
         // Read-only: View and Export (and the way of looking, People) stay
-        // live; Snap, History and Edit Canvas dim.
+        // live; Edit Canvas, the selection's controls, Snap and History dim.
         let live: Vec<&str> = GROUPS.iter().filter(|(_, live)| *live).map(|(l, _)| *l).collect();
         assert_eq!(live, ["View", "People", "Export"]);
+    }
+
+    /// No two exports of one canvas default to the same file name.
+    #[test]
+    fn every_export_has_its_own_file_name() {
+        let names = [
+            export::rendered_name("Trip", Format::Png, false),
+            export::rendered_name("Trip", Format::Jpeg, false),
+            export::rendered_name("Trip", Format::Svg, false),
+            export::rendered_name("Trip", Format::Png, true),
+            export::original_name("Trip", "png"),
+            export::original_name("Trip", "jpg"),
+        ];
+        let distinct: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
+        assert_eq!(names[0], "Trip.png");
+        assert_eq!(names[4], "Trip (original).png");
     }
 
     #[test]

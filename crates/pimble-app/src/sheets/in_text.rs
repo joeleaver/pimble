@@ -29,6 +29,13 @@ fn embedded_node(attrs: &Attrs) -> Option<(StoreId, NodeId)> {
     Some((url.store, url.node))
 }
 
+/// The sheet node an embed shows and the one table it shows, if it shows
+/// one (the toolbar's "Which toolbar": an embedded sheet node selected).
+pub(crate) fn embedded_sheet(attrs: &Attrs) -> Option<((StoreId, NodeId), Option<String>)> {
+    let node = embedded_node(attrs)?;
+    Some((node, attrs.get_str(embed_attrs::TABLE).filter(|t| !t.is_empty()).map(str::to_string)))
+}
+
 /// Insert > "Sheet" with no note to put it in.
 const NO_NOTE: &str = "Open a note to put a table in it.";
 

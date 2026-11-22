@@ -32,7 +32,7 @@
 //! * [`rail`]: the floating chrome (docs/DRAWING_CONTRACT.md section 4): the
 //!   tool rail, the context bar, the color well, the minimap corner, its keys;
 //! * [`toolbar`]: the main toolbar's canvas groups (view, snap, people,
-//!   export, history; docs/CANVAS_TOOLBAR_CONTRACT.md);
+//!   export, history; docs/TOOLBAR_CONTRACT.md);
 //! * [`layers`]: the layers panel, a tree of layers and groups;
 //! * [`nav`]: the navigator's own surface (the minimap in the corner);
 //! * [`export`]: Copy Picture, Save Picture As, Save Original As, Flatten.
@@ -75,6 +75,7 @@ use crate::state::{ActiveEdit, AppStore};
 
 pub(crate) use paint::shared_cache as shared_paint_cache;
 pub(crate) use tools::delete_selected;
+pub(crate) use rail::status_hint;
 pub(crate) use toolbar::render_canvas_toolbar;
 pub(crate) use ui::render_board;
 

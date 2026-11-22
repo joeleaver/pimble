@@ -2,7 +2,7 @@
 //! and 8; docs/DRAWING_CONTRACT.md section 4): the surface, filling the
 //! pane, and what floats over it: selection outlines and handles, the
 //! marquee, the text input, the attribution under the pointer, the markup
-//! control, and the canvas chrome (the tool rail, context bar, color well
+//! control, and the canvas chrome (the tool rail, color well
 //! and minimap corner of [`super::rail`], the panels: layers, meaning, frames).
 //! Rendered once per pane slot; everything that changes is a signal.
 
@@ -233,7 +233,6 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
     .collect();
 
     let rail = super::rail::render_rail(__scope, store, pane);
-    let context = super::rail::render_context_bar(__scope, store, pane);
     let well = super::rail::render_color_well(__scope, store, pane);
     let corner = super::rail::render_map_corner(__scope, store, pane);
     let panels = render_panels(__scope, store, pane);
@@ -463,7 +462,6 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                 div { class: "pimble-board__grow" }
                 div { style: {move || dim()}, onmouseenter: move || tools::pointer_off(store, pane), {well} }
             }
-            {context}
             div {
                 class: "pimble-board__right",
                 {panels}

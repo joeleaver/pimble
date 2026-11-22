@@ -120,7 +120,7 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
-/* The canvas's groups (boards/toolbar.rs, docs/CANVAS_TOOLBAR_CONTRACT.md):
+/* The canvas's groups (boards/toolbar.rs, docs/TOOLBAR_CONTRACT.md):
    the canvas zoom percentage as a button of its own width, and the
    dropdowns' rows. */
 .pimble-ctb__zoom-button {
@@ -146,6 +146,76 @@ pub(crate) const APP_CSS: &str = "
     display: flex;
     flex-direction: column;
     min-width: 200px;
+}
+
+/* One family (docs/TOOLBAR_CONTRACT.md, One family): the canvas and sheet
+   groups' buttons the size and colors of the text groups' (toolbar.rs
+   `btn_style`). */
+.pimble-toolbar .pimble-board-tool {
+    width: 30px;
+    height: 30px;
+    box-sizing: border-box;
+    color: var(--pimble-toolbar-icon);
+}
+.pimble-toolbar .pimble-board-tool--active {
+    border-color: var(--pimble-toolbar-active-border);
+    background: var(--pimble-toolbar-active-bg);
+    color: var(--pimble-toolbar-active-fg);
+}
+
+/* Edit Canvas, and Done while the canvas is being edited. */
+.pimble-ctb__edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 30px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    color: var(--pimble-toolbar-icon);
+    user-select: none;
+}
+.pimble-ctb__edit--done {
+    background: var(--rinch-primary-color-6);
+    border-color: var(--rinch-primary-color-6);
+    color: #ffffff;
+}
+.pimble-ctb__edit-label {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* The selection's group: the canvas's own controls in the toolbar, their
+   pickers under it, over the canvas. */
+.pimble-ctb__selection {
+    position: relative;
+}
+.pimble-toolbar .pimble-board__context {
+    padding: 0;
+    overflow: visible;
+    max-width: none;
+}
+.pimble-toolbar .pimble-board__context > .pimble-board__ctx-group {
+    margin-top: 0;
+}
+.pimble-toolbar .pimble-board__context .pimble-board-tool {
+    width: 30px;
+    height: 30px;
+}
+.pimble-ctb__popups {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    pointer-events: none;
+}
+.pimble-ctb__popups > div {
+    pointer-events: auto;
 }
 
 /* ── Presence (presence.rs; the chips and dots are pimble-ui's) ── */
@@ -1171,6 +1241,9 @@ pub(crate) const APP_CSS: &str = "
 .pimble-editor__toolbar-wrap {
     flex-shrink: 0;
     border-bottom: 1px solid var(--rinch-color-border);
+    /* The canvas selection's pickers open under the toolbar, over the panes. */
+    position: relative;
+    z-index: 20;
 }
 
 /* ── Discussions (docs/DISCUSSIONS_CONTRACT.md) ───────────────── */
@@ -2942,22 +3015,6 @@ pub(crate) const APP_CSS: &str = "
     font-size: 11px;
 }
 
-.pimble-board__top {
-    position: absolute;
-    top: 8px;
-    left: 56px;
-    right: 256px;
-    z-index: 6;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    pointer-events: none;
-}
-
-.pimble-board__top > div {
-    pointer-events: auto;
-}
-
 .pimble-board__context {
     display: flex;
     align-items: center;
@@ -3218,12 +3275,6 @@ pub(crate) const APP_CSS: &str = "
 .pimble-board--small .pimble-board__map {
     width: 140px;
     height: 88px;
-}
-
-/* A narrow pane: the context bar has the whole top, the panels and the
-   corner start below it. */
-.pimble-board--narrow .pimble-board__right {
-    top: 48px;
 }
 
 .pimble-board__panels {
@@ -4020,6 +4071,16 @@ pub(crate) const APP_CSS: &str = "
 
 /* A refusal the server sent back: not a broken connection, so it reads as a
    plain sentence rather than as the error badge. */
+/* The canvas tool in hand and what it does (docs/TOOLBAR_CONTRACT.md). */
+.pimble-status-bar__hint {
+    font-size: 11px;
+    margin-left: 8px;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .pimble-status-bar__notice {
     font-size: 11px;
     margin-left: 8px;

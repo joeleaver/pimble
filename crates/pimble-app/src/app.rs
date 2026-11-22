@@ -4842,6 +4842,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             {|| store.notice.get()}
                         }
 
+                        // The canvas tool in hand and what it does, while the
+                        // toolbar has nothing for it (docs/TOOLBAR_CONTRACT.md
+                        // "No floating bar").
+                        span {
+                            class: "pimble-status-bar__hint",
+                            style: {move || if crate::boards::status_hint(store).is_empty() { "display: none;" } else { "" }},
+                            {move || crate::boards::status_hint(store)}
+                        }
+
                         div { style: "flex: 1;", }
 
                         // The window's zoom while it is not actual size

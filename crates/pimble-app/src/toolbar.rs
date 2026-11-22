@@ -39,24 +39,96 @@ thread_local! {
     /// `None` for the default), and whether its caret is in a code block,
     /// which takes no color (docs/TEXT_COLOR_CONTRACT.md).
     static TEXT_COLOR: RefCell<Option<(Signal<Option<String>>, Signal<bool>)>> = const { RefCell::new(None) };
-    /// The canvas selected in the focused pane's text, if the selection is
-    /// exactly one (docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture").
-    static PICKED: RefCell<Option<Signal<Option<Picked>>>> = const { RefCell::new(None) };
+}
+
+/// What a pane's text has selected, as the toolbar reads it
+/// (docs/TOOLBAR_CONTRACT.md "Which toolbar"): written from the editor's own
+/// selection callback (`item_changed`), never polled.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Item {
+    /// A caret or a selection of text (a table's cells, a discussion or a
+    /// web picture in the text included).
+    #[default]
+    Text,
+    /// Exactly a canvas in the text: a picture, a canvas that began empty, or
+    /// an embedded canvas node.
+    Canvas(Picked),
+    /// Exactly a sheet in the text (a table of the note's, or an embedded
+    /// sheet node): the table it shows, when it shows one.
+    Sheet(Option<String>),
 }
 
 /// A canvas selected in a pane's text: the pane, the position before the
-/// picture, its `src` and its board (`data-board`, none before it has one).
+/// atom, its `src`, its board (`data-board`, none before it has one) and, for
+/// an embedded canvas node, that node.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Picked {
+pub struct Picked {
     pub pane: PaneId,
     pub pos: usize,
     pub src: String,
     pub board: Option<String>,
+    pub embed: Option<pimble_core::BoardUrl>,
 }
 
-/// The canvas selected in the focused pane's text, read reactively.
-pub(crate) fn picked() -> Option<Picked> {
-    PICKED.with(|p| *p.borrow()).filter(|s| s.is_alive()).and_then(|s| s.get())
+/// Pane `pane`'s selection was set or its text changed: what it selects is
+/// read again, a turn later (the editor is still busy with the change).
+pub(crate) fn item_changed(store: AppStore, pane: PaneId) {
+    run_on_main_thread(move || {
+        let item = crate::text_boards::selected_item(store, pane);
+        store.pane(pane).item.set_if_changed(item);
+    });
+}
+
+/// Which toolbar the main toolbar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Which {
+    /// The text groups: a note's caret or text selection, and every pane
+    /// with nothing of its own to act on (no document, a discussion, a
+    /// metanode), where they dim.
+    Text,
+    /// The canvas groups.
+    Canvas,
+    /// The sheet groups.
+    Sheet,
+}
+
+/// The one rule choosing the main toolbar (docs/TOOLBAR_CONTRACT.md "Which
+/// toolbar"): it shows the toolbar of what is selected in the focused pane.
+/// Read reactively; `pane_view` shows the one it names.
+pub(crate) fn which(store: AppStore) -> Which {
+    let pane = store.focused_pane.get();
+    let state = store.pane(pane);
+    if state.show_discussion.get() {
+        return Which::Text;
+    }
+    if state.show_board.get() {
+        return Which::Canvas;
+    }
+    if state.show_sheet.get() {
+        return Which::Sheet;
+    }
+    if state.show_metanode.get() || !state.show_editor.get() {
+        return Which::Text;
+    }
+    // A note: a cell of a sheet in its text being typed in or chosen, else
+    // what its editor's selection is.
+    let ui = state.sheet_ui;
+    if ui.editing.get().is_some() || ui.selected.get().is_some() {
+        return Which::Sheet;
+    }
+    match state.item.get() {
+        Item::Text => Which::Text,
+        Item::Canvas(_) => Which::Canvas,
+        Item::Sheet(_) => Which::Sheet,
+    }
+}
+
+/// The canvas selected in pane `pane`'s text, read reactively.
+pub(crate) fn picked(store: AppStore, pane: PaneId) -> Option<Picked> {
+    match store.pane(pane).item.get() {
+        Item::Canvas(p) => Some(p),
+        _ => None,
+    }
 }
 
 /// How often the watcher re-reads the editor state. Cursor moves fire no
@@ -79,10 +151,6 @@ pub(crate) fn bump_toolbar(pane: PaneId) {
 /// Store pane `pane`'s current active states in the buttons, notifying only
 /// the buttons that flipped.
 fn refresh_active_bits(pane: PaneId) {
-    if let Some(picked) = PICKED.with(|p| *p.borrow()).filter(|s| s.is_alive()) {
-        let now = crate::text_boards::selected_canvas(pane).map(|(pos, src, board)| Picked { pane, pos, src, board });
-        picked.set_if_changed(now);
-    }
     let signals = BUTTON_ACTIVE.with(|b| b.borrow().clone());
     if signals.is_empty() {
         return;
@@ -487,7 +555,6 @@ pub(crate) fn render_pimble_toolbar(
     IN_TABLE.with(|t| *t.borrow_mut() = Some(in_table));
     let text_color = (Signal::new(None::<String>), Signal::new(false));
     TEXT_COLOR.with(|t| *t.borrow_mut() = Some(text_color));
-    PICKED.with(|p| *p.borrow_mut() = Some(Signal::new(None)));
     // The buttons follow the focus: a click in another pane, or its editor
     // taking the keyboard, re-reads them from that pane's editor.
     let _ = rinch::Effect::new(move || {
@@ -677,6 +744,40 @@ mod tests {
 
     fn block_type(h: &EditorHandle) -> String {
         h.state().doc.child(0).type_name().to_string()
+    }
+
+    /// The one rule (docs/TOOLBAR_CONTRACT.md "Which toolbar"): the toolbar
+    /// of what the focused pane has selected.
+    #[test]
+    fn the_toolbar_follows_the_selected_item() {
+        let store = AppStore::new();
+        let pane = store.focused();
+        let state = store.pane(pane);
+        assert_eq!(which(store), Which::Text, "an empty pane: the text groups, dimmed");
+        state.show_editor.set(true);
+        assert_eq!(which(store), Which::Text, "a caret in a note");
+        let picked = Picked { pane, pos: 3, src: "pimble-blob:x".into(), board: None, embed: None };
+        state.item.set(Item::Canvas(picked.clone()));
+        assert_eq!(which(store), Which::Canvas, "a picture selected");
+        state.item.set(Item::Canvas(Picked { embed: Some(pimble_core::BoardUrl::new(pimble_core::StoreId::new(), pimble_core::NodeId::new())), ..picked }));
+        assert_eq!(which(store), Which::Canvas, "an embedded canvas selected");
+        state.item.set(Item::Sheet(Some("t1".into())));
+        assert_eq!(which(store), Which::Sheet, "a sheet in the text selected");
+        state.item.set(Item::Text);
+        state.sheet_ui.selected.set(Some(crate::sheets::CellKey { table: "t1".into(), row: None, col: "c".into() }));
+        assert_eq!(which(store), Which::Sheet, "a cell of a sheet in the text");
+        state.sheet_ui.selected.set(None);
+        state.show_board.set(true);
+        assert_eq!(which(store), Which::Canvas, "a canvas pane, or a canvas being edited");
+        state.show_board.set(false);
+        state.show_sheet.set(true);
+        assert_eq!(which(store), Which::Sheet, "a sheet pane");
+        state.show_sheet.set(false);
+        state.show_discussion.set(true);
+        assert_eq!(which(store), Which::Text, "a discussion pane: nothing of its own");
+        state.show_discussion.set(false);
+        state.show_metanode.set(true);
+        assert_eq!(which(store), Which::Text, "a metanode: nothing of its own");
     }
 
     /// A heading button is a toggle: pressed on its own heading it gives a plain

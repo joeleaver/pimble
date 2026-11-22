@@ -37,6 +37,9 @@ thread_local! {
     /// The press now bubbling up was inside an app component drawn in the
     /// text (a sheet's table): its inputs take the keyboard themselves.
     static PRESS_IN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The same, for the release: the desktop's editor keeps its presses
+    /// (a press in the text never reaches the pane), but not its releases.
+    static RELEASE_IN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A press inside something of the pane's with inputs of its own (a table in
@@ -45,6 +48,7 @@ thread_local! {
 /// inputs would hand the keyboard to the editor.
 pub(crate) fn press_in_view() {
     PRESS_IN_VIEW.with(|p| p.set(true));
+    RELEASE_IN_VIEW.with(|p| p.set(true));
 }
 
 /// What a split refused for want of room says.
@@ -464,6 +468,11 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                     crate::presence::follow::stop(pane);
                     focus_pane(store, pane);
                 }
+                // A click outside a table in the text ends its cell: the
+                // toolbar follows the click (docs/TOOLBAR_CONTRACT.md).
+                if !RELEASE_IN_VIEW.with(|p| p.replace(false)) {
+                    crate::sheets::pressed_outside(store, pane);
+                }
                 // A click on a board embedded in the text opens it; a
                 // double-click on a picture marks it up.
                 crate::text_boards::pane_mouseup(store, pane);
@@ -725,8 +734,7 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
     // toolbar"), and has nothing to act on while that pane holds no document
     // or one this device may only read.
-    // A canvas pane has its own groups (docs/CANVAS_TOOLBAR_CONTRACT.md),
-    // which take this toolbar's place, so a canvas never shows it.
+    // Which toolbar shows is `toolbar::which` (docs/TOOLBAR_CONTRACT.md).
     let usable = move || {
         let pane = store.focused_pane.get();
         store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get() && !editor_read_only(store, pane)
@@ -736,25 +744,11 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
         store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get() && pane_access(store, pane).allows_comment()
     };
     let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable, commentable);
-    // The sheet's own toolbar while it shows a sheet node (Joe, 2026-10-22).
+    // The main toolbar shows the toolbar of what is selected in the focused
+    // pane: one rule, `toolbar::which` (docs/TOOLBAR_CONTRACT.md).
     let sheet_toolbar = crate::sheets::toolbar::render_sheet_toolbar(__scope, store);
-    let sheet_focused = move || {
-        let pane = store.pane(store.focused_pane.get());
-        pane.show_sheet.get() && !pane.show_board.get() && !pane.show_discussion.get()
-    };
-    // The canvas's groups while it shows a canvas: a board node, or a
-    // picture in its text being marked up (back to the text's on Done).
     let canvas_toolbar = crate::boards::render_canvas_toolbar(__scope, store);
-    // And while the focused note's selection is exactly a canvas in its
-    // text (docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture").
-    let canvas_focused = move || {
-        let focused = store.focused_pane.get();
-        let pane = store.pane(focused);
-        if pane.show_discussion.get() {
-            return false;
-        }
-        pane.show_board.get() || (pane.show_editor.get() && !pane.show_sheet.get() && crate::toolbar::picked().is_some_and(|p| p.pane == focused))
-    };
+    let shows = move |which: crate::toolbar::Which| if crate::toolbar::which(store) == which { "" } else { "display: none;" };
     // The keyboard follows the pane focus, however it moved (a press in the
     // pane, a split, a close, the View menu): the focused pane's editor when
     // it holds a document, no editor when it holds none. Only a change of the
@@ -776,15 +770,15 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
             div {
                 class: "pimble-editor__toolbar-wrap",
                 div {
-                    style: {move || if sheet_focused() || canvas_focused() { "display: none;" } else { "" }},
+                    style: {move || shows(crate::toolbar::Which::Text)},
                     {toolbar}
                 }
                 div {
-                    style: {move || if canvas_focused() { "" } else { "display: none;" }},
+                    style: {move || shows(crate::toolbar::Which::Canvas)},
                     {canvas_toolbar}
                 }
                 div {
-                    style: {move || if sheet_focused() { "" } else { "display: none;" }},
+                    style: {move || shows(crate::toolbar::Which::Sheet)},
                     {sheet_toolbar}
                 }
             }

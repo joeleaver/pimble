@@ -165,8 +165,7 @@ fn save_scope(store: AppStore, scope: Option<Scope>, format: Format, all: bool, 
             }
         }
     };
-    let suffix = if all { " (all markup)" } else { "" };
-    let name = format!("{title}{suffix}.{}", format.extension());
+    let name = rendered_name(&title, format, all);
     save_bytes(store, &name, format.mime(), format.extension(), bytes);
 }
 
@@ -188,12 +187,28 @@ pub(super) fn save_original(store: AppStore, pane: PaneId) {
         crate::events::show_notice(store, "This picture has not arrived on this device yet.".to_string());
         return;
     };
+    save_original_bytes(store, title(store, pane), bytes);
+}
+
+/// Save a picture's bytes as stored, named "<title> (original)" with the
+/// extension its own format has, so it never takes a rendered export's name.
+fn save_original_bytes(store: AppStore, title: String, bytes: Vec<u8>) {
     let (mime, ext) = match pimble_core::ImageMime::sniff(&bytes) {
         Some(m) => (m.as_str(), m.as_str().trim_start_matches("image/").replace("jpeg", "jpg")),
         None => ("application/octet-stream", "bin".to_string()),
     };
-    let name = format!("{}.{ext}", title(store, pane));
-    save_bytes(store, &name, mime, &ext, bytes);
+    save_bytes(store, &original_name(&title, &ext), mime, &ext, bytes);
+}
+
+/// An original's file name.
+pub(super) fn original_name(title: &str, ext: &str) -> String {
+    format!("{title} (original).{ext}")
+}
+
+/// A rendered export's file name: what the canvas shows, or with all markup.
+pub(super) fn rendered_name(title: &str, format: Format, all: bool) -> String {
+    let suffix = if all { " (all markup)" } else { "" };
+    format!("{title}{suffix}.{}", format.extension())
 }
 
 /// Flatten into New Image: what the board shows, rendered once into a new
@@ -232,7 +247,7 @@ fn plant_flattened(store: AppStore, held: (StoreId, NodeId), picture: Rendered, 
     add_image_nodes(store, held.0, parent, vec![(Some(name), png)]);
 }
 
-// ── A canvas selected in a note's text (docs/CANVAS_TOOLBAR_CONTRACT.md
+// ── A canvas selected in a note's text (docs/TOOLBAR_CONTRACT.md
 // "Selected picture") ─────────────────────────────────────────────────────
 
 /// The note holding the selected canvas `picked`.
@@ -243,6 +258,10 @@ fn picked_host(store: AppStore, picked: &Picked) -> Option<(StoreId, NodeId)> {
 /// The selected canvas's board read whole: its markup board in the note, or
 /// (a picture not marked up yet) the board its markup would start as.
 pub(super) fn picked_raw(store: AppStore, picked: &Picked) -> Option<pimble_board::RawBoard> {
+    // An embedded canvas node: that node's board, as this window holds it.
+    if let Some(url) = &picked.embed {
+        return crate::text_boards::embed_raw(url);
+    }
     let (store_id, node_id) = picked_host(store, picked)?;
     if let Some(raw) = picked.board.as_deref().and_then(|b| crate::text_boards::raw_board(store_id, node_id, b)) {
         return Some(raw);
@@ -286,9 +305,44 @@ fn picked_scope(store: AppStore, picked: &Picked, all: bool) -> Result<Scope, &'
     if !pictures_ready(&snapshot) {
         return Err(NOT_ARRIVED);
     }
+    // An embed showing one frame: that frame, as a selected frame exports.
+    let frame = picked.embed.as_ref().and_then(|u| u.frame.as_deref()).and_then(|id| {
+        let e = snapshot.get(id).filter(|e| e.raw.kind == Kind::Frame)?;
+        let r = e.pivot_bounds;
+        Some(Rect::new(r.x + e.world.tx, r.y + e.world.ty, r.w * e.world.sx, r.h * e.world.sy))
+    });
+    let page_fill = snapshot.page.as_ref().map(|p| p.fill.unwrap_or(Color::WHITE));
+    if let Some(rect) = frame {
+        return Ok(Scope { snapshot, rect, only: None, trim: false, background: Some(page_fill.unwrap_or(Color::WHITE)) });
+    }
     let rect = snapshot.render_rect().ok_or(NOTHING_SHOWS)?;
-    let background = snapshot.page.as_ref().map(|p| p.fill.unwrap_or(Color::WHITE));
-    Ok(Scope { snapshot, rect, only: None, trim: background.is_none(), background })
+    Ok(Scope { snapshot, rect, only: None, trim: page_fill.is_none(), background: page_fill })
+}
+
+/// The name an export of the selected canvas starts from: an embedded canvas
+/// node's title, or the note's for a canvas of its own.
+fn picked_title(store: AppStore, picked: &Picked) -> String {
+    match &picked.embed {
+        Some(url) => title_of(store, Some((url.store, url.node))),
+        None => title_of(store, picked_host(store, picked)),
+    }
+}
+
+/// The picture the selected canvas is of, as a `src`: a picture's own, or
+/// the one picture an embedded canvas holds.
+fn picked_original(store: AppStore, picked: &Picked) -> Option<String> {
+    if picked.embed.is_none() {
+        return BlobUrl::parse(&picked.src).map(|_| picked.src.clone());
+    }
+    let raw = picked_raw(store, picked)?;
+    let mut pictures = raw.elements.iter().filter_map(|e| match &e.geom {
+        Geom::Picture(p) => Some(p.src.clone()),
+        _ => None,
+    });
+    match (pictures.next(), pictures.next()) {
+        (Some(src), None) => Some(src),
+        _ => None,
+    }
 }
 
 /// The selected canvas's scope, or `None` having said why.
@@ -312,33 +366,38 @@ pub(super) fn copy_picked(store: AppStore, picked: &Picked) {
 /// Save as PNG/JPEG/SVG (or with all markup), on the selected canvas.
 pub(super) fn save_picked(store: AppStore, picked: &Picked, format: Format, all: bool) {
     if let Some(scope) = picked_scope_said(store, picked, all) {
-        save_scope(store, Some(scope), format, all, title_of(store, picked_host(store, picked)));
+        save_scope(store, Some(scope), format, all, picked_title(store, picked));
     }
 }
 
 /// Why Save Original As... has nothing to save on the selected canvas, if
-/// it has nothing: a canvas that began empty holds no picture of its own.
-pub(super) fn no_original(picked: &Picked) -> Option<&'static str> {
-    BlobUrl::parse(&picked.src).is_none().then_some("This canvas began empty: there is no original picture to save.")
+/// it has nothing: a canvas that began empty holds no picture of its own,
+/// and an embedded canvas has one only when it holds exactly one.
+pub(super) fn no_original(store: AppStore, picked: &Picked) -> Option<&'static str> {
+    if picked_original(store, picked).is_some() {
+        return None;
+    }
+    Some(if picked.embed.is_some() {
+        "This canvas holds no single picture: open it and select one to save its original."
+    } else {
+        "This canvas began empty: there is no original picture to save."
+    })
 }
 
 /// Save Original As..., on the selected canvas: its picture's bytes as
 /// stored.
 pub(super) fn save_picked_original(store: AppStore, picked: &Picked) {
-    if let Some(why) = no_original(picked) {
-        crate::events::show_notice(store, why.to_string());
+    let Some(src) = picked_original(store, picked) else {
+        if let Some(why) = no_original(store, picked) {
+            crate::events::show_notice(store, why.to_string());
+        }
         return;
-    }
-    let Some(bytes) = picture_bytes(&picked.src) else {
+    };
+    let Some(bytes) = picture_bytes(&src) else {
         crate::events::show_notice(store, NOT_ARRIVED.to_string());
         return;
     };
-    let (mime, ext) = match pimble_core::ImageMime::sniff(&bytes) {
-        Some(m) => (m.as_str(), m.as_str().trim_start_matches("image/").replace("jpeg", "jpg")),
-        None => ("application/octet-stream", "bin".to_string()),
-    };
-    let name = format!("{}.{ext}", title_of(store, picked_host(store, picked)));
-    save_bytes(store, &name, mime, &ext, bytes);
+    save_original_bytes(store, picked_title(store, picked), bytes);
 }
 
 /// Flatten into New Canvas, on the selected canvas: a new canvas node beside
@@ -350,7 +409,9 @@ pub(super) fn flatten_picked(store: AppStore, picked: &Picked) {
         crate::events::show_notice(store, NOTHING_SHOWS.to_string());
         return;
     };
-    plant_flattened(store, held, picture, title_of(store, Some(held)));
+    // Beside the canvas node an embed shows, or beside the note.
+    let beside = picked.embed.as_ref().map(|u| (u.store, u.node)).unwrap_or(held);
+    plant_flattened(store, beside, picture, picked_title(store, picked));
 }
 
 /// Save `bytes` as a file the person names: a save dialog on the desktop, a

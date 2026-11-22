@@ -1579,6 +1579,25 @@ pub(crate) fn cancel(store: AppStore, pane: PaneId) {
     ui.choices.set(Vec::new());
 }
 
+/// A press in pane `pane` outside its tables (in its text, its strip): a
+/// cell of a table in its text stops being typed in (what was typed is
+/// written) and stops being chosen, so the toolbar follows the press to the
+/// text (docs/TOOLBAR_CONTRACT.md "Which toolbar"). A sheet node's pane keeps
+/// its cell.
+pub(crate) fn pressed_outside(store: AppStore, pane: PaneId) {
+    let state = store.pane(pane);
+    if untracked(|| state.show_sheet.get()) {
+        return;
+    }
+    let ui = state.sheet_ui;
+    if untracked(|| ui.editing.get()).is_some() {
+        commit(store, pane, Move::Stay);
+    }
+    if untracked(|| ui.selected.get()).is_some() {
+        ui.selected.set(None);
+    }
+}
+
 /// Write what was typed into the cell being edited, then move.
 pub(crate) fn commit(store: AppStore, pane: PaneId, mv: Move) {
     let ui = store.pane(pane).sheet_ui;

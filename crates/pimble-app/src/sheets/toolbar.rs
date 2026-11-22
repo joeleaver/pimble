@@ -51,6 +51,12 @@ fn aim_of(store: AppStore, pane: PaneId) -> Option<Aim> {
             return Some(Aim { table: table.clone(), cell: Some(cell) });
         }
     }
+    // A sheet selected in a note's text: the table it shows.
+    if let crate::toolbar::Item::Sheet(Some(id)) = store.pane(pane).item.get() {
+        if let Some(table) = tables.iter().find(|t| t.id == id) {
+            return Some(Aim { table: table.clone(), cell: None });
+        }
+    }
     let mut plain = tables.iter().filter(|t| !t.summary);
     match (plain.next(), plain.next()) {
         (Some(only), None) => Some(Aim { table: only.clone(), cell: None }),
@@ -71,18 +77,24 @@ fn button(
         div {
             title: tip,
             class: {move || if active() { "pimble-board-tool pimble-board-tool--active" } else { "pimble-board-tool" }},
-            style: {move || if enabled() { "" } else { "opacity: 0.35; pointer-events: none;" }},
+            style: {move || if enabled() { "" } else { "opacity: 0.4; pointer-events: none;" }},
             onclick: move || if enabled() { run() },
             IconGlyph { name: icon.name().to_string() }
         }
     }
 }
 
-fn group(__scope: &mut RenderScope, label: &'static str, writable: impl Fn() -> bool + Copy + 'static, buttons: Vec<NodeHandle>) -> NodeHandle {
+fn group(
+    __scope: &mut RenderScope,
+    label: &'static str,
+    shown: impl Fn() -> bool + Copy + 'static,
+    writable: impl Fn() -> bool + Copy + 'static,
+    buttons: Vec<NodeHandle>,
+) -> NodeHandle {
     rsx! {
         div {
             class: "pimble-toolbar__group",
-            style: {move || if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
+            style: {move || if !shown() { "display: none;" } else if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
             div { class: "pimble-toolbar__buttons", {buttons} }
             div { class: "pimble-toolbar__label", {label} }
         }
@@ -92,13 +104,12 @@ fn group(__scope: &mut RenderScope, label: &'static str, writable: impl Fn() -> 
 /// The toolbar, rendered once; it follows the focused pane.
 pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let focused = move || store.focused_pane.get();
+    // A sheet node, or the note whose text shows the sheet.
+    let in_text = move || !store.pane(focused()).show_sheet.get();
     let writable = move || {
-        let pane = focused();
-        store
-            .pane(pane)
-            .sheet
-            .get()
-            .is_some_and(|held| store.node_access_tracked(held.store_id, held.node_id).allows_write())
+        let state = store.pane(focused());
+        let held = if in_text() { state.active_edit.get() } else { state.sheet.get() };
+        held.is_some_and(|held| store.node_access_tracked(held.store_id, held.node_id).allows_write())
     };
     let aim = move || aim_of(store, focused());
     // Run `f` with the focused pane and its aim, when it has one.
@@ -213,11 +224,13 @@ pub(crate) fn render_sheet_toolbar(__scope: &mut RenderScope, store: AppStore) -
     ];
 
     let groups = vec![
-        group(__scope, "Sheet", writable, sheet),
-        group(__scope, "Row", writable, row),
-        group(__scope, "Column", writable, column),
-        group(__scope, "Table", writable, table),
-        group(__scope, "History", writable, history),
+        // In a note's text a new table goes in with Insert > Sheet, where
+        // the caret is; Add Table would put one nowhere in the text.
+        group(__scope, "Sheet", move || !in_text(), writable, sheet),
+        group(__scope, "Row", always, writable, row),
+        group(__scope, "Column", always, writable, column),
+        group(__scope, "Table", always, writable, table),
+        group(__scope, "History", always, writable, history),
     ];
     rsx! {
         div {

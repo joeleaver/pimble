@@ -1,12 +1,18 @@
 # Next session: start here
 
+**2026-11-21: the main toolbar follows the selected item, not committed or released**
+(docs/TOOLBAR_CONTRACT.md, the file renamed from CANVAS_TOOLBAR_CONTRACT.md). One rule
+(`toolbar::which`) over every pane and selection; embedded canvases get the canvas toolbar and
+export; Edit Canvas / Done is one button; the floating bar over canvases is gone (its controls
+are the toolbar's contextual group, the tool hint is in the status bar).
+
 **2026-11-21: the canvas toolbar for a selected picture built, not committed or released**
-(docs/CANVAS_TOOLBAR_CONTRACT.md "Selected picture"): a picture selected in a note shows the
+(docs/TOOLBAR_CONTRACT.md "Selected picture"): a picture selected in a note shows the
 canvas groups (a new Canvas group with Edit Canvas; Export on the picture directly; View and
 People open the canvas first; History is the note's until it opens).
 
 **2026-11-21: the canvas toolbar built, not committed or released**
-(docs/CANVAS_TOOLBAR_CONTRACT.md "Built"). A focused canvas (or a picture in text being marked
+(docs/TOOLBAR_CONTRACT.md "Built"). A focused canvas (or a picture in text being marked
 up) swaps the text toolbar for View / Snap / People / Export / History (`boards/toolbar.rs`);
 the bottom-right strip is gone (the minimap stays there, toggled from View), undo and redo left
 the floating bar. Not walked: a read-only canvas, and Ctrl+wheel moving the percentage (the

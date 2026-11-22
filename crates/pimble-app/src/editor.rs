@@ -206,6 +206,9 @@ pub(crate) fn start_editing(
         crate::link_picker::key(store, &editor(pane), key.key, modified)
     });
     handle.on_selection_change(move |_| {
+        // What the selection is decides the main toolbar
+        // (docs/TOOLBAR_CONTRACT.md "Which toolbar").
+        crate::toolbar::item_changed(store, pane);
         if store.focused() == pane {
             crate::link_picker::selection_changed(store, &editor(pane));
         }

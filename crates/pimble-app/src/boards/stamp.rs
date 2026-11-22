@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use pimble_board::scatter::{self, FillMethod, Jitter, Placement as Placed, RegionFill, Stamp, StampWalker};
 
 use super::*;
+use crate::appearance::IconGlyph;
 
 /// The Stamp's settings, one set for the window like every tool's.
 #[derive(Clone, Copy)]
@@ -442,11 +443,16 @@ pub(super) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
             span { class: "pimble-board__face-text", {move || shown_symbol().map(|r| r.name).unwrap_or_else(|| "No symbol".to_string())} }
         }
     };
-    let symbol_btn = rail::picker_button(__scope, ui, "Symbol: the one the Stamp places (a selected scatter's changes to it)", Popup::Symbol, "pimble-board__chooser--symbol", face);
-    let settings_face = rsx! {
-        span { class: "pimble-board__face-text", {move || format!("Every {:.1}× · ±{:.0}%", st.spacing.get(), st.size_jitter.get() * 100.0)} }
-    };
-    let settings_btn = rail::picker_button(__scope, ui, "Stamp: spacing, scatter, size, jitter, tint", Popup::Stamp, "pimble-board__chooser--stamp", settings_face);
+    let symbol_btn = rail::picker_button(__scope, ui, || "Symbol: the one the Stamp places (a selected scatter's changes to it)".to_string(), Popup::Symbol, "pimble-board__chooser--symbol", face);
+    let settings_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: rinch_tabler_icons::TablerIcon::Adjustments.name().to_string() } } };
+    let settings_btn = rail::picker_button(
+        __scope,
+        ui,
+        move || format!("Stamp: one every {:.1}× its size, size varies ±{:.0}% (spacing, scatter, size, jitter, tint)", st.spacing.get(), st.size_jitter.get() * 100.0),
+        Popup::Stamp,
+        "",
+        settings_face,
+    );
     let bar = rsx! {
         div { class: "pimble-board__ctx-group",
             {symbol_btn}

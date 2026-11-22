@@ -331,7 +331,8 @@ pub const SIDES: [u32; 7] = [3, 4, 5, 6, 8, 10, 12];
 pub const MITERS: [f32; 5] = [1.0, 2.0, 4.0, 8.0, 10.0];
 pub const STAR_POINTS: [u32; 6] = [4, 5, 6, 7, 8, 12];
 
-/// What the context bar says when the tool has nothing to set.
+/// What the tool in hand does, said in the status bar while a canvas is
+/// being edited.
 pub fn hint(tool: Tool) -> &'static str {
     match tool {
         Tool::Select => "Click to select, drag to select several",
@@ -344,7 +345,19 @@ pub fn hint(tool: Tool) -> &'static str {
         Tool::Stamp => "Drag to place the symbol along the way",
         Tool::SelectRect => "Drag over paint to select it, then move, scale or turn it",
         Tool::SelectLasso => "Draw round paint to select it, then move, scale or turn it",
-        _ => "",
+        Tool::Pen => "Click to place points, drag to curve them; Enter or Escape finishes the path",
+        Tool::Pencil => "Drag to draw; the stroke becomes a smooth path",
+        Tool::Brush => "Drag to paint ([ and ] change the size)",
+        Tool::Highlighter => "Drag over what to highlight",
+        Tool::Line | Tool::Arrow => "Drag from one end to the other",
+        Tool::Rect | Tool::Ellipse | Tool::Diamond | Tool::Polygon | Tool::Star => "Drag to draw one, or click for one at its usual size",
+        Tool::Text => "Click where the text goes, then type",
+        Tool::Step => "Click to place the next number",
+        Tool::Sticky => "Click to place a sticky note",
+        Tool::Connector => "Drag from one element to another; it follows them when they move",
+        Tool::Fill => "Click paint to fill what matches the color there",
+        Tool::Smudge => "Drag to smear the paint",
+        Tool::Blur => "Drag to soften the paint",
     }
 }
 
@@ -598,12 +611,12 @@ fn icon_button(__scope: &mut RenderScope, icon: TablerIcon, tip: String, active:
 ///
 /// `size` is a class giving a face of words its width ("" for an icon's):
 /// the button does not grow with its face.
-pub(super) fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: &'static str, popup: Popup, size: &'static str, face: NodeHandle) -> NodeHandle {
+pub(super) fn picker_button(__scope: &mut RenderScope, ui: PaneUi, tip: impl Fn() -> String + Copy + 'static, popup: Popup, size: &'static str, face: NodeHandle) -> NodeHandle {
     let class = format!("pimble-board-tool pimble-board__chooser {size}");
     let active = format!("{class} pimble-board-tool--active");
     rsx! {
         div {
-            title: tip,
+            title: {move || tip()},
             class: {move || if ui.popup.get() == popup { active.clone() } else { class.clone() }},
             onclick: move || toggle(ui, popup),
             {face}
@@ -752,7 +765,57 @@ fn render_flyout(__scope: &mut RenderScope, store: AppStore, pane: PaneId, index
 
 /// The context bar: the tool's options, or the selection's, then the
 /// selection's arrangement, then undo and redo.
-pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
+/// What pane `pane`'s canvas offers controls for: the selection's kinds, or
+/// with nothing selected the tool in hand (read reactively).
+pub(super) fn context_controls(store: AppStore, pane: PaneId) -> Controls {
+    let ui = store.pane(pane).board_ui;
+    if ui.selected.get() > 0 {
+        controls_for(&ui.selected_kinds.get())
+    } else {
+        controls_of_tool(store.board_tool.get())
+    }
+}
+
+/// The name of what pane `pane`'s canvas has selected ("Rectangle", "3
+/// Selected"), or of the tool in hand when nothing is: the contextual
+/// group's label (read reactively).
+pub(super) fn context_label(store: AppStore, pane: PaneId) -> String {
+    let ui = store.pane(pane).board_ui;
+    let n = ui.selected.get();
+    if n == 1 {
+        ui.selected_kinds.get().first().map(|k| kind_word(k).to_string()).unwrap_or_default()
+    } else if n > 1 {
+        format!("{n} Selected")
+    } else {
+        store.board_tool.get().name().to_string()
+    }
+}
+
+/// Whether the contextual group shows: something is selected, or the tool
+/// in hand has settings.
+pub(super) fn context_shown(store: AppStore, pane: PaneId) -> bool {
+    store.pane(pane).board_ui.selected.get() > 0 || context_controls(store, pane).any()
+}
+
+/// The status bar's word on the tool in hand while a canvas is focused (a
+/// canvas pane, or a canvas being edited over its note): its name and what
+/// it does ("Select: click to select, drag to select several").
+pub(crate) fn status_hint(store: AppStore) -> String {
+    let pane = store.focused_pane.get();
+    if !store.pane(pane).show_board.get() {
+        return String::new();
+    }
+    let tool = store.board_tool.get();
+    match hint(tool) {
+        "" => String::new(),
+        h => format!("{}: {}{}", tool.name(), h[..1].to_lowercase(), &h[1..]),
+    }
+}
+
+/// What the canvas offers for what is selected in pane `pane`'s canvas (or,
+/// with nothing selected, for the tool in hand): the controls, for the main
+/// toolbar's contextual group, and their pickers, which open under it.
+pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> (NodeHandle, NodeHandle) {
     let st = store.board_style;
     let state = store.pane(pane);
     let ui = state.board_ui;
@@ -1076,20 +1139,40 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             })
         })
         .collect();
+    let glyph = |__scope: &mut RenderScope, icon: TablerIcon| rsx! { span { class: "pimble-board__face", IconGlyph { name: icon.name().to_string() } } };
     let shape_face = rsx! {
         div { class: "pimble-board__face-wrap",
-            span { class: "pimble-board__face-text", style: {move || shown(controls().radius)}, {move || format!("r {}", st.radius.get().round())} }
-            span { class: "pimble-board__face-text", style: {move || shown(controls().sides)}, {move || format!("{} sides", st.sides.get())} }
-            span { class: "pimble-board__face-text", style: {move || shown(controls().star)}, {move || format!("{} pts", st.points.get())} }
+            span { class: "pimble-board__face", style: {move || shown(controls().radius)}, IconGlyph { name: TablerIcon::BorderRadius.name().to_string() } }
+            span { class: "pimble-board__face", style: {move || shown(controls().sides)}, IconGlyph { name: TablerIcon::Polygon.name().to_string() } }
+            span { class: "pimble-board__face", style: {move || shown(controls().star)}, IconGlyph { name: TablerIcon::Star.name().to_string() } }
         }
     };
     let detail_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: TablerIcon::BorderCornerRounded.name().to_string() } } };
     let smoothing_face = rsx! {
         span { class: "pimble-board__face-text", {move || { let v = st.smoothing.get(); SMOOTHING.iter().find(|(_, s)| *s == v).map(|(l, _)| l.to_string()).unwrap_or_default() }} }
     };
-    let shape_btn = picker_button(__scope, ui, "Shape: corner radius, sides, points", Popup::Shape, "pimble-board__chooser--words", shape_face);
-    let detail_btn = picker_button(__scope, ui, "Stroke ends, corners and dashes, fill rule", Popup::Detail, "", detail_face);
-    let smoothing_btn = picker_button(__scope, ui, "Smoothing", Popup::Smoothing, "pimble-board__chooser--words", smoothing_face);
+    let shape_btn = picker_button(
+        __scope,
+        ui,
+        move || {
+            let c = controls();
+            if c.radius {
+                format!("Corner radius: {}", st.radius.get().round())
+            } else if c.sides {
+                format!("Sides: {}", st.sides.get())
+            } else {
+                format!("Points: {}, inner {}%", st.points.get(), (st.inner.get() * 100.0).round())
+            }
+        },
+        Popup::Shape,
+        "",
+        shape_face,
+    );
+    let detail_btn = picker_button(__scope, ui, || "Stroke ends, corners and dashes, fill rule".to_string(), Popup::Detail, "", detail_face);
+    let smoothing_btn = picker_button(__scope, ui, move || {
+        let v = st.smoothing.get();
+        format!("Smoothing: {}", SMOOTHING.iter().find(|(_, s)| *s == v).map(|(l, _)| *l).unwrap_or("custom"))
+    }, Popup::Smoothing, "pimble-board__chooser--words", smoothing_face);
 
     // A paint tool's: the color it paints with (the color well's front
     // square), its preset, size, opacity, flow and hardness.
@@ -1114,15 +1197,18 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     let preset_face = rsx! {
         span { class: "pimble-board__face-text", {move || paint::current_preset(store).map(|p| p.label).unwrap_or("")} }
     };
-    let size_face = rsx! { span { class: "pimble-board__face-text", {move || size_label(setting(|s| s.size))} } };
-    let brush_opacity_face = rsx! { span { class: "pimble-board__face-text", {move || format!("{}%", (setting(|s| s.opacity) * 100.0).round())} } };
-    let flow_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Flow {}%", (setting(|s| s.flow) * 100.0).round())} } };
-    let hardness_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Hard {}%", (setting(|s| s.hardness) * 100.0).round())} } };
-    let preset_btn = picker_button(__scope, ui, "Brush preset", Popup::Preset, "pimble-board__chooser--words", preset_face);
-    let size_btn = picker_button(__scope, ui, "Size ([ and ] change it)", Popup::BrushSize, "pimble-board__chooser--number", size_face);
-    let brush_opacity_btn = picker_button(__scope, ui, "Opacity of the stroke", Popup::BrushOpacity, "pimble-board__chooser--number", brush_opacity_face);
-    let flow_btn = picker_button(__scope, ui, "Flow: how much paint each dab lays down", Popup::Flow, "pimble-board__chooser--words", flow_face);
-    let hardness_btn = picker_button(__scope, ui, "Hardness of the brush's edge", Popup::Hardness, "pimble-board__chooser--words", hardness_face);
+    // A dot as big as the brush (capped), as the width picker shows a width.
+    let size_face = rsx! {
+        div { class: "pimble-board-width", style: {move || { let d = (setting(|s| s.size) * 0.6 + 3.0).min(18.0).round(); format!("width: {d}px; height: {d}px;") }} }
+    };
+    let brush_opacity_face = glyph(__scope, TablerIcon::DropletHalf2);
+    let flow_face = rsx! { span { class: "pimble-board__face-text", "Flow" } };
+    let hardness_face = rsx! { span { class: "pimble-board__face-text", "Hardness" } };
+    let preset_btn = picker_button(__scope, ui, || "Brush preset".to_string(), Popup::Preset, "pimble-board__chooser--words", preset_face);
+    let size_btn = picker_button(__scope, ui, move || format!("Brush size: {} ([ and ] change it)", size_label(setting(|s| s.size))), Popup::BrushSize, "", size_face);
+    let brush_opacity_btn = picker_button(__scope, ui, move || format!("Opacity of the stroke: {}%", (setting(|s| s.opacity) * 100.0).round()), Popup::BrushOpacity, "", brush_opacity_face);
+    let flow_btn = picker_button(__scope, ui, move || format!("Flow: {}% (how much paint each dab lays down)", (setting(|s| s.flow) * 100.0).round()), Popup::Flow, "pimble-board__chooser--words", flow_face);
+    let hardness_btn = picker_button(__scope, ui, move || format!("Hardness of the brush's edge: {}%", (setting(|s| s.hardness) * 100.0).round()), Popup::Hardness, "pimble-board__chooser--long", hardness_face);
     // The size slider is logarithmic: fine steps where brushes are small.
     let size_row = paint_slider(__scope, store, 0, "Size", (0.0, 1.0, 0.005), |s| size_to_slider(s.size), |s, v| s.size = slider_to_size(v), |s| size_label(s.size));
     let brush_opacity_row = paint_slider(__scope, store, 1, "Opacity", (0.05, 1.0, 0.05), |s| s.opacity as f64, |s, v| s.opacity = v as f32, |s| format!("{}%", (s.opacity * 100.0).round()));
@@ -1157,12 +1243,12 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             })
         })
         .collect();
-    let tolerance_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Tol {}", paint::choice_label(&paint::TOLERANCES, st.tolerance.get()))} } };
+    let tolerance_face = rsx! { span { class: "pimble-board__face-text", "Tolerance" } };
     let fill_mode_face = rsx! { span { class: "pimble-board__face-text", {move || if st.contiguous.get() { "Contiguous" } else { "Everywhere" }} } };
-    let strength_face = rsx! { span { class: "pimble-board__face-text", {move || format!("Strength {}", paint::choice_label(&paint::STRENGTHS, st.strength.get()))} } };
-    let tolerance_btn = picker_button(__scope, ui, "Tolerance", Popup::Tolerance, "pimble-board__chooser--long", tolerance_face);
-    let fill_mode_btn = picker_button(__scope, ui, "Contiguous or everywhere", Popup::FillMode, "pimble-board__chooser--long", fill_mode_face);
-    let strength_btn = picker_button(__scope, ui, "Strength", Popup::Strength, "pimble-board__chooser--long", strength_face);
+    let strength_face = rsx! { span { class: "pimble-board__face-text", "Strength" } };
+    let tolerance_btn = picker_button(__scope, ui, move || format!("Tolerance: {} (how far a color may be from the one clicked)", paint::choice_label(&paint::TOLERANCES, st.tolerance.get())), Popup::Tolerance, "pimble-board__chooser--long", tolerance_face);
+    let fill_mode_btn = picker_button(__scope, ui, move || format!("Fill {}: what touches the pixel clicked, or every matching pixel", if st.contiguous.get() { "contiguous" } else { "everywhere" }), Popup::FillMode, "pimble-board__chooser--long", fill_mode_face);
+    let strength_btn = picker_button(__scope, ui, move || format!("Strength: {}", paint::choice_label(&paint::STRENGTHS, st.strength.get())), Popup::Strength, "pimble-board__chooser--long", strength_face);
 
     // The selection's arrangement.
     let act = |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| icon_button(__scope, icon, tip.to_string(), || false, move || run(store, pane));
@@ -1181,7 +1267,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
     .map(|(op, icon, label)| menu_item(__scope, store, pane, icon, label, Box::new(move |s, p| tools::combine(s, p, op))))
     .collect();
     let combine_face = rsx! { span { class: "pimble-board__face", IconGlyph { name: TablerIcon::LayersUnion.name().to_string() } } };
-    let combine_btn = picker_button(__scope, ui, "Combine: union, subtract, intersect, exclude", Popup::Combine, "", combine_face);
+    let combine_btn = picker_button(__scope, ui, || "Combine: union, subtract, intersect, exclude".to_string(), Popup::Combine, "", combine_face);
     let arrange_btn = icon_button(__scope, TablerIcon::Dots, "More: forward, backward, front, back, flip, outline stroke".to_string(), move || ui.popup.get() == Popup::Arrange, move || toggle(ui, Popup::Arrange));
     let align_btn = icon_button(__scope, TablerIcon::LayoutAlignCenter, "Align and distribute".to_string(), move || ui.popup.get() == Popup::Align, move || toggle(ui, Popup::Align));
 
@@ -1222,40 +1308,37 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         (TablerIcon::AlignCenter, Box::new(move || st.align.get() == Align::Center)),
         (TablerIcon::AlignRight, Box::new(move || st.align.get() == Align::Right)),
     ]);
-    let font_face = rsx! {
-        span {
-            class: "pimble-board__face-text",
-            style: {move || format!(
-                "font-weight: {}; font-style: {}; font-family: {};",
-                if st.bold.get() { 700 } else { 400 },
-                if st.italic.get() { "italic" } else { "normal" },
-                if st.font.get() == pimble_board::FontFamily::Serif { "serif" } else { "inherit" },
-            )},
-            {move || {
-                let size = st.font_size.get();
-                let size = FONT_SIZES.iter().find(|(_, s)| *s == size).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{size}"));
-                match st.font.get() {
-                    pimble_board::FontFamily::Sans => format!("{size} Aa"),
-                    pimble_board::FontFamily::Serif => format!("{size} Serif"),
-                    pimble_board::FontFamily::Condensed => format!("{size} Cond"),
-                }
-            }}
-        }
-    };
-    let opacity_face = rsx! {
-        span { class: "pimble-board__face-text", {move || {
-            // A soft edge shows as a ring after the percentage.
-            let soft = if controls().feather && st.feather.get() > 0.0 { " ◌" } else { "" };
-            format!("{}%{soft}", (st.opacity.get() * 100.0).round())
-        }} }
-    };
+    let font_face = glyph(__scope, TablerIcon::TextSize);
+    let opacity_face = glyph(__scope, TablerIcon::DropletHalf2);
     let feather_slider = super::ui::soft_signal(store);
-    let width_btn = picker_button(__scope, ui, "Width", Popup::Width, "", width_face);
-    let dash_btn = picker_button(__scope, ui, "Line style", Popup::Dash, "", dash_face);
-    let heads_btn = picker_button(__scope, ui, "Arrow heads", Popup::Heads, "", heads_face);
-    let font_btn = picker_button(__scope, ui, "Text: size, font, spacing, halo", Popup::Font, "pimble-board__chooser--words", font_face);
-    let align_text_btn = picker_button(__scope, ui, "Text alignment", Popup::TextAlign, "", align_face);
-    let opacity_btn = picker_button(__scope, ui, "Opacity and feather (a soft edge)", Popup::Opacity, "pimble-board__chooser--number", opacity_face);
+    let width_btn = picker_button(__scope, ui, move || format!("Line width: {}", st.width.get()), Popup::Width, "", width_face);
+    let dash_btn = picker_button(__scope, ui, || "Line style".to_string(), Popup::Dash, "", dash_face);
+    let heads_btn = picker_button(__scope, ui, || "Arrow heads".to_string(), Popup::Heads, "", heads_face);
+    let font_btn = picker_button(
+        __scope,
+        ui,
+        move || {
+            let size = st.font_size.get();
+            let size = FONT_SIZES.iter().find(|(_, s)| *s == size).map(|(l, _)| l.to_string()).unwrap_or_else(|| format!("{size}"));
+            let style = [st.bold.get().then_some("bold"), st.italic.get().then_some("italic")].into_iter().flatten().collect::<Vec<_>>().join(" ");
+            format!("Text: size {size}, {}{}{} (size, font, spacing, halo)", st.font.get().label(), if style.is_empty() { "" } else { ", " }, style)
+        },
+        Popup::Font,
+        "",
+        font_face,
+    );
+    let align_text_btn = picker_button(__scope, ui, || "Text alignment".to_string(), Popup::TextAlign, "", align_face);
+    let opacity_btn = picker_button(
+        __scope,
+        ui,
+        move || {
+            let feather = if controls().feather && st.feather.get() > 0.0 { format!(", feather {}", soft_label(st.feather.get())) } else { String::new() };
+            format!("Opacity: {}%{feather} (and feather, a soft edge)", (st.opacity.get() * 100.0).round())
+        },
+        Popup::Opacity,
+        "",
+        opacity_face,
+    );
     let more_items: Vec<NodeHandle> = vec![
         menu_item(__scope, store, pane, TablerIcon::ChevronUp, "Bring Forward (Ctrl+])", Box::new(|s, p| tools::reorder(s, p, Order::Forward))),
         menu_item(__scope, store, pane, TablerIcon::ChevronDown, "Send Backward (Ctrl+[)", Box::new(|s, p| tools::reorder(s, p, Order::Backward))),
@@ -1278,53 +1361,15 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             .is_some_and(|held| store.node_access_tracked(held.store_id, held.node_id).allows_write())
     };
 
-    rsx! {
+    // The controls go in the main toolbar, as its group for what is
+    // selected (docs/TOOLBAR_CONTRACT.md "No floating bar"); their pickers
+    // open under it, over the canvas.
+    let _ = (label, writable);
+    let controls_row = rsx! {
         div {
-            class: "pimble-board__top",
-            style: {move || match (super::ui::narrow_or_small(store, pane).0, ui.panels_hidden.get()) {
-                (true, _) => "right: 8px;",
-                (false, true) => "right: 56px;",
-                _ => "",
-            }},
-            div {
-                class: "pimble-float pimble-board__context",
-                onmouseenter: move || tools::pointer_off(store, pane),
-                onmousedown: move || {
-                    crate::pane_view::press_in_view();
-                    keys_to(store, pane, Keys::Chrome);
-                },
-                // Marking up a picture in text (docs/IMAGE_MARKUP_CONTRACT.md
-                // section 2): "Done" goes back to the text.
+            class: "pimble-toolbar__buttons pimble-board__context",
                 div {
                     class: "pimble-board__ctx-group",
-                    style: {move || shown(state.markup.get())},
-                    Button {
-                        size: "xs",
-                        onclick: move || end_markup(store, pane),
-                        "Done"
-                    }
-                }
-                // Editing a symbol (docs/DRAWING_WAVE6_CONTRACT.md section
-                // 2): "Done" goes back to the canvas.
-                div {
-                    class: "pimble-board__ctx-group",
-                    style: {move || shown(ui.editing_symbol.get().is_some())},
-                    span { class: "pimble-board__ctx-label", {move || ui.editing_symbol.get().map(|n| format!("Symbol \"{n}\"")).unwrap_or_default()} }
-                    Button {
-                        size: "xs",
-                        onclick: move || super::stamp::done(store, pane),
-                        "Done"
-                    }
-                }
-                div {
-                    class: "pimble-board__ctx-group",
-                    style: {move || if writable() { "" } else { "opacity: 0.45; pointer-events: none;" }},
-                    div { class: "pimble-board__ctx-label", {move || label()} }
-                    div {
-                        class: "pimble-board__ctx-hint",
-                        style: {move || shown(ui.selected.get() == 0 && !controls().any() && !hint(store.board_tool.get()).is_empty())},
-                        {move || hint(store.board_tool.get())}
-                    }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().stroke)}, {stroke_swatch} }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().fill)}, {fill_swatch} }
                     div { class: "pimble-board__ctx-group", style: {move || shown(controls().color)}, {brush_swatch} }
@@ -1360,6 +1405,12 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                     }
                 }
             }
+    };
+    let popups = rsx! {
+        div {
+            class: "pimble-ctb__popups",
+            onmouseenter: move || tools::pointer_off(store, pane),
+            onmousedown: move || keys_to(store, pane, Keys::Chrome),
             div {
                 class: "pimble-float pimble-board__menu",
                 style: {move || shown(ui.popup.get() == Popup::Arrange)},
@@ -1505,7 +1556,8 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Strength)}, {strengths} }
             {stamp_popups}
         }
-    }
+    };
+    (controls_row, popups)
 }
 
 /// A slider's value mirrored from the style (slot `slot`: 0 the corner
@@ -1840,7 +1892,7 @@ pub(super) fn render_color_well(__scope: &mut RenderScope, store: AppStore, pane
 }
 
 /// The minimap in the bottom-right corner, shown while the toolbar's View
-/// group says so (docs/CANVAS_TOOLBAR_CONTRACT.md: its zoom, grid, snap,
+/// group says so (docs/TOOLBAR_CONTRACT.md: its zoom, grid, snap,
 /// people and export controls are the main toolbar's now).
 pub(super) fn render_map_corner(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
     let st = store.board_style;
@@ -1917,6 +1969,14 @@ mod tests {
         assert_eq!(flyout_of(Tool::Arrow), Some(0));
         assert_eq!(flyout_of(Tool::Text), None);
         assert_eq!(flyout_of(Tool::Eraser), None);
+    }
+
+    /// The status bar says what every tool does while a canvas is edited.
+    #[test]
+    fn every_tool_says_what_it_does() {
+        for tool in Tool::ALL {
+            assert!(!hint(tool).is_empty(), "{tool:?}");
+        }
     }
 
     #[test]
