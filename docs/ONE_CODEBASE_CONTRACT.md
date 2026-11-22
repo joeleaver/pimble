@@ -194,6 +194,21 @@ would be its own device to the reports, and each would sync the same stores twic
   reconnect, exactly as the desktop app reconnects when the embedded server it borrowed goes
   away (`local.rs`, "hand it back and forth"). A store-folder `computers/` entry is not
   needed: it is one server at a time.
+- **When the leader tab closes** (Joe asked, 2026-11-22), nothing it acknowledged is lost:
+  - The other tabs' edits live in their own editors' documents; on reconnect each
+    reconciles with the new server (the desktop's reconnect path, `doc_session`), sending
+    what it lacks.
+  - The browser's server writes every update it takes to disk before it answers: appended
+    to a per-document log in OPFS (synchronous access handles make that a few
+    milliseconds), the debounced whole-document write compacting the log. A tab closed or
+    killed inside the debounce loses nothing acknowledged. (The desktop's crash window, wave
+    0's cursor bug, is the same class; whether the desktop adopts the log too is decided
+    with wave 0.)
+  - What the link still owes the cloud is in its state on disk; the next server sends it.
+  - The gap is a second or two (loading the worker, opening the stores); editors keep
+    taking edits meanwhile and hand them over on reconnect.
+  - With the last tab closed nothing runs, as with the desktop app quit; the next open
+    syncs from where it stopped.
 
 The worker holds the account's keys, not the page: signing in and unlocking go to the
 server as the desktop's `cloudSignIn` does, and no key crosses into the page.
