@@ -34,6 +34,10 @@ pub struct ViewOptions {
     /// The symbol being edited (docs/DRAWING_WAVE6_CONTRACT.md section 2):
     /// the board is seen as that symbol's elements alone, in symbol space.
     pub editing_symbol: Option<String>,
+    /// Drawn over a dark background (the app's dark theme): measurement
+    /// labels (docs/MEASURE_CONTRACT.md section 5) that name no color of
+    /// their own read light over a dark halo. Exports leave it off.
+    pub dark: bool,
 }
 
 /// The color of elements nobody is stamped on, when coloring by author.

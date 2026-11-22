@@ -36,6 +36,9 @@
 //! * [`layers`]: the layers panel, a tree of layers and groups;
 //! * [`nav`]: the navigator's own surface (the minimap in the corner);
 //! * [`export`]: Copy Picture, Save Picture As, Save Original As, Flatten.
+//! * [`measure`]: the canvas's scale and the Scale panel, the Measure tool's
+//!   ends, live readouts, typed sizes, the selection's measures
+//!   (docs/MEASURE_CONTRACT.md).
 //!
 //! Pictures on a board come from the same blob cache text pictures do
 //! (`GetBlob`/`BlobLoaded`), decoded off the UI thread on the desktop.
@@ -43,6 +46,7 @@
 mod export;
 mod gradient;
 mod layers;
+mod measure;
 mod nav;
 mod paint;
 mod paint_select;
@@ -133,11 +137,14 @@ pub enum Tool {
     /// A discussion at a point (docs/DISCUSSIONS_CONTRACT.md section 6): a
     /// pin, which is not a board element.
     Pin,
+    /// Dimensions (docs/MEASURE_CONTRACT.md section 5): drag between two
+    /// points to measure them; needs a scale.
+    Measure,
 }
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 28] = [
+    pub const ALL: [Tool; 29] = [
         Tool::Select,
         Tool::DirectSelect,
         Tool::Hand,
@@ -166,6 +173,7 @@ impl Tool {
         Tool::SelectRect,
         Tool::SelectLasso,
         Tool::Pin,
+        Tool::Measure,
     ];
 
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
@@ -209,13 +217,15 @@ impl Tool {
             Tool::SelectRect => 'm',
             Tool::SelectLasso => 'l',
             Tool::Pin => 'q',
+            // M is the rectangle select's: the Measure tool is Shift+M.
+            Tool::Measure => 'm',
         }
     }
 
     /// Whether the tool's key is its letter with Shift: a variant of the
     /// tool the plain letter picks.
     pub fn shifted(self) -> bool {
-        matches!(self, Tool::Highlighter | Tool::Line | Tool::Blur | Tool::Stamp)
+        matches!(self, Tool::Highlighter | Tool::Line | Tool::Blur | Tool::Stamp | Tool::Measure)
     }
 
     /// The key as a tooltip and a menu show it: "B", "Shift+R".
@@ -280,6 +290,7 @@ impl Tool {
             Tool::SelectRect => "Rectangle select",
             Tool::SelectLasso => "Lasso select",
             Tool::Pin => "Discussion pin",
+            Tool::Measure => "Measure",
         }
     }
 
@@ -313,6 +324,7 @@ impl Tool {
             Tool::SelectRect => TablerIcon::Marquee2,
             Tool::SelectLasso => TablerIcon::Lasso,
             Tool::Pin => TablerIcon::MessagePlus,
+            Tool::Measure => TablerIcon::RulerMeasure,
         }
     }
 
@@ -335,6 +347,7 @@ impl Tool {
             Tool::Sticky => Kind::Sticky,
             Tool::Connector => Kind::Connector,
             Tool::Frame => Kind::Frame,
+            Tool::Measure => Kind::Dimension,
             Tool::Select
             | Tool::DirectSelect
             | Tool::Hand
@@ -625,6 +638,9 @@ pub enum Popup {
     /// The Stamp's symbol (and a selected scatter's), and its settings.
     Symbol,
     Stamp,
+    /// The selection's measures: sizes to type, perimeter and area
+    /// (docs/MEASURE_CONTRACT.md section 4).
+    Measures,
 }
 
 /// What the "Meaning" section is about: the one selected element, or else
@@ -751,6 +767,9 @@ pub struct PaneUi {
     /// The symbol being edited in this pane (its name): the canvas shows
     /// only its elements until Done.
     pub editing_symbol: Signal<Option<String>>,
+    /// The canvas's scale, the Scale panel, readouts and the selection's
+    /// measures (docs/MEASURE_CONTRACT.md).
+    pub measure: measure::MeasureUi,
 }
 
 impl PaneUi {
@@ -793,6 +812,7 @@ impl PaneUi {
             rasterizing: Signal::new(None),
             symbols: Signal::new(Vec::new()),
             editing_symbol: Signal::new(None),
+            measure: measure::MeasureUi::new(),
         }
     }
 }
@@ -998,6 +1018,9 @@ enum Gesture {
     PaintSelDrag(paint_select::SelDrag),
     /// The Stamp, placing its symbol along the pointer.
     Stamp(stamp::Stamping),
+    /// An end (0 or 1) of the Scale panel's calibration line being dragged
+    /// (docs/MEASURE_CONTRACT.md section 2).
+    Calibrate(usize),
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -1090,6 +1113,15 @@ struct Session {
     ants: f32,
     /// While a symbol is edited: the camera the canvas was left at.
     symbol_camera: Option<(Point, f32)>,
+    /// The Scale panel's calibration line, board units, while it is open
+    /// on "Calibrate by drawing" (nothing of it is in the document).
+    calibration: Option<measure::Calibration>,
+    /// A size being typed for what was just drawn (docs/MEASURE_CONTRACT.md
+    /// section 4).
+    typed: Option<measure::Typed>,
+    /// The line or box this pane drew last, while it is still what is
+    /// selected: typing a size straight after drawing it sizes it.
+    last_drawn: Option<measure::Drawn>,
 }
 
 /// A picture in text being marked up in a pane.
@@ -1313,7 +1345,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         touches: Vec::new(),
         pressure: 0.5,
         text: None,
-        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
+        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), dark, ..ViewOptions::default() },
         nav_generation: 0,
         tool_chosen: false,
         markup: None,
@@ -1328,6 +1360,9 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         paint_sel: None,
         ants: 0.0,
         symbol_camera: None,
+        calibration: None,
+        typed: None,
+        last_drawn: None,
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -1576,7 +1611,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         touches: Vec::new(),
         pressure: 0.5,
         text: None,
-        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
+        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), dark, ..ViewOptions::default() },
         nav_generation: 0,
         tool_chosen: false,
         markup: Some(Markup { src: src.to_string(), pos, board_id, pending, attr_needed }),
@@ -1591,6 +1626,9 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         paint_sel: None,
         ants: 0.0,
         symbol_camera: None,
+        calibration: None,
+        typed: None,
+        last_drawn: None,
     };
     // The watch and the undo manager start after the board was made here,
     // so undo never takes back the board itself.
@@ -1972,6 +2010,7 @@ fn after_change(store: AppStore, pane: PaneId) {
         }
     }
     stamp::publish(store, pane);
+    measure::publish(store, pane);
     points::refresh_overlay(store, pane);
     present(pane);
     nav::changed(store, pane);
@@ -2100,11 +2139,30 @@ fn present(pane: PaneId) {
             // The first frame is at the fitted zoom, not a resample.
             s.view.settle(&picture_source());
         }
+        // The grid in the canvas's units (docs/MEASURE_CONTRACT.md section
+        // 6): its step follows the zoom.
+        if s.view.grid().is_some() {
+            let spacing = grid_spacing(s);
+            s.view.set_grid(Some(spacing));
+        }
         if let Some(frame) = s.view.frame(&picture_source()) {
             writer.submit_frame(frame, width, height);
         }
     });
     request_wanted_pictures();
+}
+
+/// The grid's spacing on pane `s`'s canvas, board units: in the canvas's
+/// units with a scale (nice real steps 16 to 60 CSS pixels apart at this
+/// zoom), [`GRID`] without one. What snapping lands on too.
+fn grid_spacing(s: &Session) -> f32 {
+    match s.snapshot().measuring() {
+        Some(scale) => {
+            let css_zoom = s.view.zoom() / if s.presented_scale > 0.0 { s.presented_scale } else { 1.0 };
+            pimble_board::measure::grid_step(scale, css_zoom)
+        }
+        None => GRID,
+    }
 }
 
 /// The camera moved: the floating boxes follow, a frame is due.
@@ -2422,7 +2480,16 @@ pub(crate) fn toggle_markup(store: AppStore, pane: PaneId) {
 /// The theme changed: every board's background follows.
 pub(crate) fn set_dark_mode(dark: bool) {
     for pane in PaneId::ALL {
-        if with_session(pane, |s| s.view.set_background(background(dark))).is_some() {
+        if with_session(pane, |s| {
+            s.view.set_background(background(dark));
+            if s.options.dark != dark {
+                s.options.dark = dark;
+                let options = s.options.clone();
+                s.view.set_options(options, &s.board);
+            }
+        })
+        .is_some()
+        {
             present(pane);
         }
     }
@@ -2431,7 +2498,12 @@ pub(crate) fn set_dark_mode(dark: bool) {
 /// The grid shown or hidden (per viewer): every board follows.
 pub(crate) fn set_grid(store: AppStore, shown: bool) {
     for pane in PaneId::ALL {
-        if with_session(pane, |s| s.view.set_grid(shown.then_some(GRID))).is_some() {
+        if with_session(pane, |s| {
+            let spacing = grid_spacing(s);
+            s.view.set_grid(shown.then_some(spacing))
+        })
+        .is_some()
+        {
             after_change(store, pane);
         }
     }
@@ -3997,6 +4069,139 @@ mod tests {
         tools::undo(store, P[0], false);
         let row = with_session(P[0], |s| layers::rows_of(s.snapshot()).into_iter().find(|r| r.id == layer)).flatten().unwrap();
         assert_eq!((row.blur, row.feather), (25.0, 0.0), "each is its own undo step");
+        stop(store, P[0]);
+    }
+
+    fn feet() -> pimble_board::Scale {
+        pimble_board::measure::parse_scale("1 in = 10 ft", pimble_board::Unit::Ft).unwrap()
+    }
+
+    fn press_key(store: AppStore, k: &str) {
+        let key = rinch::render_surface::SurfaceKeyData { key: k.into(), code: String::new(), ctrl: false, shift: false, alt: false, meta: false };
+        tools::on_event(store, P[0], SurfaceEvent::KeyDown(key));
+    }
+
+    /// The Measure tool (docs/MEASURE_CONTRACT.md section 5): with no scale
+    /// it opens the Scale panel and draws nothing; with one it drags out a
+    /// dimension, labeled in the canvas's units, its ends snapping to an
+    /// element's corners. Setting the scale is one undo step.
+    #[test]
+    fn the_measure_tool_needs_a_scale_and_draws_dimensions() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let mu = store.pane(P[0]).board_ui.measure;
+        store.board_tool.set(Tool::Measure);
+        mouse_drag(store, on_screen(Point::new(10.0, 10.0)), on_screen(Point::new(200.0, 10.0)));
+        assert_eq!(texts(P[0]), 0, "nothing without a scale");
+        assert!(untracked(|| mu.open.get()), "the Scale panel opened");
+        measure::close_scale(store, P[0]);
+
+        assert!(measure::set_scale(store, P[0], Some(&feet())));
+        assert_eq!(untracked(|| mu.scale.get()), Some(feet()));
+        // A box to snap to: its corner at (96, 48).
+        local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, 96.0, 48.0)))));
+        mouse_drag(store, on_screen(Point::new(1.0, 49.0)), on_screen(Point::new(95.0, 47.5)));
+        let dim = with_session(P[0], |s| {
+            let e = s.snapshot().elements.iter().find(|e| e.raw.kind == Kind::Dimension).expect("a dimension");
+            (e.raw.geom.clone(), e.marks.as_ref().map(|m| m.texts.clone()))
+        })
+        .unwrap();
+        assert_eq!(dim.0, Geom::Segment { a: Point::new(0.0, 48.0), b: Point::new(96.0, 48.0) }, "both ends snapped to the corners");
+        assert_eq!(dim.1, Some(vec!["10′".to_string()]));
+        // The selection's group measures it.
+        let sel = untracked(|| mu.selection.get()).expect("measures");
+        assert_eq!(sel.length.as_deref(), Some("10′"));
+        assert!(sel.length_editable);
+        measure::set_size(store, P[0], measure::Size::Length, "12' 6\"");
+        let geom = with_session(P[0], |s| s.snapshot().elements.iter().find(|e| e.raw.kind == Kind::Dimension).unwrap().raw.geom.clone()).unwrap();
+        assert_eq!(geom, Geom::Segment { a: Point::new(0.0, 48.0), b: Point::new(120.0, 48.0) }, "typed from its start");
+
+        // Undo takes the scale back in one step (after the edits since).
+        tools::undo(store, P[0], false);
+        tools::undo(store, P[0], false);
+        tools::undo(store, P[0], false);
+        assert_eq!(with_session(P[0], |s| s.snapshot().scale.clone()).unwrap(), Some(feet()));
+        tools::undo(store, P[0], false);
+        assert_eq!(with_session(P[0], |s| s.snapshot().scale.clone()).unwrap(), None);
+        stop(store, P[0]);
+    }
+
+    /// Typed sizes (docs/MEASURE_CONTRACT.md section 4): digits straight
+    /// after drawing a line give its length along the drawn direction, and
+    /// `w x h` sizes a box from where it was started.
+    #[test]
+    fn a_size_typed_after_drawing_sets_it() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        measure::set_scale(store, P[0], Some(&feet()));
+        store.board_tool.set(Tool::Line);
+        mouse_drag(store, on_screen(Point::new(10.0, 10.0)), on_screen(Point::new(60.0, 10.0)));
+        for k in ["1", "0", "'", "Enter"] {
+            press_key(store, k);
+        }
+        let Geom::Segment { a, b } = only_element().raw.geom else { panic!("a line") };
+        assert!((a.x - 10.0).abs() < 0.01 && (b.x - 106.0).abs() < 0.01 && (b.y - a.y).abs() < 0.01, "{a:?} {b:?}: ten feet east");
+        // A box: 5' x 2' from its start corner.
+        store.board_tool.set(Tool::Rect);
+        mouse_drag(store, on_screen(Point::new(300.0, 300.0)), on_screen(Point::new(340.0, 330.0)));
+        for k in ["5", "'", " ", "x", " ", "2", "'", "Enter"] {
+            press_key(store, k);
+        }
+        let r = with_session(P[0], |s| match &s.snapshot().elements.iter().find(|e| e.raw.kind == Kind::Rect).unwrap().raw.geom {
+            Geom::Rect(r) => *r,
+            _ => panic!(),
+        })
+        .unwrap();
+        assert!((r.x - 300.0).abs() < 0.01 && (r.w - 48.0).abs() < 0.01 && (r.h - 19.2).abs() < 0.01, "{r:?}");
+        // Escape leaves the drawn size.
+        mouse_drag(store, on_screen(Point::new(500.0, 100.0)), on_screen(Point::new(540.0, 140.0)));
+        press_key(store, "7");
+        press_key(store, "Escape");
+        let n = with_session(P[0], |s| s.snapshot().elements.iter().filter(|e| matches!(&e.raw.geom, Geom::Rect(r) if (r.w - 40.0).abs() < 0.01)).count()).unwrap();
+        assert_eq!(n, 1);
+        stop(store, P[0]);
+    }
+
+    /// The Scale panel: calibrating by drawing gives a line whose length it
+    /// reads; "Show dimensions" and "Show area" write their keys on the
+    /// selection; with a scale the grid is in its units.
+    #[test]
+    fn calibration_labels_and_the_grid_in_units() {
+        let (store, _commands) = store_with_commands();
+        start(store, P[0], StoreId::new(), NodeId::new(), &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let mu = store.pane(P[0]).board_ui.measure;
+        measure::open_scale(store, P[0]);
+        mu.way.set(measure::Way::Calibrate);
+        measure::way_changed(store, P[0]);
+        mouse_drag(store, on_screen(Point::new(0.0, 0.0)), on_screen(Point::new(120.0, 0.0)));
+        assert_eq!(texts(P[0]), 0, "a calibration line is not an element");
+        let length = untracked(|| mu.cal_length.get()).expect("the line's length");
+        assert!((length - 120.0).abs() < 0.5, "{length}");
+        let scale = measure::candidate(measure::Way::Calibrate, 0, "", "5 ft", false, None, Some(length), pimble_board::Unit::Ft, None).unwrap();
+        assert!((scale.per_unit - 24.0).abs() < 0.1);
+        measure::close_scale(store, P[0]);
+        assert!(with_session(P[0], |s| s.calibration.is_none()).unwrap());
+
+        measure::set_scale(store, P[0], Some(&scale));
+        let id = local_edit(store, P[0], |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, 240.0, 96.0))))).unwrap();
+        tools::select(store, P[0], vec![id.clone()]);
+        measure::toggle_labels(store, P[0], false);
+        measure::toggle_labels(store, P[0], true);
+        let texts = with_session(P[0], |s| s.snapshot().get(&id).unwrap().marks.as_ref().map(|m| m.texts.clone())).unwrap();
+        assert_eq!(texts, Some(vec!["10′".to_string(), "4′".to_string(), "40 sq ft".to_string()]));
+        let sel = untracked(|| mu.selection.get()).unwrap();
+        assert!(sel.dims && sel.area_on);
+        measure::toggle_labels(store, P[0], false);
+        assert!(with_session(P[0], |s| s.snapshot().get(&id).unwrap().raw.style.dims.is_none()).unwrap(), "off clears the key");
+
+        // The grid: 24 units a foot at 100%, 1 ft lines (24 px).
+        let spacing = with_session(P[0], |s| grid_spacing(s)).unwrap();
+        let zoom = with_session(P[0], |s| s.view.zoom()).unwrap();
+        assert!(spacing * zoom >= 16.0 && spacing * zoom <= 60.0 * 2.6, "{spacing} at {zoom}");
+        assert_eq!(spacing, pimble_board::measure::grid_step(&scale, zoom));
         stop(store, P[0]);
     }
 

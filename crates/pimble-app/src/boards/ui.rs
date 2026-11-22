@@ -293,6 +293,10 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         untracked(|| set_card_labels(store, pane, labels));
     });
 
+    // Measuring (docs/MEASURE_CONTRACT.md): the readout near the pointer
+    // and the Scale panel.
+    let readout = super::measure::render_readout(__scope, store, pane);
+    let scale_panel = super::measure::render_panel(__scope, store, pane);
     let canvas = rsx! {
     div {
         class: "pimble-board__canvas",
@@ -370,6 +374,8 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
             }},
         }
         {text_input}
+        {readout}
+        {scale_panel}
         div {
             class: "pimble-board__tip",
             style: {move || match ui.tip.get() {

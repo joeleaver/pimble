@@ -36,7 +36,7 @@ pub const FLYOUTS: [&[Tool]; 5] = [
     // Shapes (Draw).
     &[Tool::Rect, Tool::Ellipse, Tool::Diamond, Tool::Polygon, Tool::Star, Tool::Line, Tool::Arrow],
     // More diagram tools.
-    &[Tool::Connector, Tool::Step, Tool::Frame],
+    &[Tool::Connector, Tool::Step, Tool::Frame, Tool::Measure],
     // The brush and its highlighter preset (Paint).
     &[Tool::Brush, Tool::Highlighter],
     // The fill and the brushes that work pixels already there (Paint).
@@ -245,6 +245,8 @@ pub fn controls_of(kind: &Kind) -> Controls {
         Kind::Spotlight => Controls { opacity: true, ..none },
         // A scatter: its opacity, and its symbol and tint (the stamp's row).
         Kind::Scatter => Controls { opacity: true, stamp: true, feather: true, ..none },
+        // A dimension: its color, its ends (none: ticks), its opacity.
+        Kind::Dimension => Controls { stroke: true, heads: true, opacity: true, ..none },
         Kind::Frame | Kind::Picture | Kind::Group | Kind::Card | Kind::Other(_) => none,
     }
 }
@@ -358,6 +360,7 @@ pub fn hint(tool: Tool) -> &'static str {
         Tool::Fill => "Click paint to fill what matches the color there",
         Tool::Smudge => "Drag to smear the paint",
         Tool::Blur => "Drag to soften the paint",
+        Tool::Measure => "Drag between two points to dimension them (ends snap to points; type a length while drawing)",
     }
 }
 
@@ -698,7 +701,10 @@ fn render_flyout(__scope: &mut RenderScope, store: AppStore, pane: PaneId, index
     let st = store.board_style;
     let ui = store.pane(pane).board_ui;
     let members: &'static [Tool] = FLYOUTS[index];
-    let face = move || st.faces.get().get(index).copied().unwrap_or(members[0]);
+    let face = move || match st.faces.get().get(index).copied().unwrap_or(members[0]) {
+        Tool::Measure if ui.measure.scale.get().is_none() => members[0],
+        tool => tool,
+    };
     // A held press: which press it is (a release or a new press moves it
     // on), and whether its flyout opened, so the click that ends it uses
     // nothing.
@@ -711,6 +717,8 @@ fn render_flyout(__scope: &mut RenderScope, store: AppStore, pane: PaneId, index
                 div {
                     title: tip(tool),
                     class: {move || if store.board_tool.get() == tool { "pimble-board__menu-item pimble-board__menu-item--active" } else { "pimble-board__menu-item" }},
+                    // The Measure tool only while the canvas measures.
+                    style: {move || if tool == Tool::Measure && ui.measure.scale.get().is_none() { "display: none;" } else { "" }},
                     onclick: move || pick_tool(store, pane, tool),
                     span { class: "pimble-board__menu-icon", IconGlyph { name: tool.icon().name().to_string() } }
                     span { class: "pimble-board__grow", {tool.name()} }
@@ -806,9 +814,16 @@ pub(crate) fn status_hint(store: AppStore) -> String {
         return String::new();
     }
     let tool = store.board_tool.get();
-    match hint(tool) {
+    let said = match hint(tool) {
         "" => String::new(),
         h => format!("{}: {}{}", tool.name(), h[..1].to_lowercase(), &h[1..]),
+    };
+    // The grid's step in the canvas's units while it shows
+    // (docs/MEASURE_CONTRACT.md section 6).
+    match store.pane(pane).board_ui.measure.grid_label.get() {
+        Some(grid) if said.is_empty() => grid,
+        Some(grid) => format!("{said} · {grid}"),
+        None => said,
     }
 }
 
@@ -1354,6 +1369,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
         menu_item(__scope, store, pane, TablerIcon::Trees, "Scatter in Shape", Box::new(super::stamp::scatter_in_shape)),
     ];
     let (stamp_bar, stamp_popups) = super::stamp::render_controls(__scope, store, pane);
+    let (measure_bar, measure_popups) = super::measure::render_controls(__scope, store, pane);
     let writable = move || {
         state
             .board
@@ -1393,6 +1409,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().strength)}, {strength_btn} }
                         div { class: "pimble-board__ctx-group", style: {move || shown(controls().stamp)}, {stamp_bar} }
                     }
+                    {measure_bar}
                     div {
                         class: "pimble-board__ctx-group pimble-board__ctx-sep",
                         style: {move || shown(ui.selected.get() > 0)},
@@ -1555,6 +1572,7 @@ pub(super) fn render_context_bar(__scope: &mut RenderScope, store: AppStore, pan
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::FillMode)}, {fill_modes} }
             div { class: "pimble-float pimble-board__options", style: {move || shown(ui.popup.get() == Popup::Strength)}, {strengths} }
             {stamp_popups}
+            {measure_popups}
         }
     };
     (controls_row, popups)
@@ -1705,6 +1723,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Polygon => "Polygon",
         Kind::Star => "Star",
         Kind::Scatter => "Scatter",
+        Kind::Dimension => "Dimension",
         Kind::Other(_) => "Element",
     }
 }

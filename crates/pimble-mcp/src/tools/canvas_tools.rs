@@ -64,6 +64,107 @@ type Prepared = (HashMap<usize, (String, u32, u32)>, HashMap<usize, (String, Str
 
 // ── Parameters ───────────────────────────────────────────────────────────
 
+/// A coordinate or a size: canvas units, or on a canvas with a scale a
+/// length as a person writes it ("12 ft", "3.5 m", "12' 6\"",
+/// docs/MEASURE_CONTRACT.md section 7), measured from the canvas's origin.
+#[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum Len {
+    Units(f32),
+    Text(String),
+}
+
+impl From<f32> for Len {
+    fn from(v: f32) -> Self {
+        Len::Units(v)
+    }
+}
+
+impl Len {
+    /// In canvas units: a number as it is, a length through the canvas's
+    /// scale (a bare number in a string is canvas units).
+    fn resolve(&self, scale: Option<&pimble_board::Scale>, what: &str) -> Result<Len, BoardError> {
+        match self {
+            Len::Units(v) => Ok(Len::Units(*v)),
+            Len::Text(t) => {
+                if let Ok(v) = t.trim().parse::<f32>() {
+                    return Ok(Len::Units(v));
+                }
+                let scale = scale.ok_or_else(|| {
+                    bad(format!("{what} \"{t}\" is a length, but this canvas has no scale: give canvas units, or set one first (set_canvas scale)"))
+                })?;
+                let v = scale.parse_board(t).ok_or_else(|| bad(format!("{what} \"{t}\" is not a length Pimble can read (12 ft, 3.5 m, 12' 6\")")))?;
+                Ok(Len::Units(v as f32))
+            }
+        }
+    }
+
+    /// Its canvas units, once resolved.
+    fn units(&self) -> f32 {
+        match self {
+            Len::Units(v) => *v,
+            Len::Text(_) => f32::NAN,
+        }
+    }
+}
+
+fn f(v: &Option<Len>) -> Option<f32> {
+    v.as_ref().map(Len::units)
+}
+
+fn fv(v: &Option<Vec<Len>>) -> Option<Vec<f32>> {
+    v.as_ref().map(|v| v.iter().map(Len::units).collect())
+}
+
+fn fvv(v: &Option<Vec<Vec<Len>>>) -> Option<Vec<Vec<f32>>> {
+    v.as_ref().map(|v| v.iter().map(|p| p.iter().map(Len::units).collect()).collect())
+}
+
+fn resolve_one(v: &mut Option<Len>, scale: Option<&pimble_board::Scale>, what: &str) -> Result<(), BoardError> {
+    if let Some(l) = v.as_mut() {
+        *l = l.resolve(scale, what)?;
+    }
+    Ok(())
+}
+
+fn resolve_list(v: &mut Option<Vec<Len>>, scale: Option<&pimble_board::Scale>, what: &str) -> Result<(), BoardError> {
+    for l in v.iter_mut().flatten() {
+        *l = l.resolve(scale, what)?;
+    }
+    Ok(())
+}
+
+fn resolve_lists(v: &mut Option<Vec<Vec<Len>>>, scale: Option<&pimble_board::Scale>, what: &str) -> Result<(), BoardError> {
+    for p in v.iter_mut().flatten() {
+        for l in p.iter_mut() {
+            *l = l.resolve(scale, what)?;
+        }
+    }
+    Ok(())
+}
+
+macro_rules! resolved_lengths {
+    ($t:ty) => {
+        impl $t {
+            /// Every length in it in canvas units.
+            fn resolved(&self, scale: Option<&pimble_board::Scale>) -> Result<Self, BoardError> {
+                let mut s = self.clone();
+                resolve_one(&mut s.x, scale, "x")?;
+                resolve_one(&mut s.y, scale, "y")?;
+                resolve_one(&mut s.w, scale, "w")?;
+                resolve_one(&mut s.h, scale, "h")?;
+                resolve_lists(&mut s.points, scale, "a point")?;
+                resolve_list(&mut s.tip, scale, "tip")?;
+                resolve_list(&mut s.from_point, scale, "from_point")?;
+                resolve_list(&mut s.to_point, scale, "to_point")?;
+                Ok(s)
+            }
+        }
+    };
+}
+resolved_lengths!(ElementSpec);
+resolved_lengths!(ElementChange);
+
 #[derive(Deserialize, JsonSchema)]
 pub struct GetCanvasParams {
     /// A canvas node, or a note whose text holds the canvas: a pimble: link
@@ -340,6 +441,19 @@ pub struct StyleSpec {
     /// the radius past the shape. 0 is a hard edge.
     #[serde(default)]
     pub feather: Option<f32>,
+    /// Label its sides in the canvas's units (with a scale): a line its
+    /// length, a box its width and height, a polygon each side.
+    #[serde(default)]
+    pub dims: Option<bool>,
+    /// Show its area at its center (closed shapes, with a scale).
+    #[serde(default)]
+    pub area: Option<bool>,
+    /// dimension: how far its dimension line sits from the two points it
+    /// measures, canvas units, perpendicular (positive: to the left going
+    /// from the first point to the second, above a line drawn left to
+    /// right). Default 0.
+    #[serde(default)]
+    pub dim_offset: Option<f32>,
 }
 
 /// A gradient. Its handles are in the element's own box: [0,0] is its
@@ -378,9 +492,13 @@ pub struct StopSpec {
 #[derive(Deserialize, JsonSchema, Clone, Default)]
 pub struct ElementSpec {
     /// One of: sticky, text, rect, ellipse, diamond, polygon, star, path, frame,
-    /// line, arrow, connector, pen, highlighter, step, callout, card, picture,
-    /// spotlight, group. A polygon and a star fill the box x, y, w, h (style
-    /// `sides`; `points` and `inner`); a rect takes style `radius`.
+    /// line, arrow, dimension, connector, pen, highlighter, step, callout,
+    /// card, picture, spotlight, group. A polygon and a star fill the box x,
+    /// y, w, h (style `sides`; `points` and `inner`); a rect takes style
+    /// `radius`. A dimension measures between its two `points` and shows the
+    /// length in the canvas's units (its `text` replaces the label, `{}`
+    /// standing for the length: "{} clear"); style `dim_offset` sets it off
+    /// from them, `arrow_heads` "none" draws ticks.
     pub kind: String,
     /// A name for this element within this call, so a connector's from/to, a
     /// parent or a group's members can point at it before it has an id.
@@ -389,21 +507,21 @@ pub struct ElementSpec {
     /// Top-left corner (rect kinds, sticky, text, frame, card, picture,
     /// callout, spotlight), or a step badge's center.
     #[serde(default)]
-    pub x: Option<f32>,
+    pub x: Option<Len>,
     #[serde(default)]
-    pub y: Option<f32>,
+    pub y: Option<Len>,
     /// Size. Sticky notes default to 200x200 and grow to fit their text; text
     /// defaults to w 0 (no wrapping); cards to 240x56; pictures to their pixel
     /// size (give w alone to scale keeping the shape).
     #[serde(default)]
-    pub w: Option<f32>,
+    pub w: Option<Len>,
     #[serde(default)]
-    pub h: Option<f32>,
-    /// line and arrow: two points [[x1,y1],[x2,y2]]. pen and highlighter: the
+    pub h: Option<Len>,
+    /// line, arrow and dimension: two points [[x1,y1],[x2,y2]]. pen and highlighter: the
     /// stroke's points in order, [[x,y],...], each optionally with its
     /// pressure ([x,y,pressure], 0 to 1; left out 0.5, the stroke's width).
     #[serde(default)]
-    pub points: Option<Vec<Vec<f32>>>,
+    pub points: Option<Vec<Vec<Len>>>,
     /// pen and highlighter: draw a smooth curve through the points (a few
     /// points are enough for a hill's contour or a river) instead of straight
     /// segments between them.
@@ -428,14 +546,14 @@ pub struct ElementSpec {
     pub rule: Option<String>,
     /// callout: the point its pointer touches, [x,y].
     #[serde(default)]
-    pub tip: Option<Vec<f32>>,
+    pub tip: Option<Vec<Len>>,
     /// connector: the element it starts at (an id, or a ref from this call).
     /// It follows the element when that moves.
     #[serde(default)]
     pub from: Option<String>,
     /// connector: or a free point it starts at, [x,y].
     #[serde(default)]
-    pub from_point: Option<Vec<f32>>,
+    pub from_point: Option<Vec<Len>>,
     /// connector: which side of `from` it leaves: top, right, bottom, left
     /// (left out: the nearest side, chosen as it is drawn).
     #[serde(default)]
@@ -443,7 +561,7 @@ pub struct ElementSpec {
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
-    pub to_point: Option<Vec<f32>>,
+    pub to_point: Option<Vec<Len>>,
     #[serde(default)]
     pub to_side: Option<String>,
     /// card: the node it shows (a pimble: link, an id or a path); the card
@@ -618,16 +736,16 @@ pub struct ElementChange {
     pub id: String,
     /// New corner or size for kinds with a rectangle (and a step's center).
     #[serde(default)]
-    pub x: Option<f32>,
+    pub x: Option<Len>,
     #[serde(default)]
-    pub y: Option<f32>,
+    pub y: Option<Len>,
     #[serde(default)]
-    pub w: Option<f32>,
+    pub w: Option<Len>,
     #[serde(default)]
-    pub h: Option<f32>,
+    pub h: Option<Len>,
     /// New points: two for a line or arrow, the whole stroke for pen and highlighter.
     #[serde(default)]
-    pub points: Option<Vec<Vec<f32>>>,
+    pub points: Option<Vec<Vec<Len>>>,
     /// With new points for a stroke: a smooth curve through them, and closed.
     #[serde(default)]
     pub smooth: Option<bool>,
@@ -635,7 +753,7 @@ pub struct ElementChange {
     pub closed: Option<bool>,
     /// A callout's new pointer tip, [x,y].
     #[serde(default)]
-    pub tip: Option<Vec<f32>>,
+    pub tip: Option<Vec<Len>>,
     /// A path's new outline, SVG path data as add_elements takes it. Given
     /// for a rect, ellipse, diamond, polygon, star, a line without arrow
     /// heads or a pen stroke, it turns that element into a path (same id,
@@ -649,13 +767,13 @@ pub struct ElementChange {
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
-    pub from_point: Option<Vec<f32>>,
+    pub from_point: Option<Vec<Len>>,
     #[serde(default)]
     pub from_side: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
-    pub to_point: Option<Vec<f32>>,
+    pub to_point: Option<Vec<Len>>,
     #[serde(default)]
     pub to_side: Option<String>,
     /// A card's node.
@@ -673,7 +791,7 @@ pub struct ElementChange {
     /// too), cap, join, miter, radius, sides, points, inner, fill_gradient,
     /// stroke_gradient (clearing fill or stroke clears its gradient too),
     /// font, bold, italic, halo_color, halo_width, tracking, along,
-    /// along_offset, along_side, tint, feather.
+    /// along_offset, along_side, tint, feather, dims, area, dim_offset.
     #[serde(default)]
     pub clear_style: Vec<String>,
     /// Move it (and, for a frame or group, everything in it) by [dx,dy].
@@ -1058,6 +1176,28 @@ pub struct SetCanvasParams {
     /// Show or hide every mark (everything but pictures), for everyone.
     #[serde(default)]
     pub markup_visible: Option<bool>,
+    /// Give the canvas a scale, so it measures in real units: a ratio
+    /// ("1:100", "1:24,000") or paper = world ("1 in = 10 ft", "1/4\" = 1'",
+    /// "1 cm = 2.5 km"; a canvas unit is 1/96 inch of paper). null takes the
+    /// scale away. With a scale, add_elements and update_elements take
+    /// lengths ("12 ft"), dims and area labels show, and dimensions measure
+    /// in its units.
+    #[serde(default, deserialize_with = "present")]
+    pub scale: Option<Option<String>>,
+    /// The unit measurements are shown in: mm, cm, m, km, in, ft, yd or mi
+    /// (with `scale`, the unit a ratio is read in; alone, the scale it has
+    /// shown in another unit). Default: the world side's unit, else meters.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Metric and miles: decimals shown (0 to 3). Inches, feet and yards:
+    /// the smallest inch fraction, as its denominator (1, 2, 4, 8, 16).
+    #[serde(default)]
+    pub precision: Option<u8>,
+    /// Measuring switched on or off, the scale kept either way (a canvas
+    /// for drawing rather than plans keeps it off). Giving `scale` switches
+    /// it on.
+    #[serde(default)]
+    pub measuring: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1300,6 +1440,9 @@ fn style_of(spec: &StyleSpec) -> Result<Style, BoardError> {
         along_side: spec.along_side.as_deref().and_then(|s| AlongSide::parse(s.trim())),
         tint: spec.tint.as_deref().map(|s| color(s, "tint")).transpose()?,
         feather: spec.feather.filter(|v| v.is_finite()).map(|v| v.max(0.0)),
+        dims: spec.dims,
+        area: spec.area,
+        dim_offset: spec.dim_offset.filter(|v| v.is_finite()),
     })
 }
 
@@ -1422,6 +1565,9 @@ fn style_key(s: &str) -> Result<StyleKey, BoardError> {
         "along_offset" => StyleKey::AlongOffset,
         "along_side" => StyleKey::AlongSide,
         "feather" => StyleKey::Feather,
+        "dims" => StyleKey::Dims,
+        "area" => StyleKey::Area,
+        "dim_offset" => StyleKey::DimOffset,
         other => return Err(bad(format!("\"{other}\" is not a style key"))),
     })
 }
@@ -1539,21 +1685,24 @@ impl Scene {
 /// The geometry a spec describes.
 fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geom, Vec<[f32; 3]>), BoardError> {
     let kind = Kind::parse(spec.kind.trim());
+    let (sx, sy, sw, sh) = (f(&spec.x), f(&spec.y), f(&spec.w), f(&spec.h));
+    let spoints = fvv(&spec.points);
+    let (stip, sfrom, sto) = (fv(&spec.tip), fv(&spec.from_point), fv(&spec.to_point));
     let xy = |what: &str| -> Result<(f32, f32), BoardError> {
-        match (spec.x, spec.y) {
+        match (sx, sy) {
             (Some(x), Some(y)) => Ok((x, y)),
             _ => Err(bad(format!("a {what} needs x and y"))),
         }
     };
     let rect = |what: &str, default: Option<(f32, f32)>| -> Result<Rect, BoardError> {
         let (x, y) = xy(what)?;
-        match (spec.w.or(default.map(|d| d.0)), spec.h.or(default.map(|d| d.1))) {
+        match (sw.or(default.map(|d| d.0)), sh.or(default.map(|d| d.1))) {
             (Some(w), Some(h)) => Ok(Rect::new(x, y, w, h).normalized()),
             _ => Err(bad(format!("a {what} needs w and h"))),
         }
     };
     let points = |what: &str| -> Result<Vec<Point>, BoardError> {
-        spec.points.as_ref().ok_or_else(|| bad(format!("a {what} needs points")))?.iter().map(|p| point(p, "each point")).collect()
+        spoints.as_ref().ok_or_else(|| bad(format!("a {what} needs points")))?.iter().map(|p| point(p, "each point")).collect()
     };
     let geom = match &kind {
         Kind::Scatter => return Err(bad("a scatter is made with the scatter tool (a symbol and its placements, or a region to fill)")),
@@ -1568,13 +1717,13 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         Kind::Text if spec.center == Some(true) => {
             let (cx, cy) = xy("text label")?;
             let style = spec.style.as_ref().map(style_of).transpose()?.unwrap_or_default().resolved(&Kind::Text);
-            let wrap = spec.w.filter(|w| *w > 0.0);
+            let wrap = sw.filter(|w| *w > 0.0);
             let l = pimble_board::text::layout_styled(spec.text.as_deref().unwrap_or(""), style.font_size, wrap, &style.text);
             let w = wrap.unwrap_or(l.width);
             Geom::Rect(Rect::new(cx - w / 2.0, cy - l.height / 2.0, wrap.unwrap_or(0.0), 0.0))
         }
         Kind::Text => Geom::Rect(rect("text box", Some((0.0, 0.0)))?),
-        Kind::Line | Kind::Arrow => match points(kind.as_str())?.as_slice() {
+        Kind::Line | Kind::Arrow | Kind::Dimension => match points(kind.as_str())?.as_slice() {
             [a, b] => Geom::Segment { a: *a, b: *b },
             _ => return Err(bad(format!("a {kind} takes two points, [[x1,y1],[x2,y2]]"))),
         },
@@ -1588,7 +1737,7 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
             // Pressures given with the points (as get_elements gives them)
             // are kept; a smooth curve has its own points, at the stroke's width.
             if !smooth {
-                for (o, given) in out.iter_mut().zip(spec.points.iter().flatten()) {
+                for (o, given) in out.iter_mut().zip(spoints.iter().flatten()) {
                     if let Some(p) = given.get(2).filter(|p| p.is_finite()) {
                         o[2] = p.clamp(0.0, 1.0);
                     }
@@ -1602,11 +1751,11 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         }
         Kind::Callout => Geom::Callout {
             rect: rect("callout", None)?,
-            tip: point(spec.tip.as_deref().ok_or_else(|| bad("a callout needs its tip, [x,y]"))?, "tip")?,
+            tip: point(stip.as_deref().ok_or_else(|| bad("a callout needs its tip, [x,y]"))?, "tip")?,
         },
         Kind::Connector => Geom::Connector {
-            from: scene.end(&spec.from, &spec.from_point, &spec.from_side, "from")?,
-            to: scene.end(&spec.to, &spec.to_point, &spec.to_side, "to")?,
+            from: scene.end(&spec.from, &sfrom, &spec.from_side, "from")?,
+            to: scene.end(&spec.to, &sto, &spec.to_side, "to")?,
         },
         Kind::Card => {
             let (link, _) = scene.cards.get(&index).ok_or_else(|| bad("a card needs the node it shows (`node`)"))?;
@@ -1614,9 +1763,9 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         }
         Kind::Picture => {
             let (src, pw, ph) = scene.pictures.get(&index).ok_or_else(|| bad("a picture needs a file or a pimble-blob: src"))?;
-            let (x, y) = (spec.x.unwrap_or(0.0), spec.y.unwrap_or(0.0));
+            let (x, y) = (sx.unwrap_or(0.0), sy.unwrap_or(0.0));
             let (pw_f, ph_f) = (*pw as f32, *ph as f32);
-            let (w, h) = match (spec.w, spec.h) {
+            let (w, h) = match (sw, sh) {
                 (Some(w), Some(h)) => (w, h),
                 (Some(w), None) => (w, w * ph_f / pw_f.max(1.0)),
                 (None, Some(h)) => (h * pw_f / ph_f.max(1.0), h),
@@ -1629,7 +1778,7 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         Kind::Other(k) => {
             return Err(bad(format!(
                 "\"{k}\" is not a kind; use sticky, text, rect, ellipse, diamond, polygon, star, path, frame, line, arrow, \
-                 connector, pen, highlighter, step, callout, card, picture, spotlight or group"
+                 connector, dimension, pen, highlighter, step, callout, card, picture, spotlight or group"
             )))
         }
     };
@@ -1820,7 +1969,7 @@ fn symbol_id(snapshot: &BoardSnapshot, given: &str) -> Result<String, BoardError
 
 /// Whether a change names anything of an element's geometry.
 fn change_names_geometry(c: &ElementChange) -> bool {
-    [c.x, c.y, c.w, c.h].iter().any(Option::is_some)
+    [&c.x, &c.y, &c.w, &c.h].iter().any(|v| v.is_some())
         || c.points.is_some()
         || c.tip.is_some()
         || [&c.from, &c.from_side, &c.to, &c.to_side, &c.node].iter().any(|v| v.is_some())
@@ -1854,14 +2003,17 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
         })?),
     };
     let raw = &element.raw;
+    let (cx, cy, cw, ch) = (f(&change.x), f(&change.y), f(&change.w), f(&change.h));
+    let cpoints = fvv(&change.points);
+    let (ctip, cfrom, cto) = (fv(&change.tip), fv(&change.from_point), fv(&change.to_point));
     let raw_geom = match &converted {
         Some(p) => Geom::Path(p.clone()),
         None => raw.geom.clone(),
     };
     // Geometry, merged into what it has.
-    let r = |r: &Rect| Rect::new(change.x.unwrap_or(r.x), change.y.unwrap_or(r.y), change.w.unwrap_or(r.w), change.h.unwrap_or(r.h)).normalized();
+    let r = |r: &Rect| Rect::new(cx.unwrap_or(r.x), cy.unwrap_or(r.y), cw.unwrap_or(r.w), ch.unwrap_or(r.h)).normalized();
     let new_points = || -> Result<Option<Vec<Point>>, BoardError> {
-        change.points.as_ref().map(|ps| ps.iter().map(|p| point(p, "each point")).collect()).transpose()
+        cpoints.as_ref().map(|ps| ps.iter().map(|p| point(p, "each point")).collect()).transpose()
     };
     let geom = if !change_names_geometry(change) {
         None
@@ -1872,7 +2024,7 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
                     Some(d) => path_of(d, None)?,
                     None => p.clone(),
                 };
-                if [change.x, change.y, change.w, change.h].iter().any(Option::is_some) {
+                if [cx, cy, cw, ch].iter().any(Option::is_some) {
                     if let Some(b) = p.bounds() {
                         p = p.rescaled(&b, &r(&b));
                     }
@@ -1890,17 +2042,17 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
             Geom::Picture(p) => Some(Geom::Picture(PictureGeom { rect: r(&p.rect), ..p.clone() })),
             Geom::Callout { rect, tip } => Some(Geom::Callout {
                 rect: r(rect),
-                tip: change.tip.as_deref().map(|p| point(p, "tip")).transpose()?.unwrap_or(*tip),
+                tip: ctip.as_deref().map(|p| point(p, "tip")).transpose()?.unwrap_or(*tip),
             }),
             Geom::Card { rect, link } => Some(Geom::Card {
                 rect: r(rect),
                 link: scene.cards.get(&index).map(|(l, _)| l.clone()).unwrap_or_else(|| link.clone()),
             }),
-            Geom::Anchor(p) => Some(Geom::Anchor(Point::new(change.x.unwrap_or(p.x), change.y.unwrap_or(p.y)))),
+            Geom::Anchor(p) => Some(Geom::Anchor(Point::new(cx.unwrap_or(p.x), cy.unwrap_or(p.y)))),
             Geom::Segment { a, b } => match new_points()?.as_deref() {
                 None => Some(Geom::Segment { a: *a, b: *b }),
                 Some([a, b]) => Some(Geom::Segment { a: *a, b: *b }),
-                Some(_) => return Err(bad("a line or arrow takes two points")),
+                Some(_) => return Err(bad("a line, arrow or dimension takes two points")),
             },
             Geom::Connector { from, to } => {
                 let end = |el: &Option<String>, pt: &Option<Vec<f32>>, sd: &Option<String>, old: &End, which: &str| -> Result<End, BoardError> {
@@ -1915,8 +2067,8 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
                     scene.end(el, pt, sd, which)
                 };
                 Some(Geom::Connector {
-                    from: end(&change.from, &change.from_point, &change.from_side, from, "from")?,
-                    to: end(&change.to, &change.to_point, &change.to_side, to, "to")?,
+                    from: end(&change.from, &cfrom, &change.from_side, from, "from")?,
+                    to: end(&change.to, &cto, &change.to_side, to, "to")?,
                 })
             }
             Geom::Stroke => {
@@ -2121,6 +2273,15 @@ fn style_text(style: &Style) -> Vec<String> {
     }
     if let Some(f) = style.feather.filter(|f| *f > 0.0) {
         out.push(format!("feather {}", n(f)));
+    }
+    if style.dims == Some(true) {
+        out.push("dims".to_string());
+    }
+    if style.area == Some(true) {
+        out.push("area".to_string());
+    }
+    if let Some(v) = style.dim_offset {
+        out.push(format!("dim_offset {}", n(v)));
     }
     out
 }
@@ -2427,6 +2588,22 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
         )),
         None => out.push_str("page: none (an infinite canvas)\n"),
     }
+    match &snapshot.scale {
+        Some(s) if s.off => out.push_str(&format!(
+            "scale: {} kept, measuring off (set_canvas measuring true switches it on)\n",
+            s.name()
+        )),
+        Some(s) => out.push_str(&format!(
+            "scale: {} (unit {}, {} canvas units per {}{}); {}. Lengths like \"12 ft\" are taken anywhere a coordinate or size is.\n",
+            s.name(),
+            s.unit,
+            n(s.per_unit as f32),
+            s.unit,
+            s.label.as_deref().map(|l| format!(", written \"{l}\"")).unwrap_or_default(),
+            s.describe()
+        )),
+        None => out.push_str("scale: none (set_canvas scale gives it one, to measure in real units)\n"),
+    }
     match snapshot.visible_extent() {
         Some(r) => out.push_str(&format!("what shows: {}\n", rect_text(&r))),
         None => out.push_str("what shows: nothing\n"),
@@ -2626,6 +2803,9 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, lis
             }
             if let Some(author) = &raw.author {
                 line.push_str(&format!(" · by {}", author.name));
+            }
+            if let Some(m) = snapshot.measuring().and_then(|s| measures_text(e, s)) {
+                line.push_str(&format!(" · measures {m}"));
             }
             out.push_str(&line);
             out.push('\n');
@@ -3088,7 +3268,9 @@ impl Pimble {
     /// size (a path as its SVG path data, `d`), text, style, frame or group,
     /// lock and author, and what layers and
     /// elements mean (their notes and fields). `with_field` lists only the
-    /// elements with a field ("role=door"). Name a canvas node,
+    /// elements with a field ("role=door"). With a scale, it says the scale
+    /// and each element's measures in its units (length and angle, width ×
+    /// height, perimeter, area). Name a canvas node,
     /// or a note plus the id of a canvas in its text (`#canvas=<id>` in its
     /// picture's URL). render_canvas shows it as a picture.
     #[tool(name = "get_canvas")]
@@ -3576,6 +3758,13 @@ impl Pimble {
     /// elements when moved), pen strokes, numbered steps, callouts, node cards,
     /// pictures and groups, in one edit. Give elements a `ref` to connect or group them in the same call.
     /// A style's `feather` fades an element's edge (soft regions and haze).
+    /// On a canvas with a scale (set_canvas `scale`), any coordinate or size
+    /// may be a length ("12 ft", "3.5 m", "12' 6\"", measured from the
+    /// canvas's origin), a `dimension` (two `points`, style `dim_offset`)
+    /// draws a measured dimension line labeled in the canvas's units, and
+    /// style `dims`/`area` label a shape's sides and area: "a 12 x 14 ft room
+    /// with a 3 ft door on the south wall" is a rect at x "0 ft", y "0 ft",
+    /// w "12 ft", h "14 ft" with dims, and a line along its bottom edge.
     /// Answers each new element's id.
     #[tool(name = "add_elements")]
     async fn add_elements(&self, Parameters(p): Parameters<AddElementsParams>) -> Result<String, String> {
@@ -3587,7 +3776,11 @@ impl Pimble {
         let specs = p.elements.clone();
         let layer = p.layer.clone();
         let (ids, doc_bytes) = self
-            .canvas_edit_sized(&target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
+            .canvas_edit_sized(&target, prepared, move |t, scene, snapshot| {
+                // Lengths ("12 ft") in canvas units, through the canvas's scale.
+                let specs = specs.iter().map(|s| s.resolved(snapshot.scale.as_ref())).collect::<Result<Vec<_>, _>>()?;
+                add_specs(t, scene, &specs, layer.as_deref())
+            })
             .await?;
         Ok(format!("Added to {}:\n{}{}", target.what(), made(&p.elements, &ids), size_warning(doc_bytes)))
     }
@@ -3801,7 +3994,8 @@ impl Pimble {
         let count = changes.len();
         self.canvas_edit(&target, (HashMap::new(), cards), move |t, scene, snapshot| {
             for (i, change) in changes.iter().enumerate() {
-                change_element(t, scene, snapshot, change, i)?;
+                let change = change.resolved(snapshot.scale.as_ref())?;
+                change_element(t, scene, snapshot, &change, i)?;
             }
             Ok(())
         })
@@ -4275,17 +4469,26 @@ impl Pimble {
     }
 
     /// A canvas's own settings: a page (the rectangle it prints and renders
-    /// as; outside it stays), or none (infinite); and whether its markup shows
-    /// (hiding it shows only the pictures, for everyone).
+    /// as; outside it stays), or none (infinite); whether its markup shows
+    /// (hiding it shows only the pictures, for everyone); and its scale
+    /// ("1:100", "1 in = 10 ft", or null to remove it) and the unit it
+    /// measures in, so a plan or map drawn on it measures in real units.
     #[tool(name = "set_canvas")]
     async fn set_canvas(&self, Parameters(p): Parameters<SetCanvasParams>) -> Result<String, String> {
         let wants = [p.page.is_some(), p.page_fits_content, p.remove_page].iter().filter(|b| **b).count();
         if wants > 1 {
             return Err("Give one of page, page_fits_content and remove_page.".into());
         }
-        if wants == 0 && p.markup_visible.is_none() {
-            return Err("Nothing to set: give a page, page_fits_content, remove_page or markup_visible.".into());
+        if wants == 0 && p.markup_visible.is_none() && p.scale.is_none() && p.unit.is_none() && p.precision.is_none() {
+            return Err("Nothing to set: give a page, page_fits_content, remove_page, markup_visible, scale or unit.".into());
         }
+        let unit = match p.unit.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(u) => Some(pimble_board::Unit::parse(u).ok_or_else(|| format!("\"{u}\" is not a unit; use mm, cm, m, km, in, ft, yd or mi"))?),
+            None => None,
+        };
+        let scale_text = p.scale.clone();
+        let precision = p.precision;
+        let measuring = p.measuring;
         let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let page = match &p.page {
             Some(spec) => Some(Page {
@@ -4295,7 +4498,7 @@ impl Pimble {
             None => None,
         };
         let (fits, remove, markup) = (p.page_fits_content, p.remove_page, p.markup_visible);
-        self.canvas_edit(&target, Default::default(), move |t, _, snapshot| {
+        let now = self.canvas_edit(&target, Default::default(), move |t, _, snapshot| {
             if let Some(page) = &page {
                 if !(page.rect.w > 0.0 && page.rect.h > 0.0) {
                     return Err(bad("a page needs a width and a height"));
@@ -4312,11 +4515,87 @@ impl Pimble {
             if let Some(v) = markup {
                 t.set_markup_visible(v)?;
             }
-            Ok(())
+            // The scale (docs/MEASURE_CONTRACT.md section 7).
+            let mut scale = match &scale_text {
+                Some(None) => {
+                    t.set_scale(None)?;
+                    None
+                }
+                Some(Some(text)) if text.trim().is_empty() => {
+                    t.set_scale(None)?;
+                    None
+                }
+                Some(Some(text)) => {
+                    let read = pimble_board::measure::parse_scale(text, unit.unwrap_or(pimble_board::Unit::M)).map_err(bad)?;
+                    // A ratio is read in the unit asked; an equation names its own.
+                    Some(match unit {
+                        Some(u) if text.contains('=') => in_unit(&read, u),
+                        _ => read,
+                    })
+                }
+                None => snapshot.scale.clone().map(|s| match unit {
+                    Some(u) => in_unit(&s, u),
+                    None => s,
+                }),
+            };
+            if let Some(scale) = scale.as_mut() {
+                if precision.is_some() {
+                    scale.precision = precision;
+                }
+                if scale_text.is_some() {
+                    scale.off = false;
+                }
+                if let Some(on) = measuring {
+                    scale.off = !on;
+                }
+                if scale_text.is_some() || unit.is_some() || precision.is_some() || measuring.is_some() {
+                    t.set_scale(Some(scale))?;
+                }
+            } else if scale_text.is_none() && (unit.is_some() || precision.is_some() || measuring == Some(true)) {
+                return Err(bad("this canvas has no scale: give `scale` to measure in real units"));
+            }
+            Ok(scale)
         })
         .await?;
-        Ok(format!("Set {}.", target.what()))
+        Ok(match now {
+            Some(s) if s.off => format!("Set {}. Measuring is off (the scale {} is kept).", target.what(), s.name()),
+            Some(s) => format!("Set {}. Scale {} ({}).", target.what(), s.name(), s.describe()),
+            None => format!("Set {}.", target.what()),
+        })
     }
+}
+
+/// `scale` shown in `unit` (the same canvas units per meter).
+fn in_unit(scale: &pimble_board::Scale, unit: pimble_board::Unit) -> pimble_board::Scale {
+    if scale.unit == unit {
+        return scale.clone();
+    }
+    pimble_board::Scale { unit, per_unit: scale.board_per_meter() * unit.meters(), label: scale.label.clone(), precision: None, off: scale.off }
+}
+
+/// What an element measures, in the canvas's units (get_canvas, with a
+/// scale): "length 12′ 6″, angle 32°", "12′ × 10′, perimeter 44′, area
+/// 120 sq ft".
+fn measures_text(e: &pimble_board::Element, scale: &pimble_board::Scale) -> Option<String> {
+    let m = pimble_board::measure::of(e);
+    let len = |v: f32| scale.length(v as f64);
+    let mut parts = Vec::new();
+    if let Some(l) = m.length {
+        parts.push(format!("length {}", len(l)));
+    }
+    if let Some(a) = m.angle {
+        parts.push(format!("angle {}°", (a * 10.0).round() / 10.0));
+    }
+    if let (Some(w), Some(h)) = (m.width, m.height) {
+        parts.push(format!("{} × {}", len(w), len(h)));
+    }
+    if let Some(p) = m.perimeter {
+        parts.push(format!("perimeter {}", len(p)));
+    }
+    if let Some(a) = m.area {
+        parts.push(format!("area {}", scale.area(a as f64)));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// A canvas made from a picture file takes the file's name without its extension.
@@ -4331,6 +4610,13 @@ fn picture_title(file: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn lens(v: Vec<Vec<f32>>) -> Vec<Vec<Len>> {
+        v.into_iter().map(|p| p.into_iter().map(Len::from).collect()).collect()
+    }
+
+    fn lens1(v: Vec<f32>) -> Vec<Len> {
+        v.into_iter().map(Len::from).collect()
+    }
     use super::*;
 
     fn spec(kind: &str) -> ElementSpec {
@@ -4352,8 +4638,8 @@ mod tests {
     #[test]
     fn a_diagram_with_connectors_by_ref() {
         let board = fresh();
-        let a = ElementSpec { name: Some("a".into()), x: Some(0.0), y: Some(0.0), text: Some("Idea".into()), ..spec("sticky") };
-        let b = ElementSpec { name: Some("b".into()), x: Some(400.0), y: Some(0.0), w: Some(120.0), h: Some(80.0), text: Some("Plan".into()), ..spec("rect") };
+        let a = ElementSpec { name: Some("a".into()), x: Some(0.0.into()), y: Some(0.0.into()), text: Some("Idea".into()), ..spec("sticky") };
+        let b = ElementSpec { name: Some("b".into()), x: Some(400.0.into()), y: Some(0.0.into()), w: Some(120.0.into()), h: Some(80.0.into()), text: Some("Plan".into()), ..spec("rect") };
         // The connector comes first in the list and names elements made after it.
         let c = ElementSpec { from: Some("a".into()), to: Some("b".into()), to_side: Some("left".into()), text: Some("leads to".into()), ..spec("connector") };
         let ids = add(&board, &[c, a, b]).unwrap();
@@ -4378,21 +4664,21 @@ mod tests {
         let board = fresh();
         let err = add(&board, &[spec("rect")]).unwrap_err();
         assert!(err.to_string().contains("needs x and y"), "{err}");
-        let err = add(&board, &[ElementSpec { from: Some("nowhere".into()), to_point: Some(vec![1.0, 2.0]), ..spec("connector") }]).unwrap_err();
+        let err = add(&board, &[ElementSpec { from: Some("nowhere".into()), to_point: Some(lens1(vec![1.0, 2.0])), ..spec("connector") }]).unwrap_err();
         assert!(err.to_string().contains("no element \"nowhere\""), "{err}");
         let err = add(&board, &[spec("blob")]).unwrap_err();
         assert!(err.to_string().contains("is not a kind"), "{err}");
-        let err = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(1.0), h: Some(1.0), style: Some(StyleSpec { dash: Some("wavy".into()), ..Default::default() }), ..spec("rect") }]).unwrap_err();
+        let err = add(&board, &[ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), w: Some(1.0.into()), h: Some(1.0.into()), style: Some(StyleSpec { dash: Some("wavy".into()), ..Default::default() }), ..spec("rect") }]).unwrap_err();
         assert!(err.to_string().contains("solid, dashed, dotted"), "{err}");
     }
 
     #[test]
     fn locked_layers_and_elements_refuse_edits() {
         let board = fresh();
-        let ids = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), locked: Some(true), ..spec("rect") }]).unwrap();
+        let ids = add(&board, &[ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), locked: Some(true), ..spec("rect") }]).unwrap();
         let snapshot = board.snapshot();
         let mut scene = Scene::of(&snapshot);
-        let move_it = ElementChange { id: ids[0].clone(), x: Some(50.0), ..Default::default() };
+        let move_it = ElementChange { id: ids[0].clone(), x: Some(50.0.into()), ..Default::default() };
         let err = board.edit(Stamp::new(None, "t"), |t| change_element(t, &mut scene, &snapshot, &move_it, 0)).result.unwrap_err();
         assert!(matches!(err, BoardError::ElementLocked { layer: None, .. }), "{err:?}");
         assert!(said(&err).contains("is locked; update_elements"), "{}", said(&err));
@@ -4405,7 +4691,7 @@ mod tests {
         // Every layer locked: nowhere to draw.
         let layer = snap.layers[0].id.clone();
         board.edit(Stamp::new(None, "t"), |t| t.set_layer_locked(&layer, true)).result.unwrap();
-        let err = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), ..spec("step") }]).unwrap_err();
+        let err = add(&board, &[ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), ..spec("step") }]).unwrap_err();
         assert_eq!(err, BoardError::EveryLayerLocked);
         assert!(said(&err).contains("every layer of this canvas is locked"), "{}", said(&err));
         // An element on the locked layer takes no lock of its own either.
@@ -4419,7 +4705,7 @@ mod tests {
     #[test]
     fn a_member_that_is_locked_stays_out_of_a_group() {
         let board = fresh();
-        let ids = add(&board, &[ElementSpec { name: Some("a".into()), x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), locked: Some(true), ..spec("rect") }])
+        let ids = add(&board, &[ElementSpec { name: Some("a".into()), x: Some(0.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), locked: Some(true), ..spec("rect") }])
             .unwrap();
         let err = add(&board, &[ElementSpec { members: Some(vec![ids[0].clone()]), ..spec("group") }]).unwrap_err();
         assert!(matches!(&err, BoardError::ElementLocked { id, .. } if *id == ids[0]), "{err:?}");
@@ -4431,8 +4717,8 @@ mod tests {
         let ids = add(
             &board,
             &[
-                ElementSpec { name: Some("s".into()), points: Some(vec![vec![0.0, 0.0], vec![10.0, 5.0], vec![20.0, 0.0]]), ..spec("pen") },
-                ElementSpec { name: Some("l".into()), points: Some(vec![vec![0.0, 20.0], vec![20.0, 20.0]]), ..spec("arrow") },
+                ElementSpec { name: Some("s".into()), points: Some(lens(vec![vec![0.0, 0.0], vec![10.0, 5.0], vec![20.0, 0.0]])), ..spec("pen") },
+                ElementSpec { name: Some("l".into()), points: Some(lens(vec![vec![0.0, 20.0], vec![20.0, 20.0]])), ..spec("arrow") },
                 ElementSpec { members: Some(vec!["s".into(), "l".into()]), ..spec("group") },
             ],
         )
@@ -4460,7 +4746,7 @@ mod tests {
     #[test]
     fn a_centered_label_sits_on_its_point() {
         let board = fresh();
-        let ids = add(&board, &[ElementSpec { x: Some(100.0), y: Some(50.0), center: Some(true), text: Some("Kitchen".into()), ..spec("text") }]).unwrap();
+        let ids = add(&board, &[ElementSpec { x: Some(100.0.into()), y: Some(50.0.into()), center: Some(true), text: Some("Kitchen".into()), ..spec("text") }]).unwrap();
         let snap = board.snapshot();
         let tb = snap.get(&ids[0]).unwrap().text_box.unwrap();
         assert!((tb.center().x - 100.0).abs() < 0.5 && (tb.center().y - 50.0).abs() < 0.5, "{tb:?}");
@@ -4475,8 +4761,8 @@ mod tests {
         let ids = add(
             &board,
             &[
-                ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(90.0), h: Some(10.0), note: Some("Front door".into()), fields: Some(fields), locked: Some(true), ..spec("rect") },
-                ElementSpec { x: Some(200.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") },
+                ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), w: Some(90.0.into()), h: Some(10.0.into()), note: Some("Front door".into()), fields: Some(fields), locked: Some(true), ..spec("rect") },
+                ElementSpec { x: Some(200.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), ..spec("rect") },
             ],
         )
         .unwrap();
@@ -4537,7 +4823,7 @@ mod tests {
     #[test]
     fn get_canvas_pages_lists_a_layer_and_says_sizes() {
         let board = fresh();
-        let specs: Vec<ElementSpec> = (0..30).map(|i| ElementSpec { x: Some(i as f32 * 10.0), y: Some(0.0), w: Some(5.0), h: Some(5.0), ..spec("rect") }).collect();
+        let specs: Vec<ElementSpec> = (0..30).map(|i| ElementSpec { x: Some((i as f32 * 10.0).into()), y: Some(0.0.into()), w: Some(5.0.into()), h: Some(5.0.into()), ..spec("rect") }).collect();
         let ids = add(&board, &specs).unwrap();
         let st = Stamp::new(None, "2026-11-18T00:00:00.000Z");
         let roads = board.edit(st, |t| t.add_layer("Roads", Placement::Top)).into_result().unwrap().0;
@@ -4579,14 +4865,14 @@ mod tests {
     fn elements_read_whole_write_back_verbatim() {
         let board = fresh();
         let mut pen = spec("pen");
-        pen.points = Some(vec![vec![0.0, 0.0, 0.2], vec![30.0, 10.0, 0.9], vec![60.0, 0.0]]);
+        pen.points = Some(lens(vec![vec![0.0, 0.0, 0.2], vec![30.0, 10.0, 0.9], vec![60.0, 0.0]]));
         let specs = vec![
             ElementSpec {
                 name: Some("box".into()),
-                x: Some(10.0),
-                y: Some(20.0),
-                w: Some(100.0),
-                h: Some(50.0),
+                x: Some(10.0.into()),
+                y: Some(20.0.into()),
+                w: Some(100.0.into()),
+                h: Some(50.0.into()),
                 text: Some("Mill".into()),
                 transform: Some(TransformSpec { tx: Some(5.0), ty: Some(-3.0), rot: Some(15.0), sx: Some(1.5), sy: None }),
                 style: Some(StyleSpec { fill: Some("#ffcc00".into()), dash: Some("6 3".into()), radius: Some(4.0), ..Default::default() }),
@@ -4597,8 +4883,8 @@ mod tests {
             ElementSpec { name: Some("road".into()), d: Some("M0 0 C50 0 50 80 100 80".into()), style: Some(StyleSpec { width: Some(3.0), ..Default::default() }), ..spec("path") },
             ElementSpec { name: Some("pen".into()), ..pen },
             ElementSpec { name: Some("g".into()), members: Some(vec!["box".into(), "pen".into()]), ..spec("group") },
-            ElementSpec { from: Some("box".into()), to_point: Some(vec![300.0, 300.0]), text: Some("to town".into()), ..spec("connector") },
-            ElementSpec { points: Some(vec![vec![0.0, 100.0], vec![80.0, 140.0]]), locked: Some(true), ..spec("arrow") },
+            ElementSpec { from: Some("box".into()), to_point: Some(lens1(vec![300.0, 300.0])), text: Some("to town".into()), ..spec("connector") },
+            ElementSpec { points: Some(lens(vec![vec![0.0, 100.0], vec![80.0, 140.0]])), locked: Some(true), ..spec("arrow") },
         ];
         add(&board, &specs).unwrap();
         let snap = board.snapshot();
@@ -4640,8 +4926,8 @@ mod tests {
     fn copies_get_new_ids_move_by_the_offset_and_keep_paint() {
         let board = fresh();
         let specs = vec![
-            ElementSpec { name: Some("a".into()), x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") },
-            ElementSpec { name: Some("b".into()), x: Some(50.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("ellipse") },
+            ElementSpec { name: Some("a".into()), x: Some(0.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), ..spec("rect") },
+            ElementSpec { name: Some("b".into()), x: Some(50.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), ..spec("ellipse") },
             ElementSpec { name: Some("g".into()), members: Some(vec!["a".into()]), ..spec("group") },
             ElementSpec { from: Some("a".into()), to: Some("b".into()), ..spec("connector") },
         ];
@@ -4808,9 +5094,9 @@ mod tests {
             style: Some(StyleSpec { fill: Some("#3366ff".into()), cap: Some("square".into()), join: Some("bevel".into()), dash: Some("8 4".into()), ..Default::default() }),
             ..spec("path")
         };
-        let star = ElementSpec { x: Some(200.0), y: Some(0.0), w: Some(100.0), h: Some(100.0), style: Some(StyleSpec { points: Some(7), inner: Some(0.5), ..Default::default() }), ..spec("star") };
-        let poly = ElementSpec { x: Some(400.0), y: Some(0.0), w: Some(100.0), h: Some(100.0), ..spec("polygon") };
-        let rect = ElementSpec { x: Some(600.0), y: Some(0.0), w: Some(100.0), h: Some(60.0), style: Some(StyleSpec { radius: Some(12.0), ..Default::default() }), ..spec("rect") };
+        let star = ElementSpec { x: Some(200.0.into()), y: Some(0.0.into()), w: Some(100.0.into()), h: Some(100.0.into()), style: Some(StyleSpec { points: Some(7), inner: Some(0.5), ..Default::default() }), ..spec("star") };
+        let poly = ElementSpec { x: Some(400.0.into()), y: Some(0.0.into()), w: Some(100.0.into()), h: Some(100.0.into()), ..spec("polygon") };
+        let rect = ElementSpec { x: Some(600.0.into()), y: Some(0.0.into()), w: Some(100.0.into()), h: Some(60.0.into()), style: Some(StyleSpec { radius: Some(12.0), ..Default::default() }), ..spec("rect") };
         let ids = add(&board, &[path, star, poly, rect]).unwrap();
         let snap = board.snapshot();
         let text = describe(&snap, &HashMap::new());
@@ -4832,7 +5118,7 @@ mod tests {
         let e = snap.get(&ids[3]).unwrap();
         assert_eq!(e.raw.kind, Kind::Path);
         assert_eq!(e.raw.style.radius, Some(12.0), "its style stays");
-        change(ElementChange { id: ids[3].clone(), x: Some(0.0), w: Some(50.0), rule: Some("evenodd".into()), ..Default::default() }).unwrap();
+        change(ElementChange { id: ids[3].clone(), x: Some(0.0.into()), w: Some(50.0.into()), rule: Some("evenodd".into()), ..Default::default() }).unwrap();
         let snap = board.snapshot();
         let Geom::Path(p) = &snap.get(&ids[3]).unwrap().raw.geom else { panic!() };
         assert_eq!(p.bounds().unwrap(), Rect::new(0.0, 0.0, 50.0, 80.0));
@@ -4850,9 +5136,9 @@ mod tests {
         assert!(err.to_string().contains("needs its outline"), "{err}");
         let err = add(&board, &[ElementSpec { d: Some("M0 0 L1 1".into()), rule: Some("odd".into()), ..spec("path") }]).unwrap_err();
         assert!(err.to_string().contains("not nonzero or evenodd"), "{err}");
-        let err = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(1.0), h: Some(1.0), style: Some(StyleSpec { sides: Some(2), ..Default::default() }), ..spec("polygon") }]).unwrap_err();
+        let err = add(&board, &[ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), w: Some(1.0.into()), h: Some(1.0.into()), style: Some(StyleSpec { sides: Some(2), ..Default::default() }), ..spec("polygon") }]).unwrap_err();
         assert!(err.to_string().contains("3 sides or more"), "{err}");
-        let arrow = add(&board, &[ElementSpec { points: Some(vec![vec![0.0, 0.0], vec![5.0, 5.0]]), ..spec("arrow") }]).unwrap();
+        let arrow = add(&board, &[ElementSpec { points: Some(lens(vec![vec![0.0, 0.0], vec![5.0, 5.0]])), ..spec("arrow") }]).unwrap();
         let err = change(ElementChange { id: arrow[0].clone(), d: Some("M0 0 L1 1".into()), ..Default::default() }).unwrap_err();
         assert!(err.to_string().contains("cannot take path data"), "{err}");
     }
@@ -4867,10 +5153,10 @@ mod tests {
             stops: vec![StopSpec { offset: None, color: "#ffffff".into() }, StopSpec { offset: None, color: "#00000080".into() }],
         };
         let rect = ElementSpec {
-            x: Some(0.0),
-            y: Some(0.0),
-            w: Some(100.0),
-            h: Some(50.0),
+            x: Some(0.0.into()),
+            y: Some(0.0.into()),
+            w: Some(100.0.into()),
+            h: Some(50.0.into()),
             style: Some(StyleSpec { fill_gradient: Some(grad), ..Default::default() }),
             ..spec("rect")
         };
@@ -4907,8 +5193,8 @@ mod tests {
         let board = fresh();
         let river = ElementSpec { name: Some("river".into()), d: Some("M0 200 C100 100 300 100 400 200".into()), ..spec("path") };
         let label = ElementSpec {
-            x: Some(0.0),
-            y: Some(0.0),
+            x: Some(0.0.into()),
+            y: Some(0.0.into()),
             text: Some("Braynard River".into()),
             style: Some(StyleSpec {
                 font: Some("serif bold italic".into()),
@@ -4968,7 +5254,7 @@ mod tests {
         // Refusals.
         assert!(said(&style_of(&StyleSpec { font: Some("comic".into()), ..Default::default() }).unwrap_err()).contains("not sans, serif or condensed"));
         assert!(said(&style_of(&StyleSpec { along_side: Some("left".into()), ..Default::default() }).unwrap_err()).contains("above, on, below"));
-        let rect = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") }]).unwrap();
+        let rect = add(&board, &[ElementSpec { x: Some(0.0.into()), y: Some(0.0.into()), w: Some(10.0.into()), h: Some(10.0.into()), ..spec("rect") }]).unwrap();
         let err = change(ElementChange { id: ids[0].clone(), style: Some(StyleSpec { along: Some(rect[0].clone()), ..Default::default() }), ..Default::default() }).unwrap_err();
         assert!(said(&err).contains("only on a path"), "{err}");
         assert_eq!(font_of("Condensed-Bold").unwrap(), (FontFamily::Condensed, Some(true), None));
@@ -5025,6 +5311,80 @@ mod tests {
         pimble.update_layer(jp(serde_json::json!({ "node": "Maps/County", "layer": "Fields", "clip": null }))).await.unwrap();
         let read = pimble.get_canvas(jp(serde_json::json!({ "node": "Maps/County" }))).await.unwrap();
         assert!(!read.contains("clipped to"), "{read}");
+        let _ = server.stop().await;
+    }
+
+    /// Measuring (docs/MEASURE_CONTRACT.md section 7): set_canvas takes a
+    /// scale and a unit and null removes it; with one, add_elements and
+    /// update_elements take lengths, a dimension is labeled in the canvas's
+    /// units, dims and area read back, and get_canvas says the scale and
+    /// each element's measures. Lengths on a canvas with no scale are refused.
+    #[tokio::test]
+    async fn a_room_drawn_in_feet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            ..pimble_server::ServerConfig::in_dir(dir.path())
+        });
+        server.start().await.expect("server starts");
+        let url = format!("http://{}", server.addr());
+        let service = pimble_client::PimbleClient::connect(&url).await.unwrap();
+        service.create_store(dir.path().join("house.pimble"), "House").await.unwrap();
+        let pimble = super::super::Pimble::new(std::sync::Arc::new(crate::connection::Connection::with_client(pimble_client::PimbleClient::connect(&url).await.unwrap())));
+        pimble.create_canvas(jp(serde_json::json!({ "parent": "House", "title": "Plan" }))).await.unwrap();
+
+        // No scale yet: a length is refused with a sentence, nothing drawn.
+        let refused = pimble
+            .add_elements(jp(serde_json::json!({ "node": "House/Plan", "elements": [{ "kind": "rect", "x": 0, "y": 0, "w": "12 ft", "h": "14 ft" }] })))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("has no scale"), "{refused}");
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("scale: none"), "{read}");
+
+        let set = pimble.set_canvas(jp(serde_json::json!({ "node": "House/Plan", "scale": "1/4\" = 1'" }))).await.unwrap();
+        assert!(set.contains("Scale 1/4\" = 1'"), "{set}");
+        // A 12 x 14 ft room with a 3 ft door on the south wall.
+        let added = pimble
+            .add_elements(jp(serde_json::json!({ "node": "House/Plan", "elements": [
+                { "kind": "rect", "ref": "room", "x": "0 ft", "y": "0 ft", "w": "12 ft", "h": "14 ft", "style": { "dims": true, "area": true } },
+                { "kind": "line", "ref": "door", "points": [["4 ft", "14 ft"], ["7 ft", "14 ft"]], "style": { "dims": true } },
+                { "kind": "dimension", "ref": "dim", "points": [[0, "14 ft"], ["12'", "14 ft"]], "style": { "dim_offset": -30 } },
+            ] })))
+            .await
+            .unwrap();
+        let id = |r: &str| added.lines().find(|l| l.contains(&format!("({r})"))).and_then(|l| l.split_whitespace().nth(1)).unwrap_or_else(|| panic!("{added}")).to_string();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("scale: 1/4\" = 1' (unit ft, 24 canvas units per ft"), "{read}");
+        assert!(read.contains("12′ × 14′, perimeter 52′, area 168 sq ft"), "the room's measures: {read}");
+        assert!(read.contains("measures length 3′, angle 0°"), "the door: {read}");
+        assert!(read.contains(&format!("- {} dimension", id("dim"))) && read.contains("dim_offset -30"), "{read}");
+        assert!(read.contains("dims, area"), "{read}");
+        // The room in canvas units: 12 ft is 288.
+        assert!(read.contains("rect at 0,0 size 288x336"), "{read}");
+        let snapshot = {
+            let elements = pimble.get_elements(jp(serde_json::json!({ "node": "House/Plan", "ids": [id("dim")] }))).await.unwrap();
+            assert!(elements.contains("dimension"), "{elements}");
+            elements
+        };
+        let _ = snapshot;
+
+        // update_elements takes lengths too.
+        pimble.update_elements(jp(serde_json::json!({ "node": "House/Plan", "changes": [{ "id": id("room"), "w": "13 ft" }] }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("13′ × 14′"), "{read}");
+
+        // In inches, then metric; then removed.
+        pimble.set_canvas(jp(serde_json::json!({ "node": "House/Plan", "unit": "in" }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("length 36″"), "{read}");
+        pimble.set_canvas(jp(serde_json::json!({ "node": "House/Plan", "scale": "1:50", "unit": "m" }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("scale: 1:50 (unit m"), "{read}");
+        let refused = pimble.set_canvas(jp(serde_json::json!({ "node": "House/Plan", "scale": "huge" }))).await.unwrap_err();
+        assert!(refused.contains("Write a scale as a ratio"), "{refused}");
+        pimble.set_canvas(jp(serde_json::json!({ "node": "House/Plan", "scale": null }))).await.unwrap();
+        let read = pimble.get_canvas(jp(serde_json::json!({ "node": "House/Plan" }))).await.unwrap();
+        assert!(read.contains("scale: none") && !read.contains("measures"), "{read}");
         let _ = server.stop().await;
     }
 

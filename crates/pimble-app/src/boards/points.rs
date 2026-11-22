@@ -916,7 +916,7 @@ fn write_points(store: AppStore, pane: PaneId, w: &PointWrite) -> bool {
 /// once, the document about every 80 ms (and always when `last`).
 fn drag_to(store: AppStore, pane: PaneId, px: f32, py: f32, last: bool) {
     let scale = scale_of(pane);
-    let grid = untracked(|| store.board_style.snap.get()).then_some(GRID);
+    let grid = super::tools::snap_grid(store, pane);
     let write = with_session(pane, |s| {
         let p = s.view.screen_to_board(px, py);
         let (alt, shift) = (s.alt, s.shift);
@@ -1238,7 +1238,10 @@ pub(super) fn refresh_overlay(store: AppStore, pane: PaneId) {
         if let Some(pe) = s.points.as_mut() {
             pe.others.retain(|o| !gone.contains(&o.id));
         }
-        let overlay = if s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_some()) {
+        let overlay = if let Some(o) = super::measure::overlay(s) {
+            // The Scale panel's calibration line, whatever the tool.
+            Some(o)
+        } else if s.paint_sel.as_ref().is_some_and(|sel| sel.placing.is_some()) {
             // A picture being placed in a paint layer, whatever the tool.
             super::paint_select::overlay(s)
         } else if let Some(pen) = s.pen.as_ref().filter(|_| tool == Tool::Pen) {

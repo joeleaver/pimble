@@ -85,6 +85,9 @@ pub(super) fn style_json(style: &Style) -> Value {
     put("along_side", style.along_side.map(|s| json!(s.as_str())));
     put("tint", style.tint.map(|c| json!(c.to_hex())));
     put("feather", style.feather.map(num));
+    put("dims", style.dims.map(|v| json!(v)));
+    put("area", style.area.map(|v| json!(v)));
+    put("dim_offset", style.dim_offset.map(num));
     Value::Object(m)
 }
 

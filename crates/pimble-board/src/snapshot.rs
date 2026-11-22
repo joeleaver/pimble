@@ -147,6 +147,10 @@ pub struct Element {
     /// feather's and its layer's and groups' blurs and feathers
     /// (docs/DRAWING_WAVE6_CONTRACT.md section 3, [`crate::soft::reach`]).
     pub soft: f32,
+    /// What it draws to show measurements (a dimension; a shape with
+    /// `dims` or `area` on a canvas with a scale), in board units
+    /// (docs/MEASURE_CONTRACT.md section 5, [`crate::measure`]).
+    pub marks: Option<Arc<crate::measure::Marks>>,
 }
 
 impl Element {
@@ -204,6 +208,9 @@ pub struct BoardSnapshot {
     pub exists: bool,
     pub version: i64,
     pub page: Option<Page>,
+    /// The canvas's scale as stored (docs/MEASURE_CONTRACT.md), switched
+    /// off or not; `None` without one. What measures is [`Self::measuring`].
+    pub scale: Option<crate::measure::Scale>,
     pub markup_visible: bool,
     pub edited_by: Option<Author>,
     pub edited_at: Option<String>,
@@ -264,6 +271,12 @@ pub struct PaintMark {
 }
 
 impl BoardSnapshot {
+    /// The scale things are measured in: the stored one unless measuring
+    /// is switched off (docs/MEASURE_CONTRACT.md section 1).
+    pub fn measuring(&self) -> Option<&crate::measure::Scale> {
+        self.scale.as_ref().filter(|s| !s.off)
+    }
+
     /// A board that does not exist: nothing to draw.
     pub fn empty() -> Self {
         Self::build(None)
@@ -280,6 +293,7 @@ impl BoardSnapshot {
                 exists: false,
                 version: crate::doc::VERSION,
                 page: None,
+                scale: None,
                 markup_visible: true,
                 edited_by: None,
                 edited_at: None,
@@ -715,6 +729,7 @@ struct Resolver {
     by_id: HashMap<u64, usize>,
     options: ViewOptions,
     symbols: HashMap<String, Arc<crate::scatter::SymbolDef>>,
+    scale: Option<crate::measure::Scale>,
 }
 
 impl Resolver {
@@ -723,7 +738,7 @@ impl Resolver {
             Some(symbol) => isolate(raw, symbol),
             None => raw,
         };
-        let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements, paint: raw_paint, symbols: raw_symbols } = raw;
+        let RawBoard { version, page, scale, markup_visible, edited_by, edited_at, layers: raw_layers, elements, paint: raw_paint, symbols: raw_symbols } = raw;
         // Symbols first: a scatter's extent is its symbol's, placed. Each is
         // resolved as a board of its own, in one layer; a symbol holds no
         // scatter, so this never recurses further.
@@ -735,6 +750,7 @@ impl Resolver {
                 let inner = RawBoard {
                     version,
                     page: None,
+                    scale: scale.clone(),
                     markup_visible: true,
                     edited_by: None,
                     edited_at: None,
@@ -791,7 +807,7 @@ impl Resolver {
         let homes: Vec<Option<usize>> = ranked.iter().map(|(h, _)| *h).collect();
         let raws: Vec<RawElement> = ranked.into_iter().map(|(_, e)| e).collect();
         let by_id: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, e)| (id_hash(&e.id), i)).collect();
-        let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options, symbols: symbol_index };
+        let mut r = Resolver { reuse, layers, homes, composite, raws, by_id, options, symbols: symbol_index, scale: scale.clone().filter(|s| !s.off) };
         let mut snapshot_elements = r.resolve(markup_visible);
         let index: HashMap<u64, usize> = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
         let mut composite = std::mem::take(&mut r.composite);
@@ -861,6 +877,7 @@ impl Resolver {
             exists: true,
             version,
             page,
+            scale,
             markup_visible,
             edited_by,
             edited_at,
@@ -1147,10 +1164,22 @@ impl Resolver {
                 clips: Vec::new(),
                 scatter: scatters[i].take(),
                 soft: 0.0,
+                marks: None,
                 raw,
             };
             let (print, look) = fingerprint_and_look(&e);
             e.fingerprint = print ^ composite;
+            // Measurements (docs/MEASURE_CONTRACT.md section 5): drawn in
+            // board units, so where they reach counts in its bounds, and
+            // what they say in its fingerprint (a new scale relabels).
+            if let Some(mut m) = crate::measure::marks(&e, self.scale.as_ref()) {
+                if self.options.dark {
+                    m.on_dark();
+                }
+                e.bounds = e.bounds.union(&m.bounds);
+                e.fingerprint ^= m.hash;
+                e.marks = Some(Arc::new(m));
+            }
             if let Some(sc) = e.scatter.as_mut().and_then(Arc::get_mut) {
                 sc.look = look ^ composite;
             }
@@ -1596,6 +1625,8 @@ fn fingerprint_and_look(e: &Element) -> (u64, u64) {
     }
     s.tint.hash(&mut h);
     f(&mut h, s.feather);
+    (s.dims, s.area).hash(&mut h);
+    f(&mut h, s.dim_offset);
     let Some(sc) = &r.scatter else {
         let print = h.finish();
         return (print, print);

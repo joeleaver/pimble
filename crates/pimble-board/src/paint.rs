@@ -737,7 +737,31 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
                 });
             }
         }
+        // A dimension draws only its marks (below), in board units.
         _ => {}
     }
+    marks_ops(&mut out, e);
     out
+}
+
+/// What an element draws to show its measurements
+/// (docs/MEASURE_CONTRACT.md section 5): lines and ticks stroked, arrow
+/// heads filled, labels over a halo, all in board units.
+fn marks_ops<'a>(out: &mut Vec<Op<'a>>, e: &'a Element) {
+    let Some(m) = &e.marks else { return };
+    let bd = Space::Board;
+    if let Some(path) = &m.lines {
+        let stroke = StrokeStyle { width: m.line_width.max(0.25), dash: Dash::Solid, cap: Some(Cap::Butt), join: Join::Miter, miter: DEFAULT_MITER, pattern: None };
+        out.push(Op::stroke(PathRef::Borrowed(path), m.color, e.opacity, stroke, bd));
+    }
+    if let Some(path) = &m.heads {
+        out.push(Op::fill(PathRef::Borrowed(path), m.color, e.opacity, bd));
+    }
+    if let Some(path) = &m.labels {
+        if m.halo > 0.0 {
+            let stroke = StrokeStyle { width: m.halo * 2.0, dash: Dash::Solid, cap: Some(Cap::Round), join: Join::Round, miter: DEFAULT_MITER, pattern: None };
+            out.push(Op::stroke(PathRef::Borrowed(path), m.halo_color, e.opacity, stroke, bd));
+        }
+        out.push(Op::fill(PathRef::Borrowed(path), m.label_color, e.opacity, bd));
+    }
 }

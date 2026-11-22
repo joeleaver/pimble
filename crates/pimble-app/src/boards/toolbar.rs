@@ -10,7 +10,7 @@
 //! what is selected, or for the tool in hand: what the floating bar over
 //! the canvas carried until 2026-11-21), View (the minimap, zoom out, the
 //! canvas zoom percentage with Fit and 100%, zoom in, fit), Snap (grid,
-//! magnet), People (color by author), Export (one dropdown), History (undo,
+//! magnet), Measure (the canvas's scale, docs/MEASURE_CONTRACT.md), People (color by author), Export (one dropdown), History (undo,
 //! redo). On a canvas this device may only read, View, People and Export
 //! stay live and the rest dim.
 //!
@@ -31,11 +31,12 @@ use crate::toolbar::Picked;
 /// A group of the canvas toolbar, in order: its label, and whether it stays
 /// live on a canvas this device may only read (the rule `render_canvas_toolbar`
 /// builds the groups by). View, Snap and People show only on an open canvas.
-pub(crate) const GROUPS: [(&str, bool); 7] = [
+pub(crate) const GROUPS: [(&str, bool); 8] = [
     ("Canvas", false),
     ("Selection", false),
     ("View", true),
     ("Snap", false),
+    ("Measure", false),
     ("People", true),
     ("Export", true),
     ("History", false),
@@ -375,6 +376,41 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
         ]
     };
 
+    // Measure: the canvas's scale (docs/MEASURE_CONTRACT.md section 2), a
+    // write everyone sees, so it dims read-only.
+    let measure = move |__scope: &mut RenderScope| {
+        let scale_of_aim = move || match aim(store) {
+            Some(Aim::Board(pane)) => store.pane(pane).board_ui.measure.scale.get(),
+            _ => None,
+        };
+        let tip = move || match scale_of_aim() {
+            Some(s) => format!("Scale: {} (change or remove it)", s.name()),
+            None => "Scale: none; set one to measure in real units".to_string(),
+        };
+        // Off (every canvas starts so; artists never need it): one unlit
+        // switch. On: the switch lit, and the scale beside it.
+        let on = move || scale_of_aim().is_some();
+        vec![
+            rsx! {
+                div {
+                    title: {move || if on() { "Measuring: on (click to turn it off; the scale is kept)" } else { "Measuring: off (click to measure in real units)" }},
+                    class: {move || if on() { "pimble-board-tool pimble-board-tool--active" } else { "pimble-board-tool" }},
+                    onclick: move || on_board(store, move |store, pane| super::measure::set_measuring(store, pane, !on())),
+                    IconGlyph { name: TablerIcon::Ruler2.name().to_string() }
+                }
+            },
+            rsx! {
+                div {
+                    title: {move || tip()},
+                    class: "pimble-board-tool",
+                    style: {move || if on() { "" } else { "display: none;" }},
+                    onclick: move || on_board(store, super::measure::open_scale),
+                    IconGlyph { name: TablerIcon::Ruler3.name().to_string() }
+                }
+            },
+        ]
+    };
+
     // People: this pane only.
     let people = move |__scope: &mut RenderScope| {
         vec![button(
@@ -472,9 +508,10 @@ pub(crate) fn render_canvas_toolbar(__scope: &mut RenderScope, store: AppStore) 
     slots.extend([
         Slot::new(GROUPS[2].0, Some(5), open, always, view),
         Slot::new(GROUPS[3].0, Some(2), open, writable, snap),
-        Slot::new(GROUPS[4].0, Some(1), open, always, people),
-        Slot::new(GROUPS[5].0, Some(3), always, always, export),
-        Slot::new(GROUPS[6].0, Some(4), always, writable, history),
+        Slot::new(GROUPS[4].0, Some(2), open, writable, measure),
+        Slot::new(GROUPS[5].0, Some(1), open, always, people),
+        Slot::new(GROUPS[6].0, Some(3), always, always, export),
+        Slot::new(GROUPS[7].0, Some(4), always, writable, history),
     ]);
     // The canvas's letters keep working after a button here, as they did
     // after a press on the canvas's own chrome.
@@ -493,9 +530,10 @@ mod tests {
     #[test]
     fn the_groups_are_the_contracts() {
         let labels: Vec<&str> = GROUPS.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, ["Canvas", "Selection", "View", "Snap", "People", "Export", "History"]);
+        assert_eq!(labels, ["Canvas", "Selection", "View", "Snap", "Measure", "People", "Export", "History"]);
         // Read-only: View and Export (and the way of looking, People) stay
-        // live; Edit Canvas, the selection's controls, Snap and History dim.
+        // live; Edit Canvas, the selection's controls, Snap, Measure (the
+        // scale is a write) and History dim.
         let live: Vec<&str> = GROUPS.iter().filter(|(_, live)| *live).map(|(l, _)| *l).collect();
         assert_eq!(live, ["View", "People", "Export"]);
     }

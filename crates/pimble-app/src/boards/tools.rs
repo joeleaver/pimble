@@ -44,6 +44,11 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
     if with_session(pane, |s| s.text.is_some()).unwrap_or(false) {
         return false;
     }
+    // A size typed for what is being (or was just) drawn
+    // (docs/MEASURE_CONTRACT.md section 4).
+    if super::measure::claims_key(pane, key) {
+        return true;
+    }
     let primary = key.ctrl || key.meta;
     let pointing = points::drawing(pane) || points::editing(pane);
     let active = with_session(pane, |s| !s.selected.is_empty() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false) || pointing;
@@ -437,6 +442,10 @@ fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: Surface
     })
     .unwrap_or((false, false));
     let tool = tool.unwrap_or_else(|| untracked(|| store.board_tool.get()));
+    // The Scale panel calibrating: presses draw its line, or take up an end.
+    if button == SurfaceMouseButton::Left && !space && super::measure::calibrate_press(store, pane, px, py) {
+        return;
+    }
     match button {
         SurfaceMouseButton::Middle => begin_pan(pane, px, py),
         SurfaceMouseButton::Left if space || tool == Tool::Hand => begin_pan(pane, px, py),
@@ -490,11 +499,32 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
             with_session(pane, |s| s.gesture = Gesture::Eyedrop);
             super::paint::eyedrop(store, pane, px, py);
         }
+        Tool::Measure => {
+            // Dimensions measure in the canvas's units: without a scale the
+            // Scale panel opens instead.
+            if with_session(pane, |s| s.snapshot().measuring().is_none()).unwrap_or(true) {
+                crate::events::show_notice(store, super::measure::NEEDS_SCALE.to_string());
+                super::measure::open_scale(store, pane);
+                return;
+            }
+            if !writable_or_say(store, pane) || target_layer(store, pane).is_none() {
+                return;
+            }
+            let grid = snap_grid(store, pane);
+            let scale = scale_of(pane);
+            let start = with_session(pane, |s| super::measure::snap_end(&s.view, p, grid, scale, None)).unwrap_or(p);
+            new_undo_step(pane);
+            with_session(pane, |s| {
+                s.selected.clear();
+                s.gesture = Gesture::Shape { kind: Kind::Dimension, start, last: start, id: None, written_at: 0.0 };
+            });
+            after_change(store, pane);
+        }
         Tool::Line | Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Diamond | Tool::Polygon | Tool::Star | Tool::Frame => {
             if !writable_or_say(store, pane) || target_layer(store, pane).is_none() {
                 return;
             }
-            let start = snap(store, p);
+            let start = snap(store, pane, p);
             new_undo_step(pane);
             with_session(pane, |s| {
                 s.selected.clear();
@@ -519,14 +549,14 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
             let existing = with_session(pane, |s| hit_at(s, p).filter(|e| e.raw.kind == Kind::Text).map(|e| e.raw.id.clone())).flatten();
             match existing {
                 Some(id) => begin_text_existing(store, pane, &id),
-                None => begin_text_new(store, pane, snap(store, p)),
+                None => begin_text_new(store, pane, snap(store, pane, p)),
             }
         }
         Tool::Step => {
             let Some(layer) = target_layer(store, pane) else { return };
             new_undo_step(pane);
             let style = new_style(store, &Kind::Step);
-            let at = snap(store, p);
+            let at = snap(store, pane, p);
             if let Some(id) = local_edit(store, pane, |t| t.add_element(with_layer(NewElement::new(Kind::Step, Geom::Anchor(at)).with_style(style), &layer))) {
                 select(store, pane, vec![id]);
             }
@@ -535,7 +565,7 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
             let Some(layer) = target_layer(store, pane) else { return };
             new_undo_step(pane);
             let style = new_style(store, &Kind::Sticky);
-            let at = snap(store, Point::new(p.x - STICKY_SIZE / 2.0, p.y - STICKY_SIZE / 2.0));
+            let at = snap(store, pane, Point::new(p.x - STICKY_SIZE / 2.0, p.y - STICKY_SIZE / 2.0));
             let rect = Rect::new(at.x, at.y, STICKY_SIZE, STICKY_SIZE);
             let element = with_layer(NewElement::new(Kind::Sticky, Geom::Rect(rect)).with_text("").with_style(style), &layer);
             if let Some(id) = local_edit(store, pane, |t| t.add_element(element)) {
@@ -768,11 +798,11 @@ enum Write {
 
 fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
     with_session(pane, |s| s.pointer = (px, py));
-    if points::moved(store, pane, px, py) || super::gradient::moved(store, pane, px, py) || super::paint_select::moved(store, pane, px, py) {
+    if super::measure::calibrate_moved(store, pane, px, py) || points::moved(store, pane, px, py) || super::gradient::moved(store, pane, px, py) || super::paint_select::moved(store, pane, px, py) {
         return;
     }
     let writable = with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()).unwrap_or(false);
-    let snap_on = untracked(|| store.board_style.snap.get());
+    let snap_on = snap_grid(store, pane);
     let scale = scale_of(pane);
     let next = with_session(pane, |s| {
         s.pointer = (px, py);
@@ -812,7 +842,9 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 write
             }
             Gesture::Shape { kind, start, last, id, written_at } => {
-                let p = constrain(kind, *start, snap_point(snap_on, p), shift);
+                // A dimension's end snaps to element points (then the grid).
+                let p = if *kind == Kind::Dimension { super::measure::snap_end(&s.view, p, snap_on, scale, id.as_deref()) } else { snap_point(snap_on, p) };
+                let p = constrain(kind, *start, p, shift);
                 *last = p;
                 let far = (p.x - start.x).hypot(p.y - start.y) * zoom > CLICK_SLOP * scale;
                 match id {
@@ -898,7 +930,8 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
             | Gesture::PointMarquee { .. }
             | Gesture::GradientHandle(_)
             | Gesture::PaintSelect { .. }
-            | Gesture::PaintSelDrag(_) => Write::Nothing,
+            | Gesture::PaintSelDrag(_)
+            | Gesture::Calibrate(_) => Write::Nothing,
         }
     });
     let Some(next) = next else { return };
@@ -974,7 +1007,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
 }
 
 fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
-    let snap_on = untracked(|| store.board_style.snap.get());
+    let snap_on = snap_grid(store, pane);
     let gesture = with_session(pane, |s| std::mem::replace(&mut s.gesture, Gesture::Idle));
     let Some(gesture) = gesture else { return };
     let shift = with_session(pane, |s| s.shift).unwrap_or(false);
@@ -1031,6 +1064,9 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 if kind == Kind::Frame {
                     adopt_into_frame(store, pane, &id);
                 }
+                // Digits typed now size it (docs/MEASURE_CONTRACT.md
+                // section 4).
+                super::measure::drawn(pane, &id, &kind, start, last);
                 select(store, pane, vec![id]);
             }
             None if matches!(kind, Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Polygon | Kind::Star) => {
@@ -1191,16 +1227,23 @@ fn base_of(snapshot: &BoardSnapshot, e: &pimble_board::Element) -> Base {
 }
 
 /// Snap a board point to the grid when snapping is on.
-fn snap_point(on: bool, p: Point) -> Point {
-    if on {
-        Point::new((p.x / GRID).round() * GRID, (p.y / GRID).round() * GRID)
-    } else {
-        p
+/// `p` on the grid of spacing `grid` (snapping on), or as it is.
+fn snap_point(grid: Option<f32>, p: Point) -> Point {
+    match grid.filter(|g| g.is_finite() && *g > 0.0) {
+        Some(g) => Point::new((p.x / g).round() * g, (p.y / g).round() * g),
+        None => p,
     }
 }
 
-fn snap(store: AppStore, p: Point) -> Point {
-    snap_point(untracked(|| store.board_style.snap.get()), p)
+/// The grid snapping lands on in pane `pane` (`None` while snapping is
+/// off): the canvas's grid in its units when it has a scale
+/// (docs/MEASURE_CONTRACT.md section 6), [`GRID`] without one.
+pub(super) fn snap_grid(store: AppStore, pane: PaneId) -> Option<f32> {
+    untracked(|| store.board_style.snap.get()).then(|| with_session(pane, |s| super::grid_spacing(s)).unwrap_or(GRID))
+}
+
+fn snap(store: AppStore, pane: PaneId, p: Point) -> Point {
+    snap_point(snap_grid(store, pane), p)
 }
 
 /// Shift's constraint (contract section 4): lines at multiples of 45°,
@@ -1211,7 +1254,7 @@ fn constrain(kind: &Kind, start: Point, p: Point, shift: bool) -> Point {
     }
     let (dx, dy) = (p.x - start.x, p.y - start.y);
     match kind {
-        Kind::Line | Kind::Arrow | Kind::Connector => {
+        Kind::Line | Kind::Arrow | Kind::Connector | Kind::Dimension => {
             let len = dx.hypot(dy);
             let step = std::f32::consts::FRAC_PI_4;
             let a = (dy.atan2(dx) / step).round() * step;
@@ -1228,14 +1271,14 @@ fn constrain(kind: &Kind, start: Point, p: Point, shift: bool) -> Point {
 /// A line or arrow from `a` to `b`, or a shape spanning them.
 fn shape_geom(kind: &Kind, a: Point, b: Point) -> Geom {
     match kind {
-        Kind::Line | Kind::Arrow => Geom::Segment { a, b },
+        Kind::Line | Kind::Arrow | Kind::Dimension => Geom::Segment { a, b },
         _ => Geom::Rect(Rect::from_points(a, b)),
     }
 }
 
 /// A move's offset: the pointer's, snapped so the selection's corner lands
 /// on the grid, and along one axis with shift.
-fn move_delta(bases: &[Base], start: Point, p: Point, snap_on: bool, shift: bool) -> (f32, f32) {
+fn move_delta(bases: &[Base], start: Point, p: Point, snap_on: Option<f32>, shift: bool) -> (f32, f32) {
     let (mut dx, mut dy) = (p.x - start.x, p.y - start.y);
     if shift {
         if dx.abs() > dy.abs() {
@@ -1244,10 +1287,10 @@ fn move_delta(bases: &[Base], start: Point, p: Point, snap_on: bool, shift: bool
             dx = 0.0;
         }
     }
-    if snap_on {
+    if let Some(grid) = snap_on {
         if let Some(b) = bases.iter().map(|b| b.bounds).reduce(|a, b| a.union(&b)) {
-            let x = ((b.x + dx) / GRID).round() * GRID;
-            let y = ((b.y + dy) / GRID).round() * GRID;
+            let x = ((b.x + dx) / grid).round() * grid;
+            let y = ((b.y + dy) / grid).round() * grid;
             if !(shift && dx == 0.0) {
                 dx = x - b.x;
             }
@@ -2100,6 +2143,9 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
         Kind::Sticky => Style { fill, opacity, font_size: Some(font_size * 0.85), align: Some(align), ..lettering(font_size * 0.85) },
         Kind::Step => Style { stroke, opacity, font_size: Some(font_size), ..Style::default() },
         Kind::Frame => Style::default(),
+        // A dimension keeps its own drafting look unless a color other
+        // than the marks' red was picked.
+        Kind::Dimension => Style { stroke: stroke.filter(|c| c.to_hex() != DEFAULT_COLOR), opacity, ..Style::default() },
         _ => Style { stroke, opacity, ..Style::default() },
     }
 }
@@ -2764,7 +2810,7 @@ pub(super) fn drop_tree_row(store: AppStore, pane: PaneId) {
     let link = pimble_core::PimbleUrl { store: store_id, node: node_id, anchor: None }.to_string();
     let Some(at) = with_session(pane, |s| s.view.screen_to_board(s.pointer.0, s.pointer.1)) else { return };
     let (w, h) = CARD_SIZE;
-    let at = snap(store, Point::new(at.x - w / 2.0, at.y - h / 2.0));
+    let at = snap(store, pane, Point::new(at.x - w / 2.0, at.y - h / 2.0));
     let rect = Rect::new(at.x, at.y, w, h);
     new_undo_step(pane);
     let mut element = with_layer(NewElement::new(Kind::Card, Geom::Card { rect, link }), &layer);
@@ -2802,6 +2848,7 @@ pub(super) fn kind_label(e: &pimble_board::Element) -> String {
         Kind::Polygon => "Polygon".to_string(),
         Kind::Star => "Star".to_string(),
         Kind::Scatter => "Scatter".to_string(),
+        Kind::Dimension => "Dimension".to_string(),
         Kind::Other(k) => k.clone(),
     }
 }
@@ -2871,6 +2918,9 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
     if with_session(pane, |s| s.text.is_some()).unwrap_or(false) {
         return;
     }
+    if super::measure::key_down(store, pane, key) {
+        return;
+    }
     let primary = key.ctrl || key.meta;
     let lower = key.key.to_ascii_lowercase();
     match key.key.as_str() {
@@ -2936,9 +2986,8 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             after_change(store, pane);
         }
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
-            let snap_on = untracked(|| store.board_style.snap.get());
-            let step = if snap_on {
-                GRID
+            let step = if let Some(grid) = snap_grid(store, pane) {
+                grid
             } else if key.shift {
                 NUDGE * 10.0
             } else {
@@ -3104,7 +3153,7 @@ mod tests {
     fn moves_snap_the_selection_corner_to_the_grid() {
         let mut b = base(Kind::Rect, Geom::Rect(Rect::new(3.0, 7.0, 10.0, 10.0)));
         b.bounds = Rect::new(3.0, 7.0, 10.0, 10.0);
-        let (dx, dy) = move_delta(&[b], Point::new(0.0, 0.0), Point::new(25.0, 9.0), true, false);
+        let (dx, dy) = move_delta(&[b], Point::new(0.0, 0.0), Point::new(25.0, 9.0), Some(GRID), false);
         assert_eq!((3.0 + dx, 7.0 + dy), (20.0, 20.0));
     }
 

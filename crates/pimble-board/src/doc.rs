@@ -4,6 +4,8 @@
 //! board: Map {
 //!   v: 1,
 //!   page: Any { x, y, w, h, fill? }?,       // absent = infinite
+//!   scale: Any { unit, per_unit, label?, precision? }?,   // absent = no scale
+//!                                   // (docs/MEASURE_CONTRACT.md, crate::measure)
 //!   markup_visible: bool,
 //!   edited_by: Any { id, name }?, edited_at: String?,   // board-level writes
 //!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity,
@@ -23,7 +25,9 @@
 //!                               font?, bold?, italic?, halo_color?, halo_width?,
 //!                               tracking?, along?, along_offset?, along_side?,
 //!                                                  // lettering (wave 6, crate::along)
-//!                               feather? },        // soft edges (wave 6, crate::soft)
+//!                               feather?,          // soft edges (wave 6, crate::soft)
+//!                               dims?, area?, dim_offset? },   // measurements
+//!                                                  // (docs/MEASURE_CONTRACT.md)
 //!     transform: Any { tx, ty, rot, sx, sy }?, locked,
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
 //!     note: Text?, "field:<name>": String...,   // what it means (below)
@@ -97,6 +101,7 @@ pub const FIRST_LAYER_NAME: &str = "Layer 1";
 pub(crate) mod keys {
     pub const V: &str = "v";
     pub const PAGE: &str = "page";
+    pub const SCALE: &str = "scale";
     pub const MARKUP_VISIBLE: &str = "markup_visible";
     pub const LAYERS: &str = "layers";
     pub const ELEMENTS: &str = "elements";
@@ -702,6 +707,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         if let Some(page) = &raw.page {
             self.set_page(Some(page))?;
         }
+        if let Some(scale) = &raw.scale {
+            self.set_scale(Some(scale))?;
+        }
         if raw.layers.is_empty() {
             insert_layer(self.txn, &layers, &new_id(), FIRST_LAYER_NAME, &order::after(None));
         }
@@ -801,6 +809,27 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             }
             None => {
                 board.remove(self.txn, PAGE);
+            }
+        }
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// Give the board a scale (docs/MEASURE_CONTRACT.md section 1), or with
+    /// `None` take it away. Written whole, one value: two people setting
+    /// scales end with one of them. Refused when it is not finite and
+    /// positive.
+    pub fn set_scale(&mut self, scale: Option<&crate::measure::Scale>) -> Result<()> {
+        let board = self.board()?;
+        match scale {
+            Some(scale) => {
+                if !scale.is_valid() {
+                    return Err(BoardError::Invalid("a scale needs a positive number of board units per unit".into()));
+                }
+                board.insert(self.txn, SCALE, scale_any(scale));
+            }
+            None => {
+                board.remove(self.txn, SCALE);
             }
         }
         self.stamp_board();
@@ -3259,6 +3288,8 @@ pub struct RawElement {
 pub struct RawBoard {
     pub version: i64,
     pub page: Option<Page>,
+    /// The canvas's scale (docs/MEASURE_CONTRACT.md); `None` without one.
+    pub scale: Option<crate::measure::Scale>,
     pub markup_visible: bool,
     pub edited_by: Option<Author>,
     pub edited_at: Option<String>,
@@ -3285,6 +3316,10 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
         }),
         _ => None,
     };
+    let scale = match board.get(txn, SCALE) {
+        Some(Out::Any(Any::Map(m))) => scale_of(&m),
+        _ => None,
+    };
     let markup_visible = bool_of(board.get(txn, MARKUP_VISIBLE)).unwrap_or(true);
     let layers = match board.get(txn, LAYERS) {
         Some(Out::YMap(map)) => read_layers(txn, &map),
@@ -3308,6 +3343,7 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
     RawBoard {
         version,
         page,
+        scale,
         markup_visible,
         edited_by: author_of(board.get(txn, EDITED_BY)),
         edited_at: string_of(board.get(txn, EDITED_AT)),
@@ -3863,7 +3899,38 @@ fn read_style<T: ReadTxn>(txn: &T, m: &MapRef) -> Style {
         along_side: s("along_side").and_then(|v| AlongSide::parse(&v)),
         tint: s("tint").and_then(|v| Color::parse(&v)),
         feather: number_of(m.get(txn, "feather")),
+        dims: bool_of(m.get(txn, "dims")),
+        area: bool_of(m.get(txn, "area")),
+        dim_offset: number_of(m.get(txn, "dim_offset")),
     }
+}
+
+/// The stored scale (see the module doc): `None` when it names no unit this
+/// version knows or no positive `per_unit`.
+fn scale_of(m: &HashMap<String, Any>) -> Option<crate::measure::Scale> {
+    let unit = crate::measure::Unit::parse(m.get("unit").and_then(any_str)?)?;
+    let per_unit = m.get("per_unit").and_then(number)?;
+    let label = m.get("label").and_then(any_str).map(str::to_string);
+    let precision = m.get("precision").and_then(number).filter(|p| p.is_finite() && *p >= 0.0).map(|p| p.round().min(64.0) as u8);
+    let off = matches!(m.get("off"), Some(Any::Bool(true)));
+    let scale = crate::measure::Scale { unit, per_unit, label, precision, off };
+    scale.is_valid().then_some(scale)
+}
+
+fn scale_any(s: &crate::measure::Scale) -> Any {
+    let mut m: HashMap<String, Any> = HashMap::new();
+    m.insert("unit".into(), Any::from(s.unit.as_str()));
+    m.insert("per_unit".into(), Any::Number(s.per_unit));
+    if let Some(l) = &s.label {
+        m.insert("label".into(), Any::from(l.as_str()));
+    }
+    if let Some(p) = s.precision {
+        m.insert("precision".into(), Any::Number(p as f64));
+    }
+    if s.off {
+        m.insert("off".into(), Any::Bool(true));
+    }
+    Any::Map(Arc::new(m))
 }
 
 /// A gradient as stored: `{ type: "linear" | "radial", x1, y1, x2, y2,
@@ -4013,6 +4080,16 @@ fn write_style(txn: &mut TransactionMut, m: &MapRef, style: &Style) {
     if let Some(v) = style.feather {
         m.insert(txn, "feather", v as f64);
     }
+    // Measurements (docs/MEASURE_CONTRACT.md section 5).
+    if let Some(v) = style.dims {
+        m.insert(txn, "dims", v);
+    }
+    if let Some(v) = style.area {
+        m.insert(txn, "area", v);
+    }
+    if let Some(v) = style.dim_offset {
+        m.insert(txn, "dim_offset", v as f64);
+    }
 }
 
 // ── Encoding helpers ─────────────────────────────────────────────────────
@@ -4043,6 +4120,7 @@ fn judge_geom(kind: &Kind, geom: &Geom) -> Result<()> {
         (Kind::Path, g) => matches!(g, Geom::Path(_)),
         (_, Geom::Path(_)) => false,
         (Kind::Polygon | Kind::Star, g) => matches!(g, Geom::Rect(_)),
+        (Kind::Dimension, g) => matches!(g, Geom::Segment { .. }),
         _ => true,
     };
     if ok {
@@ -4346,7 +4424,7 @@ fn geom_of(kind: &Kind, m: &HashMap<String, Any>) -> Geom {
                 _ => None,
             },
         }),
-        Kind::Line | Kind::Arrow => Geom::Segment { a: pt("x1", "y1"), b: pt("x2", "y2") },
+        Kind::Line | Kind::Arrow | Kind::Dimension => Geom::Segment { a: pt("x1", "y1"), b: pt("x2", "y2") },
         Kind::Step => Geom::Anchor(pt("x", "y")),
         Kind::Callout => Geom::Callout { rect: rect(), tip: pt("tip_x", "tip_y") },
         Kind::Connector => Geom::Connector { from: end_of(m.get("from")), to: end_of(m.get("to")) },

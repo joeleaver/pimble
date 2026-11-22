@@ -159,6 +159,10 @@ pub enum Kind {
     /// section 2): the symbol's id in the element's `symbol` key, the
     /// placements packed in its appendable array ([`crate::scatter`]).
     Scatter,
+    /// A dimension (docs/MEASURE_CONTRACT.md section 5): the two measured
+    /// points (`Geom::Segment`), drawn as extension lines, a dimension line
+    /// `dim_offset` from them, and the computed length.
+    Dimension,
     Other(String),
 }
 
@@ -186,6 +190,7 @@ impl Kind {
             Kind::Polygon => "polygon",
             Kind::Star => "star",
             Kind::Scatter => "scatter",
+            Kind::Dimension => "dimension",
             Kind::Other(s) => s,
         }
     }
@@ -213,6 +218,7 @@ impl Kind {
             "polygon" => Kind::Polygon,
             "star" => Kind::Star,
             "scatter" => Kind::Scatter,
+            "dimension" => Kind::Dimension,
             other => Kind::Other(other.to_string()),
         }
     }
@@ -846,6 +852,18 @@ pub struct Style {
     /// in board units, over which its edge fades (a Gaussian blur of what
     /// it paints, sigma half the radius). Absent or 0: a hard edge.
     pub feather: Option<f32>,
+    // Measurements (docs/MEASURE_CONTRACT.md section 5).
+    /// Label its sides (a line its length, a box its width and height, a
+    /// polygon each side) when the canvas has a scale: absent is off.
+    pub dims: Option<bool>,
+    /// Show its area at its center (closed shapes) when the canvas has a
+    /// scale: absent is off.
+    pub area: Option<bool>,
+    /// A dimension's offset, board units, signed: how far its dimension
+    /// line sits from the measured points, perpendicular (positive is to
+    /// the left of its start-to-end direction on screen: above a line
+    /// drawn east). Absent is 0.
+    pub dim_offset: Option<f32>,
 }
 
 pub use crate::text::{FontChoice, FontFamily, TextStyle};
@@ -933,6 +951,12 @@ pub struct ResolvedStyle {
     /// Its feather radius, board units (0: a hard edge;
     /// [`crate::soft::MAX_RADIUS`] at most).
     pub feather: f32,
+    /// Its sides labeled (with a scale).
+    pub dims: bool,
+    /// Its area shown (with a scale).
+    pub area: bool,
+    /// A dimension's offset, board units.
+    pub dim_offset: f32,
 }
 
 impl ResolvedStyle {
@@ -1155,6 +1179,7 @@ impl Style {
             Kind::Frame => (Color::rgb(0x9e, 0x9e, 0x9e), None, 2.0, 18.0, ArrowHeads::None, Align::Left, false),
             Kind::Card => (Color::rgb(0x61, 0x61, 0x61), Some(Color::rgb(0xfa, 0xfa, 0xfa)), 1.5, 18.0, ArrowHeads::None, Align::Left, true),
             Kind::Spotlight => (Color::BLACK, Some(Color::rgba(0, 0, 0, 0x99)), 0.0, 24.0, ArrowHeads::None, Align::Left, false),
+            Kind::Dimension => (crate::measure::LABEL_COLOR, None, 1.0, crate::measure::LABEL_SIZE, ArrowHeads::None, Align::Center, false),
             Kind::Picture | Kind::Group | Kind::Scatter | Kind::Other(_) => (Color::BLACK, None, 0.0, 24.0, ArrowHeads::None, Align::Left, false),
         };
         let fill_gradient = self.fill_gradient.clone().filter(Gradient::is_valid).map(Gradient::normalized);
@@ -1196,6 +1221,9 @@ impl Style {
             along_side: self.along_side.unwrap_or_default(),
             tint: self.tint.unwrap_or(Color::TRANSPARENT),
             feather: crate::soft::radius(self.feather),
+            dims: self.dims.unwrap_or(false),
+            area: self.area.unwrap_or(false),
+            dim_offset: self.dim_offset.filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0e6, 1.0e6),
         }
     }
 }
@@ -1233,6 +1261,9 @@ pub enum StyleKey {
     AlongSide,
     Tint,
     Feather,
+    Dims,
+    Area,
+    DimOffset,
 }
 
 impl StyleKey {
@@ -1268,6 +1299,9 @@ impl StyleKey {
             StyleKey::AlongSide => "along_side",
             StyleKey::Tint => "tint",
             StyleKey::Feather => "feather",
+            StyleKey::Dims => "dims",
+            StyleKey::Area => "area",
+            StyleKey::DimOffset => "dim_offset",
         }
     }
 }

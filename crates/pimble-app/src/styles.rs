@@ -2643,6 +2643,101 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-primary-color-4);
 }
 
+.pimble-board-chip--primary {
+    border-color: var(--rinch-primary-color-6);
+    background: var(--rinch-primary-color-6);
+    color: #ffffff;
+}
+
+/* Measuring (docs/MEASURE_CONTRACT.md): the Scale panel over the top of a
+   canvas, not modal; the readout near the pointer; the selection's
+   measures picker. */
+.pimble-board__scale {
+    position: absolute;
+    z-index: 6;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 340px;
+    max-width: calc(100% - 32px);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.pimble-board__scale-head {
+    display: flex;
+    align-items: center;
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.pimble-board__scale-ways {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.pimble-board__scale-way {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.pimble-board__scale-way .pimble-board__row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+
+.pimble-board__scale-note {
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+    white-space: normal;
+}
+
+.pimble-board__scale-preview {
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: var(--rinch-color-default);
+    white-space: normal;
+}
+
+.pimble-board__scale-preview--bad {
+    color: var(--rinch-color-red-6);
+}
+
+.pimble-board__scale-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-board__readout {
+    position: absolute;
+    z-index: 4;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.pimble-board__measures {
+    min-width: 220px;
+}
+
+.pimble-board__measure-value {
+    font-variant-numeric: tabular-nums;
+}
+
 .pimble-board__layers {
     display: flex;
     flex-direction: column;
@@ -3404,7 +3499,7 @@ pub(crate) const APP_CSS: &str = "
     margin: 0 4px 0 2px;
     border: 1px solid var(--rinch-color-border);
     border-radius: 2px;
-    background: var(--rinch-color-default-hover);
+    background: var(--rinch-color-default);
 }
 
 /* The Stamp's symbol picker and settings (docs/DRAWING_WAVE6_CONTRACT.md
@@ -3415,7 +3510,7 @@ pub(crate) const APP_CSS: &str = "
     flex-shrink: 0;
     border: 1px solid var(--rinch-color-border);
     border-radius: 2px;
-    background: var(--rinch-color-default-hover);
+    background: var(--rinch-color-default);
 }
 
 .pimble-board__symbol-face {

@@ -65,6 +65,7 @@ pub mod tiles;
 mod hit;
 pub mod layer_tree;
 pub mod locks;
+pub mod measure;
 pub mod model;
 pub mod options;
 pub mod recipe;
@@ -104,6 +105,7 @@ pub use render::{
 };
 pub use snapshot::{BoardSnapshot, Element, Layer, PaintMark};
 pub use combine::CombineOp;
+pub use measure::{Measures, Scale, Unit};
 pub use svg::render_svg;
 pub use svg_in::{SvgError, SvgImport, SvgItem, SvgPlacement};
 pub use view::{grid_color, BoardView, EditOverlay, OverlayPicture};

@@ -99,6 +99,12 @@ impl Element {
                 _ => false,
             };
         }
+        // A dimension: its lines and its label, board units.
+        if self.raw.kind == Kind::Dimension {
+            let Some(m) = &self.marks else { return false };
+            let reach = s.width.max(1.0) / 2.0 + tol;
+            return m.segments.iter().any(|(a, b)| dist_to_segment(p, *a, *b) <= reach) || m.quads.iter().any(|q| near_polygon(p, q, tol));
+        }
         // Text set along a path: its glyphs' turned boxes, board units.
         if let Some(along) = &self.along {
             return along.quads.iter().any(|q| near_polygon(p, q, tol));
