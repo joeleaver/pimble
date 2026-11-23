@@ -1188,6 +1188,32 @@ impl PimbleClient {
             .map_err(rpc_error)
     }
 
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3).
+    pub async fn watch_node(&self, store_id: StoreId, node_id: NodeId, subtree: bool) -> Result<()> {
+        self.client.watch_node(pimble_rpc::WatchNodeRequest { store_id, node_id, subtree }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Stop watching a node.
+    pub async fn unwatch_node(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+        self.client.unwatch_node(pimble_rpc::UnwatchNodeRequest { store_id, node_id }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// The watches the signed-in account chose.
+    pub async fn list_watches(&self) -> Result<Vec<pimble_rpc::WatchEntry>> {
+        Ok(self.client.list_watches().await.map_err(rpc_error)?.watches)
+    }
+
+    /// Hear the writes other accounts make on this server (`Service`-only).
+    pub async fn subscribe_writes(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::WriteSeen>> {
+        self.client
+            .subscribe::<pimble_rpc::WriteSeen, _>("pimble_subscribeWrites", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeWrites")
+            .await
+            .map_err(rpc_error)
+    }
+
     /// Hear how this computer's connections to Pimble Cloud are doing, the
     /// first at once and then each change; `None` while signed out.
     pub async fn subscribe_cloud_connection(&self) -> Result<jsonrpsee::core::client::Subscription<Option<pimble_rpc::CloudConnection>>> {

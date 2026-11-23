@@ -2234,6 +2234,10 @@ pub enum NoticeKind {
     Mention,
     /// Someone wrote in a discussion you wrote in.
     Reply,
+    /// Someone else changed a note you watch (section 3, wave 3): told by the
+    /// accounts service, which knows only the document, the writer and how
+    /// many changes; this device fills in the rest.
+    Watch,
 }
 
 /// What one person's device tells another that it wrote to them (section 2),
@@ -2263,6 +2267,13 @@ pub struct Notice {
     pub snippet: String,
     /// When it was written, RFC 3339.
     pub at: String,
+    /// For a watch notice: how many changes it stands for.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The notices this device has received and still keeps, newest first, and
@@ -2319,4 +2330,54 @@ pub struct RegisterPushRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterPushRequest {
     pub endpoint: String,
+}
+
+/// One watch the person chose (section 3, wave 3): a node, alone or with
+/// everything under it. The person's own account data, kept with the
+/// accounts service sealed to their notice key, so every device of theirs
+/// holds the same list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WatchEntry {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    /// With its subtree: every node under it as nodes come and go.
+    #[serde(default)]
+    pub subtree: bool,
+}
+
+/// Watch a node (again, to change `subtree`). `Service`-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchNodeRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub subtree: bool,
+}
+
+/// Stop watching a node (and its subtree, when it was watched with it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnwatchNodeRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// The watches the signed-in account chose.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListWatchesResponse {
+    pub watches: Vec<WatchEntry>,
+}
+
+/// A write a principal other than this server's own operator made to a
+/// node's document (section 3): what the accounts service gathers watches
+/// from. `subscribeWrites` (`Service`-only) carries them, gathered over a
+/// couple of seconds per (store, document, writer), so someone typing is a
+/// handful of these, not hundreds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteSeen {
+    pub store_id: StoreId,
+    pub doc_id: NodeId,
+    /// The writer's account (`sub`).
+    pub writer: String,
+    /// How many appends or edits.
+    pub count: u32,
 }

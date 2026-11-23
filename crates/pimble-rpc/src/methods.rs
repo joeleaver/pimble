@@ -400,6 +400,27 @@ pub trait PimbleApi {
     #[subscription(name = "subscribeNotices" => "noticeReceived", unsubscribe = "unsubscribeNotices", item = Notice, with_extensions)]
     async fn subscribe_notices(&self) -> SubscriptionResult;
 
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3, wave 3): kept with the signed-in account, so every device of
+    /// theirs watches it. `Service`-only, as are the two below.
+    #[method(name = "watchNode", with_extensions)]
+    async fn watch_node(&self, request: WatchNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Stop watching a node.
+    #[method(name = "unwatchNode", with_extensions)]
+    async fn unwatch_node(&self, request: UnwatchNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// The watches the signed-in account chose.
+    #[method(name = "listWatches", with_extensions)]
+    async fn list_watches(&self) -> Result<ListWatchesResponse, ErrorObjectOwned>;
+
+    /// Hear the writes other accounts make to node documents on this server
+    /// (section 3): what the accounts service gathers watches from, on the
+    /// hosted server, and an owner's server from its relay face.
+    /// `Service`-only.
+    #[subscription(name = "subscribeWrites" => "writeSeen", unsubscribe = "unsubscribeWrites", item = WriteSeen, with_extensions)]
+    async fn subscribe_writes(&self) -> SubscriptionResult;
+
     /// A Pimble window hears the links `openInApp` hands it, each with the
     /// activation token it came with, if any. `Service`-only.
     #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = HandedLink, with_extensions)]
