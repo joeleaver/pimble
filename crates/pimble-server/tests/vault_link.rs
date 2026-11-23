@@ -1484,7 +1484,17 @@ async fn a_readers_replica_reads_everything_and_writes_nothing() {
     seed_content(&alice, store_id, inside, "seed", "leeks").await;
     alice.cloud_host_store(store_id).await.unwrap();
     wait_all_seeded(&env, store_id, &[root_id, shared, inside]).await;
+    let shared_head = || async { env.h_admin.vault_list_docs(store_id).await.unwrap().into_iter().find(|d| d.doc_id == VaultDocId::Node(shared)).map_or(0, |d| d.head) };
+    let seeded_head = shared_head().await;
     share_by_hand(&env, &alice, a_dir.path(), store_id, shared, &[inside], "reader", "Recipes").await;
+    // The share's marker (an edit of `shared` on Alice's device) is on the
+    // hosted twin before Bob's replica is made. Otherwise Bob's link can pull
+    // `shared` without it and report that state at connect, and Alice's link
+    // answers the report with the marker again (docs/CONVERGENCE_CONTRACT.md
+    // section 2: a report lacking what a device holds is answered with an
+    // append), an entry of Alice's landing after the count below is taken.
+    let marked = wait_until(Duration::from_secs(10), || async { shared_head().await > seeded_head }).await;
+    assert!(marked, "the owner's share marker reaches the hosted twin");
 
     let (mut b, bob, _b_dir) = start_local_server().await;
     bob.cloud_sign_in(&env.stub_url, &env.friend_email, &env.friend_password).await.unwrap();
