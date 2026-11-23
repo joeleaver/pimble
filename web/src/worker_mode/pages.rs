@@ -56,7 +56,7 @@ async fn sign_in(email: &str, password: &str, remember: bool) -> Result<(), Stri
     let client = local.client().await?;
     client.cloud_sign_in(origin(), email, password).await.map_err(|e| e.to_string())?;
     if remember {
-        super::ask_to_persist().await;
+        super::ask_to_persist();
     }
     Ok(())
 }

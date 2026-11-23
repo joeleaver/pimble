@@ -1435,3 +1435,47 @@ async fn sharing_against_the_real_accounts_service() {
     l.stop().await.unwrap();
     h.stop().await.unwrap();
 }
+
+/// Found by the browser's own server (docs/ONE_CODEBASE_CONTRACT.md wave 4,
+/// a note made with no network, the page reloaded before the network came
+/// back): a member's create made while the link was down reached nobody,
+/// ever. To a member, a document the remote never listed is offered only when
+/// the link marked it changed here, and the link wrote its marks only at the
+/// end of each backoff wait: a device stopped inside one (a tab reloaded, a
+/// crash, a quit: a stop aborts the link) forgot the create, and every later
+/// reconcile passed over it.
+#[tokio::test]
+async fn a_members_create_made_while_down_reaches_the_owner_after_a_stop_inside_the_wait() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, shared, "Holiday Plans").await.unwrap();
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.unwrap();
+
+    let b_dir = tempfile::tempdir().unwrap();
+    let (mut b, bob) = start_device_in(b_dir.path()).await;
+    env.sign_in(&bob, BOB).await;
+    bob.cloud_add_hosted_store(store_id).await.unwrap();
+    assert!(wait_until(Duration::from_secs(15), || async { node_text(&bob, store_id, fx.inside).await.contains("socks and a map") }).await);
+
+    // The network gone long enough for the link to be well into its waits.
+    env.relay.cut();
+    assert!(wait_until(Duration::from_secs(10), || async { !matches!(bob.get_store_sync(store_id).await, Ok((_, SyncState::Synced { .. }))) }).await);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let made = bob.create_node(store_id, Some(shared), "document", "Made while down").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Stopped inside the wait: the documents are written, the link aborted.
+    b.stop().await.unwrap();
+    drop(bob);
+    env.relay.restore();
+
+    let (mut b, bob) = start_device_in(b_dir.path()).await;
+    bob.open_store(b_dir.path().join("replicas").join(format!("{store_id}.pimble"))).await.unwrap();
+    let reached = wait_until(Duration::from_secs(30), || async { child_ids(&alice, store_id, shared).await.contains(&made) }).await;
+    assert!(reached, "the owner has the member's create");
+    assert_eq!(alice.get_node(store_id, made).await.unwrap().metadata.title, "Made while down");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}

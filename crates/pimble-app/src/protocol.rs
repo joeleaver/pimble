@@ -506,6 +506,10 @@ pub enum BackendEvent {
     Connected { server_addr: String, client_id: String },
     Disconnected,
     Error { message: String },
+    /// A sentence for the status bar that is not an error: nothing failed
+    /// and the connection is fine (the browser declining to keep its
+    /// storage, docs/ONE_CODEBASE_CONTRACT.md wave 4).
+    Notice { message: String },
     /// A request a modal waits on failed (`Asked::answer`): the sentence
     /// goes to that modal.
     Failed { asked: Asked, message: String },

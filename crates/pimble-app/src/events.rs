@@ -1464,6 +1464,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 show_notice(store, message.clone());
             }
 
+            BackendEvent::Notice { message } => {
+                tracing::info!("Notice: {message}");
+                show_notice(store, message.clone());
+            }
+
             BackendEvent::ReplicaRemoved { store_id } => {
                 tracing::info!("Replica removed: {:?}", store_id);
 

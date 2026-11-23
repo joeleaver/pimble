@@ -7,6 +7,14 @@ public_url = "/app/"
 # `trunk serve` for local development. The account API and the Pimble server
 # live on the same origin in production; locally they are separate processes, so
 # proxy them here and the app still sees one origin. See README.md.
+# The browser's own server's worker, renamed by its contents, and the service
+# worker that keeps this build's files for a page opened with no network
+# (build/post_build.sh).
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["build/post_build.sh"]
+
 [[proxy]]
 backend = "http://127.0.0.1:8080/api"
 rewrite = "/api/"

@@ -615,8 +615,20 @@ async fn note_local_changes_for(
         tokio::select! {
             _ = &mut deadline => break,
             change = local_rx.recv() => match change {
-                Ok(change) => progress.note(store_id, link_id, &change),
-                Err(broadcast::error::RecvError::Lagged(_)) => progress.mark_all_dirty(),
+                // On the disk at once, not at the end of the wait: a device
+                // stopped in it (a browser tab closed, a crash) must still
+                // know at its next start what changed here. Only a document
+                // newly marked is a write. To a share's member it is the only
+                // record of a create made while down (`full_reconcile` offers
+                // an unseen document only when it is marked).
+                Ok(change) => {
+                    progress.note(store_id, link_id, &change);
+                    progress.save_if_unsaved().await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    progress.mark_all_dirty();
+                    progress.save_if_unsaved().await;
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     (&mut deadline).await;
                     break;

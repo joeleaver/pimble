@@ -1,9 +1,12 @@
 //! The browser on its own Pimble server (docs/ONE_CODEBASE_CONTRACT.md wave
-//! 4), behind a switch, beside the old path: `?server=worker` turns it on for
-//! this browser (kept in `localStorage` as `pimble.server`), `?server=page`
-//! turns it off. Off, nothing here runs and the page is what it was.
+//! 4): the default since 2026-11-23 (Joe: "There's no active users of the web
+//! app ... you might as well just flip the switch"). The old path (keys in the
+//! page, stores from the hosted server) stays reachable until wave 5 deletes
+//! it: `?server=old` for this browser (kept in `localStorage` as
+//! `pimble.server`), `?server=worker` back to the default. With the old path
+//! nothing here runs but [`end`].
 //!
-//! On: the server runs in a dedicated worker of the leader tab (`hub.js`,
+//! The server runs in a dedicated worker of the leader tab (`hub.js`,
 //! [`hub`]), keeps this browser's stores in OPFS sealed with the remembered
 //! device's disk key (or in memory), holds the account's keys, and is reached
 //! through the same `pimble_api::Pimble` and `pimble_app::commands` the
@@ -13,6 +16,7 @@ pub mod backend;
 pub mod hub;
 pub mod pages;
 
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::route::{self, Route};
@@ -23,8 +27,10 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
-/// Whether this browser uses its own server: `?server=worker` or `page` in
-/// the URL says so and is remembered; otherwise what was remembered.
+/// Whether this browser uses its own server: yes, unless `?server=old` (or
+/// the earlier `?server=page`) asked for the old path, which is remembered
+/// until `?server=worker` asks for this one again. A browser that used the old
+/// path before this was the default has nothing remembered and gets this one.
 pub fn enabled() -> bool {
     thread_local! {
         static ON: bool = decide();
@@ -36,27 +42,41 @@ fn decide() -> bool {
     let asked = crate::util::query_param("server");
     let storage = storage();
     match asked.as_deref() {
-        Some("worker") => {
+        Some("old") | Some("page") => {
             if let Some(s) = &storage {
-                let _ = s.set_item(SWITCH_KEY, "worker");
-            }
-            true
-        }
-        Some("page") => {
-            if let Some(s) = &storage {
-                let _ = s.remove_item(SWITCH_KEY);
+                let _ = s.set_item(SWITCH_KEY, "old");
             }
             false
         }
-        _ => storage.and_then(|s| s.get_item(SWITCH_KEY).ok().flatten()).as_deref() == Some("worker"),
+        Some("worker") => {
+            if let Some(s) = &storage {
+                let _ = s.remove_item(SWITCH_KEY);
+            }
+            true
+        }
+        _ => storage.and_then(|s| s.get_item(SWITCH_KEY).ok().flatten()).as_deref() != Some("old"),
     }
 }
 
 /// Start the hub: this tab asks for the leader's lock, and whichever tab
 /// holds it runs the server. Called once, before routing.
 pub fn begin() {
-    tracing::info!("This browser runs its own Pimble server (?server=page turns it off)");
+    tracing::info!("This browser runs its own Pimble server (?server=old for the old path, until wave 5)");
     hub::start("auto", inherited());
+    // A new build took over the kept files (the service worker, hub.js): this
+    // page is still the one it loaded.
+    if let Some(window) = web_sys::window() {
+        let ready = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(|| {
+            backend::local().notice("A new version of Pimble is ready: reload the page to use it.".to_string());
+        });
+        let _ = window.add_event_listener_with_callback("pimble-update-ready", ready.as_ref().unchecked_ref());
+        ready.forget();
+    }
+}
+
+/// The switch off: nothing of the browser's own server is kept for offline.
+pub fn end() {
+    hub::leave_offline();
 }
 
 /// The device this browser reported as before it ran its own server, and the
@@ -81,29 +101,26 @@ fn inherited() -> Option<String> {
 
 /// Ask the browser to keep this origin's storage under pressure (section 10):
 /// the stores here are replicas, so eviction loses only what was not sent
-/// yet, and the person is told when it was refused.
-pub async fn ask_to_persist() {
-    let Some(storage) = web_sys::window().map(|w| w.navigator().storage()) else { return };
-    let Ok(promise) = storage.persist() else { return };
-    match wasm_bindgen_futures::JsFuture::from(promise).await.map(|v| v.as_bool()) {
-        Ok(Some(true)) => tracing::info!("This browser keeps Pimble's storage under pressure (persistent storage granted)"),
-        _ => {
-            tracing::warn!("Persistent storage was refused: this browser may clear Pimble's copy of the stores when it runs short of space");
-            REFUSED.with(|r| r.set(true));
+/// yet. Asked beside everything else, never waited on: Firefox asks the
+/// person, and its answer may take as long as they do (headless, for ever).
+/// A refusal is said once in the status bar, as a notice.
+pub fn ask_to_persist() {
+    wasm_bindgen_futures::spawn_local(async {
+        let Some(storage) = web_sys::window().map(|w| w.navigator().storage()) else { return };
+        let Ok(promise) = storage.persist() else { return };
+        match wasm_bindgen_futures::JsFuture::from(promise).await.map(|v| v.as_bool()) {
+            Ok(Some(true)) => tracing::info!("This browser keeps Pimble's storage under pressure (persistent storage granted)"),
+            _ => {
+                tracing::info!("Persistent storage was not granted: this browser may clear its copy of the stores when it runs short of space");
+                backend::local().notice(PERSIST_REFUSED.to_string());
+            }
         }
-    }
+    });
 }
 
-thread_local! {
-    static REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The sentence for a refused persistence request, once.
-pub fn persistence_refused() -> Option<&'static str> {
-    REFUSED.with(|r| r.replace(false)).then_some(
-        "This browser did not agree to keep Pimble's storage: it may clear this browser's copy of your stores when it runs short of space. What has been sent is safe on Pimble Cloud.",
-    )
-}
+/// What the status bar says when persistent storage is refused.
+const PERSIST_REFUSED: &str =
+    "This browser may clear its copy of your stores if it runs short of space. Everything already sent is safe on Pimble Cloud.";
 
 /// Build the app into its host, once: connected to this browser's server and
 /// signed in, or to the sign-in page.

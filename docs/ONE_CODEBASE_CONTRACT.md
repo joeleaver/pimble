@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft; waves 0, 1, 2 (with its runtime), 3 and 4 built** (2026-11-22 and 23, not merged or released; see the "Built" sections at the end; wave 4, the browser on its own server, is behind `?server=worker`, with what it left undone and what needs Joe's word at the end of its section). Decisions taken so far are under "Decisions"; the rest
+Status: **draft; waves 0, 1, 2 (with its runtime), 3 and 4 built** (2026-11-22 and 23, not merged or released; see the "Built" sections at the end; wave 4, the browser on its own server, is the web app's default since its follow-ups, the old path `?server=old` until wave 5; what it left undone and what needs Joe's word are at the end of each section). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -1277,8 +1277,11 @@ adapters and entry).
 
 ## Built: wave 4 (2026-11-23, not merged or released): the browser on its worker server, behind a switch
 
-`?server=worker` in the web app's URL turns it on for that browser (kept in `localStorage` as
-`pimble.server`; `?server=page` turns it off). Off, the page is exactly what it was: nothing of
+**The default since 2026-11-23** (Joe: "There's no active users of the web app ... you might as
+well just flip the switch"): see "Built: wave 4, the follow-ups" below; the old path is
+`?server=old` until wave 5. As built first, and as the rest of this section says:
+`?server=worker` in the web app's URL turned it on for that browser (kept in `localStorage` as
+`pimble.server`; `?server=page` turned it off). Off, the page is exactly what it was: nothing of
 this wave runs, and the worker's files, though built and served beside the page's, are never
 fetched. On, the page runs the same Pimble server the desktop runs, in a dedicated worker of one
 leader tab, keeps the account's stores in OPFS sealed with the remembered device's disk key (or
@@ -1590,3 +1593,160 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
   Browser" in Settings; the per-document log, if wanted; whether the page and worker are cached
   for offline (a service worker); Firefox and Safari runs (the fallback write path above);
   the worker's files hashed or their caching checked on jkbase.
+
+## Built: wave 4, the follow-ups (2026-11-23, not merged or released)
+
+Joe approved four things after wave 4 was committed: running it in Firefox, hashing the
+worker's files, a gentler word when persistent storage is refused, and a service worker so the
+page opens with no network; then a fifth: **the browser's own server is the web app's default**
+("There's no active users of the web app ... you might as well just flip the switch", Joe,
+2026-11-23). All five are done; Firefox found one bug of the shared link code.
+
+### The default flipped
+
+`worker_mode::enabled()` is true unless `?server=old` (or the earlier `?server=page`) asked for
+the old path, which is remembered in `localStorage` (`pimble.server = "old"`) until
+`?server=worker` forgets it. The old path is untouched and still whole, for wave 5 to delete;
+on it the page only unregisters the service worker and drops its caches. A browser that was
+signed in on the old path (keys in the page's memory, its session cookie, its device id in
+`localStorage`, nothing remembered of a switch) lands on the new sign-in page: the old path's
+keys never outlived a reload, the cookie is not read by this path, and the device id is handed
+to the server at its first start. Checked (`migrate`, below).
+
+### Firefox
+
+Playwright's Firefox (151, `firefox-1532`) ran every browser check of wave 4 (`walk`, `tabs`,
+`tabs2`, `offline`, `forget`, `alice`, `measure`, `oldpath`) and the service worker's
+(`swcheck`, below). OPFS `createWritable` in a worker, Web Locks, `BroadcastChannel`,
+IndexedDB with a `CryptoKey`, WebCrypto: all work as in Chromium; the sync-access-handle
+fallback was not taken. What Firefox broke:
+
+- **Signing in hung.** The sign-in page awaited `navigator.storage.persist()` before going to
+  the app, and Firefox asks the person (a door-hanger; headless, never answered). The request
+  is now made beside everything else and never waited on (`worker_mode::ask_to_persist`), so
+  Chromium gains nothing and loses nothing.
+- **A new build's service worker taking over while the page's worker loads** left the
+  worker's script fetch hanging in Firefox (no `error`, no `loaded`). `hub.js` now gives a
+  worker 10 s to load (longer on each retry) and starts it again; the second start loads the
+  new build's files.
+- **Opening a store was four times slower than in Chromium** (the 681-node store 9.4 s against
+  1.0 s; rows in the tree 15 s after a cold start): each OPFS read is a round trip, and
+  `LocalStore::load_node_docs` read a store's documents one after another. It now keeps 16
+  reads in flight (`READS_AT_ONCE`; what is loaded does not depend on the order), in every host:
+  Firefox 2.3 s, Chromium 0.5-0.7 s; the desktop's suites unchanged.
+- Two things in the checks themselves, not the app: Playwright's Firefox driver asserts on a
+  WebSocket a worker opens (its bookkeeping; the checks pass over that one assertion), and its
+  offline switch leaves an open WebSocket running, so the service worker check cuts the
+  network by stopping the stack's web server for the part that needs the link down.
+
+### Found by it: a member's create made while down was never sent (shared link code)
+
+`crates/pimble-server/src/vault_link.rs` `note_local_changes_for`: while the link waits out a
+backoff it marks each document changed here, and it wrote those marks only when the wait ended.
+To a share's member a document the remote never listed is offered at the next reconcile only
+when it is marked (a document its owner moved out of the share looks the same), so a create
+made while down, on a device stopped inside the wait (a tab reloaded or closed, a crash, a
+desktop quit: a stop aborts the link), reached nobody, ever. Seen in the browser (a note made
+with no network, the page reloaded before the network came back), and the desktop's the same.
+The marks are now written as each document is first marked (a write only for a newly marked
+document, not for every keystroke). Test: `share.rs`
+`a_members_create_made_while_down_reaches_the_owner_after_a_stop_inside_the_wait` (fails on
+the code before: the owner never has the create; passes now).
+
+### Hashed worker files
+
+Trunk hashes no worker. `web/build/post_build.sh`, a trunk `post_build` hook (`Trunk.toml`,
+POSIX `sh` and coreutils, so the deploy's buildpack runs it too), renames
+`pimble-worker.js` and `pimble-worker_bg.wasm` by a hash of their contents
+(`pimble-worker-<hash>.js`, `pimble-worker-<hash>_bg.wasm`), writes the loader that imports
+that pair (`pimble-worker-<hash>_loader.js`) and names it in index.html's
+`<meta name="pimble-worker-loader">`, which `hub.js` reads. A page therefore always starts the
+worker of its own build, whatever a cache kept; the hook fails the build if index.html names
+no loader after it.
+
+### Persistence refused: a notice
+
+`BackendEvent::Notice { message }` (new, `pimble-app`): a sentence for the status bar that is
+not an error (`events::show_notice`; the status bar's connection state is not touched). A
+refused `persist()` says "This browser may clear its copy of your stores if it runs short of
+space. Everything already sent is safe on Pimble Cloud." (`worker_mode::backend::Local::notice`
+holds it until the UI listens.)
+
+### The page with no network: a service worker
+
+`web/build/sw.template.js`, written by the same hook into `dist/sw.js` with this build's id (a
+hash of every file's name and bytes) and the list of its files (12: the page, its wasm and
+JavaScript, the snippets, the hub, the worker's three, the icons; the app has no CSS files or
+web fonts of its own: its styles are inline and its fonts the system's).
+
+- **Scope: the browser's own server, the default.** `hub.js` registers it (scope `/app/`); on
+  the old path (`?server=old`) the page unregisters it and deletes its caches
+  (`PimbleHub.leaveOffline`). The old path needs the network to start at all (it mints a token
+  and asks for the password), so a cache there would only add a way to run stale code until
+  wave 5 deletes it.
+- **What it keeps and answers**: on install, this build's files (fetched past the HTTP cache)
+  into `pimble-app-<build>`; it answers only GETs under `/app/`, never `/api` or `/rpc` (not
+  under the app's path) and nothing it did not list: no store data, no account data, no
+  response kept at run time.
+- **Never stale beside new**: the page itself (a navigation) is asked of the network first,
+  with the kept page only when the network does not answer within 4 s; every other file is
+  named by its contents, so a new page finds no old file under its name. A new build's service
+  worker installs its cache whole, takes over at once (`skipWaiting`, `clients.claim`), deletes
+  every older `pimble-app-*` cache, and tells the pages it took over from; the page says "A new
+  version of Pimble is ready: reload the page to use it." (a notice).
+
+### Proof (Chromium and Firefox, the local stack)
+
+- **Both browsers, every check, with no query string** (the default path): `first`, `walk` (the sharing walk-through, steps 4-8: a role
+  change reached the browser 106-107 s after the owner made it), `tabs`, `tabs2`, `offline`
+  (a reload with no network at all now loads), `forget`, `alice`, `measure`, and `oldpath` with `?server=old` (the old path signs in and shows
+  the tree, the hub idle, no worker): all pass in Chromium and in Firefox on the final build.
+- **`migrate`**, in each browser: signed in on the old path (`?server=old`), the remembered
+  switch then removed as a browser from before the flip has none; `/app/` lands on the new
+  sign-in page in both browsers (two navigations, `/app/` and its replacement by
+  `/app/login`; no error in the console; the hub on memory, nothing kept yet); signing in there
+  works, and the old path's device id is handed to the server.
+- **`swcheck`**, in each browser: signed in and remembered, the service worker in control, the
+  network fully off: a reload opens the app on its own server from OPFS, tree and all; the
+  stack's web server stopped: the same; a note made then (the link down) is kept across a
+  reload and reaches Carol's desktop when the server is back; **a second build deployed** (the
+  worker's code changed, renamed and given its service worker by the same hook): a reload
+  online loads the new page, which starts the new build's worker, the kept files are the new
+  build's only, and with the network off again the new build opens from the cache.
+- **The suites** on the final tree: `cargo test --release --no-fail-fast -p pimble-server -p
+  pimble-store -p pimble-host -p pimble-search`, 421 passed, 0 failed, 1 ignored, on the
+  machine's disk and on memory. An earlier native run (before the concurrent reads, the machine
+  at a load of 70-160) failed once in `vault_link.rs`
+  `a_readers_replica_reads_everything_and_writes_nothing` ("a reader's link pushes nothing": the
+  shared folder's hosted head was 3, not 2); run alone it failed 1 of 11 times with this wave's
+  link change and 0 of 6 without, and passed in both final runs. Not traced: a write by the
+  owner's share upkeep racing the test's first count is the likeliest; worth a look.
+- **The fault sweep** (`PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4`, after the link change):
+  all 200 converged (846 s), 100 with the browser device, 219 crashes (38 the browser's).
+- `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp` builds; the wasm smoke test
+  passes (2); `cd web && trunk build --release` builds the page, the worker, its hashed names
+  and `sw.js`.
+
+### Measurements
+
+On the local stack, the machine quiet (load about 10), the browser started afresh on alice's
+profile (two stores: Family, and Big, 681 nodes and 2.8 MB):
+
+| | Chromium | Firefox |
+| --- | --- | --- |
+| Big opened from OPFS | 0.47-0.73 s | 2.29-2.35 s |
+| both stores open, server up | 0.51-0.81 s | 2.36-2.41 s |
+| rows in the tree after the page was asked for | 1.3-1.8 s | 3.9-4.2 s |
+| the app with the network fully off (swcheck) | 0.6-8 s | 1.4-8 s |
+
+The last row's spread is the machine's load during the runs (it reached 160 while other work
+ran), not the cache. The worker's files as hashed: 6.45 MB of wasm (2.50 MB gzipped), as
+before.
+
+### Left, or for Joe
+
+- A new version takes over every open tab at once; the tab keeps running the code it loaded
+  and says a new version is ready. A gentler update (waiting until every tab closes) would leave
+  a page offline on the older build until then; this one never runs two builds' files in one
+  page.
+- Safari is still not run.

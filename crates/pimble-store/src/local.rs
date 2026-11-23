@@ -312,6 +312,9 @@ impl LinkAccess {
     }
 }
 
+/// How many node documents a store's open reads at once.
+const READS_AT_ONCE: usize = 16;
+
 impl LocalStore {
     /// Subdirectory names
     const NODES_DIR: &'static str = "nodes";
@@ -958,24 +961,33 @@ impl LocalStore {
     /// (`classify_node_file`) is not loaded but named in `conflicts`, for
     /// `open` to merge once the documents are in place.
     async fn load_node_docs(disk: &Disk, nodes_dir: &Path) -> Result<LoadedDocs> {
+        use futures::StreamExt;
         let mut loaded = LoadedDocs::default();
+        let mut documents = Vec::new();
         for entry in disk.list(nodes_dir).await? {
             let file = entry.path;
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
-            let id = match classify_node_file(name) {
-                NodeFile::Document(id) => id,
-                NodeFile::Conflict(id) => {
-                    loaded.conflicts.push((id, file));
-                    continue;
-                }
+            match classify_node_file(name) {
+                NodeFile::Document(id) => documents.push((id, file)),
+                NodeFile::Conflict(id) => loaded.conflicts.push((id, file)),
                 NodeFile::Other => {
                     if name.ends_with(".yrs") {
                         warn!("Skipping {:?}: not named by a node id", file);
                     }
-                    continue;
                 }
-            };
-            let bytes = match disk.read(&file).await {
+            }
+        }
+        // Several reads in flight at once: each is a round trip on the
+        // browser's OPFS (Firefox's especially), and a store is hundreds of
+        // files. What is loaded does not depend on the order they come in.
+        let mut reads = futures::stream::iter(documents)
+            .map(|(id, file)| async move {
+                let read = disk.read(&file).await;
+                (id, file, read)
+            })
+            .buffer_unordered(READS_AT_ONCE);
+        while let Some((id, file, read)) = reads.next().await {
+            let bytes = match read {
                 Ok(bytes) => bytes,
                 // A file that does not open (a sealed disk's file written
                 // only in part: the browser's fallback write, killed midway)

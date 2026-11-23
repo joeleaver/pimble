@@ -59,16 +59,28 @@ The backend loop supervises the endpoint the store list comes from, because that
 is the one whose absence means there is nothing to show. Any other endpoint
 connects the first time a store on it is touched.
 
-## The browser's own server (behind a switch)
+## The browser's own server (the default)
 
-`?server=worker` turns on docs/ONE_CODEBASE_CONTRACT.md wave 4 for this browser
-(`?server=page` off). The page then runs the same Pimble server the desktop runs, in a
-dedicated worker of one leader tab (`hub.js`: a Web Lock, a `BroadcastChannel` for the other
-tabs), built by trunk from `crates/pimble-worker` (its `entry` feature, the `worker` profile)
-into `pimble-worker_loader.js`. `src/worker_mode/` is the page's side: the switch, the hub's
-bindings, the backend (the desktop's shape over `PimbleClient::over_message_port`), and the
-sign-in and account pages that talk to that server. Off, none of it runs and nothing above
-changes.
+Since 2026-11-23 the page runs the same Pimble server the desktop runs, in a dedicated worker
+of one leader tab (docs/ONE_CODEBASE_CONTRACT.md wave 4). It was behind `?server=worker` until
+Joe flipped it: "There's no active users of the web app ... you might as well just flip the
+switch" (2026-11-23). The old path below (keys in the page, `vault.rs`, the hosted server read
+directly) stays reachable with `?server=old` (remembered in `localStorage` as `pimble.server`;
+`?server=worker` forgets it) until wave 5 deletes it.
+
+- `hub.js`: the leader tab (a Web Lock), the other tabs over a `BroadcastChannel`, the worker it
+  starts, and the service worker it registers.
+- The worker is built by trunk from `crates/pimble-worker` (its `entry` feature, the `worker`
+  profile); `build/post_build.sh` (a trunk `post_build` hook) renames its files by their
+  contents, names the loader in index.html's `pimble-worker-loader` meta tag, and writes
+  `sw.js` from `build/sw.template.js`: the service worker that keeps this build's own files so
+  the page opens with no network (never `/api`, `/rpc` or any store data; a new build replaces
+  the cache whole).
+- `src/worker_mode/`: the switch, the hub's bindings, the backend (the desktop's shape over
+  `PimbleClient::over_message_port`), and the sign-in and account pages that talk to that
+  server.
+
+The sections that follow describe the old path, as it is until wave 5.
 
 ## The account pages
 

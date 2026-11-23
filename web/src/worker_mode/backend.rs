@@ -56,6 +56,8 @@ pub struct Local {
     /// How many connections have been made: a new one means the old one's
     /// subscriptions went with it.
     generation: std::cell::Cell<u64>,
+    /// Notices said before the UI listened, said when it does.
+    waiting_notices: RefCell<Vec<String>>,
     me: Weak<Local>,
 }
 
@@ -65,7 +67,7 @@ pub fn local() -> Rc<Local> {
         slot.borrow_mut()
             .get_or_insert_with(|| {
                 let client_id = uuid::Uuid::new_v4().to_string();
-                Rc::new_cyclic(|me| Local { client: futures::lock::Mutex::new(None), events: RefCell::new(None), client_id, generation: std::cell::Cell::new(0), me: me.clone() })
+                Rc::new_cyclic(|me| Local { client: futures::lock::Mutex::new(None), events: RefCell::new(None), client_id, generation: std::cell::Cell::new(0), waiting_notices: RefCell::new(Vec::new()), me: me.clone() })
             })
             .clone()
     })
@@ -117,6 +119,16 @@ impl Local {
         self.hear_cloud(client.clone());
         self.emit(BackendEvent::Connected { server_addr: "this browser".to_string(), client_id: self.client_id.clone() });
         Ok(client)
+    }
+
+    /// A sentence for the status bar (`BackendEvent::Notice`), kept until the
+    /// UI listens.
+    pub fn notice(&self, message: String) {
+        if self.events.borrow().is_some() {
+            self.emit(BackendEvent::Notice { message });
+        } else {
+            self.waiting_notices.borrow_mut().push(message);
+        }
     }
 
     /// Let go of the connection held (the hub is replacing the server): the
@@ -212,8 +224,9 @@ async fn run(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>) {
     // The connection (made already by the page that started the app), said
     // to the UI.
     local.announce().await;
-    if let Some(message) = super::persistence_refused() {
-        let _ = event_tx.try_send(BackendEvent::Error { message: message.to_string() });
+    // A notice that came before the UI listened.
+    for message in local.waiting_notices.take() {
+        let _ = event_tx.try_send(BackendEvent::Notice { message });
         signal_ui();
     }
 
@@ -289,7 +302,7 @@ async fn run(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>) {
                     Some(pimble_app::import::import(&mut runner, store_id, parent_id, format, &name, &files).await)
                 }
                 BackendCommand::SendDiagnostics { .. } => Some(BackendEvent::DiagnosticsSent {
-                    result: Err("Diagnostics are not sent from the browser's own server yet; turn it off (?server=page) to send them.".to_string()),
+                    result: Err("Diagnostics are not sent from the browser's own server yet; the old path (?server=old) sends them.".to_string()),
                 }),
                 BackendCommand::CreateHostedStore { name, kind } => {
                     let event = create_store(&ctx, &name, &kind).await;

@@ -62,6 +62,8 @@ pub fn start() {
     shortcuts::install();
     if worker_mode::enabled() {
         worker_mode::begin();
+    } else {
+        worker_mode::end();
     }
     route::start();
 }

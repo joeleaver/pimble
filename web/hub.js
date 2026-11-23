@@ -1,6 +1,7 @@
 // The browser's one Pimble server, shared by every tab of this origin
-// (docs/ONE_CODEBASE_CONTRACT.md section 4): used only with the worker switch
-// on (`?server=worker`, kept in localStorage `pimble.server`).
+// (docs/ONE_CODEBASE_CONTRACT.md section 4): the web app's default; idle on
+// the old path (`?server=old`, kept in localStorage `pimble.server`, until
+// wave 5 deletes it), which only calls `leaveOffline`.
 //
 // Every tab asks for one Web Lock, `pimble-server`. The tab that holds it is
 // the leader: it runs the server in a dedicated worker (the page's build
@@ -111,19 +112,38 @@
 
     // ---- The leader's worker ----
 
+    // The worker of this page's own build: its loader is named by the
+    // worker's contents (build/post_build.sh), in a meta tag of index.html.
     function workerUrl() {
+        const meta = document.querySelector('meta[name="pimble-worker-loader"]');
+        const name = (meta && meta.content) || "pimble-worker_loader.js";
         // The page is served under /app/ (Trunk.toml public_url).
-        return new URL("/app/pimble-worker_loader.js", location.origin).href;
+        return new URL("/app/" + name, location.origin).href;
     }
 
-    function startWorker(mode) {
+    // How long a worker has to load before it is given up and started again.
+    // Firefox leaves a worker's script fetch hanging when a new build's
+    // service worker takes over while it loads (the follow-ups of wave 4); a
+    // second start loads it from the new build's files.
+    const LOAD_WITHIN_MS = 10000;
+
+    function startWorker(mode, attempt = 1) {
         workerReady = new Promise((resolve, reject) => {
             const started = performance.now();
-            const w = new Worker(workerUrl());
+            const url = workerUrl();
+            log("starting the worker", url.split("/").pop());
+            const w = new Worker(url);
             worker = w;
+            const watchdog = setTimeout(() => {
+                if (worker !== w) return;
+                log("the worker did not load within", LOAD_WITHIN_MS, "ms; starting it again");
+                w.terminate();
+                startWorker(mode, attempt + 1).then(resolve, reject);
+            }, LOAD_WITHIN_MS * Math.min(attempt, 6));
             w.onmessage = (event) => {
                 const m = event.data || {};
                 if (m.t === "loaded") {
+                    clearTimeout(watchdog);
                     log("worker loaded in", Math.round(performance.now() - started), "ms; starting the server:", mode);
                     w.postMessage({ t: "start", mode, inherited: options.inherited });
                 } else if (m.t === "started") {
@@ -295,9 +315,38 @@
 
     // ---- What the page calls ----
 
+    // ---- The page with no network (build/sw.template.js) ----
+
+    // Keep this build's files for a page opened with no network (this path
+    // only: the old path unregisters it, `leaveOffline`). A new build
+    // that takes over says so: `pimble-update-ready` on the window.
+    function keepForOffline() {
+        if (!("serviceWorker" in navigator)) return;
+        navigator.serviceWorker.addEventListener("message", (event) => {
+            if (event.data && event.data.t === "pimble-updated") {
+                log("a new version of Pimble is ready:", event.data.build);
+                dispatchEvent(new CustomEvent("pimble-update-ready", { detail: event.data.build }));
+            }
+        });
+        navigator.serviceWorker.register("/app/sw.js", { scope: "/app/" }).then(
+            (reg) => { reg.update().catch(() => {}); },
+            (e) => log("no service worker; the page needs the network to load:", e.message),
+        );
+    }
+
+    // The switch off: no service worker and no kept files.
+    function leaveOffline() {
+        if (!("serviceWorker" in navigator)) return Promise.resolve();
+        return navigator.serviceWorker.getRegistrations().then(async (regs) => {
+            for (const reg of regs) if (reg.scope.endsWith("/app/")) await reg.unregister();
+            if (self.caches) for (const name of await caches.keys()) if (name.startsWith("pimble-app-")) await caches.delete(name);
+        }).catch(() => {});
+    }
+
     function start(given) {
         if (started) return;
         started = true;
+        keepForOffline();
         options = Object.assign(options, given || {});
         bc = new BroadcastChannel(CHANNEL);
         bc.onmessage = onBroadcast;
@@ -362,5 +411,5 @@
         };
     }
 
-    window.PimbleHub = { start, connect, control, status, take };
+    window.PimbleHub = { start, connect, control, status, take, leaveOffline };
 })();

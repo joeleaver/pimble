@@ -7,6 +7,8 @@ license.workspace = true
 description = "Store abstraction for local and remote storage in Pimble"
 
 [dependencies]
+# Reading a store's documents several at once (local.rs `load_node_docs`).
+futures = { workspace = true }
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 # The disk every file of a store goes through (docs/ONE_CODEBASE_CONTRACT.md seam B).
