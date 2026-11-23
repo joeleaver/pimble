@@ -1,5 +1,11 @@
 # Next session: start here
 
+**2026-11-23 (master session local_198b8f9e, transcript 3e8511e5): wave 5 started.**
+Cleanup of session 78e7f30f done: its scratch (1.8 GB) deleted. It is the app session
+`local_0e9ad72e` ("Pimble"); archiving it was refused while a Remote Control client is
+attached, so Joe archives it from the sidebar. The three other worktrees are untouched.
+Working on wave 5 of docs/ONE_CODEBASE_CONTRACT.md in this checkout (master).
+
 **2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
 the weekly limit; every agent of it is dead).** Released today: 0.30.0 and 0.30.1 (Bear
 cards: copy a picture, Save Picture As, hourly update check; summaries posted in Shared
