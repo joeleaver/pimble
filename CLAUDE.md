@@ -30,7 +30,9 @@ Pimble is an **offline-first personal information manager**:
   The one exception is a person's own state (discussions' read state, their place in each
   node: the personal document), which is account data encrypted for their own devices. Signing in counts as asking for it to be synced, and a switch
   turns that off. No store content is ever uploaded because someone signed in (Joe,
-  2026-10-21, docs/DISCUSSIONS_CONTRACT.md section 8).
+  2026-10-21, docs/DISCUSSIONS_CONTRACT.md section 8). Notifications are the same kind of
+  account data (Joe, 2026-11-23, docs/NOTIFICATIONS_CONTRACT.md): notices sealed to their
+  recipient and the opaque ids of watched documents, on with signing in, with a switch.
 - **Everything is co-editable.** Every piece of a person's data (a node's text, its place in
   the tree, its title and metadata, a plugin's JSON) lives in a CRDT document that everyone
   with edit rights edits directly, and edits merge on their own. No projections, mirrors,

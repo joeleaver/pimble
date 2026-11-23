@@ -1,8 +1,8 @@
 # Notifications contract: hearing that someone wrote to you
 
-Status: **draft, 2026-11-23, nothing built.** Written from a conversation with Joe that day
-(listed under "Decisions" at the end). The points under "Open" are his to answer before
-wave 1 starts; the rest are design choices made here that he has not reviewed yet.
+Status: **design agreed 2026-11-23, nothing built.** Written from a conversation with Joe that
+day; his decisions are listed at the end. The details not named there are design choices
+made here that he has not reviewed yet.
 
 Will asked for it on 11/19: "Figure out how to make Mister Pimble alert you when you have
 a message" (the Bear's board, "Feature: tell me when someone writes to me").
@@ -61,7 +61,7 @@ Only the writer's device knows a mention happened, because only it has the plain
 it tells the mentioned person directly:
 
 ```text
-Notice {                         // sealed to the recipient's X25519 account key
+Notice {                         // sealed to the recipient's notice key (below)
   id, kind: Mention | Reply,
   from: sub, from_name,          // the name the sender goes by in that share
   store, node, discussion?, anchor,
@@ -70,13 +70,22 @@ Notice {                         // sealed to the recipient's X25519 account key
 }
 ```
 
-- The device seals it with the recipient's public key (already held: sharing looked it
-  up) and posts it to the accounts service: `POST /api/v1/inbox/{recipient sub}`. The
-  service checks that the sender and the recipient share a store (no inbox spam from
-  strangers), rate-limits per sender, queues it, and wakes the recipient's channels
-  (section 4).
+- **The notice key.** Every account has an X25519 key pair used for notices and nothing
+  else. Its public half is published beside the account's other public keys (`GET
+  /users/lookup`, and with each member in `GET /stores/{id}/members`). Its private half
+  is wrapped under the account key like the store keys; each device unwraps it once and
+  keeps it: the desktop in `keys.json`, a browser as a non-extractable WebCrypto key in
+  IndexedDB, so that the web app's service worker can open a notice without the account
+  being unlocked (section 4, web push). A stolen device can read the notices it was sent,
+  never a note. Rotated with "Sign out everywhere".
+- The device seals the notice to the recipient's notice key and posts it to the accounts
+  service: `POST /api/v1/inbox/{recipient sub}`, with the share (store and root) in the
+  clear. The service checks that the sender and the recipient are both in that share (no
+  inbox spam from strangers), rate-limits per sender, queues it, and wakes the
+  recipient's channels (section 4).
 - **What the service learns:** that `from` notified `to` at `at`, about something in a
-  store they share. Not where, not what.
+  share they are both in. Not which note, not what was said. It already knows both of
+  their names in that share and the share's name.
 - A reply in a discussion notifies its other participants the same way (the writer's
   device knows who wrote in the thread). That covers the implicit watch of section 3 for
   discussions without any server-side watching.
@@ -100,9 +109,12 @@ encrypted document, which account, when. So:
 - **What the service learns:** which documents you watch. New metadata, no content.
 - Watching a note may include its subtree; the device keeps the registered set in step
   as nodes come and go (it knows the tree; the server does not).
-- Shares shared with you: watched by default? (Open.)
-- **Relayed stores**: the owner's machine runs the same evaluation on its relay face, so
-  it works only while that machine is on. (Open: acceptable, or hosted stores only.)
+- **Nothing is watched by default** (Joe, 2026-11-23), not even a share someone shared
+  with you: until you choose Watch, you hear about mentions and replies only.
+- **Relayed stores** (Joe, 2026-11-23): the owner's machine runs the same evaluation on
+  its relay face and posts the notices, so watches work only while that machine is on.
+  Nothing is missed by it: while the owner is away nobody edits through the relay, and
+  edits made offline reach the relay, and the watchers, when it is back.
 
 ## 4. Delivery: every channel reads the same inbox
 
@@ -110,16 +122,24 @@ encrypted document, which account, when. So:
   over its existing connection, decrypts, and shows an OS notification with the snippet
   (rinch's `notifications` feature on the desktop; the Notifications API in the
   browser). Clicking it opens the note at the mention.
-- **The tray** (desktop, optional): Pimble can keep running with no window open, so
-  notifications arrive while you work elsewhere. (Open: on by default?)
-- **Web push** (browser and phone, through the web app's service worker): the push cannot
-  decrypt, because the keys live only in memory after unlocking, so it says "Joe
-  mentioned you in Pimble" using `from_name`. The name has to be sent in the clear for
-  that; or the push says only "You have a new notification in Pimble". (Open.)
-  Tapping it opens the web app, which unlocks and shows the notice.
-- **Email, the fallback**: an item no device has acknowledged within 15 minutes is
-  emailed through Resend (`m.pimble.app`), at most one email per hour per person, with a
-  link and no content. Devices acknowledge items as they drain them.
+- **The tray** (desktop; Joe, 2026-11-23: on by default): closing the last window leaves
+  Pimble running in the system tray, so notifications arrive while you work elsewhere.
+  The tray menu has Open Pimble and Quit (File > Quit quits too), and a setting ("Keep
+  running in the tray when the window closes") turns it off. The first time a window
+  closes into the tray, a notification says so once.
+- **Web push** (browser and phone, through the web app's service worker; Joe,
+  2026-11-23: the full notice): the push payload is the sealed notice itself, inside Web
+  Push's own encryption to the browser (RFC 8291), so neither the push service nor
+  Pimble Cloud can read it. The service worker opens it with the notice key from
+  IndexedDB and shows it whole: "Joe: @Will can you check the…". Tapping it opens the web
+  app at the mention (unlocking first if needed). A watch notice, which the service
+  cannot fill in, shows "3 changes in a note you watch, in Shared with Will".
+- **Email, the fallback** (Joe, 2026-11-23: who and which share): an item no device has
+  acknowledged within 15 minutes is emailed through Resend (`m.pimble.app`), at most one
+  email per hour per person: "Joe mentioned you in Shared with Will", or for several,
+  one line each, and a link. Only what the service already knows (the names people go by
+  in the share, the share's name); never a word of a note. Devices acknowledge items as
+  they drain them.
 - **Read anywhere clears everywhere**: opening a notice writes its id into the personal
   document (DISCUSSIONS section 8), which syncs to the person's other devices; the
   service deletes delivered items after seven days.
@@ -131,6 +151,10 @@ newest first, unread on top. The status bar shows a count. Each row opens where 
 points and has "Unwatch" for watched changes.
 
 ## 6. Turning it off
+
+Signing in turns notifications on (Decisions, the hosting rule); the Account modal says
+so in one line ("People who share notes with you can notify you; Pimble Cloud cannot read
+what they say") beside its switch.
 
 Per person, in Settings and in the Account modal: mentions, replies, watched notes, each
 on or off; per channel: OS notifications, web push, email. "Unwatch" from any watched
@@ -146,12 +170,12 @@ Will's note is exactly what Will should hear about.
 
 0. **Mentions as text**: the atom, the `@` picker over a share's members, Markdown and
    MCP. No delivery yet; the person's unread view lifts mentions of them.
-1. **The inbox and the running app**: sealed notices for mentions and replies, the
-   accounts service's inbox, draining on connect, OS notifications, View > "Inbox...".
+1. **The inbox and the running app**: the notice key, sealed notices for mentions and
+   replies, the accounts service's inbox, draining on connect, OS notifications, View > "Inbox...".
 2. **Out of band**: acknowledgements, email after 15 minutes, web push.
 3. **Watches**: registration, the server's batching, "Watch" and "Unwatch", subtrees,
    the relay face.
-4. **The tray** on the desktop.
+4. **The tray** on the desktop, on by default.
 
 ## Decisions (Joe, 2026-11-23)
 
@@ -161,18 +185,16 @@ Will's note is exactly what Will should hear about.
   by in that share; the same person can have different names in different shares.
 - Mentions first; mentions in discussions are the clearest case, and mentions in notes
   use the same atom.
-
-## Open (Joe's to answer)
-
-1. **The hosting rule.** Do sealed notices to someone's account, and a list of watched
-   document ids, count as account data that signing in implies (like read state, with a
-   switch), or must a person opt in to Pimble Cloud before notifications work? Both
-   apply to relayed and unhosted stores too.
-2. **Email content.** Content-free with a link (this draft), or may the sender's device
-   include a snippet in the clear?
-3. **Web push text.** `from_name` in the clear ("Joe mentioned you"), or nothing at all?
-4. **Watches on relayed stores.** Only while the owner's machine is on, or hosted stores
-   only for now?
-5. **Default watches.** Are shares shared with you watched by default?
-6. **The tray.** Should Pimble keep running in the tray with no window open by default
-   (needed for desktop notifications without the browser)?
+- **Signing in implies it** (the hosting rule). The sealed inbox and the list of watched
+  document ids are the person's own account data, as read state is: signing in to Pimble
+  Cloud turns them on, for hosted, relayed and unhosted stores alike, with a switch in
+  the Account modal and in Settings (section 6). Turning it off deletes the registered
+  watches and the queued notices and stops both. No store content is ever uploaded for
+  it: a notice is sealed to the recipient, and a watch names opaque document ids.
+- **Email says who and which share**, and nothing of the note: "Joe mentioned you in
+  Shared with Will" and a link (section 4).
+- **Web push shows the full notice**, sealed end to end and opened by the service worker
+  with a per-account notice key kept on each device (sections 2 and 4).
+- **Watches on relayed stores** work while the owner's machine is on (section 3).
+- **Nothing is watched by default**; shares shared with you included (section 3).
+- **The tray is on by default** on the desktop, with a setting to turn it off (section 4).
