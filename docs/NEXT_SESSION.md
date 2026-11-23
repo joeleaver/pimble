@@ -4,7 +4,14 @@
 Cleanup of session 78e7f30f done: its scratch (1.8 GB) deleted. It is the app session
 `local_0e9ad72e` ("Pimble"); archiving it was refused while a Remote Control client is
 attached, so Joe archives it from the sidebar. The three other worktrees are untouched.
-Working on wave 5 of docs/ONE_CODEBASE_CONTRACT.md in this checkout (master).
+Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all three:
+- Master: local_198b8f9e. It keeps this file, reviews, merges, releases and deploys.
+- Open work: local_29e8b449 ("Pimble master: finish notifications"). It works on notifications
+  waves 3-4 and the walk-through in `/home/joe/dev/pimble-notifications`, then wave 5. It reports
+  its branch tip and Joe's open decisions to the master and does not merge or release itself.
+- Bear liaison: local_9f92929f (`bear-liaison`). It handles Shared Pimble Notes and the Pimble To
+  Do board, and posts release summaries only once a release is published.
+- The old-path inventory for wave 5 is in the side-session notes folder (`wave5-inventory.md`).
 
 **2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
 the weekly limit; every agent of it is dead).** Released today: 0.30.0 and 0.30.1 (Bear
