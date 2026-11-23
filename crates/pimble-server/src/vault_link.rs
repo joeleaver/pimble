@@ -163,7 +163,7 @@ use pimble_core::WaitingDoc;
 use pimble_rpc::vault::{self as protocol, DocKeys, LogSizes, NewDocument, PartBuffer, SealKey, Unit, Unopened};
 use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultAppendRequest, VaultCursor, VaultDocId, VaultDocKeys, VaultSnapshotRequest};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
-use tokio::task::JoinHandle;
+use pimble_host::{Instant, Runtime, Task};
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -229,10 +229,10 @@ pub struct VaultLinkHandle {
     /// Whether the link is down because the relay says the store's owner is
     /// not there (see `run_loop`).
     owner_offline: Arc<std::sync::atomic::AtomicBool>,
-    join: JoinHandle<()>,
+    join: Task,
     /// The store's key sweep (`crate::share::run_sweeper`), which lives and
     /// dies with the link.
-    sweep: JoinHandle<()>,
+    sweep: Task,
     sweep_kick: Arc<Notify>,
     /// What a `cloudShare*` RPC asks of the share upkeep in the link's task.
     share_tx: mpsc::UnboundedSender<ShareCommand>,
@@ -338,10 +338,11 @@ impl VaultLink {
         let state = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync), owner_offline: Arc::clone(&owner_offline) };
         let sweep_kick = Arc::new(Notify::new());
         let (share_tx, share_rx) = mpsc::unbounded_channel();
-        let sweep = tokio::spawn(crate::share::run_sweeper(handler.clone(), store_id, Arc::clone(&sweep_kick)));
-        let shares = ShareSide { commands: share_rx, upkeep: Upkeep::new(), sweep_kick: Arc::clone(&sweep_kick) };
+        let runtime = handler.runtime().clone();
+        let sweep = runtime.spawn(crate::share::run_sweeper(handler.clone(), store_id, Arc::clone(&sweep_kick)));
+        let shares = ShareSide { commands: share_rx, upkeep: Upkeep::new(runtime.clone()), sweep_kick: Arc::clone(&sweep_kick) };
         let waiting = Waiting::default();
-        let join = tokio::spawn(run_loop(handler, endpoint, key_id, link_id, state, shares, waiting.clone()));
+        let join = runtime.spawn(run_loop(handler, endpoint, key_id, link_id, state, shares, waiting.clone()));
 
         VaultLinkHandle { state_rx, last_sync, owner_offline, join, sweep, sweep_kick, share_tx, waiting }
     }
@@ -609,8 +610,7 @@ async fn note_local_changes_for(
     link_id: &str,
     wait: Duration,
 ) {
-    let deadline = tokio::time::sleep(wait);
-    tokio::pin!(deadline);
+    let mut deadline = progress.runtime.sleep(wait);
     loop {
         tokio::select! {
             _ = &mut deadline => break,
@@ -796,12 +796,12 @@ async fn connect_and_sync(
     let echoes = Arc::new(EchoTracker::new());
     full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
 
-    let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
+    let runtime = handler.runtime().clone();
+    let mut save_tick = runtime.interval(PROGRESS_SAVE_EVERY);
     let grant_check_every = handler.grant_check_every();
-    let mut grant_tick = tokio::time::interval_at(tokio::time::Instant::now() + grant_check_every, grant_check_every);
+    let mut grant_tick = runtime.interval_at(runtime.now() + grant_check_every, grant_check_every);
     let mut awaited_wait = AWAITED_POLL;
-    let awaited_poll = tokio::time::sleep(awaited_wait);
-    tokio::pin!(awaited_poll);
+    let mut awaited_poll = runtime.sleep(awaited_wait);
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     *reached_synced = true;
@@ -832,24 +832,24 @@ async fn connect_and_sync(
     // scopes published, every document wrapped under its shares' keys), so
     // that nobody connects to a twin that was built again a moment ago and
     // finds their share empty; or after a while regardless.
-    let mut announce_by = matches!(endpoint, LinkEndpoint::RelayFace).then(|| tokio::time::Instant::now() + ANNOUNCE_WAIT);
-    let mut announce_check = tokio::time::interval(ANNOUNCE_CHECK_EVERY);
+    let mut announce_by = matches!(endpoint, LinkEndpoint::RelayFace).then(|| runtime.now() + ANNOUNCE_WAIT);
+    let mut announce_check = runtime.interval(ANNOUNCE_CHECK_EVERY);
 
     // What the other devices say they hold, answered, and then what this one
     // holds, said (docs/CONVERGENCE_CONTRACT.md sections 1-2).
     compare_at_connect(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
 
     let steps_every = steps_every(handler.out_of_step_after());
-    let mut steps_tick = tokio::time::interval_at(tokio::time::Instant::now() + steps_every, steps_every);
-    let mut steps_last = tokio::time::Instant::now();
+    let mut steps_tick = runtime.interval_at(runtime.now() + steps_every, steps_every);
+    let mut steps_last = runtime.now();
     // A test's faults (`crate::faults`): this device's network going away
     // is noticed within a tick.
     let faults_on = handler.link_faults().is_some();
-    let mut fault_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut fault_tick = runtime.interval(Duration::from_millis(100));
     // What a lost notification would have brought (wave 3, found by the
     // fault test): asked again every so often, never only at a reconnect.
     let recheck_every = if faults_on { RECHECK_EVERY_UNDER_FAULTS } else { RECHECK_EVERY };
-    let mut recheck_tick = tokio::time::interval_at(tokio::time::Instant::now() + recheck_every, recheck_every);
+    let mut recheck_tick = runtime.interval_at(runtime.now() + recheck_every, recheck_every);
 
     loop {
         flush_waiting(handler, link, progress).await;
@@ -858,21 +858,21 @@ async fn connect_and_sync(
         tokio::select! {
             // Read positions, a moment after they moved, behind their
             // documents (`Progress::save_if_unsaved`).
-            _ = tokio::time::sleep_until(cursor_save.unwrap_or_else(tokio::time::Instant::now)), if cursor_save.is_some() => {
+            _ = runtime.sleep_until(cursor_save.unwrap_or_else(|| runtime.now())), if cursor_save.is_some() => {
                 progress.save_if_unsaved().await;
             }
             _ = steps_tick.tick() => {
-                let now = tokio::time::Instant::now();
+                let now = runtime.now();
                 judge_steps(handler, store_id, progress, now - steps_last).await;
                 steps_last = now;
                 settle_parked(handler, &client, store_id, key_id, link_id, &echoes, progress).await?;
             }
-            _ = tokio::time::sleep_until(next_report.unwrap_or_else(tokio::time::Instant::now)), if next_report.is_some() => {
+            _ = runtime.sleep_until(next_report.unwrap_or_else(|| runtime.now())), if next_report.is_some() => {
                 let due = progress.take_due_reports();
                 send_reports(handler, &client, store_id, key_id, due, progress).await?;
             }
             _ = announce_check.tick(), if announce_by.is_some() => {
-                let waited_out = announce_by.is_some_and(|by| tokio::time::Instant::now() >= by);
+                let waited_out = announce_by.is_some_and(|by| runtime.now() >= by);
                 if waited_out || crate::share::settled(handler, store_id).await {
                     handler.relay().ready(store_id).await;
                     announce_by = None;
@@ -950,7 +950,7 @@ async fn connect_and_sync(
             // down with it: the link is the path of this device's own
             // edits, and a connection that really is gone shows in the
             // branches above.
-            _ = crate::share::until(shares.upkeep.due()) => {
+            _ = crate::share::until(&runtime, shares.upkeep.due()) => {
                 let mut session = LinkSession { handler, client: &client, store_id, link_key_id: key_id, progress: &mut *progress, calls: 0 };
                 if let Err(e) = shares.upkeep.run(&mut session, &shares.sweep_kick).await {
                     warn!("Vault link for store {}: share upkeep failed ({}); trying again shortly", store_id, e);
@@ -998,7 +998,7 @@ async fn connect_and_sync(
                 // what is awaited stays away.
                 let pulled = pull_pending(handler, &client, store_id, link_id, progress).await?;
                 awaited_wait = if pulled { AWAITED_POLL } else { (awaited_wait * 2).min(MAX_AWAITED_POLL) };
-                awaited_poll.as_mut().reset(tokio::time::Instant::now() + awaited_wait);
+                awaited_poll.reset(runtime.now() + awaited_wait);
             }
         }
     }
@@ -1009,7 +1009,8 @@ async fn connect_and_sync(
 /// [`GRANT_CHECK_EVERY`].
 fn spawn_people_refresh(handler: &RpcHandler, store_id: StoreId) {
     let handler = handler.clone();
-    tokio::spawn(async move {
+    let runtime = handler.runtime().clone();
+    runtime.spawn(async move {
         crate::people::refresh(&handler, store_id).await;
     });
 }
@@ -1286,6 +1287,8 @@ struct ProgressFile {
 }
 
 struct Progress {
+    /// The clock its saves and reports are due by, and what waits on it.
+    runtime: Runtime,
     /// The store's state directory, where the link's state is one record
     /// (`pimble_store::sync_state`, `sync-state.json`). `None` keeps it in
     /// memory (a store with no state directory; never on a server).
@@ -1317,7 +1320,7 @@ struct Progress {
     /// When the cursors that moved are written (a moment after the first
     /// one moved, by which time the content flush has usually written their
     /// documents already).
-    cursor_save_due: Option<tokio::time::Instant>,
+    cursor_save_due: Option<Instant>,
     /// Each document's snapshot number as last known, for deciding when the
     /// next one is due.
     snapshot_seqs: HashMap<String, u64>,
@@ -1339,7 +1342,7 @@ struct Progress {
     /// Whether the remote takes state reports, as this connection found.
     reports_ok: bool,
     /// When each document's report is due: 5 s after the last change to it.
-    report_due: HashMap<String, tokio::time::Instant>,
+    report_due: HashMap<String, Instant>,
     /// What the remote holds of this device's reports, as this connection has
     /// seen it (read back at connect, then what it stored): a report that
     /// says the same again is not sent.
@@ -1599,6 +1602,7 @@ impl Progress {
             None => ProgressFile::default(),
         };
         Self {
+            runtime: handler.runtime().clone(),
             state_dir,
             disk,
             manager,
@@ -1649,19 +1653,19 @@ impl Progress {
             return;
         }
         if let Some(node_id) = document_of(&notif.change_kind) {
-            let due = tokio::time::Instant::now() + self.report_debounce;
+            let due = self.runtime.now() + self.report_debounce;
             self.report_due.insert(VaultDocId::Node(node_id).as_str(), due);
         }
     }
 
     /// The soonest report due, if any.
-    fn next_report_due(&self) -> Option<tokio::time::Instant> {
+    fn next_report_due(&self) -> Option<Instant> {
         self.report_due.values().min().copied()
     }
 
     /// The documents whose reports are due now, taken off the list.
     fn take_due_reports(&mut self) -> Vec<VaultDocId> {
-        let now = tokio::time::Instant::now();
+        let now = self.runtime.now();
         let due: Vec<String> = self.report_due.iter().filter(|(_, at)| **at <= now).map(|(doc, _)| doc.clone()).collect();
         due.into_iter().filter_map(|doc| {
             self.report_due.remove(&doc);
@@ -1708,7 +1712,7 @@ impl Progress {
             return;
         }
         self.last_seq.insert(key, applied_through);
-        self.cursor_save_due.get_or_insert_with(|| tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+        self.cursor_save_due.get_or_insert_with(|| self.runtime.now() + CURSOR_SAVE_AFTER);
     }
 
     /// Where `doc_id`'s log has been read to without a gap, as this process
@@ -1867,11 +1871,11 @@ impl Progress {
                 if let Some(cursors) = cursors {
                     self.last_seq_saved = cursors;
                 }
-                self.cursor_save_due = (self.last_seq != self.last_seq_saved).then(|| tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+                self.cursor_save_due = (self.last_seq != self.last_seq_saved).then(|| self.runtime.now() + CURSOR_SAVE_AFTER);
             }
             Err(e) => {
                 debug!("Vault link for store {}: could not write {}: {}", self.store_id, sync_state::path(&state_dir).display(), e);
-                self.cursor_save_due = Some(tokio::time::Instant::now() + CURSOR_SAVE_AFTER);
+                self.cursor_save_due = Some(self.runtime.now() + CURSOR_SAVE_AFTER);
             }
         }
     }
@@ -3262,7 +3266,7 @@ async fn settle_parked(handler: &RpcHandler, client: &PimbleClient, store_id: St
         }
         progress.convergence.not_waiting(&doc);
         if progress.reports_ok {
-            progress.report_due.insert(doc.clone(), tokio::time::Instant::now());
+            progress.report_due.insert(doc.clone(), progress.runtime.now());
         }
         if let Err(e) = snapshot_after_set_aside(handler, client, store_id, key_id, link_id, &doc_id, echoes, progress).await {
             warn!("Vault link for store {} doc {}: the snapshot after setting aside failed ({}); the log still carries what was set aside", store_id, node_id, e);

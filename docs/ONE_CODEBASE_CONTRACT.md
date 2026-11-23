@@ -900,3 +900,142 @@ handler's construction, never as globals.
 - `MemoryDisk` has no modification times on wasm32 (`SystemTime::now` panics there) until the runtime's wall clock reaches it.
 - The `OpfsDisk`, the device-key `KeyRest` and the `fetch` `Http` are wave 4's.
 - Joe's by-hand check on his real stores after a backup (nothing here ran against them).
+
+## Built: wave 2, the runtime (2026-11-22, not merged or released): seam C
+
+Desktop only, behavior unchanged. Every task, timer and clock of the server's core goes
+through a `pimble_host::Runtime` handed to it beside the disk (in `ServerConfig`, then the
+store manager, then the handler), never a global. The shape is the one "What remains"
+above planned.
+
+### The runtime (`crates/pimble-host/src/runtime.rs`)
+
+- **`RuntimeBackend`** (what a host implements, five calls): `spawn(BoxFuture<()>) -> Task`,
+  `spawn_heavy(HeavyJob)` (a boxed `FnOnce()`; the job reports its own answer),
+  `sleep_until(Instant) -> SleepFuture`, `now() -> Instant`, `wall() -> SystemTime`. Futures
+  and jobs are `Send` natively and not on wasm32 (`MaybeSend`, `BoxFuture`, `SleepFuture`,
+  `HeavyJob` are `cfg`'d aliases).
+- **`Instant`**: a moment on the monotonic clock, a `Duration` since the clock's origin, with
+  `Add`/`Sub<Duration>`, `Sub<Instant>` (saturating, as std's), `duration_since`,
+  `checked_*`. There is no `elapsed()` on it: `Runtime::elapsed(earlier)` reads the clock.
+- **`Task`**: a started task. `abort()`, `is_finished()`; awaiting it waits until it ended
+  (finished or aborted); dropping it detaches it, as tokio's `JoinHandle`. A host's handle is
+  a `TaskHandle` (`abort`, `is_finished`, `poll_ended`).
+- **`Runtime`**, the cheap handle (`Arc<dyn RuntimeBackend>`), with what every caller builds
+  from the five calls: `spawn(future)` (any output, dropped), `run_heavy(closure) ->
+  Result<T, HeavyFailed>` (over a oneshot; a panicking job is `HeavyFailed`, where
+  `spawn_blocking` gave a `JoinError`), `now`, `elapsed`, `wall`, `sleep(d)`,
+  `sleep_until(at) -> Sleep` (`Unpin`, `reset(at)`, `deadline()`, `is_elapsed()`),
+  `timeout(d, future) -> Result<_, Elapsed>` (the future polled before the timer, as tokio's,
+  so `timeout(Duration::ZERO, ..)` is still a non-blocking poll), `interval(period)` and
+  `interval_at(start, period) -> Interval` (tokio's default `Burst`: a tick is due a period
+  after the one before, missed ticks fire at once; `tick()` is cancel-safe, the timer kept
+  across a `select!` that took another branch; `reset()`).
+  `Runtime::default()` is the target's own runtime.
+- **`TaskSet`**: tokio's `JoinSet` as far as the server used it (`spawn`, `prune_finished` for
+  `try_join_next`, `abort_all`, `join_all` for the `join_next` loop).
+- `tokio::sync` stays as it was (it builds for wasm32 and needs no runtime).
+
+### How each host implements it
+
+- **Desktop** (`runtime/tokio_rt.rs`, `TokioRuntime`, done): `tokio::spawn`,
+  `tokio::task::spawn_blocking`, `tokio::time::sleep_until`, on whichever tokio runtime the
+  caller is in (each test's, the app's background one), never one captured at construction.
+  The clock is tokio's `Instant` (std's: the workspace never turns on `test-util`) less a
+  process-wide origin read once, and a deadline goes back to tokio's `Instant` by adding the
+  origin again, so every sleep is the same `tokio::time::Sleep` at the same deadline as
+  before. `wall()` is `SystemTime::now()`.
+- **The browser's worker** (`runtime/local.rs`, `LocalRuntime`, wasm32, checks but runs in
+  nothing yet): `wasm_bindgen_futures::spawn_local` with an `Abortable` and a shared ended
+  flag for `abort`/`is_finished`; a heavy job runs inline (a worker has no thread to give
+  it); timers are `gloo_timers::future::TimeoutFuture` (`setTimeout`, cleared when dropped);
+  `now()` is `web_time::Instant` (`performance.now()`, which works in workers), `wall()`
+  `web_time::SystemTime` (`Date.now()`). The memory disk's modification times on wasm32 come
+  from this wall clock now (they were `None`).
+- **A phone app hosting the server in-process** (sketch): `TokioRuntime` on its background
+  tokio runtime, as the disk is `NativeDisk`.
+
+### How the server takes it
+
+- `ServerConfig.runtime` (default `Runtime::default()`); `PimbleServer::with_config` makes the
+  store manager `.on_runtime(runtime)`; the handler takes the manager's runtime with its disk
+  (`RpcHandler::runtime()`), and hands it to what it builds: the presence hub
+  (`PresenceHub::new(runtime)`), the relay host (`RelayHost::new(disk, runtime, dir)`, and the
+  relay face's own `ServerConfig`), each store's indexer, each link's `Progress`, share
+  `Upkeep` and reconcile debouncer.
+- `pimble-store`: `StoreManager::on_runtime`/`runtime()`; the `_on` constructors take the
+  runtime after the disk (`LocalStore::create_on(disk, runtime, ..)`, `create_replica_on`,
+  `open_on`, `VaultStore::create_on`, `open_on`, `BlobStore::new_on(disk, runtime, ..)`); the
+  old constructors pass `Runtime::default()`, so the importer, CLI, MCP and app are unchanged.
+  A blob's hashing is a heavy job; the store's temporaries sweep and the blobs' part sweep
+  read the runtime's wall clock (the part sweep only when it judges an age); a vault's groups
+  of parts age by the runtime's clock.
+- Clocks that lived in structs without a runtime take `now` from their caller
+  (`RepairDebouncer::debounce(store, now)`, `note(store, lists, now)`) or hold the runtime
+  (`Upkeep`, `Progress`, `PresenceHub`, `ReconcileDebouncer`, `StoreIndexer`, `VaultStore`,
+  `BlobStore`). `crate::share::until(runtime, due)` is the one "sleep until, or never".
+- `RpcHandler`'s `impl PimbleApiServer` is `async_trait` natively and `async_trait(?Send)` on
+  wasm32 (`cfg_attr`), matching the trait pimble-rpc's macro emits.
+- The timings are the constants they were: the 750 ms flush, 250 ms repair (30 s when a
+  list loops), 2 s index debounce, 1 s/5 s share upkeep, link backoffs, the vault link's
+  intervals (progress saves, grant checks, steps, rechecks, faults, the relay's announce),
+  the folder task's settle and presence intervals, the presence sweep, every `timeout`.
+
+### Changes by file
+
+- `crates/pimble-host/`: `Cargo.toml` (wasm32 only: `wasm-bindgen-futures`, `gloo-timers`
+  0.2 with `futures`, `web-time`, `futures`; all already in `Cargo.lock`, which only gains the
+  package's dependency lines), `src/runtime.rs`, `src/runtime/tokio_rt.rs`,
+  `src/runtime/local.rs` (new; five unit tests in `runtime.rs`), `src/lib.rs` (exports),
+  `src/disk/memory.rs` (wasm32 modification times).
+- `crates/pimble-store/src/`: `manager.rs` (`runtime`, `on_runtime`, the constructors),
+  `local.rs` (constructors), `local/folder.rs` (the sweep's wall clock), `blobs.rs` (heavy
+  hashing, wall clock), `vault.rs` (the parts' clock).
+- `crates/pimble-server/src/`: `server.rs` (`ServerConfig.runtime`, the manager, the model
+  warm-up's spawn and heavy job, `connect_in_process`), `handler.rs` (the field, construction,
+  every spawn, sleep, timeout, heavy job and clock: mounts' replica creation, the debounced
+  flush, repairs and their loop clock, the indexer's tasks as a `TaskSet`, the index open and
+  rebuild, waits for a first sync, hand-over, diagnostics' store record, the subscription
+  forwarders; the `?Send` `cfg_attr`), `share.rs`, `vault_link.rs`, `sync_link.rs`,
+  `presence.rs`, `presence_link.rs`, `pictures.rs`, `folder_watch.rs` (its task; the
+  `notify` watch stays native), `relay_face.rs` (its runtime and the tunnel's task).
+
+### Proof
+
+- `cargo test --release --no-fail-fast -p pimble-server -p pimble-store -p pimble-host`: 370
+  passed, 0 failed, 1 ignored (wave 2's 365 and the runtime's five new tests). With
+  `PIMBLE_TEST_DISK=memory`: 370 passed, 0 failed, 1 ignored (the folder-watch test returning
+  early on memory, as wave 2 left it). The share-recipient test in `vault_link.rs` that
+  flaked once in wave 2 passed in both runs.
+- **The fault sweep**: `PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4 cargo test --release -p
+  pimble-server --test link_faults`: all 200 seeds converged on the machine's disk (848 s) and
+  on the memory disk (830 s). A second run on the machine's disk with `-- --nocapture`, to count: 200 converged with 219 crashes among them (850 s), the count wave 0's and wave 2's sweeps gave.
+- **Release builds**: `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp`
+  builds. `cargo check --target wasm32-unknown-unknown -p pimble-host` checks (with
+  `LocalRuntime`; clippy clean on both targets); `cd web && cargo check --release --target
+  wasm32-unknown-unknown` checks (the web workspace does not depend on `pimble-host`).
+- **What is left on tokio or std's clocks directly** (a grep for `tokio::spawn`,
+  `tokio::time`, `Instant`, `spawn_blocking`, `thread::spawn`, `SystemTime::now` over
+  `pimble-server`, `pimble-store` and `pimble-search`), all deliberate:
+  - the native-only modules, which wave 3 puts behind `cfg`: `relay_tunnel.rs` (tokio-
+    tungstenite, its `JoinSet`, timeouts and ping interval), `local.rs` (finding and joining
+    the embedded server), `jwt.rs` (the JWKS refresh), `diagnostics.rs` (`SystemTime` stamps),
+    and `server.rs`'s `wait_for_shutdown_signal` (signals);
+  - `pimble-search`'s embedding warm-up (`warmup.rs`'s `Instant`) and the embedder's worker
+    thread (`embed.rs`): seam F, semantic search, native only;
+  - `pimble-store`'s tests (`manager.rs`' two `tokio::time::timeout`s) and every test's own
+    timing: tests run on tokio and may use it.
+  - `chrono::Utc::now()` (timestamps written into documents, manifests and records) is not a
+    runtime clock and stays: chrono's default `wasmbind` feature reads `Date.now()` on wasm32.
+
+### What remains for wave 3
+
+- The native-only modules behind `cfg(not(wasm32))` (above, plus `auth.rs`, `logs.rs`,
+  `memory.rs`, the folder watch's `notify`), and the dependencies that come with them
+  (`jsonrpsee`'s server, `reqwest`, `tokio-tungstenite`, `libc`; `pimble-store`'s `tokio =
+  full` and `notify`); `crate::diagnostics::set_account` from the keystore.
+- `relay_face.rs` takes the runtime but starts a `PimbleServer` on jsonrpsee: native only.
+- `LocalRuntime` has run in no browser yet: the first wasm build of the server is where it is
+  exercised (a worker smoke test should cover a sleep, an interval, a timeout, an abort and
+  a heavy job).
+- Seam F (search) and the rest of wave 3's list are as wave 2 left them.

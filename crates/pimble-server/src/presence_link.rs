@@ -25,7 +25,7 @@ use crate::handler::RpcHandler;
 
 /// The running task; dropping it stops it and ends the sessions it brought.
 pub(crate) struct PresenceLink {
-    task: tokio::task::JoinHandle<()>,
+    task: pimble_host::Task,
     handler: RpcHandler,
     store_id: StoreId,
     link_id: String,
@@ -35,14 +35,14 @@ impl Drop for PresenceLink {
     fn drop(&mut self) {
         self.task.abort();
         let (handler, store_id, link_id) = (self.handler.clone(), self.store_id, self.link_id.clone());
-        tokio::spawn(async move { handler.end_presence_of(store_id, &link_id).await });
+        self.handler.runtime().spawn(async move { handler.end_presence_of(store_id, &link_id).await });
     }
 }
 
 /// Start carrying presence over `client` for `store_id`; `sealed` for a
 /// vault link (the remote is ciphertext).
 pub(crate) fn spawn(handler: &RpcHandler, client: Arc<PimbleClient>, store_id: StoreId, link_id: &str, sealed: bool) -> PresenceLink {
-    let task = tokio::spawn(run(handler.clone(), client, store_id, link_id.to_string(), sealed));
+    let task = handler.runtime().spawn(run(handler.clone(), client, store_id, link_id.to_string(), sealed));
     PresenceLink { task, handler: handler.clone(), store_id, link_id: link_id.to_string() }
 }
 

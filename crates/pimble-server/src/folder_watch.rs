@@ -25,7 +25,7 @@ use pimble_core::{OtherComputer, StoreId};
 use pimble_crdt::derive_changes;
 use pimble_rpc::StoreChangeKind;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
+use pimble_host::Instant;
 use tracing::{debug, warn};
 
 use crate::handler::{index_events_for, RpcHandler};
@@ -71,7 +71,7 @@ struct ComputerFile {
 }
 
 /// A running folder task; dropping it stops the task (and the watch it holds).
-pub(crate) struct FolderTask(tokio::task::JoinHandle<()>);
+pub(crate) struct FolderTask(pimble_host::Task);
 
 impl Drop for FolderTask {
     fn drop(&mut self) {
@@ -106,7 +106,7 @@ impl RpcHandler {
         self.write_presence(store_id, &path).await;
         self.read_presence(store_id, &path).await;
         let handler = self.clone();
-        let task = tokio::spawn(async move { handler.run_folder_task(store_id, path).await });
+        let task = self.runtime().spawn(async move { handler.run_folder_task(store_id, path).await });
         let previous = self.folders().lock().unwrap().insert(store_id, FolderTask(task));
         // Two opens racing: the later task replaces the earlier, which stops.
         drop(previous);
@@ -139,9 +139,10 @@ impl RpcHandler {
         let mut pending: BTreeSet<PathBuf> = BTreeSet::new();
         let mut first: Option<Instant> = None;
         let mut deadline: Option<Instant> = None;
-        let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
-        let mut write_presence = tokio::time::interval_at(Instant::now() + PRESENCE_WRITE_EVERY, PRESENCE_WRITE_EVERY);
-        let mut read_presence = tokio::time::interval_at(Instant::now() + PRESENCE_READ_EVERY, PRESENCE_READ_EVERY);
+        let runtime = self.runtime().clone();
+        let mut announce = runtime.interval(ANNOUNCE_EVERY);
+        let mut write_presence = runtime.interval_at(runtime.now() + PRESENCE_WRITE_EVERY, PRESENCE_WRITE_EVERY);
+        let mut read_presence = runtime.interval_at(runtime.now() + PRESENCE_READ_EVERY, PRESENCE_READ_EVERY);
         loop {
             let next_change = async {
                 match changes.as_mut() {
@@ -151,7 +152,7 @@ impl RpcHandler {
             };
             let settle = async {
                 match deadline {
-                    Some(at) => tokio::time::sleep_until(at).await,
+                    Some(at) => runtime.sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -159,7 +160,7 @@ impl RpcHandler {
                 changed = next_change => {
                     let Some(changed) = changed else { changes = None; continue };
                     pending.insert(changed);
-                    let now = Instant::now();
+                    let now = runtime.now();
                     let started = *first.get_or_insert(now);
                     deadline = Some((now + SETTLE).min(started + SETTLE_AT_MOST));
                 }

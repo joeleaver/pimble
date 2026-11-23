@@ -52,7 +52,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use pimble_host::{Instant, Runtime};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -538,6 +540,8 @@ pub struct VaultStore {
     pub path: PathBuf,
     /// The disk the store is on (docs/ONE_CODEBASE_CONTRACT.md seam B).
     disk: Disk,
+    /// The clock a part's group is aged by.
+    runtime: Runtime,
     manifest: StoreManifest,
     docs: HashMap<String, VaultDoc>,
     /// The published scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5),
@@ -561,11 +565,11 @@ impl VaultStore {
     /// same id as an existing local store). Refusing an id already open is
     /// the caller's job (`StoreManager`).
     pub async fn create(path: impl AsRef<Path>, name: impl Into<String>, store_id: Option<StoreId>) -> Result<Self> {
-        Self::create_on(&Disk::default(), path, name, store_id).await
+        Self::create_on(&Disk::default(), &Runtime::default(), path, name, store_id).await
     }
 
-    /// [`VaultStore::create`] on `disk`.
-    pub async fn create_on(disk: &Disk, path: impl AsRef<Path>, name: impl Into<String>, store_id: Option<StoreId>) -> Result<Self> {
+    /// [`VaultStore::create`] on `disk`, timed by `runtime`.
+    pub async fn create_on(disk: &Disk, runtime: &Runtime, path: impl AsRef<Path>, name: impl Into<String>, store_id: Option<StoreId>) -> Result<Self> {
         let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
         let name = name.into();
@@ -589,17 +593,17 @@ impl VaultStore {
         disk.write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
 
         info!("Created vault store '{}' ({}) at {:?}", name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, disk, manifest, docs: HashMap::new(), scopes: ScopesFile::default(), pending: HashMap::new() })
+        Ok(Self { id: manifest.id, path, disk, runtime: runtime.clone(), manifest, docs: HashMap::new(), scopes: ScopesFile::default(), pending: HashMap::new() })
     }
 
     /// Open an existing vault store, loading every document under
     /// `<path>/vault/`.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_on(&Disk::default(), path).await
+        Self::open_on(&Disk::default(), &Runtime::default(), path).await
     }
 
-    /// [`VaultStore::open`] on `disk`.
-    pub async fn open_on(disk: &Disk, path: impl AsRef<Path>) -> Result<Self> {
+    /// [`VaultStore::open`] on `disk`, timed by `runtime`.
+    pub async fn open_on(disk: &Disk, runtime: &Runtime, path: impl AsRef<Path>) -> Result<Self> {
         let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
 
@@ -641,7 +645,7 @@ impl VaultStore {
         };
 
         info!("Opened vault store '{}' ({}) from {:?}", manifest.name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, disk, manifest, docs, scopes, pending: HashMap::new() })
+        Ok(Self { id: manifest.id, path, disk, runtime: runtime.clone(), manifest, docs, scopes, pending: HashMap::new() })
     }
 
     pub fn manifest(&self) -> &StoreManifest {
@@ -873,7 +877,7 @@ impl VaultStore {
 
     /// Let go of groups nobody has sent a part of for [`PENDING_FOR`].
     fn prune_pending(&mut self) {
-        self.pending.retain(|_, pending| pending.touched.elapsed() < PENDING_FOR);
+        self.pending.retain(|_, pending| self.runtime.elapsed(pending.touched) < PENDING_FOR);
     }
 
     /// Take one part of a group, in order: part 0 starts (or starts over) the
@@ -890,7 +894,7 @@ impl VaultStore {
         }
         let key = (doc_id.to_string(), part.group);
         if part.index == 0 {
-            self.pending.insert(key.clone(), Pending { kind, count: part.count, blobs: Vec::new(), bytes: 0, touched: Instant::now() });
+            self.pending.insert(key.clone(), Pending { kind, count: part.count, blobs: Vec::new(), bytes: 0, touched: self.runtime.now() });
         }
         let Some(pending) = self.pending.get_mut(&key) else {
             return Err(StoreError::InvalidOperation(format!(
@@ -910,7 +914,7 @@ impl VaultStore {
                 part.index, part.count
             )));
         }
-        pending.touched = Instant::now();
+        pending.touched = self.runtime.now();
         let ignored = matches!(pending.kind, PendingKind::Snapshot { ignored: true, .. });
         pending.bytes += blob.len() as u64;
         // A snapshot that will not be stored keeps nothing of what it sends.

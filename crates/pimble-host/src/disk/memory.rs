@@ -49,16 +49,16 @@ fn not_found(path: &Path) -> io::Error {
 }
 
 fn now() -> Option<SystemTime> {
-    // `SystemTime::now` panics on wasm32-unknown-unknown; the browser's
-    // memory disk has no modification times until the runtime's clock
-    // reaches it (wave 3).
+    // `SystemTime::now` panics on wasm32-unknown-unknown; there the wall
+    // clock is the worker runtime's (`Date.now()`).
     #[cfg(not(target_arch = "wasm32"))]
     {
         Some(SystemTime::now())
     }
     #[cfg(target_arch = "wasm32")]
     {
-        None
+        use crate::runtime::RuntimeBackend;
+        Some(crate::runtime::LocalRuntime.wall())
     }
 }
 

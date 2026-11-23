@@ -33,7 +33,7 @@ use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
 use pimble_rpc::{EditOperation, StoreChangeKind, StoreChangedNotification, MAX_SYNC_NODE_CONTENTS};
 use pimble_store::SyncConfig;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use pimble_host::{Runtime, Task};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ pub struct SyncLinkHandle {
     /// at [`SyncLink::start`], so a link that has never yet connected since
     /// the store reopened still knows when it last did.
     last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
-    join: JoinHandle<()>,
+    join: Task,
 }
 
 impl SyncLinkHandle {
@@ -111,7 +111,8 @@ impl SyncLink {
         let last_sync = Arc::new(Mutex::new(last_sync));
 
         let link = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync) };
-        let join = tokio::spawn(run_loop(handler, remote, link_id, link));
+        let runtime = handler.runtime().clone();
+        let join = runtime.spawn(run_loop(handler, remote, link_id, link));
 
         SyncLinkHandle { state_rx, last_sync, join }
     }
@@ -223,7 +224,7 @@ async fn run_loop(handler: RpcHandler, remote: RemoteEndpoint, link_id: String, 
             Err(e) => {
                 warn!("Sync link for store {} to {} dropped: {}", store_id, remote.url, e);
                 set_state(&handler, &link, SyncState::Offline).await;
-                tokio::time::sleep(backoff).await;
+                handler.runtime().sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
@@ -268,7 +269,7 @@ async fn connect_and_sync(
         .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", remote.url, e))?;
     let local_rx = handler.subscribe_local_changes().await;
     let (reconcile_tx, mut reconcile_rx) = mpsc::unbounded_channel::<NodeId>();
-    let mut channels = Channels { remote_sub, local_rx, debouncer: Arc::new(ReconcileDebouncer::new()), reconcile_tx };
+    let mut channels = Channels { remote_sub, local_rx, debouncer: Arc::new(ReconcileDebouncer::new(handler.runtime().clone())), reconcile_tx };
 
     full_reconcile(handler, &client, store_id, link_id, &mut channels).await?;
 
@@ -364,7 +365,7 @@ impl Channels {
         loop {
             // A zero timeout polls the subscription once and gives up if it
             // is pending, which is the non-blocking read it has no method for.
-            match tokio::time::timeout(Duration::ZERO, self.remote_sub.next()).await {
+            match handler.runtime().timeout(Duration::ZERO, self.remote_sub.next()).await {
                 Ok(Some(Ok(notif))) => {
                     handle_remote_notification(handler, store_id, link_id, notif, &self.debouncer, &self.reconcile_tx, Repair::Later).await?;
                 }
@@ -651,11 +652,13 @@ async fn push_update_remotely(client: &PimbleClient, store_id: StoreId, node_id:
 /// has arrived.
 struct ReconcileDebouncer {
     node_generation: Mutex<HashMap<NodeId, u64>>,
+    /// What its tasks run and sleep on.
+    runtime: Runtime,
 }
 
 impl ReconcileDebouncer {
-    fn new() -> Self {
-        Self { node_generation: Mutex::new(HashMap::new()) }
+    fn new(runtime: Runtime) -> Self {
+        Self { node_generation: Mutex::new(HashMap::new()), runtime }
     }
 }
 
@@ -668,8 +671,9 @@ fn schedule_node_reconcile(debouncer: &Arc<ReconcileDebouncer>, reconcile_tx: &m
     };
     let debouncer = Arc::clone(debouncer);
     let reconcile_tx = reconcile_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(RECONCILE_DEBOUNCE).await;
+    let runtime = debouncer.runtime.clone();
+    runtime.clone().spawn(async move {
+        runtime.sleep(RECONCILE_DEBOUNCE).await;
         let still_current = debouncer.node_generation.lock().unwrap().get(&node_id).copied() == Some(generation);
         if still_current {
             let _ = reconcile_tx.send(node_id);

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use pimble_core::{BlobId, ImageMime, StoreId, IMAGE_TOO_LARGE, MAX_IMAGE_BYTES, NOT_AN_IMAGE};
-use pimble_host::Disk;
+use pimble_host::{Disk, Runtime};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -69,6 +69,8 @@ pub struct BlobStore {
     dir: PathBuf,
     /// The disk the store is on.
     disk: Disk,
+    /// Where hashing runs (a heavy job) and what the wall clock says.
+    runtime: Runtime,
     /// Held while a part file is appended to or finished, so two chunks of
     /// one upload arriving together cannot interleave.
     writing: Arc<tokio::sync::Mutex<()>>,
@@ -157,12 +159,12 @@ impl BlobStore {
     /// The blobs of the store at `store_path`. Creates nothing: the directory
     /// appears with the first blob.
     pub fn new(store_id: StoreId, store_path: &Path) -> Self {
-        Self::new_on(&Disk::default(), store_id, store_path)
+        Self::new_on(&Disk::default(), &Runtime::default(), store_id, store_path)
     }
 
-    /// [`BlobStore::new`] on `disk`.
-    pub fn new_on(disk: &Disk, store_id: StoreId, store_path: &Path) -> Self {
-        Self { store_id, dir: store_path.join(Self::DIR), disk: disk.clone(), writing: Arc::new(tokio::sync::Mutex::new(())) }
+    /// [`BlobStore::new`] on `disk`, hashing on `runtime`'s heavy jobs.
+    pub fn new_on(disk: &Disk, runtime: &Runtime, store_id: StoreId, store_path: &Path) -> Self {
+        Self { store_id, dir: store_path.join(Self::DIR), disk: disk.clone(), runtime: runtime.clone(), writing: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     fn path(&self, id: BlobId) -> PathBuf {
@@ -175,8 +177,9 @@ impl BlobStore {
 
     /// The SHA-256 of `bytes`, off the async threads: hashing twenty
     /// megabytes is not something to do between two awaits.
-    async fn digest(bytes: Arc<Vec<u8>>) -> Result<[u8; HASH_LEN]> {
-        tokio::task::spawn_blocking(move || Sha256::digest(bytes.as_slice()).into())
+    async fn digest(&self, bytes: Arc<Vec<u8>>) -> Result<[u8; HASH_LEN]> {
+        self.runtime
+            .run_heavy(move || -> [u8; HASH_LEN] { Sha256::digest(bytes.as_slice()).into() })
             .await
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))
     }
@@ -324,7 +327,7 @@ impl BlobStore {
         let bytes_len = (file.len() - start) as u64;
         let hash = {
             let file = Arc::clone(&file);
-            tokio::task::spawn_blocking(move || -> [u8; HASH_LEN] { Sha256::digest(&file[start..]).into() }).await.ok()?
+            self.runtime.run_heavy(move || -> [u8; HASH_LEN] { Sha256::digest(&file[start..]).into() }).await.ok()?
         };
         if bytes_len != header.len || hash != header.hash {
             warn!("Store {}: blob {} does not match its own hash; treating it as absent", self.store_id, id);
@@ -337,7 +340,7 @@ impl BlobStore {
     async fn write_whole(&self, id: BlobId, mime: ImageMime, bytes: Vec<u8>) -> Result<()> {
         self.disk.create_dir_all(&self.dir).await?;
         let bytes = Arc::new(bytes);
-        let header = Header { mime, len: bytes.len() as u64, hash: Self::digest(Arc::clone(&bytes)).await? };
+        let header = Header { mime, len: bytes.len() as u64, hash: self.digest(Arc::clone(&bytes)).await? };
         let part = self.part_path(id);
         let written = async {
             let mut file = header.encode();
@@ -401,7 +404,7 @@ impl BlobStore {
             // header, and only then give the file its name.
             let image = Arc::new(self.disk.read_range(&part, head, total as usize).await?);
             check_magic(mime, &image)?;
-            let hash = Self::digest(image).await?;
+            let hash = self.digest(image).await?;
             self.disk.write_at(&part, head - HASH_LEN as u64, hash).await?;
             self.disk.sync_file(&part).await?;
             self.disk.rename(&part, self.path(id)).await?;
@@ -429,7 +432,9 @@ impl BlobStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
-        let now = SystemTime::now();
+        // Read only when an age is asked about: the wall clock is the
+        // runtime's (std's panics in the browser's worker).
+        let now = older_than.map(|_| self.runtime.wall()).unwrap_or(SystemTime::UNIX_EPOCH);
         let mut removed = 0;
         for entry in entries {
             if !entry.path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(PART_SUFFIX)) {

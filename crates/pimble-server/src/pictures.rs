@@ -37,8 +37,7 @@ use pimble_crdt::NodeDoc;
 use pimble_rpc::vault as protocol;
 use pimble_rpc::{StoreChangeKind, VaultDocId, BLOB_NOT_HERE};
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use pimble_host::{Instant, Task};
 use tracing::{debug, info, warn};
 
 use crate::handler::{LocalChange, RpcHandler};
@@ -101,7 +100,7 @@ impl RpcHandler {
         }
         // Reading a document's pictures projects its text: off the async
         // threads, and outside the store's lock.
-        let read = tokio::task::spawn_blocking(move || {
+        let read = self.runtime().run_heavy(move || {
             stale
                 .into_iter()
                 .map(|(id, sv, bytes)| {
@@ -348,7 +347,7 @@ enum Kick {
 /// A running copier. Dropping it stops it.
 pub(crate) struct Copier {
     kick: mpsc::UnboundedSender<Kick>,
-    join: JoinHandle<()>,
+    join: Task,
 }
 
 impl Copier {
@@ -370,7 +369,7 @@ impl Drop for Copier {
 pub(crate) async fn spawn_copier(handler: &RpcHandler, store_id: StoreId, remote: impl PictureRemote) -> Copier {
     let (kick, kicks) = mpsc::unbounded_channel();
     let local = handler.subscribe_local_changes().await;
-    let join = tokio::spawn(run(handler.clone(), store_id, remote, kicks, local));
+    let join = handler.runtime().spawn(run(handler.clone(), store_id, remote, kicks, local));
     Copier { kick, join }
 }
 
@@ -402,13 +401,14 @@ async fn run(handler: RpcHandler, store_id: StoreId, remote: impl PictureRemote,
     let mut owed = Due::default();
     let mut retry_at: Option<Instant> = None;
     let mut retry_wait = RETRY;
+    let runtime = handler.runtime().clone();
     loop {
         let wake = [at, retry_at].into_iter().flatten().min();
         tokio::select! {
             kick = kicks.recv() => {
                 let Some(kick) = kick else { return };
                 due.add(kick);
-                at.get_or_insert(Instant::now() + DEBOUNCE);
+                at.get_or_insert(runtime.now() + DEBOUNCE);
                 retry_wait = RETRY;
             }
             change = local.recv() => {
@@ -416,19 +416,19 @@ async fn run(handler: RpcHandler, store_id: StoreId, remote: impl PictureRemote,
                     Ok(LocalChange::Store(notif)) if notif.store_id == store_id => {
                         if let Some(node) = document_of(&notif.change_kind) {
                             due.add(Kick::Nodes(vec![node]));
-                            at.get_or_insert(Instant::now() + DEBOUNCE);
+                            at.get_or_insert(runtime.now() + DEBOUNCE);
                         }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         due.add(Kick::All);
-                        at.get_or_insert(Instant::now() + DEBOUNCE);
+                        at.get_or_insert(runtime.now() + DEBOUNCE);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-            _ = crate::share::until(wake) => {
-                let now = Instant::now();
+            _ = crate::share::until(&runtime, wake) => {
+                let now = runtime.now();
                 if retry_at.is_some_and(|r| r <= now) {
                     retry_at = None;
                     let again = std::mem::take(&mut owed);
@@ -457,7 +457,7 @@ async fn run(handler: RpcHandler, store_id: StoreId, remote: impl PictureRemote,
                 } else {
                     owed.all |= left.all;
                     owed.nodes.extend(left.nodes);
-                    retry_at = Some(Instant::now() + retry_wait);
+                    retry_at = Some(runtime.now() + retry_wait);
                     retry_wait = (retry_wait * 2).min(MAX_RETRY);
                 }
             }

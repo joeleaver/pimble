@@ -401,9 +401,9 @@ struct RepairDebouncer {
 /// the log, the documents it is about go out again whole, and the store is
 /// repaired at most every [`LOOP_DEBOUNCE`] until the window passes quietly.
 struct RepairLoops {
-    since: std::time::Instant,
+    since: pimble_host::Instant,
     counts: HashMap<NodeId, u32>,
-    slowed_until: Option<std::time::Instant>,
+    slowed_until: Option<pimble_host::Instant>,
     /// The lists already said and sent in this window.
     told: HashSet<NodeId>,
 }
@@ -413,19 +413,18 @@ const LOOP_WINDOW: Duration = Duration::from_secs(10 * 60);
 const LOOP_DEBOUNCE: Duration = Duration::from_secs(30);
 
 impl RepairDebouncer {
-    /// The wait before a store's next repair.
-    fn debounce(&self, store_id: StoreId) -> Duration {
+    /// The wait before a store's next repair, as of `now`.
+    fn debounce(&self, store_id: StoreId, now: pimble_host::Instant) -> Duration {
         let loops = self.loops.lock().unwrap();
         match loops.get(&store_id).and_then(|l| l.slowed_until) {
-            Some(until) if until > std::time::Instant::now() => LOOP_DEBOUNCE,
+            Some(until) if until > now => LOOP_DEBOUNCE,
             _ => REPAIR_DEBOUNCE,
         }
     }
 
     /// Count a repair that rewrote `lists`; the lists that are looping and
-    /// were not yet told about in this window.
-    fn note(&self, store_id: StoreId, lists: &[NodeId]) -> Vec<NodeId> {
-        let now = std::time::Instant::now();
+    /// were not yet told about in this window, as of `now`.
+    fn note(&self, store_id: StoreId, lists: &[NodeId], now: pimble_host::Instant) -> Vec<NodeId> {
         let mut loops = self.loops.lock().unwrap();
         let l = loops.entry(store_id).or_insert_with(|| RepairLoops { since: now, counts: HashMap::new(), slowed_until: None, told: HashSet::new() });
         if now.duration_since(l.since) > LOOP_WINDOW {
@@ -497,10 +496,10 @@ struct IndexHandle {
     index: Arc<SearchIndex>,
     events: mpsc::UnboundedSender<IndexEvent>,
     /// The `StoreIndexer::run` task.
-    main_task: tokio::task::JoinHandle<()>,
+    main_task: pimble_host::Task,
     /// Every debounced content-upsert task currently sleeping or running,
     /// shared with the `StoreIndexer` that spawns into it (`schedule_content_upsert`).
-    debounce_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+    debounce_tasks: Arc<tokio::sync::Mutex<pimble_host::TaskSet>>,
 }
 
 /// A store's index on its way (docs/STARTUP_CONTRACT.md): the channel its
@@ -511,7 +510,7 @@ struct PendingIndex {
     generation: u64,
     tx: mpsc::UnboundedSender<IndexEvent>,
     rx: Option<mpsc::UnboundedReceiver<IndexEvent>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<pimble_host::Task>,
 }
 
 static NEXT_INDEX_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -528,11 +527,13 @@ const INDEX_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_mill
 
 /// Owns one store's [`SearchIndex`] and reduces the store's mutations
 /// (`IndexEvent`s) into `upsert`/`remove` calls on it. One instance is
-/// spawned as a tokio task per open store.
+/// spawned as a task per open store.
 struct StoreIndexer {
     store_id: StoreId,
     index: Arc<SearchIndex>,
     store_manager: Arc<RwLock<StoreManager>>,
+    /// What its debounce tasks run and sleep on.
+    runtime: pimble_host::Runtime,
     /// Per-node debounce generation: `schedule_content_upsert` increments a
     /// node's counter and captures it; the sleeping task that follows only
     /// does the work if its captured value is still current when it wakes,
@@ -541,7 +542,7 @@ struct StoreIndexer {
     /// Shared with this store's [`IndexHandle`], so a shutdown can find and
     /// cancel every debounce task this indexer has spawned, not just the ones
     /// it happens to know about at the moment it starts shutting down.
-    debounce_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+    debounce_tasks: Arc<tokio::sync::Mutex<pimble_host::TaskSet>>,
 }
 
 impl StoreIndexer {
@@ -572,7 +573,7 @@ impl StoreIndexer {
     /// Bump `node_id`'s debounce generation and spawn a task that, after
     /// [`CONTENT_INDEX_DEBOUNCE`], re-indexes the node if no newer edit has
     /// arrived in the meantime. The task is spawned into `debounce_tasks`
-    /// (not bare `tokio::spawn`) so a shutdown can find and cancel it instead
+    /// (not a bare spawn) so a shutdown can find and cancel it instead
     /// of it quietly outliving the `SearchIndex` handle it holds.
     async fn schedule_content_upsert(self: Arc<Self>, node_id: NodeId) {
         let generation = {
@@ -583,15 +584,16 @@ impl StoreIndexer {
         };
         let indexer = Arc::clone(&self);
         let mut tasks = self.debounce_tasks.lock().await;
-        // `JoinSet` keeps a finished task's slot until it's joined, and
-        // `applyEdit` calls this once per keystroke — without reaping here,
-        // a long editing session would grow the set by one dead entry per
+        // The set keeps a finished task until it's pruned, and `applyEdit`
+        // calls this once per keystroke — without reaping here, a long
+        // editing session would grow the set by one dead entry per
         // keystroke, all sitting unjoined until the store closes.
-        // `try_join_next` is non-blocking (only pops entries already
-        // notified as done), so this never waits on a still-sleeping task.
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            tokio::time::sleep(CONTENT_INDEX_DEBOUNCE).await;
+        // `prune_finished` only drops tasks that have ended, so this never
+        // waits on a still-sleeping task.
+        tasks.prune_finished();
+        let runtime = self.runtime.clone();
+        tasks.spawn(&self.runtime, async move {
+            runtime.sleep(CONTENT_INDEX_DEBOUNCE).await;
             let still_current = {
                 let gens = indexer.content_gen.lock().unwrap();
                 gens.get(&node_id).copied() == Some(generation)
@@ -1276,6 +1278,9 @@ pub struct RpcHandler {
     disk: pimble_host::Disk,
     /// How this server reaches the accounts service (seam D).
     http: Arc<dyn pimble_host::http::Http>,
+    /// What every task, timer and clock of this server goes through (seam
+    /// C): its store manager's, like the disk.
+    runtime: pimble_host::Runtime,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1358,9 +1363,10 @@ impl RpcHandler {
         replicas_dir: PathBuf,
         keystore_path: PathBuf,
     ) -> Self {
-        // The manager's disk: a handler is made before anything holds the
-        // manager, and one made from a manager in use keeps the default.
-        let disk = store_manager.try_read().map(|manager| manager.disk().clone()).unwrap_or_default();
+        // The manager's disk and runtime: a handler is made before anything
+        // holds the manager, and one made from a manager in use keeps the
+        // defaults.
+        let (disk, runtime) = store_manager.try_read().map(|manager| (manager.disk().clone(), manager.runtime().clone())).unwrap_or_default();
         Self {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
@@ -1383,14 +1389,14 @@ impl RpcHandler {
             out_of_step_after: crate::vault_link::OUT_OF_STEP_AFTER,
             set_aside_after: Duration::from_secs(pimble_rpc::vault::SET_ASIDE_AFTER_SECS as u64),
             link_faults: None,
-            relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), relay_dir_beside(&replicas_dir))),
+            relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), runtime.clone(), relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(disk.clone())),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
             hands_over: false,
             version: Arc::from(env!("CARGO_PKG_VERSION")),
-            presence: Arc::new(crate::presence::PresenceHub::new()),
+            presence: Arc::new(crate::presence::PresenceHub::new(runtime.clone())),
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
             app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
@@ -1398,6 +1404,7 @@ impl RpcHandler {
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             disk,
             http: Arc::new(pimble_host::http::ReqwestHttp::default()),
+            runtime,
         }
     }
 
@@ -1417,6 +1424,11 @@ impl RpcHandler {
     /// The disk this server keeps everything on.
     pub fn disk(&self) -> &pimble_host::Disk {
         &self.disk
+    }
+
+    /// What this server's tasks, timers and clocks run on.
+    pub fn runtime(&self) -> &pimble_host::Runtime {
+        &self.runtime
     }
 
     /// The embedding model warms up beside the server: index opens wait for
@@ -1493,7 +1505,7 @@ impl RpcHandler {
     /// (`ServerConfig::relay_dir`), in place of `relay` beside the replicas
     /// directory. Call before the handler is cloned or serves anything.
     pub fn with_relay_dir(mut self, dir: PathBuf) -> Self {
-        self.relay = Arc::new(crate::relay_face::RelayHost::new(self.disk.clone(), dir));
+        self.relay = Arc::new(crate::relay_face::RelayHost::new(self.disk.clone(), self.runtime.clone(), dir));
         self
     }
 
@@ -2315,7 +2327,7 @@ impl RpcHandler {
         }
 
         let handler = self.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             handler.create_mount_source_replica(source, candidates).await;
         });
 
@@ -2567,15 +2579,15 @@ impl RpcHandler {
         // Wait up to 10s for the first full reconcile to reach `Synced`
         // (decision 8), then answer anyway with the current state.
         if wait {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = self.runtime.now() + Duration::from_secs(10);
             loop {
                 let state = self.sync_state_of(created_id).await;
                 let is_synced = matches!(state, SyncState::Synced { .. });
-                if is_synced || std::time::Instant::now() >= deadline {
+                if is_synced || self.runtime.now() >= deadline {
                     store.sync_state = state;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.runtime.sleep(Duration::from_millis(50)).await;
             }
         } else {
             store.sync_state = self.sync_state_of(created_id).await;
@@ -2623,7 +2635,7 @@ impl RpcHandler {
             *scheduled = true;
         }
         let handler = self.clone();
-        tokio::spawn(async move { handler.run_debounced_flush().await });
+        self.runtime.spawn(async move { handler.run_debounced_flush().await });
     }
 
     /// The flush task: stamp every pending node once, flush every pending
@@ -2631,7 +2643,7 @@ impl RpcHandler {
     /// (`source_client_id: None`, so a link forwards them: the peer's copy
     /// of the document gets the stamp from here, never one of its own).
     async fn run_debounced_flush(self) {
-        tokio::time::sleep(CONTENT_FLUSH_DEBOUNCE).await;
+        self.runtime.sleep(CONTENT_FLUSH_DEBOUNCE).await;
 
         let FlushPending { stores, stamps } = {
             let mut pending = self.flush_debouncer.pending.lock().unwrap();
@@ -2677,7 +2689,7 @@ impl RpcHandler {
     /// nowhere.
     pub(crate) async fn publish_presence_from(&self, frame: PresenceFrame, origin: &str) {
         if self.presence.start_sweeping() {
-            crate::presence::spawn_sweep(Arc::downgrade(&self.presence), Arc::downgrade(&self.store_manager));
+            crate::presence::spawn_sweep(&self.runtime, Arc::downgrade(&self.presence), Arc::downgrade(&self.store_manager));
         }
         if !self.presence.accept(&frame, origin) {
             return;
@@ -2890,8 +2902,8 @@ impl RpcHandler {
             return;
         }
         let handler = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+        self.runtime.spawn(async move {
+            handler.runtime.sleep(Duration::from_secs(3)).await;
             let ids = handler.store_manager.read().await.list_stores();
             let mut stores = Vec::new();
             for store_id in ids {
@@ -2934,8 +2946,8 @@ impl RpcHandler {
             *g
         };
         let handler = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(handler.repairs.debounce(store_id)).await;
+        self.runtime.spawn(async move {
+            handler.runtime.sleep(handler.repairs.debounce(store_id, handler.runtime.now())).await;
             let still_current = handler.repairs.generation.lock().unwrap().get(&store_id).copied() == Some(generation);
             if still_current {
                 handler.repair_store_tree(store_id).await;
@@ -2972,7 +2984,7 @@ impl RpcHandler {
         }
         info!("Repaired tree for store {}: {} document(s) touched", store_id, repair.touched.len());
 
-        let looping = self.repairs.note(store_id, &repair.node_ids());
+        let looping = self.repairs.note(store_id, &repair.node_ids(), self.runtime.now());
         if !looping.is_empty() {
             let resend = {
                 let manager = self.store_manager.read().await;
@@ -3069,15 +3081,16 @@ impl RpcHandler {
         tx: mpsc::UnboundedSender<IndexEvent>,
         rx: mpsc::UnboundedReceiver<IndexEvent>,
     ) {
-        let debounce_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let debounce_tasks = Arc::new(tokio::sync::Mutex::new(pimble_host::TaskSet::new()));
         let indexer = Arc::new(StoreIndexer {
             store_id,
             index: Arc::clone(&index),
             store_manager: Arc::clone(&self.store_manager),
+            runtime: self.runtime.clone(),
             content_gen: Mutex::new(HashMap::new()),
             debounce_tasks: Arc::clone(&debounce_tasks),
         });
-        let main_task = tokio::spawn(indexer.run(rx));
+        let main_task = self.runtime.spawn(indexer.run(rx));
         self.indexes.write().await.insert(store_id, IndexHandle { index, events: tx, main_task, debounce_tasks });
     }
 
@@ -3103,11 +3116,11 @@ impl RpcHandler {
     /// debounce window just because the store is closing.
     async fn shutdown_index(handle: IndexHandle) {
         drop(handle.events);
-        let _ = handle.main_task.await;
+        handle.main_task.await;
 
         let mut tasks = handle.debounce_tasks.lock().await;
         tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        tasks.join_all().await;
     }
 
     /// Every node of `store_id` to index, in walk order from its root (mount
@@ -3159,7 +3172,7 @@ impl RpcHandler {
         let total = ids.len();
         self.announce_index_state(store_id, IndexState::Rebuilding { done: 0, total }).await;
         let mut done = 0usize;
-        let mut said = std::time::Instant::now();
+        let mut said = self.runtime.now();
         for batch in ids.chunks(BATCH) {
             if !wanted() {
                 return Ok(None);
@@ -3169,16 +3182,17 @@ impl RpcHandler {
                 batch.iter().filter_map(|id| manager.get_node(store_id, *id).ok()).map(|node| build_index_node(store_id, &node)).collect()
             };
             let index = Arc::clone(index);
-            tokio::task::spawn_blocking(move || -> pimble_search::Result<()> {
-                for node in &nodes {
-                    index.upsert(node)?;
-                }
-                Ok(())
-            })
-            .await??;
+            self.runtime
+                .run_heavy(move || -> pimble_search::Result<()> {
+                    for node in &nodes {
+                        index.upsert(node)?;
+                    }
+                    Ok(())
+                })
+                .await??;
             done += batch.len();
-            if said.elapsed() >= INDEX_PROGRESS_EVERY {
-                said = std::time::Instant::now();
+            if self.runtime.elapsed(said) >= INDEX_PROGRESS_EVERY {
+                said = self.runtime.now();
                 self.announce_index_state(store_id, IndexState::Rebuilding { done, total }).await;
             }
         }
@@ -3236,7 +3250,7 @@ impl RpcHandler {
         }
         self.announce_index_state(store_id, IndexState::Opening).await;
         let handler = self.clone();
-        let task = tokio::spawn(async move { handler.open_index_in_background(store_id, generation).await });
+        let task = self.runtime.spawn(async move { handler.open_index_in_background(store_id, generation).await });
         if let Some(pending) = self.pending_indexes.lock().unwrap().get_mut(&store_id).filter(|p| p.generation == generation) {
             pending.task = Some(task);
         }
@@ -3286,14 +3300,14 @@ impl RpcHandler {
         index_dir: &std::path::Path,
         wanted: &(dyn Fn() -> bool + Send + Sync),
     ) -> anyhow::Result<Option<Result<SearchIndex, SearchError>>> {
-        let started = std::time::Instant::now();
+        let started = self.runtime.now();
         let mut held = false;
         loop {
             if !wanted() {
                 return Ok(None);
             }
             let (dir, semantic) = (index_dir.to_path_buf(), self.semantic().await);
-            match tokio::task::spawn_blocking(move || SearchIndex::open(&dir, semantic)).await? {
+            match self.runtime.run_heavy(move || SearchIndex::open(&dir, semantic)).await? {
                 Ok(index) => {
                     if held {
                         info!("Search index for store {} was let go; opened it", store_id);
@@ -3301,12 +3315,12 @@ impl RpcHandler {
                     return Ok(Some(Ok(index)));
                 }
                 Err(e) if e.is_locked() => {
-                    if !held && started.elapsed() >= INDEX_LOCK_WAIT {
+                    if !held && self.runtime.elapsed(started) >= INDEX_LOCK_WAIT {
                         held = true;
                         warn!("Search index for store {} is held by another program ({}); opening it again when it lets go, never rebuilding over it", store_id, e);
                         self.announce_index_state(store_id, IndexState::Held).await;
                     }
-                    tokio::time::sleep(if held { INDEX_LOCK_RETRY_HELD } else { INDEX_LOCK_RETRY }).await;
+                    self.runtime.sleep(if held { INDEX_LOCK_RETRY_HELD } else { INDEX_LOCK_RETRY }).await;
                 }
                 Err(e) => return Ok(Some(Err(e))),
             }
@@ -3405,7 +3419,7 @@ impl RpcHandler {
     async fn release_index(&self, store_id: StoreId) {
         let task = self.pending_indexes.lock().unwrap().remove(&store_id).and_then(|p| p.task);
         if let Some(task) = task {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            let _ = self.runtime.timeout(std::time::Duration::from_secs(5), task).await;
         }
         if let Some(handle) = self.indexes.write().await.remove(&store_id) {
             Self::shutdown_index(handle).await;
@@ -3542,7 +3556,9 @@ impl RpcHandler {
     }
 }
 
-#[async_trait]
+// The trait is `?Send` in a browser's worker (pimble-rpc's dispatch).
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PimbleApiServer for RpcHandler {
     // ── Vault (encrypted store) API, docs/CRYPTO_CONTRACT.md ─────────────
 
@@ -4050,8 +4066,8 @@ impl PimbleApiServer for RpcHandler {
         let handler = self.clone();
         // After the answer: everything written, links and the relay stopped,
         // as `PimbleServer::stop` does, then the port freed.
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.runtime.spawn(async move {
+            handler.runtime.sleep(std::time::Duration::from_millis(50)).await;
             handler.stop_folder_watches();
             handler.stop_links().await;
             handler.relay().stop().await;
@@ -4091,7 +4107,7 @@ impl PimbleApiServer for RpcHandler {
         let handler = self.clone();
         let mut changes = self.cloud_changes.subscribe();
         let mut tunnel = self.relay.watch_tunnel();
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             // The first at once, then each that differs from the last sent.
             let mut sent: Option<Option<pimble_rpc::CloudConnection>> = None;
             loop {
@@ -4131,7 +4147,7 @@ impl PimbleApiServer for RpcHandler {
         let sink = pending.accept().await?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         self.app_links.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             loop {
                 tokio::select! {
                     url = rx.recv() => {
@@ -4416,14 +4432,14 @@ impl PimbleApiServer for RpcHandler {
         // `addRemoteStore` (`create_replica_from`) does for a plain replica,
         // so the response's `root_node_id` reflects the real tree rather
         // than the placeholder above whenever the pull is fast enough.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = self.runtime.now() + Duration::from_secs(10);
         let sync_state = loop {
             let state = self.sync_state_of(created_id).await;
             let is_synced = matches!(state, SyncState::Synced { .. });
-            if is_synced || std::time::Instant::now() >= deadline {
+            if is_synced || self.runtime.now() >= deadline {
                 break state;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.runtime.sleep(Duration::from_millis(50)).await;
         };
 
         // The vault link rewrites the manifest root once the pull merges the
@@ -6201,7 +6217,7 @@ impl PimbleApiServer for RpcHandler {
         // connection dropped, or it unsubscribed), its sessions in the store
         // end now, not at their timeout.
         let handler = self.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             loop {
                 tokio::select! {
                     msg = rx.recv() => match msg {

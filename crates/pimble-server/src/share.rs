@@ -66,7 +66,7 @@ use pimble_rpc::{
 };
 use pimble_store::{StoreError, StoreManager};
 use tokio::sync::{oneshot, Notify};
-use tokio::time::Instant;
+use pimble_host::{Instant, Runtime};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -362,10 +362,10 @@ pub(crate) enum ShareCommand {
     Resend(Vec<NodeId>),
 }
 
-/// Resolves when `due` comes; never, without one.
-pub(crate) async fn until(due: Option<Instant>) {
+/// Resolves when `due` comes on `runtime`'s clock; never, without one.
+pub(crate) async fn until(runtime: &Runtime, due: Option<Instant>) {
     match due {
-        Some(due) => tokio::time::sleep_until(due).await,
+        Some(due) => runtime.sleep_until(due).await,
         None => std::future::pending().await,
     }
 }
@@ -434,6 +434,8 @@ enum Settle {
 /// long as the link's task; what it learned of the remote is forgotten at
 /// every connect.
 pub(crate) struct Upkeep {
+    /// The clock a pass is due by.
+    runtime: Runtime,
     due: Option<Instant>,
     /// When the run of changes the pending pass waits out began.
     first_noted: Option<Instant>,
@@ -476,8 +478,8 @@ struct Round {
 }
 
 impl Upkeep {
-    pub(crate) fn new() -> Self {
-        Self { due: None, first_noted: None, published: HashMap::new(), retired: HashSet::new(), owner: None, roots: HashSet::new(), round: Round::default(), retry_wait: UPKEEP_RETRY, pictures_wrapped: HashMap::new(), pictures_published: HashMap::new() }
+    pub(crate) fn new(runtime: Runtime) -> Self {
+        Self { runtime, due: None, first_noted: None, published: HashMap::new(), retired: HashSet::new(), owner: None, roots: HashSet::new(), round: Round::default(), retry_wait: UPKEEP_RETRY, pictures_wrapped: HashMap::new(), pictures_published: HashMap::new() }
     }
 
     pub(crate) fn due(&self) -> Option<Instant> {
@@ -497,12 +499,12 @@ impl Upkeep {
             handler.shares().set_owner(store_id, owner);
         }
         self.first_noted = None;
-        self.due = Some(Instant::now());
+        self.due = Some(self.runtime.now());
     }
 
     /// A pass failed: another one before long.
     pub(crate) fn retry_later(&mut self) {
-        self.due = Some(Instant::now() + self.retry_wait);
+        self.due = Some(self.runtime.now() + self.retry_wait);
         self.retry_wait = (self.retry_wait * 2).min(UPKEEP_MAX_RETRY);
     }
 
@@ -519,7 +521,7 @@ impl Upkeep {
     /// share (structure, or metadata, where markers live) makes a pass due
     /// a second after the last of them.
     pub(crate) fn note(&mut self, store_id: StoreId, change: &LocalChange) {
-        self.note_at(Instant::now(), store_id, change);
+        self.note_at(self.runtime.now(), store_id, change);
     }
 
     fn note_at(&mut self, now: Instant, store_id: StoreId, change: &LocalChange) {
@@ -636,7 +638,7 @@ impl Upkeep {
             for share in shares.iter().filter(|share| !self.retired.contains(&share.root)) {
                 link.handler().shares().set_reach(link.handler(), store_id, share.root, Reach::Pending).await;
             }
-            self.due = Some(Instant::now() + Duration::from_millis(50));
+            self.due = Some(self.runtime.now() + Duration::from_millis(50));
             return Ok(());
         }
         let unsettled = std::mem::take(&mut self.round).unsettled;
@@ -936,10 +938,11 @@ async fn retire(link: &mut LinkSession<'_>, root: NodeId) -> anyhow::Result<bool
 /// had an account appears without telling anyone.
 pub(crate) async fn run_sweeper(handler: RpcHandler, store_id: StoreId, kick: Arc<Notify>) {
     let every = handler.shares().sweep_every;
+    let runtime = handler.runtime().clone();
     loop {
         tokio::select! {
             _ = kick.notified() => {}
-            _ = tokio::time::sleep(every) => {}
+            _ = runtime.sleep(every) => {}
         }
         sweep(&handler, store_id).await;
     }
@@ -1196,7 +1199,7 @@ impl RpcHandler {
         if matches!(self.vault_link_state(store_id).await, Some(SyncState::Synced { .. })) {
             let (done, ran) = oneshot::channel();
             if self.share_command(store_id, ShareCommand::PassNow(Some(done))).await {
-                let _ = tokio::time::timeout(PASS_WAIT, ran).await;
+                let _ = self.runtime().timeout(PASS_WAIT, ran).await;
             }
         }
         // The share is made; a listing that fails now must not say otherwise.
@@ -1320,7 +1323,7 @@ impl RpcHandler {
         if !self.share_command(store_id, ShareCommand::Retire { root: node_id, done }).await {
             return Err(STOP_UNREACHABLE_REFUSAL.to_string());
         }
-        let all_wrapped = match tokio::time::timeout(RETIRE_WAIT, retired).await {
+        let all_wrapped = match self.runtime().timeout(RETIRE_WAIT, retired).await {
             Ok(Ok(Ok(all_wrapped))) => all_wrapped,
             Ok(Ok(Err(e))) => return Err(format!("The share's members were removed, but its scope could not be taken off Pimble Cloud ({e}). Stop sharing again to finish.")),
             _ => return Err("The share's members were removed, but Pimble Cloud did not answer about its scope. Stop sharing again to finish.".to_string()),
@@ -1347,7 +1350,7 @@ impl RpcHandler {
     pub(crate) async fn stop_shares_before_delete(&self, store_id: StoreId, deleting: NodeId, roots: Vec<NodeId>) {
         for root in roots {
             let name = self.marker_on(store_id, root).await.map(|marker| marker.name).unwrap_or_default();
-            let stopped = match tokio::time::timeout(STOP_BEFORE_DELETE_WAIT, self.stop_share(store_id, root)).await {
+            let stopped = match self.runtime().timeout(STOP_BEFORE_DELETE_WAIT, self.stop_share(store_id, root)).await {
                 Ok(result) => result,
                 Err(_) => Err("Pimble Cloud did not answer in time".to_string()),
             };
@@ -1426,12 +1429,13 @@ mod tests {
     async fn a_tree_change_makes_a_pass_due_a_second_after_the_last_one_and_no_later_than_five() {
         let store_id = StoreId::new();
         let node_id = NodeId::new();
-        let mut upkeep = Upkeep::new();
+        let runtime = Runtime::default();
+        let mut upkeep = Upkeep::new(runtime.clone());
         assert!(upkeep.due().is_none());
 
         // Who is who is not the shares' business, nor is another store's tree
         // this one's. (Text is: a picture put in it may be under a share.)
-        let start = Instant::now();
+        let start = runtime.now();
         upkeep.note_at(start, store_id, &change(store_id, StoreChangeKind::PeopleChanged));
         upkeep.note_at(start, StoreId::new(), &change(store_id, StoreChangeKind::MetadataUpdated { node_id }));
         assert!(upkeep.due().is_none());

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use pimble_core::{LeftShare, MountRef, Node, NodeId, NodeMetadata, Place, Store, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
-use pimble_host::Disk;
+use pimble_host::{Disk, Runtime};
 use tracing::info;
 
 /// Maximum depth for transitive mount resolution
@@ -59,6 +59,9 @@ pub struct StoreManager {
     /// The disk every store is created and opened on, and the state root is
     /// on (docs/ONE_CODEBASE_CONTRACT.md seam B).
     disk: Disk,
+    /// The runtime every store's tasks, heavy jobs and clocks go through
+    /// (seam C), and the server's with it.
+    runtime: Runtime,
 }
 
 impl StoreManager {
@@ -72,6 +75,7 @@ impl StoreManager {
             newly_opened: Vec::new(),
             state_root: None,
             disk: Disk::default(),
+            runtime: Runtime::default(),
         }
     }
 
@@ -90,6 +94,17 @@ impl StoreManager {
     /// The disk this manager's stores are on.
     pub fn disk(&self) -> &Disk {
         &self.disk
+    }
+
+    /// The same manager on `runtime`, before any store is open.
+    pub fn on_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// The runtime this manager's stores (and its server) run on.
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
     }
 
     /// The state root, when there is one.
@@ -161,7 +176,7 @@ impl StoreManager {
 
         let id = match kind {
             StoreKind::Plain => {
-                let mut store = LocalStore::create_on(&self.disk, path, name, store_id).await?;
+                let mut store = LocalStore::create_on(&self.disk, &self.runtime, path, name, store_id).await?;
                 if let Some(root) = &self.state_root {
                     store.set_state_root(root);
                 }
@@ -170,7 +185,7 @@ impl StoreManager {
                 id
             }
             StoreKind::Vault => {
-                let store = VaultStore::create_on(&self.disk, path, name, store_id).await?;
+                let store = VaultStore::create_on(&self.disk, &self.runtime, path, name, store_id).await?;
                 let id = store.id;
                 self.vault_stores.insert(id, store);
                 id
@@ -205,7 +220,7 @@ impl StoreManager {
                 id, open.path.display()
             )));
         }
-        let mut store = LocalStore::create_replica_on(&self.disk, path, id, name, root_node_id, Vec::new()).await?;
+        let mut store = LocalStore::create_replica_on(&self.disk, &self.runtime, path, id, name, root_node_id, Vec::new()).await?;
         if let Some(root) = &self.state_root {
             store.set_state_root(root);
         }
@@ -233,7 +248,7 @@ impl StoreManager {
                     info!("Store {} is already open", manifest.id);
                     return Ok(manifest.id);
                 }
-                let store = LocalStore::open_on(&self.disk, path, self.state_root.as_deref()).await?;
+                let store = LocalStore::open_on(&self.disk, &self.runtime, path, self.state_root.as_deref()).await?;
                 let id = store.id;
                 self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
                 if self.is_open(id) {
@@ -244,7 +259,7 @@ impl StoreManager {
                 id
             }
             StoreKind::Vault => {
-                let store = VaultStore::open_on(&self.disk, path).await?;
+                let store = VaultStore::open_on(&self.disk, &self.runtime, path).await?;
                 let id = store.id;
                 self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
                 if self.is_open(id) {
@@ -666,7 +681,7 @@ impl StoreManager {
             )));
         }
         let root = scope_roots.first().copied().unwrap_or_else(NodeId::new);
-        let mut store = LocalStore::create_replica_on(&self.disk, path, id, name, root, scope_roots).await?;
+        let mut store = LocalStore::create_replica_on(&self.disk, &self.runtime, path, id, name, root, scope_roots).await?;
         if let Some(root) = &self.state_root {
             store.set_state_root(root);
         }

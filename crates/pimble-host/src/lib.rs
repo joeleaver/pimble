@@ -17,13 +17,16 @@
 //! - [`http::Http`]: outbound calls to the accounts service (seam D). Native:
 //!   `reqwest`.
 //!
-//! The runtime (seam C) follows in its own module.
+//! - [`Runtime`]: tasks, timers and clocks (seam C). Native: tokio, on the
+//!   caller's runtime. wasm32: `spawn_local`, `setTimeout`, `performance.now()`.
 
 pub mod disk;
 pub mod http;
 pub mod key_rest;
 pub mod paths;
+pub mod runtime;
 
 pub use disk::{Disk, DiskBackend, DiskKind, Entry, MemoryDisk, Metadata, TmpName};
 pub use key_rest::{FileKeyRest, KeyRest, MemoryKeyRest};
 pub use paths::Paths;
+pub use runtime::{Instant, Interval, Runtime, RuntimeBackend, Sleep, Task, TaskSet};

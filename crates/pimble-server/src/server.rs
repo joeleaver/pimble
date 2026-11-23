@@ -115,6 +115,9 @@ pub struct ServerConfig {
     /// How this server reaches the Pimble Cloud accounts service (seam D):
     /// `reqwest` on the desktop.
     pub http: Arc<dyn pimble_host::http::Http>,
+    /// What this server's tasks, timers and clocks run on (seam C): tokio,
+    /// on the caller's runtime, on the desktop.
+    pub runtime: pimble_host::Runtime,
 }
 
 impl Default for ServerConfig {
@@ -140,6 +143,7 @@ impl Default for ServerConfig {
             disk: pimble_host::Disk::default(),
             paths: pimble_host::Paths::native(),
             http: Arc::new(pimble_host::http::ReqwestHttp::default()),
+            runtime: pimble_host::Runtime::default(),
         }
     }
 }
@@ -197,13 +201,14 @@ impl PimbleServer {
     pub fn with_config(config: ServerConfig) -> Self {
         let state_root = crate::handler::state_root_beside(&config.replicas_dir());
         let disk = config.disk.clone();
+        let runtime = config.runtime.clone();
         Self {
             config,
             // Each store's per-computer state (its index, its link's read
             // positions) lives beside the replicas directory, outside the
             // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1), and so
             // inside a test's temp directory whenever its replicas are.
-            store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root).on_disk(disk))),
+            store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root).on_disk(disk).on_runtime(runtime))),
             handle: None,
             handler: None,
             local_addr: None,
@@ -345,9 +350,10 @@ impl PimbleServer {
             let _ = warmed.send(Some(false));
         } else {
             let wanted = Arc::clone(&wanted);
-            tokio::spawn(async move {
+            let runtime = self.config.runtime.clone();
+            self.config.runtime.spawn(async move {
                 wanted.notified().await;
-                let _ = warmed.send(Some(warm_up_embedding_model().await));
+                let _ = warmed.send(Some(warm_up_embedding_model(&runtime).await));
             });
         }
         let semantic_available = false;
@@ -412,12 +418,12 @@ impl PimbleServer {
     /// carrying `ext` (the connection's principal: what the HTTP edge
     /// attaches to a WebSocket's calls, here attached by the caller, e.g.
     /// [`crate::service_extensions`]). `None` before the server has started.
-    /// The connection is served on a task of the current tokio runtime
-    /// until the client is dropped.
+    /// The connection is served on a task of the server's runtime until the
+    /// client is dropped.
     pub fn connect_in_process(&self, ext: jsonrpsee::Extensions) -> Option<pimble_client::PimbleClient> {
         let handler = Arc::new(self.handler.clone()?);
         let (client_end, server_end) = pimble_rpc::dispatch::session::channel();
-        tokio::spawn(pimble_rpc::dispatch::session::serve(handler, ext, server_end));
+        self.config.runtime.spawn(pimble_rpc::dispatch::session::serve(handler, ext, server_end));
         Some(pimble_client::PimbleClient::in_process(client_end))
     }
 
@@ -493,10 +499,10 @@ const EMBEDDING_MODEL: &str = "all-MiniLM-L6-v2";
 /// compiled in — both `pimble_search` calls below already are.
 ///
 /// Runs `warm_embedding_model` (a blocking, synchronous ONNX Runtime call)
-/// on a blocking thread so it can't stall the async runtime other RPCs will
+/// as the runtime's heavy job (a blocking thread on the desktop) so it can't stall the async runtime other RPCs will
 /// shortly run on; `start` still awaits it, so no store can open before it
 /// resolves.
-async fn warm_up_embedding_model() -> bool {
+async fn warm_up_embedding_model(runtime: &pimble_host::Runtime) -> bool {
     // The machine's, whatever the server's paths: a cache of a download,
     // shared by every server in the process (tests included).
     let cache_dir = pimble_host::Paths::native().data.join("models");
@@ -509,7 +515,7 @@ async fn warm_up_embedding_model() -> bool {
         return false;
     }
 
-    match tokio::task::spawn_blocking(|| pimble_search::warm_embedding_model(EMBEDDING_MODEL)).await {
+    match runtime.run_heavy(|| pimble_search::warm_embedding_model(EMBEDDING_MODEL)).await {
         Ok(Ok(elapsed)) => {
             info!("Embedding model '{}' ready in {:.1}s", EMBEDDING_MODEL, elapsed.as_secs_f64());
             true
@@ -521,10 +527,10 @@ async fn warm_up_embedding_model() -> bool {
             );
             false
         }
-        Err(join_err) => {
+        Err(failed) => {
             tracing::warn!(
                 "Embedding model warm-up task panicked ({}); running search keyword-only",
-                join_err
+                failed
             );
             false
         }

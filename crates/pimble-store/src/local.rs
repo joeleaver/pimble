@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, Place, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
 use pimble_crdt::{Cutting, NodeDoc, Planted, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
-use pimble_host::{Disk, TmpName};
+use pimble_host::{Disk, Runtime, TmpName};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -341,7 +341,7 @@ impl LocalStore {
 
     /// Create a new local store at the given path, with a freshly generated id.
     pub async fn create(path: impl AsRef<Path>, name: impl Into<String>) -> Result<Self> {
-        Self::create_on(&Disk::default(), path, name, None).await
+        Self::create_on(&Disk::default(), &Runtime::default(), path, name, None).await
     }
 
     /// Like [`LocalStore::create`], but under a chosen `id` rather than a
@@ -350,12 +350,12 @@ impl LocalStore {
     /// local store under the local store's own id). Refusing an id already
     /// open is the caller's job (`StoreManager`), same as for a fresh id.
     pub async fn create_with_id(path: impl AsRef<Path>, name: impl Into<String>, id: StoreId) -> Result<Self> {
-        Self::create_on(&Disk::default(), path, name, Some(id)).await
+        Self::create_on(&Disk::default(), &Runtime::default(), path, name, Some(id)).await
     }
 
     /// [`LocalStore::create`] (or, with `id`, [`LocalStore::create_with_id`])
-    /// on `disk`.
-    pub async fn create_on(disk: &Disk, path: impl AsRef<Path>, name: impl Into<String>, id: Option<StoreId>) -> Result<Self> {
+    /// on `disk`, timed by `runtime`.
+    pub async fn create_on(disk: &Disk, runtime: &Runtime, path: impl AsRef<Path>, name: impl Into<String>, id: Option<StoreId>) -> Result<Self> {
         let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
         let name = name.into();
@@ -388,7 +388,7 @@ impl LocalStore {
 
         let mut store = Self {
             id: manifest.id,
-            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, runtime, manifest.id, &path),
             disk,
             path,
             manifest_base: manifest.clone(),
@@ -446,12 +446,13 @@ impl LocalStore {
         root_node_id: NodeId,
         scope_roots: Vec<NodeId>,
     ) -> Result<Self> {
-        Self::create_replica_on(&Disk::default(), path, id, name, root_node_id, scope_roots).await
+        Self::create_replica_on(&Disk::default(), &Runtime::default(), path, id, name, root_node_id, scope_roots).await
     }
 
-    /// [`LocalStore::create_replica_with_scope`] on `disk`.
+    /// [`LocalStore::create_replica_with_scope`] on `disk`, timed by `runtime`.
     pub async fn create_replica_on(
         disk: &Disk,
+        runtime: &Runtime,
         path: impl AsRef<Path>,
         id: StoreId,
         name: impl Into<String>,
@@ -489,7 +490,7 @@ impl LocalStore {
 
         let store = Self {
             id: manifest.id,
-            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, runtime, manifest.id, &path),
             disk,
             path,
             manifest_base: manifest.clone(),
@@ -803,7 +804,7 @@ impl LocalStore {
     /// section 2: repair runs at open). Manifest versions other than the
     /// previous and the current one are refused: nothing older is migrated.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_on(&Disk::default(), path, None).await
+        Self::open_on(&Disk::default(), &Runtime::default(), path, None).await
     }
 
     /// [`LocalStore::open`], keeping this computer's own state for the store
@@ -813,11 +814,11 @@ impl LocalStore {
     /// Conflict copies a sync tool left in `nodes/` are merged into their
     /// documents and removed (rule 4).
     pub async fn open_in(path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
-        Self::open_on(&Disk::default(), path, state_root).await
+        Self::open_on(&Disk::default(), &Runtime::default(), path, state_root).await
     }
 
-    /// [`LocalStore::open_in`] on `disk`.
-    pub async fn open_on(disk: &Disk, path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
+    /// [`LocalStore::open_in`] on `disk`, timed by `runtime`.
+    pub async fn open_on(disk: &Disk, runtime: &Runtime, path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
         let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
 
@@ -854,7 +855,7 @@ impl LocalStore {
 
         let nodes_dir = path.join(Self::NODES_DIR);
         disk.create_dir_all(&nodes_dir).await?;
-        folder::sweep_stale_temporaries(&disk, &nodes_dir).await;
+        folder::sweep_stale_temporaries(&disk, runtime, &nodes_dir).await;
         let loaded = Self::load_node_docs(&disk, &nodes_dir).await?;
         let mut docs = loaded.docs;
 
@@ -888,7 +889,7 @@ impl LocalStore {
 
         let mut store = Self {
             id: manifest.id,
-            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, runtime, manifest.id, &path),
             disk,
             path,
             tree: Tree::from_docs(manifest.root_node_id, docs),

@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use pimble_host::{Instant, Runtime};
 
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc::PresenceFrame;
@@ -57,18 +59,20 @@ pub(crate) struct PresenceHub {
     subs: tokio::sync::Mutex<HashMap<StoreId, Vec<PresenceSub>>>,
     local: broadcast::Sender<Relayed>,
     sweeping: AtomicBool,
+    /// The clock sessions expire by, and what the sweep runs on.
+    runtime: Runtime,
 }
 
 impl Default for PresenceHub {
     fn default() -> Self {
-        Self::new()
+        Self::new(Runtime::default())
     }
 }
 
 impl PresenceHub {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(runtime: Runtime) -> Self {
         let (local, _) = broadcast::channel(1024);
-        Self { held: Mutex::new(HashMap::new()), subs: tokio::sync::Mutex::new(HashMap::new()), local, sweeping: AtomicBool::new(false) }
+        Self { held: Mutex::new(HashMap::new()), subs: tokio::sync::Mutex::new(HashMap::new()), local, sweeping: AtomicBool::new(false), runtime }
     }
 
     /// Take `frame` in from `origin`. Answers whether it is news: a frame not
@@ -86,7 +90,7 @@ impl PresenceHub {
             return held.remove(&key).is_some();
         }
         let ttl = Duration::from_millis(frame.ttl_ms).min(MAX_TTL);
-        held.insert(key, Held { frame: frame.clone(), expires: Instant::now() + ttl, origin: origin.to_string() });
+        held.insert(key, Held { frame: frame.clone(), expires: self.runtime.now() + ttl, origin: origin.to_string() });
         true
     }
 
@@ -97,7 +101,7 @@ impl PresenceHub {
 
     /// Every live frame of `store_id` and where each came from.
     pub(crate) fn held_in(&self, store_id: StoreId) -> Vec<Relayed> {
-        let now = Instant::now();
+        let now = self.runtime.now();
         self.held
             .lock()
             .unwrap()
@@ -117,7 +121,7 @@ impl PresenceHub {
 
     /// Drop the sessions that went quiet, answering a goodbye for each.
     pub(crate) fn expire(&self) -> Vec<Relayed> {
-        let now = Instant::now();
+        let now = self.runtime.now();
         let mut held = self.held.lock().unwrap();
         let ended: Vec<Key> = held.iter().filter(|(_, h)| h.expires <= now).map(|(k, _)| k.clone()).collect();
         ended.into_iter().filter_map(|k| held.remove(&k)).map(|h| Relayed { frame: goodbye(&h.frame), origin: h.origin }).collect()
@@ -175,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_frame_not_newer_than_the_held_one_is_dropped() {
-        let hub = PresenceHub::new();
+        let hub = PresenceHub::default();
         assert!(hub.accept(&frame(1, "c:0"), "c"));
         assert!(!hub.accept(&frame(1, "c:0"), "link"), "the same frame back round a chain is no news");
         assert!(hub.accept(&frame(2, "c:0"), "c"));
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_goodbye_ends_the_session_and_a_second_is_no_news() {
-        let hub = PresenceHub::new();
+        let hub = PresenceHub::default();
         hub.accept(&frame(1, "c:0"), "c");
         let bye = goodbye(&frame(1, "c:0"));
         assert!(hub.accept(&bye, "c"));
@@ -194,7 +198,7 @@ mod tests {
 
     #[test]
     fn a_client_going_away_ends_only_its_own_sessions() {
-        let hub = PresenceHub::new();
+        let hub = PresenceHub::default();
         hub.accept(&frame(1, "a:0"), "a");
         hub.accept(&frame(1, "b:0"), "link-1");
         let ended = hub.end_sessions_of(None, "a");
@@ -205,7 +209,7 @@ mod tests {
 
     #[test]
     fn a_quiet_session_expires() {
-        let hub = PresenceHub::new();
+        let hub = PresenceHub::default();
         hub.accept(&PresenceFrame { ttl_ms: 0, ..frame(1, "a:0") }, "a");
         hub.accept(&frame(1, "b:0"), "b");
         let ended = hub.expire();
@@ -248,10 +252,11 @@ pub(crate) async fn deliver(hub: &PresenceHub, manager: &tokio::sync::RwLock<pim
 
 /// Every [`SWEEP_EVERY`], end the sessions that went quiet and tell everyone.
 /// Stops once the server that owns the hub is gone.
-pub(crate) fn spawn_sweep(hub: std::sync::Weak<PresenceHub>, manager: std::sync::Weak<tokio::sync::RwLock<pimble_store::StoreManager>>) {
-    tokio::spawn(async move {
+pub(crate) fn spawn_sweep(runtime: &Runtime, hub: std::sync::Weak<PresenceHub>, manager: std::sync::Weak<tokio::sync::RwLock<pimble_store::StoreManager>>) {
+    let clock = runtime.clone();
+    runtime.spawn(async move {
         loop {
-            tokio::time::sleep(SWEEP_EVERY).await;
+            clock.sleep(SWEEP_EVERY).await;
             let (Some(hub), Some(manager)) = (hub.upgrade(), manager.upgrade()) else { return };
             for ended in hub.expire() {
                 deliver(&hub, &manager, &ended.frame, &ended.origin).await;

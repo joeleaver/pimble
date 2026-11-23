@@ -43,7 +43,6 @@ use pimble_core::{AuthMethod, RelaySide, RemoteEndpoint, StoreAccess, StoreId, S
 use pimble_rpc::{encrypted_store_error, to_rpc_error, CloseStoreRequest, CreateStoreRequest, DeleteVaultStoreRequest, OpenStoreRequest, PimbleApiServer};
 use pimble_store::{StoreError, SyncConfig, SyncMode};
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -121,7 +120,7 @@ pub(crate) enum TunnelState {
 #[derive(Default)]
 struct Inner {
     face: Option<Face>,
-    tunnel: Option<JoinHandle<()>>,
+    tunnel: Option<pimble_host::Task>,
     /// The relayed stores open here: `true` once the tunnel announces them.
     stores: HashMap<StoreId, bool>,
 }
@@ -132,6 +131,8 @@ pub(crate) struct RelayHost {
     dir: PathBuf,
     /// The host server's disk, which the face keeps its twins on too.
     disk: pimble_host::Disk,
+    /// The host server's runtime, which the face runs on too.
+    runtime: pimble_host::Runtime,
     inner: Mutex<Inner>,
     /// What the tunnel announces. Written under `inner`'s lock.
     serve: watch::Sender<HashSet<StoreId>>,
@@ -145,8 +146,8 @@ pub(crate) struct RelayHost {
 }
 
 impl RelayHost {
-    pub(crate) fn new(disk: pimble_host::Disk, dir: PathBuf) -> Self {
-        Self { dir, disk, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, tunnel: watch::channel(TunnelState::Idle).0, url: std::sync::Mutex::new(None) }
+    pub(crate) fn new(disk: pimble_host::Disk, runtime: pimble_host::Runtime, dir: PathBuf) -> Self {
+        Self { dir, disk, runtime, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, tunnel: watch::channel(TunnelState::Idle).0, url: std::sync::Mutex::new(None) }
     }
 
     /// How the tunnel is doing now.
@@ -204,7 +205,7 @@ impl RelayHost {
             self.publish(&inner);
         }
         if inner.tunnel.as_ref().is_none_or(|task| task.is_finished()) {
-            inner.tunnel = Some(tokio::spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
+            inner.tunnel = Some(self.runtime.spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
         }
         Ok(url)
     }
@@ -239,6 +240,7 @@ impl RelayHost {
             set_aside_after: None,
             link_faults: None,
             disk: self.disk.clone(),
+            runtime: self.runtime.clone(),
             paths: pimble_host::Paths::in_dir(&self.dir.join(".face")),
             // A face calls the accounts service for nothing; the host's way all the same.
             http: std::sync::Arc::new(pimble_host::http::ReqwestHttp::default()),
@@ -353,7 +355,7 @@ impl RelayHost {
         }
         self.set_tunnel_state(TunnelState::Idle);
         if !inner.stores.is_empty() {
-            inner.tunnel = Some(tokio::spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
+            inner.tunnel = Some(self.runtime.spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
         }
     }
 

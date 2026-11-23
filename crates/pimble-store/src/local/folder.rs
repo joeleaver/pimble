@@ -254,9 +254,9 @@ async fn remove_path(disk: &Disk, path: &Path) {
 /// Remove temporaries (`*.tmp`) an interrupted write left in `dir` more than
 /// an hour ago. A younger one may be another process's write in progress
 /// (two computers, or two servers, on one folder).
-pub(crate) async fn sweep_stale_temporaries(disk: &Disk, dir: &Path) {
+pub(crate) async fn sweep_stale_temporaries(disk: &Disk, runtime: &pimble_host::Runtime, dir: &Path) {
     let Ok(entries) = disk.list(dir).await else { return };
-    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let hour_ago = runtime.wall() - std::time::Duration::from_secs(3600);
     for entry in entries {
         let path = entry.path;
         if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
