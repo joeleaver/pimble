@@ -373,8 +373,9 @@ pub trait PimbleApi {
     #[method(name = "openInApp", with_extensions)]
     async fn open_in_app(&self, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned>;
 
-    /// A Pimble window hears the links `openInApp` hands it. `Service`-only.
-    #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = String, with_extensions)]
+    /// A Pimble window hears the links `openInApp` hands it, each with the
+    /// activation token it came with, if any. `Service`-only.
+    #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = HandedLink, with_extensions)]
     async fn subscribe_app_links(&self) -> SubscriptionResult;
 
     /// Host a local store's encrypted twin on Pimble Cloud. `Service`-only.

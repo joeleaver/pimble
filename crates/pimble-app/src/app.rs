@@ -5024,20 +5024,28 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     (store, app_component)
 }
 
-/// A link from outside reached this window: show it. (rinch has no way yet
-/// to raise and focus a window; until it does, the window is made visible
-/// where it is.)
+/// A link from outside reached this window: show it and bring it to the
+/// front. On Wayland a window may only take the focus with the activation
+/// token the click that started `pimble <link>` gave it (rinch #2880), which
+/// that program handed over with the link; without one (X11, Windows, a
+/// launch with none) the window asks for the focus itself.
 #[cfg(feature = "native")]
-pub(crate) fn bring_to_front() {
+pub(crate) fn bring_to_front(activation_token: Option<&str>) {
     show_current_window();
+    match activation_token {
+        Some(token) => activate_current_window_with_token(token),
+        None => focus_current_window(),
+    }
 }
 
 /// Open the desktop window: the same UI [`build_view`] builds, wrapped in a
 /// native menu bar, the borderless window and the saved theme. `renderer` is
 /// the GPU with a fall back to software unless the command line chose
-/// (`pimble --cpu`); `RINCH_RENDERER` overrides either.
+/// (`pimble --cpu`); `RINCH_RENDERER` overrides either. `activation_token`
+/// is the one this program was started with, if any, which the first window
+/// takes the focus with (rinch #2880).
 #[cfg(feature = "native")]
-pub fn run(renderer: Renderer) {
+pub fn run(renderer: Renderer, activation_token: Option<String>) {
     use std::sync::Arc;
 
     // The zoom this device saved, before the window is made, so the first
@@ -5107,6 +5115,7 @@ pub fn run(renderer: Renderer) {
         .theme(theme)
         .menu(menus)
         .renderer(renderer)
+        .activation_token(activation_token)
         .run();
 
     EVENT_PROCESSOR.with(|cell| {

@@ -1501,9 +1501,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::CloudConnectionChanged { connection } => {
                 store.cloud_connection.set(connection.clone());
             }
-            BackendEvent::AppLink { url } => {
+            BackendEvent::AppLink { url, activation_token } => {
                 #[cfg(feature = "native")]
-                crate::app::bring_to_front();
+                crate::app::bring_to_front(activation_token.as_deref());
+                #[cfg(not(feature = "native"))]
+                let _ = activation_token;
                 crate::links::open_app_link(store, url);
             }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
