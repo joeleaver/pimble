@@ -243,6 +243,19 @@ struct Kept {
     /// Items read here and not yet acknowledged to the service.
     #[serde(default)]
     acks: Vec<String>,
+    /// Wave 2: the account's email and push switches, as the service last
+    /// said them.
+    #[serde(default = "yes")]
+    email: bool,
+    #[serde(default = "yes")]
+    push: bool,
+    /// Wave 2: the service's VAPID public key, none when it sends no pushes.
+    #[serde(default)]
+    push_key: Option<String>,
+    /// Wave 2: the push subscriptions this device registered for the
+    /// account, taken back when it signs out.
+    #[serde(default)]
+    push_endpoints: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -251,7 +264,18 @@ fn yes() -> bool {
 
 impl Kept {
     fn new(account: &str) -> Self {
-        Self { account: account.to_string(), on: true, sent: BTreeMap::new(), outbox: Vec::new(), held: Vec::new(), acks: Vec::new() }
+        Self {
+            account: account.to_string(),
+            on: true,
+            sent: BTreeMap::new(),
+            outbox: Vec::new(),
+            held: Vec::new(),
+            acks: Vec::new(),
+            email: true,
+            push: true,
+            push_key: None,
+            push_endpoints: Vec::new(),
+        }
     }
 
     fn prune(&mut self, now: i64) {
@@ -416,7 +440,7 @@ impl Notices {
         let Some(account) = handler.keystore().account().await else { return pimble_rpc::ListNoticesResponse::default() };
         self.with(handler, &account.user_id, |kept| {
             let notices = kept.held.iter().rev().map(|h| h.notice.clone()).collect();
-            (pimble_rpc::ListNoticesResponse { notices, on: kept.on }, false)
+            (pimble_rpc::ListNoticesResponse { notices, on: kept.on, email: kept.email, push: kept.push, push_key: kept.push_key.clone() }, false)
         })
         .await
     }
@@ -447,7 +471,7 @@ impl Notices {
     /// what is queued there), then this device stops or starts.
     pub(crate) async fn set_on(&self, handler: &RpcHandler, on: bool) -> Result<(), String> {
         let account = handler.keystore().account().await.ok_or("Nobody is signed in.")?;
-        crate::cloud::put_notifications(handler.http(), &account.url, &account.session, on).await.map_err(|e| e.to_string())?;
+        crate::cloud::put_notifications(handler.http(), &account.url, &account.session, Some(on), None, None).await.map_err(|e| e.to_string())?;
         self.with(handler, &account.user_id, |kept| {
             kept.on = on;
             if !on {
@@ -460,6 +484,64 @@ impl Notices {
         info!("Notifications turned {}", if on { "on" } else { "off" });
         self.restart(handler);
         Ok(())
+    }
+
+    /// Wave 2's switches, for the account: email, web push.
+    pub(crate) async fn set_channels(&self, handler: &RpcHandler, email: Option<bool>, push: Option<bool>) -> Result<(), String> {
+        if email.is_none() && push.is_none() {
+            return Ok(());
+        }
+        let account = handler.keystore().account().await.ok_or("Nobody is signed in.")?;
+        crate::cloud::put_notifications(handler.http(), &account.url, &account.session, None, email, push).await.map_err(|e| e.to_string())?;
+        self.with(handler, &account.user_id, |kept| {
+            kept.email = email.unwrap_or(kept.email);
+            kept.push = push.unwrap_or(kept.push);
+            ((), true)
+        })
+        .await;
+        Ok(())
+    }
+
+    /// A browser subscribed to web push: the service keeps the subscription
+    /// under the account, and this device remembers it to take it back at
+    /// sign-out.
+    pub(crate) async fn register_push(&self, handler: &RpcHandler, endpoint: &str, p256dh: &str, auth: &str) -> Result<(), String> {
+        let account = handler.keystore().account().await.ok_or("Nobody is signed in.")?;
+        crate::cloud::push_subscribe(handler.http(), &account.url, &account.session, endpoint, p256dh, auth).await.map_err(|e| e.to_string())?;
+        self.with(handler, &account.user_id, |kept| {
+            if !kept.push_endpoints.iter().any(|e| e == endpoint) {
+                kept.push_endpoints.push(endpoint.to_string());
+            }
+            ((), true)
+        })
+        .await;
+        info!("Notices: this browser takes pushes");
+        Ok(())
+    }
+
+    pub(crate) async fn unregister_push(&self, handler: &RpcHandler, endpoint: &str) -> Result<(), String> {
+        let account = handler.keystore().account().await.ok_or("Nobody is signed in.")?;
+        crate::cloud::push_unsubscribe(handler.http(), &account.url, &account.session, endpoint).await.map_err(|e| e.to_string())?;
+        self.with(handler, &account.user_id, |kept| {
+            kept.push_endpoints.retain(|e| e != endpoint);
+            ((), true)
+        })
+        .await;
+        Ok(())
+    }
+
+    /// The account is signing out of this device: every push subscription it
+    /// registered is taken back first, while the session still works, so no
+    /// push for that account reaches this browser afterwards. Best effort: a
+    /// service out of reach keeps them until a push to them fails.
+    pub(crate) async fn signing_out(&self, handler: &RpcHandler) {
+        let Some(account) = handler.keystore().account().await else { return };
+        let endpoints = self.with(handler, &account.user_id, |kept| (std::mem::take(&mut kept.push_endpoints), true)).await;
+        for endpoint in endpoints {
+            if let Err(e) = crate::cloud::push_unsubscribe(handler.http(), &account.url, &account.session, &endpoint).await {
+                debug!("Notices: a push subscription was not taken back: {}", e);
+            }
+        }
     }
 
     /// Send what waits: acknowledgements, then each notice in the outbox,
@@ -512,7 +594,11 @@ impl Notices {
                 }
             };
             let root = scope.root.map(|r| r.to_string());
-            match crate::cloud::post_notice(handler.http(), &account.url, &account.session, &out.recipient, &store_id.to_string(), root.as_deref(), &sealed).await {
+            let kind = match notice.kind {
+                NoticeKind::Mention => "mention",
+                NoticeKind::Reply => "reply",
+            };
+            match crate::cloud::post_notice(handler.http(), &account.url, &account.session, &out.recipient, &store_id.to_string(), root.as_deref(), &sealed, kind).await {
                 Ok(_) => done.push(out.notice.id.clone()),
                 Err(e) => match e.status() {
                     Some(400 | 403 | 404) => {
@@ -649,8 +735,11 @@ async fn run(handler: RpcHandler) {
     if let Ok(me) = crate::cloud::me(handler.http(), &account.url, &account.session).await {
         notices
             .with(&handler, &account.user_id, |kept| {
-                let changed = kept.on != me.notifications;
+                let changed = kept.on != me.notifications || kept.email != me.notification_email || kept.push != me.notification_push || kept.push_key != me.push_key;
                 kept.on = me.notifications;
+                kept.email = me.notification_email;
+                kept.push = me.notification_push;
+                kept.push_key = me.push_key.clone();
                 ((), changed)
             })
             .await;
@@ -669,6 +758,7 @@ async fn run(handler: RpcHandler) {
             }
         }
     };
+    handler.keystore().publish_notice_key().await;
 
     let sending = async {
         loop {

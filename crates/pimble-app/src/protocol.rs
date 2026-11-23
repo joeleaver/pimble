@@ -347,6 +347,15 @@ pub enum BackendCommand {
     /// Notifications on or off for the account (section 6). Answers
     /// `NoticesListed`, or `CloudError { op: Notifications }`.
     SetNotifications { on: bool },
+    /// Wave 2's channels for the account, one or both: the email fallback,
+    /// web push. Answers `NoticesListed`, or `CloudError { op: Notifications }`.
+    SetNotificationChannels { email: Option<bool>, push: Option<bool> },
+    /// This browser subscribed to web push (wave 2): handed to the server,
+    /// which gives it to the accounts service and takes it back at sign-out.
+    /// Answers nothing.
+    RegisterPush { endpoint: String, p256dh: String, auth: String },
+    /// This browser's push subscription ended. Answers nothing.
+    UnregisterPush { endpoint: String },
     /// Host a local store's encrypted twin on Pimble Cloud (`CloudStoreHosted`).
     CloudHostStore { store_id: StoreId },
     /// Every store the signed-in account has a grant on (`CloudHostedStoresListed`).
@@ -757,7 +766,7 @@ pub enum BackendEvent {
     NoticeReceived { notice: pimble_rpc::Notice },
     /// The notices this device keeps, newest first, and whether
     /// notifications are on (`ListNotices`, `SetNotifications`).
-    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool },
+    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String> },
     /// A `pimble:` link this computer was asked to open, handed to this window
     /// by the server (`openInApp`; desktop only), with the activation token
     /// the program that was asked came with, to come to the front with.

@@ -951,6 +951,9 @@ pub struct AppStore {
     /// Whether notifications are on for the account (section 6): the switch
     /// in the Account window and in Settings.
     pub notifications_on: Signal<bool>,
+    /// Wave 2: the email fallback's switch, and web push's.
+    pub notify_email: Signal<bool>,
+    pub notify_push: Signal<bool>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1238,6 +1241,8 @@ impl AppStore {
             personal_sync: Signal::new(crate::persistence::load_personal_sync()),
             notices: Signal::new(Vec::new()),
             notifications_on: Signal::new(true),
+            notify_email: Signal::new(true),
+            notify_push: Signal::new(true),
             discussions_modal: Signal::new(false),
             all_discussions: Signal::new(Vec::new()),
         }

@@ -176,6 +176,12 @@ pub fn login_page() -> NodeHandle {
 /// then every store and key this browser kept, and the page starts again at
 /// the sign-in page.
 pub async fn leave(sign_out: bool) -> Result<bool, String> {
+    // This browser's pushes end with it (wave 2): the subscription here
+    // first; signing out, the server then takes it back from the accounts
+    // service while its session still works, and a browser forgotten while
+    // signed in is dropped by the service at its first push (the push service
+    // answers 410).
+    let _ = pimble_app::inbox::browser_push::end().await;
     let local = backend::local();
     if let Ok(client) = local.client().await {
         if sign_out {

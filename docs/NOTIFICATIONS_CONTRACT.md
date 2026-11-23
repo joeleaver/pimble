@@ -440,3 +440,140 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   share did not reach the member's replica within 30 seconds in the harness (one a member
   started reaches the owner at once, as `share.rs`'s commenter test shows), so the reply
   test has the member start the thread.
+
+## Built in wave 2 (2026-11-23, branch `notifications`)
+
+### Decided here (small; Joe has not reviewed them)
+
+- **Seen and read.** An item is *seen* once a running device drained it (wave 1's
+  `delivered`) or a browser's service worker showed its push, and *read* once a device
+  acknowledged it (deleted). Email goes only for an item neither seen nor read, so "no
+  device acknowledged within 15 minutes" reads as "no device so much as showed it": a
+  notice that popped up on a running desktop is not emailed again a quarter of an hour
+  later. Read on one device, an item is gone, so it stops its email and its push
+  everywhere; email and push read the same rows and agree on what is outstanding.
+- **A shown push says so without a session**: the push carries
+  `{public_url}/api/v1/inbox/seen/{item}?t=<HMAC>` (HMAC-SHA256 under the service's
+  existing server secret, over `pimble-inbox-seen:<item>`); `POST` to it marks that item
+  seen and nothing else (403 on a wrong token). The service worker has no session.
+- **The email**: one pass a minute (`notify::email_pass(state, now_ms)`, the clock the
+  caller's, so tests move it). Due items are those created at least 15 minutes ago, not
+  seen, not yet emailed; at most one email per person per hour (`User.notice_emailed_at`),
+  and items due inside that hour wait for the next email rather than being lost. Lines
+  that say the same thing are merged with a count ("Joe mentioned you in Shared with Will
+  (3 times)"), at most 20 lines and "and N more". The link is `{public_url}/app/?inbox`,
+  which opens the Inbox. An item whose switch was off when it fell due is marked emailed,
+  so turning email back on never sends old news. Undelivered items older than a day are
+  dropped by the pass as a drain drops them.
+- **The words**: "X mentioned you in S", "X replied in a discussion in S", from the name
+  X goes by in that share (the share's `ShareName`, else their default name) and the
+  share's name as the recipient's own grant names it. To say mention or reply, the sender
+  now posts `kind` beside the sealed notice (`POST /inbox/{sub} { ..., kind }`,
+  sanitized to a short lowercase word). **That is a small metadata leak**: the service
+  learns whether a notice is a mention or a reply, which it could not before. The
+  alternative was "X wrote to you in S" for both.
+- **The push payload** is `{ v: 1, id, from, to, kind, line, seen, sealed }`, inside RFC
+  8291 (`aes128gcm`), with VAPID (RFC 8292, ES256), `TTL` one day and `Urgency: high`.
+  `line` is the email's line, shown when the sealed notice cannot be opened; `sealed` is
+  dropped when the payload would pass 3,800 bytes (push services take about 4 KB). A
+  subscription a push service answers 404 or 410 is deleted.
+- **Subscriptions**: `POST /api/v1/me/push { endpoint, p256dh, auth }` (upsert by
+  endpoint, at most 20 per account), `DELETE /api/v1/me/push { endpoint }`. The endpoint
+  must be one of the browsers' push services (`fcm.googleapis.com`,
+  `push.services.mozilla.com`, `push.apple.com`, `notify.windows.com`, over https on
+  443), so nobody can make the service post to an address of their choosing.
+  `GET /me` answers `notification_email`, `notification_push` and `push_key` (the VAPID
+  public key, absent when push is not configured). Deleting an account deletes its
+  subscriptions.
+- **The switches are the account's**, like wave 1's: `PUT /me/notifications { on?,
+  email?, push? }` (`User.notify_email_off`, `notify_push_off`), shown in Settings >
+  Account on both targets ("Email me what I miss"; "Notify this browser when it is
+  closed" in a browser, "Notify my browsers when Pimble is closed" on the desktop). Push
+  off stops pushing to every browser of the account. The RPCs are `setNotifications {
+  on?, email?, push? }`, `registerPush`, `unregisterPush`; `listNotices` answers the
+  channels and the push key.
+- **The service worker's notice key**: the browser's own server, when the account is
+  remembered on this browser, writes the notice key's X25519 secret into IndexedDB
+  (`pimble-device`, `keys`, `notice` = `{ sub, key, public }`) as a **non-extractable**
+  WebCrypto key (PKCS#8 import, `deriveBits` only), so script can derive with it and never
+  read it. Sign-out and a sign-in as someone else delete it. A browser that does not
+  remember the account, or has no X25519 in WebCrypto, shows `line`. The worker opens the
+  sealed notice with `web/build/notice.js` (XChaCha20-Poly1305 written out in JavaScript,
+  WebCrypto for X25519 and HKDF), concatenated in front of `sw.js` by `post_build.sh`,
+  and shows it only when its `from` is the sender the service stamped, as the server
+  checks.
+- **A click** focuses an open Pimble tab and tells it (`postMessage`, heard by hub.js as
+  the window event `pimble-open-notice`), or opens `/app/?notice=<id>` (`?inbox` for a
+  push it could not open); the app opens that notice once the inbox holds it, else the
+  Inbox.
+- **Sign-out unsubscribes**: the server remembers the endpoints this browser registered
+  and deletes them at sign-out (and at a sign-in as another account) before the session
+  ends.
+
+### What was built, and where
+
+- `pimble-cloud`: `schema.rhype` (`User.notify_email_off`, `notify_push_off`,
+  `notice_emailed_at`; `InboxItem.kind`, `emailed`; `type PushSubscription`), `db.rs`,
+  `webpush.rs` (VAPID keys and headers, RFC 8291 encryption, `--generate-vapid-key`),
+  `notify.rs` (the endpoint allowlist, the seen token, `push_item`, `email_pass` and its
+  job, started by `build_router`), `mail.rs` (`NoticeLine`, `notices_email`),
+  `routes/inbox.rs` (`post_push`, `delete_push`, `seen`, `names_for`, `kind`, the
+  channels on the switch), `routes/accounts.rs` (the channels and `push_key` on `me`),
+  `config.rs` (`PIMBLE_VAPID_PRIVATE_KEY`, `PIMBLE_VAPID_SUBJECT`).
+- `pimble-rpc`, `pimble-client`: the RPCs above. `pimble-server`: `cloud.rs` (the HTTP
+  calls), `notices.rs` (channels kept with the run, `register_push`, `unregister_push`,
+  `signing_out`, `kind` on the outbox), `keystore.rs` (`publish_notice_key`, resting the
+  key through `KeyRest::notice_key`), `handler.rs`. `pimble-host`: `KeyRest::notice_key`
+  (a default that does nothing: the desktop keeps no such key). `pimble-worker`
+  `device.rs`: the browser's implementation.
+- `pimble-app`: the two switches and their line, `inbox::channels`, `browser_push`
+  (subscribing through `PimbleHub.pushSubscribe` with the VAPID key, unsubscribing at
+  sign-out, hearing `?notice=`, `?inbox` and the click event). `web/`: `hub.js`
+  (`pushSubscribe`, `pushUnsubscribe`, the click relay), `build/notice.js`,
+  `build/sw.template.js` (`push`, `notificationclick`), `build/post_build.sh`,
+  `src/app_page.rs` and `src/worker_mode/` (hear clicks; unsubscribe on leaving).
+
+### Verified
+
+- `pimble-cloud` whole suite: lib 17 passed, integration 88 passed against a real
+  `rhypedb-server` (none skipped). New in lib: the notice email's words, the RFC 8291
+  example decrypting, a push opening with its subscription's keys and no others, a VAPID
+  header verifying, the endpoint allowlist).
+- The new integration tests:
+  `an_unseen_notice_is_emailed_after_fifteen_minutes_at_most_hourly` (nothing at 14
+  minutes, one email at 15 naming the sender and share and no note text, nothing more
+  inside the hour, the item that fell due inside it in the next hour's email; merging
+  alike lines is in the code but not under a test),
+  `a_seen_or_read_notice_is_not_emailed` (a drained item, an acknowledged one, one a
+  push marked seen; a wrong seen token is 403), `the_email_switch_stops_the_email` (and
+  switched back on, old items stay unsent), `a_queued_notice_is_pushed_encrypted_to_the_subscription`
+  (bad keys refused, subscribing again replaces; a stand-in push service receives one
+  `aes128gcm` body that opens with the subscription's keys to the payload above, with
+  the sealed notice inside; the VAPID header's claims; the `seen` link stops the email;
+  push off and unsubscribing send nothing; a 410 deletes the subscription). The endpoint
+  allowlist is a unit test (the integration run allows a loopback push service).
+- `pimble-server/tests/notices.rs` (2): the stub service records `kind` ("mention"),
+  the channels round-trip, `registerPush`/`unregisterPush`, and Bob's sign-out deletes
+  his subscriptions. `pimble-server` lib `notices keystore` 12 passed.
+- `web/build/notice.test.mjs` (node): RFC 8439's Poly1305 vector, the XChaCha draft's
+  HChaCha20 vector, and a notice `pimble_crypto::seal_notice` sealed opening with the key
+  imported exactly as the worker imports it; another account, a tampered byte and another
+  key are refused. The assembled `sw.js` parses.
+- Builds: `pimble-app` native (release), `--features web` for wasm32, `web/` for wasm32,
+  `pimble-worker` (with `entry`) for wasm32. `pimble-app` lib `inbox menus events::` 47
+  passed.
+- **Not seen in a real browser**: no push went through a real push service (FCM,
+  Mozilla) and no service worker showed a notification; the headless walk-through on the
+  local stack was not done. Real push services need a real VAPID key and an https origin
+  (or localhost) with the permission granted.
+
+### Not done in wave 2
+
+- Watches (wave 3), so a watch notice's line ("3 changes in a note you watch") is not
+  produced yet; the worker shows whatever `line` says.
+- Per-kind switches (mentions, replies, watched notes) and per-device push switches: the
+  switches are the account's.
+- The desktop has no push (it has the running app and, in wave 4, the tray).
+- Safari's push service needs the page installed to the home screen on iOS; not tried.
+- The email has no unsubscribe link or `List-Unsubscribe` header; the switch is in
+  Settings.

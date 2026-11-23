@@ -51,6 +51,10 @@ const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
 /// The one line beside the notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
 const NOTIFICATIONS_LINE: &str = "People who share notes with you can notify you; Pimble Cloud cannot read what they say.";
 
+/// What the two channels below the switch do (docs/NOTIFICATIONS_CONTRACT.md
+/// section 4, wave 2).
+const CHANNELS_LINE: &str = "When none of your devices sees a notice within 15 minutes, Pimble Cloud emails you who wrote and in which share, never what they said, at most once an hour. A browser you allowed shows notices even when Pimble is closed in it.";
+
 /// Whether this build can make a store on the signed-in account.
 ///
 /// The exact complement of [`CAN_ADMINISTER_STORES`] for creating one: a
@@ -3828,6 +3832,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                     {NOTIFICATIONS_LINE}
                 }
+                Checkbox {
+                    label: "Email me what I miss",
+                    checked_fn: move || store.notify_email.get(),
+                    onchange: move || crate::inbox::set_email(store, !untracked(|| store.notify_email.get())),
+                }
+                Checkbox {
+                    label: "Notify this browser when it is closed",
+                    checked_fn: move || store.notify_push.get(),
+                    onchange: move || crate::inbox::set_push(store, !untracked(|| store.notify_push.get())),
+                }
+                div {
+                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                    {CHANNELS_LINE}
+                }
                 div {
                     style: "display: flex; gap: 8px;",
                     Button { variant: "default", size: "xs", onclick: run_account_action, "Your Account Page" }
@@ -3933,6 +3951,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             div {
                                 style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                                 {NOTIFICATIONS_LINE}
+                            }
+                            Checkbox {
+                                label: "Email me what I miss",
+                                checked_fn: move || store.notify_email.get(),
+                                onchange: move || crate::inbox::set_email(store, !untracked(|| store.notify_email.get())),
+                            }
+                            Checkbox {
+                                label: "Notify my browsers when Pimble is closed",
+                                checked_fn: move || store.notify_push.get(),
+                                onchange: move || crate::inbox::set_push(store, !untracked(|| store.notify_push.get())),
+                            }
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                {CHANNELS_LINE}
                             }
 
                             Button {

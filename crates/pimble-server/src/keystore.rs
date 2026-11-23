@@ -180,6 +180,8 @@ impl Keystore {
         session: String,
         keys: &AccountKeys,
     ) -> io::Result<()> {
+        // Whichever account was signed in, its notice key leaves the rest.
+        self.rest_notice_key(None).await;
         let snapshot = {
             let mut data = self.data().await.write().await;
             crate::diagnostics::set_account(Some(user_id.clone()));
@@ -203,6 +205,7 @@ impl Keystore {
     /// future sign-in (even to a different account, if this store is
     /// shared) can reuse them without re-fetching envelopes.
     pub async fn sign_out(&self) -> io::Result<()> {
+        self.rest_notice_key(None).await;
         let snapshot = {
             let mut data = self.data().await.write().await;
             data.account = None;
@@ -235,6 +238,29 @@ impl Keystore {
         let data = self.data().await.read().await;
         let secret = b64_decode_32(data.account.as_ref()?.notice_secret.as_deref()?)?;
         Some(pimble_crypto::NoticeKey { secret })
+    }
+
+    /// Hand the signed-in account's notice key to the rest (wave 2: the
+    /// browser's service worker opens pushes with it), or take it back.
+    /// Best effort: a push it cannot open is shown as a plain line.
+    async fn rest_notice_key(&self, account: Option<(&str, &[u8; 32])>) {
+        if let Err(e) = self.rest.notice_key(account).await {
+            tracing::debug!("the notice key was not handed to the key rest: {}", e);
+        }
+    }
+
+    /// The signed-in account's notice key, handed to the rest again: at
+    /// every start of the notices' work, so a rest that keeps a copy has the
+    /// one in use.
+    pub async fn publish_notice_key(&self) {
+        let held = {
+            let data = self.data().await.read().await;
+            data.account.as_ref().and_then(|a| Some((a.user_id.clone(), b64_decode_32(a.notice_secret.as_deref()?)?)))
+        };
+        match held {
+            Some((user_id, secret)) => self.rest_notice_key(Some((&user_id, &secret))).await,
+            None => self.rest_notice_key(None).await,
+        }
     }
 
     /// Keep the signed-in account's notice key; nothing when nobody is

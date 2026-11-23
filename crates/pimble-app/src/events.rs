@@ -1509,8 +1509,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::NoticeReceived { notice } => {
                 crate::inbox::received(store, notice.clone());
             }
-            BackendEvent::NoticesListed { notices, on } => {
+            BackendEvent::NoticesListed { notices, on, email, push, push_key } => {
                 crate::inbox::listed(store, notices.clone(), *on);
+                crate::inbox::channels(store, *email, *push, push_key.clone());
             }
             BackendEvent::AppLink { url, activation_token } => {
                 #[cfg(feature = "native")]

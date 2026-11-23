@@ -2271,6 +2271,17 @@ pub struct Notice {
 pub struct ListNoticesResponse {
     pub notices: Vec<Notice>,
     pub on: bool,
+    /// Wave 2 (section 4): whether an item none of the account's devices saw
+    /// within fifteen minutes is emailed.
+    #[serde(default)]
+    pub email: bool,
+    /// Wave 2: whether the browsers the account subscribed are pushed.
+    #[serde(default)]
+    pub push: bool,
+    /// Wave 2: the accounts service's VAPID public key (base64url), what a
+    /// browser subscribes with; none when the service sends no pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_key: Option<String>,
 }
 
 /// Notices the person opened: acknowledged to the accounts service, so it
@@ -2284,5 +2295,28 @@ pub struct AcknowledgeNoticesRequest {
 /// receiving and deletes what is queued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetNotificationsRequest {
-    pub on: bool,
+    /// Everything: off stops sending and receiving and deletes what is queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<bool>,
+    /// Wave 2: the email fallback alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<bool>,
+    /// Wave 2: web push alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<bool>,
+}
+
+/// A browser's push subscription (wave 2), as `PushSubscription.toJSON()`
+/// gives it: handed to the accounts service under the signed-in account, and
+/// remembered here so signing out takes it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterPushRequest {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterPushRequest {
+    pub endpoint: String,
 }

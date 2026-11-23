@@ -91,6 +91,7 @@ pub fn start() {
             pimble_app::links::set_launch_link(link);
         }
         pimble_app::diagnostics_ui::notice_once(store);
+        pimble_app::inbox::browser_push::hear_clicks(store);
         route::mount_app(store, view);
     });
 }

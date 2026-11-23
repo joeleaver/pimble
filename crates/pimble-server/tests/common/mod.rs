@@ -210,6 +210,9 @@ pub struct StubAccount {
     /// (docs/NOTIFICATIONS_CONTRACT.md section 2).
     pub notice_key: Option<(String, KeyEnvelope)>,
     pub notifications_off: bool,
+    /// Wave 2's channels.
+    pub email_off: bool,
+    pub push_off: bool,
 }
 
 /// One sealed notice queued in the stub's inbox.
@@ -246,6 +249,10 @@ pub struct StubInner {
     pub inbox: Vec<StubInboxItem>,
     pub posted: Vec<(String, String)>,
     pub next_seq: u64,
+    /// The kind of every notice posted, in order (wave 2).
+    pub kinds: Vec<String>,
+    /// Push subscriptions (user id, endpoint) (wave 2).
+    pub push_subs: Vec<(String, String)>,
 }
 
 pub struct Stub {
@@ -278,6 +285,7 @@ pub fn stub_router(state: StubState) -> Router {
         .route("/api/v1/stores/{store_id}/invitations/{email}", delete(stub_delete_invitation))
         .route("/api/v1/me/notice-key", axum::routing::put(stub_put_notice_key))
         .route("/api/v1/me/notifications", axum::routing::put(stub_put_notifications))
+        .route("/api/v1/me/push", post(stub_post_push).delete(stub_delete_push))
         .route("/api/v1/inbox", get(stub_drain_inbox).delete(stub_clear_inbox))
         .route("/api/v1/inbox/ack", post(stub_ack_inbox))
         .route("/api/v1/inbox/{recipient}", post(stub_post_notice))
@@ -381,14 +389,39 @@ pub async fn stub_put_notice_key(State(state): State<StubState>, headers: Header
 pub async fn stub_put_notifications(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let mut s = state.inner.lock().unwrap();
     let user_id = s.account_of(&headers).user_id.clone();
-    let on = req["on"].as_bool().unwrap_or(true);
+    let on = req["on"].as_bool();
     if let Some(a) = s.accounts.iter_mut().find(|a| a.user_id == user_id) {
-        a.notifications_off = !on;
+        if let Some(on) = on {
+            a.notifications_off = !on;
+        }
+        if let Some(email) = req["email"].as_bool() {
+            a.email_off = !email;
+        }
+        if let Some(push) = req["push"].as_bool() {
+            a.push_off = !push;
+        }
     }
-    if !on {
+    if on == Some(false) {
         s.inbox.retain(|i| i.recipient != user_id);
     }
     Json(json!({ "on": on }))
+}
+
+pub async fn stub_post_push(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let endpoint = req["endpoint"].as_str().unwrap_or_default().to_string();
+    s.push_subs.retain(|(_, e)| *e != endpoint);
+    s.push_subs.push((user_id, endpoint));
+    Json(json!({ "subscribed": true }))
+}
+
+pub async fn stub_delete_push(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let endpoint = req["endpoint"].as_str().unwrap_or_default().to_string();
+    s.push_subs.retain(|(u, e)| !(*u == user_id && *e == endpoint));
+    Json(json!({}))
 }
 
 impl StubInner {
@@ -412,6 +445,7 @@ pub async fn stub_post_notice(
         return Err(StatusCode::FORBIDDEN);
     }
     s.posted.push((from.clone(), recipient.clone()));
+    s.kinds.push(req["kind"].as_str().unwrap_or_default().to_string());
     if s.accounts.iter().any(|a| a.user_id == recipient && a.notifications_off) {
         return Ok(Json(json!({ "id": null, "queued": false })));
     }
@@ -655,7 +689,7 @@ pub async fn stub_me(State(state): State<StubState>, headers: HeaderMap) -> Json
     let s = state.inner.lock().unwrap();
     let a = s.account_of(&headers);
     let name = if a.display_name.is_empty() { a.email.split('@').next().unwrap_or_default().to_string() } else { a.display_name.clone() };
-    Json(json!({ "id": a.user_id, "email": a.email, "display_name": a.display_name, "name": name, "notifications": !a.notifications_off }))
+    Json(json!({ "id": a.user_id, "email": a.email, "display_name": a.display_name, "name": name, "notifications": !a.notifications_off, "notification_email": !a.email_off, "notification_push": !a.push_off, "push_key": "BStubVapidPublicKey" }))
 }
 
 pub async fn stub_put_me(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -835,6 +869,8 @@ pub fn stub_account(email: &str, password: &str) -> StubAccount {
         display_name: String::new(),
         notice_key: None,
         notifications_off: false,
+        email_off: false,
+        push_off: false,
     }
 }
 
@@ -1010,6 +1046,8 @@ pub async fn spawn_env() -> Env {
             inbox: Vec::new(),
             posted: Vec::new(),
             next_seq: 0,
+            kinds: Vec::new(),
+            push_subs: Vec::new(),
         }),
         members_down: AtomicBool::new(false),
         refuse_sessions: AtomicBool::new(false),

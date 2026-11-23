@@ -79,3 +79,111 @@ self.addEventListener("fetch", (event) => {
 self.addEventListener("message", (event) => {
     if (event.data && event.data.t === "pimble-build") event.source.postMessage({ t: "pimble-build", build: BUILD });
 });
+
+// ---- Web push (docs/NOTIFICATIONS_CONTRACT.md, wave 2) ----
+//
+// The accounts service pushes `{ v, id, from, to, kind, line, seen, sealed? }`
+// (RFC 8291, opened by the browser before it reaches here). `sealed` is the
+// notice sealed to the account's notice key, which the browser's own server
+// keeps in IndexedDB as a non-extractable CryptoKey (`pimble-device`, `keys`,
+// `notice`): opened here with notice.js (concatenated in front of this file),
+// it shows who and the words around the mention, with no page open and no
+// account unlocked. Without that key (a browser that does not remember
+// itself, another account signed in here, a browser without X25519 in
+// WebCrypto), or for a push that carries no sealed notice, `line` is shown:
+// who and in which share, what an email says. Then the service is told the
+// push was shown (`seen`), so it is not emailed too.
+
+function noticeRecord() {
+    return new Promise((resolve) => {
+        let request;
+        try {
+            request = indexedDB.open("pimble-device", 1);
+        } catch (e) {
+            resolve(null);
+            return;
+        }
+        // Not there: never make it here.
+        request.onupgradeneeded = () => request.transaction.abort();
+        request.onerror = () => resolve(null);
+        request.onsuccess = () => {
+            const db = request.result;
+            try {
+                const get = db.transaction("keys", "readonly").objectStore("keys").get("notice");
+                get.onsuccess = () => { db.close(); resolve(get.result || null); };
+                get.onerror = () => { db.close(); resolve(null); };
+            } catch (e) {
+                db.close();
+                resolve(null);
+            }
+        };
+    });
+}
+
+function titleOf(notice) {
+    const who = (notice.from_name || "").trim() || "Someone";
+    if (notice.kind === "reply") return who + " replied in a discussion";
+    return notice.discussion ? who + " mentioned you in a discussion" : who + " mentioned you";
+}
+
+async function openedNotice(push) {
+    if (!push.sealed || !self.pimbleNotice) return null;
+    try {
+        const record = await noticeRecord();
+        if (!record || record.sub !== push.to) return null;
+        const plain = await self.pimbleNotice.open(push.sealed, record, push.to);
+        const notice = JSON.parse(new TextDecoder().decode(plain));
+        // The sender the service authenticated, as the server checks it.
+        return notice && notice.from === push.from ? notice : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+self.addEventListener("push", (event) => {
+    event.waitUntil((async () => {
+        let push = null;
+        try {
+            push = event.data ? event.data.json() : null;
+        } catch (e) {
+            push = null;
+        }
+        if (!push || push.v !== 1) {
+            await self.registration.showNotification("Pimble", { body: "You have a new notice.", icon: BASE + "pimble-icon.svg", data: {} });
+            return;
+        }
+        const notice = await openedNotice(push);
+        const title = notice ? titleOf(notice) : push.line || "Someone wrote to you on Pimble";
+        const options = {
+            body: notice ? notice.snippet || "" : "",
+            icon: BASE + "pimble-icon.svg",
+            // The page shows a notice it receives under the notice's id: one
+            // notification for both.
+            tag: notice ? notice.id : push.id,
+            data: { notice: notice ? notice.id : null },
+        };
+        await self.registration.showNotification(title, options);
+        if (push.seen) {
+            try {
+                await fetch(push.seen, { method: "POST", credentials: "omit" });
+            } catch (e) {
+                // Not told: it may be emailed as well.
+            }
+        }
+    })());
+});
+
+self.addEventListener("notificationclick", (event) => {
+    event.notification.close();
+    const notice = event.notification.data && event.notification.data.notice;
+    event.waitUntil((async () => {
+        const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+        const open = windows.find((w) => (new URL(w.url).pathname + "/").startsWith(BASE));
+        if (open) {
+            open.postMessage({ t: "pimble-open-notice", notice: notice || null, inbox: !notice });
+            await open.focus();
+            return;
+        }
+        await self.clients.openWindow(notice ? BASE + "?notice=" + encodeURIComponent(notice) : BASE + "?inbox");
+    })());
+});

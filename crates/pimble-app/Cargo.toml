@@ -112,6 +112,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "BlobPropertyBag", "Url", "HtmlAnchorElement",
     # Notices shown by the browser (docs/NOTIFICATIONS_CONTRACT.md section 4).
     "Notification", "NotificationOptions", "NotificationPermission",
+    # Web push (wave 2): a notification clicked opens the app at it.
+    "Location", "CustomEvent",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 

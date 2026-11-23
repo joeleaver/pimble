@@ -4128,6 +4128,11 @@ impl PimbleApiServer for RpcHandler {
         let me_keys = crate::cloud::me_keys(self.http(), &request.url, &login.session).await.map_err(to_rpc_error)?;
         let account_keys = pimble_crypto::unwrap_account_keys(&me_keys.account_key_blob, &password_keys.kek).map_err(to_rpc_error)?;
 
+        // Another account replaces the one signed in: the pushes this browser
+        // took for the old one stop first (wave 2).
+        if self.keystore.account().await.is_some_and(|a| a.user_id != login.user.id) {
+            self.notices.signing_out(self).await;
+        }
         self.keystore
             .sign_in(request.url.clone(), login.user.email.clone(), login.user.id.clone(), login.session.clone(), &account_keys)
             .await
@@ -4144,6 +4149,7 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_sign_out(&self, ext: &Extensions) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudSignOut")?;
         info!("Signing out of Pimble Cloud");
+        self.notices.signing_out(self).await;
         self.keystore.sign_out().await.map_err(to_rpc_error)?;
         // Nothing is served to anyone on a session that was given up.
         self.relay.account_changed(self).await;
@@ -4286,7 +4292,22 @@ impl PimbleApiServer for RpcHandler {
 
     async fn set_notifications(&self, ext: &Extensions, request: pimble_rpc::SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "setNotifications")?;
-        self.notices.set_on(self, request.on).await.map_err(to_rpc_error)?;
+        if let Some(on) = request.on {
+            self.notices.set_on(self, on).await.map_err(to_rpc_error)?;
+        }
+        self.notices.set_channels(self, request.email, request.push).await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn register_push(&self, ext: &Extensions, request: pimble_rpc::RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "registerPush")?;
+        self.notices.register_push(self, &request.endpoint, &request.p256dh, &request.auth).await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn unregister_push(&self, ext: &Extensions, request: pimble_rpc::UnregisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "unregisterPush")?;
+        self.notices.unregister_push(self, &request.endpoint).await.map_err(to_rpc_error)?;
         Ok(EmptyResponse {})
     }
 

@@ -1157,7 +1157,26 @@ impl PimbleClient {
 
     /// Turn notifications on or off for the signed-in account.
     pub async fn set_notifications(&self, on: bool) -> Result<()> {
-        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on }).await.map_err(rpc_error)?;
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: Some(on), email: None, push: None }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Turn one channel (wave 2: email, web push) on or off, the rest as
+    /// they are.
+    pub async fn set_notification_channels(&self, email: Option<bool>, push: Option<bool>) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: None, email, push }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// This browser subscribed to web push.
+    pub async fn register_push(&self, endpoint: String, p256dh: String, auth: String) -> Result<()> {
+        self.client.register_push(pimble_rpc::RegisterPushRequest { endpoint, p256dh, auth }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// This browser's push subscription ended.
+    pub async fn unregister_push(&self, endpoint: String) -> Result<()> {
+        self.client.unregister_push(pimble_rpc::UnregisterPushRequest { endpoint }).await.map_err(rpc_error)?;
         Ok(())
     }
 

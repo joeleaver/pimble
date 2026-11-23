@@ -184,8 +184,29 @@ pub async fn put_notice_key(http: &dyn Http, base_url: &str, session: &str, publ
     }
 }
 
-pub async fn put_notifications(http: &dyn Http, base_url: &str, session: &str, on: bool) -> Result<()> {
-    let _: serde_json::Value = put(http, &endpoint(base_url, "/api/v1/me/notifications"), session, &serde_json::json!({ "on": on })).await?;
+/// The account's switches: everything (`on`), and wave 2's channels
+/// (`email`, `push`); `None` leaves one as it is.
+pub async fn put_notifications(http: &dyn Http, base_url: &str, session: &str, on: Option<bool>, email: Option<bool>, push: Option<bool>) -> Result<()> {
+    let mut body = serde_json::Map::new();
+    for (name, value) in [("on", on), ("email", email), ("push", push)] {
+        if let Some(value) = value {
+            body.insert(name.into(), value.into());
+        }
+    }
+    let _: serde_json::Value = put(http, &endpoint(base_url, "/api/v1/me/notifications"), session, &body).await?;
+    Ok(())
+}
+
+/// A browser's push subscription, kept by the accounts service (wave 2).
+pub async fn push_subscribe(http: &dyn Http, base_url: &str, session: &str, endpoint_url: &str, p256dh: &str, auth: &str) -> Result<()> {
+    let body = serde_json::json!({ "endpoint": endpoint_url, "keys": { "p256dh": p256dh, "auth": auth } });
+    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/push"), Some(session), &body).await?;
+    Ok(())
+}
+
+pub async fn push_unsubscribe(http: &dyn Http, base_url: &str, session: &str, endpoint_url: &str) -> Result<()> {
+    let url = endpoint(base_url, "/api/v1/me/push");
+    let _: serde_json::Value = finish(&url, send(http, Method::Delete, &url, Some(session), Some(json_of(&serde_json::json!({ "endpoint": endpoint_url })))).await?)?;
     Ok(())
 }
 
@@ -197,8 +218,10 @@ pub struct PostedNotice {
     pub queued: bool,
 }
 
-pub async fn post_notice(http: &dyn Http, base_url: &str, session: &str, recipient: &str, store_id: &str, root: Option<&str>, sealed: &str) -> Result<PostedNotice> {
-    let body = serde_json::json!({ "store_id": store_id, "root": root, "sealed": sealed });
+/// `kind` (wave 2) is the one thing an email or a push says about the notice
+/// besides who and where: `"mention"` or `"reply"`.
+pub async fn post_notice(http: &dyn Http, base_url: &str, session: &str, recipient: &str, store_id: &str, root: Option<&str>, sealed: &str, kind: &str) -> Result<PostedNotice> {
+    let body = serde_json::json!({ "store_id": store_id, "root": root, "sealed": sealed, "kind": kind });
     post(http, &endpoint(base_url, &format!("/api/v1/inbox/{recipient}")), Some(session), &body).await
 }
 
@@ -676,6 +699,15 @@ pub struct MeView {
     /// them says nothing, and they are on.
     #[serde(default = "on")]
     pub notifications: bool,
+    /// Wave 2: the email fallback; on unless turned off.
+    #[serde(default = "on")]
+    pub notification_email: bool,
+    /// Wave 2: web push; on unless turned off.
+    #[serde(default = "on")]
+    pub notification_push: bool,
+    /// Wave 2: the service's VAPID public key, none when it sends no pushes.
+    #[serde(default)]
+    pub push_key: Option<String>,
 }
 
 fn on() -> bool {

@@ -102,6 +102,7 @@ async fn a_mention_reaches_the_member_once_sealed_and_opened_by_their_server() {
     let second = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("the second notice").expect("a notice").expect("parses");
     assert_eq!((second.node, second.anchor.as_deref()), (fx.leaf, Some("abc123")));
     assert_eq!(posted(&env, &alice_id, &bob_id), 2);
+    assert!(env.stub.inner.lock().unwrap().kinds.iter().all(|k| k == "mention"), "the kind goes with each notice (wave 2)");
 
     // Bob opens them: acknowledged, the service keeps them no longer.
     assert_eq!(queued_for(&env, &bob_id), 2);
@@ -113,6 +114,22 @@ async fn a_mention_reaches_the_member_once_sealed_and_opened_by_their_server() {
     append(&alice2, fx.store_id, fx.inside, &format!("[@Carol](pimble-person:{carol_id}?m=c1)")).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(posted(&env, &alice_id, &carol_id), 0);
+
+    // Wave 2: the channels and a browser's push subscription go through the
+    // device's server to the service; signing out takes the subscription back.
+    let listed = bob.list_notices().await.unwrap();
+    assert!(listed.email && listed.push, "on unless turned off");
+    assert_eq!(listed.push_key.as_deref(), Some("BStubVapidPublicKey"));
+    bob.set_notification_channels(Some(false), None).await.unwrap();
+    let listed = bob.list_notices().await.unwrap();
+    assert!(!listed.email && listed.push && listed.on);
+    assert!(env.stub.inner.lock().unwrap().accounts.iter().any(|a| a.user_id == bob_id && a.email_off && !a.push_off));
+    bob.register_push("https://fcm.googleapis.com/fcm/send/bob".into(), "p256dh".into(), "auth".into()).await.unwrap();
+    bob.register_push("https://fcm.googleapis.com/fcm/send/bob2".into(), "p256dh".into(), "auth".into()).await.unwrap();
+    bob.unregister_push("https://fcm.googleapis.com/fcm/send/bob2".into()).await.unwrap();
+    assert_eq!(env.stub.inner.lock().unwrap().push_subs, vec![(bob_id.clone(), "https://fcm.googleapis.com/fcm/send/bob".to_string())]);
+    bob.cloud_sign_out().await.unwrap();
+    assert!(env.stub.inner.lock().unwrap().push_subs.is_empty(), "signing out takes the browser's subscription back");
 
     // Alice turns notifications off: nothing more goes from her device.
     alice2.set_notifications(false).await.unwrap();

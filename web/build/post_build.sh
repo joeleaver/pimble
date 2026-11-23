@@ -10,8 +10,9 @@
 #    index.html, which hub.js reads), so a page always starts the worker of
 #    its own build, whatever a cache kept.
 # 2. sw.js, the service worker that keeps this build's own files for a page
-#    opened with no network, is written from sw.template.js with this build's
-#    id and the list of its files.
+#    opened with no network and shows pushed notices, is written from
+#    notice.js and sw.template.js with this build's id and the list of its
+#    files.
 #
 # POSIX sh and coreutils only: the deploy's trunk buildpack runs it too.
 set -eu
@@ -36,5 +37,6 @@ fi
 files=$(cd "$dir" && find . -type f ! -name sw.js | sed 's|^\./||' | LC_ALL=C sort)
 build=$(cd "$dir" && for f in $files; do printf '%s\n' "$f"; cat "$f"; done | sha256sum | cut -c1-16)
 list=$(for f in $files; do printf '"%s%s",' "$base" "$f"; done)
-sed -e "s|__PIMBLE_BUILD__|$build|" -e "s|\"__PIMBLE_FILES__\"|${list%,}|" -e "s|__PIMBLE_BASE__|$base|g" "$here/sw.template.js" > "$dir/sw.js"
+# notice.js (opening a pushed notice, wave 2) goes in front of it.
+{ cat "$here/notice.js"; sed -e "s|__PIMBLE_BUILD__|$build|" -e "s|\"__PIMBLE_FILES__\"|${list%,}|" -e "s|__PIMBLE_BASE__|$base|g" "$here/sw.template.js"; } > "$dir/sw.js"
 echo "post_build: build $build, $(echo "$files" | wc -l) files kept for offline"

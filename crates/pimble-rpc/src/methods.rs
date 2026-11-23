@@ -387,6 +387,15 @@ pub trait PimbleApi {
     #[method(name = "setNotifications", with_extensions)]
     async fn set_notifications(&self, request: SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    /// A browser subscribed to web push (wave 2): the subscription goes to
+    /// the accounts service, and is taken back when the account signs out.
+    #[method(name = "registerPush", with_extensions)]
+    async fn register_push(&self, request: RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// A browser's push subscription ended.
+    #[method(name = "unregisterPush", with_extensions)]
+    async fn unregister_push(&self, request: UnregisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// Hear each notice as it arrives, opened.
     #[subscription(name = "subscribeNotices" => "noticeReceived", unsubscribe = "unsubscribeNotices", item = Notice, with_extensions)]
     async fn subscribe_notices(&self) -> SubscriptionResult;

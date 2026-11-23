@@ -54,6 +54,53 @@ pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool)> {
 pub(crate) fn listed(store: AppStore, notices: Vec<Notice>, on: bool) {
     store.notices.set(notices);
     store.notifications_on.set(on);
+    open_wanted(store);
+}
+
+/// Wave 2's channels, as the server last heard them from the accounts
+/// service; in the browser, this browser's push subscription follows them.
+pub(crate) fn channels(store: AppStore, email: bool, push: bool, push_key: Option<String>) {
+    store.notify_email.set(email);
+    store.notify_push.set(push);
+    // Nobody signed in lists no key: the server answers its empty list.
+    let on = untracked(|| store.notifications_on.get());
+    browser_push::follow(store, on && push, push_key);
+}
+
+/// The email fallback's switch (wave 2), for the account.
+pub(crate) fn set_email(store: AppStore, on: bool) {
+    store.notify_email.set(on);
+    store.send(BackendCommand::SetNotificationChannels { email: Some(on), push: None });
+}
+
+/// Web push's switch (wave 2), for the account.
+pub(crate) fn set_push(store: AppStore, on: bool) {
+    store.notify_push.set(on);
+    store.send(BackendCommand::SetNotificationChannels { email: None, push: Some(on) });
+    if on {
+        ask_permission();
+    }
+}
+
+thread_local! {
+    /// A notice to open once it is listed: the one a pushed notification
+    /// that was clicked names (wave 2).
+    static WANTED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Open the notice `id` now if it is held, else as soon as it arrives.
+pub fn open_when_held(store: AppStore, id: String) {
+    WANTED.with(|w| *w.borrow_mut() = Some(id));
+    open_wanted(store);
+}
+
+fn open_wanted(store: AppStore) {
+    let Some(id) = WANTED.with(|w| w.borrow().clone()) else { return };
+    let held = untracked(|| store.notices.with(|all| all.iter().find(|n| n.id == id).cloned()));
+    if let Some(notice) = held {
+        WANTED.with(|w| *w.borrow_mut() = None);
+        open(store, &notice);
+    }
 }
 
 /// A notice arrived: it heads the list, and unless it was opened already
@@ -64,6 +111,10 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
         return;
     }
     store.notices.update(|all| all.insert(0, notice.clone()));
+    if WANTED.with(|w| w.borrow().as_deref() == Some(notice.id.as_str())) {
+        open_wanted(store);
+        return;
+    }
     if untracked(|| is_read(store, &notice)) {
         return;
     }
@@ -176,12 +227,137 @@ fn show_system_notification(_store: AppStore, _notice: &Notice) {}
 #[cfg(all(feature = "web", not(feature = "native")))]
 fn ask_permission() {
     if web_sys::Notification::permission() == web_sys::NotificationPermission::Default {
-        let _ = web_sys::Notification::request_permission();
+        if let Ok(asked) = web_sys::Notification::request_permission() {
+            // Allowed: the next listing subscribes this browser to pushes.
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = wasm_bindgen_futures::JsFuture::from(asked).await;
+                if web_sys::Notification::permission() == web_sys::NotificationPermission::Granted {
+                    if let Some(store) = browser_push::store() {
+                        store.send(BackendCommand::ListNotices);
+                    }
+                }
+            });
+        }
     }
 }
 
 #[cfg(not(all(feature = "web", not(feature = "native"))))]
 fn ask_permission() {}
+
+// ── Web push in the browser (wave 2) ──────────────────────────────────────
+
+/// This browser's push subscription (docs/NOTIFICATIONS_CONTRACT.md, wave 2),
+/// made through hub.js (`PimbleHub.pushSubscribe`) and handed to the
+/// browser's own server, which gives it to the accounts service under the
+/// signed-in account and takes it back at sign-out. The service worker shows
+/// what arrives (build/sw.template.js).
+#[cfg(all(feature = "web", not(feature = "native")))]
+pub mod browser_push {
+    use super::*;
+    use wasm_bindgen::{JsCast, JsValue};
+
+    thread_local! {
+        static STORE: std::cell::Cell<Option<AppStore>> = const { std::cell::Cell::new(None) };
+        /// What was registered from this page: (key, endpoint).
+        static REGISTERED: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn store() -> Option<AppStore> {
+        STORE.with(|s| s.get())
+    }
+
+    fn hub_call(name: &str, arg: Option<&JsValue>) -> Option<js_sys::Promise> {
+        let window = web_sys::window()?;
+        let hub = js_sys::Reflect::get(&window, &JsValue::from_str("PimbleHub")).ok().filter(|h| h.is_object())?;
+        let f: js_sys::Function = js_sys::Reflect::get(&hub, &JsValue::from_str(name)).ok()?.dyn_into().ok()?;
+        let answer = match arg {
+            Some(arg) => f.call1(&hub, arg),
+            None => f.call0(&hub),
+        };
+        answer.ok()?.dyn_into().ok()
+    }
+
+    fn field(value: &JsValue, name: &str) -> Option<String> {
+        js_sys::Reflect::get(value, &JsValue::from_str(name)).ok()?.as_string()
+    }
+
+    /// Subscribed when `wanted` (notifications and push on, signed in) and the
+    /// service sends pushes, unsubscribed otherwise.
+    pub(crate) fn follow(store: AppStore, wanted: bool, push_key: Option<String>) {
+        STORE.with(|s| s.set(Some(store)));
+        match push_key.filter(|_| wanted) {
+            Some(key) => {
+                if web_sys::Notification::permission() != web_sys::NotificationPermission::Granted {
+                    return;
+                }
+                if REGISTERED.with(|r| r.borrow().as_ref().is_some_and(|(k, _)| *k == key)) {
+                    return;
+                }
+                let Some(promise) = hub_call("pushSubscribe", Some(&JsValue::from_str(&key))) else { return };
+                wasm_bindgen_futures::spawn_local(async move {
+                    match wasm_bindgen_futures::JsFuture::from(promise).await {
+                        Ok(sub) if sub.is_object() => {
+                            let (Some(endpoint), Some(p256dh), Some(auth)) = (field(&sub, "endpoint"), field(&sub, "p256dh"), field(&sub, "auth")) else { return };
+                            REGISTERED.with(|r| *r.borrow_mut() = Some((key, endpoint.clone())));
+                            store.send(BackendCommand::RegisterPush { endpoint, p256dh, auth });
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::info!("This browser did not subscribe to pushes: {e:?}"),
+                    }
+                });
+            }
+            None => {
+                if !wanted {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Some(endpoint) = end().await {
+                            store.send(BackendCommand::UnregisterPush { endpoint });
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// End this browser's push subscription; its endpoint, when it had one.
+    /// Signing out calls it before the server takes the subscription back.
+    pub async fn end() -> Option<String> {
+        REGISTERED.with(|r| *r.borrow_mut() = None);
+        let promise = hub_call("pushUnsubscribe", None)?;
+        wasm_bindgen_futures::JsFuture::from(promise).await.ok()?.as_string()
+    }
+
+    /// What the page was opened for by a notification or an email: `?notice=`
+    /// (a pushed notice, opened once it is listed) or `?inbox` (the Inbox);
+    /// and, while it is open, a notification clicked in another tab or with
+    /// no notice inside (`pimble-open-notice` from hub.js).
+    pub fn hear_clicks(store: AppStore) {
+        STORE.with(|s| s.set(Some(store)));
+        let Some(window) = web_sys::window() else { return };
+        let search = window.location().search().unwrap_or_default();
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes()).into_owned().collect();
+        if let Some((_, id)) = pairs.iter().find(|(k, _)| k == "notice") {
+            open_when_held(store, id.clone());
+        } else if pairs.iter().any(|(k, _)| k == "inbox") {
+            open_inbox(store);
+        }
+        let heard = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+            let detail = event.detail();
+            match field(&detail, "notice") {
+                Some(id) => open_when_held(store, id),
+                None => open_inbox(store),
+            }
+        });
+        let _ = window.add_event_listener_with_callback("pimble-open-notice", heard.as_ref().unchecked_ref());
+        heard.forget();
+    }
+}
+
+#[cfg(not(all(feature = "web", not(feature = "native"))))]
+pub mod browser_push {
+    use super::*;
+
+    pub(crate) fn follow(_store: AppStore, _wanted: bool, _push_key: Option<String>) {}
+}
 
 // ── The Inbox's rows ──────────────────────────────────────────────────────
 

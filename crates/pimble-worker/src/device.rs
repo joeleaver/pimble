@@ -8,6 +8,14 @@
 //! - the **keystore**, the signed-in account's unwrapped keys and the store
 //!   keys the server holds ([`DeviceKeyRest`], the worker's `KeyRest`).
 //!
+//! - the **notice key** (docs/NOTIFICATIONS_CONTRACT.md, wave 2): the
+//!   signed-in account's X25519 notice secret imported as a non-extractable
+//!   WebCrypto key, `{ sub, key, public }`, which the service worker opens
+//!   pushed notices with while no page is open. Not sealed under the device
+//!   key (the service worker could not open it then), but as unreadable to
+//!   script as the device key itself: WebCrypto derives with it and never
+//!   gives it out. Kept only in a remembered browser; signing out deletes it.
+//!
 //! Forgetting deletes the device key first, so what OPFS and IndexedDB still
 //! hold is unreadable even if clearing them fails or is interrupted.
 //!
@@ -29,6 +37,7 @@ const STORE: &str = "keys";
 const DEVICE: &str = "device";
 const DISK: &str = "disk";
 const KEYSTORE: &str = "keystore";
+const NOTICE: &str = "notice";
 
 fn failed(what: &str, e: JsValue) -> io::Error {
     let message = Reflect::get(&e, &JsValue::from_str("message")).ok().and_then(|m| m.as_string()).or_else(|| e.as_string()).unwrap_or_else(|| format!("{e:?}"));
@@ -242,5 +251,40 @@ impl pimble_host::KeyRest for DeviceKeyRest {
 
     fn describe(&self) -> String {
         "IndexedDB, sealed under this browser's device key".to_string()
+    }
+
+    async fn notice_key(&self, account: Option<(&str, &[u8; 32])>) -> io::Result<()> {
+        let Some((sub, secret)) = account else { return delete(NOTICE).await };
+        // Only in a browser that remembers itself: one that does not keeps
+        // no key at rest, and its pushes show the plain line.
+        if !is_remembered().await {
+            return Ok(());
+        }
+        // PKCS#8 for an X25519 private key: the fixed prefix, then the 32
+        // bytes (RFC 8410).
+        let mut pkcs8 = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20];
+        pkcs8.extend_from_slice(secret);
+        let algorithm = Object::new();
+        let _ = Reflect::set(&algorithm, &JsValue::from_str("name"), &JsValue::from_str("X25519"));
+        let usages = Array::of1(&JsValue::from_str("deriveBits"));
+        let imported = match subtle()?.import_key_with_object("pkcs8", &Uint8Array::from(&pkcs8[..]), &algorithm, false, &usages) {
+            Ok(promise) => JsFuture::from(promise).await,
+            Err(e) => Err(e),
+        };
+        let key = match imported {
+            Ok(key) => key,
+            Err(e) => {
+                // A browser without X25519 in WebCrypto: its pushes show the
+                // plain line (the contract's trade-off).
+                tracing::info!("{}; pushed notices will show without their text", failed("this browser cannot keep the notice key", e));
+                return delete(NOTICE).await;
+            }
+        };
+        let public = pimble_crypto::NoticeKey { secret: *secret }.public();
+        let record = Object::new();
+        let _ = Reflect::set(&record, &JsValue::from_str("sub"), &JsValue::from_str(sub));
+        let _ = Reflect::set(&record, &JsValue::from_str("key"), &key);
+        let _ = Reflect::set(&record, &JsValue::from_str("public"), &JsValue::from_str(&public));
+        put(NOTICE, &record.into()).await
     }
 }
