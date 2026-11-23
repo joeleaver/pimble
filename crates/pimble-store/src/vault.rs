@@ -59,8 +59,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use pimble_core::{BlobId, NodeId, StoreId, StoreKind, StoreManifest};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use pimble_host::{Disk, TmpName};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -106,11 +105,8 @@ fn log_limit() -> u64 {
 /// Write a file atomically: write to a `.tmp` sibling, then rename into
 /// place. Mirrors `local::atomic_write` (not reused directly: that function
 /// is private to this crate's `local` module).
-async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, data).await?;
-    fs::rename(&tmp_path, path).await?;
-    Ok(())
+async fn atomic_write(disk: &Disk, path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    disk.write_atomic(path, data, TmpName::Extension).await
 }
 
 /// Which part of a blob sealed in parts an entry or a snapshot blob is
@@ -391,11 +387,11 @@ impl VaultDoc {
     /// log record (a crash mid-append): it is dropped, with a warning, and
     /// the log file is rewritten without it so the next append's offset
     /// arithmetic (based on the file's length) stays correct.
-    async fn load(dir: PathBuf) -> Result<Self> {
+    async fn load(disk: &Disk, dir: PathBuf) -> Result<Self> {
         let snapshot = {
             let snapshot_path = dir.join("snapshot");
-            if snapshot_path.exists() {
-                let bytes = fs::read(&snapshot_path).await?;
+            if disk.exists(&snapshot_path).await {
+                let bytes = disk.read(&snapshot_path).await?;
                 let decoded = if bytes.len() >= 8 { StoredSnapshot::decode(&bytes) } else { None };
                 if decoded.is_none() {
                     warn!("Vault snapshot {:?} is too short or malformed; ignoring it", snapshot_path);
@@ -409,8 +405,8 @@ impl VaultDoc {
         let mut head = snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(0);
         let mut entries = Vec::new();
         let log_path = dir.join("log");
-        if log_path.exists() {
-            let bytes = fs::read(&log_path).await?;
+        if disk.exists(&log_path).await {
+            let bytes = disk.read(&log_path).await?;
             let mut offset = 0usize;
             let mut truncated = false;
             loop {
@@ -464,12 +460,12 @@ impl VaultDoc {
                     "Vault log {:?} has a truncated trailing record ({} of {} bytes read); dropping it",
                     log_path, offset, bytes.len()
                 );
-                atomic_write(&log_path, &bytes[..offset]).await?;
+                atomic_write(disk, &log_path, &bytes[..offset]).await?;
             }
         }
 
         let keys_path = dir.join(Self::KEYS_FILE);
-        let keys = match fs::read_to_string(&keys_path).await {
+        let keys = match disk.read_to_string(&keys_path).await {
             Ok(json) => {
                 let parsed = DocKeys::parse(json);
                 if parsed.is_none() {
@@ -480,7 +476,7 @@ impl VaultDoc {
             Err(_) => None,
         };
 
-        let reports = Self::load_reports(&dir.join(Self::REPORTS_FILE)).await;
+        let reports = Self::load_reports(disk, &dir.join(Self::REPORTS_FILE)).await;
 
         Ok(Self { dir, entries, snapshot, head, keys, reports })
     }
@@ -491,8 +487,8 @@ impl VaultDoc {
     /// The `reports` file, or nothing when it is absent or does not parse
     /// (with a warning): every device reports again at its next connect, so
     /// a lost file costs one round of reports and never the document.
-    async fn load_reports(path: &Path) -> HashMap<String, StoredReport> {
-        let Ok(json) = fs::read_to_string(path).await else { return HashMap::new() };
+    async fn load_reports(disk: &Disk, path: &Path) -> HashMap<String, StoredReport> {
+        let Ok(json) = disk.read_to_string(path).await else { return HashMap::new() };
         let records: HashMap<String, ReportRecord> = match serde_json::from_str(&json) {
             Ok(records) => records,
             Err(e) => {
@@ -509,23 +505,19 @@ impl VaultDoc {
             .collect()
     }
 
-    async fn save_reports(&self) -> Result<()> {
+    async fn save_reports(&self, disk: &Disk) -> Result<()> {
         let records: HashMap<&str, ReportRecord> = self
             .reports
             .iter()
             .map(|(device, report)| (device.as_str(), ReportRecord { blob: STANDARD.encode(&report.blob), at: report.at, account: report.account.clone() }))
             .collect();
-        atomic_write(&self.dir.join(Self::REPORTS_FILE), serde_json::to_vec(&records)?).await?;
+        atomic_write(disk, &self.dir.join(Self::REPORTS_FILE), serde_json::to_vec(&records)?).await?;
         Ok(())
     }
 
     /// The bytes of one already-recorded log entry, read fresh from disk.
-    async fn read_entry(&self, entry: &LogEntryMeta) -> Result<Vec<u8>> {
-        let mut file = fs::File::open(self.dir.join("log")).await?;
-        file.seek(std::io::SeekFrom::Start(entry.offset + entry.header_len())).await?;
-        let mut buf = vec![0u8; entry.len as usize];
-        file.read_exact(&mut buf).await?;
-        Ok(buf)
+    async fn read_entry(&self, disk: &Disk, entry: &LogEntryMeta) -> Result<Vec<u8>> {
+        Ok(disk.read_range(self.dir.join("log"), entry.offset + entry.header_len(), entry.len as usize).await?)
     }
 
     /// Every log entry's total on-disk size (header plus blob).
@@ -544,6 +536,8 @@ impl VaultDoc {
 pub struct VaultStore {
     pub id: StoreId,
     pub path: PathBuf,
+    /// The disk the store is on (docs/ONE_CODEBASE_CONTRACT.md seam B).
+    disk: Disk,
     manifest: StoreManifest,
     docs: HashMap<String, VaultDoc>,
     /// The published scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5),
@@ -567,15 +561,21 @@ impl VaultStore {
     /// same id as an existing local store). Refusing an id already open is
     /// the caller's job (`StoreManager`).
     pub async fn create(path: impl AsRef<Path>, name: impl Into<String>, store_id: Option<StoreId>) -> Result<Self> {
+        Self::create_on(&Disk::default(), path, name, store_id).await
+    }
+
+    /// [`VaultStore::create`] on `disk`.
+    pub async fn create_on(disk: &Disk, path: impl AsRef<Path>, name: impl Into<String>, store_id: Option<StoreId>) -> Result<Self> {
+        let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
         let name = name.into();
 
-        if path.exists() {
+        if disk.exists(&path).await {
             return Err(StoreError::StoreExists(path.display().to_string()));
         }
 
-        fs::create_dir_all(&path).await?;
-        fs::create_dir(path.join(Self::VAULT_DIR)).await?;
+        disk.create_dir_all(&path).await?;
+        disk.create_dir(path.join(Self::VAULT_DIR)).await?;
 
         // `root_node_id` is meaningless for a vault (there is no tree here),
         // but `StoreManifest` always carries one; a fresh id is as good as
@@ -586,22 +586,28 @@ impl VaultStore {
         }
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        disk.write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
 
         info!("Created vault store '{}' ({}) at {:?}", name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, manifest, docs: HashMap::new(), scopes: ScopesFile::default(), pending: HashMap::new() })
+        Ok(Self { id: manifest.id, path, disk, manifest, docs: HashMap::new(), scopes: ScopesFile::default(), pending: HashMap::new() })
     }
 
     /// Open an existing vault store, loading every document under
     /// `<path>/vault/`.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_on(&Disk::default(), path).await
+    }
+
+    /// [`VaultStore::open`] on `disk`.
+    pub async fn open_on(disk: &Disk, path: impl AsRef<Path>) -> Result<Self> {
+        let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
 
         let manifest_path = path.join(Self::MANIFEST_FILE);
-        if !manifest_path.exists() {
+        if !disk.exists(&manifest_path).await {
             return Err(StoreError::InvalidPath(format!("No manifest found at {}", manifest_path.display())));
         }
-        let manifest_json = fs::read_to_string(&manifest_path).await?;
+        let manifest_json = disk.read_to_string(&manifest_path).await?;
         let manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
         if manifest.kind != StoreKind::Vault {
             return Err(StoreError::InvalidOperation(format!(
@@ -611,12 +617,11 @@ impl VaultStore {
 
         let mut docs = HashMap::new();
         let vault_dir = path.join(Self::VAULT_DIR);
-        if vault_dir.exists() {
-            let mut entries = fs::read_dir(&vault_dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                if entry.file_type().await?.is_dir() {
-                    let doc_id = entry.file_name().to_string_lossy().into_owned();
-                    let doc = VaultDoc::load(entry.path()).await?;
+        if disk.exists(&vault_dir).await {
+            for entry in disk.list(&vault_dir).await? {
+                if entry.is_dir {
+                    let doc_id = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let doc = VaultDoc::load(&disk, entry.path).await?;
                     docs.insert(doc_id, doc);
                 }
             }
@@ -627,7 +632,7 @@ impl VaultStore {
         // and failing the open over authorization metadata would take the
         // whole store away from its owner too.
         let scopes_path = path.join(Self::SCOPES_FILE);
-        let scopes = match fs::read_to_string(&scopes_path).await {
+        let scopes = match disk.read_to_string(&scopes_path).await {
             Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
                 warn!("Vault scopes file {:?} could not be parsed ({}); starting with no scopes", scopes_path, e);
                 ScopesFile::default()
@@ -636,7 +641,7 @@ impl VaultStore {
         };
 
         info!("Opened vault store '{}' ({}) from {:?}", manifest.name, manifest.id, path);
-        Ok(Self { id: manifest.id, path, manifest, docs, scopes, pending: HashMap::new() })
+        Ok(Self { id: manifest.id, path, disk, manifest, docs, scopes, pending: HashMap::new() })
     }
 
     pub fn manifest(&self) -> &StoreManifest {
@@ -794,7 +799,7 @@ impl VaultStore {
     async fn write_scopes(&mut self) -> Result<()> {
         self.scopes.v = ScopesFile::VERSION;
         let json = serde_json::to_string_pretty(&self.scopes)?;
-        atomic_write(&self.path.join(Self::SCOPES_FILE), json).await?;
+        atomic_write(&self.disk, &self.path.join(Self::SCOPES_FILE), json).await?;
         Ok(())
     }
 
@@ -812,8 +817,8 @@ impl VaultStore {
         let keys = DocKeys::parse(json).ok_or_else(|| StoreError::InvalidOperation(format!("document {}: a keys record needs a dek_id", doc_id)))?;
         let dir = self.doc_dir(doc_id);
         let doc = self.docs.entry(doc_id.to_string()).or_insert_with(|| VaultDoc::empty(dir));
-        fs::create_dir_all(&doc.dir).await?;
-        atomic_write(&doc.dir.join(VaultDoc::KEYS_FILE), &keys.json).await?;
+        self.disk.create_dir_all(&doc.dir).await?;
+        atomic_write(&self.disk, &doc.dir.join(VaultDoc::KEYS_FILE), &keys.json).await?;
         doc.keys = Some(keys);
         Ok(())
     }
@@ -842,9 +847,9 @@ impl VaultStore {
             return Err(StoreError::VaultSnapshotRequired);
         }
 
-        fs::create_dir_all(&doc.dir).await?;
+        self.disk.create_dir_all(&doc.dir).await?;
         let log_path = doc.dir.join("log");
-        let mut offset = fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(0);
+        let mut offset = self.disk.metadata(&log_path).await.map(|m| m.len).unwrap_or(0);
 
         let mut records = Vec::with_capacity(size as usize);
         let mut metas = Vec::with_capacity(blobs.len());
@@ -859,9 +864,7 @@ impl VaultStore {
             landed.push(StoredEntry { seq, blob, part });
         }
 
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&log_path).await?;
-        file.write_all(&records).await?;
-        file.flush().await?;
+        self.disk.append(&log_path, &records).await?;
 
         doc.entries.extend(metas);
         doc.head = seq;
@@ -973,7 +976,7 @@ impl VaultStore {
         }
         let mut updates = Vec::new();
         for entry in &doc.entries[start..] {
-            updates.push(StoredEntry { seq: entry.seq, blob: doc.read_entry(entry).await?, part: entry.part });
+            updates.push(StoredEntry { seq: entry.seq, blob: doc.read_entry(&self.disk, entry).await?, part: entry.part });
         }
 
         Ok(Fetched { snapshot, updates, head: doc.head })
@@ -1035,8 +1038,8 @@ impl VaultStore {
             }
         }
 
-        fs::create_dir_all(&doc.dir).await?;
-        atomic_write(&doc.dir.join("snapshot"), snapshot.encode()).await?;
+        self.disk.create_dir_all(&doc.dir).await?;
+        atomic_write(&self.disk, &doc.dir.join("snapshot"), snapshot.encode()).await?;
         doc.snapshot = Some(snapshot);
 
         // Drop every entry at or below the new snapshot, rewriting the log
@@ -1047,12 +1050,12 @@ impl VaultStore {
             let mut new_log = Vec::new();
             let mut new_entries = Vec::with_capacity(keep.len());
             for entry in &keep {
-                let bytes = doc.read_entry(entry).await?;
+                let bytes = doc.read_entry(&self.disk, entry).await?;
                 let offset = new_log.len() as u64;
                 new_log.extend_from_slice(&LogEntryMeta::record(entry.seq, entry.part, &bytes));
                 new_entries.push(LogEntryMeta { seq: entry.seq, offset, len: bytes.len() as u32, part: entry.part });
             }
-            atomic_write(&doc.dir.join("log"), &new_log).await?;
+            atomic_write(&self.disk, &doc.dir.join("log"), &new_log).await?;
             doc.entries = new_entries;
         }
 
@@ -1111,7 +1114,7 @@ impl VaultStore {
             let Some(oldest) = doc.reports.values().min_by_key(|r| r.at).map(|r| r.device.clone()) else { break };
             doc.reports.remove(&oldest);
         }
-        doc.save_reports().await
+        doc.save_reports(&self.disk).await
     }
 
     /// Every device's latest report of `doc_id` (none for a document this
@@ -1133,6 +1136,7 @@ pub struct VaultDocSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_host::disk::testfs as tfs;
 
     /// A fetch of whole blobs only, as tuples.
     fn flat(fetched: Fetched) -> (Option<(u64, Vec<u8>)>, Vec<(u64, Vec<u8>)>, u64) {
@@ -1244,9 +1248,9 @@ mod tests {
             store.append("doc", b"one".to_vec()).await.unwrap();
         }
         let log_path = path.join("vault").join("doc").join("log");
-        let mut bytes = std::fs::read(&log_path).unwrap();
+        let mut bytes = tfs::read(&log_path).unwrap();
         bytes.extend_from_slice(&LogEntryMeta::record(2, Some(part(0, 2, group)), b"first half"));
-        std::fs::write(&log_path, &bytes).unwrap();
+        tfs::write(&log_path, &bytes).unwrap();
         let mut store = VaultStore::open(&path).await.unwrap();
         assert_eq!(flat(store.fetch("doc", 0).await.unwrap()), (None, vec![(1, b"one".to_vec())], 1));
         assert_eq!(store.append("doc", b"two".to_vec()).await.unwrap(), 2, "the number is handed out again");
@@ -1379,11 +1383,11 @@ mod tests {
         // Simulate a crash mid-write: append a truncated record's header (a
         // seq/len with no, or partial, blob bytes) directly to the log file.
         let log_path = path.join("vault").join("tree").join("log");
-        let mut bytes = std::fs::read(&log_path).unwrap();
+        let mut bytes = tfs::read(&log_path).unwrap();
         bytes.extend_from_slice(&2u64.to_le_bytes());
         bytes.extend_from_slice(&100u32.to_le_bytes()); // claims 100 bytes of blob
         bytes.extend_from_slice(b"short"); // far fewer than declared
-        std::fs::write(&log_path, &bytes).unwrap();
+        tfs::write(&log_path, &bytes).unwrap();
 
         let store = VaultStore::open(&path).await.unwrap();
         let (_, updates, head) = flat(store.fetch("tree", 0).await.unwrap());
@@ -1391,7 +1395,7 @@ mod tests {
         assert_eq!(head, 1);
 
         // And the log file on disk was rewritten without the truncated tail.
-        let rewritten = std::fs::read(&log_path).unwrap();
+        let rewritten = tfs::read(&log_path).unwrap();
         assert!(rewritten.len() < bytes.len());
     }
 

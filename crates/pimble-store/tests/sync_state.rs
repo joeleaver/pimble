@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use pimble_core::{StoreAccess, StoreId};
 use pimble_store::{sync_state, LocalStore, SyncConfig, SyncMode};
 use serde_json::{json, Value};
+use pimble_host::disk::testfs as tfs;
+use pimble_host::Disk;
 use tempfile::TempDir;
 
 /// A computer's layout: the data directory's `stores/` (the state root) and
@@ -31,7 +33,7 @@ async fn layout() -> Layout {
     let data = dir.path().join("pimble");
     let state_root = data.join("stores");
     let state_dir = state_root.join(store_id.to_string());
-    std::fs::create_dir_all(&state_dir).unwrap();
+    tfs::create_dir_all(&state_dir).unwrap();
     Layout { store_path, state_dir, devices: data.join("devices.json"), state_root, store_id, _dir: dir }
 }
 
@@ -49,15 +51,15 @@ fn write_folder_link(l: &Layout, mode: SyncMode) {
         read_only_roots: Vec::new(),
         comment_roots: Vec::new(),
     };
-    std::fs::write(l.store_path.join("sync.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    tfs::write(l.store_path.join("sync.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 }
 
 fn write(path: &Path, value: &Value) {
-    std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    tfs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
 fn read(path: &Path) -> Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))).unwrap()
+    serde_json::from_slice(&tfs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))).unwrap()
 }
 
 fn link_json() -> Value {
@@ -109,7 +111,7 @@ fn assert_vault_record(l: &Layout) {
     assert_eq!(record["convergence"], convergence_json(), "convergence.json, as it was");
     assert_eq!(record["device"], device_entry(), "this store's entry of devices.json, as it was");
     for (name, section) in [("link.json", link_json()), ("vault-link.json", vault_link_json()), ("convergence.json", convergence_json())] {
-        assert!(!l.state_dir.join(name).exists(), "{name} is renamed");
+        assert!(!tfs::exists(&l.state_dir.join(name)), "{name} is renamed");
         assert_eq!(read(&l.state_dir.join(format!("{name}.migrated"))), section, "{name}.migrated keeps what it held");
     }
 }
@@ -118,13 +120,13 @@ fn assert_vault_record(l: &Layout) {
 async fn a_vault_links_four_files_become_one_record() {
     let l = layout().await;
     write_old_vault_files(&l, SyncMode::Vault);
-    let devices_before = std::fs::read(&l.devices).unwrap();
-    let folder_before = std::fs::read(l.store_path.join("sync.json")).unwrap();
+    let devices_before = tfs::read(&l.devices).unwrap();
+    let folder_before = tfs::read(l.store_path.join("sync.json")).unwrap();
 
     let store = LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap();
     assert_vault_record(&l);
-    assert_eq!(std::fs::read(&l.devices).unwrap(), devices_before, "devices.json holds every store's entry: read, never written");
-    assert_eq!(std::fs::read(l.store_path.join("sync.json")).unwrap(), folder_before, "what the folder shares stays where it is");
+    assert_eq!(tfs::read(&l.devices).unwrap(), devices_before, "devices.json holds every store's entry: read, never written");
+    assert_eq!(tfs::read(l.store_path.join("sync.json")).unwrap(), folder_before, "what the folder shares stays where it is");
 
     // The store reads its link through the record.
     let config = store.read_sync_config().await.unwrap().unwrap();
@@ -140,7 +142,7 @@ async fn a_vault_links_four_files_become_one_record() {
     assert_eq!(record["link"]["last_sync"], "2026-11-22T10:00:00Z");
     assert_eq!(record["vault"], vault_link_json());
     assert_eq!(record["device"], device_entry());
-    assert!(!l.state_dir.join("link.json").exists(), "nothing writes the old files");
+    assert!(!tfs::exists(&l.state_dir.join("link.json")), "nothing writes the old files");
 }
 
 #[tokio::test]
@@ -160,7 +162,7 @@ async fn a_plain_link_keeps_its_last_sync() {
     let store = LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap();
     let record = record(&l);
     assert_eq!(record, json!({ "version": 1, "link": { "last_sync": "2026-11-21T09:30:00Z" } }), "a plain link holds no belief about its remote");
-    assert!(l.state_dir.join("link.json.migrated").exists());
+    assert!(tfs::exists(&l.state_dir.join("link.json.migrated")));
     let config = store.read_sync_config().await.unwrap().unwrap();
     assert_eq!(config.mode, SyncMode::Sync);
     assert!(config.last_sync.is_some() && config.last_seq.is_empty());
@@ -171,7 +173,7 @@ async fn a_store_with_no_link_gets_no_record() {
     let l = layout().await;
     let store = LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap();
     assert!(store.read_sync_config().await.unwrap().is_none());
-    let left: Vec<_> = std::fs::read_dir(&l.state_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+    let left: Vec<_> = tfs::names(&l.state_dir).unwrap();
     assert!(left.is_empty(), "nothing written for a store that was never linked: {left:?}");
 
     // Linking it later writes the record, not the old files.
@@ -179,7 +181,7 @@ async fn a_store_with_no_link_gets_no_record() {
     config.last_sync = Some("2026-11-22T10:00:00Z".parse().unwrap());
     store.write_sync_config(&config).await.unwrap();
     assert_eq!(record(&l)["link"]["last_sync"], "2026-11-22T10:00:00Z");
-    assert!(!l.state_dir.join("link.json").exists());
+    assert!(!tfs::exists(&l.state_dir.join("link.json")));
 }
 
 #[tokio::test]
@@ -187,11 +189,11 @@ async fn the_migration_runs_once() {
     let l = layout().await;
     write_old_vault_files(&l, SyncMode::Vault);
     drop(LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap());
-    let first = std::fs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap();
+    let first = tfs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap();
     drop(LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap());
-    assert_eq!(std::fs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap(), first, "a second open changes nothing");
+    assert_eq!(tfs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap(), first, "a second open changes nothing");
     assert_vault_record(&l);
-    assert!(!l.state_dir.join("link.json.migrated.2").exists());
+    assert!(!tfs::exists(&l.state_dir.join("link.json.migrated.2")));
 
     // An older Pimble run in between writes its file again: the record is
     // newer than anything it holds and stays, and the file is renamed beside
@@ -209,7 +211,7 @@ async fn the_migration_runs_once() {
 async fn a_crash_before_the_record_is_written_loses_nothing() {
     let l = layout().await;
     write_old_vault_files(&l, SyncMode::Vault);
-    std::fs::write(l.state_dir.join("sync-state.3f9a0c1d2e4b.tmp"), b"{\"version\":1,\"li").unwrap();
+    tfs::write(l.state_dir.join("sync-state.3f9a0c1d2e4b.tmp"), b"{\"version\":1,\"li").unwrap();
     drop(LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap());
     assert_vault_record(&l);
 }
@@ -223,13 +225,13 @@ async fn a_crash_between_the_record_and_the_renames_loses_nothing() {
     write_old_vault_files(&l, SyncMode::Vault);
     // What the migration writes, and what a crash right after it leaves:
     // the record, `link.json` renamed, the other two not yet.
-    sync_state::migrate(&l.state_dir, l.store_id, Some(&l.devices)).await;
-    std::fs::rename(l.state_dir.join("vault-link.json.migrated"), l.state_dir.join("vault-link.json")).unwrap();
-    std::fs::rename(l.state_dir.join("convergence.json.migrated"), l.state_dir.join("convergence.json")).unwrap();
-    let written = std::fs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap();
+    sync_state::migrate(&Disk::default(), &l.state_dir, l.store_id, Some(&l.devices)).await;
+    tfs::rename(l.state_dir.join("vault-link.json.migrated"), l.state_dir.join("vault-link.json")).unwrap();
+    tfs::rename(l.state_dir.join("convergence.json.migrated"), l.state_dir.join("convergence.json")).unwrap();
+    let written = tfs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap();
 
     drop(LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap());
-    assert_eq!(std::fs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap(), written, "the record is not rebuilt");
+    assert_eq!(tfs::read(l.state_dir.join(sync_state::FILE_NAME)).unwrap(), written, "the record is not rebuilt");
     assert_vault_record(&l);
 }
 
@@ -240,12 +242,12 @@ async fn a_crash_between_the_record_and_the_renames_loses_nothing() {
 async fn an_unreadable_old_file_is_kept_and_not_carried() {
     let l = layout().await;
     write_old_vault_files(&l, SyncMode::Vault);
-    std::fs::write(l.state_dir.join("convergence.json"), b"{ not json").unwrap();
+    tfs::write(l.state_dir.join("convergence.json"), b"{ not json").unwrap();
     drop(LocalStore::open_in(&l.store_path, Some(&l.state_root)).await.unwrap());
     let record = record(&l);
     assert!(record.get("convergence").is_none(), "{record}");
     assert_eq!(record["vault"], vault_link_json());
-    assert_eq!(std::fs::read(l.state_dir.join("convergence.json.migrated")).unwrap(), b"{ not json");
+    assert_eq!(tfs::read(l.state_dir.join("convergence.json.migrated")).unwrap(), b"{ not json");
 }
 
 /// What the folder of an older Pimble holds of this computer's link goes
@@ -266,7 +268,7 @@ async fn state_from_an_older_folder_reaches_the_record_in_one_open() {
     let record = record(&l);
     assert_eq!(record["link"], json!({ "last_sync": "2026-11-18T10:00:00Z", "last_seq": { "node:x": 5 } }));
     assert_eq!(record["vault"], vault_link_json());
-    assert!(!l.store_path.join("vault-link.json").exists());
+    assert!(!tfs::exists(&l.store_path.join("vault-link.json")));
     let shared = read(&l.store_path.join("sync.json"));
     assert!(shared.get("last_seq").is_none() && shared.get("last_sync").is_none());
 }

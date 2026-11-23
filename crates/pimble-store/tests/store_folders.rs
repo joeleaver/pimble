@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use pimble_core::{Node, NodeId, Place, StoreAccess, StoreManifest};
 use pimble_crdt::NodeDoc;
 use pimble_store::{classify_node_file, conflict_copy_name, ConflictStyle, LocalStore, NodeFile, SyncConfig, SyncMode};
+use pimble_host::disk::testfs as tfs;
 use tempfile::TempDir;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ fn node_file(store: &Path, id: NodeId) -> PathBuf {
 }
 
 fn text_in_file(store: &Path, id: NodeId) -> String {
-    NodeDoc::load(&std::fs::read(node_file(store, id)).unwrap()).unwrap().text()
+    NodeDoc::load(&tfs::read(node_file(store, id)).unwrap()).unwrap().text()
 }
 
 fn text_held(store: &LocalStore, id: NodeId) -> String {
@@ -42,16 +43,7 @@ async fn made_store(dir: &Path) -> (PathBuf, NodeId) {
 }
 
 fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
+    tfs::copy_dir(from, to).unwrap();
 }
 
 fn link(last_seq: &[(&str, u64)]) -> SyncConfig {
@@ -113,7 +105,7 @@ async fn the_manifest_is_merged_field_by_field() {
     let mut rest = vec![r1, r2];
     rest.sort_by_key(|r| r.to_string());
     let expected = vec![first, rest[0], rest[1]];
-    let on_disk: StoreManifest = serde_json::from_slice(&std::fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    let on_disk: StoreManifest = serde_json::from_slice(&tfs::read(path.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(on_disk.scope_roots, expected);
     a.absorb_folder().await.unwrap();
     assert_eq!(a.scope_roots(), expected.as_slice());
@@ -158,10 +150,10 @@ async fn an_external_change_is_merged_once_and_own_writes_are_not() {
     assert!(b.get_node(made).is_ok(), "the new node is in b's tree");
     assert!(b.take_folder_merges().iter().any(|m| m.node_id == made && m.effect.structure));
 
-    let stale = std::fs::read(node_file(&path, note)).unwrap();
+    let stale = tfs::read(node_file(&path, note)).unwrap();
     b.node_doc(note).unwrap().append_markdown("newer").unwrap();
     b.flush().await.unwrap();
-    std::fs::write(node_file(&path, note), &stale).unwrap();
+    tfs::write(node_file(&path, note), &stale).unwrap();
     b.absorb_folder().await.unwrap();
     assert!(b.has_unwritten(), "b holds more than the stale file");
     b.flush().await.unwrap();
@@ -196,27 +188,27 @@ async fn conflict_copies_are_merged_and_removed() {
         let mut store = LocalStore::open_in(&path, Some(&dir.path().join("state"))).await.unwrap();
 
         // The other computer's copy, with an edit of its own.
-        let mut theirs = NodeDoc::load(&std::fs::read(node_file(&path, note)).unwrap()).unwrap();
+        let mut theirs = NodeDoc::load(&tfs::read(node_file(&path, note)).unwrap()).unwrap();
         theirs.append_markdown("kept as a conflict copy").unwrap();
         let copy = path.join("nodes").join(conflict_copy_name(note, style, 0));
-        std::fs::write(&copy, theirs.save()).unwrap();
+        tfs::write(&copy, theirs.save()).unwrap();
         let junk = path.join("nodes").join(conflict_copy_name(note, style, 1));
-        std::fs::write(&junk, b"not a document").unwrap();
+        tfs::write(&junk, b"not a document").unwrap();
 
         store.absorb_folder().await.unwrap();
-        assert!(!copy.exists(), "{style:?}: the copy is removed");
-        assert!(junk.exists(), "{style:?}: a file that is not a document is left alone");
+        assert!(!tfs::exists(&copy), "{style:?}: the copy is removed");
+        assert!(tfs::exists(&junk), "{style:?}: a file that is not a document is left alone");
         assert!(text_held(&store, note).contains("kept as a conflict copy"), "{style:?}");
         assert!(text_in_file(&path, note).contains("kept as a conflict copy"), "{style:?}: the merged document is written");
         drop(store);
 
         // At open.
-        let mut later = NodeDoc::load(&std::fs::read(node_file(&path, note)).unwrap()).unwrap();
+        let mut later = NodeDoc::load(&tfs::read(node_file(&path, note)).unwrap()).unwrap();
         later.append_markdown("found at open").unwrap();
         let copy = path.join("nodes").join(conflict_copy_name(note, style, 2));
-        std::fs::write(&copy, later.save()).unwrap();
+        tfs::write(&copy, later.save()).unwrap();
         let store = LocalStore::open_in(&path, Some(&dir.path().join("state"))).await.unwrap();
-        assert!(!copy.exists(), "{style:?}: removed at open");
+        assert!(!tfs::exists(&copy), "{style:?}: removed at open");
         assert!(text_held(&store, note).contains("found at open"));
         assert!(text_in_file(&path, note).contains("found at open"));
     }
@@ -234,11 +226,11 @@ async fn per_computer_state_moves_out_once() {
     // What an older Pimble kept in the folder.
     let mut old = serde_json::to_value(link(&[("node:abc", 7)])).unwrap();
     old["last_sync"] = serde_json::json!("2026-11-18T10:00:00Z");
-    std::fs::write(path.join("sync.json"), serde_json::to_vec(&old).unwrap()).unwrap();
-    std::fs::write(path.join("vault-link.json"), b"{\"pushed_sv\":{}}").unwrap();
-    std::fs::write(path.join("people.json"), b"{\"scopes\":[]}").unwrap();
-    std::fs::create_dir_all(path.join("index").join("rhypedb")).unwrap();
-    std::fs::write(path.join("index").join("rhypedb").join("data"), b"x").unwrap();
+    tfs::write(path.join("sync.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+    tfs::write(path.join("vault-link.json"), b"{\"pushed_sv\":{}}").unwrap();
+    tfs::write(path.join("people.json"), b"{\"scopes\":[]}").unwrap();
+    tfs::create_dir_all(path.join("index").join("rhypedb")).unwrap();
+    tfs::write(path.join("index").join("rhypedb").join("data"), b"x").unwrap();
 
     let state_root = dir.path().join("state-a");
     let a = LocalStore::open_in(&path, Some(&state_root)).await.unwrap();
@@ -247,24 +239,24 @@ async fn per_computer_state_moves_out_once() {
     let config = a.read_sync_config().await.unwrap().unwrap();
     assert_eq!(config.last_seq.get("node:abc"), Some(&7), "the read positions are this computer's now");
     assert!(config.last_sync.is_some());
-    let folder: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("sync.json")).unwrap()).unwrap();
+    let folder: serde_json::Value = serde_json::from_slice(&tfs::read(path.join("sync.json")).unwrap()).unwrap();
     assert!(folder.get("last_seq").is_none() && folder.get("last_sync").is_none(), "{folder}");
     assert_eq!(folder["mode"], "vault", "the shared part stays");
     for moved in ["people.json", "index"] {
-        assert!(!path.join(moved).exists() && state.join(moved).exists(), "{moved} moved out");
+        assert!(!tfs::exists(&path.join(moved)) && tfs::exists(&state.join(moved)), "{moved} moved out");
     }
     // The link's state, then, into the one record (docs/ONE_CODEBASE_CONTRACT.md
     // decision 7), the old file kept beside it.
-    assert!(!path.join("vault-link.json").exists() && state.join("vault-link.json.migrated").exists(), "vault-link.json moved out and folded in");
-    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sync-state.json")).unwrap()).unwrap();
+    assert!(!tfs::exists(&path.join("vault-link.json")) && tfs::exists(&state.join("vault-link.json.migrated")), "vault-link.json moved out and folded in");
+    let record: serde_json::Value = serde_json::from_slice(&tfs::read(state.join("sync-state.json")).unwrap()).unwrap();
     assert_eq!(record["vault"], serde_json::json!({"pushed_sv": {}}), "{record}");
     assert_eq!(record["link"]["last_seq"]["node:abc"], 7, "{record}");
-    assert!(path.join("computers").is_dir());
+    assert!(tfs::is_dir(path.join("computers")));
 
     // Writing a read position touches this computer's file only.
-    let before = std::fs::read(path.join("sync.json")).unwrap();
+    let before = tfs::read(path.join("sync.json")).unwrap();
     a.write_sync_config(&link(&[("node:abc", 9)])).await.unwrap();
-    assert_eq!(std::fs::read(path.join("sync.json")).unwrap(), before, "the folder's sync.json is not rewritten for a read position");
+    assert_eq!(tfs::read(path.join("sync.json")).unwrap(), before, "the folder's sync.json is not rewritten for a read position");
     assert_eq!(a.read_sync_config().await.unwrap().unwrap().last_seq.get("node:abc"), Some(&9));
     drop(a);
 
@@ -272,15 +264,15 @@ async fn per_computer_state_moves_out_once() {
     // folder again; a second computer opening it now takes none of them.
     let mut old = serde_json::to_value(link(&[("node:abc", 3)])).unwrap();
     old["last_sync"] = serde_json::json!("2026-11-18T11:00:00Z");
-    std::fs::write(path.join("sync.json"), serde_json::to_vec(&old).unwrap()).unwrap();
-    std::fs::write(path.join("vault-link.json"), b"{\"pushed_sv\":{\"x\":\"y\"}}").unwrap();
+    tfs::write(path.join("sync.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+    tfs::write(path.join("vault-link.json"), b"{\"pushed_sv\":{\"x\":\"y\"}}").unwrap();
     let b_root = dir.path().join("state-b");
     let b = LocalStore::open_in(&path, Some(&b_root)).await.unwrap();
     let config = b.read_sync_config().await.unwrap().unwrap();
     assert!(config.last_seq.is_empty() && config.last_sync.is_none(), "another computer's positions are not this one's: {config:?}");
     assert_eq!(config.mode, SyncMode::Vault);
-    assert!(path.join("vault-link.json").exists(), "the older Pimble's own file is left where it uses it");
-    assert!(!b_root.join(b.id.to_string()).join("vault-link.json").exists(), "and never taken");
+    assert!(tfs::exists(&path.join("vault-link.json")), "the older Pimble's own file is left where it uses it");
+    assert!(!tfs::exists(&b_root.join(b.id.to_string()).join("vault-link.json")), "and never taken");
     // The first computer, opening again, keeps its own.
     let a = LocalStore::open_in(&path, Some(&state_root)).await.unwrap();
     assert_eq!(a.read_sync_config().await.unwrap().unwrap().last_seq.get("node:abc"), Some(&9));
@@ -353,16 +345,15 @@ impl SyncTool {
     fn files(&self, side: usize) -> BTreeMap<String, Vec<u8>> {
         let mut files = BTreeMap::new();
         let root = &self.folders[side];
-        if let Ok(bytes) = std::fs::read(root.join("manifest.json")) {
+        if let Ok(bytes) = tfs::read(root.join("manifest.json")) {
             files.insert("manifest.json".to_string(), bytes);
         }
-        for entry in std::fs::read_dir(root.join("nodes")).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for path in tfs::read_dir(root.join("nodes")).unwrap() {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if name.ends_with(".tmp") {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(entry.path()) {
+            if let Ok(bytes) = tfs::read(&path) {
                 files.insert(format!("nodes/{name}"), bytes);
             }
         }
@@ -388,7 +379,7 @@ impl SyncTool {
         let (from, rel, bytes) = self.queue.remove(at);
         let to = 1 - from;
         let target = self.folders[to].join(&rel);
-        let current = std::fs::read(&target).ok();
+        let current = tfs::read(&target).ok();
         let changed_there = current.as_ref().is_some_and(|c| self.seen[to].get(&rel) != Some(c));
         self.log.push(format!("deliver {from}->{to} {rel} {} over {} changed_there {changed_there}", sv_of(&bytes), current.as_deref().map(sv_of).unwrap_or_default()));
         if current.as_ref() == Some(&bytes) {
@@ -404,14 +395,14 @@ impl SyncTool {
             self.conflicts_made += 1;
             let name = conflict_copy_name(node.unwrap(), style, self.conflicts_made);
             self.log.push(format!("  as copy {name}"));
-            std::fs::write(self.folders[to].join("nodes").join(&name), &bytes).unwrap();
+            tfs::write(self.folders[to].join("nodes").join(&name), &bytes).unwrap();
             self.seen[to].insert(format!("nodes/{name}"), bytes);
             return;
         }
         // Written in place, the way a sync tool lands a download.
         let tmp = target.with_extension("synctool.tmp");
-        std::fs::write(&tmp, &bytes).unwrap();
-        std::fs::rename(&tmp, &target).unwrap();
+        tfs::write(&tmp, &bytes).unwrap();
+        tfs::rename(&tmp, &target).unwrap();
         self.seen[to].insert(rel, bytes);
     }
 }
@@ -571,18 +562,18 @@ async fn run_seed(seed: u64) -> Provoked {
         assert_eq!(held, &b[id], "seed {seed}: document {id} differs between the computers");
     }
     for (side, store) in stores.iter().enumerate() {
-        let mut names: Vec<String> = std::fs::read_dir(store.path.join("nodes")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> = tfs::names(store.path.join("nodes")).unwrap();
         names.sort();
         let mut expected: Vec<String> = store.doc_ids().into_iter().map(|id| format!("{id}.yrs")).collect();
         expected.sort();
         assert_eq!(names, expected, "seed {seed}: side {side}'s folder holds exactly one file per document and no conflict copies");
         for id in store.doc_ids() {
-            let file = NodeDoc::load(&std::fs::read(node_file(&store.path, id)).unwrap()).unwrap();
+            let file = NodeDoc::load(&tfs::read(node_file(&store.path, id)).unwrap()).unwrap();
             let doc = store.tree().doc(id).unwrap();
             assert_eq!((file.state_vector(), file.delete_set_digest()), (doc.state_vector(), doc.delete_set_digest()), "seed {seed}: side {side}'s file of {id} holds what it holds");
         }
     }
-    let manifests: Vec<StoreManifest> = stores.iter().map(|s| serde_json::from_slice(&std::fs::read(s.path.join("manifest.json")).unwrap()).unwrap()).collect();
+    let manifests: Vec<StoreManifest> = stores.iter().map(|s| serde_json::from_slice(&tfs::read(s.path.join("manifest.json")).unwrap()).unwrap()).collect();
     assert_eq!(manifests[0].root_node_id, manifests[1].root_node_id, "seed {seed}");
     provoked.conflicts = tool.conflicts_made;
     provoked.documents = a.len();

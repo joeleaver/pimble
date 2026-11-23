@@ -100,6 +100,21 @@ pub struct ServerConfig {
     /// (`crate::faults`). `None` outside the fault test.
     #[doc(hidden)]
     pub link_faults: Option<std::sync::Arc<crate::faults::LinkFaults>>,
+    /// The disk everything this server keeps is on
+    /// (docs/ONE_CODEBASE_CONTRACT.md seam B): its stores, their state
+    /// directories, the keystore, the saved credentials, the agents file, the
+    /// relay twins. The machine's own on the desktop; a memory disk in a
+    /// browser told not to remember itself, and in the suite run on one
+    /// (`PIMBLE_TEST_DISK=memory`, which `Disk::default` reads in tests).
+    pub disk: pimble_host::Disk,
+    /// Where this server keeps what is its own (seam E): every `*_path` and
+    /// `*_dir` above that is `None` is laid out under these
+    /// ([`pimble_host::Paths::native`] by default: the platform's data and
+    /// config directories).
+    pub paths: pimble_host::Paths,
+    /// How this server reaches the Pimble Cloud accounts service (seam D):
+    /// `reqwest` on the desktop.
+    pub http: Arc<dyn pimble_host::http::Http>,
 }
 
 impl Default for ServerConfig {
@@ -122,6 +137,9 @@ impl Default for ServerConfig {
             out_of_step_after: None,
             set_aside_after: None,
             link_faults: None,
+            disk: pimble_host::Disk::default(),
+            paths: pimble_host::Paths::native(),
+            http: Arc::new(pimble_host::http::ReqwestHttp::default()),
         }
     }
 }
@@ -141,8 +159,13 @@ impl ServerConfig {
             keystore_path: Some(dir.join("keys.json")),
             relay_dir: Some(dir.join("relay")),
             agents_path: Some(dir.join("agents.json")),
+            paths: pimble_host::Paths::in_dir(dir),
             ..Default::default()
         }
+    }
+
+    fn replicas_dir(&self) -> PathBuf {
+        self.replicas_dir.clone().unwrap_or_else(|| self.paths.replicas())
     }
 }
 
@@ -172,14 +195,15 @@ impl PimbleServer {
 
     /// Create a new server with custom configuration
     pub fn with_config(config: ServerConfig) -> Self {
-        let state_root = crate::handler::state_root_beside(&config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir));
+        let state_root = crate::handler::state_root_beside(&config.replicas_dir());
+        let disk = config.disk.clone();
         Self {
             config,
             // Each store's per-computer state (its index, its link's read
             // positions) lives beside the replicas directory, outside the
             // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1), and so
             // inside a test's temp directory whenever its replicas are.
-            store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root))),
+            store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root).on_disk(disk))),
             handle: None,
             handler: None,
             local_addr: None,
@@ -265,9 +289,9 @@ impl PimbleServer {
         // relay face or a server verifying Pimble Cloud's tokens.
         let agents = match &self.config.agents_path {
             _ if self.face => None,
-            Some(path) => Some(Arc::new(crate::agents::AgentRegistry::load(path.clone()))),
+            Some(path) => Some(Arc::new(crate::agents::AgentRegistry::load(&self.config.disk, path.clone()).await)),
             None if self.config.addr.ip().is_loopback() && !jwt_configured => {
-                Some(Arc::new(crate::agents::AgentRegistry::load(crate::agents::default_agents_path())))
+                Some(Arc::new(crate::agents::AgentRegistry::load(&self.config.disk, self.config.paths.agents()).await))
             }
             None => None,
         };
@@ -293,6 +317,8 @@ impl PimbleServer {
         self.local_addr = Some(local_addr);
 
         let handler = self.make_handler(agents, jwt_configured, true);
+        // The keystore is read before the first call, as it always was.
+        handler.keystore().load().await;
         let methods = handler.clone().into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);
@@ -326,10 +352,11 @@ impl PimbleServer {
         }
         let semantic_available = false;
 
-        let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
-        let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
-        let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
+        let credentials_path = self.config.credentials_path.clone().unwrap_or_else(|| self.config.paths.credentials());
+        let replicas_dir = self.config.replicas_dir();
+        let keystore_path = self.config.keystore_path.clone().unwrap_or_else(|| self.config.paths.keystore());
         let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path).with_semantic_warmup(warmup, wanted);
+        handler = handler.with_http(Arc::clone(&self.config.http));
         if let Some(relay_dir) = self.config.relay_dir.clone() {
             handler = handler.with_relay_dir(relay_dir);
         }
@@ -372,8 +399,12 @@ impl PimbleServer {
         if self.handler.is_some() {
             return Err(crate::ServerError::Server("this server has started already".to_string()));
         }
-        let agents = self.config.agents_path.clone().map(|path| Arc::new(crate::agents::AgentRegistry::load(path)));
-        self.make_handler(agents, false, false);
+        let agents = match self.config.agents_path.clone() {
+            Some(path) => Some(Arc::new(crate::agents::AgentRegistry::load(&self.config.disk, path).await)),
+            None => None,
+        };
+        let handler = self.make_handler(agents, false, false);
+        handler.keystore().load().await;
         Ok(())
     }
 
@@ -466,10 +497,9 @@ const EMBEDDING_MODEL: &str = "all-MiniLM-L6-v2";
 /// shortly run on; `start` still awaits it, so no store can open before it
 /// resolves.
 async fn warm_up_embedding_model() -> bool {
-    let cache_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("pimble")
-        .join("models");
+    // The machine's, whatever the server's paths: a cache of a download,
+    // shared by every server in the process (tests included).
+    let cache_dir = pimble_host::Paths::native().data.join("models");
 
     if let Err(e) = pimble_search::set_model_cache_dir(&cache_dir) {
         tracing::warn!(

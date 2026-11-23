@@ -127,7 +127,12 @@ impl RpcHandler {
     }
 
     async fn run_folder_task(self, store_id: StoreId, path: PathBuf) {
-        let (_watch, mut changes) = match pimble_store::watch_folder(&path) {
+        // Only a folder on the machine's own disk can be watched: a memory
+        // disk (or the browser's OPFS, which sends no change events) has no
+        // other computer writing into it. The rest of the task (announcing
+        // what a flush merged, the presence files) runs on any disk.
+        let watched = if self.disk().is_native() { pimble_store::watch_folder(&path) } else { None };
+        let (_watch, mut changes) = match watched {
             Some((watch, rx)) => (Some(watch), Some(rx)),
             None => (None, None),
         };
@@ -233,12 +238,12 @@ impl RpcHandler {
         let device = presence_id(&self.device_entry(store_id).await.device);
         let file = ComputerFile { device: device.clone(), name: computer_name(), last_seen: Utc::now(), version: self.version().to_string() };
         let dir = path.join(pimble_store::LocalStore::COMPUTERS_DIR);
+        let disk = self.disk();
         let written = async {
-            tokio::fs::create_dir_all(&dir).await?;
+            disk.create_dir_all(&dir).await?;
             let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
-            let tmp = dir.join(format!("{device}.{}.tmp", &uuid::Uuid::new_v4().simple().to_string()[..12]));
-            tokio::fs::write(&tmp, json).await?;
-            tokio::fs::rename(&tmp, dir.join(format!("{device}.json"))).await
+            // `<device>.<12 random hex>.tmp`, renamed to `<device>.json`.
+            disk.write_atomic(dir.join(format!("{device}.json")), json, pimble_host::TmpName::Unique).await
         };
         if let Err(e) = written.await {
             warn!("Store {}: could not say in its folder that this computer has it open: {}", store_id, e);
@@ -249,13 +254,14 @@ impl RpcHandler {
     async fn read_presence(&self, store_id: StoreId, path: &Path) {
         let own = presence_id(&self.device_entry(store_id).await.device);
         let mut others = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(path.join(pimble_store::LocalStore::COMPUTERS_DIR)).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file = entry.path();
+        let disk = self.disk();
+        if let Ok(entries) = disk.list(path.join(pimble_store::LocalStore::COMPUTERS_DIR)).await {
+            for entry in entries {
+                let file = entry.path;
                 if file.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                let Ok(bytes) = tokio::fs::read(&file).await else { continue };
+                let Ok(bytes) = disk.read(&file).await else { continue };
                 let Ok(computer) = serde_json::from_slice::<ComputerFile>(&bytes) else { continue };
                 if computer.device == own || Utc::now() - computer.last_seen > PRESENCE_SHOWN_FOR {
                     continue;

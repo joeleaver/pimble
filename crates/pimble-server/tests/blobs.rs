@@ -9,6 +9,7 @@ mod common;
 
 mod isolated;
 
+use pimble_host::disk::testfs as tfs;
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -53,10 +54,7 @@ async fn fixture() -> Fixture {
 
 /// The names in a store's `blobs/` (empty when there is no such directory).
 fn blob_files(store_path: &Path) -> Vec<String> {
-    match std::fs::read_dir(store_path.join("blobs")) {
-        Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect(),
-        Err(_) => Vec::new(),
-    }
+    tfs::names(store_path.join("blobs")).unwrap_or_default()
 }
 
 fn refusal<T: std::fmt::Debug>(result: Result<T, pimble_client::ClientError>, what: &str) -> String {
@@ -181,15 +179,15 @@ async fn a_corrupted_file_on_disk_reads_as_absent() {
     let path = f.store_path.join("blobs").join(url.blob.to_string());
 
     // One byte of the image changed: the header's hash no longer matches.
-    let mut file = std::fs::read(&path).unwrap();
+    let mut file = tfs::read(&path).unwrap();
     assert_eq!(&file[..4], b"PIMG");
     let at = file.len() - 100;
     file[at] ^= 0xFF;
-    std::fs::write(&path, &file).unwrap();
+    tfs::write(&path, &file).unwrap();
     assert_eq!(refusal(f.client.get_blob(f.store_id, url.blob).await, "a blob that fails its hash"), BLOB_NOT_HERE);
 
     // Cut short: missing by its length alone, without reading it.
-    std::fs::write(&path, &file[..file.len() / 2]).unwrap();
+    tfs::write(&path, &file[..file.len() / 2]).unwrap();
     assert_eq!(f.client.have_blobs(f.store_id, &[url.blob]).await.unwrap(), vec![url.blob]);
     assert_eq!(refusal(f.client.get_blob(f.store_id, url.blob).await, "a truncated blob"), BLOB_NOT_HERE);
 }

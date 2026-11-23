@@ -20,13 +20,12 @@
 //! cheap handle a caller clones out from under the store manager's lock and
 //! does its reading and writing without holding up anyone else.
 
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use pimble_core::{BlobId, ImageMime, StoreId, IMAGE_TOO_LARGE, MAX_IMAGE_BYTES, NOT_AN_IMAGE};
+use pimble_host::Disk;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -68,9 +67,11 @@ pub struct BlobUpload {
 pub struct BlobStore {
     store_id: StoreId,
     dir: PathBuf,
+    /// The disk the store is on.
+    disk: Disk,
     /// Held while a part file is appended to or finished, so two chunks of
     /// one upload arriving together cannot interleave.
-    writing: Arc<Mutex<()>>,
+    writing: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The fixed fields of a blob file's header.
@@ -114,20 +115,13 @@ impl Header {
         Some((Self { mime, len, hash }, Self::size(mime)))
     }
 
-    /// The header of the file at `path`, without reading the image.
-    fn read_from(path: &Path) -> Option<Self> {
-        let mut file = fs::File::open(path).ok()?;
+    /// The header of the file at `path`, without reading the image, with
+    /// the file's length.
+    async fn read_from(disk: &Disk, path: &Path) -> Option<(Self, u64)> {
+        let len = disk.metadata(path).await.ok()?.len;
         // Longer than any header: the longest accepted MIME type is ten bytes.
-        let mut head = [0u8; 128];
-        let mut filled = 0;
-        while filled < head.len() {
-            match file.read(&mut head[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(_) => return None,
-            }
-        }
-        Self::decode(&head[..filled]).map(|(header, _)| header)
+        let head = disk.read_range(path, 0, len.min(128) as usize).await.ok()?;
+        Self::decode(&head).map(|(header, _)| (header, len))
     }
 }
 
@@ -163,7 +157,12 @@ impl BlobStore {
     /// The blobs of the store at `store_path`. Creates nothing: the directory
     /// appears with the first blob.
     pub fn new(store_id: StoreId, store_path: &Path) -> Self {
-        Self { store_id, dir: store_path.join(Self::DIR), writing: Arc::new(Mutex::new(())) }
+        Self::new_on(&Disk::default(), store_id, store_path)
+    }
+
+    /// [`BlobStore::new`] on `disk`.
+    pub fn new_on(disk: &Disk, store_id: StoreId, store_path: &Path) -> Self {
+        Self { store_id, dir: store_path.join(Self::DIR), disk: disk.clone(), writing: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     fn path(&self, id: BlobId) -> PathBuf {
@@ -174,13 +173,12 @@ impl BlobStore {
         self.dir.join(format!(".{id}{PART_SUFFIX}"))
     }
 
-    /// Run `work` off the async threads: every operation here is file IO, and
-    /// hashing twenty megabytes is not something to do between two awaits.
-    async fn blocking<T: Send + 'static>(&self, work: impl FnOnce(&BlobStore) -> Result<T> + Send + 'static) -> Result<T> {
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || work(&this))
+    /// The SHA-256 of `bytes`, off the async threads: hashing twenty
+    /// megabytes is not something to do between two awaits.
+    async fn digest(bytes: Arc<Vec<u8>>) -> Result<[u8; HASH_LEN]> {
+        tokio::task::spawn_blocking(move || Sha256::digest(bytes.as_slice()).into())
             .await
-            .map_err(|e| StoreError::Io(std::io::Error::other(e)))?
+            .map_err(|e| StoreError::Io(std::io::Error::other(e)))
     }
 
     /// Keep `bytes` as a new blob and return its id. Refused, with a sentence
@@ -188,13 +186,10 @@ impl BlobStore {
     /// that are not that type, and for more than [`MAX_IMAGE_BYTES`].
     pub async fn put(&self, mime: &str, bytes: Vec<u8>) -> Result<BlobId> {
         let mime = admit(mime, bytes.len() as u64)?;
-        self.blocking(move |this| {
-            check_magic(mime, &bytes)?;
-            let id = BlobId::new();
-            this.write_whole(id, mime, &bytes)?;
-            Ok(id)
-        })
-        .await
+        check_magic(mime, &bytes)?;
+        let id = BlobId::new();
+        self.write_whole(id, mime, bytes).await?;
+        Ok(id)
     }
 
     /// Keep `bytes` under an id minted somewhere else (a replica copying a
@@ -204,54 +199,52 @@ impl BlobStore {
     /// that fails its own check is absent, and is replaced.
     pub async fn put_as(&self, id: BlobId, mime: &str, bytes: Vec<u8>) -> Result<bool> {
         let mime = admit(mime, bytes.len() as u64)?;
-        self.blocking(move |this| {
-            check_magic(mime, &bytes)?;
-            if let Some(held) = this.read(id) {
-                if held.bytes == bytes {
-                    return Ok(false);
-                }
-                return Err(StoreError::InvalidOperation(format!(
-                    "Blob {id} is already in store {} with different contents.",
-                    this.store_id
-                )));
+        check_magic(mime, &bytes)?;
+        if let Some(held) = self.read(id).await {
+            if held.bytes == bytes {
+                return Ok(false);
             }
-            this.write_whole(id, mime, &bytes)?;
-            Ok(true)
-        })
-        .await
+            return Err(StoreError::InvalidOperation(format!(
+                "Blob {id} is already in store {} with different contents.",
+                self.store_id
+            )));
+        }
+        self.write_whole(id, mime, bytes).await?;
+        Ok(true)
     }
 
     /// The blob `id`, or `None` when the store does not hold it whole: no
     /// file, or one whose length or hash is not what its header says (logged).
     pub async fn get(&self, id: BlobId) -> Result<Option<Blob>> {
-        self.blocking(move |this| Ok(this.read(id))).await
+        Ok(self.read(id).await)
     }
 
     /// Whether the store holds `id`: a file whose header reads and whose
     /// length is what the header says. The hash is left to the read.
     pub async fn has(&self, id: BlobId) -> bool {
-        self.blocking(move |this| Ok(this.holds(id))).await.unwrap_or(false)
+        self.holds(id).await.is_some()
     }
 
     /// The length of each of `ids` the store holds whole (from its header).
     pub async fn sizes(&self, ids: &[BlobId]) -> std::collections::HashMap<BlobId, u64> {
-        let ids = ids.to_vec();
-        self.blocking(move |this| {
-            Ok(ids
-                .into_iter()
-                .filter(|id| this.holds(*id))
-                .filter_map(|id| Header::read_from(&this.path(id)).map(|header| (id, header.len)))
-                .collect())
-        })
-        .await
-        .unwrap_or_default()
+        let mut sizes = std::collections::HashMap::new();
+        for &id in ids {
+            if let Some(header) = self.holds(id).await {
+                sizes.insert(id, header.len);
+            }
+        }
+        sizes
     }
 
     /// Which of `ids` the store lacks, in the order given.
     pub async fn missing(&self, ids: &[BlobId]) -> Vec<BlobId> {
-        let ids = ids.to_vec();
-        let all = ids.clone();
-        self.blocking(move |this| Ok(ids.into_iter().filter(|id| !this.holds(*id)).collect())).await.unwrap_or(all)
+        let mut missing = Vec::new();
+        for &id in ids {
+            if self.holds(id).await.is_none() {
+                missing.push(id);
+            }
+        }
+        missing
     }
 
     /// One chunk of a picture too large for one message. The first chunk
@@ -295,26 +288,27 @@ impl BlobStore {
                 }
             }
         }
-        self.blocking(move |this| this.write_chunk(upload, copy_of, mime, total, offset, &bytes)).await
+        self.write_chunk(upload, copy_of, mime, total, offset, bytes).await
     }
 
     /// Remove what unfinished uploads left behind. Run when a store opens:
     /// nothing can be mid-upload then.
     pub async fn sweep_partial(&self) -> Result<usize> {
-        self.blocking(|this| this.remove_parts(None)).await
+        self.remove_parts(None).await
     }
 
-    // ── The synchronous halves ───────────────────────────────────────────
+    // ── The halves ───────────────────────────────────────────────────────
 
-    fn holds(&self, id: BlobId) -> bool {
-        let path = self.path(id);
-        let Some(header) = Header::read_from(&path) else { return false };
-        fs::metadata(&path).is_ok_and(|meta| meta.len() == Header::size(header.mime) as u64 + header.len)
+    /// The header of `id`'s file when the store holds it whole: a header
+    /// that reads and a length that is what the header says.
+    async fn holds(&self, id: BlobId) -> Option<Header> {
+        let (header, len) = Header::read_from(&self.disk, &self.path(id)).await?;
+        (len == Header::size(header.mime) as u64 + header.len).then_some(header)
     }
 
-    fn read(&self, id: BlobId) -> Option<Blob> {
+    async fn read(&self, id: BlobId) -> Option<Blob> {
         let path = self.path(id);
-        let file = match fs::read(&path) {
+        let file = match self.disk.read(&path).await {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
@@ -326,34 +320,41 @@ impl BlobStore {
             warn!("Store {}: blob {} has no header this version reads; treating it as absent", self.store_id, id);
             return None;
         };
-        let bytes = &file[start..];
-        if bytes.len() as u64 != header.len || Sha256::digest(bytes).as_slice() != header.hash {
+        let file = Arc::new(file);
+        let bytes_len = (file.len() - start) as u64;
+        let hash = {
+            let file = Arc::clone(&file);
+            tokio::task::spawn_blocking(move || -> [u8; HASH_LEN] { Sha256::digest(&file[start..]).into() }).await.ok()?
+        };
+        if bytes_len != header.len || hash != header.hash {
             warn!("Store {}: blob {} does not match its own hash; treating it as absent", self.store_id, id);
             return None;
         }
-        Some(Blob { mime: header.mime, bytes: bytes.to_vec() })
+        Some(Blob { mime: header.mime, bytes: file[start..].to_vec() })
     }
 
     /// Write a whole blob: the part file, synced, then renamed into place.
-    fn write_whole(&self, id: BlobId, mime: ImageMime, bytes: &[u8]) -> Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let header = Header { mime, len: bytes.len() as u64, hash: Sha256::digest(bytes).into() };
+    async fn write_whole(&self, id: BlobId, mime: ImageMime, bytes: Vec<u8>) -> Result<()> {
+        self.disk.create_dir_all(&self.dir).await?;
+        let bytes = Arc::new(bytes);
+        let header = Header { mime, len: bytes.len() as u64, hash: Self::digest(Arc::clone(&bytes)).await? };
         let part = self.part_path(id);
-        let written = (|| {
-            let mut file = fs::File::create(&part)?;
-            file.write_all(&header.encode())?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            fs::rename(&part, self.path(id))
-        })();
+        let written = async {
+            let mut file = header.encode();
+            file.extend_from_slice(&bytes);
+            self.disk.write(&part, &file).await?;
+            self.disk.sync_file(&part).await?;
+            self.disk.rename(&part, self.path(id)).await
+        }
+        .await;
         if written.is_err() {
-            let _ = fs::remove_file(&part);
+            let _ = self.disk.remove_file(&part).await;
         }
         Ok(written?)
     }
 
-    fn write_chunk(&self, upload: Option<BlobId>, copy_of: Option<BlobId>, mime: ImageMime, total: u64, offset: u64, bytes: &[u8]) -> Result<BlobUpload> {
-        let _writing = self.writing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    async fn write_chunk(&self, upload: Option<BlobId>, copy_of: Option<BlobId>, mime: ImageMime, total: u64, offset: u64, bytes: Vec<u8>) -> Result<BlobUpload> {
+        let _writing = self.writing.lock().await;
         let out_of_step = || StoreError::InvalidOperation("This picture's upload is out of step; start it again.".into());
         let head = Header::size(mime) as u64;
 
@@ -365,34 +366,32 @@ impl BlobStore {
                 // Enough of the file to tell: refuse the wrong thing now
                 // rather than after twenty megabytes of it.
                 if bytes.len() as u64 == total || bytes.len() >= 4096 {
-                    check_magic(mime, bytes)?;
+                    check_magic(mime, &bytes)?;
                 }
-                fs::create_dir_all(&self.dir)?;
-                self.remove_parts(Some(STALE_UPLOAD))?;
+                self.disk.create_dir_all(&self.dir).await?;
+                self.remove_parts(Some(STALE_UPLOAD)).await?;
                 let id = copy_of.unwrap_or_else(BlobId::new);
                 // The hash is not known until the last byte: zeros until then.
                 let header = Header { mime, len: total, hash: [0; HASH_LEN] };
-                fs::File::create(self.part_path(id))?.write_all(&header.encode())?;
+                self.disk.write(self.part_path(id), header.encode()).await?;
                 id
             }
             Some(id) => id,
         };
 
         let part = self.part_path(id);
-        let appended = (|| -> Result<u64> {
+        let appended = async {
             // An upload that is not there (never started, swept, finished)
             // and one continued under another type or length are the same
             // mistake to the caller.
-            let header = Header::read_from(&part).ok_or_else(out_of_step)?;
+            let (header, len) = Header::read_from(&self.disk, &part).await.ok_or_else(out_of_step)?;
             if header.mime != mime || header.len != total {
                 return Err(out_of_step());
             }
-            let mut file = fs::OpenOptions::new().read(true).write(true).open(&part)?;
-            if file.metadata()?.len() != head + offset {
+            if len != head + offset {
                 return Err(out_of_step());
             }
-            file.seek(SeekFrom::End(0))?;
-            file.write_all(bytes)?;
+            self.disk.append(&part, &bytes).await?;
             let received = offset + bytes.len() as u64;
             if received < total {
                 return Ok(received);
@@ -400,18 +399,15 @@ impl BlobStore {
 
             // The last chunk: check the whole image, write its hash into the
             // header, and only then give the file its name.
-            file.seek(SeekFrom::Start(head))?;
-            let mut image = Vec::with_capacity(total as usize);
-            file.read_to_end(&mut image)?;
+            let image = Arc::new(self.disk.read_range(&part, head, total as usize).await?);
             check_magic(mime, &image)?;
-            let hash: [u8; HASH_LEN] = Sha256::digest(&image).into();
-            file.seek(SeekFrom::Start(head - HASH_LEN as u64))?;
-            file.write_all(&hash)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&part, self.path(id))?;
+            let hash = Self::digest(image).await?;
+            self.disk.write_at(&part, head - HASH_LEN as u64, hash).await?;
+            self.disk.sync_file(&part).await?;
+            self.disk.rename(&part, self.path(id)).await?;
             Ok(received)
-        })();
+        }
+        .await;
 
         match appended {
             Ok(received) => Ok(BlobUpload { id, received, complete: received == total }),
@@ -419,7 +415,7 @@ impl BlobStore {
                 // A refused or broken upload leaves nothing; an out-of-step
                 // chunk leaves the upload it was not part of alone.
                 if upload.is_none() || matches!(e, StoreError::BlobRefused(_) | StoreError::Io(_)) {
-                    let _ = fs::remove_file(&part);
+                    let _ = self.disk.remove_file(&part).await;
                 }
                 Err(e)
             }
@@ -427,26 +423,25 @@ impl BlobStore {
     }
 
     /// Remove part files: all of them, or those untouched for `older_than`.
-    fn remove_parts(&self, older_than: Option<Duration>) -> Result<usize> {
-        let entries = match fs::read_dir(&self.dir) {
+    async fn remove_parts(&self, older_than: Option<Duration>) -> Result<usize> {
+        let entries = match self.disk.list(&self.dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
         let now = SystemTime::now();
         let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if !name.to_string_lossy().ends_with(PART_SUFFIX) {
+        for entry in entries {
+            if !entry.path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(PART_SUFFIX)) {
                 continue;
             }
             if let Some(age) = older_than {
-                let modified = entry.metadata().and_then(|meta| meta.modified()).unwrap_or(now);
+                let modified = self.disk.metadata(&entry.path).await.ok().and_then(|meta| meta.modified).unwrap_or(now);
                 if now.duration_since(modified).unwrap_or_default() < age {
                     continue;
                 }
             }
-            if fs::remove_file(entry.path()).is_ok() {
+            if self.disk.remove_file(&entry.path).await.is_ok() {
                 removed += 1;
             }
         }
@@ -460,6 +455,7 @@ impl BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_host::disk::testfs as fs;
     use tempfile::TempDir;
 
     /// The smallest thing that passes for a PNG here: the signature, then
@@ -477,10 +473,7 @@ mod tests {
     }
 
     fn names(blobs: &BlobStore) -> Vec<String> {
-        match fs::read_dir(&blobs.dir) {
-            Ok(entries) => entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect(),
-            Err(_) => Vec::new(),
-        }
+        fs::names(&blobs.dir).unwrap_or_default()
     }
 
     fn sentence(result: Result<impl std::fmt::Debug>) -> String {
@@ -565,9 +558,9 @@ mod tests {
         let id = BlobId::new();
         let image = png(3000, 3);
         assert!(blobs.put_as(id, "image/png", image.clone()).await.unwrap());
-        let written = fs::metadata(blobs.path(id)).unwrap().modified().unwrap();
+        let written = fs::modified(blobs.path(id)).unwrap();
         assert!(!blobs.put_as(id, "image/png", image.clone()).await.unwrap());
-        assert_eq!(fs::metadata(blobs.path(id)).unwrap().modified().unwrap(), written, "the file was not rewritten");
+        assert_eq!(fs::modified(blobs.path(id)).unwrap(), written, "the file was not rewritten");
 
         let err = blobs.put_as(id, "image/png", png(3000, 4)).await.unwrap_err();
         assert!(err.to_string().contains("different contents"), "{err}");
@@ -653,7 +646,7 @@ mod tests {
 
         // A new upload does not disturb one that is still fresh.
         let other = blobs.upload_chunk(None, "image/png", image.len() as u64, 0, image[..5000].to_vec()).await.unwrap();
-        assert!(blobs.part_path(abandoned.id).exists());
+        assert!(fs::exists(blobs.part_path(abandoned.id)));
 
         assert_eq!(blobs.sweep_partial().await.unwrap(), 2);
         assert_eq!(names(&blobs), vec![kept.to_string()]);

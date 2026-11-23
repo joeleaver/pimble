@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, Place, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
 use pimble_crdt::{Cutting, NodeDoc, Planted, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
+use pimble_host::{Disk, TmpName};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 use tracing::{debug, info, warn};
 
 use crate::blobs::BlobStore;
@@ -142,8 +142,8 @@ struct LoadedDocs {
 }
 
 /// A JSON file's value, `None` when it is absent or does not parse.
-async fn read_json(path: &Path) -> Option<serde_json::Value> {
-    let json = fs::read_to_string(path).await.ok()?;
+async fn read_json(disk: &Disk, path: &Path) -> Option<serde_json::Value> {
+    let json = disk.read_to_string(path).await.ok()?;
     serde_json::from_str(&json).ok()
 }
 
@@ -154,15 +154,8 @@ async fn read_json(path: &Path) -> Option<serde_json::Value> {
 /// shared `<id>.tmp` let one rename the other's half-written bytes into
 /// place. It never ends in `.yrs`, so nothing takes it for a document or a
 /// sync tool's conflict copy.
-pub(crate) async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let unique = uuid::Uuid::new_v4().simple().to_string();
-    let tmp_path = path.with_extension(format!("{}.tmp", &unique[..12]));
-    fs::write(&tmp_path, data).await?;
-    if let Err(e) = fs::rename(&tmp_path, path).await {
-        let _ = fs::remove_file(&tmp_path).await;
-        return Err(e);
-    }
-    Ok(())
+pub(crate) async fn atomic_write(disk: &Disk, path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    disk.write_atomic(path, data, TmpName::Unique).await
 }
 
 /// The timestamp every edit made here carries: the crdt crate never reads a
@@ -188,8 +181,14 @@ pub async fn peek_manifest_kind(path: impl AsRef<Path>) -> Result<pimble_core::S
 
 /// A store directory's whole manifest, read without opening the store.
 pub async fn peek_manifest(path: impl AsRef<Path>) -> Result<StoreManifest> {
+    peek_manifest_on(&Disk::default(), path).await
+}
+
+/// [`peek_manifest`] on `disk`.
+pub async fn peek_manifest_on(disk: &Disk, path: impl AsRef<Path>) -> Result<StoreManifest> {
     let manifest_path = path.as_ref().join(LocalStore::MANIFEST_FILE);
-    let manifest_json = fs::read_to_string(&manifest_path)
+    let manifest_json = disk
+        .read_to_string(&manifest_path)
         .await
         .map_err(|_| StoreError::InvalidPath(format!("No manifest found at {}", manifest_path.display())))?;
     Ok(serde_json::from_str(&manifest_json)?)
@@ -227,6 +226,11 @@ pub async fn peek_manifest(path: impl AsRef<Path>) -> Result<StoreManifest> {
 pub struct LocalStore {
     /// Store ID
     pub id: StoreId,
+
+    /// The disk the folder and the state directory are on
+    /// (docs/ONE_CODEBASE_CONTRACT.md seam B): every file of the store is
+    /// read and written through it.
+    disk: Disk,
 
     /// Path to the store directory
     pub path: PathBuf,
@@ -337,7 +341,7 @@ impl LocalStore {
 
     /// Create a new local store at the given path, with a freshly generated id.
     pub async fn create(path: impl AsRef<Path>, name: impl Into<String>) -> Result<Self> {
-        Self::create_impl(path, name, None).await
+        Self::create_on(&Disk::default(), path, name, None).await
     }
 
     /// Like [`LocalStore::create`], but under a chosen `id` rather than a
@@ -346,22 +350,25 @@ impl LocalStore {
     /// local store under the local store's own id). Refusing an id already
     /// open is the caller's job (`StoreManager`), same as for a fresh id.
     pub async fn create_with_id(path: impl AsRef<Path>, name: impl Into<String>, id: StoreId) -> Result<Self> {
-        Self::create_impl(path, name, Some(id)).await
+        Self::create_on(&Disk::default(), path, name, Some(id)).await
     }
 
-    async fn create_impl(path: impl AsRef<Path>, name: impl Into<String>, id: Option<StoreId>) -> Result<Self> {
+    /// [`LocalStore::create`] (or, with `id`, [`LocalStore::create_with_id`])
+    /// on `disk`.
+    pub async fn create_on(disk: &Disk, path: impl AsRef<Path>, name: impl Into<String>, id: Option<StoreId>) -> Result<Self> {
+        let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
         let name = name.into();
 
         // Check if store already exists
-        if path.exists() {
+        if disk.exists(&path).await {
             return Err(StoreError::StoreExists(path.display().to_string()));
         }
 
         // Create directory structure
-        fs::create_dir_all(&path).await?;
-        fs::create_dir(path.join(Self::NODES_DIR)).await?;
-        fs::create_dir(path.join(Self::ASSETS_DIR)).await?;
+        disk.create_dir_all(&path).await?;
+        disk.create_dir(path.join(Self::NODES_DIR)).await?;
+        disk.create_dir(path.join(Self::ASSETS_DIR)).await?;
 
         // Create root node ID
         let root_node_id = NodeId::new();
@@ -374,14 +381,15 @@ impl LocalStore {
 
         // Write manifest
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
+        disk.write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
 
         // The root folder is the store's first document.
         let tree = Tree::new(root_node_id, &name, &now()).map_err(StoreError::from)?;
 
         let mut store = Self {
             id: manifest.id,
-            blobs: BlobStore::new(manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            disk,
             path,
             manifest_base: manifest.clone(),
             manifest_hash: Some(content_hash(manifest_json.as_bytes())),
@@ -438,17 +446,30 @@ impl LocalStore {
         root_node_id: NodeId,
         scope_roots: Vec<NodeId>,
     ) -> Result<Self> {
+        Self::create_replica_on(&Disk::default(), path, id, name, root_node_id, scope_roots).await
+    }
+
+    /// [`LocalStore::create_replica_with_scope`] on `disk`.
+    pub async fn create_replica_on(
+        disk: &Disk,
+        path: impl AsRef<Path>,
+        id: StoreId,
+        name: impl Into<String>,
+        root_node_id: NodeId,
+        scope_roots: Vec<NodeId>,
+    ) -> Result<Self> {
+        let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
         let name = name.into();
         let root_node_id = scope_roots.first().copied().unwrap_or(root_node_id);
 
-        if path.exists() {
+        if disk.exists(&path).await {
             return Err(StoreError::StoreExists(path.display().to_string()));
         }
 
-        fs::create_dir_all(&path).await?;
-        fs::create_dir(path.join(Self::NODES_DIR)).await?;
-        fs::create_dir(path.join(Self::ASSETS_DIR)).await?;
+        disk.create_dir_all(&path).await?;
+        disk.create_dir(path.join(Self::NODES_DIR)).await?;
+        disk.create_dir(path.join(Self::ASSETS_DIR)).await?;
 
         let now = Utc::now();
         let manifest = StoreManifest {
@@ -464,11 +485,12 @@ impl LocalStore {
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
+        disk.write(path.join(Self::MANIFEST_FILE), &manifest_json).await?;
 
         let store = Self {
             id: manifest.id,
-            blobs: BlobStore::new(manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            disk,
             path,
             manifest_base: manifest.clone(),
             manifest_hash: Some(content_hash(manifest_json.as_bytes())),
@@ -499,6 +521,11 @@ impl LocalStore {
         self.state_dir.as_deref()
     }
 
+    /// The disk the store is on.
+    pub fn disk(&self) -> &Disk {
+        &self.disk
+    }
+
     /// Read the store's link: the folder's `sync.json` (what every computer
     /// opening the folder shares: the remote, the mode, the access) with this
     /// computer's own part (the `link` section of `sync-state.json` in the
@@ -508,16 +535,16 @@ impl LocalStore {
     /// (docs/STORE_FOLDERS_CONTRACT.md rule 1).
     pub async fn read_sync_config(&self) -> Result<Option<SyncConfig>> {
         let path = self.path.join(Self::SYNC_CONFIG_FILE);
-        if !path.exists() {
+        if !self.disk.exists(&path).await {
             return Ok(None);
         }
-        let json = fs::read_to_string(&path).await?;
+        let json = self.disk.read_to_string(&path).await?;
         let mut value: serde_json::Value = serde_json::from_str(&json)?;
         if let (Some(state_dir), serde_json::Value::Object(map)) = (&self.state_dir, &mut value) {
             for key in Self::PER_COMPUTER_KEYS {
                 map.remove(key);
             }
-            if let Some(serde_json::Value::Object(state)) = crate::sync_state::read_section(state_dir, crate::sync_state::LINK).await {
+            if let Some(serde_json::Value::Object(state)) = crate::sync_state::read_section(&self.disk, state_dir, crate::sync_state::LINK).await {
                 for (key, v) in state {
                     if Self::PER_COMPUTER_KEYS.contains(&key.as_str()) {
                         map.insert(key, v);
@@ -530,12 +557,12 @@ impl LocalStore {
 
     /// `sync.json` in `store_path` alone, for what the store keeps in memory
     /// at open (the access, which every computer shares).
-    async fn read_sync_config_at(store_path: &Path) -> Result<Option<SyncConfig>> {
+    async fn read_sync_config_at(disk: &Disk, store_path: &Path) -> Result<Option<SyncConfig>> {
         let path = store_path.join(Self::SYNC_CONFIG_FILE);
-        if !path.exists() {
+        if !disk.exists(&path).await {
             return Ok(None);
         }
-        let json = fs::read_to_string(&path).await?;
+        let json = disk.read_to_string(&path).await?;
         let config: SyncConfig = serde_json::from_str(&json)?;
         Ok(Some(config))
     }
@@ -551,7 +578,7 @@ impl LocalStore {
         let folder_path = self.path.join(Self::SYNC_CONFIG_FILE);
         let Some(state_dir) = &self.state_dir else {
             let json = serde_json::to_string_pretty(config)?;
-            atomic_write(&folder_path, json).await?;
+            atomic_write(&self.disk, &folder_path, json).await?;
             *self.link_access.write().unwrap() = LinkAccess::of(config);
             return Ok(());
         };
@@ -564,7 +591,7 @@ impl LocalStore {
                 }
             }
         }
-        let on_disk = read_json(&folder_path).await.map(|mut v| {
+        let on_disk = read_json(&self.disk, &folder_path).await.map(|mut v| {
             if let serde_json::Value::Object(map) = &mut v {
                 for key in Self::PER_COMPUTER_KEYS {
                     map.remove(key);
@@ -573,11 +600,11 @@ impl LocalStore {
             v
         });
         if on_disk.as_ref() != Some(&shared) {
-            atomic_write(&folder_path, serde_json::to_string_pretty(&shared)?).await?;
+            atomic_write(&self.disk, &folder_path, serde_json::to_string_pretty(&shared)?).await?;
         }
         let state = (!state.is_empty()).then_some(serde_json::Value::Object(state));
-        if state.is_some() || crate::sync_state::path(state_dir).exists() {
-            crate::sync_state::set_section(state_dir, crate::sync_state::LINK, state).await?;
+        if state.is_some() || crate::sync_state::exists(&self.disk, state_dir).await {
+            crate::sync_state::set_section(&self.disk, state_dir, crate::sync_state::LINK, state).await?;
         }
         *self.link_access.write().unwrap() = LinkAccess::of(config);
         Ok(())
@@ -588,12 +615,12 @@ impl LocalStore {
     /// store with one remote), and this computer's part.
     pub async fn clear_sync_config(&self) -> Result<()> {
         let path = self.path.join(Self::SYNC_CONFIG_FILE);
-        if path.exists() {
-            fs::remove_file(&path).await?;
+        if self.disk.exists(&path).await {
+            self.disk.remove_file(&path).await?;
         }
         if let Some(state_dir) = &self.state_dir {
-            if crate::sync_state::path(state_dir).exists() {
-                crate::sync_state::set_section(state_dir, crate::sync_state::LINK, None).await?;
+            if crate::sync_state::exists(&self.disk, state_dir).await {
+                crate::sync_state::set_section(&self.disk, state_dir, crate::sync_state::LINK, None).await?;
             }
         }
         *self.link_access.write().unwrap() = Default::default();
@@ -776,7 +803,7 @@ impl LocalStore {
     /// section 2: repair runs at open). Manifest versions other than the
     /// previous and the current one are refused: nothing older is migrated.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_in(path, None).await
+        Self::open_on(&Disk::default(), path, None).await
     }
 
     /// [`LocalStore::open`], keeping this computer's own state for the store
@@ -786,18 +813,24 @@ impl LocalStore {
     /// Conflict copies a sync tool left in `nodes/` are merged into their
     /// documents and removed (rule 4).
     pub async fn open_in(path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
+        Self::open_on(&Disk::default(), path, state_root).await
+    }
+
+    /// [`LocalStore::open_in`] on `disk`.
+    pub async fn open_on(disk: &Disk, path: impl AsRef<Path>, state_root: Option<&Path>) -> Result<Self> {
+        let disk = disk.clone();
         let path = path.as_ref().to_path_buf();
 
         // Read manifest
         let manifest_path = path.join(Self::MANIFEST_FILE);
-        if !manifest_path.exists() {
+        if !disk.exists(&manifest_path).await {
             return Err(StoreError::InvalidPath(format!(
                 "No manifest found at {}",
                 manifest_path.display()
             )));
         }
 
-        let manifest_json = fs::read_to_string(&manifest_path).await?;
+        let manifest_json = disk.read_to_string(&manifest_path).await?;
         let mut manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
         let manifest_base = manifest.clone();
         let manifest_hash = Some(content_hash(manifest_json.as_bytes()));
@@ -812,25 +845,26 @@ impl LocalStore {
 
         let state_dir = state_root.map(|root| root.join(manifest.id.to_string()));
         if let Some(state_dir) = &state_dir {
-            folder::migrate_per_computer_state(&path, state_dir, manifest.id).await;
+            folder::migrate_per_computer_state(&disk, &path, state_dir, manifest.id).await;
             // The link's state files of this computer, into one record
             // (docs/ONE_CODEBASE_CONTRACT.md decision 7).
             let devices = state_root.and_then(crate::sync_state::legacy_devices_path);
-            crate::sync_state::migrate(state_dir, manifest.id, devices.as_deref()).await;
+            crate::sync_state::migrate(&disk, state_dir, manifest.id, devices.as_deref()).await;
         }
 
         let nodes_dir = path.join(Self::NODES_DIR);
-        fs::create_dir_all(&nodes_dir).await?;
-        folder::sweep_stale_temporaries(&nodes_dir).await;
-        let loaded = Self::load_node_docs(&nodes_dir).await?;
+        disk.create_dir_all(&nodes_dir).await?;
+        folder::sweep_stale_temporaries(&disk, &nodes_dir).await;
+        let loaded = Self::load_node_docs(&disk, &nodes_dir).await?;
         let mut docs = loaded.docs;
 
         // The previous layout's tree document, when it is still there, is
         // written into the node documents before anything else happens.
         let store_doc_path = path.join(Self::STORE_DOC_FILE);
         let mut dirty = HashSet::new();
-        if store_doc_path.exists() {
-            let bytes = fs::read(&store_doc_path).await?;
+        let previous_tree_doc = disk.exists(&store_doc_path).await;
+        if previous_tree_doc {
+            let bytes = disk.read(&store_doc_path).await?;
             let store_doc = StoreDocument::load(&bytes).map_err(StoreError::from)?;
             dirty = Self::migrate(&store_doc, manifest.root_node_id, &mut docs)?;
             info!(
@@ -847,14 +881,15 @@ impl LocalStore {
         // A `sync.json` that does not parse is the link's problem to report
         // (`read_sync_config` fails the same way later); the store still
         // opens, with the access an unlinked store has.
-        let link_access = match Self::read_sync_config_at(&path).await {
+        let link_access = match Self::read_sync_config_at(&disk, &path).await {
             Ok(Some(config)) => LinkAccess::of(&config),
             _ => LinkAccess::default(),
         };
 
         let mut store = Self {
             id: manifest.id,
-            blobs: BlobStore::new(manifest.id, &path),
+            blobs: BlobStore::new_on(&disk, manifest.id, &path),
+            disk,
             path,
             tree: Tree::from_docs(manifest.root_node_id, docs),
             manifest,
@@ -879,13 +914,13 @@ impl LocalStore {
             warn!("Store {}: could not clear unfinished picture uploads: {}", store.id, e);
         }
 
-        if store_doc_path.exists() {
+        if previous_tree_doc {
             // Every migrated document reaches disk before the tree document
             // is retired: a crash in between re-runs the migration on the
             // next open, which then finds every document initialised, writes
             // nothing, and only renames.
             store.flush().await?;
-            fs::rename(&store_doc_path, store.path.join(Self::MIGRATED_STORE_DOC_FILE)).await?;
+            store.disk.rename(&store_doc_path, store.path.join(Self::MIGRATED_STORE_DOC_FILE)).await?;
         }
 
         // A manifest whose root names no node (a replica created around a
@@ -921,11 +956,10 @@ impl LocalStore {
     /// on the next reconcile. A sync tool's conflict copy of a document
     /// (`classify_node_file`) is not loaded but named in `conflicts`, for
     /// `open` to merge once the documents are in place.
-    async fn load_node_docs(nodes_dir: &Path) -> Result<LoadedDocs> {
+    async fn load_node_docs(disk: &Disk, nodes_dir: &Path) -> Result<LoadedDocs> {
         let mut loaded = LoadedDocs::default();
-        let mut entries = fs::read_dir(nodes_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let file = entry.path();
+        for entry in disk.list(nodes_dir).await? {
+            let file = entry.path;
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
             let id = match classify_node_file(name) {
                 NodeFile::Document(id) => id,
@@ -940,7 +974,7 @@ impl LocalStore {
                     continue;
                 }
             };
-            let bytes = fs::read(&file).await?;
+            let bytes = disk.read(&file).await?;
             match NodeDoc::load(&bytes) {
                 Ok(doc) => {
                     loaded.hashes.insert(id, content_hash(&bytes));
@@ -1460,11 +1494,9 @@ impl LocalStore {
             }
         }
         for &node_id in ids {
-            if let Ok(file) = fs::File::open(self.node_doc_path(node_id)).await {
-                file.sync_all().await?;
-            }
+            self.disk.sync_file(self.node_doc_path(node_id)).await?;
         }
-        crate::sync_state::sync_dir(&self.path.join(Self::NODES_DIR)).await;
+        self.disk.sync_dir(self.path.join(Self::NODES_DIR)).await;
         Ok(())
     }
 
@@ -1484,6 +1516,7 @@ impl LocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_host::disk::testfs as tfs;
     use pimble_crdt::ContentDoc;
     use tempfile::tempdir;
 
@@ -1501,11 +1534,11 @@ mod tests {
         let store_path = dir.path().join("test.pimble");
 
         let store = LocalStore::create(&store_path, "Test Store").await.unwrap();
-        assert!(store_path.exists());
-        assert!(store_path.join("manifest.json").exists());
-        assert!(store_path.join("nodes").exists());
-        assert!(node_file(&store_path, store.root_node_id()).exists(), "the root is a document");
-        assert!(!store_path.join("store.yrs").exists(), "no tree document");
+        assert!(tfs::exists(&store_path));
+        assert!(tfs::exists(&store_path.join("manifest.json")));
+        assert!(tfs::exists(&store_path.join("nodes")));
+        assert!(tfs::exists(&node_file(&store_path, store.root_node_id())), "the root is a document");
+        assert!(!tfs::exists(&store_path.join("store.yrs")), "no tree document");
         assert_eq!(store.manifest().version, StoreManifest::CURRENT_VERSION);
     }
 
@@ -1528,7 +1561,7 @@ mod tests {
     async fn test_open_rejects_unsupported_format() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("test.pimble");
-        fs::create_dir_all(&store_path).await.unwrap();
+        tfs::create_dir_all(&store_path).unwrap();
 
         // A manifest declaring a version older than the one migrated.
         let manifest = StoreManifest {
@@ -1542,10 +1575,10 @@ mod tests {
             scope_roots: Vec::new(),
             ended_roots: Vec::new(),
         };
-        fs::write(
+        tfs::write(
             store_path.join("manifest.json"),
             serde_json::to_string_pretty(&manifest).unwrap(),
-        ).await.unwrap();
+        ).unwrap();
 
         match LocalStore::open(&store_path).await {
             Err(StoreError::UnsupportedFormat { version, .. }) => assert_eq!(version, 2),
@@ -1791,7 +1824,7 @@ mod tests {
         assert!(store.node_state_vector(doc_id).is_ok());
         store.flush().await.unwrap();
         for id in [folder_id, sub_id, doc_id] {
-            assert!(node_file(&store_path, id).exists(), "a tombstone's file stays");
+            assert!(tfs::exists(&node_file(&store_path, id)), "a tombstone's file stays");
         }
         assert!(matches!(store.delete_node(folder_id), Err(StoreError::NodeNotFound(_))), "already deleted");
         assert!(matches!(store.delete_node(root_id), Err(StoreError::InvalidOperation(_))));
@@ -1901,7 +1934,7 @@ mod tests {
         store.flush().await.unwrap();
         assert!(store.dirty.is_empty());
 
-        let before = |id: NodeId| std::fs::read(node_file(&store_path, id)).unwrap();
+        let before = |id: NodeId| tfs::read(node_file(&store_path, id)).unwrap();
         let (root_before, a_before, b_before) = (before(root_id), before(a_id), before(b_id));
 
         // A rename touches one document; the flush rewrites that one.
@@ -1915,7 +1948,7 @@ mod tests {
         assert_ne!(before(a_id), a_before, "the renamed node's file was rewritten");
         assert_eq!(before(root_id), root_before, "the root's file was left alone");
         assert_eq!(before(b_id), b_before, "the other node's file was left alone");
-        assert!(!node_file(&store_path, a_id).with_extension("tmp").exists(), "no temp file left behind");
+        assert!(!tfs::exists(&node_file(&store_path, a_id).with_extension("tmp")), "no temp file left behind");
 
         // An edit through `tree_mut` reaches disk only once marked dirty.
         store.tree_mut().set_title(b_id, "B renamed", &now()).unwrap();
@@ -1974,7 +2007,7 @@ mod tests {
         assert!(store.doc_ids().is_empty(), "no document at all");
         assert!(store.get_node(root_id).is_err());
         assert_eq!(store.document_root(), None);
-        assert!(!node_file(&store_path, root_id).exists());
+        assert!(!tfs::exists(&node_file(&store_path, root_id)));
         drop(store);
 
         // A reopen creates nothing either.
@@ -2031,7 +2064,7 @@ mod tests {
         // And at open, from a manifest that still says the placeholder.
         let mut manifest = store.manifest().clone();
         manifest.root_node_id = placeholder;
-        std::fs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        tfs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
         let store = LocalStore::open(&store_path).await.unwrap();
         assert_eq!(store.root_node_id(), real_root);
         assert_eq!(store.manifest().root_node_id, real_root);
@@ -2058,7 +2091,7 @@ mod tests {
     /// `nodes/{id}.yrs` content document for every node that had text.
     /// Returns the root id and the nodes in creation order.
     async fn write_old_layout_store(store_path: &Path, name: &str) -> (StoreId, NodeId, Vec<OldNode>) {
-        fs::create_dir_all(store_path.join("nodes")).await.unwrap();
+        tfs::create_dir_all(store_path.join("nodes")).unwrap();
         let root_id = NodeId::new();
         let store_id = StoreId::new();
         let manifest = StoreManifest {
@@ -2072,7 +2105,7 @@ mod tests {
             scope_roots: Vec::new(),
             ended_roots: Vec::new(),
         };
-        fs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).await.unwrap();
+        tfs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
 
         let folder = NodeId::new();
         let nodes = vec![
@@ -2133,7 +2166,7 @@ mod tests {
             }
             if let Some(text) = node.text {
                 let content = ContentDoc::from_plain_text(text).unwrap();
-                fs::write(store_path.join("nodes").join(format!("{}.yrs", node.id)), content.save()).await.unwrap();
+                tfs::write(store_path.join("nodes").join(format!("{}.yrs", node.id)), content.save()).unwrap();
             }
         }
         // "Second" was created before "First" but sits after it: the order
@@ -2143,7 +2176,7 @@ mod tests {
         for node in &nodes {
             store_doc.set_timestamps(node.id, node.created_at, node.modified_at).unwrap();
         }
-        fs::write(store_path.join("store.yrs"), store_doc.save()).await.unwrap();
+        tfs::write(store_path.join("store.yrs"), store_doc.save()).unwrap();
         (store_id, root_id, nodes)
     }
 
@@ -2183,28 +2216,28 @@ mod tests {
         assert_eq!(store.id, store_id);
         assert_eq!(store.manifest().version, StoreManifest::CURRENT_VERSION);
         assert_migrated(&store, root_id, &nodes, "Old Store");
-        assert!(!store_path.join("store.yrs").exists(), "the tree document is retired");
-        assert!(store_path.join("store.yrs.migrated").exists());
+        assert!(!tfs::exists(&store_path.join("store.yrs")), "the tree document is retired");
+        assert!(tfs::exists(&store_path.join("store.yrs.migrated")));
         for id in std::iter::once(root_id).chain(nodes.iter().map(|n| n.id)) {
-            assert!(node_file(&store_path, id).exists(), "every node has a document on disk, content or not");
+            assert!(tfs::exists(&node_file(&store_path, id)), "every node has a document on disk, content or not");
         }
         drop(store);
 
         // A second open finds nothing to migrate and writes nothing.
         let snapshot = |path: &Path| -> HashMap<String, Vec<u8>> {
-            std::fs::read_dir(path.join("nodes"))
+            tfs::read_dir(path.join("nodes"))
                 .unwrap()
-                .map(|e| e.unwrap().path())
-                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+                .into_iter()
+                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), tfs::read(&p).unwrap()))
                 .collect()
         };
-        let manifest_before = std::fs::read(store_path.join("manifest.json")).unwrap();
+        let manifest_before = tfs::read(store_path.join("manifest.json")).unwrap();
         let files_before = snapshot(&store_path);
         let store = LocalStore::open(&store_path).await.unwrap();
         assert_migrated(&store, root_id, &nodes, "Old Store");
         assert_eq!(snapshot(&store_path), files_before, "no document was rewritten");
-        assert_eq!(std::fs::read(store_path.join("manifest.json")).unwrap(), manifest_before);
-        let manifest_json = std::fs::read_to_string(store_path.join("manifest.json")).unwrap();
+        assert_eq!(tfs::read(store_path.join("manifest.json")).unwrap(), manifest_before);
+        let manifest_json = tfs::read_to_string(store_path.join("manifest.json")).unwrap();
         assert!(manifest_json.contains("\"version\": 4"), "{manifest_json}");
     }
 
@@ -2216,18 +2249,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("old.pimble");
         let (_, root_id, nodes) = write_old_layout_store(&store_path, "Old Store").await;
-        let store_doc_bytes = std::fs::read(store_path.join("store.yrs")).unwrap();
+        let store_doc_bytes = tfs::read(store_path.join("store.yrs")).unwrap();
 
         let store = LocalStore::open(&store_path).await.unwrap();
         let states: Vec<Vec<u8>> = store.doc_ids().into_iter().map(|id| store.tree().doc(id).unwrap().save()).collect();
         drop(store);
 
         // Put the tree document back, as if the rename never happened.
-        std::fs::write(store_path.join("store.yrs"), &store_doc_bytes).unwrap();
-        std::fs::remove_file(store_path.join("store.yrs.migrated")).unwrap();
+        tfs::write(store_path.join("store.yrs"), &store_doc_bytes).unwrap();
+        tfs::remove_file(store_path.join("store.yrs.migrated")).unwrap();
         let store = LocalStore::open(&store_path).await.unwrap();
         assert_migrated(&store, root_id, &nodes, "Old Store");
-        assert!(!store_path.join("store.yrs").exists());
+        assert!(!tfs::exists(&store_path.join("store.yrs")));
         let mut after: Vec<Vec<u8>> = store.doc_ids().into_iter().map(|id| store.tree().doc(id).unwrap().save()).collect();
         let mut before = states;
         before.sort();
@@ -2236,16 +2269,7 @@ mod tests {
     }
 
     fn copy_dir(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_dir(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).unwrap();
-            }
-        }
+        tfs::copy_dir(from, to).unwrap();
     }
 
     /// Two replicas migrating the same old store independently, then
@@ -2511,7 +2535,7 @@ mod tests {
         assert!(partial.is_partial(), "never a whole store");
         assert!(partial.write_refused(&[under_trips]) && partial.write_refused(&[under_recipes]));
         assert_eq!(partial.get_node(under_trips).unwrap().metadata.title, "Lisbon", "nothing was deleted");
-        assert!(path.join("nodes").join(format!("{}.yrs", under_trips)).exists());
+        assert!(tfs::exists(&path.join("nodes").join(format!("{}.yrs", under_trips))));
 
         // The manifest round trip: a reopen reads what was recorded.
         drop(partial);
@@ -2529,7 +2553,7 @@ mod tests {
 
         // A manifest written before ended roots existed has none.
         assert!(reopened.set_ended_roots(Vec::new()).await.unwrap());
-        let written = fs::read_to_string(path.join("manifest.json")).await.unwrap();
+        let written = tfs::read_to_string(path.join("manifest.json")).unwrap();
         assert!(!written.contains("ended_roots"), "skipped when empty, so an old manifest is what an unended one looks like: {written}");
         drop(reopened);
         assert!(LocalStore::open(&path).await.unwrap().ended_roots().is_empty());

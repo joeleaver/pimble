@@ -17,6 +17,7 @@
 // Not every test file uses every helper.
 #![allow(dead_code)]
 
+use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -828,14 +829,13 @@ impl Env {
 }
 
 pub fn contains_bytes_recursive(dir: &Path, needle: &[u8]) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
+    let Ok(entries) = tfs::read_dir(dir) else { return false };
+    for path in entries {
+        if tfs::is_dir(&path) {
             if contains_bytes_recursive(&path, needle) {
                 return true;
             }
-        } else if let Ok(bytes) = std::fs::read(&path) {
+        } else if let Ok(bytes) = tfs::read(&path) {
             if bytes.windows(needle.len()).any(|w| w == needle) {
                 return true;
             }
@@ -851,7 +851,7 @@ pub async fn spawn_env() -> Env {
 
     let h_dir = tempfile::tempdir().unwrap();
     let h_stores_dir = h_dir.path().join("stores");
-    std::fs::create_dir_all(&h_stores_dir).unwrap();
+    tfs::create_dir_all(&h_stores_dir).unwrap();
 
     let state: StubState = Arc::new(Stub {
         inner: Mutex::new(StubInner {
@@ -905,7 +905,7 @@ pub async fn spawn_env() -> Env {
 
 /// The store keys a device's keystore holds for `store_id`, off its `keys.json`.
 pub fn scope_keys_in(server_dir: &Path, store_id: StoreId) -> Vec<(Uuid, pimble_crypto::SymmetricKey)> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(server_dir.join("keys.json")).expect("the keystore file")).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&tfs::read(server_dir.join("keys.json")).expect("the keystore file")).unwrap();
     json["store_keys"]
         .as_array()
         .cloned()

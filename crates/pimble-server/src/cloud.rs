@@ -2,7 +2,8 @@
 //! (docs/CRYPTO_CONTRACT.md "Accounts service endpoints (C)"), used by the
 //! `cloud*` RPC handlers (`crate::handler`) and by
 //! [`crate::vault_link::VaultLink`] to mint a fresh JWT before every
-//! connect. Plain `reqwest` JSON calls, mirroring the request/response
+//! connect. Plain JSON calls through the host's [`pimble_host::Http`]
+//! (docs/ONE_CODEBASE_CONTRACT.md seam D: `reqwest` on the desktop), mirroring the request/response
 //! shapes `pimble-cloud`'s `src/routes/{accounts,stores}.rs` actually
 //! serve — this crate has no dependency on `pimble-cloud` (a service, not a
 //! library), so the shapes are duplicated here deliberately, the same way
@@ -15,17 +16,18 @@
 //! cookie or that header; see its `src/session.rs`).
 
 use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams, KeyEnvelope};
+use pimble_host::http::{Http, HttpRequest, HttpResponse, Method};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
     #[error("could not reach the cloud service at {url}: {source}")]
-    Request { url: String, source: reqwest::Error },
+    Request { url: String, source: pimble_host::http::HttpError },
     #[error("cloud service at {url} answered {status}: {body}")]
     Status { url: String, status: u16, body: String },
     #[error("cloud service response from {url} could not be parsed: {source}")]
-    Decode { url: String, source: reqwest::Error },
+    Decode { url: String, source: serde_json::Error },
 }
 
 impl CloudError {
@@ -40,59 +42,37 @@ impl CloudError {
 
 pub type Result<T> = std::result::Result<T, CloudError>;
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("a reqwest client with only a timeout set always builds")
-}
-
-async fn finish<T: for<'de> Deserialize<'de>>(url: &str, resp: reqwest::Response) -> Result<T> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CloudError::Status { url: url.to_string(), status: status.as_u16(), body });
-    }
-    resp.json::<T>().await.map_err(|e| CloudError::Decode { url: url.to_string(), source: e })
-}
-
-async fn get<T: for<'de> Deserialize<'de>>(url: &str, bearer: Option<&str>) -> Result<T> {
-    let mut req = client().get(url);
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().await.map_err(|e| CloudError::Request { url: url.to_string(), source: e })?;
-    finish(url, resp).await
-}
-
-async fn post<B: Serialize, T: for<'de> Deserialize<'de>>(url: &str, bearer: Option<&str>, body: &B) -> Result<T> {
-    let mut req = client().post(url).json(body);
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().await.map_err(|e| CloudError::Request { url: url.to_string(), source: e })?;
-    finish(url, resp).await
-}
-
-async fn put<B: Serialize, T: for<'de> Deserialize<'de>>(url: &str, bearer: &str, body: &B) -> Result<T> {
-    let resp = client()
-        .put(url)
-        .bearer_auth(bearer)
-        .json(body)
-        .send()
+async fn send(http: &dyn Http, method: Method, url: &str, bearer: Option<&str>, json: Option<Vec<u8>>) -> Result<HttpResponse> {
+    http.send(HttpRequest { method, url: url.to_string(), bearer: bearer.map(str::to_string), json })
         .await
-        .map_err(|e| CloudError::Request { url: url.to_string(), source: e })?;
-    finish(url, resp).await
+        .map_err(|e| CloudError::Request { url: url.to_string(), source: e })
 }
 
-async fn delete(url: &str, bearer: &str) -> Result<()> {
-    let resp = client()
-        .delete(url)
-        .bearer_auth(bearer)
-        .send()
-        .await
-        .map_err(|e| CloudError::Request { url: url.to_string(), source: e })?;
-    let _: serde_json::Value = finish(url, resp).await?;
+fn finish<T: for<'de> Deserialize<'de>>(url: &str, resp: HttpResponse) -> Result<T> {
+    if !resp.is_success() {
+        return Err(CloudError::Status { url: url.to_string(), status: resp.status, body: resp.text() });
+    }
+    serde_json::from_slice::<T>(&resp.body).map_err(|e| CloudError::Decode { url: url.to_string(), source: e })
+}
+
+fn json_of<B: Serialize>(body: &B) -> Vec<u8> {
+    serde_json::to_vec(body).expect("a request body serializes")
+}
+
+async fn get<T: for<'de> Deserialize<'de>>(http: &dyn Http, url: &str, bearer: Option<&str>) -> Result<T> {
+    finish(url, send(http, Method::Get, url, bearer, None).await?)
+}
+
+async fn post<B: Serialize, T: for<'de> Deserialize<'de>>(http: &dyn Http, url: &str, bearer: Option<&str>, body: &B) -> Result<T> {
+    finish(url, send(http, Method::Post, url, bearer, Some(json_of(body))).await?)
+}
+
+async fn put<B: Serialize, T: for<'de> Deserialize<'de>>(http: &dyn Http, url: &str, bearer: &str, body: &B) -> Result<T> {
+    finish(url, send(http, Method::Put, url, Some(bearer), Some(json_of(body))).await?)
+}
+
+async fn delete(http: &dyn Http, url: &str, bearer: &str) -> Result<()> {
+    let _: serde_json::Value = finish(url, send(http, Method::Delete, url, Some(bearer), None).await?)?;
     Ok(())
 }
 
@@ -109,8 +89,8 @@ pub struct PersonalBody {
 }
 
 /// The account's sealed personal document, `None` when it has none.
-pub async fn get_personal(base_url: &str, session: &str) -> Result<Option<PersonalBody>> {
-    match get(&endpoint(base_url, "/api/v1/me/personal"), Some(session)).await {
+pub async fn get_personal(http: &dyn Http, base_url: &str, session: &str) -> Result<Option<PersonalBody>> {
+    match get(http, &endpoint(base_url, "/api/v1/me/personal"), Some(session)).await {
         Ok(body) => Ok(Some(body)),
         Err(e) if e.status() == Some(404) => Ok(None),
         Err(e) => Err(e),
@@ -119,34 +99,34 @@ pub async fn get_personal(base_url: &str, session: &str) -> Result<Option<Person
 
 /// Replace it, naming the version replaced; `Ok(None)` when another device
 /// wrote first (409): fetch, merge, write again.
-pub async fn put_personal(base_url: &str, session: &str, version: u64, blob: &str) -> Result<Option<u64>> {
+pub async fn put_personal(http: &dyn Http, base_url: &str, session: &str, version: u64, blob: &str) -> Result<Option<u64>> {
     let body = PersonalBody { version, blob: blob.to_string() };
-    match put::<_, PersonalBody>(&endpoint(base_url, "/api/v1/me/personal"), session, &body).await {
+    match put::<_, PersonalBody>(http, &endpoint(base_url, "/api/v1/me/personal"), session, &body).await {
         Ok(answer) => Ok(Some(answer.version)),
         Err(e) if e.status() == Some(409) => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-pub async fn delete_personal(base_url: &str, session: &str) -> Result<()> {
-    let resp = client()
-        .delete(endpoint(base_url, "/api/v1/me/personal"))
-        .bearer_auth(session)
-        .send()
+pub async fn delete_personal(http: &dyn Http, base_url: &str, session: &str) -> Result<()> {
+    let resp = send(http, Method::Delete, &endpoint(base_url, "/api/v1/me/personal"), Some(session), None)
         .await
-        .map_err(|e| CloudError::Request { url: base_url.to_string(), source: e })?;
-    if resp.status().is_success() || resp.status().as_u16() == 404 {
+        .map_err(|e| match e {
+            CloudError::Request { source, .. } => CloudError::Request { url: base_url.to_string(), source },
+            other => other,
+        })?;
+    if resp.is_success() || resp.status == 404 {
         Ok(())
     } else {
-        Err(CloudError::Status { url: base_url.to_string(), status: resp.status().as_u16(), body: resp.text().await.unwrap_or_default() })
+        Err(CloudError::Status { url: base_url.to_string(), status: resp.status, body: resp.text() })
     }
 }
 
 // ── GET /kdf ──────────────────────────────────────────────────────────────
 
-pub async fn kdf(base_url: &str, email: &str) -> Result<KdfParams> {
+pub async fn kdf(http: &dyn Http, base_url: &str, email: &str) -> Result<KdfParams> {
     let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
-    get(&endpoint(base_url, &format!("/api/v1/kdf?email={encoded_email}")), None).await
+    get(http, &endpoint(base_url, &format!("/api/v1/kdf?email={encoded_email}")), None).await
 }
 
 // ── POST /login ───────────────────────────────────────────────────────────
@@ -169,8 +149,8 @@ pub struct LoginResponse {
     pub session: String,
 }
 
-pub async fn login(base_url: &str, email: &str, auth_key: &str) -> Result<LoginResponse> {
-    post(&endpoint(base_url, "/api/v1/login"), None, &LoginRequest { email, auth_key }).await
+pub async fn login(http: &dyn Http, base_url: &str, email: &str, auth_key: &str) -> Result<LoginResponse> {
+    post(http, &endpoint(base_url, "/api/v1/login"), None, &LoginRequest { email, auth_key }).await
 }
 
 // ── GET /me/keys ──────────────────────────────────────────────────────────
@@ -182,8 +162,8 @@ pub struct MeKeysResponse {
     pub account_key_blob: AccountKeyBlob,
 }
 
-pub async fn me_keys(base_url: &str, session: &str) -> Result<MeKeysResponse> {
-    get(&endpoint(base_url, "/api/v1/me/keys"), Some(session)).await
+pub async fn me_keys(http: &dyn Http, base_url: &str, session: &str) -> Result<MeKeysResponse> {
+    get(http, &endpoint(base_url, "/api/v1/me/keys"), Some(session)).await
 }
 
 // ── POST /token ───────────────────────────────────────────────────────────
@@ -245,8 +225,8 @@ impl TokenResponse {
 
 /// Mint a fresh JWT for the Pimble RPC server (docs/CRYPTO_CONTRACT.md: "the
 /// link mints a JWT through `POST /api/v1/token` before every connect").
-pub async fn mint_token(base_url: &str, session: &str) -> Result<TokenResponse> {
-    post(&endpoint(base_url, "/api/v1/token"), Some(session), &serde_json::json!({})).await
+pub async fn mint_token(http: &dyn Http, base_url: &str, session: &str) -> Result<TokenResponse> {
+    post(http, &endpoint(base_url, "/api/v1/token"), Some(session), &serde_json::json!({})).await
 }
 
 // ── POST /stores, GET /stores ─────────────────────────────────────────────
@@ -399,22 +379,22 @@ pub fn is_owner_of(rows: &[StoreView], store_id: pimble_core::StoreId) -> bool {
     rows.iter().any(|row| row.store_id == id && row.root.is_none() && row.role == "owner")
 }
 
-pub async fn create_store(base_url: &str, session: &str, name: &str, kind: &str, store_id: Option<&str>) -> Result<StoreView> {
-    post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name, kind, store_id, tier: None }).await
+pub async fn create_store(http: &dyn Http, base_url: &str, session: &str, name: &str, kind: &str, store_id: Option<&str>) -> Result<StoreView> {
+    post(http, &endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name, kind, store_id, tier: None }).await
 }
 
 /// Record a store that is shared from this computer (docs/RELAY_CONTRACT.md):
 /// its id, the owner's grant, and nothing else. The name sent is empty, since
 /// nothing on Pimble Cloud needs the owner's name for it, and the accounts
 /// service makes no call to the hosted server for it.
-pub async fn create_relayed_store(base_url: &str, session: &str, store_id: &str) -> Result<StoreView> {
-    post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name: "", kind: "vault", store_id: Some(store_id), tier: Some(TIER_RELAY) }).await
+pub async fn create_relayed_store(http: &dyn Http, base_url: &str, session: &str, store_id: &str) -> Result<StoreView> {
+    post(http, &endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name: "", kind: "vault", store_id: Some(store_id), tier: Some(TIER_RELAY) }).await
 }
 
 /// Remove a store's record: its grants, invitations and key envelopes go
 /// with it, and a relayed store is withdrawn from the relay at once.
-pub async fn delete_store(base_url: &str, session: &str, store_id: &str) -> Result<()> {
-    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}")), session).await
+pub async fn delete_store(http: &dyn Http, base_url: &str, session: &str, store_id: &str) -> Result<()> {
+    delete(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}")), session).await
 }
 
 /// `path` on the accounts service's origin as a WebSocket URL: `https` is
@@ -449,8 +429,8 @@ pub fn jwks_url(base_url: &str) -> std::result::Result<url::Url, String> {
     endpoint(base_url, "/api/v1/.well-known/jwks.json").parse().map_err(|e| format!("{base_url} is not a URL: {e}"))
 }
 
-pub async fn list_stores(base_url: &str, session: &str) -> Result<Vec<StoreView>> {
-    get(&endpoint(base_url, "/api/v1/stores"), Some(session)).await
+pub async fn list_stores(http: &dyn Http, base_url: &str, session: &str) -> Result<Vec<StoreView>> {
+    get(http, &endpoint(base_url, "/api/v1/stores"), Some(session)).await
 }
 
 // ── GET/PUT /stores/{id}/keys ─────────────────────────────────────────────
@@ -506,8 +486,8 @@ fn root_query(root: Option<&pimble_core::NodeId>) -> String {
 
 /// The caller's own key envelopes for a scope: the store key without a
 /// `root`, that share's key with one; and the signers to believe.
-pub async fn get_store_keys(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<KeyGrantsResponse> {
-    get(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys{}", root_query(root))), Some(session)).await
+pub async fn get_store_keys(http: &dyn Http, base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<KeyGrantsResponse> {
+    get(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys{}", root_query(root))), Some(session)).await
 }
 
 #[derive(Serialize)]
@@ -529,6 +509,7 @@ struct PutStoreKeysRequest<'a> {
 /// (verified by the accounts service against the caller's own signing key):
 /// the store key's, or with `root` that share's key.
 pub async fn put_store_key(
+    http: &dyn Http,
     base_url: &str,
     session: &str,
     store_id: &str,
@@ -538,7 +519,7 @@ pub async fn put_store_key(
     root: Option<&pimble_core::NodeId>,
 ) -> Result<()> {
     let body = PutStoreKeysRequest { envelopes: vec![EnvelopeUpsert { user_id, key_id: key_id.to_string(), envelope, root: root.map(|r| r.to_string()) }] };
-    let _: serde_json::Value = put(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys")), session, &body).await?;
+    let _: serde_json::Value = put(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys")), session, &body).await?;
     Ok(())
 }
 
@@ -617,12 +598,12 @@ pub struct MeView {
     pub name: String,
 }
 
-pub async fn me(base_url: &str, session: &str) -> Result<MeView> {
-    get(&endpoint(base_url, "/api/v1/me"), Some(session)).await
+pub async fn me(http: &dyn Http, base_url: &str, session: &str) -> Result<MeView> {
+    get(http, &endpoint(base_url, "/api/v1/me"), Some(session)).await
 }
 
-pub async fn put_display_name(base_url: &str, session: &str, display_name: &str) -> Result<()> {
-    let _: serde_json::Value = put(&endpoint(base_url, "/api/v1/me"), session, &serde_json::json!({ "display_name": display_name })).await?;
+pub async fn put_display_name(http: &dyn Http, base_url: &str, session: &str, display_name: &str) -> Result<()> {
+    let _: serde_json::Value = put(http, &endpoint(base_url, "/api/v1/me"), session, &serde_json::json!({ "display_name": display_name })).await?;
     Ok(())
 }
 
@@ -652,18 +633,18 @@ impl ShareView {
     }
 }
 
-pub async fn list_shares(base_url: &str, session: &str) -> Result<Vec<ShareView>> {
-    get(&endpoint(base_url, "/api/v1/me/shares"), Some(session)).await
+pub async fn list_shares(http: &dyn Http, base_url: &str, session: &str) -> Result<Vec<ShareView>> {
+    get(http, &endpoint(base_url, "/api/v1/me/shares"), Some(session)).await
 }
 
-pub async fn put_share_name(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>, name: &str) -> Result<()> {
+pub async fn put_share_name(http: &dyn Http, base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>, name: &str) -> Result<()> {
     let body = serde_json::json!({ "root": root.map(|r| r.to_string()), "name": name });
-    let _: serde_json::Value = put(&endpoint(base_url, &format!("/api/v1/me/shares/{store_id}")), session, &body).await?;
+    let _: serde_json::Value = put(http, &endpoint(base_url, &format!("/api/v1/me/shares/{store_id}")), session, &body).await?;
     Ok(())
 }
 
-pub async fn list_members(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<MembersResponse> {
-    get(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members{}", root_query(root))), Some(session)).await
+pub async fn list_members(http: &dyn Http, base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<MembersResponse> {
+    get(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members{}", root_query(root))), Some(session)).await
 }
 
 #[derive(Serialize)]
@@ -680,6 +661,7 @@ struct PutMemberRequest<'a> {
 /// Give `email` a role on a scope: a grant when the address has an account
 /// (the answer then carries its `public_keys`), an invitation when not.
 pub async fn put_member(
+    http: &dyn Http,
     base_url: &str,
     session: &str,
     store_id: &str,
@@ -689,17 +671,17 @@ pub async fn put_member(
     name: Option<&str>,
 ) -> Result<MemberView> {
     let body = PutMemberRequest { email, role, root: root.map(|r| r.to_string()), name };
-    put(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members")), session, &body).await
+    put(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members")), session, &body).await
 }
 
-pub async fn delete_member(base_url: &str, session: &str, store_id: &str, user_id: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
-    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members/{user_id}{}", root_query(root))), session).await
+pub async fn delete_member(http: &dyn Http, base_url: &str, session: &str, store_id: &str, user_id: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+    delete(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members/{user_id}{}", root_query(root))), session).await
 }
 
 /// Withdraw an invitation; `200` whether or not there was one.
-pub async fn delete_invitation(base_url: &str, session: &str, store_id: &str, email: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+pub async fn delete_invitation(http: &dyn Http, base_url: &str, session: &str, store_id: &str, email: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
     let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
-    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/invitations/{encoded_email}{}", root_query(root))), session).await
+    delete(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/invitations/{encoded_email}{}", root_query(root))), session).await
 }
 
 #[cfg(test)]

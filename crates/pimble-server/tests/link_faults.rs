@@ -40,6 +40,7 @@
 //! A run's timing is not replayed, only its choices.
 
 mod common;
+use pimble_host::disk::testfs as tfs;
 use common::*;
 
 use std::path::{Path, PathBuf};
@@ -99,7 +100,7 @@ impl Device {
     /// The link's record of what the remote holds: the `vault` section of
     /// `sync-state.json`.
     fn progress(&self, store_id: StoreId) -> Option<serde_json::Value> {
-        let bytes = std::fs::read(self.state_dir(store_id).join("sync-state.json")).ok()?;
+        let bytes = tfs::read(self.state_dir(store_id).join("sync-state.json")).ok()?;
         let mut record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         record.get_mut("vault").map(serde_json::Value::take)
     }
@@ -107,13 +108,13 @@ impl Device {
     /// Replace (or with `None`, remove) that section, the device stopped.
     fn put_progress(&self, store_id: StoreId, section: Option<serde_json::Value>) {
         let path = self.state_dir(store_id).join("sync-state.json");
-        let Some(mut record) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return };
+        let Some(mut record) = tfs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return };
         let Some(map) = record.as_object_mut() else { return };
         match section {
             Some(section) => map.insert("vault".to_string(), section),
             None => map.remove("vault"),
         };
-        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        tfs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
     async fn start(&mut self) {
@@ -142,25 +143,30 @@ impl Device {
     async fn crash(&mut self) {
         let copy = tempfile::tempdir().unwrap();
         copy_tree(&self.dir.path().join("stores"), &copy.path().join("stores"));
-        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
-            if entry.file_name() != "stores" {
-                copy_tree(&entry.path(), &copy.path().join(entry.file_name()));
+        for path in tfs::read_dir(self.dir.path()).unwrap() {
+            let name = path.file_name().unwrap().to_owned();
+            if name != "stores" {
+                copy_tree(&path, &copy.path().join(name));
             }
         }
         self.stop().await;
         // Anything the stopped server still had in flight lands before the
         // copy goes back.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).unwrap();
+        for path in tfs::read_dir(self.dir.path()).unwrap() {
+            if tfs::is_dir(&path) {
+                tfs::remove_dir_all(&path).unwrap();
             } else {
-                std::fs::remove_file(&path).unwrap();
+                tfs::remove_file(&path).unwrap();
             }
         }
-        for entry in std::fs::read_dir(copy.path()).unwrap().flatten() {
-            std::fs::rename(entry.path(), self.dir.path().join(entry.file_name())).unwrap();
+        if tfs::is_memory() {
+            // The search indexes are on the machine's own disk whatever the
+            // server's disk is (seam F): gone with the crash, as above.
+            let _ = std::fs::remove_dir_all(self.dir.path().join("stores"));
+        }
+        for path in tfs::read_dir(copy.path()).unwrap() {
+            tfs::rename(&path, self.dir.path().join(path.file_name().unwrap())).unwrap();
         }
     }
 }
@@ -169,20 +175,20 @@ impl Device {
 /// indexes and whatever vanishes while it is copied (a temporary renamed
 /// into place).
 fn copy_tree(from: &Path, to: &Path) {
-    let Ok(meta) = std::fs::metadata(from) else { return };
-    if meta.is_dir() {
+    if !tfs::exists(from) {
+        return;
+    }
+    if tfs::is_dir(from) {
         if from.file_name().is_some_and(|n| n == "index") {
             return;
         }
-        let _ = std::fs::create_dir_all(to);
-        let Ok(entries) = std::fs::read_dir(from) else { return };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            copy_tree(&entry.path(), &to.join(entry.file_name()));
+        let _ = tfs::create_dir_all(to);
+        let Ok(entries) = tfs::read_dir(from) else { return };
+        for path in entries {
+            copy_tree(&path, &to.join(path.file_name().unwrap()));
         }
     } else if !from.extension().is_some_and(|e| e == "tmp") {
-        let _ = std::fs::copy(from, to);
+        let _ = tfs::copy(from, to);
     }
 }
 

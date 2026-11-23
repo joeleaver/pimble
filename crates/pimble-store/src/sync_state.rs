@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pimble_core::StoreId;
+use pimble_host::Disk;
 use serde_json::{Map, Value};
-use tokio::fs;
 use tracing::{info, warn};
 
 /// The record's file name, in the store's state directory.
@@ -88,8 +88,8 @@ fn lock_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// parse is set aside (`sync-state.json.unreadable`) and read as empty: the
 /// link starts over from nothing, which is safe (everything is read and
 /// offered again), where writing sections over it would keep half of it.
-async fn read_map(path: &Path) -> Map<String, Value> {
-    let bytes = match fs::read(path).await {
+async fn read_map(disk: &Disk, path: &Path) -> Map<String, Value> {
+    let bytes = match disk.read(path).await {
         Ok(bytes) => bytes,
         Err(_) => return Map::new(),
     };
@@ -98,48 +98,53 @@ async fn read_map(path: &Path) -> Map<String, Value> {
         Ok(_) | Err(_) => {
             let aside = path.with_extension("json.unreadable");
             warn!("{} could not be read; set aside as {} and starting over", path.display(), aside.display());
-            let _ = fs::rename(path, &aside).await;
+            let _ = disk.rename(path, &aside).await;
             Map::new()
         }
     }
 }
 
 /// The whole record of `state_dir`; empty when there is none.
-pub async fn read(state_dir: &Path) -> Map<String, Value> {
+pub async fn read(disk: &Disk, state_dir: &Path) -> Map<String, Value> {
     let path = path(state_dir);
     let lock = lock_for(&path);
     let _held = lock.lock().await;
-    read_map(&path).await
+    read_map(disk, &path).await
 }
 
 /// One section of the record, when it has it.
-pub async fn read_section(state_dir: &Path, section: &str) -> Option<Value> {
-    read(state_dir).await.remove(section)
+pub async fn read_section(disk: &Disk, state_dir: &Path, section: &str) -> Option<Value> {
+    read(disk, state_dir).await.remove(section)
+}
+
+/// Whether `state_dir` has a record.
+pub async fn exists(disk: &Disk, state_dir: &Path) -> bool {
+    disk.exists(path(state_dir)).await
 }
 
 /// Change the record under its lock: `change` gets the whole of it (empty
 /// when there is none) and what it leaves is written, atomically and
 /// durably, when it differs from what was read. Each writer changes only its
 /// own sections.
-pub async fn update<R>(state_dir: &Path, change: impl FnOnce(&mut Map<String, Value>) -> R) -> std::io::Result<R> {
+pub async fn update<R>(disk: &Disk, state_dir: &Path, change: impl FnOnce(&mut Map<String, Value>) -> R) -> std::io::Result<R> {
     let path = path(state_dir);
     let lock = lock_for(&path);
     let _held = lock.lock().await;
-    let mut map = read_map(&path).await;
+    let mut map = read_map(disk, &path).await;
     let before = map.clone();
     let answer = change(&mut map);
     if map != before {
         map.insert("version".to_string(), Value::from(VERSION));
-        fs::create_dir_all(state_dir).await?;
+        disk.create_dir_all(state_dir).await?;
         let json = serde_json::to_vec_pretty(&Value::Object(map)).map_err(std::io::Error::other)?;
-        write_durably(&path, &json).await?;
+        disk.write_durable(&path, &json).await?;
     }
     Ok(answer)
 }
 
 /// Replace one section (`None` removes it).
-pub async fn set_section(state_dir: &Path, section: &str, value: Option<Value>) -> std::io::Result<()> {
-    update(state_dir, |map| match value {
+pub async fn set_section(disk: &Disk, state_dir: &Path, section: &str, value: Option<Value>) -> std::io::Result<()> {
+    update(disk, state_dir, |map| match value {
         Some(value) => {
             map.insert(section.to_string(), value);
         }
@@ -150,55 +155,23 @@ pub async fn set_section(state_dir: &Path, section: &str, value: Option<Value>) 
     .await
 }
 
-/// Write `bytes` to `path` so that a crash leaves either the old file or the
-/// new one, and the new one is on the disk before this answers: a temporary
-/// beside it, synced, renamed into place, the directory synced.
-pub async fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let unique = uuid::Uuid::new_v4().simple().to_string();
-    let tmp = path.with_extension(format!("{}.tmp", &unique[..12]));
-    let written = async {
-        let mut file = fs::File::create(&tmp).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        fs::rename(&tmp, path).await
-    }
-    .await;
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp).await;
-        return Err(e);
-    }
-    if let Some(dir) = path.parent() {
-        sync_dir(dir).await;
-    }
-    Ok(())
-}
-
-/// Sync a directory's entries (a rename in it) to disk. Best effort: not
-/// every platform opens a directory as a file.
-pub async fn sync_dir(dir: &Path) {
-    if let Ok(dir) = fs::File::open(dir).await {
-        let _ = dir.sync_all().await;
-    }
-}
-
 /// A JSON file's value, `None` when it is absent or does not parse.
-async fn read_json(path: &Path) -> Option<Value> {
-    let bytes = fs::read(path).await.ok()?;
+async fn read_json(disk: &Disk, path: &Path) -> Option<Value> {
+    let bytes = disk.read(path).await.ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// A free name to rename `from` to: `<name>.migrated`, or with a number after
 /// it when that is taken (an earlier migration's copy is never written over).
-async fn migrated_name(from: &Path) -> PathBuf {
+async fn migrated_name(disk: &Disk, from: &Path) -> PathBuf {
     let name = from.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let first = from.with_file_name(format!("{name}.migrated"));
-    if fs::metadata(&first).await.is_err() {
+    if !disk.exists(&first).await {
         return first;
     }
     for n in 2.. {
         let next = from.with_file_name(format!("{name}.migrated.{n}"));
-        if fs::metadata(&next).await.is_err() {
+        if !disk.exists(&next).await {
             return next;
         }
     }
@@ -219,26 +192,26 @@ async fn migrated_name(from: &Path) -> PathBuf {
 /// and nothing is lost. When the record exists the old files are never read:
 /// the record is newer than anything they could hold. `devices.json` is
 /// shared by every store and is only ever read.
-pub async fn migrate(state_dir: &Path, store_id: StoreId, legacy_devices: Option<&Path>) {
+pub async fn migrate(disk: &Disk, state_dir: &Path, store_id: StoreId, legacy_devices: Option<&Path>) {
     let record = path(state_dir);
-    if fs::metadata(&record).await.is_err() {
+    if !disk.exists(&record).await {
         let mut map = Map::new();
         let mut from = Vec::new();
         for (name, section) in MIGRATED_FILES {
             let file = state_dir.join(name);
-            match read_json(&file).await {
+            match read_json(disk, &file).await {
                 Some(value) => {
                     map.insert(section.to_string(), value);
                     from.push(name);
                 }
-                None if fs::metadata(&file).await.is_ok() => {
+                None if disk.exists(&file).await => {
                     warn!("Store {}: {} does not parse; it is not carried into {} (the link starts that part over) and is kept as it was renamed", store_id, file.display(), FILE_NAME);
                 }
                 None => {}
             }
         }
         if let Some(devices) = legacy_devices {
-            if let Some(entry) = read_json(devices).await.and_then(|mut v| v.get_mut("stores").and_then(|s| s.get_mut(store_id.to_string())).map(Value::take)) {
+            if let Some(entry) = read_json(disk, devices).await.and_then(|mut v| v.get_mut("stores").and_then(|s| s.get_mut(store_id.to_string())).map(Value::take)) {
                 if entry.get("device").and_then(Value::as_str).is_some_and(|d| !d.is_empty()) {
                     map.insert(DEVICE.to_string(), entry);
                     from.push(LEGACY_DEVICES_FILE);
@@ -250,11 +223,11 @@ pub async fn migrate(state_dir: &Path, store_id: StoreId, legacy_devices: Option
         if !from.is_empty() {
             map.insert("version".to_string(), Value::from(VERSION));
             let written = async {
-                fs::create_dir_all(state_dir).await?;
+                disk.create_dir_all(state_dir).await?;
                 let json = serde_json::to_vec_pretty(&Value::Object(map)).map_err(std::io::Error::other)?;
                 let lock = lock_for(&record);
                 let _held = lock.lock().await;
-                write_durably(&record, &json).await
+                disk.write_durable(&record, &json).await
             };
             if let Err(e) = written.await {
                 // The old files stay where they are and are read again at
@@ -267,11 +240,11 @@ pub async fn migrate(state_dir: &Path, store_id: StoreId, legacy_devices: Option
     }
     for (name, _) in MIGRATED_FILES {
         let file = state_dir.join(name);
-        if fs::metadata(&file).await.is_err() {
+        if !disk.exists(&file).await {
             continue;
         }
-        let to = migrated_name(&file).await;
-        match fs::rename(&file, &to).await {
+        let to = migrated_name(disk, &file).await;
+        match disk.rename(&file, &to).await {
             Ok(()) => info!("Store {}: {} renamed {}", store_id, file.display(), to.display()),
             Err(e) => warn!("Store {}: could not rename {} ({}); it is left where it is and not read", store_id, file.display(), e),
         }

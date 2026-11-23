@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft; wave 0 built** (2026-11-22, not merged or released; see "Built: wave 0" at the end). Decisions taken so far are under "Decisions"; the rest
+Status: **draft; waves 0 and 1 built, wave 2 built but for its runtime** (2026-11-22, not merged or released; see the "Built" sections at the end). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -734,3 +734,169 @@ out is in `METHODS` with the right kind, and every unsubscribe too.
 - `subscribeNodeChanges` on a store that is not open is accepted for a `Service` principal (the
   parity test's request 13): `reject_if_vault` passes an unknown store and nothing else looks.
   A subscription to nothing; unchanged here, since the wire had to stay the same.
+
+## Built: wave 2 (2026-11-22, not merged or released): seams B, D, E and key rest
+
+Desktop only, behavior unchanged. **The runtime (seam C) is not built**: see "What remains" at
+the end. Everything else the wave names is: a disk under every file the server keeps, outbound
+HTTP behind a trait, paths handed in, and where the keystore rests. A new crate,
+`crates/pimble-host`, holds the seams; the server takes them in `ServerConfig` and the
+handler's construction, never as globals.
+
+### The seams (`crates/pimble-host`)
+
+- **`Disk`** (`src/disk.rs`): a cheap `Clone` handle over `Arc<dyn DiskBackend>`.
+  `DiskBackend` (async; `#[async_trait]`, `?Send` on wasm32) is what a host implements:
+  `read`, `read_range(path, offset, len)`, `metadata -> Metadata { len, is_dir, modified }`,
+  `list(dir) -> Vec<Entry { path, is_dir }>`, `create_dir`, `create_dir_all`, `write` (in
+  place, `std::fs::write`), `write_private` (mode `0600`, set at creation and again after),
+  `append` (creating), `write_at(path, offset, bytes)`, `sync_file -> Ok(bool)` (fsync; `false`
+  when the file would not open), `sync_dir` (best effort), `rename`, `copy`, `remove_file`,
+  `remove_dir_all`, `kind() -> DiskKind { Native, Memory, Other }`. Three provided
+  compositions a host may override: `write_atomic(path, bytes, TmpName)` (temporary, rename,
+  temporary removed on failure; `TmpName::Unique` = `<stem>.<12 hex>.tmp`, the store folder's
+  and state directory's naming; `TmpName::Extension` = `with_extension("tmp")`, the vault
+  files' naming), `write_durable` (the same with the temporary synced before the rename and the
+  directory after: wave 0's `sync_state::write_durably`, now this), `write_private_atomic`
+  (parent made, `<path>.tmp` at `0600`, renamed: `fs_util::write_atomic_0600`'s sequence).
+  The handle adds `read_to_string`, `exists`, `is_dir`, `remove_path`.
+  - `NativeDisk` (`src/disk/native.rs`): `tokio::fs`, each call the one the code made before.
+    The one deliberate difference: `append`, `write_at` and `write_private` `flush()` the tokio
+    file before dropping it (tokio otherwise finishes the write in the background after
+    `write_all` returns; the vault append already flushed).
+  - `MemoryDisk` (`src/disk/memory.rs`): a `BTreeMap` of normalized paths, keeping a
+    filesystem's rules (a parent must be a directory, `create_dir` refuses what exists, a
+    directory is not read, a rename replaces a file and moves a directory's subtree, a
+    non-empty directory is not renamed over). `MemoryDisk::with_roots(pred)` takes directories
+    a host hands it as existing. Synchronous `*_now` methods, which the async trait and the
+    tests' `testfs` both call.
+- **`Paths`** (`src/paths.rs`): `{ data, config, state }`, each already `.../pimble`;
+  `Paths::native()` (the platform's `data_local_dir`/`config_dir`, `dirs`), `Paths::new`,
+  `Paths::in_dir(dir)` (a test's layout), and `replicas()`, `relay()`, `keystore()`,
+  `credentials()`, `agents()`.
+- **`KeyRest`** (`src/key_rest.rs`): `load() -> io::Result<Option<Vec<u8>>>`, `save(bytes)`,
+  `describe()`. `FileKeyRest { disk, path }` (`keys.json`, `write_private_atomic`) and
+  `MemoryKeyRest`.
+- **`Http`** (`src/http.rs`): `send(HttpRequest { method, url, bearer, json }) ->
+  Result<HttpResponse { status, body }, HttpError>`. `ReqwestHttp`: one `reqwest` client,
+  rustls, 15 s timeout, as `cloud.rs` built it.
+
+### How each host implements them
+
+- **Desktop** (done): `NativeDisk`, `Paths::native()`, `FileKeyRest` on the native disk at
+  `<config>/pimble/keys.json`, `ReqwestHttp`. `ServerConfig::default()` gives exactly these.
+- **The browser's worker** (sketch, wave 4): an `OpfsDisk` in the dedicated worker, walking a
+  path's components as directory handles from the OPFS root (`Paths` rooted at OPFS folders:
+  `data = /pimble`, `config = /pimble-config`). Reads through sync access handles; `write`
+  and the three compositions overridden as one `createWritable()` + `close()` (atomic at close,
+  so no temporary and no rename), `append`/`write_at` through a sync access handle at an
+  offset (the per-document log of section 4 is an `append` before each answer), `sync_file` a
+  handle `flush()`, `sync_dir` nothing; every file sealed with the disk key (section 7) in the
+  backend, so everything above sees plain bytes. "Don't remember this browser": `MemoryDisk`.
+  `KeyRest`: the keystore's bytes AES-GCM-wrapped under the device key in IndexedDB, or
+  `MemoryKeyRest`. `Http`: `fetch` with `credentials: "include"` (the session cookie), the
+  bearer left out.
+- **A phone app hosting the server in-process** (sketch): `NativeDisk` as it is (a real
+  filesystem, `tokio::fs` on a background runtime), `Paths::new(<app support>, <app
+  support>/config)`, a `KeyRest` over the platform keychain (Keychain Services, Android
+  Keystore) or `FileKeyRest` in the sandbox, `ReqwestHttp` or the platform's client.
+
+### How the server takes them
+
+- `ServerConfig` gains `disk: Disk`, `paths: Paths` and `http: Arc<dyn Http>` (defaults:
+  `Disk::default()`, `Paths::native()`, `ReqwestHttp`). `ServerConfig::in_dir(dir)` sets
+  `paths: Paths::in_dir(dir)` as well as the explicit paths it set before. Every `*_path`/
+  `*_dir` left `None` now falls back to `config.paths`, not to `dirs`.
+- `PimbleServer::with_config` makes the store manager on `config.disk`
+  (`StoreManager::with_state_root(..).on_disk(disk)`); `make_handler` hands the handler
+  `config.http`; the handler takes its disk from its manager (`try_read` at construction, the
+  default when the manager is held), so the stores, their state directories, the keystore,
+  the credentials, the devices' records, the people files, the folder's `computers/` files
+  and the relay twins are on one disk. A relay face is made on its host's disk.
+- `StoreManager::on_disk(disk)`, `disk()`; `LocalStore::create_on`, `create_replica_on`,
+  `open_on`, `disk()`; `VaultStore::create_on`, `open_on`; `BlobStore::new_on`;
+  `peek_manifest_on`. The old constructors (`LocalStore::create`, `open`, `open_in`, ...)
+  stay, on `Disk::default()`, so the importer, the CLI, the MCP and the app are unchanged.
+- `pimble_store::sync_state::{read, read_section, update, set_section, migrate}` take a
+  `&Disk`; `exists(disk, state_dir)` is new; `write_durably` and `sync_dir` went into the disk.
+- `Keystore::new(path)` (default disk), `Keystore::on_disk(disk, path)`,
+  `Keystore::resting(Arc<dyn KeyRest>)`; it loads at the first use or at `load()`, which
+  `PimbleServer::start` and `start_in_process` call before the first RPC, as the eager load
+  in its constructor did. `CredentialStore::on_disk` loads at the first use the same way.
+  `AgentRegistry::load(disk, path)` is async and so are `create`, `update`, `remove` and
+  `touch` (the HTTP edge awaits `touch`).
+- `crate::cloud`'s calls take `http: &dyn Http` first; `RpcHandler::http()`,
+  `with_http`. `CloudError::Request`'s source is `HttpError` (the reqwest error's text) and
+  `Decode`'s a `serde_json::Error`.
+- `dirs` is gone from the server's core: the default-path functions
+  (`default_keystore_path`, `default_credentials_path`, `default_agents_path`,
+  `default_replicas_dir`) are `Paths::native()`'s, and the embedding model's cache stays
+  `Paths::native().data/models` whatever the server's paths (a download, shared by every
+  server in a process, tests included). `dirs` remains only in the native-only modules
+  (`local.rs`, `auth.rs`, `logs.rs`, `diagnostics.rs`) and in `pimble-host`'s
+  `Paths::native`.
+- Native-only, still on the machine's disk directly, by design: the folder watch (`notify`;
+  `run_folder_task` starts it only when `disk.is_native()`, the task's announcing of flush
+  merges and its presence files run on any disk), the search index (seam F: rhypedb's own
+  files under `<state dir>/index/`; `removeReplica` on a non-native disk also removes that
+  directory from the machine's disk), the server token file (`auth.rs`, `fs_util`),
+  `local.rs`, `logs.rs`, `diagnostics.rs`, the relay tunnel, the JWKS fetch (`jwt.rs`,
+  the HTTP edge's).
+
+### Changes by file
+
+- `Cargo.toml`: the `pimble-host` member and workspace dependency.
+- `crates/pimble-host/` (new): `disk.rs`, `disk/native.rs`, `disk/memory.rs`,
+  `disk/testfs.rs` (feature `test-disk`), `paths.rs`, `key_rest.rs`, `http.rs`.
+- `crates/pimble-store/`: `Cargo.toml` (the dependency, and the dev-dependency with
+  `test-disk`); `local.rs` (a `disk` field; every file through it; the `_on` constructors),
+  `local/folder.rs` (the folder migration, merges, conflict copies, temporaries' sweep),
+  `blobs.rs` (async over the disk: the part file written, appended to, its hash written at
+  its offset, synced, renamed; hashing still off the async threads), `vault.rs` (logs,
+  snapshots, keys, reports, scopes; `read_range` for an entry), `sync_state.rs`,
+  `manager.rs`; `tests/test_disk.rs` (new: the switch does what it says); the unit and
+  integration tests' own file reads through `testfs`.
+- `crates/pimble-server/`: `Cargo.toml`; `server.rs` (`ServerConfig.disk/paths/http`, the
+  manager on the disk, the keystore loaded at start, agents loaded async); `handler.rs`
+  (`disk`, `http`, construction, `removeReplica`, the agent RPCs awaited); `keystore.rs`
+  (`KeyRest`, lazy); `credentials.rs`, `agents.rs`, `people.rs`, `devices.rs`,
+  `vault_link.rs` (its record through the disk), `folder_watch.rs`, `relay_face.rs`,
+  `cloud.rs`, `share.rs`, `auth.rs` (`touch().await`), `fs_util.rs` (doc only); the tests'
+  file reads through `testfs`.
+
+### Proof
+
+- **The suites on both disks.** `PIMBLE_TEST_DISK=memory` (feature `test-disk`, turned on only
+  by the dev-dependencies of `pimble-store` and `pimble-server`, so no shipped build has it)
+  makes `Disk::default()` one `MemoryDisk` for the whole test process, taking the system temp
+  directory's real subdirectories (each test's `TempDir`) as existing roots; `testfs` gives
+  the tests' own looks at files (`read`, `write`, `exists`, `read_dir`, `names`, `copy_dir`,
+  `set_modified`, ...) on that same disk. Unset, it is the machine's disk. Every test's
+  `std::fs`/`tokio::fs` call on a server's or store's files and `Path::exists` on them went
+  through `testfs` (the ones on the search index, real binaries and the spawned accounts
+  service's log stay on the machine's disk). A helper that scanned a directory for plaintext
+  (`contains_bytes_recursive`) reads through `testfs` too, so on the memory disk it scans what
+  the server wrote rather than an empty directory.
+  - `cargo test --release --no-fail-fast -p pimble-server -p pimble-store -p pimble-host`:
+    365 passed, 0 failed, 1 ignored (13.5 min). An earlier run (before the `Http` seam) failed once in `vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner` ("wrapped under the scope key its maker holds": a second wrap under the store key had landed before the assertion read the keys); it passed three times alone and in the full run after. A race in the test's reading, not a disk effect; worth a look on its own.
+  - the same with `PIMBLE_TEST_DISK=memory`: 364 passed, 1 failed, 1 ignored (14.5 min); the one failure was `store_folders.rs` `an_edit_through_one_server_reaches_the_other_through_the_folder`, two servers that meet only through the folder watch, which is native-only by design. It now says so and returns on the memory disk (`testfs::is_memory()`), and passes (skipped) in a rerun. Every other test, `pimble-store`'s randomized two-computer folder test included, passes on memory.
+- **The fault sweep**: `PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4 cargo test --release -p pimble-server --test link_faults`: all 200 seeds converged with 219 crashes among them (855 s), the same count as wave 0's sweeps. The same sweep on the memory disk: all 200 converged, 219 crashes (827 s). The crash fault copies the device's directory through `testfs`, so on memory it copies what the server wrote.
+- **`test_isolation.rs`**: passes in both runs (no test builds a server or handler on the
+  defaults; the new `paths` default is `Paths::native()`, which `in_dir` replaces).
+- **Release builds**: `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp` builds (no caller outside the server needed a change: the old constructors stay). `cargo check --target wasm32-unknown-unknown -p pimble-host` checks; `cd web && cargo check --release --target wasm32-unknown-unknown` checks.
+- **Format identity**: a capture test (not kept) run on `d3fb074` in a scratch worktree and on this tree: a server started in process writes a plain store (three nodes with text, a picture through `putBlob`), a vault store (three appends and a snapshot), an agent, then the store's link (`write_sync_config`), a signed-in keystore and saved credentials; the test lists every file under the directory with its mode, the bytes of binary files as hex (the blob file, header and image), JSON with ids and timestamps masked, `.yrs` files by their decoded title and text, and the secret files by their JSON shape. With blob names, the `computers/` presence name and the app version masked, the two listings are identical (26 entries): the same files, names, modes (`0600` for `keys.json`, `credentials.json`, `agents.json`), JSON text, key order and indentation, vault log and snapshot bytes, blob bytes, and no temporary left anywhere.
+
+### Found while building
+
+- **`PIMBLE_TEST_DISK=memory` was not enough by itself**: a test helper that scans a directory for text that must not be there (`contains_bytes_recursive`, in `common/mod.rs`, `relay.rs`, `vault_link.rs`) read the machine's disk, so on the memory disk it would have passed for scanning nothing. It reads through `testfs` now; noted in case another test grows the same shape.
+- **tokio's `File` finishes a write in the background** after `write_all` returns unless flushed; the native disk's `append`, `write_at` and `write_private` flush before they answer (the vault append already did).
+- **Joe's 0.29.3 release picked up this wave's uncommitted workspace member** (`crates/pimble-host` in `Cargo.toml`); 0.29.4 fixed it. Work in progress in the shared tree touches the root manifest: a release cut while a wave is in flight should come from a worktree.
+- Not this wave's: `vault_link.rs`'s share-recipient test above reads the doc keys racily.
+
+### What remains
+
+- **Seam C, the runtime, is not built.** `spawn` (about 35 sites, several keeping a `JoinHandle` to `abort` or ask `is_finished`), `spawn_blocking` (blobs' hashing, pictures, the index), and `tokio::time` (`sleep`, `sleep_until`, `interval`, `interval_at`, `timeout`, `Instant` in about 70 places, many inside `select!`) across `handler.rs`, `vault_link.rs`, `share.rs`, `sync_link.rs`, `presence*.rs`, `pictures.rs`, `folder_watch.rs`, and `SystemTime::now` in the store's sweeps. The shape I would build: `pimble_host::Runtime` (`spawn(BoxFuture) -> Task` with `abort`/`is_finished`, `spawn_heavy(FnOnce) -> BoxFuture`, `sleep(Duration) -> BoxFuture`, `now() -> pimble_host::Instant` (a monotonic `Duration` since the runtime started), `wall() -> SystemTime`), `TokioRuntime` natively, held in `ServerConfig` and the handler beside the disk; `interval` and `sleep_until` written once over `sleep` and `now`. It is mechanical but touches every timer the links' convergence depends on, so it wants its own pass with the 200-seed sweep after it (on both disks: the switch is in place).
+- **What still blocks wasm for the server**: the runtime above; `pimble-store`'s `tokio = full` (mio) and `notify` (`watch.rs` and `local.rs`'s use of it want `cfg(not(wasm32))`); in `pimble-server`, `jsonrpsee`'s server, `reqwest` (now only in `jwt.rs`, `diagnostics.rs` and `pimble-host`'s native `ReqwestHttp`), `tokio-tungstenite`, `libc`, and the native-only modules not yet behind `cfg` (`local.rs`, `auth.rs`, `jwt.rs`, `folder_watch.rs`'s watch, `relay_face.rs`, `relay_tunnel.rs`, `logs.rs`, `diagnostics.rs`, `memory.rs`), plus `crate::diagnostics::set_account` called from the keystore; `pimble-search` (seam F). The modules are not `cfg`'d in this wave: nothing builds the server for wasm32 yet to tell what else breaks, and wave 3 is where it first does.
+- `MemoryDisk` has no modification times on wasm32 (`SystemTime::now` panics there) until the runtime's wall clock reaches it.
+- The `OpfsDisk`, the device-key `KeyRest` and the `fetch` `Http` are wave 4's.
+- Joe's by-hand check on his real stores after a backup (nothing here ran against them).

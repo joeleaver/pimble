@@ -671,7 +671,7 @@ async fn connect(
     if handler.keystore().session_expired() {
         return Err(anyhow::Error::new(SessionExpired));
     }
-    let minted = match crate::cloud::mint_token(&account.url, &account.session).await {
+    let minted = match crate::cloud::mint_token(handler.http(), &account.url, &account.session).await {
         Ok(minted) => minted,
         Err(e) if e.status() == Some(401) => {
             if !handler.keystore().session_expired() {
@@ -1027,7 +1027,7 @@ struct GrantShape {
 /// concluded from that, and the connection stands.
 async fn grant_shape(handler: &RpcHandler, store_id: StoreId) -> Option<GrantShape> {
     let account = handler.keystore().account().await?;
-    let rows = crate::cloud::list_stores(&account.url, &account.session).await.ok()?;
+    let rows = crate::cloud::list_stores(handler.http(), &account.url, &account.session).await.ok()?;
     let ids = |roots: &[NodeId]| roots.iter().map(|id| id.to_string()).collect::<std::collections::BTreeSet<_>>();
     Some(GrantShape {
         held: crate::cloud::HeldAs::from_rows(&rows, store_id).map(|held_as| (held_as.access, ids(&held_as.roots), ids(&held_as.read_only_roots))),
@@ -1048,7 +1048,7 @@ async fn grant_shape(handler: &RpcHandler, store_id: StoreId) -> Option<GrantSha
 /// this device keeps the store's shares up (`crate::share`).
 async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> {
     let account = handler.keystore().account().await?;
-    let rows = match crate::cloud::list_stores(&account.url, &account.session).await {
+    let rows = match crate::cloud::list_stores(handler.http(), &account.url, &account.session).await {
         Ok(rows) => rows,
         Err(e) => {
             debug!("Vault link for store {}: could not list the account's stores: {}", store_id, e);
@@ -1210,7 +1210,7 @@ pub(crate) async fn fetch_scope_keys(
     let scopes: Vec<Option<&NodeId>> = if roots.is_empty() { vec![None] } else { roots.iter().map(Some).collect() };
     let mut link_key: Option<Uuid> = None;
     for scope in scopes {
-        let grants = crate::cloud::get_store_keys(&account.url, &account.session, &store_id.to_string(), scope).await?;
+        let grants = crate::cloud::get_store_keys(handler.http(), &account.url, &account.session, &store_id.to_string(), scope).await?;
         for grant in &grants.envelopes {
             let Ok(key_id) = grant.key_id.parse::<Uuid>() else {
                 warn!("Store {}: the cloud service returned a bad key id {:?}; skipping it", store_id, grant.key_id);
@@ -1290,6 +1290,8 @@ struct Progress {
     /// (`pimble_store::sync_state`, `sync-state.json`). `None` keeps it in
     /// memory (a store with no state directory; never on a server).
     state_dir: Option<PathBuf>,
+    /// The disk the record is on.
+    disk: pimble_host::Disk,
     /// Whose documents the cursors are about, to put them on the disk before
     /// a cursor that covers changes to them is written.
     manager: Arc<tokio::sync::RwLock<pimble_store::StoreManager>>,
@@ -1581,8 +1583,9 @@ impl Progress {
             };
             (manager.state_dir(store_id), last_seq)
         };
+        let disk = handler.disk().clone();
         let record = match &state_dir {
-            Some(dir) => sync_state::read(dir).await,
+            Some(dir) => sync_state::read(&disk, dir).await,
             None => serde_json::Map::new(),
         };
         let convergence = Convergence::of(record.get(sync_state::CONVERGENCE));
@@ -1597,6 +1600,7 @@ impl Progress {
         };
         Self {
             state_dir,
+            disk,
             manager,
             file,
             unsaved: false,
@@ -1829,7 +1833,7 @@ impl Progress {
         let vault = self.unsaved.then(|| serde_json::to_value(&self.file));
         let convergence = self.convergence.unsaved.then(|| serde_json::to_value(&self.convergence.file));
         let answered = self.answered_unsaved.then(|| crate::devices::DeviceEntry { device: self.device.clone(), answered: self.answered.clone() });
-        let written = sync_state::update(&state_dir, |record| {
+        let written = sync_state::update(&self.disk, &state_dir, |record| {
             if let Some(Ok(vault)) = vault {
                 record.insert(sync_state::VAULT.to_string(), vault);
             }
@@ -1882,7 +1886,7 @@ impl Progress {
 pub(crate) async fn forget_progress(handler: &RpcHandler, store_id: StoreId) {
     let state_dir = handler.store_manager_handle().read().await.state_dir(store_id);
     let Some(state_dir) = state_dir else { return };
-    let forgotten = sync_state::update(&state_dir, |record| {
+    let forgotten = sync_state::update(handler.disk(), &state_dir, |record| {
         record.remove(sync_state::VAULT);
         record.remove(sync_state::CONVERGENCE);
         if let Some(serde_json::Value::Object(link)) = record.get_mut(sync_state::LINK) {

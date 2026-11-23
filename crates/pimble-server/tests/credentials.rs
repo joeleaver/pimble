@@ -6,6 +6,7 @@
 
 mod isolated;
 
+use pimble_host::disk::testfs as tfs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -82,7 +83,7 @@ async fn add_remote_store_saves_the_credential_and_never_writes_it_to_disk() {
     );
 
     // sync.json never stores the real credential (decision 4).
-    let sync_json = std::fs::read_to_string(replica_path.join("sync.json")).unwrap();
+    let sync_json = tfs::read_to_string(replica_path.join("sync.json")).unwrap();
     let sync_value: serde_json::Value = serde_json::from_str(&sync_json).unwrap();
     assert_eq!(
         sync_value["remote"]["auth"]["method"], "none",

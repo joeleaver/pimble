@@ -60,14 +60,15 @@ impl DeviceEntry {
 /// The entries, read from and written to each store's record. A store with
 /// no state directory (none on a server, which always has a state root)
 /// keeps its entry in memory for the life of the process.
-#[derive(Default)]
 pub(crate) struct Devices {
+    /// The disk the records are on.
+    disk: pimble_host::Disk,
     memory: tokio::sync::Mutex<HashMap<StoreId, DeviceEntry>>,
 }
 
 impl Devices {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(disk: pimble_host::Disk) -> Self {
+        Self { disk, memory: Default::default() }
     }
 
     /// `store_id`'s entry, made (with a fresh device id) the first time.
@@ -80,7 +81,7 @@ impl Devices {
         let Some(state_dir) = state_dir else {
             return self.memory.lock().await.entry(store_id).or_insert_with(fresh).clone();
         };
-        let made = sync_state::update(state_dir, |record| match DeviceEntry::of(record) {
+        let made = sync_state::update(&self.disk, state_dir, |record| match DeviceEntry::of(record) {
             Some(entry) => entry,
             None => {
                 let entry = fresh();

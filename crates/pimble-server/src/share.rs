@@ -981,7 +981,7 @@ async fn sweep(handler: &RpcHandler, store_id: StoreId) {
         };
         fetched_a_key |= !held;
 
-        let listing = match crate::cloud::list_members(&account.url, &account.session, &store_id.to_string(), Some(&root)).await {
+        let listing = match crate::cloud::list_members(handler.http(), &account.url, &account.session, &store_id.to_string(), Some(&root)).await {
             Ok(listing) => listing,
             Err(e) => {
                 debug!("Share {} of store {}: could not list its members: {}", root, store_id, e);
@@ -993,7 +993,7 @@ async fn sweep(handler: &RpcHandler, store_id: StoreId) {
             // An owner is given every active member's public keys; without
             // them the key is not this account's to hand over.
             let (Some(user_id), Some(public_keys)) = (&member.user_id, &member.public_keys) else { continue };
-            match hand_key(&account, store_id, root, &marker, &key, user_id, public_keys).await {
+            match hand_key(handler.http(), &account, store_id, root, &marker, &key, user_id, public_keys).await {
                 Ok(()) => info!("Share {} of store {}: handed the key to {}", root, store_id, member.email),
                 Err(e) => {
                     warn!("Share {} of store {}: could not hand the key to {}: {}", root, store_id, member.email, e);
@@ -1023,6 +1023,7 @@ async fn share_key(handler: &RpcHandler, account: &SignedInAccount, store_id: St
 
 /// Wrap the share key to one member and upload the envelope.
 async fn hand_key(
+    http: &dyn pimble_host::http::Http,
     account: &SignedInAccount,
     store_id: StoreId,
     root: NodeId,
@@ -1032,7 +1033,7 @@ async fn hand_key(
     public_keys: &pimble_crypto::AccountPublicKeys,
 ) -> anyhow::Result<()> {
     let envelope = pimble_crypto::wrap_key(key, marker.key_id, public_keys, &account.keys, &share_context(store_id, root))?;
-    crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), user_id, marker.key_id, &envelope, Some(&root)).await?;
+    crate::cloud::put_store_key(http, &account.url, &account.session, &store_id.to_string(), user_id, marker.key_id, &envelope, Some(&root)).await?;
     Ok(())
 }
 
@@ -1085,7 +1086,7 @@ impl RpcHandler {
     /// account, or on a device that holds the store as someone else's
     /// (a recipient looking at the share they are in), whoever shared it.
     async fn share_answer(&self, account: &SignedInAccount, store_id: StoreId, node_id: NodeId, marker: &ShareMarker) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
-        let listing = crate::cloud::list_members(&account.url, &account.session, &store_id.to_string(), Some(&node_id)).await.map_err(to_rpc_error)?;
+        let listing = crate::cloud::list_members(self.http(), &account.url, &account.session, &store_id.to_string(), Some(&node_id)).await.map_err(to_rpc_error)?;
         let shared_by = self.store_manager_handle().read().await.get_store_info(store_id).ok().and_then(|store| store.shared_by);
         // The owner: this account when the store is not someone else's
         // share, with its email (an owner sees emails); whoever shared it
@@ -1169,7 +1170,7 @@ impl RpcHandler {
         }
         // An editor of the whole store holds it as this device does, and
         // would get as far as a marker nobody can publish a scope for.
-        let rows = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let rows = crate::cloud::list_stores(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         if !crate::cloud::is_owner_of(&rows, store_id) {
             return Err(to_rpc_error(ONLY_AN_OWNER_REFUSAL));
         }
@@ -1180,7 +1181,7 @@ impl RpcHandler {
         let key = SymmetricKey::generate();
         let key_id = Uuid::new_v4();
         let envelope = pimble_crypto::wrap_key(&key, key_id, &account.keys.public_keys(), &account.keys, &share_context(store_id, node_id)).map_err(to_rpc_error)?;
-        crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope, Some(&node_id))
+        crate::cloud::put_store_key(self.http(), &account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope, Some(&node_id))
             .await
             .map_err(to_rpc_error)?;
         self.keystore().add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)?;
@@ -1232,7 +1233,7 @@ impl RpcHandler {
         }
         info!("Inviting {} to share {} of store {} as {}", email, node_id, store_id, request.role.as_str());
 
-        let member = crate::cloud::put_member(&account.url, &account.session, &store_id.to_string(), email, request.role.as_str(), Some(&node_id), Some(&marker.name))
+        let member = crate::cloud::put_member(self.http(), &account.url, &account.session, &store_id.to_string(), email, request.role.as_str(), Some(&node_id), Some(&marker.name))
             .await
             .map_err(to_rpc_error)?;
         // An address that has an account already gets the key at once. One
@@ -1241,7 +1242,7 @@ impl RpcHandler {
             if let (Some(user_id), Some(public_keys)) = (&member.user_id, &member.public_keys) {
                 match share_key(self, &account, store_id, node_id, &marker).await {
                     Some(key) => {
-                        if let Err(e) = hand_key(&account, store_id, node_id, &marker, &key, user_id, public_keys).await {
+                        if let Err(e) = hand_key(self.http(), &account, store_id, node_id, &marker, &key, user_id, public_keys).await {
                             warn!("Share {} of store {}: could not hand the key to {} yet ({}); the sweep tries again", node_id, store_id, member.email, e);
                         }
                     }
@@ -1262,15 +1263,15 @@ impl RpcHandler {
         info!("Removing {} from share {} of store {}", email, node_id, store_id);
 
         let store = store_id.to_string();
-        let listing = crate::cloud::list_members(&account.url, &account.session, &store, Some(&node_id)).await.map_err(to_rpc_error)?;
+        let listing = crate::cloud::list_members(self.http(), &account.url, &account.session, &store, Some(&node_id)).await.map_err(to_rpc_error)?;
         let member = listing
             .members
             .iter()
             .find(|member| member.email.eq_ignore_ascii_case(email))
             .ok_or_else(|| to_rpc_error(format!("{} is not a member of this share and has no invitation to it", email)))?;
         match &member.user_id {
-            Some(user_id) => crate::cloud::delete_member(&account.url, &account.session, &store, user_id, Some(&node_id)).await,
-            None => crate::cloud::delete_invitation(&account.url, &account.session, &store, &member.email, Some(&node_id)).await,
+            Some(user_id) => crate::cloud::delete_member(self.http(), &account.url, &account.session, &store, user_id, Some(&node_id)).await,
+            None => crate::cloud::delete_invitation(self.http(), &account.url, &account.session, &store, &member.email, Some(&node_id)).await,
         }
         .map_err(to_rpc_error)?;
         self.share_answer(&account, store_id, node_id, &marker).await
@@ -1301,7 +1302,7 @@ impl RpcHandler {
             return Err(STOP_UNREACHABLE_REFUSAL.to_string());
         }
         let store = store_id.to_string();
-        let listing = crate::cloud::list_members(&account.url, &account.session, &store, Some(&node_id))
+        let listing = crate::cloud::list_members(self.http(), &account.url, &account.session, &store, Some(&node_id))
             .await
             .map_err(|e| format!("{STOP_UNREACHABLE_REFUSAL} ({e})"))?;
 
@@ -1309,8 +1310,8 @@ impl RpcHandler {
         // listing names it; were one to, it is not a share's to remove.
         for member in listing.members.iter().filter(|member| member.user_id.as_deref() != Some(account.user_id.as_str())) {
             match &member.user_id {
-                Some(user_id) => crate::cloud::delete_member(&account.url, &account.session, &store, user_id, Some(&node_id)).await,
-                None => crate::cloud::delete_invitation(&account.url, &account.session, &store, &member.email, Some(&node_id)).await,
+                Some(user_id) => crate::cloud::delete_member(self.http(), &account.url, &account.session, &store, user_id, Some(&node_id)).await,
+                None => crate::cloud::delete_invitation(self.http(), &account.url, &account.session, &store, &member.email, Some(&node_id)).await,
             }
             .map_err(|e| format!("{} could not be removed from the share ({}). The share is still in place; stop it again to finish.", member.email, e))?;
         }

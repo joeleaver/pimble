@@ -17,6 +17,7 @@
 
 mod common;
 
+use pimble_host::disk::testfs as tfs;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -67,7 +68,7 @@ async fn blob_of(client: &PimbleClient, store_id: StoreId, node_id: NodeId) -> S
 }
 
 fn log_file_len(env: &Env, store_id: StoreId, node_id: NodeId) -> u64 {
-    std::fs::metadata(env.h_store_path(store_id).join("vault").join(node_id.to_string()).join("log")).map(|m| m.len()).unwrap_or(0)
+    tfs::len(env.h_store_path(store_id).join("vault").join(node_id.to_string()).join("log")).unwrap_or(0)
 }
 
 async fn snapshot_seq_on_h(env: &Env, store_id: StoreId, node_id: NodeId) -> u64 {

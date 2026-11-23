@@ -1,7 +1,8 @@
-//! Small filesystem helper shared by [`crate::auth`]'s server token file and
-//! [`crate::credentials`]'s credentials file: both are small, sensitive,
-//! single-writer files that must never be world- or group-readable and must
-//! never appear half-written to a concurrent reader.
+//! Small filesystem helper for [`crate::auth`]'s server token file (the HTTP
+//! edge, native only): a small, sensitive, single-writer file that must never
+//! be world- or group-readable and must never appear half-written to a
+//! concurrent reader. Everything else the server keeps goes through its
+//! [`pimble_host::Disk`] (`Disk::write_private_atomic` is this same sequence).
 
 use std::io;
 use std::path::{Path, PathBuf};

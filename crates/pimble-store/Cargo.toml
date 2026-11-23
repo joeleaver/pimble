@@ -9,6 +9,8 @@ description = "Store abstraction for local and remote storage in Pimble"
 [dependencies]
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
+# The disk every file of a store goes through (docs/ONE_CODEBASE_CONTRACT.md seam B).
+pimble-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -28,3 +30,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).
+pimble-host = { workspace = true, features = ["test-disk"] }

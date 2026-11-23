@@ -10,6 +10,8 @@ description = "Local and remote server implementation for Pimble"
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-store = { workspace = true }
+# The disk, paths and key rest a server is handed (docs/ONE_CODEBASE_CONTRACT.md seams B-E).
+pimble-host = { workspace = true }
 pimble-search = { workspace = true }
 pimble-plugins = { workspace = true }
 pimble-sheet = { workspace = true }
@@ -72,6 +74,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).
+pimble-host = { workspace = true, features = ["test-disk"] }
 # tests/search.rs makes a board node the way the app does (its board written
 # with the create) and finds the words on it.
 pimble-board = { workspace = true }

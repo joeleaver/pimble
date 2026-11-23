@@ -5,6 +5,7 @@
 //! connections — the sync link itself is a `PimbleClient` under the hood, so
 //! this is the only way to exercise it honestly.
 
+use pimble_host::disk::testfs as tfs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -424,7 +425,7 @@ async fn adding_or_linking_a_store_to_its_own_server_is_refused() {
         .await
         .expect_err("adding an already-open store must be refused");
     assert!(err.to_string().contains("already open locally"), "got: {}", err);
-    assert!(!dir.path().join("replica.pimble").exists(), "no replica directory may be created");
+    assert!(!tfs::exists(&dir.path().join("replica.pimble")), "no replica directory may be created");
 
     let err = client
         .set_store_sync(store_id, Some(me))

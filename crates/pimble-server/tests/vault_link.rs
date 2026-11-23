@@ -20,6 +20,7 @@
 //!   the "desktop" side under test — each with its own temp keystore,
 //!   credentials file and replicas directory.
 
+use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -438,14 +439,13 @@ impl Env {
 }
 
 fn contains_bytes_recursive(dir: &Path, needle: &[u8]) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
+    let Ok(entries) = tfs::read_dir(dir) else { return false };
+    for path in entries {
+        if tfs::is_dir(&path) {
             if contains_bytes_recursive(&path, needle) {
                 return true;
             }
-        } else if let Ok(bytes) = std::fs::read(&path) {
+        } else if let Ok(bytes) = tfs::read(&path) {
             if bytes.windows(needle.len()).any(|w| w == needle) {
                 return true;
             }
@@ -485,7 +485,7 @@ async fn spawn_env() -> Env {
 
     let h_dir = tempfile::tempdir().unwrap();
     let h_stores_dir = h_dir.path().join("stores");
-    std::fs::create_dir_all(&h_stores_dir).unwrap();
+    tfs::create_dir_all(&h_stores_dir).unwrap();
 
     let state: StubState = Arc::new(Mutex::new(StubInner {
         accounts: vec![owner, friend],
@@ -788,9 +788,9 @@ async fn a_replica_from_before_the_progress_file_pushes_what_the_remote_lacks() 
     a.stop().await.unwrap();
     // What the link knew of the remote (the `vault` section of its record) is lost.
     let record_path = a_dir.path().join("stores").join(store_id.to_string()).join("sync-state.json");
-    if let Some(mut record) = std::fs::read(&record_path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) {
+    if let Some(mut record) = tfs::read(&record_path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) {
         record.as_object_mut().unwrap().remove("vault");
-        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        tfs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
     }
     env.relay.restore();
 
@@ -876,9 +876,9 @@ async fn adopting_a_hosted_replica_starts_no_plain_link_beside_its_vault_link() 
     // `openStore` reads the root after that).
     {
         let manifest_path = b_path.join("manifest.json");
-        let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&tfs::read_to_string(&manifest_path).unwrap()).unwrap();
         manifest["root_node_id"] = json!(NodeId::new().to_string());
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        tfs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     }
 
     let dir = b_dir.path();
@@ -1174,7 +1174,7 @@ async fn restarting_a_server_resumes_the_vault_link_without_losing_or_duplicatin
 /// sharing (wrapping data keys under a share's key), which a later wave
 /// builds into the server.
 fn scope_keys_in(server_dir: &Path, store_id: StoreId) -> Vec<(Uuid, pimble_crypto::SymmetricKey)> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(server_dir.join("keys.json")).expect("the keystore file")).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&tfs::read(server_dir.join("keys.json")).expect("the keystore file")).unwrap();
     json["store_keys"]
         .as_array()
         .cloned()
@@ -1381,7 +1381,7 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
         assert!(err.to_lowercase().contains("not found"), "{err}");
     }
     let replica_dir = b_dir.path().join("replicas").join(format!("{store_id}.pimble"));
-    assert!(!replica_dir.join("nodes").join(format!("{private}.yrs")).exists());
+    assert!(!tfs::exists(&replica_dir.join("nodes").join(format!("{private}.yrs"))));
     assert!(!contains_bytes_recursive(b_dir.path(), b"PRIVATE-DIARY-TEXT"));
     let listed = bob.list_stores().await.unwrap();
     assert_eq!(listed.iter().find(|s| s.id == store_id).unwrap().roots, vec![shared]);

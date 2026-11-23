@@ -4,6 +4,7 @@
 //! answers over its WebSocket, judges every call by the principal the
 //! caller attached, and sends its notifications.
 
+use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +131,7 @@ async fn both_transports_answer_the_same_bytes() {
     };
     // A store that cannot be created there (a file is in the way), the same
     // refusal from both.
-    std::fs::write(dir.path().join("blocker"), b"").unwrap();
+    tfs::write(dir.path().join("blocker"), b"").unwrap();
     let blocked = dir.path().join("blocker").join("x.pimble");
     let reader = || as_user(HashMap::from([(store_id, Grant::whole(Role::Reader))]));
     let requests = [

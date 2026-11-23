@@ -148,7 +148,7 @@ where
                     return match agents.connect(credential) {
                         Some(connection) => {
                             let principal = connection.principal();
-                            agents.touch(&principal);
+                            agents.touch(&principal).await;
                             request.extensions_mut().insert(principal);
                             request.extensions_mut().insert(connection);
                             inner.call(request).await.map_err(Into::into)

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use pimble_core::{NodeId, StoreId, StoreManifest};
 use pimble_crdt::{DocShape, NodeDoc, NodeUpdateEffect};
-use tokio::fs;
+use pimble_host::Disk;
 use tracing::{info, warn};
 
 use super::{atomic_write, LocalStore};
@@ -170,16 +170,16 @@ pub(crate) fn merge_manifests(base: &StoreManifest, ours: &StoreManifest, theirs
 /// logged and the store still opens: everything moved here is either
 /// derived (the index, people) or heals (a link that starts over from no
 /// positions fetches everything again).
-pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Path, store_id: StoreId) {
+pub(crate) async fn migrate_per_computer_state(disk: &Disk, store_path: &Path, state_dir: &Path, store_id: StoreId) {
     let computers = store_path.join(LocalStore::COMPUTERS_DIR);
-    let first = !computers.exists();
+    let first = !disk.exists(&computers).await;
     // This computer's own link state, once it has the one record
     // (`crate::sync_state`): whatever the folder holds then is not its.
-    let has_record = crate::sync_state::path(state_dir).exists();
+    let has_record = crate::sync_state::exists(disk, state_dir).await;
 
     // `sync.json`'s per-computer keys.
     let sync_path = store_path.join(LocalStore::SYNC_CONFIG_FILE);
-    if let Some(serde_json::Value::Object(mut map)) = super::read_json(&sync_path).await {
+    if let Some(serde_json::Value::Object(mut map)) = super::read_json(disk, &sync_path).await {
         let mut state = serde_json::Map::new();
         for key in LocalStore::PER_COMPUTER_KEYS {
             if let Some(v) = map.remove(key) {
@@ -188,11 +188,11 @@ pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Pa
         }
         if !state.is_empty() {
             let state_path = state_dir.join(LocalStore::LINK_STATE_FILE);
-            if first && !state_path.exists() && !has_record {
+            if first && !disk.exists(&state_path).await && !has_record {
                 let moved = async {
-                    fs::create_dir_all(state_dir).await?;
-                    atomic_write(&state_path, serde_json::to_string_pretty(&serde_json::Value::Object(state))?).await?;
-                    atomic_write(&sync_path, serde_json::to_string_pretty(&serde_json::Value::Object(map))?).await?;
+                    disk.create_dir_all(state_dir).await?;
+                    atomic_write(disk, &state_path, serde_json::to_string_pretty(&serde_json::Value::Object(state))?).await?;
+                    atomic_write(disk, &sync_path, serde_json::to_string_pretty(&serde_json::Value::Object(map))?).await?;
                     Ok::<(), std::io::Error>(())
                 };
                 match moved.await {
@@ -208,7 +208,7 @@ pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Pa
     // Whole files and directories, the same rule each.
     for name in ["vault-link.json", "people.json", LocalStore::INDEX_DIR] {
         let from = store_path.join(name);
-        if !from.exists() {
+        if !disk.exists(&from).await {
             continue;
         }
         let to = state_dir.join(name);
@@ -216,38 +216,37 @@ pub(crate) async fn migrate_per_computer_state(store_path: &Path, state_dir: &Pa
             info!("Store {}: {} in the folder belongs to an older Pimble on another computer; left alone", store_id, name);
             continue;
         }
-        if to.exists() || (name == "vault-link.json" && has_record) {
+        if disk.exists(&to).await || (name == "vault-link.json" && has_record) {
             // This computer already has its own; the folder's is a leftover.
-            remove_path(&from).await;
+            remove_path(disk, &from).await;
             continue;
         }
-        if let Err(e) = fs::create_dir_all(state_dir).await {
+        if let Err(e) = disk.create_dir_all(state_dir).await {
             warn!("Store {}: could not make {}: {}", store_id, state_dir.display(), e);
             return;
         }
-        match fs::rename(&from, &to).await {
+        match disk.rename(&from, &to).await {
             Ok(()) => info!("Store {}: {} moved out of the folder into {}", store_id, name, state_dir.display()),
             Err(_) if name == LocalStore::INDEX_DIR => {
                 // Another filesystem: the index is derived, so it is built
                 // again rather than copied.
-                remove_path(&from).await;
+                remove_path(disk, &from).await;
                 info!("Store {}: the search index in the folder was removed; it is built again outside it", store_id);
             }
-            Err(_) => match fs::copy(&from, &to).await {
-                Ok(_) => remove_path(&from).await,
+            Err(_) => match disk.copy(&from, &to).await {
+                Ok(_) => remove_path(disk, &from).await,
                 Err(e) => warn!("Store {}: could not move {} out of the folder: {}", store_id, name, e),
             },
         }
     }
 
-    if let Err(e) = fs::create_dir_all(&computers).await {
+    if let Err(e) = disk.create_dir_all(&computers).await {
         warn!("Store {}: could not make {}: {}", store_id, computers.display(), e);
     }
 }
 
-async fn remove_path(path: &Path) {
-    let removed = if path.is_dir() { fs::remove_dir_all(path).await } else { fs::remove_file(path).await };
-    if let Err(e) = removed {
+async fn remove_path(disk: &Disk, path: &Path) {
+    if let Err(e) = disk.remove_path(path).await {
         warn!("Could not remove {}: {}", path.display(), e);
     }
 }
@@ -255,17 +254,17 @@ async fn remove_path(path: &Path) {
 /// Remove temporaries (`*.tmp`) an interrupted write left in `dir` more than
 /// an hour ago. A younger one may be another process's write in progress
 /// (two computers, or two servers, on one folder).
-pub(crate) async fn sweep_stale_temporaries(dir: &Path) {
-    let Ok(mut entries) = fs::read_dir(dir).await else { return };
+pub(crate) async fn sweep_stale_temporaries(disk: &Disk, dir: &Path) {
+    let Ok(entries) = disk.list(dir).await else { return };
     let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry.path;
         if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
             continue;
         }
-        let old = entry.metadata().await.ok().and_then(|m| m.modified().ok()).is_some_and(|t| t < hour_ago);
+        let old = disk.metadata(&path).await.ok().and_then(|m| m.modified).is_some_and(|t| t < hour_ago);
         if old {
-            let _ = fs::remove_file(&path).await;
+            let _ = disk.remove_file(&path).await;
         }
     }
 }
@@ -296,7 +295,7 @@ impl LocalStore {
     /// written over with a warning: there is nothing in it to merge.
     pub(super) async fn write_node(&mut self, node_id: NodeId) -> Result<()> {
         let path = self.node_doc_path(node_id);
-        match fs::read(&path).await {
+        match self.disk.read(&path).await {
             Ok(on_disk) => {
                 if self.disk_hashes.get(&node_id) != Some(&content_hash(&on_disk)) {
                     if let Err(e) = self.merge_from_folder(node_id, &on_disk) {
@@ -309,7 +308,7 @@ impl LocalStore {
         }
         let Some(doc) = self.tree.doc(node_id) else { return Ok(()) };
         let bytes = doc.save();
-        atomic_write(&path, &bytes).await?;
+        atomic_write(&self.disk, &path, &bytes).await?;
         self.disk_hashes.insert(node_id, content_hash(&bytes));
         Ok(())
     }
@@ -326,7 +325,7 @@ impl LocalStore {
     /// it since this process last read or wrote it (rule 2).
     pub(super) async fn write_manifest(&mut self) -> Result<()> {
         let path = self.path.join(Self::MANIFEST_FILE);
-        if let Ok(on_disk) = fs::read(&path).await {
+        if let Ok(on_disk) = self.disk.read(&path).await {
             if Some(content_hash(&on_disk)) != self.manifest_hash {
                 match serde_json::from_slice::<StoreManifest>(&on_disk) {
                     Ok(theirs) => self.take_manifest(theirs),
@@ -335,7 +334,7 @@ impl LocalStore {
             }
         }
         let json = serde_json::to_string_pretty(&self.manifest)?;
-        atomic_write(&path, &json).await?;
+        atomic_write(&self.disk, &path, &json).await?;
         self.manifest_hash = Some(content_hash(json.as_bytes()));
         self.manifest_base = self.manifest.clone();
         Ok(())
@@ -357,7 +356,7 @@ impl LocalStore {
     /// (`manifest_changed`), so the next flush writes it.
     async fn absorb_manifest(&mut self) -> Result<()> {
         let path = self.path.join(Self::MANIFEST_FILE);
-        let Ok(on_disk) = fs::read(&path).await else { return Ok(()) };
+        let Ok(on_disk) = self.disk.read(&path).await else { return Ok(()) };
         let hash = content_hash(&on_disk);
         if Some(hash) == self.manifest_hash {
             return Ok(());
@@ -418,16 +417,15 @@ impl LocalStore {
     /// every file in `nodes/` and the manifest.
     pub async fn absorb_folder(&mut self) -> Result<()> {
         let mut paths = vec![self.path.join(Self::MANIFEST_FILE)];
-        let mut entries = fs::read_dir(self.path.join(Self::NODES_DIR)).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            paths.push(entry.path());
+        for entry in self.disk.list(self.path.join(Self::NODES_DIR)).await? {
+            paths.push(entry.path);
         }
         paths.sort();
         self.absorb_folder_paths(&paths).await
     }
 
     async fn absorb_node_file(&mut self, node_id: NodeId, path: &Path) -> Result<()> {
-        let bytes = match fs::read(path).await {
+        let bytes = match self.disk.read(path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -462,7 +460,7 @@ impl LocalStore {
     /// A copy that does not load as a yrs document is left alone with a
     /// warning: it may not be ours to delete.
     pub(super) async fn absorb_conflict_file(&mut self, node_id: NodeId, path: &Path) -> Result<()> {
-        let bytes = match fs::read(path).await {
+        let bytes = match self.disk.read(path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -474,7 +472,7 @@ impl LocalStore {
         self.merge_from_folder(node_id, &bytes)?;
         self.write_node(node_id).await?;
         self.dirty.remove(&node_id);
-        match fs::remove_file(path).await {
+        match self.disk.remove_file(path).await {
             Ok(()) => info!("Store {}: merged the conflict copy {} into its document and removed it", self.id, path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!("Store {}: merged {} but could not remove it: {}", self.id, path.display(), e),

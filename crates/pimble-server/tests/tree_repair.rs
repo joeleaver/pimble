@@ -8,6 +8,7 @@
 
 mod isolated;
 
+use pimble_host::disk::testfs as tfs;
 use std::time::Duration;
 
 use base64::Engine;
@@ -218,7 +219,7 @@ async fn deleting_a_folder_tombstones_its_subtree_and_keeps_the_documents() {
 
     assert!(client.get_node(store_id, folder_id).await.is_err(), "folder should be gone");
     assert!(client.get_node(store_id, doc_id).await.is_err(), "descendant should be gone too");
-    assert!(content_path.exists(), "the descendant's document stays on disk as a tombstone");
+    assert!(tfs::exists(&content_path), "the descendant's document stays on disk as a tombstone");
 
     let (_, root_children) = client.get_children(store_id, root_id).await.unwrap();
     assert!(root_children.iter().all(|n| n.id != folder_id));

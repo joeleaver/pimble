@@ -5220,6 +5220,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-host"
+version = "0.29.4"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "pimble-image"
 version = "0.29.4"
 dependencies = [
@@ -5413,6 +5426,7 @@ dependencies = [
  "pimble-crdt",
  "pimble-crypto",
  "pimble-discussion",
+ "pimble-host",
  "pimble-plugins",
  "pimble-rpc",
  "pimble-search",
@@ -5458,6 +5472,7 @@ dependencies = [
  "notify",
  "pimble-core",
  "pimble-crdt",
+ "pimble-host",
  "serde",
  "serde_json",
  "sha2",

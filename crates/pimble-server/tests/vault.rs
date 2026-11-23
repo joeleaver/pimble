@@ -8,6 +8,7 @@
 
 mod isolated;
 
+use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -232,7 +233,7 @@ async fn snapshot_drops_old_entries_and_survives_close_and_reopen() {
 
     client.close_store(store_id).await.unwrap();
     let log_path = path.join("vault").join("tree").join("log");
-    let log_bytes = std::fs::read(&log_path).unwrap_or_default();
+    let log_bytes = tfs::read(&log_path).unwrap_or_default();
     assert!(log_bytes.is_empty(), "every entry is covered by the snapshot, so the log should hold nothing on disk");
 
     client.open_store(&path).await.unwrap();
@@ -345,7 +346,7 @@ async fn create_store_with_a_chosen_id_and_refusal_when_already_open() {
         .await
         .expect_err("an id already open must be refused");
     assert!(err.to_string().to_lowercase().contains("already open"), "got: {}", err);
-    assert!(!second_path.exists(), "no second store directory should have been created");
+    assert!(!tfs::exists(&second_path), "no second store directory should have been created");
 }
 
 // ── 8. Subscription delivers VaultAppended with the blob ─────────────
@@ -440,11 +441,11 @@ async fn a_truncated_trailing_log_record_is_dropped_when_the_store_reopens() {
     // Simulate a crash mid-append directly on disk: a record whose declared
     // length claims far more body bytes than are actually present.
     let log_path = path.join("vault").join("tree").join("log");
-    let mut bytes = std::fs::read(&log_path).unwrap();
+    let mut bytes = tfs::read(&log_path).unwrap();
     bytes.extend_from_slice(&2u64.to_le_bytes());
     bytes.extend_from_slice(&100u32.to_le_bytes());
     bytes.extend_from_slice(b"short");
-    std::fs::write(&log_path, &bytes).unwrap();
+    tfs::write(&log_path, &bytes).unwrap();
 
     let (mut server, client) = start_server().await;
     client.open_store(&path).await.expect("reopening the vault store succeeds despite the truncated tail");
@@ -676,7 +677,7 @@ async fn scope_sets_are_an_owners_to_publish_and_survive_a_restart() {
 
     // A restart: a new server over the same directory.
     let path = v.dir.path().join("v.pimble");
-    assert!(path.join("scopes.json").exists());
+    assert!(tfs::exists(&path.join("scopes.json")));
     v.server.stop().await.unwrap();
     let server = start_jwt_server("admin-secret", &v.jwks_url, v.issuer).await;
     let url = format!("http://{}", server.addr());
@@ -756,7 +757,7 @@ async fn data_keys_round_trip_and_merge_by_scope_key() {
     // On disk beside the document, and back after a reopen; keys can come
     // before a document's first blob.
     let path = dir.path().join("v.pimble");
-    assert!(path.join("vault").join(doc.as_str()).join("keys.json").exists());
+    assert!(tfs::exists(&path.join("vault").join(doc.as_str()).join("keys.json")));
     let early = VaultDocId::Node(NodeId::new());
     client.vault_set_doc_keys(store_id, early.clone(), pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_share] }).await.unwrap();
     client.close_store(store_id).await.unwrap();
@@ -842,15 +843,15 @@ async fn delete_vault_store_removes_an_open_vault_and_nothing_else() {
 
     let err = admin.delete_vault_store(plain_id).await.expect_err("a plain store is refused").to_string();
     assert!(err.contains("is not a vault store"), "{err}");
-    assert!(plain_path.join("manifest.json").exists(), "and left exactly where it was");
+    assert!(tfs::exists(&plain_path.join("manifest.json")), "and left exactly where it was");
     admin.delete_vault_store(StoreId::new()).await.expect_err("a store that is not open here");
 
     admin.delete_vault_store(vault_id).await.expect("the open vault goes");
-    assert!(!vault_path.exists(), "its directory with it");
+    assert!(!tfs::exists(&vault_path), "its directory with it");
     assert!(admin.list_stores().await.unwrap().iter().all(|s| s.id != vault_id));
     admin.vault_list_docs(vault_id).await.expect_err("nothing answers for it any more");
     admin.delete_vault_store(vault_id).await.expect_err("twice is an error, not a second removal");
-    assert!(plain_path.join("manifest.json").exists());
+    assert!(tfs::exists(&plain_path.join("manifest.json")));
 }
 
 // ── State reports (docs/CONVERGENCE_CONTRACT.md, wave 1) ─────────────────

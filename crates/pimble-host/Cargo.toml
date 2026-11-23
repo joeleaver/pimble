@@ -1,0 +1,39 @@
+[package]
+name = "pimble-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "What a Pimble server needs from the machine it runs on: a disk, a runtime, outbound HTTP, its paths (docs/ONE_CODEBASE_CONTRACT.md seams B-E)"
+
+[dependencies]
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+# The desktop's adapters: tokio's files, its runtime, and the platform's
+# directories. Nothing here builds for the browser's worker, which brings its
+# own (OPFS, spawn_local, gloo timers).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "rt", "time"] }
+dirs = "6"
+# The accounts service's calls (src/http.rs): rustls, no openssl, as pimble-server had it.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# uuid v4 needs a randomness backend in the browser; the native build has one.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time"] }
+
+[features]
+# Tests only: `Disk::default()` answers the disk `PIMBLE_TEST_DISK` names
+# (`native`, the default, or `memory`: one memory disk for the whole test
+# process), and `disk::testfs` reads and writes that same disk, so a suite's
+# own looks at the files go where its stores went. Turned on by the
+# dev-dependencies of pimble-store and pimble-server; never by a build that
+# ships (cargo's resolver 2 keeps dev-dependency features out of those).
+test-disk = []

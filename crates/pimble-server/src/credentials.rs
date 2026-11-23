@@ -11,14 +11,15 @@ use std::io;
 use std::path::PathBuf;
 
 use pimble_core::AuthMethod;
-use tokio::sync::RwLock;
+use pimble_host::Disk;
+use tokio::sync::{OnceCell, RwLock};
 use tracing::warn;
 use url::Url;
 
-/// `<dirs::config_dir()>/pimble/credentials.json`, used whenever
-/// `ServerConfig::credentials_path` is `None`.
+/// `<config dir>/pimble/credentials.json` ([`pimble_host::Paths::native`]),
+/// used whenever `ServerConfig::credentials_path` is `None`.
 pub fn default_credentials_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("credentials.json")
+    pimble_host::Paths::native().credentials()
 }
 
 /// `url`'s origin as the credentials file keys it: `scheme://host[:port]`,
@@ -43,21 +44,38 @@ pub fn origin_of(url: &Url) -> String {
     }
 }
 
-/// One server's saved credentials, keyed by origin. Loaded once at
-/// construction (a missing file starts empty silently — nothing has ever
+/// One server's saved credentials, keyed by origin. Loaded once, at the
+/// first use (a missing file starts empty silently — nothing has ever
 /// been saved yet; a file that exists but can't be read or parsed also
 /// starts empty, logged, rather than failing server startup — the worst
 /// case is re-prompting for a credential already saved once, and a `save`
 /// only ever happens after that); every [`CredentialStore::save`] persists
 /// the whole map with an atomic, mode-`0600` rewrite.
 pub struct CredentialStore {
+    disk: Disk,
     path: PathBuf,
-    entries: RwLock<HashMap<String, AuthMethod>>,
+    entries: OnceCell<RwLock<HashMap<String, AuthMethod>>>,
 }
 
 impl CredentialStore {
+    /// The credentials saved at `path` on the default disk.
     pub fn new(path: PathBuf) -> Self {
-        let entries = match std::fs::read(&path) {
+        Self::on_disk(&Disk::default(), path)
+    }
+
+    /// The credentials saved at `path` on `disk`. Nothing is read until the
+    /// first use.
+    pub fn on_disk(disk: &Disk, path: PathBuf) -> Self {
+        Self { disk: disk.clone(), path, entries: OnceCell::new() }
+    }
+
+    async fn entries(&self) -> &RwLock<HashMap<String, AuthMethod>> {
+        self.entries.get_or_init(|| async { RwLock::new(self.read_file().await) }).await
+    }
+
+    async fn read_file(&self) -> HashMap<String, AuthMethod> {
+        let path = &self.path;
+        match self.disk.read(path).await {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, AuthMethod>>(&bytes) {
                 Ok(entries) => entries,
                 Err(e) => {
@@ -78,8 +96,7 @@ impl CredentialStore {
                 );
                 HashMap::new()
             }
-        };
-        Self { path, entries: RwLock::new(entries) }
+        }
     }
 
     /// The credential to use for a connection to `url`: `requested` if it
@@ -89,14 +106,14 @@ impl CredentialStore {
         if !matches!(requested, AuthMethod::None) {
             return requested.clone();
         }
-        self.entries.read().await.get(&origin_of(url)).cloned().unwrap_or(AuthMethod::None)
+        self.entries().await.read().await.get(&origin_of(url)).cloned().unwrap_or(AuthMethod::None)
     }
 
     /// The credential saved for `url`'s origin, if any, without the
     /// `resolve` fallback — used by callers that need to know whether
     /// anything was actually saved.
     pub async fn get(&self, url: &Url) -> Option<AuthMethod> {
-        self.entries.read().await.get(&origin_of(url)).cloned()
+        self.entries().await.read().await.get(&origin_of(url)).cloned()
     }
 
     /// Record `auth` as the credential for `url`'s origin, overwriting
@@ -107,7 +124,7 @@ impl CredentialStore {
     pub async fn save(&self, url: &Url, auth: AuthMethod) -> io::Result<()> {
         let origin = origin_of(url);
         let snapshot = {
-            let mut entries = self.entries.write().await;
+            let mut entries = self.entries().await.write().await;
             entries.insert(origin, auth);
             entries.clone()
         };
@@ -115,11 +132,8 @@ impl CredentialStore {
     }
 
     async fn write_atomic(&self, entries: &HashMap<String, AuthMethod>) -> io::Result<()> {
-        let path = self.path.clone();
         let json = serde_json::to_vec_pretty(entries).map_err(io::Error::other)?;
-        tokio::task::spawn_blocking(move || crate::fs_util::write_atomic_0600(&path, &json))
-            .await
-            .map_err(io::Error::other)?
+        self.disk.write_private_atomic(&self.path, &json).await
     }
 }
 
@@ -179,8 +193,9 @@ mod tests {
             other => panic!("expected the saved token to survive a reload, got {other:?}"),
         }
 
+        // The mode is the machine's disk's to keep; a memory disk has none.
         #[cfg(unix)]
-        {
+        if !pimble_host::disk::testfs::is_memory() {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be mode 0600");

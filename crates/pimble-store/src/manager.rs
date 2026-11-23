@@ -5,6 +5,7 @@ use std::path::Path;
 
 use pimble_core::{LeftShare, MountRef, Node, NodeId, NodeMetadata, Place, Store, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
+use pimble_host::Disk;
 use tracing::info;
 
 /// Maximum depth for transitive mount resolution
@@ -12,7 +13,7 @@ const MAX_MOUNT_DEPTH: usize = 16;
 
 use crate::blobs::BlobStore;
 use crate::error::{Result, StoreError};
-use crate::local::{peek_manifest, FolderMerge, LocalStore, NodeRemoval, SyncConfig};
+use crate::local::{peek_manifest_on, FolderMerge, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
 use crate::vault::{DocKeys, VaultDocSummary, VaultStore};
 
@@ -55,11 +56,14 @@ pub struct StoreManager {
     /// `None` (a manager made with [`StoreManager::new`]) keeps the old
     /// single-file layout in the store's folder.
     state_root: Option<std::path::PathBuf>,
+    /// The disk every store is created and opened on, and the state root is
+    /// on (docs/ONE_CODEBASE_CONTRACT.md seam B).
+    disk: Disk,
 }
 
 impl StoreManager {
     /// Create a new store manager with no state root (see
-    /// [`StoreManager::with_state_root`]).
+    /// [`StoreManager::with_state_root`]), on the default disk.
     pub fn new() -> Self {
         Self {
             local_stores: HashMap::new(),
@@ -67,6 +71,7 @@ impl StoreManager {
             registry: StoreRegistry::new(),
             newly_opened: Vec::new(),
             state_root: None,
+            disk: Disk::default(),
         }
     }
 
@@ -74,6 +79,17 @@ impl StoreManager {
     /// `state_root` (docs/STORE_FOLDERS_CONTRACT.md rule 1).
     pub fn with_state_root(state_root: impl Into<std::path::PathBuf>) -> Self {
         Self { state_root: Some(state_root.into()), ..Self::new() }
+    }
+
+    /// The same manager on `disk`, before any store is open.
+    pub fn on_disk(mut self, disk: Disk) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// The disk this manager's stores are on.
+    pub fn disk(&self) -> &Disk {
+        &self.disk
     }
 
     /// The state root, when there is one.
@@ -145,10 +161,7 @@ impl StoreManager {
 
         let id = match kind {
             StoreKind::Plain => {
-                let mut store = match store_id {
-                    Some(id) => LocalStore::create_with_id(path, name, id).await?,
-                    None => LocalStore::create(path, name).await?,
-                };
+                let mut store = LocalStore::create_on(&self.disk, path, name, store_id).await?;
                 if let Some(root) = &self.state_root {
                     store.set_state_root(root);
                 }
@@ -157,7 +170,7 @@ impl StoreManager {
                 id
             }
             StoreKind::Vault => {
-                let store = VaultStore::create(path, name, store_id).await?;
+                let store = VaultStore::create_on(&self.disk, path, name, store_id).await?;
                 let id = store.id;
                 self.vault_stores.insert(id, store);
                 id
@@ -192,7 +205,7 @@ impl StoreManager {
                 id, open.path.display()
             )));
         }
-        let mut store = LocalStore::create_replica(path, id, name, root_node_id).await?;
+        let mut store = LocalStore::create_replica_on(&self.disk, path, id, name, root_node_id, Vec::new()).await?;
         if let Some(root) = &self.state_root {
             store.set_state_root(root);
         }
@@ -207,7 +220,7 @@ impl StoreManager {
     /// `kind` decides which; docs/CRYPTO_CONTRACT.md).
     pub async fn open_local_store(&mut self, path: impl AsRef<Path>) -> Result<StoreId> {
         let path = path.as_ref();
-        let manifest = peek_manifest(path).await?;
+        let manifest = peek_manifest_on(&self.disk, path).await?;
 
         let id = match manifest.kind {
             StoreKind::Plain => {
@@ -220,7 +233,7 @@ impl StoreManager {
                     info!("Store {} is already open", manifest.id);
                     return Ok(manifest.id);
                 }
-                let store = LocalStore::open_in(path, self.state_root.as_deref()).await?;
+                let store = LocalStore::open_on(&self.disk, path, self.state_root.as_deref()).await?;
                 let id = store.id;
                 self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
                 if self.is_open(id) {
@@ -231,7 +244,7 @@ impl StoreManager {
                 id
             }
             StoreKind::Vault => {
-                let store = VaultStore::open(path).await?;
+                let store = VaultStore::open_on(&self.disk, path).await?;
                 let id = store.id;
                 self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
                 if self.is_open(id) {
@@ -563,7 +576,7 @@ impl StoreManager {
         let store = self.vault_stores.remove(&store_id).ok_or(StoreError::NotOpen(store_id))?;
         self.registry.unregister(&store_id);
         self.newly_opened.retain(|id| *id != store_id);
-        tokio::fs::remove_dir_all(&store.path).await?;
+        self.disk.remove_dir_all(&store.path).await?;
         info!("Deleted vault store {} at {:?}", store_id, store.path);
         Ok(())
     }
@@ -653,7 +666,7 @@ impl StoreManager {
             )));
         }
         let root = scope_roots.first().copied().unwrap_or_else(NodeId::new);
-        let mut store = LocalStore::create_replica_with_scope(path, id, name, root, scope_roots).await?;
+        let mut store = LocalStore::create_replica_on(&self.disk, path, id, name, root, scope_roots).await?;
         if let Some(root) = &self.state_root {
             store.set_state_root(root);
         }
@@ -1068,6 +1081,7 @@ impl Default for StoreManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_host::disk::testfs as tfs;
     use std::collections::HashSet;
 
     const T: &str = "2026-09-18T10:00:00+00:00";
@@ -1098,7 +1112,7 @@ mod tests {
         // The original store must be untouched: still open, same root.
         assert!(manager.is_open(store_id));
         assert_eq!(manager.root_node_id(store_id).unwrap(), root_id);
-        assert!(!replica_dir.path().join("replica.pimble").exists(), "no replica directory should have been created");
+        assert!(!tfs::exists(&replica_dir.path().join("replica.pimble")), "no replica directory should have been created");
     }
 
     /// A replica starts with no documents, not even the root's: the peer's
@@ -1136,7 +1150,7 @@ mod tests {
 
         let store_path = manager.get_store_info(store_id).unwrap().local_path().unwrap().clone();
         let content_path = store_path.join("nodes").join(format!("{}.yrs", doc_id));
-        assert!(content_path.exists(), "the document's file should exist before delete");
+        assert!(tfs::exists(&content_path), "the document's file should exist before delete");
 
         let (removal, edit) = manager.delete_node(store_id, folder_id).unwrap();
 
@@ -1154,7 +1168,7 @@ mod tests {
         assert!(manager.doc_ids(store_id).unwrap().contains(&doc_id), "a tombstone is still a document");
         assert!(!manager.list_node_ids(store_id).unwrap().contains(&doc_id));
         manager.flush(store_id).await.unwrap();
-        assert!(content_path.exists(), "no file is deleted");
+        assert!(tfs::exists(&content_path), "no file is deleted");
     }
 
     /// A subtree that hasn't been repaired yet can itself be malformed: a

@@ -14,6 +14,7 @@
 //! process, so no other test's env is affected and this one has the env to
 //! itself.
 
+use pimble_host::disk::testfs as tfs;
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, RemoteEndpoint};
 use pimble_server::{PimbleServer, ServerConfig};
@@ -53,5 +54,5 @@ async fn add_remote_store_with_no_path_uses_the_default_replica_directory() {
         actual_path, expected_dir,
         "with path: None, the replica should land under <XDG_DATA_HOME>/pimble/replicas/<store id>.pimble"
     );
-    assert!(actual_path.exists(), "the replica directory should actually exist on disk");
+    assert!(tfs::exists(&actual_path), "the replica directory should actually exist on disk");
 }

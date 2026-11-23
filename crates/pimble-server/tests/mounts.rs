@@ -3,6 +3,7 @@
 //! exactly the code paths a real client hits over JSON-RPC — the same
 //! pattern `store_sync.rs` and `content_sync.rs` use.
 
+use pimble_host::disk::testfs as tfs;
 use std::sync::Arc;
 
 use pimble_core::{MountState, NodeId, StoreId};
@@ -229,7 +230,7 @@ async fn mount_source_directory_gone_is_unavailable() {
     // The source store's directory disappears before a fresh handler opens
     // the mounting store, so neither "already open" nor "registry entry"
     // resolves it, and the source_path hint points nowhere.
-    std::fs::rename(&b_path, &b_moved_path).unwrap();
+    tfs::rename(&b_path, &b_moved_path).unwrap();
 
     let (handler, _store_manager, _home) = new_handler();
     handler

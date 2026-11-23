@@ -349,10 +349,7 @@ pub(crate) fn state_root_beside(replicas_dir: &std::path::Path) -> PathBuf {
 /// (`Store::is_replica`), and only such a store can be removed with
 /// `removeReplica`.
 pub(crate) fn default_replicas_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("pimble")
-        .join("replicas")
+    pimble_host::Paths::native().replicas()
 }
 
 /// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
@@ -1272,6 +1269,13 @@ pub struct RpcHandler {
     folders: Arc<std::sync::Mutex<HashMap<StoreId, crate::folder_watch::FolderTask>>>,
     /// The other computers each open store's folder names (rule 5).
     computers: Arc<std::sync::Mutex<HashMap<StoreId, Vec<pimble_core::OtherComputer>>>>,
+    /// The disk this server keeps everything on (docs/ONE_CODEBASE_CONTRACT.md
+    /// seam B): its store manager's, so the stores, their state directories,
+    /// the keystore, the credentials, the agents file and the relay twins
+    /// are on one disk.
+    disk: pimble_host::Disk,
+    /// How this server reaches the accounts service (seam D).
+    http: Arc<dyn pimble_host::http::Http>,
 }
 
 /// Where a client's frames come from, as the presence hub keys them: a
@@ -1354,6 +1358,9 @@ impl RpcHandler {
         replicas_dir: PathBuf,
         keystore_path: PathBuf,
     ) -> Self {
+        // The manager's disk: a handler is made before anything holds the
+        // manager, and one made from a manager in use keeps the default.
+        let disk = store_manager.try_read().map(|manager| manager.disk().clone()).unwrap_or_default();
         Self {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
@@ -1366,18 +1373,18 @@ impl RpcHandler {
             semantic_available,
             semantic_warmup: None,
             links: Arc::new(RwLock::new(HashMap::new())),
-            credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
+            credentials: Arc::new(crate::credentials::CredentialStore::on_disk(&disk, credentials_path)),
             mounts: Arc::new(Mutex::new(MountTracking::default())),
             vault_links: Arc::new(RwLock::new(HashMap::new())),
-            keystore: Arc::new(Keystore::new(keystore_path)),
+            keystore: Arc::new(Keystore::on_disk(&disk, keystore_path)),
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
             grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
             vault_reports: true,
             out_of_step_after: crate::vault_link::OUT_OF_STEP_AFTER,
             set_aside_after: Duration::from_secs(pimble_rpc::vault::SET_ASIDE_AFTER_SECS as u64),
             link_faults: None,
-            relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
-            devices: Arc::new(crate::devices::Devices::new()),
+            relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), relay_dir_beside(&replicas_dir))),
+            devices: Arc::new(crate::devices::Devices::new(disk.clone())),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -1389,7 +1396,27 @@ impl RpcHandler {
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
             folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            disk,
+            http: Arc::new(pimble_host::http::ReqwestHttp::default()),
         }
+    }
+
+    /// How this server reaches the accounts service, in place of `reqwest`
+    /// (`ServerConfig::http`). Call before the handler is cloned or serves
+    /// anything.
+    pub fn with_http(mut self, http: Arc<dyn pimble_host::http::Http>) -> Self {
+        self.http = http;
+        self
+    }
+
+    /// How this server reaches the accounts service.
+    pub fn http(&self) -> &dyn pimble_host::http::Http {
+        &*self.http
+    }
+
+    /// The disk this server keeps everything on.
+    pub fn disk(&self) -> &pimble_host::Disk {
+        &self.disk
     }
 
     /// The embedding model warms up beside the server: index opens wait for
@@ -1466,7 +1493,7 @@ impl RpcHandler {
     /// (`ServerConfig::relay_dir`), in place of `relay` beside the replicas
     /// directory. Call before the handler is cloned or serves anything.
     pub fn with_relay_dir(mut self, dir: PathBuf) -> Self {
-        self.relay = Arc::new(crate::relay_face::RelayHost::new(dir));
+        self.relay = Arc::new(crate::relay_face::RelayHost::new(self.disk.clone(), dir));
         self
     }
 
@@ -2171,7 +2198,7 @@ impl RpcHandler {
         key_id: Uuid,
         held_as: &crate::cloud::HeldAs,
     ) -> Result<url::Url, ErrorObjectOwned> {
-        let minted = crate::cloud::mint_token(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let minted = crate::cloud::mint_token(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         let reach = minted.reach(store_id, None).map_err(to_rpc_error)?;
         let rpc_url = reach.url;
 
@@ -3936,12 +3963,12 @@ impl PimbleApiServer for RpcHandler {
         authorize_service_only(&principal_of(ext), "cloudSignIn")?;
         info!("Signing in to Pimble Cloud at {} as {}", request.url, request.email);
 
-        let kdf_params = crate::cloud::kdf(&request.url, &request.email).await.map_err(to_rpc_error)?;
+        let kdf_params = crate::cloud::kdf(self.http(), &request.url, &request.email).await.map_err(to_rpc_error)?;
         let password_keys = pimble_crypto::derive_password_keys(&request.password, &kdf_params).map_err(to_rpc_error)?;
         let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
 
-        let login = crate::cloud::login(&request.url, &request.email, &auth_key).await.map_err(to_rpc_error)?;
-        let me_keys = crate::cloud::me_keys(&request.url, &login.session).await.map_err(to_rpc_error)?;
+        let login = crate::cloud::login(self.http(), &request.url, &request.email, &auth_key).await.map_err(to_rpc_error)?;
+        let me_keys = crate::cloud::me_keys(self.http(), &request.url, &login.session).await.map_err(to_rpc_error)?;
         let account_keys = pimble_crypto::unwrap_account_keys(&me_keys.account_key_blob, &password_keys.kek).map_err(to_rpc_error)?;
 
         self.keystore
@@ -3977,7 +4004,7 @@ impl PimbleApiServer for RpcHandler {
             return Err(invalid_params("Name the agent: the app it is for, or what it does."));
         }
         let grants = self.checked_grants(request.grants).await?;
-        let (agent, key) = self.agents()?.create(name, grants).map_err(to_rpc_error)?;
+        let (agent, key) = self.agents()?.create(name, grants).await.map_err(to_rpc_error)?;
         Ok(CreateAgentResponse { agent, key })
     }
 
@@ -3993,13 +4020,14 @@ impl PimbleApiServer for RpcHandler {
         };
         self.agents()?
             .update(&request.id, name, grants)
+            .await
             .map_err(to_rpc_error)?
             .ok_or_else(|| invalid_params("There is no such agent."))
     }
 
     async fn remove_agent(&self, ext: &Extensions, request: RemoveAgentRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "removeAgent")?;
-        if !self.agents()?.remove(&request.id).map_err(to_rpc_error)? {
+        if !self.agents()?.remove(&request.id).await.map_err(to_rpc_error)? {
             return Err(invalid_params("There is no such agent."));
         }
         Ok(EmptyResponse {})
@@ -4140,7 +4168,7 @@ impl PimbleApiServer for RpcHandler {
             manager.get_store_info(store_id).map_err(to_rpc_error)?.name
         };
 
-        let store_view = crate::cloud::create_store(&account.url, &account.session, &name, "vault", Some(&store_id.to_string()))
+        let store_view = crate::cloud::create_store(self.http(), &account.url, &account.session, &name, "vault", Some(&store_id.to_string()))
             .await
             .map_err(to_rpc_error)?;
         if store_view.store_id != store_id.to_string() {
@@ -4154,7 +4182,7 @@ impl PimbleApiServer for RpcHandler {
         let key_id = Uuid::new_v4();
         let recipient = account.keys.public_keys();
         let envelope = pimble_crypto::wrap_key(&key, key_id, &recipient, &account.keys, &format!("store:{}", store_id)).map_err(to_rpc_error)?;
-        crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope, None)
+        crate::cloud::put_store_key(self.http(), &account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope, None)
             .await
             .map_err(to_rpc_error)?;
         self.keystore.add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)?;
@@ -4180,7 +4208,7 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_list_hosted_stores(&self, ext: &Extensions) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudListHostedStores")?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
-        let stores = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let stores = crate::cloud::list_stores(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         // One id however many rows name the store (a row per grant).
         let mut relayed: Vec<String> = stores.iter().filter(|s| s.is_relayed()).map(|s| s.store_id.clone()).collect();
         relayed.sort();
@@ -4205,8 +4233,8 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_list_shares(&self, ext: &Extensions) -> Result<CloudListSharesResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudListShares")?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
-        let me = crate::cloud::me(&account.url, &account.session).await.map_err(to_rpc_error)?;
-        let shares = crate::cloud::list_shares(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let me = crate::cloud::me(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
+        let shares = crate::cloud::list_shares(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         let manager = self.store_manager.read().await;
         let rows = shares
             .into_iter()
@@ -4240,7 +4268,7 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_set_display_name(&self, ext: &Extensions, request: CloudSetDisplayNameRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudSetDisplayName")?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
-        crate::cloud::put_display_name(&account.url, &account.session, request.name.trim()).await.map_err(to_rpc_error)?;
+        crate::cloud::put_display_name(self.http(), &account.url, &account.session, request.name.trim()).await.map_err(to_rpc_error)?;
         // Every store this name may show in.
         let open: Vec<StoreId> = self.store_manager.read().await.list_stores();
         for store_id in open {
@@ -4255,7 +4283,7 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_set_share_name(&self, ext: &Extensions, request: CloudSetShareNameRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudSetShareName")?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
-        crate::cloud::put_share_name(&account.url, &account.session, &request.store_id.to_string(), request.root.as_ref(), request.name.trim())
+        crate::cloud::put_share_name(self.http(), &account.url, &account.session, &request.store_id.to_string(), request.root.as_ref(), request.name.trim())
             .await
             .map_err(to_rpc_error)?;
         if self.store_manager.read().await.is_open(request.store_id) {
@@ -4280,7 +4308,7 @@ impl PimbleApiServer for RpcHandler {
 
         // How the account holds the store: the whole of it, or shares of it
         // (a row per grant, docs/NODE_DOCUMENT_CONTRACT.md section 5).
-        let rows = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let rows = crate::cloud::list_stores(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         // No row for it (an accounts service that lists nothing): held as
         // it always was, whole and writable.
         let held_as = crate::cloud::HeldAs::from_rows(&rows, store_id).unwrap_or_else(crate::cloud::HeldAs::owner);
@@ -4960,14 +4988,14 @@ impl PimbleApiServer for RpcHandler {
         let local = b64.decode(&request.state).map_err(|e| to_rpc_error(format!("the personal document is not base64: {e}")))?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
         if !request.enabled {
-            crate::cloud::delete_personal(&account.url, &account.session).await.map_err(to_rpc_error)?;
+            crate::cloud::delete_personal(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
             return Ok(CloudPersonalSyncResponse { state: request.state, off: true });
         }
         let key = pimble_crypto::personal_key(&account.keys);
         let aad = pimble_crypto::personal_aad(&account.user_id);
         // Fetch, merge, write; again when another device wrote in between.
         for _ in 0..4 {
-            let remote = crate::cloud::get_personal(&account.url, &account.session).await.map_err(to_rpc_error)?;
+            let remote = crate::cloud::get_personal(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
             // An empty copy: another device of theirs turned it off.
             if remote.as_ref().is_some_and(|b| b.blob.is_empty()) && !request.turn_on {
                 return Ok(CloudPersonalSyncResponse { state: request.state, off: true });
@@ -4989,7 +5017,7 @@ impl PimbleApiServer for RpcHandler {
             }
             let sealed = pimble_crypto::Blob::encrypt(&key, uuid::Uuid::nil(), &aad, &after);
             let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sealed);
-            if crate::cloud::put_personal(&account.url, &account.session, version, &blob).await.map_err(to_rpc_error)?.is_some() {
+            if crate::cloud::put_personal(self.http(), &account.url, &account.session, version, &blob).await.map_err(to_rpc_error)?.is_some() {
                 return Ok(CloudPersonalSyncResponse { state: b64.encode(after), off: false });
             }
         }
@@ -5808,10 +5836,16 @@ impl PimbleApiServer for RpcHandler {
         // (docs/STORE_FOLDERS_CONTRACT.md rule 1): its index, its link's
         // positions. Derived or meaningless without the replica; best effort.
         if let Some(state_dir) = state_dir {
-            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            let _ = self.disk.remove_dir_all(&state_dir).await;
+            // The search index is on the machine's own disk whatever the
+            // server's disk is (docs/ONE_CODEBASE_CONTRACT.md seam F, not yet
+            // behind the disk).
+            if !self.disk.is_native() {
+                let _ = tokio::fs::remove_dir_all(state_dir.join("index")).await;
+            }
         }
         if let Some(path) = path {
-            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            if let Err(e) = self.disk.remove_dir_all(&path).await {
                 // The store is already closed and unlinked at this point,
                 // so this can't be silently swallowed into a success: the
                 // caller (app or CLI) needs to know the directory is still

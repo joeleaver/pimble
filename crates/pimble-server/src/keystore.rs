@@ -3,28 +3,32 @@
 //! `<config dir>/pimble/keys.json` mode `0600`
 //! (docs/CRYPTO_CONTRACT.md "Pimble server, the desktop side").
 //!
-//! Loaded once at server start (or in a test, at `RpcHandler` construction),
-//! held in memory, and rewritten atomically (via [`crate::fs_util::write_atomic_0600`],
-//! same as [`crate::credentials::CredentialStore`]) after every change:
-//! signing in or out, or adding a store key. Moving the unwrapped material
-//! to the OS keychain is a follow-up, not this phase.
+//! Loaded once, when the server starts (`PimbleServer::start` asks for it) or
+//! at the first use, held in memory, and handed whole to where it rests after
+//! every change: signing in or out, or adding a store key. Where it rests is
+//! the host's ([`pimble_host::KeyRest`], docs/ONE_CODEBASE_CONTRACT.md section
+//! 6): `keys.json` mode `0600` on the desktop, written atomically, as the
+//! saved credentials are. Moving the unwrapped material to the OS keychain is
+//! a follow-up, not this phase.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use pimble_core::StoreId;
 use pimble_crypto::{AccountKeys, SymmetricKey};
+use pimble_host::{Disk, FileKeyRest, KeyRest};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use tracing::warn;
 use uuid::Uuid;
 
-/// `<dirs::config_dir()>/pimble/keys.json`.
+/// `<config dir>/pimble/keys.json` ([`pimble_host::Paths::native`]).
 pub fn default_keystore_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("keys.json")
+    pimble_host::Paths::native().keystore()
 }
 
 fn b64_encode(bytes: &[u8]) -> String {
@@ -86,8 +90,9 @@ pub struct SignedInAccount {
 /// (docs/CRYPTO_CONTRACT.md). One instance per [`crate::handler::RpcHandler`]
 /// (`Arc`-shared), same shape as [`crate::credentials::CredentialStore`].
 pub struct Keystore {
-    path: PathBuf,
-    data: RwLock<KeystoreData>,
+    rest: Arc<dyn KeyRest>,
+    /// Loaded from `rest` at the first use.
+    data: OnceCell<RwLock<KeystoreData>>,
     /// Pimble Cloud refused the session (it expired, or was signed out
     /// elsewhere): nothing that needs it is tried again until a sign-in.
     /// In memory: a restart tries once, and learns it again.
@@ -95,30 +100,54 @@ pub struct Keystore {
 }
 
 impl Keystore {
-    /// Load `path`, if it exists. A missing, unreadable or unparseable file
+    /// The keystore resting at `path` on the default disk.
+    pub fn new(path: PathBuf) -> Self {
+        Self::on_disk(&Disk::default(), path)
+    }
+
+    /// The keystore resting at `path` on `disk`, mode `0600`.
+    pub fn on_disk(disk: &Disk, path: PathBuf) -> Self {
+        Self::resting(Arc::new(FileKeyRest::new(disk.clone(), path)))
+    }
+
+    /// The keystore resting wherever `rest` keeps it. Nothing is read until
+    /// [`Keystore::load`] or the first use.
+    pub fn resting(rest: Arc<dyn KeyRest>) -> Self {
+        Self { rest, data: OnceCell::new(), expired: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// Read what rests, once. A missing, unreadable or unparseable keystore
     /// starts empty (logged for the latter two) rather than failing server
     /// startup — the worst case is having to sign in again; the next save
     /// overwrites whatever was there.
-    pub fn new(path: PathBuf) -> Self {
-        let data = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<KeystoreData>(&bytes).unwrap_or_else(|e| {
-                warn!(
-                    "Keystore {} could not be parsed ({}); starting with no signed-in account (the next save overwrites it)",
-                    path.display(), e
-                );
-                KeystoreData::default()
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => KeystoreData::default(),
-            Err(e) => {
-                warn!(
-                    "Keystore {} could not be read ({}); starting with no signed-in account (the next save overwrites it)",
-                    path.display(), e
-                );
-                KeystoreData::default()
-            }
-        };
-        crate::diagnostics::set_account(data.account.as_ref().map(|a| a.user_id.clone()));
-        Self { path, data: RwLock::new(data), expired: std::sync::atomic::AtomicBool::new(false) }
+    pub async fn load(&self) {
+        self.data().await;
+    }
+
+    async fn data(&self) -> &RwLock<KeystoreData> {
+        self.data
+            .get_or_init(|| async {
+                let data = match self.rest.load().await {
+                    Ok(Some(bytes)) => serde_json::from_slice::<KeystoreData>(&bytes).unwrap_or_else(|e| {
+                        warn!(
+                            "Keystore {} could not be parsed ({}); starting with no signed-in account (the next save overwrites it)",
+                            self.rest.describe(), e
+                        );
+                        KeystoreData::default()
+                    }),
+                    Ok(None) => KeystoreData::default(),
+                    Err(e) => {
+                        warn!(
+                            "Keystore {} could not be read ({}); starting with no signed-in account (the next save overwrites it)",
+                            self.rest.describe(), e
+                        );
+                        KeystoreData::default()
+                    }
+                };
+                crate::diagnostics::set_account(data.account.as_ref().map(|a| a.user_id.clone()));
+                RwLock::new(data)
+            })
+            .await
     }
 
     /// Persist a fresh sign-in, replacing any previous account (a store key
@@ -143,7 +172,7 @@ impl Keystore {
         keys: &AccountKeys,
     ) -> io::Result<()> {
         let snapshot = {
-            let mut data = self.data.write().await;
+            let mut data = self.data().await.write().await;
             crate::diagnostics::set_account(Some(user_id.clone()));
             self.expired.store(false, std::sync::atomic::Ordering::SeqCst);
             data.account = Some(AccountSession {
@@ -165,7 +194,7 @@ impl Keystore {
     /// shared) can reuse them without re-fetching envelopes.
     pub async fn sign_out(&self) -> io::Result<()> {
         let snapshot = {
-            let mut data = self.data.write().await;
+            let mut data = self.data().await.write().await;
             data.account = None;
             crate::diagnostics::set_account(None);
             self.expired.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -178,7 +207,7 @@ impl Keystore {
     /// (or the on-disk entry is corrupt — treated the same as signed out,
     /// rather than panicking).
     pub async fn account(&self) -> Option<SignedInAccount> {
-        let data = self.data.read().await;
+        let data = self.data().await.read().await;
         let account = data.account.as_ref()?;
         let encryption_secret = b64_decode_32(&account.encryption_secret)?;
         let signing_secret = b64_decode_32(&account.signing_secret)?;
@@ -197,7 +226,7 @@ impl Keystore {
     /// practice.
     pub async fn add_store_key(&self, store_id: StoreId, key_id: Uuid, key: &SymmetricKey) -> io::Result<()> {
         let snapshot = {
-            let mut data = self.data.write().await;
+            let mut data = self.data().await.write().await;
             data.store_keys.retain(|e| !(e.store_id == store_id && e.key_id == key_id));
             data.store_keys.push(StoreKeyEntry { store_id, key_id, key: b64_encode(&key.0) });
             data.clone()
@@ -209,7 +238,7 @@ impl Keystore {
     /// Forgetting one that is not held changes nothing.
     pub async fn remove_store_key(&self, store_id: StoreId, key_id: Uuid) -> io::Result<()> {
         let snapshot = {
-            let mut data = self.data.write().await;
+            let mut data = self.data().await.write().await;
             let before = data.store_keys.len();
             data.store_keys.retain(|e| !(e.store_id == store_id && e.key_id == key_id));
             if data.store_keys.len() == before {
@@ -225,7 +254,7 @@ impl Keystore {
     /// blob's key id up against, logging and skipping the blob on `None`
     /// rather than failing the whole link.
     pub async fn store_key(&self, store_id: StoreId, key_id: Uuid) -> Option<SymmetricKey> {
-        let data = self.data.read().await;
+        let data = self.data().await.read().await;
         let entry = data.store_keys.iter().find(|e| e.store_id == store_id && e.key_id == key_id)?;
         let bytes = b64_decode_32(&entry.key)?;
         Some(SymmetricKey(bytes))
@@ -234,7 +263,7 @@ impl Keystore {
     /// Every key this server holds for `store_id`, by id: the scope keys a
     /// vault blob's key is resolved against (`pimble_rpc::vault::DocKeys`).
     pub async fn store_keys(&self, store_id: StoreId) -> HashMap<Uuid, SymmetricKey> {
-        let data = self.data.read().await;
+        let data = self.data().await.read().await;
         data.store_keys
             .iter()
             .filter(|e| e.store_id == store_id)
@@ -243,11 +272,8 @@ impl Keystore {
     }
 
     async fn write_atomic(&self, data: &KeystoreData) -> io::Result<()> {
-        let path = self.path.clone();
         let json = serde_json::to_vec_pretty(data).map_err(io::Error::other)?;
-        tokio::task::spawn_blocking(move || crate::fs_util::write_atomic_0600(&path, &json))
-            .await
-            .map_err(io::Error::other)?
+        self.rest.save(&json).await
     }
 }
 
@@ -348,7 +374,7 @@ mod tests {
     async fn a_corrupt_file_starts_empty_rather_than_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.json");
-        std::fs::write(&path, b"not json").unwrap();
+        pimble_host::disk::testfs::write(&path, b"not json").unwrap();
         let ks = Keystore::new(path);
         assert!(ks.account().await.is_none());
     }

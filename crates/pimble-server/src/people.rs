@@ -33,7 +33,7 @@ async fn file_of(handler: &RpcHandler, store_id: StoreId) -> Option<std::path::P
 /// What this device last learned, empty when it never has.
 pub(crate) async fn cached(handler: &RpcHandler, store_id: StoreId) -> StorePeople {
     let Some(path) = file_of(handler, store_id).await else { return StorePeople::default() };
-    match tokio::fs::read_to_string(&path).await {
+    match handler.disk().read_to_string(&path).await {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => StorePeople::default(),
     }
@@ -41,8 +41,8 @@ pub(crate) async fn cached(handler: &RpcHandler, store_id: StoreId) -> StorePeop
 
 /// Ask the accounts service now. `None` when it cannot be asked (nobody
 /// signed in, no network, a store no row names).
-pub(crate) async fn fetch(account: &SignedInAccount, store_id: StoreId) -> Option<StorePeople> {
-    let shares = match crate::cloud::list_shares(&account.url, &account.session).await {
+pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedInAccount, store_id: StoreId) -> Option<StorePeople> {
+    let shares = match crate::cloud::list_shares(http, &account.url, &account.session).await {
         Ok(shares) => shares,
         Err(e) => {
             debug!("People of store {}: could not list the account's shares: {}", store_id, e);
@@ -53,7 +53,7 @@ pub(crate) async fn fetch(account: &SignedInAccount, store_id: StoreId) -> Optio
     let mut scopes = Vec::new();
     for share in shares.iter().filter(|share| share.store_id == id) {
         let root: Option<NodeId> = share.scope_root();
-        let listing = match crate::cloud::list_members(&account.url, &account.session, &id, root.as_ref()).await {
+        let listing = match crate::cloud::list_members(http, &account.url, &account.session, &id, root.as_ref()).await {
             Ok(listing) => listing,
             Err(e) => {
                 debug!("People of store {}: could not list scope {:?}: {}", store_id, root, e);
@@ -77,12 +77,12 @@ pub(crate) async fn fetch(account: &SignedInAccount, store_id: StoreId) -> Optio
 pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId) -> StorePeople {
     let kept = cached(handler, store_id).await;
     let Some(account) = handler.keystore().account().await else { return kept };
-    let Some(fresh) = fetch(&account, store_id).await else { return kept };
+    let Some(fresh) = fetch(handler.http(), &account, store_id).await else { return kept };
     if fresh != kept {
         if let Some(path) = file_of(handler, store_id).await {
             match serde_json::to_vec_pretty(&fresh) {
                 Ok(bytes) => {
-                    if let Err(e) = crate::fs_util::write_atomic_0600(&path, &bytes) {
+                    if let Err(e) = handler.disk().write_private_atomic(&path, &bytes).await {
                         warn!("People of store {}: could not write {}: {}", store_id, FILE_NAME, e);
                     }
                 }

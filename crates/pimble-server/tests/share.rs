@@ -18,6 +18,7 @@
 //! stopped and see each other.
 
 mod common;
+use pimble_host::disk::testfs as tfs;
 use common::*;
 
 use std::collections::HashMap;
@@ -748,7 +749,7 @@ async fn sharing_from_a_store_that_is_not_hosted_is_refused_and_nothing_is_uploa
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(env.h_admin.list_stores().await.unwrap().is_empty(), "the hosted server's store list is unchanged");
     assert!(env.h_admin.vault_list_docs(store_id).await.is_err(), "and it has no vault of the store");
-    assert_eq!(std::fs::read_dir(&env.h_stores_dir).unwrap().count(), 0);
+    assert_eq!(tfs::read_dir(&env.h_stores_dir).unwrap().len(), 0);
     assert!(!contains_bytes_recursive(env._h_dir.path(), b"NEVER-HOSTED-TEXT"));
     {
         let s = env.stub.inner.lock().unwrap();
@@ -1114,7 +1115,7 @@ async fn a_share_that_ended_is_announced_and_kept_on_disk_until_the_replica_is_r
     assert_eq!(sorted(listed.roots.clone()), sorted(vec![holiday, recipes]), "and it is a partial replica still");
     for (doc, text) in [(fx.inside, "socks and a map"), (soup, "leeks and potatoes")] {
         assert!(node_text(&bob, store_id, doc).await.contains(text), "nothing was deleted");
-        assert!(replica_path.join("nodes").join(format!("{doc}.yrs")).exists());
+        assert!(tfs::exists(&replica_path.join("nodes").join(format!("{doc}.yrs"))));
     }
     let refused = bob.create_node(store_id, Some(recipes), "document", "Too late").await.expect_err("read only throughout").to_string();
     assert!(refused.contains(StoreAccess::READ_ONLY_REFUSAL), "{refused}");
@@ -1122,7 +1123,7 @@ async fn a_share_that_ended_is_announced_and_kept_on_disk_until_the_replica_is_r
 
     // Removing the replica is where the files go.
     bob.remove_replica(store_id, true).await.expect("an ended replica can be removed");
-    assert!(!replica_path.exists(), "the directory is deleted with the replica");
+    assert!(!tfs::exists(&replica_path), "the directory is deleted with the replica");
     assert!(bob.list_stores().await.unwrap().iter().all(|s| s.id != store_id));
 
     a.stop().await.unwrap();

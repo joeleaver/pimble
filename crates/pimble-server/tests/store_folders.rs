@@ -5,6 +5,7 @@
 //! alone, is announced there once, and each says the other has the folder
 //! open.
 
+use pimble_host::disk::testfs as tfs;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -61,6 +62,13 @@ const BOUND: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn an_edit_through_one_server_reaches_the_other_through_the_folder() {
+    // Two servers on one folder meet only through the folder watch, which a
+    // memory disk has no use for (docs/ONE_CODEBASE_CONTRACT.md section 2,
+    // seam B: `notify` stays native; one browser runs one server).
+    if tfs::is_memory() {
+        eprintln!("skipped on the memory disk: the folder watch is the machine's disk's");
+        return;
+    }
     let (dir_a, dir_b, folder) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
     let (mut a_server, a) = computer(&dir_a).await;
     let (mut b_server, b) = computer(&dir_b).await;
@@ -69,7 +77,7 @@ async fn an_edit_through_one_server_reaches_the_other_through_the_folder() {
     let note = a.create_node(store_id, Some(root), "document", "Note").await.unwrap();
     append(&a, store_id, note, "first words").await;
     // A's flush, so the folder holds the note before B opens it.
-    assert!(wait_until(BOUND, || async { path.join("nodes").join(format!("{note}.yrs")).exists() }).await);
+    assert!(wait_until(BOUND, || async { tfs::exists(&path.join("nodes").join(format!("{note}.yrs"))) }).await);
     tokio::time::sleep(Duration::from_millis(1000)).await;
     b.open_store(&path).await.expect("B opens the same folder");
     assert!(text_of(&b, store_id, note).await.contains("first words"));
@@ -113,7 +121,7 @@ async fn an_edit_through_one_server_reaches_the_other_through_the_folder() {
     // per node, no conflict copies.
     a_server.stop().await.unwrap();
     b_server.stop().await.unwrap();
-    let text = NodeDoc::load(&std::fs::read(path.join("nodes").join(format!("{note}.yrs"))).unwrap()).unwrap().text();
+    let text = NodeDoc::load(&tfs::read(path.join("nodes").join(format!("{note}.yrs"))).unwrap()).unwrap().text();
     assert!(text.contains("typed on A") && text.contains("typed on B"), "{text:?}");
 }
 
@@ -129,9 +137,9 @@ async fn an_older_pimble_on_another_computer_is_named() {
         client.create_store(&path, "Mine").await.unwrap();
         server.stop().await.unwrap();
     }
-    std::fs::create_dir_all(path.join("computers")).unwrap();
+    tfs::create_dir_all(path.join("computers")).unwrap();
     let seen = chrono::Utc::now() - chrono::Duration::minutes(3);
-    std::fs::write(
+    tfs::write(
         path.join("computers").join("0123456789abcdef0123.json"),
         serde_json::to_vec(&serde_json::json!({ "device": "0123456789abcdef0123", "name": "old-laptop", "last_seen": seen, "version": "0.1.0" })).unwrap(),
     )
@@ -144,9 +152,9 @@ async fn an_older_pimble_on_another_computer_is_named() {
     assert_eq!((other.name.as_str(), other.version.as_str(), other.older), ("old-laptop", "0.1.0", true));
     assert!(other.sentence(chrono::Utc::now()).starts_with("Also open on old-laptop (seen 3 minutes ago)"));
     assert!(other.update_sentence().unwrap().contains("Please update Pimble on old-laptop"));
-    let own: Vec<_> = std::fs::read_dir(path.join("computers")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let own: Vec<_> = tfs::names(path.join("computers")).unwrap();
     assert_eq!(own.len(), 2, "this computer says it is there too: {own:?}");
-    assert!(!path.join("index").exists(), "the search index is not in the folder");
+    assert!(!tfs::exists(&path.join("index")) && !path.join("index").exists(), "the search index is not in the folder");
     // It opens in the background (docs/STARTUP_CONTRACT.md).
     for _ in 0..200 {
         if client.get_store_sync_response(store.id).await.unwrap().index.is_ready() {
@@ -154,6 +162,8 @@ async fn an_older_pimble_on_another_computer_is_named() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    // The index is on the machine's own disk whatever the server's disk is
+    // (docs/ONE_CODEBASE_CONTRACT.md seam F).
     assert!(dir.path().join("stores").join(store.id.to_string()).join("index").exists(), "it is in this computer's state directory");
     server.stop().await.unwrap();
 }

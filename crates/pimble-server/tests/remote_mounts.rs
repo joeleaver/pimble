@@ -20,6 +20,7 @@
 //! replicates, putting the resolving server where a second machine really
 //! is: the remote is all it has.
 
+use pimble_host::disk::testfs as tfs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -531,12 +532,12 @@ async fn last_sync_persists_so_a_reopened_source_is_cached_not_connecting() {
     let record_json = f.l.replicas_dir.parent().unwrap().join("stores").join(f.b_id.to_string()).join("sync-state.json");
     let link_of = |json: String| serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|mut v| v.get_mut("link").map(serde_json::Value::take));
     let link_state: serde_json::Value = wait_until(Duration::from_secs(10), || async {
-        std::fs::read_to_string(&record_json).ok().and_then(link_of).map(|v| v.get("last_sync").is_some()).unwrap_or(false)
+        tfs::read_to_string(&record_json).ok().and_then(link_of).map(|v| v.get("last_sync").is_some()).unwrap_or(false)
     })
     .await
-    .then(|| link_of(std::fs::read_to_string(&record_json).unwrap()).unwrap())
+    .then(|| link_of(tfs::read_to_string(&record_json).unwrap()).unwrap())
     .expect("sync-state.json should record last_sync once the link has synced");
-    let sync_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f.b_replica_path.join("sync.json")).unwrap()).unwrap();
+    let sync_json: serde_json::Value = serde_json::from_str(&tfs::read_to_string(f.b_replica_path.join("sync.json")).unwrap()).unwrap();
     assert!(sync_json.get("last_sync").is_none(), "the folder's sync.json holds no per-computer state");
 
     assert_eq!(sync_json["remote"]["auth"]["method"], "none", "sync.json never stores a credential");
@@ -694,14 +695,7 @@ async fn two_mounts_of_one_source_produce_one_replica() {
 /// How many directories in `replicas_dir` belong to `store_id`.
 fn replica_dirs_for(replicas_dir: &Path, store_id: StoreId) -> usize {
     let wanted = format!("{}.pimble", store_id);
-    std::fs::read_dir(replicas_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| entry.file_name().to_string_lossy() == wanted)
-                .count()
-        })
-        .unwrap_or(0)
+    tfs::names(replicas_dir).map(|names| names.iter().filter(|name| **name == wanted).count()).unwrap_or(0)
 }
 
 // ── 10. Extra (found in the GUI pass): an implicitly opened replica links ──

@@ -10,6 +10,7 @@
 //! never sharing a process with a test that reads `dirs::data_local_dir()`
 //! expecting the real one.
 
+use pimble_host::disk::testfs as tfs;
 use std::time::Duration;
 
 use pimble_client::PimbleClient;
@@ -78,10 +79,10 @@ async fn remove_replica_refuses_ordinary_stores_and_removes_replicas() {
     assert!(replica.is_replica, "a replica addRemoteStore creates must report is_replica: true");
     assert!(matches!(replica.sync_state, SyncState::Synced { .. }), "should already be Synced: {:?}", replica.sync_state);
     let replica_path = replica.local_path().cloned().expect("a local store reports a local path");
-    assert!(replica_path.exists());
+    assert!(tfs::exists(&replica_path));
 
     client_a.remove_replica(store_id, false).await.expect("a fully synced replica is removed without force");
-    assert!(!replica_path.exists(), "the replica directory must be deleted");
+    assert!(!tfs::exists(&replica_path), "the replica directory must be deleted");
     let remaining = client_a.list_stores().await.unwrap();
     assert!(!remaining.iter().any(|s| s.id == store_id), "the removed replica must not be in listStores any more");
 
@@ -105,10 +106,10 @@ async fn remove_replica_refuses_ordinary_stores_and_removes_replicas() {
         .await
         .expect_err("an out-of-sync replica must be refused without force");
     assert!(err.to_string().contains("force"), "expected the refusal to mention force, got: {}", err);
-    assert!(replica2_path.exists(), "a refused removal must not touch the directory");
+    assert!(tfs::exists(&replica2_path), "a refused removal must not touch the directory");
 
     client_a.remove_replica(store_id2, true).await.expect("force removes an out-of-sync replica");
-    assert!(!replica2_path.exists(), "force must still delete the directory");
+    assert!(!tfs::exists(&replica2_path), "force must still delete the directory");
 
     server_a.stop().await.unwrap();
 }

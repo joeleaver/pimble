@@ -130,6 +130,8 @@ pub(crate) struct RelayHost {
     /// Where the twins live: `<data dir>/pimble/relay` unless the server's
     /// configuration says otherwise.
     dir: PathBuf,
+    /// The host server's disk, which the face keeps its twins on too.
+    disk: pimble_host::Disk,
     inner: Mutex<Inner>,
     /// What the tunnel announces. Written under `inner`'s lock.
     serve: watch::Sender<HashSet<StoreId>>,
@@ -143,8 +145,8 @@ pub(crate) struct RelayHost {
 }
 
 impl RelayHost {
-    pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, tunnel: watch::channel(TunnelState::Idle).0, url: std::sync::Mutex::new(None) }
+    pub(crate) fn new(disk: pimble_host::Disk, dir: PathBuf) -> Self {
+        Self { dir, disk, inner: Mutex::new(Inner::default()), serve: watch::channel(HashSet::new()).0, tunnel: watch::channel(TunnelState::Idle).0, url: std::sync::Mutex::new(None) }
     }
 
     /// How the tunnel is doing now.
@@ -208,7 +210,7 @@ impl RelayHost {
     }
 
     async fn start_face(&self, account: &SignedInAccount, issuer: String) -> anyhow::Result<Face> {
-        tokio::fs::create_dir_all(&self.dir).await.map_err(|e| anyhow::anyhow!("could not create {}: {}", self.dir.display(), e))?;
+        self.disk.create_dir_all(&self.dir).await.map_err(|e| anyhow::anyhow!("could not create {}: {}", self.dir.display(), e))?;
         let jwks_url = crate::cloud::jwks_url(&account.url).map_err(|e| anyhow::anyhow!(e))?;
         let config = ServerConfig {
             addr: "127.0.0.1:0".parse().expect("a loopback address"),
@@ -236,6 +238,10 @@ impl RelayHost {
             out_of_step_after: None,
             set_aside_after: None,
             link_faults: None,
+            disk: self.disk.clone(),
+            paths: pimble_host::Paths::in_dir(&self.dir.join(".face")),
+            // A face calls the accounts service for nothing; the host's way all the same.
+            http: std::sync::Arc::new(pimble_host::http::ReqwestHttp::default()),
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;
@@ -255,7 +261,7 @@ impl RelayHost {
         if open && !fresh {
             // Deleted from under the running face: the open store is a
             // handle on nothing.
-            if path.join("manifest.json").exists() {
+            if self.disk.exists(path.join("manifest.json")).await {
                 return Ok(());
             }
             let _ = face.handler.close_store(&ext, CloseStoreRequest { store_id }).await;
@@ -263,9 +269,9 @@ impl RelayHost {
             let _ = face.handler.close_store(&ext, CloseStoreRequest { store_id }).await;
         }
         if fresh {
-            remove_twin_dir(&self.dir, store_id).await;
+            remove_twin_dir(&self.disk, &self.dir, store_id).await;
         }
-        if path.exists() {
+        if self.disk.exists(&path).await {
             match face.handler.open_store(&ext, OpenStoreRequest { path: path.clone() }).await {
                 Ok(opened) if opened.store.id == store_id && opened.store.kind == StoreKind::Vault => return Ok(()),
                 Ok(opened) => {
@@ -274,7 +280,7 @@ impl RelayHost {
                 }
                 Err(e) => warn!("Relay face: the twin at {} does not open ({}); building it again", path.display(), e.message()),
             }
-            remove_twin_dir(&self.dir, store_id).await;
+            remove_twin_dir(&self.disk, &self.dir, store_id).await;
         }
         // No name: the owner's name for the store is the owner's, and a
         // member with a grant on the whole store would be told this one.
@@ -322,7 +328,7 @@ impl RelayHost {
             }
         }
         if delete {
-            remove_twin_dir(&self.dir, store_id).await;
+            remove_twin_dir(&self.disk, &self.dir, store_id).await;
         }
     }
 
@@ -425,7 +431,7 @@ impl RpcHandler {
 
         // The face and an empty twin first: if this machine cannot serve the
         // store, nothing has been recorded anywhere.
-        let minted = crate::cloud::mint_token(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let minted = crate::cloud::mint_token(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
         self.relay().prepare(self, store_id, &account, &minted.token, true).await.map_err(to_rpc_error)?;
 
         let key_id = match self.record_relayed_store(&account, store_id).await {
@@ -462,7 +468,7 @@ impl RpcHandler {
             .await;
         if let Err(e) = written {
             self.relay().withdraw(store_id, true).await;
-            if let Err(undo) = crate::cloud::delete_store(&account.url, &account.session, &store_id.to_string()).await {
+            if let Err(undo) = crate::cloud::delete_store(self.http(), &account.url, &account.session, &store_id.to_string()).await {
                 warn!("Store {}: its record on {} could not be removed again: {}", store_id, account.url, undo);
             }
             return Err(to_rpc_error(e));
@@ -477,7 +483,7 @@ impl RpcHandler {
     /// hosted store; the record is taken back if the key cannot be put.
     async fn record_relayed_store(&self, account: &SignedInAccount, store_id: StoreId) -> Result<Uuid, ErrorObjectOwned> {
         let id = store_id.to_string();
-        let view = crate::cloud::create_relayed_store(&account.url, &account.session, &id).await.map_err(to_rpc_error)?;
+        let view = crate::cloud::create_relayed_store(self.http(), &account.url, &account.session, &id).await.map_err(to_rpc_error)?;
         if view.store_id != id {
             return Err(to_rpc_error(format!("cloud service recorded store {} instead of the requested {}", view.store_id, id)));
         }
@@ -485,12 +491,12 @@ impl RpcHandler {
         let key_id = Uuid::new_v4();
         let handed_over = async {
             let envelope = pimble_crypto::wrap_key(&key, key_id, &account.keys.public_keys(), &account.keys, &format!("store:{}", store_id)).map_err(to_rpc_error)?;
-            crate::cloud::put_store_key(&account.url, &account.session, &id, &account.user_id, key_id, &envelope, None).await.map_err(to_rpc_error)?;
+            crate::cloud::put_store_key(self.http(), &account.url, &account.session, &id, &account.user_id, key_id, &envelope, None).await.map_err(to_rpc_error)?;
             self.keystore().add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)
         }
         .await;
         if let Err(e) = handed_over {
-            if let Err(undo) = crate::cloud::delete_store(&account.url, &account.session, &id).await {
+            if let Err(undo) = crate::cloud::delete_store(self.http(), &account.url, &account.session, &id).await {
                 warn!("Store {}: its record on {} could not be removed again: {}", store_id, account.url, undo);
             }
             return Err(e);
@@ -519,7 +525,7 @@ impl RpcHandler {
             return Err(to_rpc_error(HAS_SHARES_REFUSAL));
         }
         let account = self.keystore().account().await.ok_or_else(|| to_rpc_error(NOT_SIGNED_IN))?;
-        match crate::cloud::delete_store(&account.url, &account.session, &store_id.to_string()).await {
+        match crate::cloud::delete_store(self.http(), &account.url, &account.session, &store_id.to_string()).await {
             Ok(()) => {}
             // Gone already: there is nothing left there to undo.
             Err(e) if e.status() == Some(404) => debug!("Store {}: no record of it on {} any more", store_id, account.url),
@@ -542,12 +548,12 @@ impl RpcHandler {
 
 /// Delete a twin's directory: that one directory inside the relay directory,
 /// named by the store's id, never a path anyone gives.
-async fn remove_twin_dir(dir: &Path, store_id: StoreId) {
+async fn remove_twin_dir(disk: &pimble_host::Disk, dir: &Path, store_id: StoreId) {
     let path = twin_path(dir, store_id);
-    if !path.starts_with(dir) || !path.exists() {
+    if !path.starts_with(dir) || !disk.exists(&path).await {
         return;
     }
-    if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+    if let Err(e) = disk.remove_dir_all(&path).await {
         warn!("Relay face: could not delete {}: {}", path.display(), e);
     }
 }

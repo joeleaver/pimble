@@ -38,7 +38,7 @@ pub const KEY_PREFIX: &str = "pmbl_agent_";
 pub const AGENT_SUB_PREFIX: &str = "agent:";
 
 pub fn default_agents_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("agents.json")
+    pimble_host::Paths::native().agents()
 }
 
 /// Whether `principal` is an agent's.
@@ -210,16 +210,17 @@ fn id_of_key(key: &str) -> Option<Uuid> {
 
 /// The agents of this device.
 pub struct AgentRegistry {
+    disk: pimble_host::Disk,
     path: PathBuf,
     agents: RwLock<Vec<AgentRecord>>,
 }
 
 impl AgentRegistry {
-    /// The agents saved at `path` (none when there is no file yet; a file
-    /// that does not parse is left alone and logged, and holds no agent
-    /// until the next save rewrites it).
-    pub fn load(path: PathBuf) -> Self {
-        let agents = match std::fs::read(&path) {
+    /// The agents saved at `path` on `disk` (none when there is no file yet;
+    /// a file that does not parse is left alone and logged, and holds no
+    /// agent until the next save rewrites it).
+    pub async fn load(disk: &pimble_host::Disk, path: PathBuf) -> Self {
+        let agents = match disk.read(&path).await {
             Ok(bytes) => serde_json::from_slice::<Vec<AgentRecord>>(&bytes).unwrap_or_else(|e| {
                 warn!("Agents file {} could not be parsed ({e}); no agent can connect until it is fixed or rewritten", path.display());
                 Vec::new()
@@ -230,7 +231,7 @@ impl AgentRegistry {
                 Vec::new()
             }
         };
-        Self { path, agents: RwLock::new(agents) }
+        Self { disk: disk.clone(), path, agents: RwLock::new(agents) }
     }
 
     /// The connection `key` opens, when it is a current agent's key.
@@ -255,7 +256,7 @@ impl AgentRegistry {
 
     /// Record that agent `principal` connected (its `last_used_at`), saved
     /// at most once a minute per agent.
-    pub fn touch(&self, principal: &Principal) {
+    pub async fn touch(&self, principal: &Principal) {
         let Principal::User { sub, .. } = principal else { return };
         let Some(id) = sub.strip_prefix(AGENT_SUB_PREFIX).and_then(|s| Uuid::parse_str(s).ok()) else { return };
         let now = chrono::Utc::now();
@@ -273,7 +274,7 @@ impl AgentRegistry {
             stale
         };
         if changed {
-            let _ = self.save();
+            let _ = self.save().await;
         }
     }
 
@@ -282,7 +283,7 @@ impl AgentRegistry {
     }
 
     /// A new agent; answers it and its key, which is never shown again.
-    pub fn create(&self, name: &str, grants: Vec<AgentGrant>) -> io::Result<(AgentInfo, String)> {
+    pub async fn create(&self, name: &str, grants: Vec<AgentGrant>) -> io::Result<(AgentInfo, String)> {
         let id = Uuid::new_v4();
         let key = new_key(id);
         let record = AgentRecord {
@@ -295,13 +296,13 @@ impl AgentRegistry {
         };
         let info = record.info();
         self.agents.write().map_err(|_| io::Error::other("agents lock poisoned"))?.push(record);
-        self.save()?;
+        self.save().await?;
         Ok((info, key))
     }
 
     /// Rename agent `id` or replace its grants; `None` leaves that alone.
     /// Answers `None` when there is no such agent.
-    pub fn update(&self, id: &str, name: Option<&str>, grants: Option<Vec<AgentGrant>>) -> io::Result<Option<AgentInfo>> {
+    pub async fn update(&self, id: &str, name: Option<&str>, grants: Option<Vec<AgentGrant>>) -> io::Result<Option<AgentInfo>> {
         let Ok(id) = Uuid::parse_str(id) else { return Ok(None) };
         let info = {
             let mut agents = self.agents.write().map_err(|_| io::Error::other("agents lock poisoned"))?;
@@ -314,13 +315,13 @@ impl AgentRegistry {
             }
             agent.info()
         };
-        self.save()?;
+        self.save().await?;
         Ok(Some(info))
     }
 
     /// Remove agent `id`: its key stops working on its next call. Answers
     /// whether there was one.
-    pub fn remove(&self, id: &str) -> io::Result<bool> {
+    pub async fn remove(&self, id: &str) -> io::Result<bool> {
         let Ok(id) = Uuid::parse_str(id) else { return Ok(false) };
         let removed = {
             let mut agents = self.agents.write().map_err(|_| io::Error::other("agents lock poisoned"))?;
@@ -329,17 +330,17 @@ impl AgentRegistry {
             agents.len() != before
         };
         if removed {
-            self.save()?;
+            self.save().await?;
         }
         Ok(removed)
     }
 
-    fn save(&self) -> io::Result<()> {
+    async fn save(&self) -> io::Result<()> {
         let json = {
             let agents = self.agents.read().map_err(|_| io::Error::other("agents lock poisoned"))?;
             serde_json::to_vec_pretty(&*agents).map_err(io::Error::other)?
         };
-        crate::fs_util::write_atomic_0600(&self.path, &json)
+        self.disk.write_private_atomic(&self.path, &json).await
     }
 }
 
@@ -351,12 +352,13 @@ mod tests {
         StoreId::new()
     }
 
-    #[test]
-    fn a_key_finds_its_agent_and_nothing_else_does() {
+    #[tokio::test]
+    async fn a_key_finds_its_agent_and_nothing_else_does() {
         let dir = tempfile::tempdir().unwrap();
-        let reg = AgentRegistry::load(dir.path().join("agents.json"));
+        let disk = pimble_host::Disk::default();
+        let reg = AgentRegistry::load(&disk, dir.path().join("agents.json")).await;
         let s = store();
-        let (info, key) = reg.create("Claude", vec![AgentGrant { store: s, node: None, role: AgentRole::Reader }]).unwrap();
+        let (info, key) = reg.create("Claude", vec![AgentGrant { store: s, node: None, role: AgentRole::Reader }]).await.unwrap();
         assert!(key.starts_with(KEY_PREFIX));
         let Some(Principal::User { sub, grants, .. }) = reg.principal_for_key(&key) else { panic!("the key is the agent's") };
         assert_eq!(sub, format!("agent:{}", info.id));
@@ -366,18 +368,19 @@ mod tests {
         assert!(reg.principal_for_key(&forged).is_none());
         assert!(reg.principal_for_key("not a key").is_none());
         // The file keeps the hash, never the key, and is 0600.
-        let text = std::fs::read_to_string(dir.path().join("agents.json")).unwrap();
+        let text = pimble_host::disk::testfs::read_to_string(dir.path().join("agents.json")).unwrap();
         assert!(!text.contains(&key));
+        // The mode is the machine's disk's to keep; a memory disk has none.
         #[cfg(unix)]
-        {
+        if !pimble_host::disk::testfs::is_memory() {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(dir.path().join("agents.json")).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
         // Reloaded, the key still works; removed, it stops.
-        let reg = AgentRegistry::load(dir.path().join("agents.json"));
+        let reg = AgentRegistry::load(&disk, dir.path().join("agents.json")).await;
         assert!(reg.principal_for_key(&key).is_some());
-        assert!(reg.remove(&info.id).unwrap());
+        assert!(reg.remove(&info.id).await.unwrap());
         assert!(reg.principal_for_key(&key).is_none());
     }
 

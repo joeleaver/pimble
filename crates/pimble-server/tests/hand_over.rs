@@ -4,6 +4,7 @@
 //! and `pimble_server::local::ensure_connected` starts a current one in its
 //! place. A server that is not this computer's own never hands over.
 
+use pimble_host::disk::testfs as tfs;
 use std::time::Duration;
 
 use pimble_client::PimbleClient;
@@ -49,7 +50,7 @@ async fn a_newer_client_takes_the_port_over_from_an_older_server() {
         tokio::time::timeout(Duration::from_secs(5), old.wait()).await.is_ok(),
         "the older server stopped"
     );
-    assert!(store_path.join("nodes").join(format!("{note}.yrs")).exists(), "and wrote what it held before it went");
+    assert!(tfs::exists(&store_path.join("nodes").join(format!("{note}.yrs"))), "and wrote what it held before it went");
 
     let mut owned = owned;
     local::shut_down(&mut owned).await;

@@ -23,6 +23,7 @@
 //! server starts inside itself, the tunnel client, the vault links, the
 //! share upkeep, and the JWT verification between all of them.
 
+use pimble_host::disk::testfs as tfs;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -105,14 +106,13 @@ fn sorted(ids: Vec<NodeId>) -> Vec<String> {
 }
 
 fn contains_bytes_recursive(dir: &Path, needle: &[u8]) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
+    let Ok(entries) = tfs::read_dir(dir) else { return false };
+    for path in entries {
+        if tfs::is_dir(&path) {
             if contains_bytes_recursive(&path, needle) {
                 return true;
             }
-        } else if let Ok(bytes) = std::fs::read(&path) {
+        } else if let Ok(bytes) = tfs::read(&path) {
             if bytes.windows(needle.len()).any(|w| w == needle) {
                 return true;
             }
@@ -151,14 +151,14 @@ fn twin_dir(device_dir: &Path, store_id: StoreId) -> PathBuf {
 
 /// The twin's epoch as it is on disk: its manifest's creation time.
 fn twin_created_at(device_dir: &Path, store_id: StoreId) -> Option<String> {
-    let manifest = std::fs::read(twin_dir(device_dir, store_id).join("manifest.json")).ok()?;
+    let manifest = tfs::read(twin_dir(device_dir, store_id).join("manifest.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
     manifest["created_at"].as_str().map(str::to_string)
 }
 
 /// How many documents the twin holds a log of.
 fn twin_doc_count(device_dir: &Path, store_id: StoreId) -> usize {
-    std::fs::read_dir(twin_dir(device_dir, store_id).join("vault")).map(|entries| entries.flatten().filter(|e| e.path().is_dir()).count()).unwrap_or(0)
+    tfs::read_dir(twin_dir(device_dir, store_id).join("vault")).map(|entries| entries.iter().filter(|p| tfs::is_dir(p)).count()).unwrap_or(0)
 }
 
 // ── JWTs ──────────────────────────────────────────────────────────────────
@@ -923,7 +923,7 @@ impl Env {
     /// stores directory no entry, and none of `needles` is anywhere under it.
     async fn assert_nothing_hosted(&self, needles: &[&str]) {
         assert!(self.h_admin.list_stores().await.unwrap().is_empty(), "the hosted server holds no store");
-        assert_eq!(std::fs::read_dir(&self.h_stores_dir).unwrap().count(), 0, "and its stores directory gained nothing");
+        assert_eq!(tfs::read_dir(&self.h_stores_dir).unwrap().len(), 0, "and its stores directory gained nothing");
         for needle in needles {
             assert!(!contains_bytes_recursive(self.h_dir.path(), needle.as_bytes()), "{needle:?} reached the hosted server's disk");
         }
@@ -936,7 +936,7 @@ async fn spawn_env() -> Env {
 
     let h_dir = tempfile::tempdir().unwrap();
     let h_stores_dir = h_dir.path().join("stores");
-    std::fs::create_dir_all(&h_stores_dir).unwrap();
+    tfs::create_dir_all(&h_stores_dir).unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_addr = listener.local_addr().unwrap();
@@ -1099,7 +1099,7 @@ async fn relaying_a_store_uploads_nothing_and_keeps_its_twin_on_this_machine() {
     assert_eq!(sync.remote.as_ref().map(|r| r.url.to_string()), Some(env.relay_url(store_id)));
     let listed = alice.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
     assert_eq!((listed.relay, listed.sync_mode, listed.name.as_str()), (RelaySide::Owner, StoreKind::Vault, STORE_NAME));
-    let sync_json: serde_json::Value = serde_json::from_slice(&std::fs::read(a_dir.path().join("a.pimble").join("sync.json")).unwrap()).unwrap();
+    let sync_json: serde_json::Value = serde_json::from_slice(&tfs::read(a_dir.path().join("a.pimble").join("sync.json")).unwrap()).unwrap();
     assert_eq!(sync_json["mode"].as_str(), Some("relay"));
     assert_eq!(sync_json["remote"]["url"].as_str(), Some(env.relay_url(store_id).as_str()), "the face's address, new every run, is never written down");
 
@@ -1160,7 +1160,7 @@ async fn relaying_is_refused_for_what_cannot_be_shared_from_here() {
         let s = env.stub.inner.lock().unwrap();
         assert!(s.create_store_bodies.iter().all(|body| body["tier"].as_str() != Some("relay")));
     }
-    assert!(!a_dir.path().join("relay").exists() && !a2_dir.path().join("relay").exists(), "no relay face was started for a refusal");
+    assert!(!tfs::exists(&a_dir.path().join("relay")) && !tfs::exists(&a2_dir.path().join("relay")), "no relay face was started for a refusal");
 
     a.stop().await.unwrap();
     a2.stop().await.unwrap();
@@ -1343,7 +1343,7 @@ async fn a_deleted_twin_is_built_again_and_members_converge_on_it() {
     write_text(&carol, store_id, fx.inside, "carol", "OFFLINE-SUNHAT").await;
     rename(&carol, store_id, fx.deeper, "Travel").await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    std::fs::remove_dir_all(twin_dir(a_dir.path(), store_id)).expect("the twin is deleted while its server is stopped");
+    tfs::remove_dir_all(twin_dir(a_dir.path(), store_id)).expect("the twin is deleted while its server is stopped");
 
     // Back: the link builds the twin again from the store, the members read
     // the new logs from the start and offer what they hold, and everyone
@@ -1480,7 +1480,7 @@ async fn stopping_is_refused_while_a_share_stands_and_undoes_everything_after() 
     // A share stands: refused, and nothing has changed.
     assert_eq!(alice.cloud_stop_relaying(store_id).await.expect_err("a share is in place").to_string(), pimble_server::relay_face::HAS_SHARES_REFUSAL);
     assert_eq!(alice.get_store_sync_response(store_id).await.unwrap().relay, RelaySide::Owner);
-    assert!(twin_dir(a_dir.path(), store_id).exists() && env.stub.relay.serves(store_id));
+    assert!(tfs::exists(&twin_dir(a_dir.path(), store_id)) && env.stub.relay.serves(store_id));
     assert!(env.stub.inner.lock().unwrap().stores.iter().any(|row| row.store_id == store_id.to_string() && row.root.is_none()));
 
     // The share stopped, the way back is open: the record, the tunnel's
@@ -1489,10 +1489,10 @@ async fn stopping_is_refused_while_a_share_stands_and_undoes_everything_after() 
     alice.cloud_stop_relaying(store_id).await.expect("then the store is no longer shared from here");
     let sync = alice.get_store_sync_response(store_id).await.unwrap();
     assert!(sync.remote.is_none() && sync.relay == RelaySide::None && sync.sync_mode == StoreKind::Plain, "{sync:?}");
-    assert!(!twin_dir(a_dir.path(), store_id).exists(), "the twin is deleted");
+    assert!(!tfs::exists(&twin_dir(a_dir.path(), store_id)), "the twin is deleted");
     let state_dir = a_dir.path().join("stores").join(store_id.to_string());
-    let record: serde_json::Value = std::fs::read(state_dir.join("sync-state.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-    assert!(!store_dir.join("sync.json").exists() && record.get("vault").is_none() && record.get("link").is_none() && record.get("convergence").is_none(), "{record}");
+    let record: serde_json::Value = tfs::read(state_dir.join("sync-state.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    assert!(!tfs::exists(&store_dir.join("sync.json")) && record.get("vault").is_none() && record.get("link").is_none() && record.get("convergence").is_none(), "{record}");
     {
         let s = env.stub.inner.lock().unwrap();
         assert!(!s.stores.iter().any(|row| row.store_id == store_id.to_string()), "the accounts service's record is removed");
