@@ -1,5 +1,37 @@
 # Next session: start here
 
+**2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
+the weekly limit; every agent of it is dead).** Released today: 0.30.0 and 0.30.1 (Bear
+cards: copy a picture, Save Picture As, hourly update check; summaries posted in Shared
+Pimble Notes). Building: **notifications**, docs/NOTIFICATIONS_CONTRACT.md (design agreed
+with Joe; he said "build the whole thing, all waves").
+
+- Branch `notifications`, worktree `/home/joe/dev/pimble-notifications`, target dir
+  `/home/joe/dev/pimble-notif-target`. Not pushed, not merged. Must survive.
+- Done and committed: wave 0 (mentions, d55c115), wave 1 (notice key, inbox, sending,
+  Inbox view, switch; 11a2b8e, 4fb67a1), wave 2 (email fallback, web push, seen/read,
+  channel switches; 6d96320, 5a9faea). Each has a "Built in wave N" section in the contract.
+- Wave 3 (watches): only a checkpoint, ba4a2de, **which does not build**: `pimble-core`
+  `watch.rs`, RPC types and the declarations `watchNode`, `unwatchNode`, `listWatches`,
+  `subscribeWrites`. Still to write: the handler, the accounts service's
+  `PUT/GET /api/v1/me/watches` and 5-quiet-minute batching per (watcher, doc, writer)
+  (injectable clock, as `notify.rs`), Watch/Unwatch UI with subtrees, the relay face,
+  the switch deleting watches, tests, the contract's "Built in wave 3".
+- Then wave 4 (the tray, on by default), then the end-to-end walk-through on
+  `scripts/local-stack` (OS notification, Inbox, a real browser push).
+- Decisions to put to Joe at the end: mention names in note text do not follow renames
+  (needs a rinch mechanism); the `list_people` MCP tool; one account-wide switch; notices
+  open at the mention, a discussion as a whole; the service now learns mention vs reply
+  (for the email wording; else "wrote to you"); seen-but-unread is not emailed; push
+  switched per account, not per browser. Before deploying: `pimble-cloud
+  --generate-vapid-key` into `PIMBLE_VAPID_PRIVATE_KEY` (docs/DEPLOY.md).
+- Offer as its own task: in the sharing test harness, a discussion the owner starts on a
+  shared note did not reach the member within 30 s (member to owner works).
+- Bear board: the welcome-note card is still in To Do; the notifications card points at
+  the contract. Post Bear summaries only once a release is published.
+- Not this session's, leave alone: worktrees `pimble-tree-drops` and
+  `.claude/worktrees/jolly-lovelace-c07780`.
+
 **2026-11-23 handover (master session 78e7f30f-9d69-4df3-984a-dee51fb8f54e, ended after
 a compaction and a session-limit stop; no background jobs or agents survive).**
 
