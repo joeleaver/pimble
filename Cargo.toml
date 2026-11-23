@@ -4,7 +4,6 @@ members = [
     "crates/pimble-core",
     "crates/pimble-crdt",
     "crates/pimble-store",
-    "crates/pimble-host",
     "crates/pimble-search",
     "crates/pimble-rpc",
     "crates/pimble-rpc-macros",
@@ -31,7 +30,7 @@ members = [
 exclude = ["crates/pimble-plugin-sdk", "plugins"]
 
 [workspace.package]
-version = "0.29.3"
+version = "0.29.4"
 edition = "2021"
 authors = ["Pimble Contributors"]
 license = "MIT"
@@ -110,7 +109,6 @@ pimble-core = { path = "crates/pimble-core" }
 pimble-crypto = { path = "crates/pimble-crypto" }
 pimble-crdt = { path = "crates/pimble-crdt" }
 pimble-store = { path = "crates/pimble-store" }
-pimble-host = { path = "crates/pimble-host" }
 pimble-search = { path = "crates/pimble-search" }
 pimble-rpc = { path = "crates/pimble-rpc" }
 pimble-server = { path = "crates/pimble-server" }
