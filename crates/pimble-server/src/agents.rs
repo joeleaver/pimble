@@ -38,7 +38,7 @@ pub const KEY_PREFIX: &str = "pmbl_agent_";
 pub const AGENT_SUB_PREFIX: &str = "agent:";
 
 pub fn default_agents_path() -> PathBuf {
-    pimble_host::Paths::native().agents()
+    crate::server::default_paths().agents()
 }
 
 /// Whether `principal` is an agent's.

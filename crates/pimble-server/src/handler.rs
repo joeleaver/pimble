@@ -48,9 +48,9 @@ use std::time::Duration;
 use base64::Engine;
 use pimble_rpc::dispatch::{async_trait, PendingSubscriptionSink, SubscriptionMessage, SubscriptionResult, SubscriptionSink};
 use jsonrpsee::types::ErrorObjectOwned;
-use jsonrpsee::Extensions;
+use http::Extensions;
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
     OpenInAppRequest, OpenInAppResponse,
@@ -100,6 +100,10 @@ use crate::vault_link::{LinkEndpoint, VaultLink, VaultLinkHandle};
 /// keystroke; this coalesces a burst of edits into one re-index per node,
 /// independent of the (unrelated) content-flush debounce above.
 const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
+
+/// How often an index in memory (a browser's worker) runs the work rhypedb
+/// leaves for later, between its events: it has no threads to do it.
+const DEFERRED_INDEX_WORK_EVERY: Duration = Duration::from_secs(1);
 
 /// How long to wait after a content edit before flushing it to disk. A burst
 /// of keystrokes coalesces into at most one flush per window, instead of one
@@ -349,7 +353,7 @@ pub(crate) fn state_root_beside(replicas_dir: &std::path::Path) -> PathBuf {
 /// (`Store::is_replica`), and only such a store can be removed with
 /// `removeReplica`.
 pub(crate) fn default_replicas_dir() -> PathBuf {
-    pimble_host::Paths::native().replicas()
+    crate::server::default_paths().replicas()
 }
 
 /// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
@@ -518,9 +522,12 @@ static NEXT_INDEX_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// How long a locked index is retried quietly before the store's row says
 /// another program holds it, and how often: a server handing over lets go
 /// within a second.
+#[cfg(not(target_arch = "wasm32"))]
 const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(not(target_arch = "wasm32"))]
 const INDEX_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 /// After that, how often it is tried again, for as long as the store is open.
+#[cfg(not(target_arch = "wasm32"))]
 const INDEX_LOCK_RETRY_HELD: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often a rebuild says how far it is.
 const INDEX_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -551,7 +558,23 @@ impl StoreIndexer {
     /// drained, so every `IndexEvent` sent before the handle was dropped —
     /// including one that spawns a fresh debounce task — is still seen.
     async fn run(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<IndexEvent>) {
-        while let Some(event) = rx.recv().await {
+        // An index in memory (a browser's worker) runs what rhypedb left for
+        // later here, on a timer, when no event is waiting; one on disk has
+        // its own threads for it.
+        let mut deferred = self.index.is_in_memory().then(|| self.runtime.interval(DEFERRED_INDEX_WORK_EVERY));
+        loop {
+            let event = match deferred.as_mut() {
+                None => rx.recv().await,
+                Some(deferred) => tokio::select! {
+                    biased;
+                    event = rx.recv() => event,
+                    _ = deferred.tick() => {
+                        self.index.run_deferred_work();
+                        continue;
+                    }
+                },
+            };
+            let Some(event) = event else { break };
             match event {
                 IndexEvent::Upsert(node_id) => {
                     if let Err(e) = self.upsert_now(node_id).await {
@@ -1181,6 +1204,8 @@ pub struct RpcHandler {
     /// anyway would just start a background worker that lazily retries (and
     /// re-fails) the same download per store. `false` here makes every store
     /// open keyword-only instead; it never disables an already-open index.
+    /// (A browser's worker opens every index in memory, keyword only.)
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     semantic_available: bool,
     /// The embedding model's warm-up, when the server started it beside
     /// itself rather than before (docs/STARTUP_CONTRACT.md "Built"): an index
@@ -1250,7 +1275,7 @@ pub struct RpcHandler {
     /// The running server's own handle, and whether it hands over to a newer
     /// local one (`handOver`): set by `PimbleServer::start` for the app's
     /// loopback server only.
-    hand_over: Arc<std::sync::Mutex<Option<jsonrpsee::server::ServerHandle>>>,
+    hand_over: Arc<std::sync::Mutex<Option<ListenerHandle>>>,
     hands_over: bool,
     /// What `serverInfo` says this server is: this build's version.
     version: Arc<str>,
@@ -1403,7 +1428,7 @@ impl RpcHandler {
             folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             disk,
-            http: Arc::new(pimble_host::http::ReqwestHttp::default()),
+            http: crate::server::default_http(),
             runtime,
         }
     }
@@ -1441,6 +1466,7 @@ impl RpcHandler {
 
     /// Whether indexes open with semantic search: the warm-up's answer once
     /// it has one, else what the handler was made with.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     async fn semantic(&self) -> bool {
         match &self.semantic_warmup {
             Some((rx, wanted)) => {
@@ -1469,7 +1495,8 @@ impl RpcHandler {
     }
 
     /// The running server's handle, for `handOver` to stop it with.
-    pub fn set_server_handle(&self, handle: jsonrpsee::server::ServerHandle) {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_server_handle(&self, handle: ListenerHandle) {
         *self.hand_over.lock().unwrap() = Some(handle);
     }
 
@@ -3045,7 +3072,9 @@ impl RpcHandler {
     /// store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1: two computers
     /// opening one folder through a sync tool wrote one index, lock contention
     /// at best, seen 2026-11-18). Only local stores have one.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn index_dir_for(&self, store_id: StoreId) -> anyhow::Result<PathBuf> {
+        use pimble_core::StoreLocation;
         let manager = self.store_manager.read().await;
         let store = manager.get_store_info(store_id)?;
         match store.location {
@@ -3294,6 +3323,7 @@ impl RpcHandler {
     /// `IndexState::Held`, every second for as long as the store is wanted.
     /// `Ok(None)`: it stopped being wanted. The inner error is any other
     /// failure to open.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn open_waiting_for_lock(
         &self,
         store_id: StoreId,
@@ -3348,6 +3378,7 @@ impl RpcHandler {
     /// Before/after diffing sidesteps needing to replicate that gate:
     /// whatever `open` just wrote is definitionally correct for this build,
     /// whether or not `semantic` ends up honored.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn open_index_for_store(&self, store_id: StoreId, wanted: &(dyn Fn() -> bool + Send + Sync)) -> anyhow::Result<Option<SearchIndex>> {
         let index_dir = self.index_dir_for(store_id).await?;
         let hash_path = index_dir.join(pimble_search::SCHEMA_HASH_FILE);
@@ -3409,6 +3440,22 @@ impl RpcHandler {
         match Arc::try_unwrap(fresh) {
             Ok(index) => Ok(Some(index)),
             Err(_) => anyhow::bail!("the rebuilt index of store {store_id} is still held elsewhere"),
+        }
+    }
+
+    /// A browser's worker: the index lives in memory and is built from the
+    /// store's documents every time the store opens
+    /// (docs/ONE_CODEBASE_CONTRACT.md section 3), keyword only.
+    #[cfg(target_arch = "wasm32")]
+    async fn open_index_for_store(&self, store_id: StoreId, wanted: &(dyn Fn() -> bool + Send + Sync)) -> anyhow::Result<Option<SearchIndex>> {
+        let fresh = Arc::new(SearchIndex::open_in_memory()?);
+        let Some(count) = self.reindex_in_batches(store_id, &fresh, wanted).await? else {
+            return Ok(None);
+        };
+        info!("Built the search index of store {} in memory: {} node(s) indexed", store_id, count);
+        match Arc::try_unwrap(fresh) {
+            Ok(index) => Ok(Some(index)),
+            Err(_) => anyhow::bail!("the index of store {store_id} is still held elsewhere"),
         }
     }
 
@@ -3540,20 +3587,49 @@ impl RpcHandler {
     /// no task anywhere still holds the old `Arc<SearchIndex>` — and so
     /// nothing can land a background upsert mid-delete — before the
     /// directory is removed (docs/history/HARDENING_CONTRACT.md decision 12).
-    async fn rebuild_store_index(&self, store_id: StoreId) -> anyhow::Result<usize> {
-        // An open on its way stops first: this rebuild replaces it.
-        self.release_index(store_id).await;
-
+    /// An empty index for `store_id` to fill: its directory deleted and
+    /// opened again, or, in a browser's worker, a new one in memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fresh_index(&self, store_id: StoreId) -> anyhow::Result<SearchIndex> {
         let index_dir = self.index_dir_for(store_id).await?;
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;
         }
-        let index = Arc::new(SearchIndex::open(&index_dir, self.semantic().await)?);
+        Ok(SearchIndex::open(&index_dir, self.semantic().await)?)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn fresh_index(&self, _store_id: StoreId) -> anyhow::Result<SearchIndex> {
+        Ok(SearchIndex::open_in_memory()?)
+    }
+
+    async fn rebuild_store_index(&self, store_id: StoreId) -> anyhow::Result<usize> {
+        // An open on its way stops first: this rebuild replaces it.
+        self.release_index(store_id).await;
+
+        let index = Arc::new(self.fresh_index(store_id).await?);
         let count = self.reindex_in_batches(store_id, &index, &|| true).await?.unwrap_or(0);
         self.install_index_handle(store_id, index).await;
         self.announce_index_state(store_id, IndexState::Ready).await;
         Ok(count)
     }
+}
+
+/// What `handOver` stops: the desktop's jsonrpsee server. A browser's worker
+/// listens on nothing, so it never holds one.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ListenerHandle = jsonrpsee::server::ServerHandle;
+#[cfg(target_arch = "wasm32")]
+pub type ListenerHandle = std::convert::Infallible;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stop_listener(handle: ListenerHandle) {
+    let _ = handle.stop();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stop_listener(handle: ListenerHandle) {
+    match handle {}
 }
 
 // The trait is `?Send` in a browser's worker (pimble-rpc's dispatch).
@@ -4078,7 +4154,7 @@ impl PimbleApiServer for RpcHandler {
             // free: the newer server opens the same stores the moment it can
             // bind (docs/STARTUP_CONTRACT.md "Hand-over releases everything").
             handler.release_all_stores().await;
-            let _ = handle.stop();
+            stop_listener(handle);
             info!("Pimble server stopped for a newer one");
         });
         Ok(EmptyResponse {})
@@ -4656,7 +4732,11 @@ impl PimbleApiServer for RpcHandler {
         // the saved stores open side by side and nothing else waits on them
         // (docs/STARTUP_CONTRACT.md "The saved stores open side by side");
         // one lock per store keeps two opens of it from loading it twice.
-        let manifest = pimble_store::peek_manifest(&request.path).await.map_err(to_rpc_error)?;
+        // On the server's disk, as everything it keeps (a browser's worker
+        // has nothing on the machine's: before wave 3 this read and the load
+        // below used the default disk, which only a test's memory disk
+        // shared with the server's).
+        let manifest = pimble_store::peek_manifest_on(&self.disk, &request.path).await.map_err(to_rpc_error)?;
         if manifest.kind == StoreKind::Plain {
             let guard = {
                 let mut loading = self.loading.lock().await;
@@ -4668,7 +4748,7 @@ impl PimbleApiServer for RpcHandler {
                 (manager.is_open(manifest.id), manager.state_root().map(std::path::Path::to_path_buf))
             };
             if !open {
-                let loaded = pimble_store::LocalStore::open_in(&request.path, state_root.as_deref()).await.map_err(to_rpc_error)?;
+                let loaded = pimble_store::LocalStore::open_on(&self.disk, &self.runtime, &request.path, state_root.as_deref()).await.map_err(to_rpc_error)?;
                 self.store_manager.write().await.adopt_local_store(&request.path, loaded);
             }
         }
@@ -5856,6 +5936,8 @@ impl PimbleApiServer for RpcHandler {
             // The search index is on the machine's own disk whatever the
             // server's disk is (docs/ONE_CODEBASE_CONTRACT.md seam F, not yet
             // behind the disk).
+            // (A browser's worker keeps its index in memory: nothing on disk.)
+            #[cfg(not(target_arch = "wasm32"))]
             if !self.disk.is_native() {
                 let _ = tokio::fs::remove_dir_all(state_dir.join("index")).await;
             }

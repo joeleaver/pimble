@@ -30,7 +30,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jsonrpsee::core::async_trait;
+// `?Send` in a browser's worker, as the handler's trait is (pimble-rpc's dispatch).
+use pimble_rpc::dispatch::async_trait;
 use pimble_client::PimbleClient;
 use pimble_core::{BlobId, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
@@ -134,7 +135,8 @@ impl RpcHandler {
 }
 
 /// The other end of a link, as far as pictures go.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub(crate) trait PictureRemote: Send + Sync + 'static {
     /// Which of `ids` the remote lacks, or holds only part of. `held` gives
     /// the length of each one this store holds whole: what a remote that
@@ -156,7 +158,8 @@ pub(crate) struct PlainRemote {
     pub store_id: StoreId,
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PictureRemote for PlainRemote {
     // A plain server never names a blob until it is whole (an upload cut
     // short is a part file, sent again from the start).
@@ -208,7 +211,8 @@ pub(crate) struct VaultRemote {
     pub link_id: String,
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PictureRemote for VaultRemote {
     async fn missing(&self, ids: &[BlobId], held: &HashMap<BlobId, u64>) -> anyhow::Result<HashSet<BlobId>> {
         let listing = self.client.vault_list_docs_with_blobs(self.store_id).await.map_err(|e| anyhow::anyhow!("vaultListDocs: {e}"))?;

@@ -9,6 +9,7 @@ members = [
     "crates/pimble-rpc",
     "crates/pimble-rpc-macros",
     "crates/pimble-server",
+    "crates/pimble-worker",
     "crates/pimble-client",
     "crates/pimble-plugins",
     "crates/pimble-app",
@@ -59,9 +60,9 @@ wasmtime-wasi = "47"
 
 # Search and graph index engine (Joe's rhypedb). default-features off keeps the
 # ONNX/fastembed stack out; pimble-search's `semantic` feature turns it on.
-rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
-rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
-rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
+rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "wasm-memory", default-features = false }
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "wasm-memory" }
+rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "wasm-memory", default-features = false }
 
 # UI framework, tracked from GitHub main (never the local checkout). `rinch` itself is
 # declared in crates/pimble-app/Cargo.toml (default features off there; the `native`

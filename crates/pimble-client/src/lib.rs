@@ -8,6 +8,8 @@
 pub mod client;
 pub mod error;
 pub mod in_process;
+#[cfg(target_arch = "wasm32")]
+pub mod message_port;
 
 pub use client::*;
 pub use error::*;

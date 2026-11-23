@@ -24,6 +24,9 @@ const PRODUCTION: &[&str] = &[
     "pimble-server/src/local.rs",
     "pimble-server/src/relay_face.rs",
     "pimble-cli/src/main.rs",
+    // The browser worker's entry: wasm32 only, its defaults the worker's own
+    // disk (`/pimble`, `/pimble-config`), never the machine's directories.
+    "pimble-worker/src/worker.rs",
 ];
 
 const REFUSED_CALLS: &[&str] = &[

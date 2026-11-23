@@ -24,16 +24,39 @@ pimble-crypto = { path = "../pimble-crypto" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee = { workspace = true }
-tokio = { workspace = true }
+# tokio's locks, channels and `select!` (`sync`, `macros`) build for wasm32; the
+# runtime itself is the host's (pimble-host's `Runtime`).
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
+http = "1"
+rand = "0.9"
+# Constant-time comparison for the bearer/API-key check (decision 1); already
+# in the dependency tree transitively (a crypto crate rhypedb-embed pulls in),
+# declared directly here so pimble-server can use it.
+subtle = "2.6"
+sha2 = "0.10"
+futures = { workspace = true }
+
+# The desktop's server: jsonrpsee's HTTP/WebSocket server and the HTTP edge in
+# front of it, tokio's whole runtime, the platform's directories, and the
+# native-only modules (local.rs, auth.rs, jwt.rs, logs.rs, diagnostics.rs,
+# memory.rs, relay_tunnel.rs). None of it builds for a browser's worker
+# (docs/ONE_CODEBASE_CONTRACT.md wave 3), which serves the same handler over a
+# `MessagePort` (crates/pimble-worker).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonrpsee = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 dirs = "6"
+# EdDSA (Ed25519) JWT verification (docs/CLOUD_CONTRACT.md "B: pimble-server"
+# item 1): the JWT itself is parsed by hand (see src/jwt.rs) rather than
+# through a JWT crate, so this is only the signature primitive.
+ed25519-dalek = "2.2"
 # Diagnostics records go gzipped (src/diagnostics.rs).
 flate2 = "1"
 # HTTP-edge auth middleware (docs/history/HARDENING_CONTRACT.md decision 1), wired
@@ -42,19 +65,8 @@ flate2 = "1"
 # `tower::ServiceBuilder<T>` that function takes must be the same `tower`
 # crate, or the types don't unify.
 tower = { version = "0.4", features = ["util"] }
-http = "1"
 http-body = "1"
 bytes = "1"
-rand = "0.9"
-# Constant-time comparison for the bearer/API-key check (decision 1); already
-# in the dependency tree transitively (a crypto crate rhypedb-embed pulls in),
-# declared directly here so pimble-server can use it.
-subtle = "2.6"
-sha2 = "0.10"
-# EdDSA (Ed25519) JWT verification (docs/CLOUD_CONTRACT.md "B: pimble-server"
-# item 1): the JWT itself is parsed by hand (see src/jwt.rs) rather than
-# through a JWT crate, so this is only the signature primitive.
-ed25519-dalek = "2.2"
 # Fetching the JWKS. rustls (not the default-tls/openssl backend) per the
 # contract; no default features so openssl-sys never enters the dependency
 # tree.
@@ -66,7 +78,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # brings into the workspace (pimble-cloud), so the lock file gains nothing;
 # rustls with the platform's roots, as jsonrpsee's own `wss` has.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-futures = { workspace = true }
+
+# A browser's worker: jsonrpsee's types and client core only (no `server`
+# feature: it pulls in mio and spawns with `tokio::spawn`), as pimble-rpc and
+# pimble-client have it there; randomness from the page's crypto.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsonrpsee = { version = "0.24", default-features = false, features = ["client-core", "macros"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 # memory.rs: malloc_trim, to give a large canvas's freed copies back.

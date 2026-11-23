@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 /// `<config dir>/pimble/keys.json` ([`pimble_host::Paths::native`]).
 pub fn default_keystore_path() -> PathBuf {
-    pimble_host::Paths::native().keystore()
+    crate::server::default_paths().keystore()
 }
 
 fn b64_encode(bytes: &[u8]) -> String {

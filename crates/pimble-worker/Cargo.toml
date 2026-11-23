@@ -1,0 +1,34 @@
+[package]
+name = "pimble-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "The Pimble server in a browser's Web Worker: its entry point and its MessagePort transport (docs/ONE_CODEBASE_CONTRACT.md wave 3)"
+
+[lib]
+# cdylib: what wasm-bindgen turns into the worker's module; rlib: the tests.
+crate-type = ["cdylib", "rlib"]
+
+# Everything is wasm32's: natively this crate is empty, so the workspace's
+# native builds pass over it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+pimble-server = { workspace = true }
+pimble-client = { workspace = true }
+pimble-host = { workspace = true }
+pimble-rpc = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["MessagePort"] }
+tracing = { workspace = true }
+# A panic in the worker said in its console, not as "unreachable".
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# tests/smoke.rs, in Node: wasm-bindgen-test-runner as the target's runner.
+wasm-bindgen-test = "0.3"
+pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
+base64 = { workspace = true }
+web-sys = { version = "0.3", features = ["MessageChannel", "MessagePort"] }

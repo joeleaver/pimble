@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft; waves 0 and 1 built, wave 2 built but for its runtime** (2026-11-22, not merged or released; see the "Built" sections at the end). Decisions taken so far are under "Decisions"; the rest
+Status: **draft; waves 0, 1, 2 (with its runtime) and 3 built** (2026-11-22, not merged or released; see the "Built" sections at the end; wave 3 builds against a local rhypedb branch, see its section). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -1039,3 +1039,241 @@ above planned.
   exercised (a worker smoke test should cover a sleep, an interval, a timeout, an abort and
   a heavy job).
 - Seam F (search) and the rest of wave 3's list are as wave 2 left them.
+
+## Built: wave 3 (2026-11-22, not merged or released): the server builds for wasm32, with keyword search
+
+`pimble-server`, `pimble-store`, `pimble-search`, `pimble-client` and `pimble-host` build for
+`wasm32-unknown-unknown`, and a new crate, `crates/pimble-worker`, is the worker's entry point.
+The server runs in Node under wasm-bindgen-test on the memory disk and `LocalRuntime`, reached
+by `PimbleClient`s over `MessagePort`s, and finds what it was given with rhypedb's in-memory
+index. The desktop's behavior is unchanged. Nothing of `web/` changed (its lock gains three
+dependency lines of `pimble-client`'s).
+
+### Native-only, behind `cfg(not(target_arch = "wasm32"))`
+
+The target, not a feature, because that is what the earlier waves keyed on (`pimble-rpc`'s
+`dispatch::native`, `pimble-client`'s transports, `pimble-host`'s adapters) and because nothing
+native wants these off.
+
+- **Modules** (`pimble-server/src/lib.rs`): `auth` (the HTTP edge and its token), `fs_util`,
+  `jwt` (fetching the JWKS), `local` (finding, joining and starting the embedded server), `logs`,
+  `diagnostics`, `memory`, `relay_tunnel`. What the core asks of them is answered on wasm32 by a
+  few lines in `lib.rs`: `diagnostics::{ids, set_account, record}` record nothing (section 6
+  item 10, the worker's own diagnostics, come later), `local::host_kind()` is `"worker"` and
+  `handed_over` nothing, and `relay_tunnel::owner_is_offline` is `false` (a browser's WebSocket
+  cannot send the bearer header the desktop's probe uses; a relayed store whose owner is off
+  reads as plainly offline there, wave 4).
+- **In modules that build on both**: `PimbleServer::start` (jsonrpsee's server, the HTTP edge),
+  `wait`, the listener handle, `wait_for_shutdown_signal`, `run_server`, the embedding model's
+  warm-up (a worker's indexes are keyword only, so nothing waits for a model: the warm-up
+  channel says `false` at once, as for a relay face); `RpcHandler::set_server_handle` and what
+  `handOver` stops (`ListenerHandle` is `Infallible` on wasm32: a server with no port never
+  holds one); the index on disk (`index_dir_for`, `open_waiting_for_lock`, the lock waits, the
+  schema-hash rebuild); `removeReplica`'s removal of an index directory; the folder watch's
+  `notify` (the folder task runs on any disk, as wave 2 left it); the relay face
+  (`start_face` refuses in a worker: "Sharing from this computer needs the Pimble app on a
+  computer; a browser cannot share its stores itself.", section 5) and its tunnel's task
+  (`RelayHost::start_tunnel`, none in a worker).
+- **Dependencies by target**. `pimble-server`: jsonrpsee with `server`, tokio `full`,
+  `tracing-subscriber`, `dirs`, `flate2`, `tower`, `http-body`, `bytes`, `reqwest`,
+  `tokio-tungstenite` and `ed25519-dalek` are native only; on both, tokio `sync` + `macros`;
+  on wasm32, jsonrpsee `client-core` + `macros` (as `pimble-rpc` has it) and getrandom 0.3 with
+  `wasm_js` (rand 0.9). `pimble-store`: tokio `sync` on both, tokio `full` and `notify` native
+  only (`watch.rs` and `watch_folder` are native only). `pimble-search`: its unused `tokio`
+  dependency dropped. `libc` was already Linux-only.
+- `Paths`: the default-path functions (`default_keystore_path`, `default_credentials_path`,
+  `default_agents_path`, `default_replicas_dir`) and `ServerConfig::default()` read
+  `server::default_paths()`: `Paths::native()` on the desktop, `/pimble` and `/pimble-config`
+  on the worker's disk on wasm32. `ServerConfig::default().http` is `ReqwestHttp` natively and
+  `FetchHttp` on wasm32; the handler's own default takes the same.
+- `pimble_host::Task` is `Send` on wasm32 without the `atomics` target feature (one thread, no
+  way to start another; `local.rs`'s handle was already `Sync` for the same reason), so the
+  server's structs that hold one stay `Send` as they are natively. `PictureRemote` is
+  `async_trait(?Send)` on wasm32, as the handler's trait is.
+
+### Search on wasm32 (seam F)
+
+Built against rhypedb's in-memory mode (question 4's own route, so no stopgap index):
+`Database::open_in_memory`, `run_deferred_work`, `default-features = false`.
+
+- `SearchIndex::open_in_memory()` (`pimble-search/src/index.rs`): the same composed schema
+  and english analyzer as `SearchIndex::open`, keyword only (no `Chunk` type; semantic search
+  in the browser is wave 6), nothing written anywhere. `is_in_memory()`,
+  `run_deferred_work()`. `open` and the new constructor share the rest (`SearchIndex::over`).
+- The handler on wasm32 opens every store's index in memory and builds it from the store's
+  documents each time the store opens (`open_index_for_store`'s wasm32 twin; the same
+  `reindex_in_batches`, `IndexState::Rebuilding` and `Ready` as a rebuild on the desktop), and
+  `rebuildIndex` makes a new one (`fresh_index`). Search, its 2 s content debounce, upserts and
+  removals are the desktop's code.
+- What rhypedb leaves for later runs in `StoreIndexer::run`, between events: for an index in
+  memory a `select!` takes an event first and otherwise ticks a 1 s interval of the runtime
+  (`DEFERRED_INDEX_WORK_EVERY`) that calls `run_deferred_work`. An index on disk takes the old
+  loop exactly (no interval is made).
+- **rhypedb's `wasm-memory` branch** (194029d) is pushed and open as joeleaver/rhypedb#57
+  (Joe, 2026-11-23); every rhypedb line of the workspace (the root's `engine`, `schema`,
+  `query`, `pimble-search`'s `embed`, `pimble-cloud`'s `client` and `wire`) names
+  `branch = "wasm-memory"` until it merges, then master. While it was local, a temporary
+  `[patch]` pointed at a worktree; it is gone. The branch is based on rhypedb master `6200e3c`
+  (0.2.1), and the workspace was on `6975cb0`: **the desktop's rhypedb moves forward by
+  master's 17 commits (14 without merges)** (0.2.0 and 0.2.1: link peers, cover generations,
+  the generation race fix, k-way merges) as well as the branch's own commit; the native
+  suites below ran on it. Nothing in rhypedb was changed by this wave.
+
+### The worker entry point (`crates/pimble-worker`)
+
+A crate of its own, `cdylib` + `rlib`, empty natively: it is a host of the server, as the
+desktop app's backend is, and `web/` is the page; the worker's module is built from it and the
+page's from `web/`, and neither links the other's code (section 6: `web/` keeps only the page's
+adapters and entry).
+
+- `startServer()` (wasm-bindgen, `start_server`): `PimbleServer::with_config(ServerConfig::default())`
+  on wasm32 (a memory disk, `LocalRuntime`, `FetchHttp`, `/pimble` and `/pimble-config`), then
+  `start_in_process`, and answers a `WorkerServer`. `start(config)` is the same with a host's
+  own configuration (wave 4's OPFS disk; the tests).
+- `WorkerServer::connect(port)`: serves one connection on a `MessagePort`, the worker's end of a
+  `MessageChannel`, with the `Service` principal the desktop's loopback app has (the page is
+  this browser's own app). It goes through `PimbleServer::serve_connection(ext, incoming, send)`
+  (new, both targets): `dispatch::session::serve_with` on a task of the server's runtime, for
+  any transport that is a stream of text and a send.
+- How a page starts it (wave 4): a module worker (`new Worker("worker.js", { type: "module" })`)
+  whose script does `await init(); const server = await startServer();` and, for each
+  `postMessage("connect", [port])` from a page, `server.connect(event.ports[0])`; the page keeps
+  the other end and makes `PimbleClient::over_message_port(port)`.
+- `console_error_panic_hook` (already in `web/`'s lock) so a panic in the worker is said in its
+  console. No tracing subscriber is installed: which one, and at what level, is the page's
+  choice in wave 4.
+
+### The `MessagePort` transport (`crates/pimble-client/src/message_port.rs`, wasm32)
+
+- `PimbleClient::over_message_port(port)`: a jsonrpsee `Client` built with `build_with_wasm`
+  over a second pair of `TransportSenderT`/`TransportReceiverT` beside wave 1's channels: one
+  JSON-RPC text per message (`postMessage` of a string), `close` closes the port.
+  `MESSAGE_PORT_URL` is what `url()` answers.
+- `PortText::listen(port)` (`onmessage` into a channel, which also starts the port; a message
+  that is not a string is skipped and logged; listening stops when it is dropped) and
+  `post_text(port, text)`: the one way either side reads and writes a port; the worker's
+  `connect` uses them too.
+- A `MessagePort` says nothing when its other side goes: a client whose worker stopped sees
+  calls left unanswered. Noticing (the leader tab's lock passing) is wave 4's.
+
+### Found while building, fixed
+
+- **`openStore` read the machine's disk, not the server's.** `RpcHandler::open_store` peeked the
+  manifest with `peek_manifest` and loaded a plain store with `LocalStore::open_in`, both on
+  `Disk::default()`, since wave 2. Natively the default disk is the server's, and under
+  `PIMBLE_TEST_DISK=memory` both are the one test disk, so nothing showed it; on wasm32
+  `Disk::default()` is a new memory disk each time, and reopening a store failed ("No manifest
+  found"). Both now go through the handler's disk and runtime (`peek_manifest_on`,
+  `LocalStore::open_on`). A grep for `Disk::default()` and the old constructors in the server's
+  and store's non-test code finds no other caller. `Disk::default()` on wasm32 stays a fresh
+  disk for that reason: a shared one would hide the next such bypass, and OPFS (wave 4) would
+  not.
+- The index's title for a note without an explicit title is derived from its text while the
+  node's `metadata.title` keeps the name it was created with; the smoke test checks the hit's
+  snippet rather than its title. The same on the desktop; not changed.
+
+### Changes by file
+
+- `Cargo.toml`: the `pimble-worker` member; rhypedb on `branch = "wasm-memory"` (rhypedb#57).
+  `Cargo.lock`: rhypedb 0.2.1 from the worktree (path entries, one copy), `web-time` and
+  getrandom 0.3's `wasm_js` for its wasm32 build, `console_error_panic_hook`,
+  `wasm-bindgen-test` lines for the worker, and dependency lines. `web/Cargo.lock`: three
+  dependency lines of `pimble-client`.
+- `crates/pimble-host/`: `Cargo.toml` (wasm32: `wasm-bindgen`, `js-sys`, `web-sys` with
+  `Headers`, `Request`, `RequestCredentials`, `RequestInit`, `Response`); `src/http.rs`
+  (`FetchHttp`: the global `fetch`, so a window, a worker and Node alike, `credentials:
+  "include"`, the bearer when given, JSON body); `src/runtime.rs` (`Task` is `Send` on
+  single-threaded wasm32); `src/lib.rs` (doc).
+- `crates/pimble-store/`: `Cargo.toml` (tokio `sync`; tokio `full` and `notify` native);
+  `src/lib.rs` (`watch` native only).
+- `crates/pimble-search/`: `Cargo.toml` (unused tokio dropped); `src/index.rs`
+  (`open_in_memory`, `is_in_memory`, `run_deferred_work`, `over`); `tests/in_memory.rs` (new).
+- `crates/pimble-server/`: `Cargo.toml` (dependencies by target); `src/lib.rs` (native-only
+  modules, the wasm32 answers); `src/server.rs` (`default_paths`, `default_http`, `start`/`wait`/
+  shutdown native, the warm-up, `serve_connection`); `src/handler.rs` (`http::Extensions`,
+  `ListenerHandle`/`stop_listener`, the index in memory, `DEFERRED_INDEX_WORK_EVERY` and the
+  indexer's loop, `fresh_index`, `openStore` on the server's disk, the index-on-disk items
+  native); `src/relay_face.rs` (`start_face` and `start_tunnel` per target); `src/folder_watch.rs`
+  (the watch native); `src/pictures.rs` (`?Send` on wasm32); `src/principal.rs`
+  (`http::Extensions`); `src/agents.rs`, `src/credentials.rs`, `src/keystore.rs`
+  (`default_paths`).
+- `crates/pimble-client/`: `Cargo.toml` (wasm32: `wasm-bindgen`, `web-sys` `MessageEvent`
+  and `MessagePort`, `futures`); `src/message_port.rs` (new); `src/lib.rs`; `src/in_process.rs`
+  (doc).
+- `crates/pimble-worker/` (new): `Cargo.toml`, `src/lib.rs`, `src/worker.rs`,
+  `tests/smoke.rs`.
+- `crates/pimble-server/tests/test_isolation.rs`: `pimble-worker/src/worker.rs` joins the
+  production files allowed `ServerConfig::default()` (its defaults are the worker's own disk,
+  `/pimble` and `/pimble-config`, never the machine's directories); the guard is otherwise
+  unchanged, and the smoke test builds on `ServerConfig::in_dir` as every test does.
+
+### Proof
+
+- **The wasm32 builds.** `cargo build --target wasm32-unknown-unknown -p pimble-server -p
+  pimble-store -p pimble-search -p pimble-client -p pimble-host -p pimble-worker` builds, no
+  warnings of these crates (the one warning is `pimble-crdt`'s unused `Encode` import, there
+  natively too, not this wave's). `cargo build --release --target wasm32-unknown-unknown -p
+  pimble-worker`: `pimble_worker.wasm` is 13.7 MB before wasm-bindgen, `wasm-opt` and
+  compression (section 10's size risk, to measure in wave 4).
+- **The smoke test**, `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo
+  test --target wasm32-unknown-unknown -p pimble-worker --test smoke`, in Node 24: 2 passed.
+  The runner must match the lock's `wasm-bindgen` exactly (0.2.128; the one installed in
+  `~/.cargo/bin` is 0.2.126 and refuses the file, so a 0.2.128 was installed under the session
+  scratchpad: `cargo install wasm-bindgen-cli --version 0.2.128 --locked --root <dir>`).
+  - `the_server_answers_over_message_ports`: the server started by the worker's entry on the
+    memory disk (`ServerConfig::in_dir("/smoke")`, checked to be `DiskKind::Memory`) and
+    `LocalRuntime`; two `PimbleClient::over_message_port` clients, each on a new
+    `MessageChannel` whose other end went to `WorkerServer::connect`; `serverInfo` (`host:
+    "worker"`, `hands_over: false`); `createStore`, `createNode`, `listStores`; the second
+    client subscribes (`subscribeStoreChanges`) and hears the first's `applyEdit` (an edit of
+    the node's own document, `NodeDoc::replace_plain_text`) as `ContentUpdated` with its
+    `source_client_id`; both read the text back (`getNode`, the document decoded); keyword
+    search through the in-memory index finds it by a stem ("pomegranate" for "pomegranates")
+    and a prefix ("water"), and finds nothing for a word it lacks; an unsubscribe is answered;
+    the store closes and opens again from the memory disk with its text, and its index is
+    built again and finds it (this step found the `openStore` bypass above).
+  - `the_local_runtime_runs_in_wasm`: a sleep (at least as long as asked, by the runtime's
+    clock), the wall clock, an interval's four ticks a period apart after the first at once, a
+    timeout that elapses and one that does not, a task awaited to its end, a task aborted in
+    its sleep (ended, and never past its await), a heavy job run inline.
+- **`pimble-search` in memory, natively**: `tests/in_memory.rs` (new): the same nodes in an
+  index on disk and one in memory answer five queries (stem, prefix, title, two words, none)
+  with the same nodes in the same order; an update and a removal are seen at once.
+- **The suites on the machine's disk**: `cargo test --release --no-fail-fast -p pimble-server -p
+  pimble-store -p pimble-host -p pimble-search`: 410 passed, 2 failed, 1 ignored. The two:
+  `test_isolation.rs` (the guard caught the worker's `ServerConfig::default()`, as it should;
+  answered above, then passed) and the known `vault_link.rs`
+  `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner` flake at the same
+  assertion as in wave 2 ("wrapped under the scope key its maker holds"), which passed twice
+  run alone. Wave 2's 371 for server, store and host, plus `pimble-search`'s own tests (its new
+  one included).
+- **The suites on the memory disk** (`PIMBLE_TEST_DISK=memory`, on the final tree): 412 passed,
+  0 failed, 1 ignored.
+- **The fault sweep**: `PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4 cargo test --release -p
+  pimble-server --test link_faults -- --nocapture` on the machine's disk: all 200 converged,
+  219 crashes among them (848 s), the count of waves 0 and 2.
+- **Release builds**: `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp` builds
+  (7 min). `cd web && cargo check --release --target wasm32-unknown-unknown` checks.
+
+### What remains for wave 4
+
+- The worker as the browser's server, behind a switch: the module worker script and its build
+  (trunk can build a worker from this crate), the leader tab (Web Locks, a `BroadcastChannel`
+  from the other tabs, which needs a transport like `message_port.rs` over it), noticing a
+  worker that has gone (a `MessagePort` does not say), and the app's backend on
+  `PimbleClient::over_message_port`.
+- `OpfsDisk` with the disk key, the device-key `KeyRest`, and `start(config)` with them;
+  `Disk::default()` on wasm32 stays a fresh memory disk ("don't remember this browser" builds
+  its own).
+- `FetchHttp` is built and checks but has called nothing yet: sign-in through the server
+  (`cloudSignIn` and the rest) is where it first runs, against the local stack.
+- A tracing subscriber in the worker (which, at what level).
+- A relayed store's owner being away reads as plainly offline in the worker
+  (`owner_is_offline` is `false` there).
+- The index is rebuilt from the documents at every store open: measure on Joe's 674-node store
+  in wave 4 (section 10).
+- Semantic search in the worker is wave 6 (`open_in_memory` is keyword only).
+- rhypedb back to `master` once rhypedb#57 merges.
+- The smoke test runs in Node, not yet in a browser worker or in CI (section 8 wants a browser
+  runner and OPFS: wave 4).
+

@@ -131,7 +131,10 @@ impl RpcHandler {
         // disk (or the browser's OPFS, which sends no change events) has no
         // other computer writing into it. The rest of the task (announcing
         // what a flush merged, the presence files) runs on any disk.
+        #[cfg(not(target_arch = "wasm32"))]
         let watched = if self.disk().is_native() { pimble_store::watch_folder(&path) } else { None };
+        #[cfg(target_arch = "wasm32")]
+        let watched: Option<((), tokio::sync::mpsc::UnboundedReceiver<PathBuf>)> = None;
         let (_watch, mut changes) = match watched {
             Some((watch, rx)) => (Some(watch), Some(rx)),
             None => (None, None),

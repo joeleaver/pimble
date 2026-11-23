@@ -50,7 +50,9 @@ use uuid::Uuid;
 use crate::handler::RpcHandler;
 use crate::keystore::SignedInAccount;
 use crate::principal::service_extensions;
-use crate::server::{PimbleServer, ServerConfig};
+use crate::server::PimbleServer;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::server::ServerConfig;
 use crate::vault_link::LinkEndpoint;
 
 // ── What the person is told ──────────────────────────────────────────────
@@ -104,6 +106,7 @@ struct Face {
 /// How the tunnel to Pimble Cloud's relay is doing: whether the people
 /// something is shared with can reach this computer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) enum TunnelState {
     /// Nothing is shared from this computer, so there is no tunnel.
     Idle,
@@ -132,6 +135,7 @@ pub(crate) struct RelayHost {
     /// The host server's disk, which the face keeps its twins on too.
     disk: pimble_host::Disk,
     /// The host server's runtime, which the face runs on too.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     runtime: pimble_host::Runtime,
     inner: Mutex<Inner>,
     /// What the tunnel announces. Written under `inner`'s lock.
@@ -205,11 +209,19 @@ impl RelayHost {
             self.publish(&inner);
         }
         if inner.tunnel.as_ref().is_none_or(|task| task.is_finished()) {
-            inner.tunnel = Some(self.runtime.spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
+            inner.tunnel = self.start_tunnel(handler);
         }
         Ok(url)
     }
 
+    /// A browser's worker shares nothing from itself (docs/ONE_CODEBASE_CONTRACT.md
+    /// section 5: a tab is not on reliably, and the face listens on a port).
+    #[cfg(target_arch = "wasm32")]
+    async fn start_face(&self, _account: &SignedInAccount, _issuer: String) -> anyhow::Result<Face> {
+        anyhow::bail!("Sharing from this computer needs the Pimble app on a computer; a browser cannot share its stores itself.")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn start_face(&self, account: &SignedInAccount, issuer: String) -> anyhow::Result<Face> {
         self.disk.create_dir_all(&self.dir).await.map_err(|e| anyhow::anyhow!("could not create {}: {}", self.dir.display(), e))?;
         let jwks_url = crate::cloud::jwks_url(&account.url).map_err(|e| anyhow::anyhow!(e))?;
@@ -339,8 +351,21 @@ impl RelayHost {
         self.inner.lock().await.stores.contains_key(&store_id)
     }
 
+    /// The tunnel's task (`crate::relay_tunnel`); none in a browser's
+    /// worker, which has no face for a tunnel to reach.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_tunnel(&self, handler: &RpcHandler) -> Option<pimble_host::Task> {
+        Some(self.runtime.spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn start_tunnel(&self, _handler: &RpcHandler) -> Option<pimble_host::Task> {
+        None
+    }
+
     /// The face's URL while it runs: where the tunnel takes a member's
     /// connection.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn face_url(&self) -> Option<Url> {
         self.url.lock().unwrap().clone()
     }
@@ -355,7 +380,7 @@ impl RelayHost {
         }
         self.set_tunnel_state(TunnelState::Idle);
         if !inner.stores.is_empty() {
-            inner.tunnel = Some(self.runtime.spawn(crate::relay_tunnel::run(handler.clone(), self.serve.subscribe())));
+            inner.tunnel = self.start_tunnel(handler);
         }
     }
 

@@ -37,3 +37,8 @@ jsonrpsee = { version = "0.24", default-features = false, features = [
     "async-wasm-client",
     "macros",
 ] }
+# The `MessagePort` transport to the server in a browser's worker
+# (src/message_port.rs).
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["MessageEvent", "MessagePort"] }
+futures = { workspace = true }

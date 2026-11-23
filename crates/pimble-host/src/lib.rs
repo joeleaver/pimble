@@ -15,7 +15,7 @@
 //!   `keys.json`, mode `0600`, on the disk.
 //!
 //! - [`http::Http`]: outbound calls to the accounts service (seam D). Native:
-//!   `reqwest`.
+//!   `reqwest`. wasm32: `fetch`.
 //!
 //! - [`Runtime`]: tasks, timers and clocks (seam C). Native: tokio, on the
 //!   caller's runtime. wasm32: `spawn_local`, `setTimeout`, `performance.now()`.

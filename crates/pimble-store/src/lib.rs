@@ -12,6 +12,8 @@ pub mod manager;
 pub mod registry;
 pub mod sync_state;
 pub mod vault;
+// The folder watch (`notify`) is the desktop's only (docs/ONE_CODEBASE_CONTRACT.md seam B).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod watch;
 
 pub use blobs::*;
@@ -20,4 +22,5 @@ pub use local::*;
 pub use manager::*;
 pub use registry::*;
 pub use vault::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use watch::{watch_folder, FolderWatch};

@@ -19,7 +19,7 @@ use url::Url;
 /// `<config dir>/pimble/credentials.json` ([`pimble_host::Paths::native`]),
 /// used whenever `ServerConfig::credentials_path` is `None`.
 pub fn default_credentials_path() -> PathBuf {
-    pimble_host::Paths::native().credentials()
+    crate::server::default_paths().credentials()
 }
 
 /// `url`'s origin as the credentials file keys it: `scheme://host[:port]`,

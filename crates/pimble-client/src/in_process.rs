@@ -2,7 +2,8 @@
 //! seam A): JSON-RPC text over a pair of channels to
 //! `pimble_rpc::dispatch::session::serve`, with no socket. The client is the
 //! same `PimbleClient` a WebSocket gives, so everything built on it works
-//! over either; wave 3 puts a browser `MessagePort` where the channels are.
+//! over either; `message_port.rs` is the same with a browser `MessagePort`
+//! where the channels are.
 
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::client::{ClientBuilder, ReceivedMessage, TransportReceiverT, TransportSenderT};

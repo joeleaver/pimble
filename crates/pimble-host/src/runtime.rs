@@ -171,6 +171,13 @@ pub trait TaskHandle: MaybeSend + Sync {
 /// finished or aborted.
 pub struct Task(Box<dyn TaskHandle>);
 
+// wasm32-unknown-unknown without the `atomics` target feature has one thread
+// and no way to start another, so a task handle never crosses threads: the
+// server's structs that hold one stay `Send` there as on the desktop
+// (docs/ONE_CODEBASE_CONTRACT.md wave 3), as `local.rs`'s handle is `Sync`.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+unsafe impl Send for Task {}
+
 impl Task {
     pub fn new(handle: impl TaskHandle + 'static) -> Self {
         Self(Box::new(handle))

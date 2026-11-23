@@ -1097,6 +1097,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2419,9 +2429,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5108,6 +5120,7 @@ version = "0.29.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "futures",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",
@@ -5117,6 +5130,8 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -5227,12 +5242,15 @@ dependencies = [
  "dirs",
  "futures",
  "gloo-timers",
+ "js-sys",
  "reqwest",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
 ]
 
@@ -5399,7 +5417,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
- "tokio",
  "tracing",
  "unicode-segmentation",
  "uuid",
@@ -5418,6 +5435,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "futures",
+ "getrandom 0.3.4",
  "http",
  "http-body",
  "hyper",
@@ -5495,6 +5513,26 @@ dependencies = [
  "pimble-core",
  "rinch",
  "rinch-tabler-icons",
+]
+
+[[package]]
+name = "pimble-worker"
+version = "0.29.4"
+dependencies = [
+ "base64 0.22.1",
+ "console_error_panic_hook",
+ "js-sys",
+ "pimble-client",
+ "pimble-core",
+ "pimble-crdt",
+ "pimble-host",
+ "pimble-rpc",
+ "pimble-server",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]
@@ -6409,8 +6447,8 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-authz"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -6418,12 +6456,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "web-time",
 ]
 
 [[package]]
 name = "rhypedb-client"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "rhypedb-subscribe",
  "rhypedb-wire",
@@ -6436,8 +6475,8 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-embed"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "fastembed",
  "hf-hub",
@@ -6447,8 +6486,8 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-engine"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -6471,8 +6510,8 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-query"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "bytes",
  "rhypedb-authz",
@@ -6484,21 +6523,22 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-schema"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "rhypedb-storage"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "ahash",
  "bytes",
  "crc32fast",
  "crossbeam-skiplist",
+ "getrandom 0.3.4",
  "libc",
  "lz4_flex",
  "memmap2",
@@ -6507,13 +6547,14 @@ dependencies = [
  "roaring",
  "tempfile",
  "thiserror 2.0.21",
+ "web-time",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "rhypedb-subscribe"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "parking_lot",
  "serde",
@@ -6522,10 +6563,11 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-vector"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "boxcar",
+ "getrandom 0.3.4",
  "parking_lot",
  "rand 0.9.2",
  "thiserror 2.0.21",
@@ -6533,8 +6575,8 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-wire"
-version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#6975cb0cb47b8d7430d7e0748e35655112d54bef"
+version = "0.2.1"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=wasm-memory#194029d8ab3d5eed24cfb0edb6adfb3740b45a08"
 dependencies = [
  "base64 0.22.1",
  "bytes",

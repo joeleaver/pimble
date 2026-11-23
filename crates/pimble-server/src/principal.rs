@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use jsonrpsee::types::ErrorObjectOwned;
-use jsonrpsee::Extensions;
+use http::Extensions;
 use pimble_core::{NodeId, StoreAccess, StoreId};
 use pimble_rpc::forbidden_error;
 

@@ -1954,6 +1954,7 @@ version = "0.29.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "futures",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",
@@ -1963,6 +1964,8 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

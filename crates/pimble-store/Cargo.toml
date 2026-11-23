@@ -13,7 +13,8 @@ pimble-crdt = { workspace = true }
 pimble-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# The store itself needs only tokio's locks (`sync`, which builds for wasm32).
+tokio = { version = "1", default-features = false, features = ["sync"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -23,10 +24,17 @@ base64 = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-notify = { workspace = true }
 # A blob's header carries the SHA-256 of its image (docs/IMAGES_CONTRACT.md);
 # the version pimble-crypto already uses.
 sha2 = "0.10"
+
+# The desktop's: tokio's whole runtime (the tests' too) and the folder watch
+# (src/watch.rs). A browser's worker has neither: its runtime is pimble-host's
+# `LocalRuntime`, and it has no folder to watch (docs/ONE_CODEBASE_CONTRACT.md
+# seam B, wave 3).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

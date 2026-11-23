@@ -4,10 +4,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::server::{Server, ServerHandle};
+#[cfg(not(target_arch = "wasm32"))]
 use pimble_rpc::PimbleApiServer;
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::info;
 use url::Url;
 
@@ -113,10 +116,11 @@ pub struct ServerConfig {
     /// config directories).
     pub paths: pimble_host::Paths,
     /// How this server reaches the Pimble Cloud accounts service (seam D):
-    /// `reqwest` on the desktop.
+    /// `reqwest` on the desktop, `fetch` in a browser's worker.
     pub http: Arc<dyn pimble_host::http::Http>,
     /// What this server's tasks, timers and clocks run on (seam C): tokio,
-    /// on the caller's runtime, on the desktop.
+    /// on the caller's runtime, on the desktop; `spawn_local` and
+    /// `setTimeout` in a browser's worker.
     pub runtime: pimble_host::Runtime,
 }
 
@@ -141,11 +145,34 @@ impl Default for ServerConfig {
             set_aside_after: None,
             link_faults: None,
             disk: pimble_host::Disk::default(),
-            paths: pimble_host::Paths::native(),
-            http: Arc::new(pimble_host::http::ReqwestHttp::default()),
+            paths: default_paths(),
+            http: default_http(),
             runtime: pimble_host::Runtime::default(),
         }
     }
+}
+
+/// The desktop's: the platform's data and config directories.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn default_paths() -> pimble_host::Paths {
+    pimble_host::Paths::native()
+}
+
+/// A browser's worker: folders at the root of its disk (the origin private
+/// file system's root in wave 4; a memory disk's until then).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn default_paths() -> pimble_host::Paths {
+    pimble_host::Paths::new("/pimble", "/pimble-config")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn default_http() -> Arc<dyn pimble_host::http::Http> {
+    Arc::new(pimble_host::http::ReqwestHttp::default())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn default_http() -> Arc<dyn pimble_host::http::Http> {
+    Arc::new(pimble_host::http::FetchHttp)
 }
 
 impl ServerConfig {
@@ -177,6 +204,7 @@ impl ServerConfig {
 pub struct PimbleServer {
     config: ServerConfig,
     store_manager: Arc<RwLock<StoreManager>>,
+    #[cfg(not(target_arch = "wasm32"))]
     handle: Option<ServerHandle>,
     /// The handler the running server dispatches to, kept so `stop()` can
     /// stop the links it started.
@@ -209,6 +237,7 @@ impl PimbleServer {
             // store's folder (docs/STORE_FOLDERS_CONTRACT.md rule 1), and so
             // inside a test's temp directory whenever its replicas are.
             store_manager: Arc::new(RwLock::new(StoreManager::with_state_root(state_root).on_disk(disk).on_runtime(runtime))),
+            #[cfg(not(target_arch = "wasm32"))]
             handle: None,
             handler: None,
             local_addr: None,
@@ -217,12 +246,14 @@ impl PimbleServer {
     }
 
     /// A relay face: see [`crate::relay_face`].
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn relay_face(config: ServerConfig) -> Self {
         Self { face: true, ..Self::with_config(config) }
     }
 
     /// The handler a started server dispatches to, for calls made to it
     /// in-process.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn handler(&self) -> Option<RpcHandler> {
         self.handler.clone()
     }
@@ -245,6 +276,10 @@ impl PimbleServer {
     /// stores opening at once each lazily construct their own embedder and
     /// race to download the same model" into "one download, serially, before
     /// any store exists to race over."
+    ///
+    /// The desktop's only: a browser's worker has no port, and starts with
+    /// [`PimbleServer::start_in_process`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn start(&mut self) -> Result<()> {
         // An empty or whitespace-only token is never valid: treating it as
         // "no token configured" would silently disable the non-loopback
@@ -346,14 +381,19 @@ impl PimbleServer {
         // background after their stores have answered.
         let (warmed, warmup) = tokio::sync::watch::channel(None);
         let wanted = Arc::new(tokio::sync::Notify::new());
-        if self.face {
+        // A browser's worker searches by keyword only (semantic search there
+        // is wave 6), so nothing waits for a model.
+        if self.face || cfg!(target_arch = "wasm32") {
             let _ = warmed.send(Some(false));
         } else {
             let wanted = Arc::clone(&wanted);
             let runtime = self.config.runtime.clone();
             self.config.runtime.spawn(async move {
                 wanted.notified().await;
+                #[cfg(not(target_arch = "wasm32"))]
                 let _ = warmed.send(Some(warm_up_embedding_model(&runtime).await));
+                #[cfg(target_arch = "wasm32")]
+                let _ = (warmed, runtime);
             });
         }
         let semantic_available = false;
@@ -420,11 +460,27 @@ impl PimbleServer {
     /// [`crate::service_extensions`]). `None` before the server has started.
     /// The connection is served on a task of the server's runtime until the
     /// client is dropped.
-    pub fn connect_in_process(&self, ext: jsonrpsee::Extensions) -> Option<pimble_client::PimbleClient> {
+    pub fn connect_in_process(&self, ext: http::Extensions) -> Option<pimble_client::PimbleClient> {
         let handler = Arc::new(self.handler.clone()?);
         let (client_end, server_end) = pimble_rpc::dispatch::session::channel();
         self.config.runtime.spawn(pimble_rpc::dispatch::session::serve(handler, ext, server_end));
         Some(pimble_client::PimbleClient::in_process(client_end))
+    }
+
+    /// Serve one connection whose JSON-RPC text arrives on `incoming` and
+    /// whose answers and notifications go to `send` (which says `false` once
+    /// the other side has gone), every call carrying `ext`: what a transport
+    /// other than the in-process channel feeds, such as a browser worker's
+    /// `MessagePort` (crates/pimble-worker). Served on a task of the server's
+    /// runtime until either side ends; `false` before the server has started.
+    pub fn serve_connection<I, F>(&self, ext: http::Extensions, incoming: I, send: F) -> bool
+    where
+        I: futures::Stream<Item = String> + Unpin + pimble_host::runtime::MaybeSend + 'static,
+        F: FnMut(String) -> bool + pimble_host::runtime::MaybeSend + 'static,
+    {
+        let Some(handler) = self.handler.clone() else { return false };
+        self.config.runtime.spawn(pimble_rpc::dispatch::session::serve_with(Arc::new(handler), ext, incoming, send));
+        true
     }
 
     /// Stop the server
@@ -450,6 +506,7 @@ impl PimbleServer {
             manager.flush_all().await?;
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(handle) = self.handle.take() {
             handle.stop().map_err(|e| crate::ServerError::Server(e.to_string()))?;
             info!("Pimble server stopped");
@@ -458,6 +515,7 @@ impl PimbleServer {
     }
 
     /// Wait for the server to finish
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn wait(&self) {
         if let Some(ref handle) = self.handle {
             handle.clone().stopped().await;
@@ -483,6 +541,7 @@ impl Default for PimbleServer {
 /// [`warm_up_embedding_model`] and every `SearchIndex`'s own lazy
 /// `Vectorizer` (via the schema's `@vectorize(model: "...")` directive)
 /// agree on it.
+#[cfg(not(target_arch = "wasm32"))]
 const EMBEDDING_MODEL: &str = "all-MiniLM-L6-v2";
 
 /// Point the embedding model cache at a stable, per-user directory and force
@@ -502,6 +561,7 @@ const EMBEDDING_MODEL: &str = "all-MiniLM-L6-v2";
 /// as the runtime's heavy job (a blocking thread on the desktop) so it can't stall the async runtime other RPCs will
 /// shortly run on; `start` still awaits it, so no store can open before it
 /// resolves.
+#[cfg(not(target_arch = "wasm32"))]
 async fn warm_up_embedding_model(runtime: &pimble_host::Runtime) -> bool {
     // The machine's, whatever the server's paths: a cache of a download,
     // shared by every server in the process (tests included).
@@ -542,6 +602,7 @@ async fn warm_up_embedding_model(runtime: &pimble_host::Runtime) -> bool {
 /// container or `systemd stop` sends `SIGTERM`, not `SIGINT`; without this a
 /// headless server killed that way skips its flush instead of stopping
 /// cleanly.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -565,6 +626,7 @@ pub async fn wait_for_shutdown_signal() {
 }
 
 /// Start a server and run it until shutdown
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let mut server = PimbleServer::with_config(config);
     server.start().await?;

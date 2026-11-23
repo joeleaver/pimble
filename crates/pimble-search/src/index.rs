@@ -205,6 +205,39 @@ impl SearchIndex {
             tracing::debug!("SearchIndex::open: could not write schema hash marker: {e}");
         }
 
+        Self::over(db, schema, semantic)
+    }
+
+    /// An empty index in memory only, with the same schema and analyzers as
+    /// [`SearchIndex::open`]'s: nothing written anywhere, built again from
+    /// the store's documents each time it opens. What a browser's worker
+    /// searches with (docs/ONE_CODEBASE_CONTRACT.md section 3); it builds
+    /// natively too. No thread is started: the work rhypedb leaves for later
+    /// (cover refreshes, full-text backfills) waits for
+    /// [`SearchIndex::run_deferred_work`], which the caller drives when idle.
+    /// Keyword only: semantic search in the browser is wave 6.
+    pub fn open_in_memory() -> Result<Self> {
+        let schema_text = compose_schema(false, &[]);
+        let schema = parse_schema(&schema_text).map_err(|e| SearchError::Schema(e.to_string()))?;
+        let db = Database::open_in_memory(schema.clone(), rhypedb_engine::database::OpenOptions::default()).map_err(map_engine_err)?;
+        Self::over(db, schema, false)
+    }
+
+    /// Whether this index lives in memory only ([`SearchIndex::open_in_memory`]).
+    pub fn is_in_memory(&self) -> bool {
+        self.db.storage().is_in_memory()
+    }
+
+    /// Run what an in-memory index left for later (see
+    /// [`SearchIndex::open_in_memory`]); how many pieces of work ran. Never
+    /// needed for a read to be right: a write indexes its own text, and a
+    /// stale cover is read through. Nothing to do for an index on disk, whose
+    /// own threads do it.
+    pub fn run_deferred_work(&self) -> usize {
+        self.db.run_deferred_work()
+    }
+
+    fn over(db: Arc<Database>, schema: rhypedb_schema::Schema, semantic: bool) -> Result<Self> {
         let vectorizer = if semantic {
             // `embed.cache_dir` comes from `crate::warmup::set_model_cache_dir`
             // (a `OnceLock`, not an env var) so every store's lazily-created
