@@ -74,6 +74,25 @@ pub struct Inner {
     /// One personal-document write at a time, so a version check and its
     /// write are one step (docs/DISCUSSIONS_CONTRACT.md section 8).
     pub personal_lock: tokio::sync::Mutex<()>,
+    /// Notices one sender may queue (docs/NOTIFICATIONS_CONTRACT.md section 2).
+    pub inbox_quota: QuotaLimiter,
+    /// Wakes a recipient's waiting drain when a notice is queued for them.
+    pub inbox_wakers: crate::routes::InboxWakers,
+}
+
+impl Inner {
+    /// The waker of `recipient`'s drains.
+    pub fn inbox_waker(&self, recipient: &str) -> Arc<tokio::sync::Notify> {
+        let mut wakers = self.inbox_wakers.lock().expect("inbox wakers poisoned");
+        Arc::clone(wakers.entry(recipient.to_string()).or_default())
+    }
+
+    /// A notice was queued for `recipient`: every drain of theirs that waits answers.
+    pub fn wake_inbox(&self, recipient: &str) {
+        if let Some(wake) = self.inbox_wakers.lock().expect("inbox wakers poisoned").get(recipient) {
+            wake.notify_waiters();
+        }
+    }
 }
 
 impl std::ops::Deref for AppState {
@@ -125,6 +144,8 @@ impl AppState {
             kdf_decoy_secret,
             relay,
             personal_lock: tokio::sync::Mutex::new(()),
+            inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
+            inbox_wakers: Default::default(),
         }))
     }
 }

@@ -189,6 +189,12 @@ pub struct UserRow {
     /// them (docs/PRESENCE_CONTRACT.md section 3). `""` until they choose
     /// one, and on every row from before the field.
     pub display_name: String,
+    /// The notice key's public half and its envelope
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 2); `""` until one is made.
+    pub notice_public_key: String,
+    pub notice_key_envelope: String,
+    /// Whether the person turned notifications off (section 6).
+    pub notifications_off: bool,
 }
 
 impl UserRow {
@@ -425,6 +431,39 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         recovery_token_hash: get_string_opt(o, "recovery_token_hash")?.map(str::to_string).unwrap_or_default(),
         recovery_token_expires_at_ms: get_datetime_ms_opt(o, "recovery_token_expires_at")?.unwrap_or(0),
         display_name: get_string_opt(o, "display_name")?.map(str::to_string).unwrap_or_default(),
+        notice_public_key: get_string_opt(o, "notice_public_key")?.map(str::to_string).unwrap_or_default(),
+        notice_key_envelope: get_string_opt(o, "notice_key_envelope")?.map(str::to_string).unwrap_or_default(),
+        notifications_off: get_bool_opt(o, "notifications_off")?.unwrap_or(false),
+    })
+}
+
+/// One sealed notice in an inbox (`InboxItem`).
+#[derive(Debug, Clone)]
+pub struct InboxItemRow {
+    pub rid: u64,
+    pub item_uuid: String,
+    pub recipient_uuid: String,
+    pub sender_uuid: String,
+    pub store_uuid: String,
+    pub root: String,
+    pub sealed: String,
+    pub created_at_ms: i64,
+    pub delivered: bool,
+    pub delivered_at_ms: i64,
+}
+
+fn inbox_item_from_object(o: &Object) -> CloudResult<InboxItemRow> {
+    Ok(InboxItemRow {
+        rid: o.id,
+        item_uuid: get_string(o, "item_uuid")?.to_string(),
+        recipient_uuid: get_string(o, "recipient_uuid")?.to_string(),
+        sender_uuid: get_string(o, "sender_uuid")?.to_string(),
+        store_uuid: get_string(o, "store_uuid")?.to_string(),
+        root: get_string(o, "root")?.to_string(),
+        sealed: get_string(o, "sealed")?.to_string(),
+        created_at_ms: get_datetime_ms(o, "created_at")?,
+        delivered: get_bool(o, "delivered")?,
+        delivered_at_ms: get_datetime_ms(o, "delivered_at")?,
     })
 }
 
@@ -944,6 +983,62 @@ impl RhypeDb {
             self.objects(&format!("ShareName.get({}).delete()", row.rid)).await?;
         }
         Ok(())
+    }
+
+    // ── Notices (docs/NOTIFICATIONS_CONTRACT.md) ─────────────────────
+
+    pub async fn set_notice_key(&self, user_rid: u64, public_key: &str, envelope_json: &str) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ notice_public_key: {}, notice_key_envelope: {} }})",
+            ql_str(public_key),
+            ql_str(envelope_json)
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    pub async fn set_notifications_off(&self, user_rid: u64, off: bool) -> CloudResult<()> {
+        self.objects(&format!("User.get({user_rid}).update({{ notifications_off: {off} }})")).await?;
+        Ok(())
+    }
+
+    /// Queue a sealed notice; answers the new item.
+    pub async fn create_inbox_item(&self, recipient: &str, sender: &str, store_uuid: &str, root: &str, sealed: &str) -> CloudResult<InboxItemRow> {
+        let item_uuid = uuid::Uuid::new_v4().to_string();
+        let q = format!(
+            "InboxItem.create({{ item_uuid: {item}, recipient_uuid: {recipient}, sender_uuid: {sender}, store_uuid: {store}, root: {root}, sealed: {sealed}, created_at: {now}, delivered: false, delivered_at: {epoch} }})",
+            item = ql_str(&item_uuid),
+            recipient = ql_str(recipient),
+            sender = ql_str(sender),
+            store = ql_str(store_uuid),
+            root = ql_str(root),
+            sealed = ql_str(sealed),
+            now = now_literal(),
+            epoch = datetime_literal(0),
+        );
+        let o = self.one(&q).await?.ok_or_else(|| CloudError::Internal("InboxItem.create returned nothing".into()))?;
+        inbox_item_from_object(&o)
+    }
+
+    /// Every item waiting for `recipient`, oldest first.
+    pub async fn inbox_of(&self, recipient: &str) -> CloudResult<Vec<InboxItemRow>> {
+        let q = format!("InboxItem.filter(.recipient_uuid == {})", ql_str(recipient));
+        let mut rows: Vec<InboxItemRow> = self.objects(&q).await?.iter().map(inbox_item_from_object).collect::<CloudResult<_>>()?;
+        rows.sort_by_key(|r| r.rid);
+        Ok(rows)
+    }
+
+    pub async fn mark_inbox_item_delivered(&self, rid: u64) -> CloudResult<()> {
+        self.objects(&format!("InboxItem.get({rid}).update({{ delivered: true, delivered_at: {} }})", now_literal())).await?;
+        Ok(())
+    }
+
+    pub async fn delete_inbox_item(&self, rid: u64) -> CloudResult<()> {
+        match self.client.query(&format!("InboxItem.get({rid}).delete()")).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // ── Personal documents ────────────────────────────────────────────

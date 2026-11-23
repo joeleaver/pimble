@@ -497,6 +497,10 @@ pub struct MemberView {
     /// collecting everyone else's ("invitations and `public_keys` only when
     /// the caller is an owner").
     public_keys: Option<AccountPublicKeys>,
+    /// The member's notice key's public half, to every member alike: a
+    /// public key, and what anyone in the share seals a notice with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<String>,
 }
 
 /// `GET /stores/{id}/members` — the scope's members, and the scope's own
@@ -523,6 +527,11 @@ pub struct PersonView {
     user_id: String,
     name: String,
     role: String,
+    /// Their notice key's public half (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 2): what another member seals a notice to them with. Absent
+    /// until they have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<String>,
 }
 
 /// Everyone reaching `root`: the whole-store holders, then its own members
@@ -536,7 +545,8 @@ async fn people_of_scope(state: &AppState, names: &Names, grants: &[GrantRow], r
             continue;
         }
         if let Some(user) = state.db.get_user(grant.user_rid).await? {
-            out.push(PersonView { name: names.name_of(&user, root), user_id: user.user_uuid, role: grant.role.clone() });
+            let notice_key = Some(user.notice_public_key.clone()).filter(|k| !k.is_empty());
+            out.push(PersonView { name: names.name_of(&user, root), user_id: user.user_uuid, role: grant.role.clone(), notice_key });
         }
     }
     Ok(out)
@@ -620,6 +630,7 @@ pub async fn list_members(
                 status: STATUS_ACTIVE,
                 has_key: has_key(&state, grant.user_rid, store.rid, &root).await?,
                 public_keys,
+                notice_key: Some(user.notice_public_key.clone()).filter(|k| !k.is_empty()),
             });
         }
     }
@@ -640,6 +651,7 @@ pub async fn list_members(
                 status: STATUS_INVITED,
                 has_key: false,
                 public_keys: None,
+                notice_key: None,
             });
         }
     }
@@ -840,6 +852,7 @@ async fn grant_member(
         // exactly what they need to wrap the scope's key to the new member
         // without a second round trip.
         public_keys: target.public_keys(),
+        notice_key: Some(target.notice_public_key.clone()).filter(|k| !k.is_empty()),
         email: target.email,
         role: role.to_string(),
         root: root_view(root),
@@ -895,6 +908,7 @@ async fn invite_member(
         status: STATUS_INVITED,
         has_key: false,
         public_keys: None,
+        notice_key: None,
     }))
 }
 

@@ -36,6 +36,7 @@ pub mod logs;
 pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod memory;
+pub mod notices;
 mod people;
 pub mod pictures;
 mod presence;

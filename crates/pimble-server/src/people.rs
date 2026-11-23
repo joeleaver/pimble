@@ -62,7 +62,7 @@ pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedIn
         };
         scopes.push(ScopePeople {
             root,
-            people: listing.people.into_iter().map(|person| Person { user_id: person.user_id, name: person.name }).collect(),
+            people: listing.people.into_iter().map(|person| Person { user_id: person.user_id, name: person.name, notice_key: person.notice_key }).collect(),
             my_name: share.appears_as.clone(),
             my_name_chosen: !share.my_name.trim().is_empty(),
             share_name: share.name.clone(),

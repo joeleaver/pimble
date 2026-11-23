@@ -1691,6 +1691,11 @@ pub struct ScopePeople {
 pub struct Person {
     pub user_id: String,
     pub name: String,
+    /// Their notice key's public half (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 2): what a notice to them is sealed with. `None` until their
+    /// account has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_key: Option<String>,
 }
 
 impl StorePeople {
@@ -1737,7 +1742,7 @@ mod people_tests {
     use super::*;
 
     fn person(id: &str, name: &str) -> Person {
-        Person { user_id: id.into(), name: name.into() }
+        Person { user_id: id.into(), name: name.into(), notice_key: None }
     }
 
     fn scope(root: Option<NodeId>, people: Vec<Person>) -> ScopePeople {
@@ -2216,4 +2221,68 @@ impl<'de> Deserialize<'de> for HandedLink {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenInAppResponse {
     pub delivered: bool,
+}
+
+// ============================================================================
+// Notices, docs/NOTIFICATIONS_CONTRACT.md
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// Someone mentioned you, in a note's text or in a discussion.
+    Mention,
+    /// Someone wrote in a discussion you wrote in.
+    Reply,
+}
+
+/// What one person's device tells another that it wrote to them (section 2),
+/// sealed to the recipient's notice key on the way, opened by the
+/// recipient's own server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    /// Made by the sender; what read state names it by.
+    pub id: String,
+    pub kind: NoticeKind,
+    /// The sender's account.
+    pub from: String,
+    /// The name the sender goes by in that share.
+    pub from_name: String,
+    pub store: StoreId,
+    /// The node the mention is in, or the discussion's host (the discussion
+    /// itself for a standalone one).
+    pub node: NodeId,
+    /// The discussion, for a mention or reply in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discussion: Option<NodeId>,
+    /// Where it points: the mention's id in a note's text, the message's id
+    /// in a discussion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// About 120 characters around the mention, or of the message.
+    pub snippet: String,
+    /// When it was written, RFC 3339.
+    pub at: String,
+}
+
+/// The notices this device has received and still keeps, newest first, and
+/// whether notifications are on for the account.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListNoticesResponse {
+    pub notices: Vec<Notice>,
+    pub on: bool,
+}
+
+/// Notices the person opened: acknowledged to the accounts service, so it
+/// keeps them no longer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcknowledgeNoticesRequest {
+    pub ids: Vec<String>,
+}
+
+/// The switch (section 6), for the whole account: off stops sending and
+/// receiving and deletes what is queued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetNotificationsRequest {
+    pub on: bool,
 }

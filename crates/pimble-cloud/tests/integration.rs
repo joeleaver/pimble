@@ -4423,3 +4423,147 @@ async fn diagnostics_from_a_page_go_on_with_the_key_and_the_account() {
     }
     assert_eq!(seen[0].3, "{\"kind\":\"log\"}\n");
 }
+
+// ── Notices (docs/NOTIFICATIONS_CONTRACT.md, wave 1) ─────────────────────
+
+/// The notice key: made once by the account's own device (its envelope
+/// signed by and sealed to the account), published with the account's other
+/// public keys and to every member of a share; a second, different key is
+/// refused. Then the inbox: a sender in the share queues a sealed notice,
+/// the recipient's long poll hears it, opens it with the notice key, and
+/// acknowledges it; an outsider cannot queue one, a notice through a share
+/// the recipient is not in is refused, and the switch drops what is queued
+/// and keeps new ones out.
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_go_between_members_of_a_share_only_sealed_to_the_notice_key() {
+    let stack = skip_without_rhypedb!();
+    let (_, olga_keys) = signup_with_material(&stack, "olga.notices@example.com", "notices owner password!!").await;
+    let (olga, olga_cookie) = verify_then_login(&stack, "olga.notices@example.com", "notices owner password!!").await;
+    let (_, will_keys) = signup_with_material(&stack, "will.notices@example.com", "notices will password!!").await;
+    let (will, will_cookie) = verify_then_login(&stack, "will.notices@example.com", "notices will password!!").await;
+    let (_cy, cy_cookie) = signup_verify_login(&stack, "cy.notices@example.com", "notices cy password!!").await;
+    let olga_id = olga["user"]["id"].as_str().unwrap().to_string();
+    let will_id = will["user"]["id"].as_str().unwrap().to_string();
+    let store = create_store_with_body(&stack, &olga_cookie, json!({ "name": "Family", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+    let other_root = node_id();
+    let resp = put_member_with(&stack, &olga_cookie, &store_id, json!({ "email": "will.notices@example.com", "role": "editor", "root": root, "name": "Recipes" })).await;
+    assert_eq!(resp.status(), 200);
+
+    let put = |cookie: &str, path: &str, body: Value| stack.http.put(format!("{}{path}", stack.base_url)).header("Cookie", cookie).json(&body).send();
+    let post = |cookie: &str, path: &str, body: Value| stack.http.post(format!("{}{path}", stack.base_url)).header("Cookie", cookie).json(&body).send();
+    let get = |cookie: &str, path: &str| stack.http.get(format!("{}{path}", stack.base_url)).header("Cookie", cookie).send();
+
+    // Each makes a notice key; Will's is refused under Olga's account, and a
+    // second different key is a conflict, the same key again is fine.
+    let will_notice = pimble_crypto::NoticeKey::generate();
+    let will_env = pimble_crypto::wrap_notice_key(&will_notice, &will_keys, &will_id).unwrap();
+    let resp = put(&olga_cookie, "/me/notice-key", json!({ "public_key": will_notice.public(), "envelope": will_env })).await.unwrap();
+    assert_eq!(resp.status(), 400, "an envelope that is not this account's");
+    assert_eq!(put(&will_cookie, "/me/notice-key", json!({ "public_key": will_notice.public(), "envelope": will_env })).await.unwrap().status(), 200);
+    assert_eq!(put(&will_cookie, "/me/notice-key", json!({ "public_key": will_notice.public(), "envelope": will_env })).await.unwrap().status(), 200, "the same key again");
+    let other = pimble_crypto::NoticeKey::generate();
+    let other_env = pimble_crypto::wrap_notice_key(&other, &will_keys, &will_id).unwrap();
+    assert_eq!(put(&will_cookie, "/me/notice-key", json!({ "public_key": other.public(), "envelope": other_env })).await.unwrap().status(), 409);
+    let olga_notice = pimble_crypto::NoticeKey::generate();
+    let olga_env = pimble_crypto::wrap_notice_key(&olga_notice, &olga_keys, &olga_id).unwrap();
+    assert_eq!(put(&olga_cookie, "/me/notice-key", json!({ "public_key": olga_notice.public(), "envelope": olga_env })).await.unwrap().status(), 200);
+
+    // Will's own devices get the envelope back and open it.
+    let keys: Value = get(&will_cookie, "/me/keys").await.unwrap().json().await.unwrap();
+    assert_eq!(keys["notice_key"]["public_key"], will_notice.public());
+    let envelope: pimble_crypto::KeyEnvelope = serde_json::from_value(keys["notice_key"]["envelope"].clone()).unwrap();
+    assert_eq!(pimble_crypto::unwrap_notice_key(&envelope, &will_keys, &will_id, &will_notice.public()).unwrap().secret, will_notice.secret);
+    // The public half: in a lookup and to the share's members.
+    let looked: Value = get(&olga_cookie, "/users/lookup?email=will.notices@example.com").await.unwrap().json().await.unwrap();
+    assert_eq!(looked["notice_key"], will_notice.public());
+    let listing: Value = members_response(&stack, &will_cookie, &store_id, Some(&root)).await.json().await.unwrap();
+    let people = listing["people"].as_array().unwrap();
+    assert!(people.iter().any(|p| p["user_id"] == olga_id.as_str() && p["notice_key"] == olga_notice.public().as_str()), "{people:?}");
+    assert!(listing["members"].as_array().unwrap().iter().any(|m| m["notice_key"] == will_notice.public().as_str()));
+    let me: Value = get(&will_cookie, "/me").await.unwrap().json().await.unwrap();
+    assert_eq!(me["notifications"], true, "on from sign-in");
+
+    // Will waits; Olga notifies him through the share; the wait answers.
+    let sealed = pimble_crypto::seal_notice(br#"{"snippet":"@Will can you check the oven"}"#, &will_notice.public(), &will_id).unwrap();
+    let waiting = {
+        let req = stack.http.get(format!("{}/inbox?after=0&wait=10", stack.base_url)).header("Cookie", &will_cookie);
+        tokio::spawn(async move { req.send().await.unwrap().json::<Value>().await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let resp = post(&olga_cookie, &format!("/inbox/{will_id}"), json!({ "store_id": store_id, "root": root, "sealed": sealed })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let queued: Value = resp.json().await.unwrap();
+    assert_eq!(queued["queued"], true);
+    let drained = tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("the long poll answers when a notice is queued").unwrap();
+    let items = drained["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{drained}");
+    assert_eq!(items[0]["from"], olga_id.as_str(), "the sender as the service authenticated them");
+    assert_eq!(items[0]["root"], root.as_str());
+    let opened = pimble_crypto::open_notice(items[0]["sealed"].as_str().unwrap(), &will_notice, &will_id).unwrap();
+    assert_eq!(opened, br#"{"snippet":"@Will can you check the oven"}"#);
+    let cursor = drained["cursor"].as_u64().unwrap();
+    // After the cursor: nothing (no wait); from the start: still there until acknowledged.
+    let after: Value = get(&will_cookie, &format!("/inbox?after={cursor}")).await.unwrap().json().await.unwrap();
+    assert!(after["items"].as_array().unwrap().is_empty());
+    let again: Value = get(&will_cookie, "/inbox").await.unwrap().json().await.unwrap();
+    assert_eq!(again["items"].as_array().unwrap().len(), 1, "another device of Will's drains it too");
+    let resp = post(&will_cookie, "/inbox/ack", json!({ "ids": [items[0]["id"]] })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let gone: Value = get(&will_cookie, "/inbox").await.unwrap().json().await.unwrap();
+    assert!(gone["items"].as_array().unwrap().is_empty(), "acknowledged: deleted");
+
+    // Cy is in no share: he can neither notify Will nor be notified.
+    let resp = post(&cy_cookie, &format!("/inbox/{will_id}"), json!({ "store_id": store_id, "root": root, "sealed": sealed })).await.unwrap();
+    assert_eq!(resp.status(), 403, "no inbox spam from strangers");
+    // Through a share Will is not in: refused, even from the owner.
+    let resp = post(&olga_cookie, &format!("/inbox/{will_id}"), json!({ "store_id": store_id, "root": other_root, "sealed": sealed })).await.unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = post(&olga_cookie, &format!("/inbox/{will_id}"), json!({ "store_id": store_id, "sealed": sealed })).await.unwrap();
+    assert_eq!(resp.status(), 403, "the whole store is not Will's");
+    // A member notifies the owner through the share: the owner holds the whole store.
+    let to_olga = pimble_crypto::seal_notice(b"{}", &olga_notice.public(), &olga_id).unwrap();
+    let resp = post(&will_cookie, &format!("/inbox/{olga_id}"), json!({ "store_id": store_id, "root": root, "sealed": to_olga })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let olga_inbox: Value = get(&olga_cookie, "/inbox").await.unwrap().json().await.unwrap();
+    assert_eq!(olga_inbox["items"].as_array().unwrap().len(), 1);
+
+    // Olga turns notifications off: what was queued goes, new ones are dropped.
+    assert_eq!(put(&olga_cookie, "/me/notifications", json!({ "on": false })).await.unwrap().status(), 200);
+    let olga_inbox: Value = get(&olga_cookie, "/inbox").await.unwrap().json().await.unwrap();
+    assert!(olga_inbox["items"].as_array().unwrap().is_empty());
+    let resp: Value = post(&will_cookie, &format!("/inbox/{olga_id}"), json!({ "store_id": store_id, "root": root, "sealed": to_olga })).await.unwrap().json().await.unwrap();
+    assert_eq!(resp["queued"], false);
+    assert!(get(&olga_cookie, "/inbox").await.unwrap().json::<Value>().await.unwrap()["items"].as_array().unwrap().is_empty());
+    let me: Value = get(&olga_cookie, "/me").await.unwrap().json().await.unwrap();
+    assert_eq!(me["notifications"], false);
+    assert_eq!(put(&olga_cookie, "/me/notifications", json!({ "on": true })).await.unwrap().status(), 200);
+    let resp: Value = post(&will_cookie, &format!("/inbox/{olga_id}"), json!({ "store_id": store_id, "root": root, "sealed": to_olga })).await.unwrap().json().await.unwrap();
+    assert_eq!(resp["queued"], true);
+
+    // DELETE empties it.
+    assert_eq!(stack.http.delete(format!("{}/inbox", stack.base_url)).header("Cookie", &olga_cookie).send().await.unwrap().status(), 200);
+    assert!(get(&olga_cookie, "/inbox").await.unwrap().json::<Value>().await.unwrap()["items"].as_array().unwrap().is_empty());
+}
+
+/// A sender may queue sixty notices a minute and no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_is_rate_limited() {
+    let stack = skip_without_rhypedb!();
+    let (olga, olga_cookie) = signup_verify_login(&stack, "olga.rate@example.com", "rate owner password!!").await;
+    let (will, _) = signup_verify_login(&stack, "will.rate@example.com", "rate will password!!").await;
+    let _ = olga;
+    let will_id = will["user"]["id"].as_str().unwrap().to_string();
+    let store = create_store_with_body(&stack, &olga_cookie, json!({ "name": "Family", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+    assert_eq!(put_member_with(&stack, &olga_cookie, &store_id, json!({ "email": "will.rate@example.com", "role": "editor", "root": root, "name": "R" })).await.status(), 200);
+    let mut statuses = Vec::new();
+    for _ in 0..=pimble_cloud::routes::inbox::SENDS_PER_WINDOW {
+        let resp = stack.http.post(format!("{}/inbox/{will_id}", stack.base_url)).header("Cookie", &olga_cookie).json(&json!({ "store_id": store_id, "root": root, "sealed": "AQID" })).send().await.unwrap();
+        statuses.push(resp.status().as_u16());
+    }
+    assert!(statuses[..pimble_cloud::routes::inbox::SENDS_PER_WINDOW].iter().all(|s| *s == 200), "{statuses:?}");
+    assert_eq!(*statuses.last().unwrap(), 429);
+}

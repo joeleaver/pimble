@@ -92,6 +92,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# notices.rs's tests build a discussion's document the way the app does.
+yrs = { workspace = true }
 # `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).
 pimble-host = { workspace = true, features = ["test-disk"] }
 # tests/search.rs makes a board node the way the app does (its board written

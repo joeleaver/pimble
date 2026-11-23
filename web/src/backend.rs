@@ -1053,7 +1053,7 @@ async fn people_of(store_id: StoreId) -> Result<pimble_rpc::StorePeople, String>
         let listing = crate::accounts::list_members(&id, share.root.as_deref()).await.map_err(|e| e.message)?;
         scopes.push(pimble_rpc::ScopePeople {
             root: share.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok()),
-            people: listing.people.into_iter().map(|p| pimble_rpc::Person { user_id: p.user_id, name: p.name }).collect(),
+            people: listing.people.into_iter().map(|p| pimble_rpc::Person { user_id: p.user_id, name: p.name, notice_key: None }).collect(),
             my_name: share.appears_as,
             my_name_chosen: !share.my_name.trim().is_empty(),
             share_name: share.name.clone(),

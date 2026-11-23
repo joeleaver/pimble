@@ -740,7 +740,7 @@ mod tests {
         let store = crate::state::AppStore::new();
         let (s, n) = (StoreId::new(), NodeId::new());
         if people {
-            let person = |id: &str, name: &str| pimble_rpc::Person { user_id: id.into(), name: name.into() };
+            let person = |id: &str, name: &str| pimble_rpc::Person { user_id: id.into(), name: name.into(), notice_key: None };
             let scope = pimble_rpc::ScopePeople {
                 root: None,
                 people: vec![person("will", "Will"), person("sam", "Sam"), person("wilma", "Wilma")],

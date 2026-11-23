@@ -122,11 +122,14 @@ pub struct UserView {
     /// What they are called where nothing more particular applies: the
     /// chosen name, else the local part of the email.
     name: String,
+    /// Whether people who share notes with them can notify them
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 6): on from sign-in.
+    notifications: bool,
 }
 
 impl From<&UserRow> for UserView {
     fn from(user: &UserRow) -> Self {
-        Self { id: user.user_uuid.clone(), email: user.email.clone(), display_name: user.display_name.clone(), name: user.default_name() }
+        Self { id: user.user_uuid.clone(), email: user.email.clone(), display_name: user.display_name.clone(), name: user.default_name(), notifications: !user.notifications_off }
     }
 }
 
@@ -360,6 +363,18 @@ pub struct MeKeysResponse {
     public_keys: AccountPublicKeys,
     kdf: KdfParams,
     account_key_blob: AccountKeyBlob,
+    /// The notice key (docs/NOTIFICATIONS_CONTRACT.md section 2), absent
+    /// until the account's first signed-in device of wave 1 makes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<NoticeKeyView>,
+}
+
+/// An account's notice key as its own devices fetch it: the public half and
+/// the secret sealed to the account.
+#[derive(Serialize)]
+pub struct NoticeKeyView {
+    public_key: String,
+    envelope: Value,
 }
 
 /// `GET /api/v1/me/keys` — never the recovery blob (docs/CRYPTO_CONTRACT.md).
@@ -377,7 +392,13 @@ pub async fn me_keys(authed: AuthedUser) -> CloudResult<Json<MeKeysResponse>> {
     let account_key_blob_json = user.account_key_blob.as_deref().ok_or_else(no_keys)?;
     let account_key_blob: AccountKeyBlob =
         serde_json::from_str(account_key_blob_json).map_err(|e| CloudError::Internal(format!("stored account_key_blob is not valid JSON: {e}")))?;
-    Ok(Json(MeKeysResponse { public_keys, kdf, account_key_blob }))
+    let notice_key = if user.notice_public_key.is_empty() {
+        None
+    } else {
+        let envelope = serde_json::from_str(&user.notice_key_envelope).map_err(|e| CloudError::Internal(format!("stored notice key envelope is not valid JSON: {e}")))?;
+        Some(NoticeKeyView { public_key: user.notice_public_key.clone(), envelope })
+    };
+    Ok(Json(MeKeysResponse { public_keys, kdf, account_key_blob, notice_key }))
 }
 
 #[derive(Deserialize)]
@@ -389,6 +410,9 @@ pub struct UsersLookupQuery {
 pub struct UserLookupResponse {
     id: String,
     public_keys: AccountPublicKeys,
+    /// The notice key's public half, absent until the account has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<String>,
 }
 
 /// `GET /api/v1/users/lookup?email=` — a verified user's id and public keys
@@ -411,7 +435,8 @@ pub async fn users_lookup(State(state): State<AppState>, authed: AuthedUser, Que
         .filter(|u| u.verified && u.has_key_material())
         .ok_or_else(|| CloudError::NotFound("no such user".to_string()))?;
     let public_keys = user.public_keys().ok_or_else(|| CloudError::Internal("user has key material but public_keys() failed".to_string()))?;
-    Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys }))
+    let notice_key = Some(user.notice_public_key.clone()).filter(|k| !k.is_empty());
+    Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys, notice_key }))
 }
 
 // ── Recovery (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ─────────────────────
@@ -603,6 +628,9 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
         state.db.delete_session(session.rid).await?;
     }
     state.db.delete_share_names_for_user(user.rid).await?;
+    for item in state.db.inbox_of(&user.user_uuid).await? {
+        state.db.delete_inbox_item(item.rid).await?;
+    }
     state.db.delete_user(user.rid).await?;
 
     Ok(Json(json!({})))

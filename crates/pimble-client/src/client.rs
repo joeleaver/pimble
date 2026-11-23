@@ -1143,6 +1143,32 @@ impl PimbleClient {
             .map_err(rpc_error)
     }
 
+    /// The notices this device has received, newest first, and whether
+    /// notifications are on (docs/NOTIFICATIONS_CONTRACT.md).
+    pub async fn list_notices(&self) -> Result<pimble_rpc::ListNoticesResponse> {
+        self.client.list_notices().await.map_err(rpc_error)
+    }
+
+    /// The person opened these notices.
+    pub async fn acknowledge_notices(&self, ids: Vec<String>) -> Result<()> {
+        self.client.acknowledge_notices(pimble_rpc::AcknowledgeNoticesRequest { ids }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Turn notifications on or off for the signed-in account.
+    pub async fn set_notifications(&self, on: bool) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Hear each notice as it arrives, opened.
+    pub async fn subscribe_notices(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::Notice>> {
+        self.client
+            .subscribe::<pimble_rpc::Notice, _>("pimble_subscribeNotices", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeNotices")
+            .await
+            .map_err(rpc_error)
+    }
+
     /// Hear how this computer's connections to Pimble Cloud are doing, the
     /// first at once and then each change; `None` while signed out.
     pub async fn subscribe_cloud_connection(&self) -> Result<jsonrpsee::core::client::Subscription<Option<pimble_rpc::CloudConnection>>> {

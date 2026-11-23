@@ -206,6 +206,22 @@ pub struct StubAccount {
     pub account_public_keys: pimble_crypto::AccountPublicKeys,
     /// The default name chosen (docs/PRESENCE_CONTRACT.md section 3).
     pub display_name: String,
+    /// The notice key's public half and envelope, once a device made it
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 2).
+    pub notice_key: Option<(String, KeyEnvelope)>,
+    pub notifications_off: bool,
+}
+
+/// One sealed notice queued in the stub's inbox.
+#[derive(Clone, Debug)]
+pub struct StubInboxItem {
+    pub seq: u64,
+    pub id: String,
+    pub recipient: String,
+    pub from: String,
+    pub store_id: String,
+    pub root: Option<String>,
+    pub sealed: String,
 }
 
 pub struct StubInner {
@@ -225,6 +241,11 @@ pub struct StubInner {
     /// The names chosen per (user, store, root) (docs/PRESENCE_CONTRACT.md
     /// section 3).
     pub share_names: HashMap<(String, String, Option<String>), String>,
+    /// Notices queued (docs/NOTIFICATIONS_CONTRACT.md section 2), and every
+    /// one ever posted (sender, recipient), for a test to count.
+    pub inbox: Vec<StubInboxItem>,
+    pub posted: Vec<(String, String)>,
+    pub next_seq: u64,
 }
 
 pub struct Stub {
@@ -235,6 +256,8 @@ pub struct Stub {
     pub refuse_sessions: AtomicBool,
     /// How many times `/token` was asked.
     pub token_calls: std::sync::atomic::AtomicUsize,
+    /// Wakes a waiting inbox drain.
+    pub inbox_wake: tokio::sync::Notify,
 }
 
 pub type StubState = Arc<Stub>;
@@ -253,6 +276,11 @@ pub fn stub_router(state: StubState) -> Router {
         .route("/api/v1/stores/{store_id}/members", get(stub_list_members).put(stub_put_member))
         .route("/api/v1/stores/{store_id}/members/{user_id}", delete(stub_delete_member))
         .route("/api/v1/stores/{store_id}/invitations/{email}", delete(stub_delete_invitation))
+        .route("/api/v1/me/notice-key", axum::routing::put(stub_put_notice_key))
+        .route("/api/v1/me/notifications", axum::routing::put(stub_put_notifications))
+        .route("/api/v1/inbox", get(stub_drain_inbox).delete(stub_clear_inbox))
+        .route("/api/v1/inbox/ack", post(stub_ack_inbox))
+        .route("/api/v1/inbox/{recipient}", post(stub_post_notice))
         .route("/jwks.json", get(stub_jwks))
         .with_state(state)
 }
@@ -326,7 +354,116 @@ pub async fn stub_login(State(state): State<StubState>, Json(req): Json<serde_js
 pub async fn stub_me_keys(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let s = state.inner.lock().unwrap();
     let account = s.account_of(&headers);
-    Json(json!({ "public_keys": account.account_public_keys, "kdf": account.kdf, "account_key_blob": account.account_key_blob }))
+    let notice_key = account.notice_key.as_ref().map(|(public, envelope)| json!({ "public_key": public, "envelope": envelope }));
+    Json(json!({ "public_keys": account.account_public_keys, "kdf": account.kdf, "account_key_blob": account.account_key_blob, "notice_key": notice_key }))
+}
+
+// ── Notices (docs/NOTIFICATIONS_CONTRACT.md), as the real service keeps them ──
+
+pub async fn stub_put_notice_key(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let public = req["public_key"].as_str().unwrap_or_default().to_string();
+    let envelope: KeyEnvelope = serde_json::from_value(req["envelope"].clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let account = s.accounts.iter_mut().find(|a| a.user_id == user_id).unwrap();
+    if envelope.recipient != account.account_public_keys.encryption || pimble_crypto::verify_envelope(&envelope, &account.account_public_keys.signing).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match &account.notice_key {
+        Some((held, _)) if *held != public => Err(StatusCode::CONFLICT),
+        _ => {
+            account.notice_key = Some((public.clone(), envelope));
+            Ok(Json(json!({ "public_key": public })))
+        }
+    }
+}
+
+pub async fn stub_put_notifications(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let on = req["on"].as_bool().unwrap_or(true);
+    if let Some(a) = s.accounts.iter_mut().find(|a| a.user_id == user_id) {
+        a.notifications_off = !on;
+    }
+    if !on {
+        s.inbox.retain(|i| i.recipient != user_id);
+    }
+    Json(json!({ "on": on }))
+}
+
+impl StubInner {
+    /// Whether `user_id` reaches the scope `root` of `store_id`.
+    pub fn reaches(&self, user_id: &str, store_id: &str, root: &Option<String>) -> bool {
+        self.stores.iter().any(|row| row.user_id == user_id && row.store_id == store_id && (row.root.is_none() || (root.is_some() && row.root == *root)))
+    }
+}
+
+pub async fn stub_post_notice(
+    State(state): State<StubState>,
+    AxPath(recipient): AxPath<String>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut s = state.inner.lock().unwrap();
+    let from = s.account_of(&headers).user_id.clone();
+    let store_id = req["store_id"].as_str().unwrap_or_default().to_string();
+    let root = req["root"].as_str().map(str::to_string);
+    if !s.reaches(&from, &store_id, &root) || !s.reaches(&recipient, &store_id, &root) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    s.posted.push((from.clone(), recipient.clone()));
+    if s.accounts.iter().any(|a| a.user_id == recipient && a.notifications_off) {
+        return Ok(Json(json!({ "id": null, "queued": false })));
+    }
+    s.next_seq += 1;
+    let item = StubInboxItem { seq: s.next_seq, id: Uuid::new_v4().to_string(), recipient, from, store_id, root, sealed: req["sealed"].as_str().unwrap_or_default().to_string() };
+    let id = item.id.clone();
+    s.inbox.push(item);
+    drop(s);
+    state.inbox_wake.notify_waiters();
+    Ok(Json(json!({ "id": id, "queued": true })))
+}
+
+fn stub_items_after(s: &StubInner, me: &str, after: u64) -> Vec<StubInboxItem> {
+    s.inbox.iter().filter(|i| i.recipient == me && i.seq > after).cloned().collect()
+}
+
+pub async fn stub_drain_inbox(State(state): State<StubState>, headers: HeaderMap, Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+    let after: u64 = query.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+    let wait: u64 = query.get("wait").and_then(|a| a.parse().ok()).unwrap_or(0).min(25);
+    let me = state.inner.lock().unwrap().account_of(&headers).user_id.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    let items = loop {
+        let notified = state.inbox_wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let items = stub_items_after(&state.inner.lock().unwrap(), &me, after);
+        if !items.is_empty() || tokio::time::Instant::now() >= deadline {
+            break items;
+        }
+        let _ = tokio::time::timeout_at(deadline, notified).await;
+    };
+    let cursor = items.iter().map(|i| i.seq).max().unwrap_or(after);
+    let items: Vec<_> = items
+        .iter()
+        .map(|i| json!({ "id": i.id, "seq": i.seq, "from": i.from, "store_id": i.store_id, "root": i.root, "sealed": i.sealed, "at": chrono::Utc::now().to_rfc3339() }))
+        .collect();
+    Json(json!({ "items": items, "cursor": cursor }))
+}
+
+pub async fn stub_ack_inbox(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let me = s.account_of(&headers).user_id.clone();
+    let ids: Vec<String> = req["ids"].as_array().cloned().unwrap_or_default().into_iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+    s.inbox.retain(|i| !(i.recipient == me && ids.contains(&i.id)));
+    Json(json!({}))
+}
+
+pub async fn stub_clear_inbox(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let me = s.account_of(&headers).user_id.clone();
+    s.inbox.retain(|i| i.recipient != me);
+    Json(json!({}))
 }
 
 /// The token as the accounts service mints it: a role for a store held
@@ -507,7 +644,8 @@ pub async fn stub_list_members(
     let mut seen = std::collections::HashSet::new();
     for row in s.stores.iter().filter(|row| row.store_id == store_id && (row.root.is_none() || (root.is_some() && row.root == root))) {
         if seen.insert(row.user_id.clone()) {
-            people.push(json!({ "user_id": row.user_id, "name": s.name_in(&row.user_id, &store_id, &root), "role": row.role }));
+            let notice_key = s.accounts.iter().find(|a| a.user_id == row.user_id).and_then(|a| a.notice_key.as_ref().map(|(public, _)| public.clone()));
+            people.push(json!({ "user_id": row.user_id, "name": s.name_in(&row.user_id, &store_id, &root), "role": row.role, "notice_key": notice_key }));
         }
     }
     Ok(Json(json!({ "members": members, "share_name": share_name, "people": people })))
@@ -517,7 +655,7 @@ pub async fn stub_me(State(state): State<StubState>, headers: HeaderMap) -> Json
     let s = state.inner.lock().unwrap();
     let a = s.account_of(&headers);
     let name = if a.display_name.is_empty() { a.email.split('@').next().unwrap_or_default().to_string() } else { a.display_name.clone() };
-    Json(json!({ "id": a.user_id, "email": a.email, "display_name": a.display_name, "name": name }))
+    Json(json!({ "id": a.user_id, "email": a.email, "display_name": a.display_name, "name": name, "notifications": !a.notifications_off }))
 }
 
 pub async fn stub_put_me(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -695,6 +833,8 @@ pub fn stub_account(email: &str, password: &str) -> StubAccount {
         account_key_blob,
         account_public_keys: account_keys.public_keys(),
         display_name: String::new(),
+        notice_key: None,
+        notifications_off: false,
     }
 }
 
@@ -867,10 +1007,14 @@ pub async fn spawn_env() -> Env {
             h_stores_dir: h_stores_dir.clone(),
             sharing_calls: 0,
             share_names: HashMap::new(),
+            inbox: Vec::new(),
+            posted: Vec::new(),
+            next_seq: 0,
         }),
         members_down: AtomicBool::new(false),
         refuse_sessions: AtomicBool::new(false),
         token_calls: std::sync::atomic::AtomicUsize::new(0),
+        inbox_wake: tokio::sync::Notify::new(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -373,6 +373,24 @@ pub trait PimbleApi {
     #[method(name = "openInApp", with_extensions)]
     async fn open_in_app(&self, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned>;
 
+    /// The notices this device has received (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 5), and whether notifications are on. `Service`-only, as are
+    /// the three below.
+    #[method(name = "listNotices", with_extensions)]
+    async fn list_notices(&self) -> Result<ListNoticesResponse, ErrorObjectOwned>;
+
+    /// The person opened these notices: the accounts service may forget them.
+    #[method(name = "acknowledgeNotices", with_extensions)]
+    async fn acknowledge_notices(&self, request: AcknowledgeNoticesRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Turn notifications on or off for the signed-in account.
+    #[method(name = "setNotifications", with_extensions)]
+    async fn set_notifications(&self, request: SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Hear each notice as it arrives, opened.
+    #[subscription(name = "subscribeNotices" => "noticeReceived", unsubscribe = "unsubscribeNotices", item = Notice, with_extensions)]
+    async fn subscribe_notices(&self) -> SubscriptionResult;
+
     /// A Pimble window hears the links `openInApp` hands it, each with the
     /// activation token it came with, if any. `Service`-only.
     #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = HandedLink, with_extensions)]

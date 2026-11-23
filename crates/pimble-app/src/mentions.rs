@@ -353,7 +353,7 @@ pub(crate) fn box_pick(ui: crate::discussions::DiscussionUi, person: &Person) {
 mod tests {
     use super::*;
     fn person(id: &str, name: &str) -> Person {
-        Person { user_id: id.into(), name: name.into() }
+        Person { user_id: id.into(), name: name.into(), notice_key: None }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod accounts;
 mod diagnostics;
+pub mod inbox;
 mod misc;
 mod people;
 mod stores;
@@ -8,6 +9,8 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::state::AppState;
+
+pub use inbox::InboxWakers;
 
 /// Everything under `/api/v1` (docs/CLOUD_CONTRACT.md: "serving under
 /// `/api/v1`", including `/health` and `/.well-known/jwks.json` — see
@@ -26,6 +29,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/me/shares/:store_id", axum::routing::put(people::put_share_name))
         .route("/api/v1/me/keys", get(accounts::me_keys))
         .route("/api/v1/me/personal", get(accounts::get_personal).put(accounts::put_personal).delete(accounts::delete_personal))
+        .route("/api/v1/me/notice-key", axum::routing::put(inbox::put_notice_key))
+        .route("/api/v1/me/notifications", axum::routing::put(inbox::put_notifications))
+        .route("/api/v1/inbox", get(inbox::drain).delete(inbox::clear))
+        .route("/api/v1/inbox/ack", post(inbox::ack))
+        .route("/api/v1/inbox/:recipient", post(inbox::post_notice))
         .route("/api/v1/me/password", post(accounts::change_password))
         .route("/api/v1/me/recovery-code", post(accounts::change_recovery_code))
         .route("/api/v1/users/lookup", get(accounts::users_lookup))

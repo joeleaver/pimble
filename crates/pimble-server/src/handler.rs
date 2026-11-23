@@ -134,6 +134,15 @@ fn is_link_client(client_id: &str) -> bool {
     client_id.starts_with("sync-link:") || client_id.starts_with("vault-link:")
 }
 
+/// Whether a call's writes are this device's own: the operator's (the app,
+/// the CLI, an MCP server on loopback) or an agent's acting for the account
+/// signed in here. A member connected with their own token (to a hosted
+/// server, a relay face) writes on their own device, which notifies for
+/// them (docs/NOTIFICATIONS_CONTRACT.md section 1).
+fn writes_here(ext: &Extensions, principal: &Principal) -> bool {
+    matches!(principal, Principal::Service) || ext.get::<crate::agents::AgentConnection>().is_some()
+}
+
 /// The documents a principal scoped to `roots` reaches in `store_id`
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5): a vault store's published
 /// scope sets (the server holds no tree of it, so the owner's devices say
@@ -1289,6 +1298,8 @@ pub struct RpcHandler {
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The Pimble windows hearing `openInApp`, oldest first.
     app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<HandedLink>>>>,
+    /// Notices sent and received (docs/NOTIFICATIONS_CONTRACT.md, `crate::notices`).
+    notices: Arc<crate::notices::Notices>,
     /// Which pictures each document names, per its state vector
     /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
     pictures: Arc<crate::pictures::PictureRefs>,
@@ -1417,6 +1428,7 @@ impl RpcHandler {
             link_faults: None,
             relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), runtime.clone(), relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(disk.clone())),
+            notices: Arc::new(crate::notices::Notices::new(crate::notices::Notices::beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -2125,6 +2137,42 @@ impl RpcHandler {
 
     pub(crate) fn relay(&self) -> &crate::relay_face::RelayHost {
         &self.relay
+    }
+
+    /// This server's notices (`crate::notices`).
+    pub(crate) fn notices(&self) -> Arc<crate::notices::Notices> {
+        Arc::clone(&self.notices)
+    }
+
+    /// Start, or start again, receiving and sending notices for whoever is
+    /// signed in (`PimbleServer::start`, sign-in and out).
+    pub fn restart_notices(&self) {
+        self.notices.restart(self);
+    }
+
+    /// Stop the notices' work (the server stops).
+    pub fn stop_notices(&self) {
+        self.notices.stop();
+    }
+
+    /// A person (or their agent) wrote `node_id` here: the notices the write
+    /// calls for go out (docs/NOTIFICATIONS_CONTRACT.md section 1). `before`
+    /// is the whole document before the write, `None` for one it made; what
+    /// it is after is read now. Off the request's path.
+    pub(crate) fn notice_write(&self, store_id: StoreId, node_id: NodeId, before: Option<Vec<u8>>) {
+        let handler = self.clone();
+        self.runtime.spawn(async move {
+            let after = {
+                let manager = handler.store_manager.read().await;
+                let Ok(tree) = manager.tree(store_id) else { return };
+                let Some(doc) = tree.doc(node_id) else { return };
+                doc.save()
+            };
+            let found = handler.runtime.run_heavy(move || crate::notices::candidates(node_id, before.as_deref(), &after)).await.unwrap_or_default();
+            if !found.is_empty() {
+                handler.notices.queue(&handler, store_id, found).await;
+            }
+        });
     }
 
     /// `store_id`'s vault link state; `None` when it has no vault link.
@@ -4087,6 +4135,8 @@ impl PimbleApiServer for RpcHandler {
         // A tunnel to the relay is opened with the account's session.
         self.relay.account_changed(self).await;
         self.cloud_changed();
+        // The notice key, the inbox and the outbox are the account's.
+        self.notices.restart(self);
 
         Ok(EmptyResponse {})
     }
@@ -4098,6 +4148,7 @@ impl PimbleApiServer for RpcHandler {
         // Nothing is served to anyone on a session that was given up.
         self.relay.account_changed(self).await;
         self.cloud_changed();
+        self.notices.restart(self);
         Ok(EmptyResponse {})
     }
 
@@ -4215,6 +4266,50 @@ impl PimbleApiServer for RpcHandler {
                 tokio::select! {
                     changed = changes.changed() => if changed.is_err() { break },
                     changed = tunnel.changed() => if changed.is_err() { break },
+                    _ = sink.closed() => break,
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn list_notices(&self, ext: &Extensions) -> Result<pimble_rpc::ListNoticesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listNotices")?;
+        Ok(self.notices.list(self).await)
+    }
+
+    async fn acknowledge_notices(&self, ext: &Extensions, request: pimble_rpc::AcknowledgeNoticesRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "acknowledgeNotices")?;
+        self.notices.acknowledge(self, &request.ids).await;
+        Ok(EmptyResponse {})
+    }
+
+    async fn set_notifications(&self, ext: &Extensions, request: pimble_rpc::SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setNotifications")?;
+        self.notices.set_on(self, request.on).await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn subscribe_notices(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeNotices") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let mut notices = self.notices.subscribe();
+        self.runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    notice = notices.recv() => match notice {
+                        Ok(notice) => {
+                            let Ok(msg) = SubscriptionMessage::from_json(&notice) else { break };
+                            if sink.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
                     _ = sink.closed() => break,
                 }
             }
@@ -4974,6 +5069,7 @@ impl PimbleApiServer for RpcHandler {
             request.node_type, request.title, request.store_id
         );
 
+        let notices_wanted = writes_here(ext, &principal) && request.content.is_some();
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;
         // What the node starts with goes in with the create, one edit
@@ -5012,6 +5108,9 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::NodeCreated { node_id, parent_id })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        if notices_wanted {
+            self.notice_write(request.store_id, node_id, None);
+        }
 
         Ok(CreateNodeResponse { node_id })
     }
@@ -5026,6 +5125,7 @@ impl PimbleApiServer for RpcHandler {
         self.reject_if_vault(request.store_id).await?;
         info!("Creating {} attachment of node {} in store {}", request.node_type, request.host_id, request.store_id);
 
+        let notices_wanted = writes_here(ext, &principal) && request.content.is_some();
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;
         if let Some(content) = &request.content {
@@ -5060,6 +5160,9 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::AttachmentChanged { node_id, host_id, live: true })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        if notices_wanted {
+            self.notice_write(request.store_id, node_id, None);
+        }
         Ok(CreateNodeResponse { node_id })
     }
 
@@ -6125,9 +6228,16 @@ impl PimbleApiServer for RpcHandler {
             .decode(changes)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
 
+        // A write of this device's (a person's, or their agent's) may tell
+        // someone they were written to: the document as it was, kept when
+        // the write could (`crate::notices`).
+        let mut notice_before: Option<Option<Vec<u8>>> = None;
         {
             let manager = self.store_manager.read().await;
             let held = manager.tree(request.store_id).is_ok_and(|tree| tree.doc(request.node_id).is_some());
+            if writes_here(ext, &principal) && !is_link_client(&request.client_id) && (crate::notices::may_mention(&bytes) || (held && manager.is_discussion(request.store_id, request.node_id))) {
+                notice_before = Some(manager.tree(request.store_id).ok().and_then(|tree| tree.doc(request.node_id)).map(|doc| doc.save()));
+            }
             // A document the store holds is judged by where it is; one it
             // does not hold yet, by the parent its first update names (a
             // create is the node's document and the parent's list, and a
@@ -6177,6 +6287,11 @@ impl PimbleApiServer for RpcHandler {
         // travels as its own update.
         if (effect.content || effect.data) && !is_link_client(&request.client_id) {
             self.note_content_edit(request.store_id, request.node_id);
+        }
+        if let Some(before) = notice_before {
+            if effect.changed {
+                self.notice_write(request.store_id, request.node_id, before);
+            }
         }
 
         Ok(ApplyEditResponse {})

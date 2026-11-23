@@ -160,6 +160,78 @@ pub struct MeKeysResponse {
     pub public_keys: AccountPublicKeys,
     pub kdf: KdfParams,
     pub account_key_blob: AccountKeyBlob,
+    /// The account's notice key, once one of its devices made it.
+    #[serde(default)]
+    pub notice_key: Option<NoticeKeyView>,
+}
+
+#[derive(Deserialize)]
+pub struct NoticeKeyView {
+    pub public_key: String,
+    pub envelope: KeyEnvelope,
+}
+
+// ── Notices (docs/NOTIFICATIONS_CONTRACT.md) ──────────────────────────────
+
+/// `PUT /api/v1/me/notice-key`: `Ok(false)` when the account already has a
+/// different one (another device made it first).
+pub async fn put_notice_key(http: &dyn Http, base_url: &str, session: &str, public_key: &str, envelope: &KeyEnvelope) -> Result<bool> {
+    let body = serde_json::json!({ "public_key": public_key, "envelope": envelope });
+    match put::<_, serde_json::Value>(http, &endpoint(base_url, "/api/v1/me/notice-key"), session, &body).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.status() == Some(409) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn put_notifications(http: &dyn Http, base_url: &str, session: &str, on: bool) -> Result<()> {
+    let _: serde_json::Value = put(http, &endpoint(base_url, "/api/v1/me/notifications"), session, &serde_json::json!({ "on": on })).await?;
+    Ok(())
+}
+
+/// What `POST /api/v1/inbox/{recipient}` answers: whether it was kept (it is
+/// not when the recipient turned notifications off).
+#[derive(Debug, Deserialize)]
+pub struct PostedNotice {
+    #[serde(default)]
+    pub queued: bool,
+}
+
+pub async fn post_notice(http: &dyn Http, base_url: &str, session: &str, recipient: &str, store_id: &str, root: Option<&str>, sealed: &str) -> Result<PostedNotice> {
+    let body = serde_json::json!({ "store_id": store_id, "root": root, "sealed": sealed });
+    post(http, &endpoint(base_url, &format!("/api/v1/inbox/{recipient}")), Some(session), &body).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboxItem {
+    pub id: String,
+    #[allow(dead_code)]
+    pub seq: u64,
+    pub from: String,
+    #[allow(dead_code)]
+    pub store_id: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub root: Option<String>,
+    pub sealed: String,
+    #[allow(dead_code)]
+    pub at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InboxBody {
+    pub items: Vec<InboxItem>,
+    pub cursor: u64,
+}
+
+/// `GET /api/v1/inbox?after=&wait=`: waits up to `wait` seconds for an item.
+pub async fn drain_inbox(http: &dyn Http, base_url: &str, session: &str, after: u64, wait: u64) -> Result<InboxBody> {
+    get(http, &endpoint(base_url, &format!("/api/v1/inbox?after={after}&wait={wait}")), Some(session)).await
+}
+
+pub async fn ack_inbox(http: &dyn Http, base_url: &str, session: &str, ids: &[String]) -> Result<()> {
+    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/inbox/ack"), Some(session), &serde_json::json!({ "ids": ids })).await?;
+    Ok(())
 }
 
 pub async fn me_keys(http: &dyn Http, base_url: &str, session: &str) -> Result<MeKeysResponse> {
@@ -581,6 +653,9 @@ pub struct PersonView {
     pub name: String,
     #[serde(default)]
     pub role: String,
+    /// Their notice key's public half (docs/NOTIFICATIONS_CONTRACT.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_key: Option<String>,
 }
 
 // ── Names (docs/PRESENCE_CONTRACT.md section 3) ───────────────────────────
@@ -596,6 +671,15 @@ pub struct MeView {
     /// What the account is called where nothing more particular applies.
     #[serde(default)]
     pub name: String,
+    /// Whether notifications are on for the account
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 6); a service from before
+    /// them says nothing, and they are on.
+    #[serde(default = "on")]
+    pub notifications: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 pub async fn me(http: &dyn Http, base_url: &str, session: &str) -> Result<MeView> {

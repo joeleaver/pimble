@@ -74,6 +74,17 @@ type User {
     // every row from before the field; read optional), when the local part
     // of their email stands in.
     display_name: String
+    // docs/NOTIFICATIONS_CONTRACT.md section 2: the account's notice key, an
+    // X25519 key pair used for notices and nothing else. The public half
+    // (base64url) is published with the other public keys; the envelope is
+    // the secret sealed to the account itself (a `pimble_crypto::KeyEnvelope`
+    // as JSON, opaque here, like `KeyGrant.envelope`). Both empty or absent
+    // until the account's first signed-in device of wave 1 makes one.
+    notice_public_key: String
+    notice_key_envelope: String
+    // Section 6: notifications are on from sign-in; `true` once the person
+    // turns them off (absent on every row from before: on).
+    notifications_off: Bool
 }
 
 type Session {
@@ -231,4 +242,23 @@ type PersonalDoc {
     blob: String
     version: u64
     updated_at: DateTime
+}
+
+// A sealed notice waiting in its recipient's inbox
+// (docs/NOTIFICATIONS_CONTRACT.md section 2). The service knows who sent it
+// to whom, about which share (store and root, `""` for a whole store), and
+// when; `sealed` is opaque to it. Undelivered items older than a day are
+// dropped rather than delivered late; delivered ones go when acknowledged,
+// or seven days after their first delivery. `item_uuid` is what devices name
+// it by; the row's own id orders a recipient's items (the drain's cursor).
+type InboxItem {
+    item_uuid: String @unique
+    recipient_uuid: String @indexed
+    sender_uuid: String
+    store_uuid: String
+    root: String
+    sealed: String
+    created_at: DateTime
+    delivered: Bool
+    delivered_at: DateTime
 }
