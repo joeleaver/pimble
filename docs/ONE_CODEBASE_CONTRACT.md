@@ -608,3 +608,129 @@ again); the device id survives because `devices.json` is untouched.
 - Not done: the fault test's crash is the whole device's (a process crash); a crash between a
   document's write and its `fsync` on power loss is not simulated. The browser's vault client
   (`web/src/vault.rs`) keeps its cursors in memory and is unchanged (waves 4-5).
+
+## Built: wave 1 (2026-11-22, not merged or released)
+
+Seam A, desktop only: the handler apart from its transport. `pimble-rpc`, `pimble-rpc-macros`
+(new), `pimble-server`, `pimble-client`.
+
+### The dispatch
+
+`crates/pimble-rpc/src/dispatch.rs` (with `dispatch/native.rs` and `dispatch/session.rs`):
+
+- `PimbleApiServer`: the trait a server implements, the same method signatures as before
+  (`&self`, `ext: &Extensions` when the method declares `with_extensions`, its arguments,
+  `Result<R, ErrorObjectOwned>`). A subscription takes `pimble_rpc::dispatch::PendingSubscriptionSink`
+  in place of jsonrpsee-server's and returns `dispatch::SubscriptionResult`. `Send + Sync`
+  natively (`#[async_trait]`), not on wasm32 (`#[async_trait(?Send)]`).
+- `dispatch::call(server, ext, method, params) -> Result<Box<RawValue>, ErrorObjectOwned>`: a
+  wire name (`pimble_applyEdit`) and the raw params in, the bytes of the wire's `result` (serde_json
+  of the method's answer, as jsonrpsee writes it) or the error out; an unknown name is `-32601`.
+- `dispatch::subscribe(Arc<server>, ext, method, params) -> Option<Subscribing>`: the server's
+  subscribe future (`run`), and an `Opening` with the server's `Decision` (accept or reject) and
+  the receiver of its `SubscriptionMessage`s. `SubscriptionSink` (`send`, `is_closed`, `closed`)
+  and `PendingSubscriptionSink` (`accept`, `reject`) are tokio `sync` channels, which build for
+  wasm32; dropping the receiver is what the server reads as the subscriber gone.
+- The principal is the caller's: `Extensions` (`http::Extensions`, the type jsonrpsee hands its
+  methods) carrying the `Principal`, attached by whatever transport took the call.
+- `dispatch::METHODS`: every wire name, with its kind (a call, or a subscription with its
+  notification and unsubscribe names).
+- `dispatch::native::into_rpc` (native only, and the trait's provided `into_rpc()`): jsonrpsee's
+  `RpcModule`, one registration per `METHODS` entry, each calling the dispatch. A subscription's
+  decision is carried out on jsonrpsee's own pending sink and its messages forwarded to
+  jsonrpsee's sink until either side goes. `PimbleServer::start` serves this module behind the
+  same HTTP edge (`AuthLayer`), so auth and the principal reach every RPC as before.
+- `dispatch::session::serve(server, ext, ServerEnd)` / `serve_with(server, ext, stream, send)`: a
+  whole JSON-RPC connection over text in and text out: calls, batches of calls, subscriptions,
+  notifications, unsubscribes, all polled inside its one future (no `spawn`, no clock).
+  `session::channel()` makes an in-process pair.
+- `PimbleClient::in_process(ClientEnd)` (`crates/pimble-client/src/in_process.rs`): the same
+  `PimbleClient` over that channel pair, a jsonrpsee `Client` built with `build_with_tokio`
+  natively and `build_with_wasm` on wasm32 (`TransportSenderT`/`TransportReceiverT` over the
+  channels). `PimbleServer::start_in_process()` builds the handler without binding a port, and
+  `PimbleServer::connect_in_process(ext)` serves one connection on a task and answers its client.
+
+### One list of methods
+
+`methods.rs`'s trait is still the list, written with jsonrpsee's `#[method]`/`#[subscription]`
+attributes. `#[pimble_api(namespace = "pimble")]` (`crates/pimble-rpc-macros`, a proc macro)
+reads it and emits the trait under jsonrpsee's `#[rpc(client, namespace = "pimble")]` (the
+client is generated exactly as before), `PimbleApiServer`, `METHODS`, and the two dispatch
+functions (`__call`, `__subscribe`), every one from the same items. A name defined twice is a
+compile error; an attribute key the macro does not dispatch (aliases, blocking methods,
+`param_kind`) is a compile error rather than half-honored. Params are decoded as jsonrpsee's
+server macro decodes them (its `render_params_decoding`, over the same `jsonrpsee_types::Params`):
+a JSON array by position with `optional_next` for an `Option`, a JSON object by name with
+snake_case and lowerCamelCase aliases, the same `-32602` errors. The test
+`pimble-rpc` `dispatch::tests::every_method_of_the_trait_is_dispatched` reads `methods.rs` as
+text and fails unless every `#[method(name = ...)]` and `#[subscription(name = ...)]` it spells
+out is in `METHODS` with the right kind, and every unsubscribe too.
+
+### Changes by file
+
+- `Cargo.toml`: the `pimble-rpc-macros` member.
+- `crates/pimble-rpc-macros/` (new): the macro.
+- `crates/pimble-rpc/Cargo.toml`: the macro, `async-trait`, `futures`, `tokio` (`sync`,
+  `macros`), `http`, serde_json's `raw_value`.
+- `crates/pimble-rpc/src/methods.rs`: `#[pimble_api]` in place of the two `cfg_attr(rpc(...))`;
+  the trait's items are unchanged. `lib.rs`: `pub mod dispatch`.
+- `crates/pimble-rpc/src/dispatch.rs`, `dispatch/native.rs`, `dispatch/session.rs` (new).
+- `crates/pimble-server/src/handler.rs`: the sink types from `pimble_rpc::dispatch` (imports
+  only; no method changed). `presence.rs`: the same.
+- `crates/pimble-server/src/server.rs`: the handler's construction moved out of `start` into
+  `make_handler` (unchanged); `start_in_process`, `connect_in_process`. A server with no port
+  says `hands_over: false`.
+- `crates/pimble-client/`: `in_process.rs` (new), `PimbleClient::from_rpc_client`, `tokio`
+  (`sync`).
+- `crates/pimble-server/tests/in_process.rs` (new).
+
+### Proof
+
+- `crates/pimble-server/tests/in_process.rs`: a server started with no port, reached through
+  `PimbleClient::in_process`: a store created, closed and opened again, a node read, an
+  `applyEdit` by one connection heard as `ContentUpdated` (with its `source_client_id`) by
+  another's `subscribeStoreChanges`, an unsubscribe answered; a reader principal reads and
+  subscribes, and is refused a write with `READ_ONLY_REFUSAL` as the whole message, a store
+  it has no grant on (read and subscription) and a `Service`-only method (`-32004`); and the
+  same fifteen requests (unknown method, bad, missing and named params, reads, a refused and an
+  accepted write, a failing `createStore`, a bad and a refused subscription, an unknown
+  unsubscribe, `serverInfo`) answered by jsonrpsee's path (`into_rpc().raw_json_request`) and
+  by the session give the same bytes, for a service and for a reader principal (subscription
+  ids aside: jsonrpsee draws a random integer, the session counts).
+- **Byte-for-byte with the code before**: a capture test (not kept) sent 21 requests per
+  principal plus a subscription and an edit's notification through `into_rpc().raw_json_request`
+  on this tree and on `884b834` in a scratch worktree; with only what differs per run masked
+  (timestamps, yrs bytes, uuids, subscription ids, the index's progress), the 43 answers and
+  notifications were identical, keys in the same order.
+- `cargo test --release -p pimble-server -p pimble-rpc -p pimble-client`: 312 passed, 0
+  failed, 1 ignored (every pimble-server test file unchanged, `test_isolation.rs` included,
+  plus `in_process.rs`). The existing tests that call `handler.into_rpc()` and
+  `RpcModule::call`/`subscribe_unbounded` now go through the dispatch.
+- `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp`: builds.
+- `cargo check --target wasm32-unknown-unknown -p pimble-rpc -p pimble-client` and
+  `cd web && cargo check --release --target wasm32-unknown-unknown`: both check (`web/Cargo.lock`
+  gains the macro crate). The dispatch and the session build for wasm32; `dispatch::native`
+  does not exist there.
+
+### What still needs a runtime, for wave 3
+
+- **Nothing in the dispatch or the session spawns.** `dispatch::native` is the one place
+  jsonrpsee-core's `server` feature runs (and with it jsonrpsee's `tokio::spawn` per
+  subscription); it is native-only. Before this wave jsonrpsee's generated code also spawned
+  `pending.reject(e)` when a subscription's params did not decode; the generated dispatch
+  rejects inline.
+- **The handler's own subscribe methods spawn**: `subscribe_presence`,
+  `subscribe_cloud_connection` and `subscribe_app_links` start a forwarding task each with
+  `tokio::spawn`, and `hand_over` spawns its stop. These, with the rest of the handler's spawns
+  and timers, are wave 2's `Runtime`.
+- `RpcHandler`'s `impl PimbleApiServer` uses `#[async_trait]` (Send); on wasm32 the trait is
+  `?Send`, so the impl takes the same `cfg_attr` when the server first builds for wasm32.
+- `PimbleClient::in_process` builds with `build_with_wasm` on wasm32 (`spawn_local`); the
+  `MessagePort` transport is a second pair of `TransportSenderT`/`TransportReceiverT` beside
+  the channels, and the worker's side is `session::serve_with` over the port's messages.
+
+### Found beyond the brief, not done
+
+- `subscribeNodeChanges` on a store that is not open is accepted for a `Service` principal (the
+  parity test's request 13): `reject_if_vault` passes an unknown store and nothing else looks.
+  A subscription to nothing; unchanged here, since the wire had to stay the same.

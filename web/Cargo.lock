@@ -1960,6 +1960,7 @@ dependencies = [
  "pimble-rpc",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "url",
 ]
@@ -2085,17 +2086,32 @@ dependencies = [
 name = "pimble-rpc"
 version = "0.29.1"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
+ "futures",
+ "http",
  "jsonrpsee",
  "pimble-core",
  "pimble-crdt",
  "pimble-crypto",
+ "pimble-rpc-macros",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pimble-rpc-macros"
+version = "0.29.1"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

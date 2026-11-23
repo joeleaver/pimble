@@ -1,0 +1,18 @@
+[package]
+name = "pimble-rpc-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Generates Pimble's transport-free RPC dispatch from the one trait in pimble-rpc's methods.rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+# The same case conversions jsonrpsee's own server macro gives a parameter's
+# aliases when it is passed by name.
+heck = "0.5"

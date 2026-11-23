@@ -16,6 +16,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 base64 = { workspace = true }
+# The in-process transport's channels (src/in_process.rs): `sync` builds for
+# wasm32 too.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Native: the tokio-backed WebSocket transport, with the credential in an
 # `Authorization` / `X-Api-Key` header.

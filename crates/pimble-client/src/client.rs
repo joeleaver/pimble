@@ -173,6 +173,12 @@ impl PimbleClient {
         Ok(Self { client, base_url, vault_page_bytes: pimble_rpc::VAULT_FETCH_PAGE_BYTES })
     }
 
+    /// A client over an already-built jsonrpsee client (another transport:
+    /// [`PimbleClient::in_process`]).
+    pub(crate) fn from_rpc_client(client: RpcClient, base_url: Url) -> Self {
+        Self { client, base_url, vault_page_bytes: pimble_rpc::VAULT_FETCH_PAGE_BYTES }
+    }
+
     /// Read vault logs in pages of at most `bytes` from now on (at least one
     /// entry a page, whatever its size). For tests that need a read to span
     /// pages (docs/CONVERGENCE_CONTRACT.md, "Proving it").

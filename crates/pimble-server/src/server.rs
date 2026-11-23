@@ -292,6 +292,21 @@ impl PimbleServer {
         let local_addr = server.local_addr().map_err(|e| crate::ServerError::Server(e.to_string()))?;
         self.local_addr = Some(local_addr);
 
+        let handler = self.make_handler(agents, jwt_configured, true);
+        let methods = handler.clone().into_rpc();
+
+        info!("Starting Pimble server on {}", local_addr);
+        let handle = server.start(methods);
+        handler.set_server_handle(handle.clone());
+        self.handle = Some(handle);
+
+        Ok(())
+    }
+
+    /// The handler this server dispatches to, configured from `config`, and
+    /// kept so `stop()` can stop what it started. Every transport reaches
+    /// this one handler (`start`'s jsonrpsee server, `connect_in_process`).
+    fn make_handler(&mut self, agents: Option<Arc<crate::agents::AgentRegistry>>, jwt_configured: bool, listening: bool) -> RpcHandler {
         // A relay face holds vault twins only, and a vault has no index.
         // The model warms up when the first index wants it, not before the
         // server listens (docs/STARTUP_CONTRACT.md "Built": it took up to a
@@ -337,20 +352,42 @@ impl PimbleServer {
         handler = handler.with_agents(agents);
         // The app's own server (loopback, tokenless, no JWT) hands over to a
         // newer one (docs/MCP_CONTRACT.md "Which server it talks to").
-        let local_own = !self.face && self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() && !jwt_configured;
+        // A server with no port has none to hand over.
+        let local_own = listening && !self.face && self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() && !jwt_configured;
         handler = handler.with_hand_over(local_own);
         if let Some(version) = self.config.reported_version.clone() {
             handler = handler.with_reported_version(version);
         }
         self.handler = Some(handler.clone());
-        let methods = handler.clone().into_rpc();
+        handler
+    }
 
-        info!("Starting Pimble server on {}", local_addr);
-        let handle = server.start(methods);
-        handler.set_server_handle(handle.clone());
-        self.handle = Some(handle);
-
+    /// Start the server without listening on any socket: its handler is
+    /// reached only through [`PimbleServer::connect_in_process`]
+    /// (docs/ONE_CODEBASE_CONTRACT.md seam A; what a browser's worker or a
+    /// phone's in-process server will be). The config's paths, intervals and
+    /// switches apply as for [`PimbleServer::start`]; nothing about the HTTP
+    /// edge does (there is none, so no token or JWT verifier and no agents).
+    pub async fn start_in_process(&mut self) -> Result<()> {
+        if self.handler.is_some() {
+            return Err(crate::ServerError::Server("this server has started already".to_string()));
+        }
+        let agents = self.config.agents_path.clone().map(|path| Arc::new(crate::agents::AgentRegistry::load(path)));
+        self.make_handler(agents, false, false);
         Ok(())
+    }
+
+    /// A client of this server over an in-process channel, every call
+    /// carrying `ext` (the connection's principal: what the HTTP edge
+    /// attaches to a WebSocket's calls, here attached by the caller, e.g.
+    /// [`crate::service_extensions`]). `None` before the server has started.
+    /// The connection is served on a task of the current tokio runtime
+    /// until the client is dropped.
+    pub fn connect_in_process(&self, ext: jsonrpsee::Extensions) -> Option<pimble_client::PimbleClient> {
+        let handler = Arc::new(self.handler.clone()?);
+        let (client_end, server_end) = pimble_rpc::dispatch::session::channel();
+        tokio::spawn(pimble_rpc::dispatch::session::serve(handler, ext, server_end));
+        Some(pimble_client::PimbleClient::in_process(client_end))
     }
 
     /// Stop the server

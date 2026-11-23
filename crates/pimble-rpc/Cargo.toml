@@ -13,22 +13,35 @@ pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-crypto = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: a method's answer travels as the bytes of the wire's `result`
+# (`dispatch::answer`), so every transport sends what jsonrpsee sends.
+serde_json = { workspace = true, features = ["raw_value"] }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 # When a state report was stored (`VaultReport::at`).
 chrono = { workspace = true }
+# The transport-free dispatch (src/dispatch.rs, docs/ONE_CODEBASE_CONTRACT.md
+# seam A): generated from methods.rs's trait; subscription sinks over tokio's
+# channels (`sync` builds for wasm32); a connection's calls polled together
+# in one future (`futures`), no runtime needed.
+pimble-rpc-macros = { path = "../pimble-rpc-macros" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+# `Extensions`: what a transport attaches to a call (jsonrpsee's server hands
+# its methods the same type).
+http = "1"
 
-# Native: the workspace features, which include `server` — this crate's
-# `#[rpc(server, client)]` generates both halves of the API.
+# Native: the workspace features, which include `server`: jsonrpsee's
+# HTTP/WebSocket server is fed from the dispatch (`dispatch::native`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 jsonrpsee = { workspace = true }
 
-# wasm32: the client half only (see `methods.rs`). The `server` feature pulls
-# in jsonrpsee-server -> tokio/net -> mio, which has no
-# wasm32-unknown-unknown implementation, and the generated server trait is
-# useless in a browser anyway.
+# wasm32: no `server` feature, which pulls in jsonrpsee-server -> tokio/net ->
+# mio (no wasm32-unknown-unknown implementation) and spawns with
+# `tokio::spawn`. The dispatch and `dispatch::session` need neither; only
+# `dispatch::native` does, and it is native-only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 jsonrpsee = { version = "0.24", default-features = false, features = ["client-core", "macros"] }

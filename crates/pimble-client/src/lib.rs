@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod error;
+pub mod in_process;
 
 pub use client::*;
 pub use error::*;

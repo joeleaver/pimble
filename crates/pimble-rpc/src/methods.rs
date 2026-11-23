@@ -1,15 +1,15 @@
-//! RPC method definitions using jsonrpsee
+//! RPC method definitions: the one list of Pimble's methods.
+//!
+//! `#[pimble_api]` (crates/pimble-rpc-macros) turns this trait into every
+//! half of the API: jsonrpsee's `PimbleApiClient` (as `#[rpc(client)]`
+//! always made it), the `PimbleApiServer` a server implements, `METHODS`
+//! and the transport-free dispatch in [`crate::dispatch`]
+//! (docs/ONE_CODEBASE_CONTRACT.md seam A). A method added here is a method
+//! of the client, the server trait and the dispatch at once.
 
-// `SubscriptionResult` is the *server* half's return type for a
-// `#[subscription]` method, and jsonrpsee-core only defines it under its
-// `server` feature, which wasm32 doesn't build (see this crate's
-// Cargo.toml). The client half the macro generates for wasm32 never names
-// it.
-#[cfg(not(target_arch = "wasm32"))]
-use jsonrpsee::core::SubscriptionResult;
-use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::{NodeId, StoreId};
+use pimble_rpc_macros::pimble_api;
 
 use crate::types::*;
 
@@ -17,13 +17,12 @@ use crate::types::*;
 ///
 /// This defines all available RPC methods for the Pimble server.
 ///
-/// Both halves are generated natively. On wasm32 only the client half is:
-/// nothing in a browser implements the server trait, and asking for it
-/// would drag jsonrpsee-server (and so mio) into a target it cannot build
-/// for. The method set, names and types are identical either way — this is
-/// a build-target gate, not a protocol difference.
-#[cfg_attr(not(target_arch = "wasm32"), rpc(server, client, namespace = "pimble"))]
-#[cfg_attr(target_arch = "wasm32", rpc(client, namespace = "pimble"))]
+/// The method set, names and types are the same on every target; the
+/// server half (`PimbleApiServer`) is `Send` natively and not in a
+/// browser's worker. A subscription's `-> SubscriptionResult` is
+/// `crate::dispatch::SubscriptionResult` in the server trait (the client's
+/// subscription methods answer a `Subscription` whatever it says).
+#[pimble_api(namespace = "pimble")]
 pub trait PimbleApi {
     // ========================================================================
     // Store Operations

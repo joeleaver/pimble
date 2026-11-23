@@ -46,9 +46,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use jsonrpsee::core::{async_trait, SubscriptionResult};
+use pimble_rpc::dispatch::{async_trait, PendingSubscriptionSink, SubscriptionMessage, SubscriptionResult, SubscriptionSink};
 use jsonrpsee::types::ErrorObjectOwned;
-use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::Extensions;
 use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
@@ -923,7 +923,7 @@ pub enum LocalChange {
 /// moved out of its share stops reaching it at once
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5).
 struct ScopedSink {
-    sink: jsonrpsee::core::server::SubscriptionSink,
+    sink: SubscriptionSink,
     roots: Option<Vec<NodeId>>,
     /// Whether the subscriber reads `VaultReported` (it asked,
     /// `StoreSubscribeOptions::reports`); one that did not is never sent one.
@@ -998,11 +998,11 @@ impl SubscriptionRegistry {
         self.local_changes.subscribe()
     }
 
-    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>, reports: bool) {
+    fn add_store_sub(&mut self, store_id: StoreId, sink: SubscriptionSink, roots: Option<Vec<NodeId>>, reports: bool) {
         self.store_subs.entry(store_id).or_default().push(ScopedSink { sink, roots, reports });
     }
 
-    fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>) {
+    fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: SubscriptionSink, roots: Option<Vec<NodeId>>) {
         self.node_subs.entry((store_id, node_id)).or_default().push(ScopedSink { sink, roots, reports: false });
     }
 

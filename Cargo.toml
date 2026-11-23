@@ -6,6 +6,7 @@ members = [
     "crates/pimble-store",
     "crates/pimble-search",
     "crates/pimble-rpc",
+    "crates/pimble-rpc-macros",
     "crates/pimble-server",
     "crates/pimble-client",
     "crates/pimble-plugins",

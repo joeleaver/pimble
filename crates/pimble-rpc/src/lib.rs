@@ -5,6 +5,7 @@
 //! - Request/response types
 //! - Server and client traits
 
+pub mod dispatch;
 pub mod error;
 pub mod methods;
 pub mod types;

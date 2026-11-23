@@ -37,7 +37,7 @@ struct Held {
 /// that owns its sink alone (a `SubscriptionSink` deregisters the
 /// subscription when any clone of it is dropped).
 pub(crate) struct PresenceSub {
-    pub tx: tokio::sync::mpsc::UnboundedSender<jsonrpsee::SubscriptionMessage>,
+    pub tx: tokio::sync::mpsc::UnboundedSender<pimble_rpc::dispatch::SubscriptionMessage>,
     /// The scope roots of the subscriber's grant; `None` for the whole store.
     pub roots: Option<Vec<NodeId>>,
     /// Its own client: what it publishes is not sent back to it.
@@ -129,7 +129,7 @@ impl PresenceHub {
 
     /// The open subscribers of `store_id`, as `(sender, roots, client)`;
     /// closed ones are dropped on the way.
-    pub(crate) async fn subs_of(&self, store_id: StoreId) -> Vec<(tokio::sync::mpsc::UnboundedSender<jsonrpsee::SubscriptionMessage>, Option<Vec<NodeId>>, String)> {
+    pub(crate) async fn subs_of(&self, store_id: StoreId) -> Vec<(tokio::sync::mpsc::UnboundedSender<pimble_rpc::dispatch::SubscriptionMessage>, Option<Vec<NodeId>>, String)> {
         let mut subs = self.subs.lock().await;
         let Some(list) = subs.get_mut(&store_id) else { return Vec::new() };
         list.retain(|s| !s.tx.is_closed());
@@ -221,7 +221,7 @@ pub(crate) async fn deliver(hub: &PresenceHub, manager: &tokio::sync::RwLock<pim
     if subs.is_empty() {
         return;
     }
-    let Ok(msg) = jsonrpsee::SubscriptionMessage::from_json(frame) else { return };
+    let Ok(msg) = pimble_rpc::dispatch::SubscriptionMessage::from_json(frame) else { return };
     let mut allowed: HashMap<Vec<NodeId>, bool> = HashMap::new();
     {
         let manager = manager.read().await;
