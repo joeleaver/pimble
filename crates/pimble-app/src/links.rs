@@ -21,7 +21,7 @@ impl Plugin for LinksPlugin {
     }
 
     fn input_rules(&self) -> Vec<InputRule> {
-        vec![autolink_rule(), picker_rule(self.pane)]
+        vec![autolink_rule(), picker_rule(self.pane), mention_rule(self.pane)]
     }
 
     /// A pasted link (docs/LINKS_CONTRACT.md "Making a link"): a Pimble or
@@ -141,6 +141,24 @@ fn picker_rule(pane: crate::panes::PaneId) -> InputRule {
         let mut tr = state.tr();
         tr.insert_text("[").ok()?;
         later(move |store| crate::link_picker::start_typed(store, &crate::editor::editor(pane), start));
+        Some(tr)
+    })
+}
+
+/// Typing `@` at the start of a word opens the picker of the people who can
+/// open the note (docs/NOTIFICATIONS_CONTRACT.md section 1). An `@` inside a
+/// word (an email address) is only an `@`. The rule types the `@` itself and
+/// opens the picker once the dispatch is over.
+fn mention_rule(pane: crate::panes::PaneId) -> InputRule {
+    InputRule::new(r#"(?:^|[\s(\[{"'])@$"#, move |state, _caps, _start, end| {
+        // Not in a link's words or in inline code.
+        let marks = state.doc.resolve(Pos(end)).ok()?.marks();
+        if marks.iter().any(|m| m.type_name() == "code") {
+            return None;
+        }
+        let mut tr = state.tr();
+        tr.insert_text("@").ok()?;
+        later(move |store| crate::link_picker::start_mention(store, &crate::editor::editor(pane), end));
         Some(tr)
     })
 }
@@ -385,7 +403,7 @@ thread_local! {
 /// The editor's hover callback: the link under the pointer changed
 /// (`None`: it left every link). The tooltip shows after the pointer has
 /// rested for [`HOVER_DELAY_MS`] and goes at once when it leaves.
-pub fn hover_link(store: crate::state::AppStore, hover: Option<&crate::rinch_editor::LinkHover>) {
+pub fn hover_link(store: crate::state::AppStore, node: Option<(pimble_core::StoreId, pimble_core::NodeId)>, hover: Option<&crate::rinch_editor::LinkHover>) {
     use rinch::prelude::{clear_timeout, set_timeout};
     if let Some(pending) = HOVER_TIMER.with(|t| t.borrow_mut().take()) {
         clear_timeout(pending);
@@ -394,8 +412,15 @@ pub fn hover_link(store: crate::state::AppStore, hover: Option<&crate::rinch_edi
         store.link_hover.set(None);
         return;
     };
+    let mention = pimble_core::mention::is_mention_href(&hover.link.href);
     let tooltip = crate::state::LinkTooltip {
-        target: tooltip_target(store, &hover.link.href),
+        target: if mention {
+            crate::mentions::tooltip(store, node, &hover.link.href, hover.link.from.0, hover.link.to.0)
+        } else {
+            tooltip_target(store, &hover.link.href)
+        },
+        // A mention leads nowhere to open.
+        hint: if mention { "" } else { OPEN_HINT },
         x: hover.rect.x,
         y: hover.rect.y + hover.rect.height + 4.0,
     };

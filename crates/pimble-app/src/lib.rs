@@ -39,6 +39,7 @@ pub mod hashtags;
 pub mod import;
 pub mod link_picker;
 pub mod links;
+pub mod mentions;
 pub mod menus;
 pub mod metanodes;
 pub mod metanode_setup;

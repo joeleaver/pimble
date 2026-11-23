@@ -21,6 +21,7 @@ pub mod error;
 pub mod hashtags;
 pub mod links;
 pub mod markdown;
+pub mod mentions;
 pub mod node_doc;
 pub mod order;
 pub mod rules;

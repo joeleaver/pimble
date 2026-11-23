@@ -1007,10 +1007,7 @@ fn picker_query_text(store: AppStore) -> String {
 
 /// What the open picker says with no rows; empty when it has some.
 fn picker_empty_text(store: AppStore) -> String {
-    store.link_picker.with(|view| match view {
-        Some(view) if view.rows.is_empty() => crate::link_picker::empty_line(view).to_string(),
-        _ => String::new(),
-    })
+    store.link_picker.with(|view| view.as_ref().map(|view| crate::link_picker::quiet_line(view).to_string()).unwrap_or_default())
 }
 
 /// Resolve raw search hits into display-ready `SearchRow`s (looking up each
@@ -4887,7 +4884,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             class: "pimble-link-tooltip__target",
                             {|| store.link_hover.get().map(|tip| tip.target).unwrap_or_default()}
                         }
-                        div { class: "pimble-link-tooltip__hint", {crate::links::OPEN_HINT} }
+                        div {
+                            class: "pimble-link-tooltip__hint",
+                            style: {|| if store.link_hover.get().is_some_and(|tip| tip.hint.is_empty()) { "display: none;" } else { "" }},
+                            {|| store.link_hover.get().map(|tip| tip.hint).unwrap_or_default()}
+                        }
                     }
 
                     // The link picker (`[[` and Ctrl+L, docs/LINKS_CONTRACT.md

@@ -69,6 +69,15 @@ fn check_scope(md: &str) -> Result<()> {
             Event::Start(Tag::Strong) => open.push("bold"),
             Event::Start(Tag::Emphasis) => open.push("italic"),
             Event::Start(Tag::Strikethrough) => open.push("struck through"),
+            Event::Start(Tag::Link { dest_url, .. })
+                if pimble_core::mention::is_mention_href(dest_url) && pimble_core::mention::parse_href(dest_url).is_none() =>
+            {
+                return Err(refused(format!(
+                    "Line {} is a mention that names no account; a mention is [@Name](pimble-person:<account>), \
+                     its account as list_people shows it, so nothing was written.",
+                    line(range.start)
+                )));
+            }
             Event::Start(Tag::Link { .. }) => open.push("a link"),
             Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link) => {
                 open.pop();
@@ -136,7 +145,9 @@ fn strict(schema: &Schema, md: &str) -> Result<Node> {
         MarkdownError::Invalid(e) => collab(e),
     })?;
     check_scope_of(&doc)?;
-    with_canvas_attrs(&doc)
+    // A mention written without its id is given one as it enters a document
+    // (docs/NOTIFICATIONS_CONTRACT.md "Built in wave 0").
+    Ok(crate::mentions::with_ids(&with_canvas_attrs(&doc)?, schema))
 }
 
 /// `md` as an editor `doc`, after [`check`]. Markdown with no blocks at all is

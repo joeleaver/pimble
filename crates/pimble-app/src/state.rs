@@ -468,6 +468,8 @@ pub fn display_label_from_node(node: &Node) -> String {
 pub struct LinkTooltip {
     /// The target: a note's title and store, a sentence, or a web link's URL.
     pub target: String,
+    /// The line under it: how to open the link (nothing for a mention).
+    pub hint: &'static str,
     pub x: f32,
     pub y: f32,
 }

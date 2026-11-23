@@ -244,6 +244,27 @@ fn discussion_view(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: D
                     }
                 }
                 {input}
+                // The people an `@` at the end of the box can mention
+                // (docs/NOTIFICATIONS_CONTRACT.md section 1): a click, Tab or
+                // Enter picks one.
+                div {
+                    class: "pimble-discussion__mention-offers",
+                    style: {move || if crate::mentions::box_offers(store, slot, ui).is_empty() { "display: none;" } else { "" }},
+                    for person in crate::mentions::box_offers(store, slot, ui) {
+                        button {
+                            key: person.user_id.clone(),
+                            class: "pimble-discussion__mention-offer",
+                            onclick: {
+                                let person = person.clone();
+                                move || {
+                                    crate::mentions::box_pick(ui, &person);
+                                    focus_composer(slot, Composer::New);
+                                }
+                            },
+                            {format!("@{}", person.name)}
+                        }
+                    }
+                }
                 div {
                     class: "pimble-discussion__composer-row",
                     button {
@@ -301,11 +322,38 @@ fn emoji_picker(__scope: &mut RenderScope, _store: AppStore, slot: Slot, ui: Dis
     }
 }
 
-/// A message's text: its spans, each bold, italic or a link as it is.
-fn body_node(__scope: &mut RenderScope, store: AppStore, spans: &[Span]) -> NodeHandle {
+/// A message's text: its spans, each bold, italic or a link as it is. A
+/// mention shows `@` and the name its person goes by in the discussion's
+/// share now, greyed when they can no longer open it
+/// (docs/NOTIFICATIONS_CONTRACT.md section 1); `discussion` is the
+/// discussion's node, whose share that is.
+fn body_node(__scope: &mut RenderScope, store: AppStore, discussion: Option<(pimble_core::StoreId, pimble_core::NodeId)>, spans: &[Span]) -> NodeHandle {
+    let body = pimble_discussion::Body { spans: spans.to_vec() };
+    let mut mentions = body.mentions().into_iter();
+    // The href of the mention being drawn: its other spans are drawn with it.
+    let mut drawn: Option<String> = None;
     let parts: Vec<NodeHandle> = spans
         .iter()
-        .map(|span| {
+        .filter_map(|span| {
+            let href = span.link.as_deref().filter(|h| pimble_core::mention::parse_href(h).is_some());
+            match href {
+                Some(href) if drawn.as_deref() == Some(href) => return None,
+                Some(href) => drawn = Some(href.to_string()),
+                None => drawn = None,
+            }
+            let mention = href.and_then(|_| mentions.next());
+            Some((span, mention))
+        })
+        .map(|(span, mention)| {
+            if let Some(mention) = mention {
+                let (name, gone) = match discussion {
+                    Some((s, n)) => crate::mentions::shown(store, s, n, &mention),
+                    None => (mention.name.clone(), false),
+                };
+                let class = if gone { "pimble-discussion__mention pimble-discussion__mention--gone" } else { "pimble-discussion__mention" };
+                let tip = if gone { format!("{} can no longer open this discussion", mention.name) } else { format!("A mention of {name}") };
+                return rsx! { span { class: class, title: tip, {format!("@{name}")} } };
+            }
             let mut style = String::new();
             if span.bold {
                 style.push_str("font-weight: 600;");
@@ -393,7 +441,7 @@ fn message_node(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: Disc
             }
         }
     } else {
-        body_node(__scope, store, &m.spans)
+        body_node(__scope, store, crate::discussions::held_by(slot), &m.spans)
     };
     let (reply_id, edit_id, delete_id) = (m.id.clone(), m.id.clone(), m.id.clone());
     let mine = own.then(|| {

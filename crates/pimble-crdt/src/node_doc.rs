@@ -734,6 +734,28 @@ impl NodeDoc {
         Self::load(bytes).map(|doc| doc.links()).unwrap_or_default()
     }
 
+    /// Every mention of a person in the content, in document order
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 1). `[]` when there is no
+    /// projection yet.
+    pub fn mentions(&self) -> Vec<pimble_core::mention::Mention> {
+        if !self.has_projection() {
+            return Vec::new();
+        }
+        project(&self.save(), "NodeDoc::mentions").map(|model| crate::mentions::of_model(&model)).unwrap_or_default()
+    }
+
+    /// The mentions `update` would add to this document's content, each with
+    /// its id, leaving out `writer`'s own account; this document is not
+    /// changed. The hook a writer's device notifies from (wave 1): it passes
+    /// the updates its own edits made, and keeps the ids it has notified, so
+    /// redoing a mention it already told someone about tells nobody again
+    /// (`pimble_core::mention::added`).
+    pub fn mentions_added_by(&self, update: &[u8], writer: Option<&str>) -> Result<Vec<pimble_core::mention::Mention>> {
+        let mut after = Self::load(&self.save())?;
+        after.apply_update(update)?;
+        Ok(pimble_core::mention::added(&self.mentions(), &after.mentions(), writer))
+    }
+
     /// Every picture the content names that is kept in a store's blobs: each
     /// `image` whose `src` is a `pimble-blob:` URL, in document order, at any
     /// depth (docs/IMAGES_CONTRACT.md "On disk"). `[]` when there is no
@@ -2954,5 +2976,24 @@ mod split_tests {
         // before the caret kept where it was): joining puts blocks after
         // blocks.
         assert_eq!(doc.markdown().unwrap().trim(), "# Heading\n\nOne two \n\nthree.\n\n- a\n- b\n\nLast.");
+    }
+
+    /// docs/NOTIFICATIONS_CONTRACT.md "Built in wave 0": the hook wave 1
+    /// notifies from. An update that adds a mention names it; the same update
+    /// applied again, or one that only types elsewhere, names nothing; the
+    /// writer's own account is never named.
+    #[test]
+    fn an_update_names_the_mentions_it_adds() {
+        let mut doc = NodeDoc::from_plain_text("Notes").unwrap();
+        let before = doc.save();
+        let adding = doc.append_markdown("Ask [@Will](pimble-person:will?m=w1) and [@Me](pimble-person:me?m=m1)").unwrap();
+        let base = NodeDoc::load(&before).unwrap();
+        let added = base.mentions_added_by(&adding, Some("me")).unwrap();
+        assert_eq!(added.iter().map(|m| (m.account.as_str(), m.id.as_deref())).collect::<Vec<_>>(), vec![("will", Some("w1"))]);
+        assert!(doc.mentions_added_by(&adding, Some("me")).unwrap().is_empty(), "already held: nothing new");
+        let held = NodeDoc::load(&doc.save()).unwrap();
+        let typing = doc.append_markdown("More words.").unwrap();
+        assert!(held.mentions_added_by(&typing, None).unwrap().is_empty());
+        assert_eq!(doc.mentions().len(), 2);
     }
 }

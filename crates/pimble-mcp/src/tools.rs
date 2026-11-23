@@ -68,7 +68,11 @@ in a cell is an HTML <table>. Pictures are canvases: \
 a picture already in Pimble is written as get_node shows it (![alt](pimble-blob:...#canvas=<id>)), so \
 keep those lines when rewriting; insert_canvas puts a new picture or an empty canvas into a note. Other \
 images, task lists, footnotes and any other HTML are refused with a sentence naming the line; nothing is \
-written then. Link to another node with its pimble: link as the href.
+written then. Link to another node with its pimble: link as the href. A mention of a \
+person is a link to their account, [@Will](pimble-person:<account>): list_people says who can \
+open a note, by the names they go by in its share, each with the Markdown that mentions them. \
+Keep a mention's href as get_node shows it (its ?m= is the mention's own id, so rewriting a note \
+does not mention anyone again); a new mention is written without one.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
 section), replace_section (the blocks under a heading; a heading is named as get_node's \
@@ -97,7 +101,7 @@ or as discussion nodes of their own. list_discussions lists a node's, read_discu
 one as a nested list with message ids, start_discussion starts one with its first message, \
 reply answers a message (or posts at the top level), edit_message and delete_message change \
 only your own messages, resolve_discussion closes or reopens one. Messages are Markdown with \
-bold, italic and links; your messages are signed with your agent's name.
+bold, italic, links and mentions (as in notes); your messages are signed with your agent's name.
 
 A metanode is a node shown a particular way: it names which nodes it shows (its source, such as \
 its children two levels deep) and the viewer that shows them (such as a kanban, whose columns are \
@@ -995,6 +999,29 @@ impl Pimble {
                 if said.is_empty() { "The link leads nowhere." } else { said }.to_string()
             }
         })
+    }
+
+    /// Who can open a node (the members of the shares it is in), by the name each
+    /// goes by in its share, with the Markdown that mentions each one.
+    #[tool(name = "list_people")]
+    async fn list_people(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
+        let addr = self.resolve(&p.node).await?;
+        let people = match self.api.backend().people(addr.store).await {
+            Ok(people) => people,
+            Err(_) => return Ok("Nobody else can open this note: its store is not shared.".into()),
+        };
+        let mut chain = vec![addr.node];
+        chain.extend(self.api.ancestors(addr).await?.into_iter().map(|a| a.node));
+        let members = people.members_of(&chain);
+        if members.is_empty() {
+            return Ok("Nobody else can open this note: it is in no share.".into());
+        }
+        let mut out = String::from("People who can open it (mention one with its Markdown):\n");
+        for person in members {
+            let mention = pimble_core::mention::Mention { account: person.user_id.clone(), id: None, name: person.name.clone() };
+            out.push_str(&format!("- {}: [{}]({})\n", person.name, mention.words(), mention.href()));
+        }
+        Ok(out)
     }
 
     /// A store's recently deleted nodes, which undelete_node can put back.

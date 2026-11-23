@@ -1,6 +1,7 @@
 # Notifications contract: hearing that someone wrote to you
 
-Status: **design agreed 2026-11-23, nothing built.** Written from a conversation with Joe that
+Status: **design agreed 2026-11-23; wave 0 (mentions as text) built the same day**, see
+"Built in wave 0" at the end. Written from a conversation with Joe that
 day; his decisions are listed at the end. The details not named there are design choices
 made here that he has not reviewed yet.
 
@@ -198,3 +199,114 @@ Will's note is exactly what Will should hear about.
 - **Watches on relayed stores** work while the owner's machine is on (section 3).
 - **Nothing is watched by default**; shares shared with you included (section 3).
 - **The tray is on by default** on the desktop, with a setting to turn it off (section 4).
+
+## Built in wave 0 (2026-11-23, branch `notifications`)
+
+### The representation: a link, not a new inline atom
+
+Section 1 asked for an inline atom. **A mention is rinch's `link` mark** over the words
+`@Name` (the name as written), whose href is `pimble-person:<sub>?m=<id>`. Why:
+
+- rinch's collaboration (`rinch-editor-collab` at `e8e04cc`) carries any schema's inline
+  atom (`is_inline_atom` is a predicate on the node type), but the schema is rinch's
+  `Schema::starter_kit()`, built in rinch and used as is by the editor, `pimble-crdt`,
+  Markdown and the browser. Its only inline atoms are `image` and `hard_break`, and the
+  only app-defined node is the block `embed`. A `mention` node would need rinch to take
+  an app's inline node type (a general mechanism: an inline counterpart of `embed`,
+  `data-*` attributes, an app-drawn view), and every peer to run that build before anyone
+  writes one: an older peer's session is poisoned by an atom type it does not know
+  (rinch #196).
+- A link mark needs nothing upstream and no coordinated upgrade: an older build, Markdown
+  export, search, the MCP and another app all read it as `@Will`, a link.
+- The mention's id rides in the href (`?m=`), so undo, redo, copy and a Markdown round
+  trip all keep it. The link's `title` attribute would have held it too, but Markdown
+  writes a title as `"..."` after the URL, which an agent rewriting a note is likelier to
+  drop.
+
+What the link cannot do: **the note's own words keep the name as written.** rinch has
+no decoration that replaces text (a `Widget` is the placeholder only), so in a note a
+rename shows in the tooltip ("A mention of William (written as Will)"), and the words
+change when someone retypes them. In a discussion message, which the app draws itself,
+the current name shows. Greying works everywhere (an `Inline` decoration with a class).
+If Joe wants the current name in the text too, the general rinch mechanism is either an
+app inline atom (above) or a decoration that draws a widget in place of a range.
+
+### What was built, and where
+
+- `pimble_core::mention` (`crates/pimble-core/src/mention.rs`): `Mention { account, id,
+  name }`, the href (`href`, `parse_href`, `is_mention_href`, `new_id`: 12 hex digits),
+  and **`added(before, after, writer)`, the detection hook**: the mentions in `after`
+  not in `before`, by id (an id-less mention by account and ordinal), never the writer's
+  own account, a pasted copy (same id) once. Undo then redo is "added" again by design;
+  the notifier keeps the ids it has sent (wave 1).
+- `pimble_crdt::mentions` (`crates/pimble-crdt/src/mentions.rs`): `of_model` (every
+  mention in an editor model, a run split by other marks one mention), `added_between`
+  (two models), `with_ids` (a mention written without an id gets one).
+  `NodeDoc::mentions()` and **`NodeDoc::mentions_added_by(update, writer)`**: the mentions
+  a yrs update would add, without changing the document. Wave 1 calls it on the updates
+  this device's own edits make (the outbound path, `doc_session::send`).
+- Markdown (`crates/pimble-crdt/src/markdown.rs`): `[@Will](pimble-person:<sub>)` in,
+  written out with its `?m=`; a mention written without an id is given one in `strict`
+  (`mentions::with_ids`); a `pimble-person:` href naming no account is refused with a
+  sentence. rinch's Markdown already carries the link both ways.
+- Discussion messages (`crates/pimble-discussion/src/body.rs`): the same href as a link
+  span; `Body::mentions()`, ids given in `from_markdown`, and
+  `Body::with_picked_mentions` (a name picked in the message box becomes a mention when
+  the message is sent). Detection for a message is `mention::added(&old.mentions(),
+  &new.mentions(), writer)`.
+- `StorePeople::members_of(chain)` (`crates/pimble-rpc/src/types.rs`): the people who
+  can open a node, from the store's people (`cloudPeople`, the member list the app
+  already caches per store) and the node's ancestry: every share rooted at the node or
+  above it plus the whole store's, each person once by the name of the innermost share.
+- The app (`crates/pimble-app/src/mentions.rs`, `link_picker.rs`, `links.rs`):
+  - Typing `@` at the start of a word (not in inline code; an email address is left
+    alone) opens the link picker's new `PickerKind::Mention`: the people who can open the
+    note, never this account, filtered by name (a word of it first). A pick replaces
+    `@query` with the linked `@Name` and a space, one undo step. Words nobody is called
+    close the picker, so `@home` is just typed. With nobody to offer it says "Only you
+    can open this note" and, on the desktop in one's own store, offers "Share this with
+    someone..." (the existing Share dialog), which Enter takes only when the arrows chose
+    it, so `@` then Enter is a new line.
+  - `MentionsPlugin` (one per pane): an `Inline` decoration `pimble-mention` over each
+    mention, plus `pimble-mention--gone` when the store's people are known and the
+    person is not among those who can open the note. The people reach it through a
+    meta transaction from an effect per pane (`follow_members`, on the pane's note and
+    the people); unknown people never grey anything.
+  - The link tooltip of a mention says the current name, or that the person can no
+    longer open the note, and drops "Ctrl+click to open" (`follow_href` ignores the
+    scheme, so nothing opens).
+  - Discussions: a message shows a mention as `@` and the current name (greyed when the
+    person has left); the message box offers people for the `@` it ends in (chips under
+    it; a click, Tab or Enter picks the first) and links the picked names on send.
+- MCP (`crates/pimble-mcp/src/tools.rs`, `docs/MCP_CONTRACT.md`): the instructions
+  describe mentions where links are described, and say to keep a mention's href; a new
+  tool **`list_people`** names who can open a node, each with the Markdown that
+  mentions them (an agent has no other way to learn a `sub`).
+
+### Verified
+
+- Unit tests: `pimble-core` (mention hrefs, `added`), `pimble-crdt` (reading mentions,
+  split runs, ids given by Markdown and kept by a round trip, `added_between`,
+  `NodeDoc::mentions_added_by` on real updates), `pimble-discussion` (body mentions, ids
+  kept by editing, picked names), `pimble-rpc` (`members_of` with nested and whole-store
+  shares), `pimble-app` (who `@` offers, the picker's rows and pick, stepping aside,
+  the nobody case and its Enter, the query, undo/redo keeping the id, the plugin's
+  classes, the message box's `@`).
+- Runs: `pimble-crdt` lib 222 passed; `pimble-core`, `pimble-discussion`, `pimble-rpc` lib
+  all passed; `pimble-app` lib filtered to `link_picker mentions links:: hashtags
+  discussions` 31 passed; `pimble-mcp` 53 passed.
+- The browser build checks (`--features web --target wasm32-unknown-unknown`).
+- Not seen in a running app: a store with members needs the cloud stack, so the picker
+  was tested against a fake member list.
+
+### Not done in wave 0
+
+- The person's own unread view does not lift mentions of them (optional; nothing reads
+  "unread" for notes yet, and discussions' unread counts are untouched).
+- The note's words do not follow a rename (above).
+- A pasted mention keeps its id, so pasting a mention of Will into another note is not
+  news to Will in wave 1. Re-minting ids on paste is a small paste-hook change if wanted.
+- Nothing calls the detection hook yet; wave 1 does, from the outbound edit path and
+  from posting or editing a message.
+- Editing a message shows its mentions as Markdown (`[@Will](pimble-person:...)`), as it
+  already shows links.

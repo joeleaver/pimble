@@ -1405,6 +1405,37 @@ pub(crate) const APP_CSS: &str = "
     cursor: pointer;
 }
 
+.pimble-discussion__mention {
+    color: var(--rinch-primary-color);
+    font-weight: 600;
+}
+
+.pimble-discussion__mention-offers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 4px 0;
+}
+
+.pimble-discussion__mention-offer {
+    border: 1px solid var(--rinch-color-default-border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 12px;
+    background: var(--rinch-color-default);
+    color: var(--rinch-color-text);
+    cursor: pointer;
+}
+
+.pimble-discussion__mention-offer:first-child {
+    border-color: var(--rinch-primary-color);
+}
+
+.pimble-discussion__mention--gone {
+    color: var(--rinch-color-dimmed);
+    font-weight: normal;
+}
+
 .pimble-discussion__actions {
     display: flex;
     gap: 10px;
@@ -4341,6 +4372,24 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-hashtag {
     color: var(--rinch-primary-color-4);
+}
+
+/* Mentions (docs/NOTIFICATIONS_CONTRACT.md section 1, mentions.rs): the accent on a
+   tint, which neither pads nor sizes anything, so the text lays out as before. A
+   mention of someone who can no longer open the note is greyed. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention {
+    color: var(--rinch-primary-color-7);
+    background: var(--rinch-primary-color-0);
+    border-radius: 3px;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-mention {
+    color: var(--rinch-primary-color-3);
+    background: rgba(255, 255, 255, 0.06);
+}
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention.pimble-mention--gone,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-mention.pimble-mention--gone {
+    color: var(--rinch-color-dimmed);
+    background: transparent;
 }
 
 /* Text color (docs/TEXT_COLOR_CONTRACT.md, text_color.rs). The stored color is the
