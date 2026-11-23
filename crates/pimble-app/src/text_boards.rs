@@ -1789,6 +1789,27 @@ fn resize_grip(
     }
 }
 
+/// The picture under the pointer as the toolbar's exports name a selected one.
+fn picked_of(pane: PaneId, hover: &PictureHover) -> crate::toolbar::Picked {
+    crate::toolbar::Picked { pane, pos: hover.pos, src: hover.src.clone(), board: hover.board.clone(), embed: hover.embed.clone() }
+}
+
+/// The picture menu's Copy Picture: the picture is selected and copied as
+/// Ctrl+C copies a selected one (the picture itself on the clipboard).
+fn copy_hovered(store: AppStore, pane: PaneId, hover: &PictureHover) {
+    let handle = crate::editor::editor(pane);
+    let html = rinch_editor_core::Selection::node_at(&handle.doc(), rinch_editor_core::Pos(hover.pos)).and_then(|selection| {
+        handle.set_selection(selection);
+        handle.selection_clipboard().map(|(html, _)| html)
+    });
+    crate::boards::copy_picked_from_text(store, &picked_of(pane, hover), html);
+}
+
+/// The picture menu's Save Picture As...: a PNG of what it shows.
+fn save_hovered(store: AppStore, pane: PaneId, hover: &PictureHover) {
+    crate::boards::save_picked_png(store, &picked_of(pane, hover));
+}
+
 /// Pane `pane`'s floating controls over the picture under the pointer:
 /// rendered once per pane slot, positioned over the picture.
 pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
@@ -1921,6 +1942,16 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                             disabled: {move || is_picture() && read_only()},
                             onclick: with_hover(mark_up),
                             "Mark Up..."
+                        }
+                        DropdownMenuItem {
+                            left_section: TablerIcon::ClipboardCopy,
+                            onclick: with_hover(copy_hovered),
+                            "Copy Picture"
+                        }
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Download,
+                            onclick: with_hover(save_hovered),
+                            "Save Picture As..."
                         }
                         DropdownMenuItem {
                             left_section: TablerIcon::Photo,

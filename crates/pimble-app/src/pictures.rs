@@ -73,6 +73,45 @@ thread_local! {
     static NEXT_REQUEST: Cell<u64> = const { Cell::new(1) };
 }
 
+// ── A picture copied from a note ────────────────────────────────────────────
+
+/// The last picture copied from a note's text (`boards::copy_picked_from_text`):
+/// its pixels' size and hash, and the html the editor would have copied.
+struct Copied {
+    width: u32,
+    height: u32,
+    hash: u64,
+    html: String,
+}
+
+thread_local! {
+    static COPIED: RefCell<Option<Copied>> = const { RefCell::new(None) };
+}
+
+fn pixels_hash(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Remember the picture just put on the clipboard from a note: its RGBA
+/// pixels, and `html`, the picture as the note's text holds it.
+pub(crate) fn remember_copy(width: u32, height: u32, rgba: &[u8], html: String) {
+    let copied = Copied { width, height, hash: pixels_hash(rgba), html };
+    COPIED.with(|c| *c.borrow_mut() = Some(copied));
+}
+
+/// The html of the picture last copied from a note, when the pasted `bytes`
+/// are that very picture: the clipboard holds only its pixels (so that any
+/// program can take it), and a paste back into a note should bring the
+/// canvas with its markup rather than a flattened copy of it.
+fn copied_html_for(bytes: &[u8]) -> Option<String> {
+    let (width, height, hash, html) = COPIED.with(|c| c.borrow().as_ref().map(|c| (c.width, c.height, c.hash, c.html.clone())))?;
+    let pasted = image::load_from_memory(bytes).ok()?.to_rgba8();
+    (pasted.width() == width && pasted.height() == height && pixels_hash(pasted.as_raw()) == hash).then_some(html)
+}
+
 /// The `alt` a picture goes in with: its file's name without the extension,
 /// and nothing for a pasted bitmap, which has no name (the browser calls
 /// every one of those `image.png`).
@@ -157,6 +196,12 @@ pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlo
 pub(crate) fn take_image_input(store: AppStore, pane: PaneId) {
     use crate::rinch_editor::ImageInputSource;
     crate::editor::editor(pane).on_image_input(move |input| {
+        if input.source == ImageInputSource::Paste {
+            if let Some(html) = copied_html_for(&input.bytes) {
+                crate::editor::editor(pane).paste(&PasteContent::new(None, Some(html)));
+                return None;
+            }
+        }
         let alt = alt_from_name(input.name.as_deref(), input.source == ImageInputSource::Paste);
         add_picture(store, pane, input.bytes, alt, input.anchor);
         None
@@ -562,6 +607,28 @@ mod tests {
     use crossbeam_channel::bounded;
 
     const P: [PaneId; crate::panes::MAX_PANES] = PaneId::ALL;
+
+    fn png_of(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// A picture copied from a note goes on the clipboard as pixels only; a
+    /// paste of those very pixels back into a note is that picture again (its
+    /// html, canvas and all), and any other picture is a picture.
+    #[test]
+    fn a_picture_copied_from_a_note_pastes_back_as_itself() {
+        let rgba: Vec<u8> = (0..2 * 3 * 4).map(|i| i as u8).collect();
+        remember_copy(2, 3, &rgba, "<img src=\"x\" data-board=\"b1\">".to_string());
+        assert_eq!(copied_html_for(&png_of(2, 3, &rgba)).as_deref(), Some("<img src=\"x\" data-board=\"b1\">"));
+        let mut other = rgba.clone();
+        other[5] ^= 1;
+        assert_eq!(copied_html_for(&png_of(2, 3, &other)), None, "another picture of the same size");
+        assert_eq!(copied_html_for(&png_of(3, 2, &rgba)), None, "the same bytes, another shape");
+        assert_eq!(copied_html_for(b"not a picture"), None);
+    }
 
     fn store_with_commands() -> (AppStore, crossbeam_channel::Receiver<BackendCommand>) {
         let store = AppStore::new();

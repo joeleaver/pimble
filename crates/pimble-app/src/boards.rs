@@ -44,6 +44,7 @@
 //! (`GetBlob`/`BlobLoaded`), decoded off the UI thread on the desktop.
 
 mod export;
+pub(crate) use export::{copy_picked_from_text, save_picked_png};
 mod gradient;
 mod layers;
 mod measure;

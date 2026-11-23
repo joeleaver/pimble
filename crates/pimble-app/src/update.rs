@@ -27,7 +27,13 @@ const STAGE: &str = "update";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 const FIRST_CHECK: Duration = Duration::from_secs(30);
-const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Hourly, so a release that comes out while an older one waits for "Restart
+/// to update" takes its place: checked daily, an app that staged 0.28.9 one
+/// night still offered it the next afternoon, after 0.28.12 was out, and
+/// updating took two restarts (Will, 2026-11-20). A check is one small read
+/// of the feed (cached ten minutes by the accounts service); a package is
+/// fetched only when it is newer than the one waiting.
+const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(target_os = "linux")]
 const OS: &str = "linux";
@@ -441,7 +447,7 @@ pub fn start(store: AppStore) {
     std::thread::Builder::new()
         .name("pimble-update".into())
         .spawn(move || {
-            // The first check half a minute after start, then daily, or at
+            // The first check half a minute after start, then hourly, or at
             // once when asked.
             let _ = woken.recv_timeout(FIRST_CHECK);
             loop {

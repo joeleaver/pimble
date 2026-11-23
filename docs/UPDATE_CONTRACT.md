@@ -89,13 +89,13 @@ keeping it current stands (`AppStore::update_status`, reported by the checker):
 - not the installed app (a development build, or run from where it was unpacked): it does
   not update itself;
 - waiting for the first check, half a minute after start; checking;
-- up to date, with when it last checked (it checks daily);
+- up to date, with when it last checked (it checks every hour, so a newer release replaces one waiting for a restart);
 - a newer version downloaded and checked: "Restart to Update" installs it and restarts, the
   same as the status bar's "Restart to update to <version>"; a staged update stays offered
   after later checks find nothing newer to fetch;
 - the last check failed, with the reason and when.
 
-"Check Now" runs a check at once (it wakes the daily wait). The browser's About says it is
+"Check Now" runs a check at once (it wakes the hourly wait). The browser's About says it is
 the web app, which loads the version pimble.app serves on every visit. Checked in the
 release build as a scratch managed copy (up to date after Check Now; a staged 0.12.9
 offered after the first check, and Restart to Update moving it into place and restarting)

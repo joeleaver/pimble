@@ -48,9 +48,9 @@ pub(crate) fn update_line(s: &UpdateStatus) -> String {
         UpdateStatus::NotInstalled => "This copy does not update itself: it is not the installed app (a development build, or run from where it was unpacked).".to_string(),
         UpdateStatus::Waiting => "Updates itself. The first check runs a moment after start.".to_string(),
         UpdateStatus::Checking => "Checking for a newer version...".to_string(),
-        UpdateStatus::UpToDate { at } => format!("Up to date. Last checked {at}; it checks daily."),
+        UpdateStatus::UpToDate { at } => format!("Up to date. Last checked {at}; it checks every hour."),
         UpdateStatus::Ready { version } => format!("Pimble {version} is downloaded and checked; restart to update."),
-        UpdateStatus::Failed { reason, at } => format!("The last check, {at}, failed: {reason}. It tries again daily, or now."),
+        UpdateStatus::Failed { reason, at } => format!("The last check, {at}, failed: {reason}. It tries again within the hour, or now."),
     }
 }
 

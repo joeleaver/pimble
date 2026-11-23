@@ -111,11 +111,22 @@ pub(crate) fn copy_picture(store: AppStore, pane: PaneId) {
 
 /// Copy what `scope` covers as a flattened PNG.
 fn copy_scope(store: AppStore, scope: Option<Scope>) {
+    copy_scope_as(store, scope, None);
+}
+
+/// [`copy_scope`], remembering `html` (the picture as the note's text holds
+/// it) beside the pixels, so that pasting this very picture into a note
+/// again brings the canvas with its markup, not a flattened copy
+/// (`pictures::copied_html_for`).
+fn copy_scope_as(store: AppStore, scope: Option<Scope>, html: Option<String>) {
     let Some(picture) = scope.and_then(|s| rendered(&s)) else {
         crate::events::show_notice(store, NOTHING_SHOWS.to_string());
         return;
     };
     let image = picture.image;
+    if let Some(html) = html {
+        crate::pictures::remember_copy(image.width, image.height, &image.data, html);
+    }
     #[cfg(feature = "native")]
     {
         let data = rinch::clipboard::ImageData::new(image.width as usize, image.height as usize, image.data);
@@ -361,6 +372,24 @@ pub(super) fn copy_picked(store: AppStore, picked: &Picked) {
     if let Some(scope) = picked_scope_said(store, picked, false) {
         copy_scope(store, Some(scope));
     }
+}
+
+/// Ctrl+C (and Copy in its right-click menu) on a canvas selected in a
+/// note's text: the picture itself on the clipboard, as Copy Picture puts it
+/// there, so it pastes into any program. Copied as text it was only the
+/// placeholder character U+FFFC wherever the note's html was not read (Will,
+/// 2026-11-23). `html` is the selection as the editor copies it, for a paste
+/// back into a note.
+pub(crate) fn copy_picked_from_text(store: AppStore, picked: &Picked, html: Option<String>) {
+    if let Some(scope) = picked_scope_said(store, picked, false) {
+        copy_scope_as(store, Some(scope), html);
+    }
+}
+
+/// Save Picture As... (a PNG of what it shows) on a canvas in a note's text,
+/// from the picture's own menu.
+pub(crate) fn save_picked_png(store: AppStore, picked: &Picked) {
+    save_picked(store, picked, Format::Png, false);
 }
 
 /// Save as PNG/JPEG/SVG (or with all markup), on the selected canvas.

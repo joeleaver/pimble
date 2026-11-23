@@ -202,6 +202,15 @@ pub(crate) fn start_editing(
         if crate::zoom::on_alias(store, key.key, "", key.primary, key.alt) {
             return true;
         }
+        // Ctrl+C on a picture selected in the text copies the picture
+        // itself, as the toolbar's "Copy Picture (Ctrl+C)" says.
+        if key.primary && !key.shift && !key.alt && key.key.eq_ignore_ascii_case("c") {
+            if let Some(picked) = untracked(|| crate::toolbar::picked(store, pane)) {
+                let html = editor(pane).selection_clipboard().map(|(html, _)| html);
+                crate::boards::copy_picked_from_text(store, &picked, html);
+                return true;
+            }
+        }
         let modified = key.primary || key.ctrl || key.meta || key.alt;
         crate::link_picker::key(store, &editor(pane), key.key, modified)
     });
