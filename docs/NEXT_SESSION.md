@@ -1,5 +1,41 @@
 # Next session: start here
 
+**2026-11-23 handover (master session 78e7f30f-9d69-4df3-984a-dee51fb8f54e, ended after
+a compaction and a session-limit stop; no background jobs or agents survive).**
+
+State: v0.30.1 released and installed here; the web app is deployed as jkbase v64
+(8c150b9) with the browser's own server (worker) as its default, `/app/sw.js` 200.
+docs/ONE_CODEBASE_CONTRACT.md waves 0-4 and the wave 4 follow-ups are done.
+
+Fixed in passing: every web deploy since 0.30.0 failed silently ("[static] app failed"),
+because jkbase's trunk buildpack fetches only web/'s workspace and the worker was built
+from the main one. The worker now builds through `web/worker` (a member of web's
+workspace; files `pimble-web-worker-<hash>`). A failed build's reason is not in
+`jkbase logs`: read it from `GET https://api.jkbase.app/projects/pimble/builds`
+(targets[].detail) with the CLI's token from `~/.jkbase/credentials` (never print it).
+Local check of a deploy build: an empty `CARGO_HOME`, `cargo fetch --locked` in web/,
+then `trunk build --release --offline` with wasm-bindgen 0.2.128 on PATH.
+
+Open, in order:
+
+1. **Wave 5** (docs/ONE_CODEBASE_CONTRACT.md): delete the browser's old path
+   (`?server=old`, web's vault.rs, vault_backend.rs, routed.rs, endpoints.rs and what
+   only they use) and turn on the no-second-path check. Not briefed yet.
+2. The plain hosted stores in the browser; a Settings switch and "Forget This Browser";
+   worker diagnostics; Safari untested.
+3. Joe may want to rotate the jkbase CLI token (it was printed into session 78e7f30f's
+   transcript by mistake on 2026-11-23; it went nowhere else).
+
+Cleanup for the next master (docs: ~/.claude/rules/master-session-handover.md):
+- Archive session 78e7f30f-9d69-4df3-984a-dee51fb8f54e. It started no side sessions that
+  are still open, and its agents ran in this checkout (no agent worktrees of its own).
+- Not this session's, leave them: worktrees `/home/joe/dev/pimble-notifications`
+  (`notifications`), `/home/joe/dev/pimble-tree-drops` (`tree-drops-stores`),
+  `.claude/worktrees/jolly-lovelace-c07780` (detached), and the uncommitted work of the
+  notifications session, if any.
+- Scratch to delete: `/tmp/claude-1000/-home-joe-dev-pimble/78e7f30f-9d69-4df3-984a-dee51fb8f54e/`
+  (a fresh cargo home, dist checks, a deploy export, wasm-bindgen 0.2.128).
+
 **2026-11-22: v0.29.0 released and installed. Everything below this line up to 0.28.9 is
 committed and released** (0.28.10 to 0.29.0): text color (docs/TEXT_COLOR_CONTRACT.md),
 whole-window zoom (docs/ZOOM_CONTRACT.md), the toolbar that follows the selection, one-row
