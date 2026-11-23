@@ -23,6 +23,8 @@ pub mod releases;
 pub mod routes;
 pub mod session;
 pub mod state;
+pub mod notify;
+pub mod webpush;
 
 use axum::Router;
 
@@ -84,5 +86,9 @@ pub fn router_from_state(state: AppState) -> Router {
 /// `main` binds `config.port`; tests bind their own ephemeral port.
 pub async fn build_router(config: Config) -> anyhow::Result<Router> {
     let state = build_state(config).await?;
+    // The email fallback's job (docs/NOTIFICATIONS_CONTRACT.md section 4).
+    // Here, not in `build_state`, so tests drive `notify::email_pass` with a
+    // clock of their own.
+    notify::spawn(state.clone());
     Ok(router_from_state(state))
 }

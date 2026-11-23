@@ -70,6 +70,14 @@ hex = "0.4"
 # "a deterministic decoy salt (HMAC-SHA256 of the lowercased email under a
 # server secret)").
 hmac = "0.12"
+# Web Push (docs/NOTIFICATIONS_CONTRACT.md section 4, src/webpush.rs): VAPID
+# (ES256 over P-256) and RFC 8291's encryption (P-256 ECDH, HKDF-SHA256,
+# AES-128-GCM), over RustCrypto rather than the `web-push` crate, whose `ece`
+# links OpenSSL. `rand_core` 0.6 is the one these crates draw keys from.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Outbound HTTP: jkbase-Auth token minting, jkbase's JWKS proxy-and-cache, and
 # the GitHub Releases API for /releases. rustls (no system OpenSSL) matches

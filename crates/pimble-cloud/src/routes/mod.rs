@@ -33,6 +33,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/me/notifications", axum::routing::put(inbox::put_notifications))
         .route("/api/v1/inbox", get(inbox::drain).delete(inbox::clear))
         .route("/api/v1/inbox/ack", post(inbox::ack))
+        .route("/api/v1/inbox/seen/:item", post(inbox::seen))
+        .route("/api/v1/me/push", post(inbox::post_push).delete(inbox::delete_push))
         .route("/api/v1/inbox/:recipient", post(inbox::post_notice))
         .route("/api/v1/me/password", post(accounts::change_password))
         .route("/api/v1/me/recovery-code", post(accounts::change_recovery_code))

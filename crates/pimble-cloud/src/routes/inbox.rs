@@ -6,10 +6,17 @@
 //!   the account's own (signed by it, sealed to it, for this account's notice
 //!   key). A second, different key is refused (409): the device that lost
 //!   the race fetches the first one from `GET /me/keys`.
-//! - `PUT /api/v1/me/notifications { on }`: the switch. Off drops everything
-//!   queued for the account and refuses new notices to it.
-//! - `POST /api/v1/inbox/{recipient} { store_id, root, sealed }`: a sender
-//!   queues a notice. Both accounts must reach that share (the store whole,
+//! - `PUT /api/v1/me/notifications { on?, email?, push? }`: the switches.
+//!   `on` off drops everything queued for the account and refuses new
+//!   notices to it; `email` and `push` (wave 2) turn one channel off alone.
+//! - `POST /api/v1/me/push { endpoint, keys: { p256dh, auth } }` and
+//!   `DELETE /api/v1/me/push { endpoint }`: a browser's push subscription
+//!   (wave 2), one per endpoint.
+//! - `POST /api/v1/inbox/seen/{item}?t=`: a service worker showed that
+//!   item's push; the token the push carried is the only credential.
+//! - `POST /api/v1/inbox/{recipient} { store_id, root, sealed, kind? }`: a
+//!   sender queues a notice, and every browser the recipient subscribed is
+//!   pushed it. Both accounts must reach that share (the store whole,
 //!   or that root); a sender may queue [`SENDS_PER_WINDOW`] per
 //!   [`SEND_WINDOW`].
 //! - `GET /api/v1/inbox?after=&wait=`: the caller's items after the cursor
@@ -81,17 +88,141 @@ pub async fn put_notice_key(State(state): State<AppState>, authed: AuthedUser, J
 
 #[derive(Deserialize)]
 pub struct PutNotifications {
-    pub on: bool,
+    #[serde(default)]
+    pub on: Option<bool>,
+    /// Wave 2: the email fallback, apart from the rest.
+    #[serde(default)]
+    pub email: Option<bool>,
+    /// Wave 2: web push, apart from the rest.
+    #[serde(default)]
+    pub push: Option<bool>,
 }
 
 pub async fn put_notifications(State(state): State<AppState>, authed: AuthedUser, Json(body): Json<PutNotifications>) -> CloudResult<Json<Value>> {
-    state.db.set_notifications_off(authed.user.rid, !body.on).await?;
-    if !body.on {
-        for item in state.db.inbox_of(&authed.user.user_uuid).await? {
-            state.db.delete_inbox_item(item.rid).await?;
+    let user = &authed.user;
+    if let Some(on) = body.on {
+        state.db.set_notifications_off(user.rid, !on).await?;
+        if !on {
+            for item in state.db.inbox_of(&user.user_uuid).await? {
+                state.db.delete_inbox_item(item.rid).await?;
+            }
         }
     }
-    Ok(Json(json!({ "on": body.on })))
+    if body.email.is_some() || body.push.is_some() {
+        state.db.set_notify_channels(user.rid, body.email.map(|on| !on), body.push.map(|on| !on)).await?;
+    }
+    Ok(Json(json!({
+        "on": body.on.unwrap_or(!user.notifications_off),
+        "email": body.email.unwrap_or(!user.notify_email_off),
+        "push": body.push.unwrap_or(!user.notify_push_off),
+    })))
+}
+
+// ── Push subscriptions (wave 2) ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct PushKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+#[derive(Deserialize)]
+pub struct PostPush {
+    pub endpoint: String,
+    pub keys: PushKeys,
+}
+
+/// The most browsers one account keeps subscribed; the oldest goes first.
+const MAX_PUSH_SUBSCRIPTIONS: usize = 20;
+
+pub async fn post_push(State(state): State<AppState>, authed: AuthedUser, Json(body): Json<PostPush>) -> CloudResult<Json<Value>> {
+    let endpoint = body.endpoint.trim();
+    if endpoint.len() > 2048 || !crate::notify::push_endpoint_allowed(state.config.push_any_endpoint, endpoint) {
+        return Err(CloudError::BadRequest("that is not a browser's push service".into()));
+    }
+    // The keys must work before they are kept: a push to them is encrypted
+    // with them.
+    if crate::webpush::encrypt(b"check", body.keys.p256dh.trim(), body.keys.auth.trim()).is_err() {
+        return Err(CloudError::BadRequest("keys.p256dh or keys.auth is not a push subscription's key".into()));
+    }
+    let me = &authed.user.user_uuid;
+    state.db.put_push_subscription(me, endpoint, body.keys.p256dh.trim(), body.keys.auth.trim()).await?;
+    let mut mine = state.db.push_subscriptions_of(me).await?;
+    if mine.len() > MAX_PUSH_SUBSCRIPTIONS {
+        mine.sort_by_key(|s| s.rid);
+        for old in &mine[..mine.len() - MAX_PUSH_SUBSCRIPTIONS] {
+            state.db.delete_push_subscription(old.rid).await?;
+        }
+    }
+    Ok(Json(json!({ "subscribed": true, "push_key": state.vapid.as_ref().map(|v| v.public()) })))
+}
+
+#[derive(Deserialize)]
+pub struct DeletePush {
+    pub endpoint: String,
+}
+
+pub async fn delete_push(State(state): State<AppState>, authed: AuthedUser, Json(body): Json<DeletePush>) -> CloudResult<Json<Value>> {
+    let mut removed = 0;
+    for sub in state.db.push_subscriptions_at(body.endpoint.trim()).await? {
+        if sub.user_uuid == authed.user.user_uuid {
+            state.db.delete_push_subscription(sub.rid).await?;
+            removed += 1;
+        }
+    }
+    Ok(Json(json!({ "unsubscribed": removed })))
+}
+
+#[derive(Deserialize)]
+pub struct SeenQuery {
+    #[serde(default)]
+    pub t: String,
+}
+
+/// A service worker showed this item's push: it is seen, so it is not
+/// emailed. Answers the same whether or not the item is still there.
+pub async fn seen(State(state): State<AppState>, Path(item): Path<String>, Query(query): Query<SeenQuery>) -> CloudResult<Json<Value>> {
+    if !crate::notify::seen_token_valid(&state, &item, &query.t) {
+        return Err(CloudError::Forbidden("that is not this item's token".into()));
+    }
+    if let Some(row) = state.db.find_inbox_item(&item).await? {
+        if !row.delivered {
+            state.db.mark_inbox_item_delivered(row.rid).await?;
+        }
+    }
+    Ok(Json(json!({})))
+}
+
+// ── Names, for email and push ─────────────────────────────────────────────
+
+/// The longest a kind may be; it is a word.
+const MAX_KIND_LEN: usize = 16;
+
+/// What the sender of `item` goes by in its share, and the share's name as
+/// its recipient knows it: the name of the recipient's own grant (the
+/// store's for a whole-store grant, else the share's).
+pub async fn names_for(state: &AppState, item: &InboxItemRow) -> CloudResult<(String, String)> {
+    let store = state.db.find_hosted_store(&item.store_uuid).await?;
+    let sender = state.db.find_user_by_uuid(&item.sender_uuid).await?;
+    let recipient = state.db.find_user_by_uuid(&item.recipient_uuid).await?;
+    let Some(store) = store else { return Ok((sender.map(|u| u.default_name()).unwrap_or_else(|| "Someone".into()), "a shared store".into())) };
+    let names = super::stores::Names::of_store(state, store.rid).await?;
+    let sender_name = match &sender {
+        Some(user) => names.name_of(user, &item.root),
+        None => "Someone".into(),
+    };
+    let mut share = String::new();
+    if let Some(recipient) = recipient {
+        let grants = state.db.grants_for_user_and_store(recipient.rid, store.rid).await?;
+        let grant = grants.iter().find(|g| !g.is_whole_store() && g.root == item.root).or_else(|| grants.iter().find(|g| g.is_whole_store()));
+        if let Some(grant) = grant {
+            share = super::stores::row_name(&store, grant);
+        }
+    }
+    if share.trim().is_empty() {
+        share = if item.root.is_empty() { "a shared store".into() } else { super::stores::UNNAMED_SHARE.into() };
+    }
+    Ok((sender_name, share))
 }
 
 // ── Sending ───────────────────────────────────────────────────────────────
@@ -103,6 +234,11 @@ pub struct PostNotice {
     #[serde(default)]
     pub root: Option<String>,
     pub sealed: String,
+    /// Wave 2: what the sender calls it (`"mention"`, `"reply"`), the one
+    /// thing an email or a push says about it besides who and where. Kept in
+    /// the clear, so the service knows the kind of every notice.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Whether `user_rid` reaches the scope `root` of the store: a whole-store
@@ -134,8 +270,15 @@ pub async fn post_notice(State(state): State<AppState>, authed: AuthedUser, Path
     if to.notifications_off {
         return Ok(Json(json!({ "id": null, "queued": false })));
     }
-    let item = state.db.create_inbox_item(&to.user_uuid, &authed.user.user_uuid, &store.store_id, &root, &body.sealed).await?;
+    let kind: String = body.kind.as_deref().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(MAX_KIND_LEN).collect::<String>().to_ascii_lowercase();
+    let item = state.db.create_inbox_item(&to.user_uuid, &authed.user.user_uuid, &store.store_id, &root, &body.sealed, &kind).await?;
     state.wake_inbox(&to.user_uuid);
+    if state.vapid.is_some() && !to.notify_push_off {
+        let (state, item) = (state.clone(), item.clone());
+        tokio::spawn(async move {
+            crate::notify::push_item(&state, &to, &item).await;
+        });
+    }
     Ok(Json(json!({ "id": item.item_uuid, "queued": true })))
 }
 

@@ -195,6 +195,12 @@ pub struct UserRow {
     pub notice_key_envelope: String,
     /// Whether the person turned notifications off (section 6).
     pub notifications_off: bool,
+    /// Whether the person turned the email, or the web push, channel off
+    /// (section 6, wave 2).
+    pub notify_email_off: bool,
+    pub notify_push_off: bool,
+    /// When the last notice email went to them; `0` for never.
+    pub notice_emailed_at_ms: i64,
 }
 
 impl UserRow {
@@ -434,6 +440,9 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         notice_public_key: get_string_opt(o, "notice_public_key")?.map(str::to_string).unwrap_or_default(),
         notice_key_envelope: get_string_opt(o, "notice_key_envelope")?.map(str::to_string).unwrap_or_default(),
         notifications_off: get_bool_opt(o, "notifications_off")?.unwrap_or(false),
+        notify_email_off: get_bool_opt(o, "notify_email_off")?.unwrap_or(false),
+        notify_push_off: get_bool_opt(o, "notify_push_off")?.unwrap_or(false),
+        notice_emailed_at_ms: get_datetime_ms_opt(o, "notice_emailed_at")?.unwrap_or(0),
     })
 }
 
@@ -450,6 +459,30 @@ pub struct InboxItemRow {
     pub created_at_ms: i64,
     pub delivered: bool,
     pub delivered_at_ms: i64,
+    /// What the sender says it is: `"mention"`, `"reply"` or `""`.
+    pub kind: String,
+    /// Whether the email fallback has told the recipient of it.
+    pub emailed: bool,
+}
+
+/// One browser's push subscription (`PushSubscription`).
+#[derive(Debug, Clone)]
+pub struct PushSubscriptionRow {
+    pub rid: u64,
+    pub user_uuid: String,
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+}
+
+fn push_subscription_from_object(o: &Object) -> CloudResult<PushSubscriptionRow> {
+    Ok(PushSubscriptionRow {
+        rid: o.id,
+        user_uuid: get_string(o, "user_uuid")?.to_string(),
+        endpoint: get_string(o, "endpoint")?.to_string(),
+        p256dh: get_string(o, "p256dh")?.to_string(),
+        auth: get_string(o, "auth")?.to_string(),
+    })
 }
 
 fn inbox_item_from_object(o: &Object) -> CloudResult<InboxItemRow> {
@@ -464,6 +497,8 @@ fn inbox_item_from_object(o: &Object) -> CloudResult<InboxItemRow> {
         created_at_ms: get_datetime_ms(o, "created_at")?,
         delivered: get_bool(o, "delivered")?,
         delivered_at_ms: get_datetime_ms(o, "delivered_at")?,
+        kind: get_string_opt(o, "kind")?.unwrap_or("").to_string(),
+        emailed: get_bool_opt(o, "emailed")?.unwrap_or(false),
     })
 }
 
@@ -1002,18 +1037,47 @@ impl RhypeDb {
         Ok(())
     }
 
+    /// The email and push switches (wave 2); `None` leaves one as it is.
+    pub async fn set_notify_channels(&self, user_rid: u64, email_off: Option<bool>, push_off: Option<bool>) -> CloudResult<()> {
+        let mut fields = Vec::new();
+        if let Some(off) = email_off {
+            fields.push(format!("notify_email_off: {off}"));
+        }
+        if let Some(off) = push_off {
+            fields.push(format!("notify_push_off: {off}"));
+        }
+        if fields.is_empty() {
+            return Ok(());
+        }
+        self.objects(&format!("User.get({user_rid}).update({{ {} }})", fields.join(", "))).await?;
+        Ok(())
+    }
+
+    pub async fn set_notice_emailed_at(&self, user_rid: u64, at_ms: i64) -> CloudResult<()> {
+        self.objects(&format!("User.get({user_rid}).update({{ notice_emailed_at: {} }})", datetime_literal(at_ms))).await?;
+        Ok(())
+    }
+
     /// Queue a sealed notice; answers the new item.
-    pub async fn create_inbox_item(&self, recipient: &str, sender: &str, store_uuid: &str, root: &str, sealed: &str) -> CloudResult<InboxItemRow> {
+    pub async fn create_inbox_item(&self, recipient: &str, sender: &str, store_uuid: &str, root: &str, sealed: &str, kind: &str) -> CloudResult<InboxItemRow> {
+        self.create_inbox_item_at(recipient, sender, store_uuid, root, sealed, kind, chrono::Utc::now().timestamp_millis()).await
+    }
+
+    /// [`Self::create_inbox_item`] as if it were queued at `at_ms` (the
+    /// email fallback's tests move time rather than wait for it).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_inbox_item_at(&self, recipient: &str, sender: &str, store_uuid: &str, root: &str, sealed: &str, kind: &str, at_ms: i64) -> CloudResult<InboxItemRow> {
         let item_uuid = uuid::Uuid::new_v4().to_string();
         let q = format!(
-            "InboxItem.create({{ item_uuid: {item}, recipient_uuid: {recipient}, sender_uuid: {sender}, store_uuid: {store}, root: {root}, sealed: {sealed}, created_at: {now}, delivered: false, delivered_at: {epoch} }})",
+            "InboxItem.create({{ item_uuid: {item}, recipient_uuid: {recipient}, sender_uuid: {sender}, store_uuid: {store}, root: {root}, sealed: {sealed}, created_at: {now}, delivered: false, delivered_at: {epoch}, kind: {kind}, emailed: false }})",
+            kind = ql_str(kind),
             item = ql_str(&item_uuid),
             recipient = ql_str(recipient),
             sender = ql_str(sender),
             store = ql_str(store_uuid),
             root = ql_str(root),
             sealed = ql_str(sealed),
-            now = now_literal(),
+            now = datetime_literal(at_ms),
             epoch = datetime_literal(0),
         );
         let o = self.one(&q).await?.ok_or_else(|| CloudError::Internal("InboxItem.create returned nothing".into()))?;
@@ -1031,6 +1095,83 @@ impl RhypeDb {
     pub async fn mark_inbox_item_delivered(&self, rid: u64) -> CloudResult<()> {
         self.objects(&format!("InboxItem.get({rid}).update({{ delivered: true, delivered_at: {} }})", now_literal())).await?;
         Ok(())
+    }
+
+    /// Every item no device has seen yet, across all inboxes: what the
+    /// email fallback looks over.
+    pub async fn unseen_inbox_items(&self) -> CloudResult<Vec<InboxItemRow>> {
+        let mut rows: Vec<InboxItemRow> = self.objects("InboxItem.filter(.delivered == false)").await?.iter().map(inbox_item_from_object).collect::<CloudResult<_>>()?;
+        rows.sort_by_key(|r| r.rid);
+        Ok(rows)
+    }
+
+    pub async fn find_inbox_item(&self, item_uuid: &str) -> CloudResult<Option<InboxItemRow>> {
+        let q = format!("InboxItem.filter(.item_uuid == {})", ql_str(item_uuid));
+        self.one(&q).await?.map(|o| inbox_item_from_object(&o)).transpose()
+    }
+
+    pub async fn mark_inbox_item_emailed(&self, rid: u64) -> CloudResult<()> {
+        match self.client.query(&format!("InboxItem.get({rid}).update({{ emailed: true }})")).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ── Push subscriptions (docs/NOTIFICATIONS_CONTRACT.md section 4) ──
+
+    /// Keep `user_uuid`'s subscription at `endpoint`: one row per endpoint,
+    /// whoever held it before (a browser signed in to another account).
+    pub async fn put_push_subscription(&self, user_uuid: &str, endpoint: &str, p256dh: &str, auth: &str) -> CloudResult<()> {
+        let existing = self.push_subscriptions_at(endpoint).await?;
+        let mut kept = false;
+        for row in existing {
+            if !kept {
+                let q = format!(
+                    "PushSubscription.get({}).update({{ user_uuid: {}, p256dh: {}, auth: {} }})",
+                    row.rid,
+                    ql_str(user_uuid),
+                    ql_str(p256dh),
+                    ql_str(auth)
+                );
+                self.objects(&q).await?;
+                kept = true;
+            } else {
+                self.delete_push_subscription(row.rid).await?;
+            }
+        }
+        if !kept {
+            let q = format!(
+                "PushSubscription.create({{ user_uuid: {}, endpoint: {}, p256dh: {}, auth: {}, created_at: {} }})",
+                ql_str(user_uuid),
+                ql_str(endpoint),
+                ql_str(p256dh),
+                ql_str(auth),
+                now_literal()
+            );
+            self.objects(&q).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn push_subscriptions_at(&self, endpoint: &str) -> CloudResult<Vec<PushSubscriptionRow>> {
+        let q = format!("PushSubscription.filter(.endpoint == {})", ql_str(endpoint));
+        self.objects(&q).await?.iter().map(push_subscription_from_object).collect()
+    }
+
+    pub async fn push_subscriptions_of(&self, user_uuid: &str) -> CloudResult<Vec<PushSubscriptionRow>> {
+        let q = format!("PushSubscription.filter(.user_uuid == {})", ql_str(user_uuid));
+        let mut rows: Vec<PushSubscriptionRow> = self.objects(&q).await?.iter().map(push_subscription_from_object).collect::<CloudResult<_>>()?;
+        rows.sort_by_key(|r| r.rid);
+        Ok(rows)
+    }
+
+    pub async fn delete_push_subscription(&self, rid: u64) -> CloudResult<()> {
+        match self.client.query(&format!("PushSubscription.get({rid}).delete()")).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn delete_inbox_item(&self, rid: u64) -> CloudResult<()> {

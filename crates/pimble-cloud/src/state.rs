@@ -78,6 +78,11 @@ pub struct Inner {
     pub inbox_quota: QuotaLimiter,
     /// Wakes a recipient's waiting drain when a notice is queued for them.
     pub inbox_wakers: crate::routes::InboxWakers,
+    /// This service's Web Push key, when one is configured
+    /// (`PIMBLE_VAPID_PRIVATE_KEY`).
+    pub vapid: Option<crate::webpush::VapidKey>,
+    /// What pushes go out on: short timeouts, no redirects.
+    pub push_http: reqwest::Client,
 }
 
 impl Inner {
@@ -129,6 +134,22 @@ impl AppState {
     pub fn new(config: Config, db: RhypeDb, pimble: PimbleService, signer: JwtSigner, releases: ReleasesCache, mailer: Arc<dyn Mailer>) -> Self {
         let kdf_decoy_secret = resolve_kdf_decoy_secret(&config);
         let relay = Relay::new(config.relay.clone());
+        let vapid = match config.vapid_private_key.as_deref().map(crate::webpush::VapidKey::from_private) {
+            Some(Ok(key)) => Some(key),
+            Some(Err(e)) => {
+                tracing::error!("PIMBLE_VAPID_PRIVATE_KEY is not a VAPID key ({e}); web push is off");
+                None
+            }
+            None => {
+                tracing::warn!("PIMBLE_VAPID_PRIVATE_KEY is not set; web push is off");
+                None
+            }
+        };
+        let push_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
         AppState(Arc::new(Inner {
             config,
             db,
@@ -146,6 +167,8 @@ impl AppState {
             personal_lock: tokio::sync::Mutex::new(()),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),
+            vapid,
+            push_http,
         }))
     }
 }

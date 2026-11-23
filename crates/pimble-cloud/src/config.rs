@@ -77,6 +77,23 @@ pub struct Config {
     /// `/diagnostics/*` answers 503 and the page keeps what it queued.
     pub diagnostics_url: String,
     pub diagnostics_key: Option<String>,
+    /// `PIMBLE_VAPID_PRIVATE_KEY`: this service's Web Push (VAPID) key, the
+    /// P-256 private scalar base64url (`pimble-cloud --generate-vapid-key`
+    /// makes one; docs/NOTIFICATIONS_CONTRACT.md section 4). Unset: no web
+    /// push (`GET /me` answers `push_key: null` and nothing is pushed). It
+    /// must stay the same across deploys: browsers subscribed with its public
+    /// half, and a new key leaves every subscription unable to be pushed to.
+    pub vapid_private_key: Option<String>,
+    /// `PIMBLE_VAPID_SUBJECT`: the contact a push service may reach this
+    /// service's operator at (RFC 8292's `sub`). Default
+    /// `mailto:no-reply@m.pimble.app`.
+    pub vapid_subject: String,
+    /// Whether a push subscription may name any endpoint (`http` and
+    /// loopback included). Off in every real run, where only the browsers'
+    /// own push services are accepted (`notify::push_endpoint_allowed`);
+    /// not an environment variable, a field so a test can stand in a push
+    /// service of its own.
+    pub push_any_endpoint: bool,
 }
 
 /// The value [`Config::from_env`] always uses for
@@ -108,6 +125,9 @@ impl Config {
             relay: crate::relay::RelayLimits::default(),
             diagnostics_url: env_var("PIMBLE_DIAGNOSTICS_URL").unwrap_or_else(|| "https://pimble-diagnostics.jkbase.app".to_string()),
             diagnostics_key: env_var("PIMBLE_DIAGNOSTICS_KEY"),
+            vapid_private_key: env_var("PIMBLE_VAPID_PRIVATE_KEY"),
+            vapid_subject: env_var("PIMBLE_VAPID_SUBJECT").unwrap_or_else(|| "mailto:no-reply@m.pimble.app".to_string()),
+            push_any_endpoint: false,
         }
     }
 

@@ -363,6 +363,79 @@ pub fn shared_with_you_email(inviter_email: &str, share_name: &str, link: &str, 
     (subject, text, html)
 }
 
+/// One line of a notice email (docs/NOTIFICATIONS_CONTRACT.md section 4):
+/// who, what kind of notice, and in which share, from what the service
+/// already knows. Never a word of the note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeLine {
+    /// The name the sender goes by in that share.
+    pub sender: String,
+    /// What the sender called it: `"mention"`, `"reply"`, or anything else.
+    pub kind: String,
+    /// The share's name as the recipient knows it.
+    pub share: String,
+    /// How many items this line stands for.
+    pub count: usize,
+}
+
+impl NoticeLine {
+    /// "Joe mentioned you in Shared with Will", "(3 times)" when several.
+    pub fn text(&self) -> String {
+        let sender = display_name(&self.sender);
+        let share = display_name(&self.share);
+        let verb = match self.kind.as_str() {
+            "mention" => "mentioned you in",
+            "reply" => "replied in a discussion in",
+            "assign" => "assigned you something in",
+            _ => "wrote to you in",
+        };
+        let mut line = format!("{sender} {verb} {share}");
+        if self.count > 1 {
+            line.push_str(&format!(" ({} times)", self.count));
+        }
+        line
+    }
+}
+
+/// The notice email: one line per item (or per run of alike items), a link
+/// to the web app's inbox, and how to turn these off. `more` counts the lines
+/// left out.
+pub fn notices_email(lines: &[NoticeLine], more: usize, link: &str) -> (String, String, String) {
+    let subject = match lines {
+        [one] if more == 0 && one.count == 1 => one.text(),
+        _ => "You have notices on Pimble".to_string(),
+    };
+    let texts: Vec<String> = lines.iter().map(NoticeLine::text).collect();
+    let mut text = String::from("While none of your devices was open:\n\n");
+    for line in &texts {
+        text.push_str(&format!("- {line}\n"));
+    }
+    if more > 0 {
+        text.push_str(&format!("- and {more} more\n"));
+    }
+    text.push_str(&format!(
+        "\nOpen your inbox in Pimble:\n\n{link}\n\n\
+         You get at most one of these an hour. To stop them, turn off Email under \
+         Settings > Account in Pimble."
+    ));
+    let mut items = String::new();
+    for line in &texts {
+        items.push_str(&format!("<li>{}</li>", escape_html(line)));
+    }
+    if more > 0 {
+        items.push_str(&format!("<li>and {more} more</li>"));
+    }
+    let html = format!(
+        "<p>While none of your devices was open:</p><ul>{items}</ul>\
+         <p>Open your inbox in Pimble:</p>\
+         <p><a href=\"{link}\">{link}</a></p>\
+         <p>You get at most one of these an hour. To stop them, turn off Email under \
+         Settings &gt; Account in Pimble.</p>",
+        link = escape_html(link),
+    );
+    (subject, text, html)
+}
+
 /// Pulls the first `http://` or `https://` URL out of a plain-text email
 /// body. Used by tests against [`LogMailer::last_message`] to recover the
 /// verification link without parsing HTML.
@@ -447,6 +520,23 @@ mod tests {
         // Both the sentence at the top and the encryption sentence carry the
         // inviter, and both must be escaped.
         assert_eq!(html.matches("&lt;b&gt;ann&lt;/b&gt;").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn a_notice_email_says_who_and_where_and_nothing_else() {
+        let lines = vec![
+            NoticeLine { sender: "Joe".into(), kind: "mention".into(), share: "Shared with Will".into(), count: 1 },
+            NoticeLine { sender: "Ann\n<b>".into(), kind: "reply".into(), share: "Garden".into(), count: 2 },
+        ];
+        assert_eq!(lines[0].text(), "Joe mentioned you in Shared with Will");
+        let (subject, text, html) = notices_email(&lines, 1, "https://pimble.app/app/?inbox");
+        assert_eq!(subject, "You have notices on Pimble");
+        assert!(text.contains("- Joe mentioned you in Shared with Will\n"));
+        assert!(text.contains("- Ann<b> replied in a discussion in Garden (2 times)\n"));
+        assert!(text.contains("and 1 more"));
+        assert!(html.contains("Ann&lt;b&gt;"), "{html}");
+        let (subject, ..) = notices_email(&lines[..1], 0, "x");
+        assert_eq!(subject, "Joe mentioned you in Shared with Will");
     }
 
     #[test]

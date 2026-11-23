@@ -125,11 +125,30 @@ pub struct UserView {
     /// Whether people who share notes with them can notify them
     /// (docs/NOTIFICATIONS_CONTRACT.md section 6): on from sign-in.
     notifications: bool,
+    /// Wave 2: whether an inbox item nobody has seen in fifteen minutes is
+    /// emailed (section 4).
+    notification_email: bool,
+    /// Wave 2: whether the browsers they subscribed are pushed their items.
+    notification_push: bool,
+    /// Wave 2, `GET /me` only: the service's VAPID public key, the
+    /// `applicationServerKey` a browser subscribes with; absent when this
+    /// service sends no pushes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_key: Option<String>,
 }
 
 impl From<&UserRow> for UserView {
     fn from(user: &UserRow) -> Self {
-        Self { id: user.user_uuid.clone(), email: user.email.clone(), display_name: user.display_name.clone(), name: user.default_name(), notifications: !user.notifications_off }
+        Self {
+            id: user.user_uuid.clone(),
+            email: user.email.clone(),
+            display_name: user.display_name.clone(),
+            name: user.default_name(),
+            notifications: !user.notifications_off,
+            notification_email: !user.notify_email_off,
+            notification_push: !user.notify_push_off,
+            push_key: None,
+        }
     }
 }
 
@@ -352,8 +371,10 @@ pub async fn logout(State(state): State<AppState>, authed: AuthedUser) -> CloudR
     Ok((StatusCode::OK, [(SET_COOKIE, cookie)], Json(json!({}))).into_response())
 }
 
-pub async fn me(authed: AuthedUser) -> Json<UserView> {
-    Json(UserView::from(&authed.user))
+pub async fn me(State(state): State<AppState>, authed: AuthedUser) -> Json<UserView> {
+    let mut view = UserView::from(&authed.user);
+    view.push_key = state.vapid.as_ref().map(|v| v.public());
+    Json(view)
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────
@@ -630,6 +651,9 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
     state.db.delete_share_names_for_user(user.rid).await?;
     for item in state.db.inbox_of(&user.user_uuid).await? {
         state.db.delete_inbox_item(item.rid).await?;
+    }
+    for sub in state.db.push_subscriptions_of(&user.user_uuid).await? {
+        state.db.delete_push_subscription(sub.rid).await?;
     }
     state.db.delete_user(user.rid).await?;
 

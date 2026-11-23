@@ -395,6 +395,11 @@ async fn spawn_stack_inner(
         relay: relay_limits.unwrap_or_default(),
         diagnostics_url: "http://127.0.0.1:9".to_string(),
         diagnostics_key: None,
+        // A fresh VAPID key per stack, and any endpoint allowed, so a test's
+        // own push service on loopback can stand in for a browser's.
+        vapid_private_key: Some(pimble_cloud::webpush::VapidKey::generate().private()),
+        vapid_subject: "mailto:test@example.invalid".to_string(),
+        push_any_endpoint: true,
     };
 
     let app_state = match mailer_override {
@@ -4566,4 +4571,257 @@ async fn a_sender_is_rate_limited() {
     }
     assert!(statuses[..pimble_cloud::routes::inbox::SENDS_PER_WINDOW].iter().all(|s| *s == 200), "{statuses:?}");
     assert_eq!(*statuses.last().unwrap(), 429);
+}
+
+// ── Wave 2: email after fifteen minutes, and web push ─────────────────────
+// (docs/NOTIFICATIONS_CONTRACT.md section 4)
+
+/// Olga owns a store and shares "Recipes" in it with Will; both have made a
+/// notice key. Answers (olga cookie, will cookie, will id, store id, root,
+/// Will's notice key).
+async fn a_share_with_notice_keys(stack: &Stack, tag: &str) -> (String, String, String, String, String, pimble_crypto::NoticeKey) {
+    let olga_email = format!("olga.{tag}@example.com");
+    let will_email = format!("will.{tag}@example.com");
+    let (_, _olga_keys) = signup_with_material(stack, &olga_email, "wave two owner password!!").await;
+    let (_olga, olga_cookie) = verify_then_login(stack, &olga_email, "wave two owner password!!").await;
+    let (_, will_keys) = signup_with_material(stack, &will_email, "wave two will password!!").await;
+    let (will, will_cookie) = verify_then_login(stack, &will_email, "wave two will password!!").await;
+    let will_id = will["user"]["id"].as_str().unwrap().to_string();
+    let store = create_store_with_body(stack, &olga_cookie, json!({ "name": "Family", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+    let resp = put_member_with(stack, &olga_cookie, &store_id, json!({ "email": will_email, "role": "editor", "root": root, "name": "Recipes" })).await;
+    assert_eq!(resp.status(), 200);
+    let notice = pimble_crypto::NoticeKey::generate();
+    let env = pimble_crypto::wrap_notice_key(&notice, &will_keys, &will_id).unwrap();
+    let resp = stack.http.put(format!("{}/me/notice-key", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "public_key": notice.public(), "envelope": env })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    (olga_cookie, will_cookie, will_id, store_id, root, notice)
+}
+
+async fn notify(stack: &Stack, cookie: &str, to: &str, store_id: &str, root: &str, notice: &pimble_crypto::NoticeKey, kind: &str) -> String {
+    let sealed = pimble_crypto::seal_notice(br#"{"snippet":"the secret oven words"}"#, &notice.public(), to).unwrap();
+    let resp = stack.http.post(format!("{}/inbox/{to}", stack.base_url)).header("Cookie", cookie).json(&json!({ "store_id": store_id, "root": root, "sealed": sealed, "kind": kind })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["queued"], true);
+    body["id"].as_str().unwrap().to_string()
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+const MIN: i64 = 60 * 1000;
+
+/// An item nobody has seen is emailed after fifteen minutes, once, with who
+/// and where and never a word of the note; at most one email an hour, the
+/// items in between waiting for the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unseen_notice_is_emailed_after_fifteen_minutes_at_most_hourly() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, _will_cookie, will_id, store_id, root, notice) = a_share_with_notice_keys(&stack, "email15").await;
+    let will_email = "will.email15@example.com";
+    let before = mail_count(&stack, will_email);
+    let t0 = now_ms();
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "reply").await;
+
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 14 * MIN).await.unwrap(), 0, "not before fifteen minutes");
+    assert_eq!(mail_count(&stack, will_email), before);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 16 * MIN).await.unwrap(), 1);
+    assert_eq!(mail_count(&stack, will_email), before + 1);
+    let mail = last_mail(&stack, will_email);
+    assert!(mail.contains("olga.email15 mentioned you in Recipes"), "{mail}");
+    assert!(mail.contains("olga.email15 replied in a discussion in Recipes"), "{mail}");
+    assert!(mail.contains(&format!("{PUBLIC_URL}/app/?inbox")), "{mail}");
+    assert!(!mail.contains("oven") && !mail.contains("Family"), "no note text and not the owner's name for the store: {mail}");
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 17 * MIN).await.unwrap(), 0, "each item once");
+
+    // Another item: due at +31 min, but the last email went at +16.
+    let t1 = now_ms();
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t1 + 31 * MIN).await.unwrap(), 0, "one an hour");
+    assert_eq!(mail_count(&stack, will_email), before + 1);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 77 * MIN).await.unwrap(), 1, "it waited for the next hour");
+    assert_eq!(mail_count(&stack, will_email), before + 2);
+    let mail = last_mail(&stack, will_email);
+    assert!(mail.contains("olga.email15 mentioned you in Recipes"), "{mail}");
+    assert!(!mail.contains("replied"), "only the new item: {mail}");
+}
+
+/// Seen by a device (drained, or its push shown) or read (acknowledged):
+/// never emailed. Read on one device stops the email for every device.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seen_or_read_notice_is_not_emailed() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, will_cookie, will_id, store_id, root, notice) = a_share_with_notice_keys(&stack, "seen").await;
+    let will_email = "will.seen@example.com";
+    let before = mail_count(&stack, will_email);
+    let t0 = now_ms();
+
+    // Read: acknowledged without ever being drained (another device).
+    let read = notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    let resp = stack.http.post(format!("{}/inbox/ack", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "ids": [read] })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 20 * MIN).await.unwrap(), 0);
+
+    // Seen: a running device drained it.
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    let drained: Value = stack.http.get(format!("{}/inbox", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(drained["items"].as_array().unwrap().len(), 1);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 20 * MIN).await.unwrap(), 0);
+
+    // Seen: a service worker showed its push, with the token it carried.
+    let pushed = notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    let resp = stack.http.post(format!("{}/inbox/seen/{pushed}?t=00", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "a wrong token");
+    let token = pimble_cloud::notify::seen_token(&stack.app_state, &pushed);
+    let resp = stack.http.post(format!("{}/inbox/seen/{pushed}?t={token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 20 * MIN).await.unwrap(), 0);
+    assert_eq!(mail_count(&stack, will_email), before, "nothing emailed");
+    // The drained and the pushed one are still in the inbox for his devices.
+    let all: Value = stack.http.get(format!("{}/inbox", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(all["items"].as_array().unwrap().len(), 2);
+}
+
+/// The email switch stops the email alone; the items stay for the devices.
+/// The switches show in `/me`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_email_switch_stops_the_email() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, will_cookie, will_id, store_id, root, notice) = a_share_with_notice_keys(&stack, "switch").await;
+    let will_email = "will.switch@example.com";
+    let me: Value = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["notification_email"], true);
+    assert_eq!(me["notification_push"], true);
+    assert!(me["push_key"].as_str().is_some_and(|k| k.len() == 87), "a VAPID public key: {me}");
+    let resp = stack.http.put(format!("{}/me/notifications", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "email": false })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: Value = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["notification_email"], false);
+    assert_eq!(me["notifications"], true, "the rest stays on");
+    let before = mail_count(&stack, will_email);
+    let t0 = now_ms();
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 20 * MIN).await.unwrap(), 0);
+    assert_eq!(mail_count(&stack, will_email), before);
+    // Turned back on, the item skipped while off is not emailed late.
+    let resp = stack.http.put(format!("{}/me/notifications", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "email": true })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 40 * MIN).await.unwrap(), 0);
+    let inbox: Value = stack.http.get(format!("{}/inbox", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1, "still there for his devices");
+}
+
+/// What a stand-in push service heard.
+#[derive(Clone, Default)]
+struct Heard(std::sync::Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, Vec<u8>)>>>);
+
+/// A push service on loopback that keeps what it is sent and answers
+/// `status`.
+async fn stand_in_push_service(status: u16) -> (String, Heard) {
+    let heard = Heard::default();
+    let kept = heard.clone();
+    let app = axum::Router::new().route(
+        "/push/:id",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+            let kept = kept.clone();
+            async move {
+                kept.0.lock().unwrap().push((headers, body.to_vec()));
+                axum::http::StatusCode::from_u16(status).unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), heard)
+}
+
+/// A browser subscribes; a notice queued for its account is pushed to it at
+/// once, encrypted to the subscription's keys (RFC 8291) and signed with the
+/// service's VAPID key; inside is the sealed notice, which only the notice
+/// key opens, and the token that marks it seen. Unsubscribed, nothing goes;
+/// a subscription its push service says is gone is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_notice_is_pushed_encrypted_to_the_subscription() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, will_cookie, will_id, store_id, root, notice) = a_share_with_notice_keys(&stack, "push").await;
+    let (push_origin, heard) = stand_in_push_service(201).await;
+    let endpoint = format!("{push_origin}/push/will-browser");
+    let (ua_secret, p256dh, auth, auth_b64) = pimble_cloud::webpush::test_subscription_keys();
+
+    let post = |cookie: &str, path: &str, body: Value| stack.http.post(format!("{}{path}", stack.base_url)).header("Cookie", cookie).json(&body).send();
+    let resp = post(&will_cookie, "/me/push", json!({ "endpoint": endpoint, "keys": { "p256dh": "AAAA", "auth": auth_b64 } })).await.unwrap();
+    assert_eq!(resp.status(), 400, "keys that are not a subscription's");
+    let resp = post(&will_cookie, "/me/push", json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": auth_b64 } })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = post(&will_cookie, "/me/push", json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": auth_b64 } })).await.unwrap();
+    assert_eq!(resp.status(), 200, "subscribing again replaces it");
+
+    let t0 = now_ms();
+    let id = notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while heard.0.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no push arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (headers, body) = {
+        let pushes = heard.0.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "one push per subscription, not one per subscribe");
+        pushes[0].clone()
+    };
+    assert_eq!(headers["content-encoding"], "aes128gcm");
+    assert!(headers.contains_key("ttl"));
+    let me: Value = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &will_cookie).send().await.unwrap().json().await.unwrap();
+    let push_key = me["push_key"].as_str().unwrap();
+    let claims = pimble_cloud::webpush::verify_authorization(headers["authorization"].to_str().unwrap(), push_key, &push_origin, chrono::Utc::now().timestamp()).expect("the VAPID signature verifies");
+    assert_eq!(claims["sub"], "mailto:test@example.invalid");
+    assert!(!String::from_utf8_lossy(&body).contains("Recipes"), "the body is ciphertext");
+
+    let plain = pimble_cloud::webpush::decrypt(&body, &ua_secret, &auth).expect("decrypts with the subscription's keys");
+    let payload: Value = serde_json::from_slice(&plain).unwrap();
+    assert_eq!(payload["id"], id.as_str());
+    assert_eq!(payload["kind"], "mention");
+    assert_eq!(payload["line"], "olga.push mentioned you in Recipes");
+    let opened = pimble_crypto::open_notice(payload["sealed"].as_str().unwrap(), &notice, &will_id).unwrap();
+    assert_eq!(opened, br#"{"snippet":"the secret oven words"}"#);
+    // The service worker says it showed it: then it is not emailed.
+    let seen = payload["seen"].as_str().unwrap().replace(PUBLIC_URL, &stack.base_url.replace("/api/v1", ""));
+    assert_eq!(stack.http.post(seen).send().await.unwrap().status(), 200);
+    assert_eq!(pimble_cloud::notify::email_pass(&stack.app_state, t0 + 20 * MIN).await.unwrap(), 0, "seen through its push");
+
+    // The push switch off: no push.
+    let resp = stack.http.put(format!("{}/me/notifications", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "push": false })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(heard.0.lock().unwrap().len(), 1, "push switched off");
+    let resp = stack.http.put(format!("{}/me/notifications", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "push": true })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Unsubscribed (sign-out): nothing goes.
+    let resp = stack.http.delete(format!("{}/me/push", stack.base_url)).header("Cookie", &will_cookie).json(&json!({ "endpoint": endpoint })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["unsubscribed"], 1);
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(heard.0.lock().unwrap().len(), 1, "unsubscribed");
+
+    // A push service that says the subscription is gone: deleted.
+    let (gone_origin, gone_heard) = stand_in_push_service(410).await;
+    let gone_endpoint = format!("{gone_origin}/push/old-browser");
+    let resp = post(&will_cookie, "/me/push", json!({ "endpoint": gone_endpoint, "keys": { "p256dh": p256dh, "auth": auth_b64 } })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    notify(&stack, &olga_cookie, &will_id, &store_id, &root, &notice, "mention").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while gone_heard.0.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no push arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(stack.app_state.db.push_subscriptions_of(&will_id).await.unwrap().is_empty(), "a 410 deletes the subscription");
 }

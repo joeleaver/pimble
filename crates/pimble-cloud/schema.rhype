@@ -85,6 +85,13 @@ type User {
     // Section 6: notifications are on from sign-in; `true` once the person
     // turns them off (absent on every row from before: on).
     notifications_off: Bool
+    // Section 6, per channel (wave 2): `true` once the person turns email,
+    // or web push, off. Absent on every row from before: on.
+    notify_email_off: Bool
+    notify_push_off: Bool
+    // Section 4: when the last notice email went to this person (at most one
+    // an hour). Absent or epoch zero: never.
+    notice_emailed_at: DateTime
 }
 
 type Session {
@@ -251,6 +258,14 @@ type PersonalDoc {
 // dropped rather than delivered late; delivered ones go when acknowledged,
 // or seven days after their first delivery. `item_uuid` is what devices name
 // it by; the row's own id orders a recipient's items (the drain's cursor).
+//
+// Wave 2 (section 4): `delivered` is "seen by a device": a running device
+// drained it, or a browser's service worker showed its push. An item that is
+// neither seen nor acknowledged (deleted) fifteen minutes after it was queued
+// is emailed, once (`emailed`). `kind` is what the sender says it is
+// (`"mention"`, `"reply"`, `""` when it said nothing), in the clear, so the
+// email can say "mentioned you" without reading the notice. Both absent on
+// rows from before wave 2: not emailed, no kind.
 type InboxItem {
     item_uuid: String @unique
     recipient_uuid: String @indexed
@@ -261,4 +276,20 @@ type InboxItem {
     created_at: DateTime
     delivered: Bool
     delivered_at: DateTime
+    kind: String
+    emailed: Bool
+}
+
+// One browser's Web Push subscription (docs/NOTIFICATIONS_CONTRACT.md
+// section 4, wave 2): where its push service takes pushes for it
+// (`endpoint`) and the keys a push is encrypted to (RFC 8291: `p256dh`, the
+// browser's P-256 public key, and `auth`, its 16-byte secret, both
+// base64url). One row per endpoint, enforced in the service; a push service
+// answering 404 or 410 deletes it.
+type PushSubscription {
+    user_uuid: String @indexed
+    endpoint: String @indexed
+    p256dh: String
+    auth: String
+    created_at: DateTime
 }
