@@ -1109,10 +1109,8 @@ Built against rhypedb's in-memory mode (question 4's own route, so no stopgap in
   memory a `select!` takes an event first and otherwise ticks a 1 s interval of the runtime
   (`DEFERRED_INDEX_WORK_EVERY`) that calls `run_deferred_work`. An index on disk takes the old
   loop exactly (no interval is made).
-- **rhypedb's `wasm-memory` branch** (194029d) is pushed and open as joeleaver/rhypedb#57
-  (Joe, 2026-11-23); every rhypedb line of the workspace (the root's `engine`, `schema`,
-  `query`, `pimble-search`'s `embed`, `pimble-cloud`'s `client` and `wire`) names
-  `branch = "wasm-memory"` until it merges, then master. While it was local, a temporary
+- **rhypedb's `wasm-memory` branch** (194029d) was merged into rhypedb master as joeleaver/rhypedb#57
+  (c73cc88, 2026-11-23), which the workspace's rhypedb lines follow again. While it was local, a temporary
   `[patch]` pointed at a worktree; it is gone. The branch is based on rhypedb master `6200e3c`
   (0.2.1), and the workspace was on `6975cb0`: **the desktop's rhypedb moves forward by
   master's 17 commits (14 without merges)** (0.2.0 and 0.2.1: link peers, cover generations,
@@ -1174,7 +1172,7 @@ adapters and entry).
 
 ### Changes by file
 
-- `Cargo.toml`: the `pimble-worker` member; rhypedb on `branch = "wasm-memory"` (rhypedb#57).
+- `Cargo.toml`: the `pimble-worker` member; rhypedb master with #57 (c73cc88).
   `Cargo.lock`: rhypedb 0.2.1 from the worktree (path entries, one copy), `web-time` and
   getrandom 0.3's `wasm_js` for its wasm32 build, `console_error_panic_hook`,
   `wasm-bindgen-test` lines for the worker, and dependency lines. `web/Cargo.lock`: three
@@ -1273,7 +1271,6 @@ adapters and entry).
 - The index is rebuilt from the documents at every store open: measure on Joe's 674-node store
   in wave 4 (section 10).
 - Semantic search in the worker is wave 6 (`open_in_memory` is keyword only).
-- rhypedb back to `master` once rhypedb#57 merges.
 - The smoke test runs in Node, not yet in a browser worker or in CI (section 8 wants a browser
   runner and OPFS: wave 4).
 

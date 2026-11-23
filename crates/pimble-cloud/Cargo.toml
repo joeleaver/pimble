@@ -48,11 +48,11 @@ async-trait = "0.1.67"
 # RhypeDB client: the accounts database. `async` pulls in the native
 # `AsyncClient` (tokio-backed); the sync `Client` stays unused. Pinned to the
 # same git branch as every other rhypedb-* crate in this workspace.
-rhypedb-client = { git = "https://github.com/joeleaver/rhypedb.git", branch = "wasm-memory", features = ["async"] }
+rhypedb-client = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", features = ["async"] }
 # Named directly (not just transitively through rhypedb-client) because this
 # crate names `rhypedb_wire::object::{Object, Value}` itself when reading rows
 # back off the wire — see src/db.rs.
-rhypedb-wire = { git = "https://github.com/joeleaver/rhypedb.git", branch = "wasm-memory" }
+rhypedb-wire = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
 
 # Password hashing (argon2id).
 argon2 = "0.5"
