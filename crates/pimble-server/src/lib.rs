@@ -18,6 +18,7 @@ pub mod auth;
 pub mod cloud;
 pub mod credentials;
 mod devices;
+pub use devices::InheritedDevice;
 pub mod error;
 pub mod faults;
 mod folder_watch;

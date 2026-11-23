@@ -150,6 +150,19 @@ pointing at it worked the same. `edge.js` stops at the first request if `web/dis
    `scripts/perf/rd.py` to click and screenshot): Holiday shows both canvases, and each
    opens with its picture drawn.
 
+## The browser on its own server (wave 4, docs/ONE_CODEBASE_CONTRACT.md)
+
+`http://127.0.0.1:18091/app/?server=worker` turns it on for that browser profile
+(`?server=page` turns it off; the choice is kept in `localStorage`). The sign-in page then
+sends the password to the server in the leader tab's worker, which keeps the account's
+stores as replicas in OPFS (sealed with the remembered device's key) or, with "Don't remember
+this browser", in memory. `PimbleHub.status()` in a tab's console says which tab leads and
+how the stores are kept; `PimbleHub.connect()` answers a `MessagePort` to the server, for
+JSON-RPC text by hand (`pimble_listStores`, params as `[{...}]`). Pimble Cloud "down" for an
+offline reload is the hosted server and the accounts service stopped with the edge left
+serving `/app/` (their commands are in `up.sh`): a browser has no copy of the page's own
+files without the network.
+
 ## The apps on the same identities
 
 Stop the headless desktop for that name, write

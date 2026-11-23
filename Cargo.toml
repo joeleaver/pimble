@@ -126,3 +126,13 @@ pimble-api = { path = "crates/pimble-api" }
 pimble-plugin-abi = { path = "crates/pimble-plugin-abi" }
 pimble-plugin-host = { path = "crates/pimble-plugin-host" }
 pimble-ui = { path = "crates/pimble-ui" }
+
+# The browser's worker (crates/pimble-worker, built by web/index.html through
+# trunk): shipped over the wire, so built for size, as web/'s own release
+# profile is. Nothing native uses it.
+[profile.worker]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

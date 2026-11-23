@@ -26,7 +26,9 @@ pub mod key_rest;
 pub mod paths;
 pub mod runtime;
 
-pub use disk::{Disk, DiskBackend, DiskKind, Entry, MemoryDisk, Metadata, TmpName};
+pub use disk::{Disk, DiskBackend, DiskKind, Entry, MemoryDisk, Metadata, SealedDisk, TmpName};
+#[cfg(target_arch = "wasm32")]
+pub use disk::OpfsDisk;
 pub use key_rest::{FileKeyRest, KeyRest, MemoryKeyRest};
 pub use paths::Paths;
 pub use runtime::{Instant, Interval, Runtime, RuntimeBackend, Sleep, Task, TaskSet};

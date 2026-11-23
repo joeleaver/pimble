@@ -16,7 +16,8 @@
 //! Three hosts are meant (the contract, question 8): the desktop
 //! ([`NativeDisk`]: `tokio::fs`, the files exactly as they were before this
 //! seam), the browser's worker (OPFS through synchronous access handles in a
-//! dedicated worker, every file sealed with the disk key; wave 4), and a
+//! dedicated worker, every file sealed with the disk key: [`OpfsDisk`] under
+//! a [`SealedDisk`]; wave 4), and a
 //! phone app hosting the server on a background thread (a real filesystem:
 //! [`NativeDisk`] as it is). [`MemoryDisk`] is the fourth: tests, and a
 //! browser told not to remember itself.
@@ -34,12 +35,18 @@ use std::time::SystemTime;
 mod memory;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+#[cfg(target_arch = "wasm32")]
+mod opfs;
+mod sealed;
 #[cfg(feature = "test-disk")]
 pub mod testfs;
 
 pub use memory::MemoryDisk;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::NativeDisk;
+#[cfg(target_arch = "wasm32")]
+pub use opfs::OpfsDisk;
+pub use sealed::{SealedDisk, SEAL_OVERHEAD};
 
 /// What [`Disk::metadata`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,14 +20,14 @@ const OPEN_KEY: &str = "pimble.open";
 /// `/app/?open=<pimble: link>` (docs/SETTINGS_CONTRACT.md section 12: the
 /// website's "Open in the web app"): kept until the app is up, then opened as
 /// the desktop opens a link it is started with.
-fn keep_open_link() {
+pub(crate) fn keep_open_link() {
     let Some(link) = crate::util::query_pairs().into_iter().find(|(k, _)| k == "open").map(|(_, v)| v) else { return };
     if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
         let _ = storage.set_item(OPEN_KEY, &link);
     }
 }
 
-fn take_open_link() -> Option<String> {
+pub(crate) fn take_open_link() -> Option<String> {
     let storage = web_sys::window()?.session_storage().ok().flatten()?;
     let link = storage.get_item(OPEN_KEY).ok().flatten()?;
     let _ = storage.remove_item(OPEN_KEY);

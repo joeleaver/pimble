@@ -11,6 +11,9 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The sealed disk (src/disk/sealed.rs): every file the browser's server keeps,
+# sealed with the remembered device's disk key. Pure Rust.
+pimble-crypto = { workspace = true }
 
 # The desktop's adapters: tokio's files, its runtime, and the platform's
 # directories. Nothing here builds for the browser's worker, which brings its
@@ -34,7 +37,14 @@ web-time = "1"
 # window, a worker and Node all have.
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Headers", "Request", "RequestCredentials", "RequestInit", "Response"] }
+web-sys = { version = "0.3", features = [
+    "Headers", "Request", "RequestCredentials", "RequestInit", "Response",
+    # The OPFS disk (src/disk/opfs.rs).
+    "Blob", "File", "StorageManager", "WritableStream",
+    "FileSystemHandle", "FileSystemHandleKind", "FileSystemDirectoryHandle", "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemRemoveOptions",
+    "FileSystemWritableFileStream", "FileSystemSyncAccessHandle", "FileSystemReadWriteOptions",
+] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,9 +30,15 @@
 //! said out of step, and no device appends anything more, within a bound.
 //!
 //! The devices: Alice's computer (the owner, which hosts the store), Alice's
-//! second computer (the whole store), and Bob's (an editor of the shared
-//! folder, a partial replica). Desktop links only: the browser's vault client
-//! joins this test after the one-sync-engine work (the contract's "Next").
+//! second device (the whole store), and Bob's (an editor of the shared
+//! folder, a partial replica). Alice's second device is configured as a
+//! browser on odd seeds (docs/ONE_CODEBASE_CONTRACT.md section 8, wave 4): the
+//! server as the browser's worker runs it, started in process and reached over
+//! an in-process connection, its files on a memory disk that outlives each
+//! server (as OPFS outlives a leader tab) sealed with a disk key, its keys
+//! resting apart from the disk, and the device id a browser hands over from
+//! before it ran its own server. Its crash copies that disk.
+//! `PIMBLE_LINK_BROWSER=all` makes it a browser on every seed, `none` on none.
 //!
 //! Seeds: `PIMBLE_LINK_SEEDS=1,5` replays those, `PIMBLE_LINK_SEEDS=200` runs
 //! 0..200; two by default, so the normal suite stays quick.
@@ -53,8 +59,9 @@ use pimble_client::PimbleClient;
 use pimble_core::{NodeId, StoreId, SyncState};
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{EditOperation, MemberRole};
+use pimble_host::{Disk, DiskBackend, MemoryDisk, MemoryKeyRest, Paths, SealedDisk};
 use pimble_server::faults::LinkFaults;
-use pimble_server::{PimbleServer, ServerConfig};
+use pimble_server::{service_extensions, InheritedDevice, PimbleServer, ServerConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -66,8 +73,95 @@ fn config(dir: &Path, faults: &Arc<LinkFaults>) -> ServerConfig {
     ServerConfig { vault_reports: true, out_of_step_after: Some(Duration::from_secs(2)), link_faults: Some(Arc::clone(faults)), ..device_config(dir) }
 }
 
+/// A device configured as a browser: its disk outlives each server it runs.
+struct Browser {
+    /// The disk below the seal (OPFS), what a crash copies.
+    raw: Arc<dyn DiskBackend>,
+    key: pimble_crypto::SymmetricKey,
+    /// Where its keystore rests (the device key's IndexedDB), apart from the
+    /// disk.
+    keys: Arc<MemoryKeyRest>,
+    device: String,
+}
+
+impl Browser {
+    fn new(device: String) -> Self {
+        Self { raw: Arc::new(MemoryDisk::new()), key: pimble_crypto::SymmetricKey::generate(), keys: Arc::new(MemoryKeyRest::default()), device }
+    }
+
+    fn disk(&self) -> Disk {
+        Disk::new(SealedDisk::new(Arc::clone(&self.raw), self.key.clone()))
+    }
+
+    fn config(&self, dir: &Path, faults: &Arc<LinkFaults>) -> ServerConfig {
+        let paths = Paths::new("/pimble", "/pimble-config");
+        ServerConfig {
+            disk: self.disk(),
+            replicas_dir: Some(paths.replicas()),
+            credentials_path: Some(paths.credentials()),
+            keystore_path: Some(paths.keystore()),
+            relay_dir: Some(paths.relay()),
+            agents_path: None,
+            paths,
+            key_rest: Some(self.keys.clone()),
+            inherited_device: Some(InheritedDevice { device: self.device.clone(), answered: Default::default() }),
+            ..config(dir, faults)
+        }
+    }
+
+    fn store_path(store_id: StoreId) -> PathBuf {
+        Paths::new("/pimble", "/pimble-config").replicas().join(format!("{store_id}.pimble"))
+    }
+}
+
+/// Copy a disk's files as they are now, the state directories first and the
+/// rest after (see [`Device::crash`]), leaving out temporaries.
+async fn copy_disk(from: &Disk, to: &Disk) {
+    async fn walk(from: &Disk, to: &Disk, dir: PathBuf) {
+        let Ok(entries) = from.list(&dir).await else { return };
+        let _ = to.create_dir_all(&dir).await;
+        for entry in entries {
+            if entry.is_dir {
+                Box::pin(walk(from, to, entry.path)).await;
+            } else if !entry.path.extension().is_some_and(|e| e == "tmp") {
+                if let Ok(bytes) = from.read(&entry.path).await {
+                    let _ = to.write(&entry.path, bytes).await;
+                }
+            }
+        }
+    }
+    walk(from, to, PathBuf::from("/pimble/stores")).await;
+    let Ok(roots) = from.list("/").await else { return };
+    for root in roots {
+        if root.path == Path::new("/pimble") {
+            for entry in from.list("/pimble").await.unwrap_or_default() {
+                if entry.path != Path::new("/pimble/stores") {
+                    if entry.is_dir {
+                        walk(from, to, entry.path).await;
+                    } else if let Ok(bytes) = from.read(&entry.path).await {
+                        let _ = to.write(&entry.path, bytes).await;
+                    }
+                }
+            }
+        } else if root.is_dir {
+            walk(from, to, root.path).await;
+        }
+    }
+}
+
+/// Whether `seed` makes Alice's second device a browser.
+fn browser_on(seed: u64) -> bool {
+    match std::env::var("PIMBLE_LINK_BROWSER").as_deref() {
+        Ok("all") => true,
+        Ok("none") => false,
+        _ => seed % 2 == 1,
+    }
+}
+
 struct Device {
     name: &'static str,
+    /// Configured as a browser (see the module documentation).
+    browser: Option<Browser>,
     dir: tempfile::TempDir,
     /// The store's folder on this device, opened again after a restart.
     store_path: PathBuf,
@@ -94,33 +188,53 @@ impl Device {
     }
 
     fn state_dir(&self, store_id: StoreId) -> PathBuf {
-        self.dir.path().join("stores").join(store_id.to_string())
+        match &self.browser {
+            Some(_) => Path::new("/pimble/stores").join(store_id.to_string()),
+            None => self.dir.path().join("stores").join(store_id.to_string()),
+        }
+    }
+
+    async fn read_file(&self, path: &Path) -> Option<Vec<u8>> {
+        match &self.browser {
+            Some(browser) => browser.disk().read(path).await.ok(),
+            None => tfs::read(path).ok(),
+        }
     }
 
     /// The link's record of what the remote holds: the `vault` section of
     /// `sync-state.json`.
-    fn progress(&self, store_id: StoreId) -> Option<serde_json::Value> {
-        let bytes = tfs::read(self.state_dir(store_id).join("sync-state.json")).ok()?;
+    async fn progress(&self, store_id: StoreId) -> Option<serde_json::Value> {
+        let bytes = self.read_file(&self.state_dir(store_id).join("sync-state.json")).await?;
         let mut record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         record.get_mut("vault").map(serde_json::Value::take)
     }
 
     /// Replace (or with `None`, remove) that section, the device stopped.
-    fn put_progress(&self, store_id: StoreId, section: Option<serde_json::Value>) {
+    async fn put_progress(&self, store_id: StoreId, section: Option<serde_json::Value>) {
         let path = self.state_dir(store_id).join("sync-state.json");
-        let Some(mut record) = tfs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return };
+        let Some(mut record) = self.read_file(&path).await.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return };
         let Some(map) = record.as_object_mut() else { return };
         match section {
             Some(section) => map.insert("vault".to_string(), section),
             None => map.remove("vault"),
         };
-        tfs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        match &self.browser {
+            Some(browser) => browser.disk().write(&path, bytes).await.unwrap(),
+            None => tfs::write(&path, bytes).unwrap(),
+        }
     }
 
     async fn start(&mut self) {
-        let mut server = PimbleServer::with_config(config(self.dir.path(), &self.faults));
-        server.start().await.expect("a device starts");
-        let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("a client connects");
+        let (server, client) = match &self.browser {
+            Some(browser) => start_browser(browser, self.dir.path(), &self.faults).await,
+            None => {
+                let mut server = PimbleServer::with_config(config(self.dir.path(), &self.faults));
+                server.start().await.expect("a device starts");
+                let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("a client connects");
+                (server, client)
+            }
+        };
         client.open_store(&self.store_path).await.expect("the store opens again");
         self.server = Some(server);
         self.client = Some(client);
@@ -141,6 +255,16 @@ impl Device {
     /// and built again. The server is stopped, and what its stop wrote is
     /// thrown away for the copy.
     async fn crash(&mut self) {
+        if let Some(browser) = &self.browser {
+            let below = Disk::from_arc(Arc::clone(&browser.raw));
+            let copy: Arc<dyn DiskBackend> = Arc::new(MemoryDisk::new());
+            copy_disk(&below, &Disk::from_arc(Arc::clone(&copy))).await;
+            self.stop().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // A browser's index lives in memory: gone with the crash.
+            self.browser.as_mut().expect("a browser").raw = copy;
+            return;
+        }
         let copy = tempfile::tempdir().unwrap();
         copy_tree(&self.dir.path().join("stores"), &copy.path().join("stores"));
         for path in tfs::read_dir(self.dir.path()).unwrap() {
@@ -169,6 +293,16 @@ impl Device {
             tfs::rename(&path, self.dir.path().join(path.file_name().unwrap())).unwrap();
         }
     }
+}
+
+/// A browser-configured device's server: in process, as the worker starts
+/// it, reached over an in-process connection with the `Service` principal, as
+/// the page reaches the worker.
+async fn start_browser(browser: &Browser, dir: &Path, faults: &Arc<LinkFaults>) -> (PimbleServer, PimbleClient) {
+    let mut server = PimbleServer::with_config(browser.config(dir, faults));
+    server.start_in_process().await.expect("a browser's server starts");
+    let client = server.connect_in_process(service_extensions()).expect("a started server connects");
+    (server, client)
 }
 
 /// Copy `from` to `to` as it is now, a file at a time, leaving out search
@@ -388,6 +522,7 @@ async fn run(seed: u64) -> Result<String, String> {
     let _ = who;
     let mut devices = vec![Device {
         name,
+        browser: None,
         store_path: a_dir.path().join("a.pimble"),
         dir: a_dir,
         faults,
@@ -403,17 +538,42 @@ async fn run(seed: u64) -> Result<String, String> {
     for (name, who, docs) in [("alice-2", ALICE, all_docs.clone()), ("bob", BOB, shared_docs.clone())] {
         let (name, who, faults) = make(name, who);
         let dir = tempfile::tempdir().unwrap();
-        let mut server = PimbleServer::with_config(config(dir.path(), &faults));
-        server.start().await.expect("a device starts");
-        let client = PimbleClient::connect(format!("http://{}", server.addr())).await.unwrap();
+        let browser = (name == "alice-2" && browser_on(seed)).then(|| Browser::new(format!("browser-of-seed-{seed}")));
+        let (server, client) = match &browser {
+            Some(browser) => start_browser(browser, dir.path(), &faults).await,
+            None => {
+                let mut server = PimbleServer::with_config(config(dir.path(), &faults));
+                server.start().await.expect("a device starts");
+                let client = PimbleClient::connect(format!("http://{}", server.addr())).await.unwrap();
+                (server, client)
+            }
+        };
+        if browser.is_some() {
+            log.push(format!("{name} is configured as a browser"));
+        }
         env.sign_in(&client, who).await;
         client.cloud_add_hosted_store(store_id).await.map_err(|e| format!("{name} adds the store: {e}"))?;
         let pulled = wait_until(Duration::from_secs(30), || async { node_text(&client, store_id, fx.inside).await.contains("socks and a map") }).await;
         if !pulled {
             return Err(format!("{name} never pulled the store"));
         }
-        let store_path = dir.path().join("replicas").join(format!("{store_id}.pimble"));
-        devices.push(Device { name, dir, store_path, faults, server: Some(server), client: Some(client), docs, offline_for: 0, away_for: 0, older_progress: None });
+        let store_path = match &browser {
+            Some(_) => Browser::store_path(store_id),
+            None => dir.path().join("replicas").join(format!("{store_id}.pimble")),
+        };
+        if let Some(browser) = &browser {
+            // The device it was handed is the one it reports as.
+            let record = Path::new("/pimble/stores").join(store_id.to_string()).join("sync-state.json");
+            let reports_as = || async {
+                let bytes = browser.disk().read(&record).await.ok()?;
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()?["device"]["device"].as_str().map(str::to_string)
+            };
+            let handed = wait_until(Duration::from_secs(15), || async { reports_as().await.as_deref() == Some(browser.device.as_str()) }).await;
+            if !handed {
+                return Err(format!("{name} does not report as the device it was handed: {:?}", reports_as().await));
+            }
+        }
+        devices.push(Device { name, browser, dir, store_path, faults, server: Some(server), client: Some(client), docs, offline_for: 0, away_for: 0, older_progress: None });
     }
 
     let mut markers: std::collections::HashMap<NodeId, Vec<String>> = std::collections::HashMap::new();
@@ -516,12 +676,12 @@ async fn run(seed: u64) -> Result<String, String> {
                     devices[i].stop().await;
                     let what = match rng.random_range(0..3) {
                         0 => {
-                            devices[i].put_progress(store_id, None);
+                            devices[i].put_progress(store_id, None).await;
                             "its record of what the remote holds deleted"
                         }
                         1 => match devices[i].older_progress.clone() {
                             Some(older) => {
-                                devices[i].put_progress(store_id, Some(older));
+                                devices[i].put_progress(store_id, Some(older)).await;
                                 "its record of what the remote holds put back from an older copy"
                             }
                             None => "its files kept",
@@ -550,7 +710,7 @@ async fn run(seed: u64) -> Result<String, String> {
             }
             // A copy of a device's record to put back later.
             87..=94 => {
-                if let Some(section) = devices[i].progress(store_id) {
+                if let Some(section) = devices[i].progress(store_id).await {
                     devices[i].older_progress = Some(section);
                 }
             }
@@ -580,7 +740,9 @@ async fn run(seed: u64) -> Result<String, String> {
     };
     let (lost, dropped) = devices.iter().map(|d| d.faults.happened()).fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
     let crashes = log.iter().filter(|line| line.contains(" crashed ")).count();
-    let summary = format!("seed {seed}: {} steps, {lost} answers lost, {dropped} notifications dropped, {crashes} crashes", log.len());
+    let browser_crashes = log.iter().filter(|line| line.contains(" alice-2 crashed ")).count();
+    let browser = if log.iter().any(|line| line.contains("configured as a browser")) { format!(", alice-2 a browser ({browser_crashes} of its crashes)") } else { String::new() };
+    let summary = format!("seed {seed}: {} steps, {lost} answers lost, {dropped} notifications dropped, {crashes} crashes{browser}", log.len());
     if let Some(why) = last {
         return Err(format!("{summary}\nnot converged within {:?}: {why}\nsteps:\n  {}", SETTLE_WITHIN, log.join("\n  ")));
     }

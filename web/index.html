@@ -13,6 +13,14 @@
         body { background: #1a1b1e; }
     </style>
     <link data-trunk rel="rust" data-wasm-opt="z" />
+    <!-- The browser's own Pimble server (docs/ONE_CODEBASE_CONTRACT.md wave 4,
+         behind ?server=worker): the hub that elects the leader tab, and the
+         worker it starts, built from crates/pimble-worker with its `entry`
+         feature into pimble-worker_loader.js beside the page's files. -->
+    <script data-trunk src="hub.js"></script>
+    <link data-trunk rel="rust" href="../crates/pimble-worker/Cargo.toml" data-type="worker"
+          data-bindgen-target="no-modules" data-loader-shim data-cargo-features="entry"
+          data-cargo-profile-release="worker" data-wasm-opt="z" />
 </head>
 <body></body>
 </html>

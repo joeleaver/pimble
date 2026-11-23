@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft; waves 0, 1, 2 (with its runtime) and 3 built** (2026-11-22, not merged or released; see the "Built" sections at the end; wave 3 builds against a local rhypedb branch, see its section). Decisions taken so far are under "Decisions"; the rest
+Status: **draft; waves 0, 1, 2 (with its runtime), 3 and 4 built** (2026-11-22 and 23, not merged or released; see the "Built" sections at the end; wave 4, the browser on its own server, is behind `?server=worker`, with what it left undone and what needs Joe's word at the end of its section). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -1274,3 +1274,319 @@ adapters and entry).
 - The smoke test runs in Node, not yet in a browser worker or in CI (section 8 wants a browser
   runner and OPFS: wave 4).
 
+
+## Built: wave 4 (2026-11-23, not merged or released): the browser on its worker server, behind a switch
+
+`?server=worker` in the web app's URL turns it on for that browser (kept in `localStorage` as
+`pimble.server`; `?server=page` turns it off). Off, the page is exactly what it was: nothing of
+this wave runs, and the worker's files, though built and served beside the page's, are never
+fetched. On, the page runs the same Pimble server the desktop runs, in a dedicated worker of one
+leader tab, keeps the account's stores in OPFS sealed with the remembered device's disk key (or
+in memory), holds the account's keys in that worker, and reaches it through the same
+`pimble_api::Pimble` and `pimble_app::commands` the desktop uses.
+
+### The worker and its build
+
+- **`crates/pimble-worker`** gains `entry.rs` (feature `entry`): a `#[wasm_bindgen(start)]` that
+  installs the worker's tracing subscriber (a small layer of its own writing each event at INFO
+  or above as one line to the worker's console) and answers the leader page's messages: `start { mode, inherited }` (answered `started {
+  mode }` or `failed`), `connect` with a transferred `MessagePort` (held until the server is up),
+  `stop` (every link stopped, every document written) and `forget`. The feature is off in the
+  tests (the smoke test drives the server itself) and on in the page's build.
+- `worker.rs`: `start_browser(keeping, inherited)` (`startBrowserServer` to JavaScript):
+  `remember` makes or finds the device key and the disk key under it and starts the server on
+  `SealedDisk(OpfsDisk, disk key)` with the keystore resting in IndexedDB; `memory` starts it on
+  a `MemoryDisk` with `MemoryKeyRest`; `auto` is `remember` when this browser already remembers
+  itself, else `memory` (what a tab asks for before anyone signs in). A remembered browser whose
+  files do not open (its device key gone or changed underneath) is forgotten and starts on
+  memory, said in the log. It then opens every store this browser keeps
+  (`/pimble/replicas/*.pimble`): a browser has no list of open stores but its replicas.
+- **The build**: `web/index.html` has a second trunk `rust` link,
+  `../crates/pimble-worker/Cargo.toml` with `data-type="worker"`, `data-bindgen-target="no-modules"`,
+  `data-loader-shim`, `data-cargo-features="entry"`, `data-cargo-profile-release="worker"` and
+  `data-wasm-opt="z"`, so `trunk build --release` writes `pimble-worker_loader.js`,
+  `pimble-worker.js` and `pimble-worker_bg.wasm` beside the page's files (not hashed: the hub
+  names the loader). The worker is built from the root workspace with its lock (the same
+  `wasm-bindgen` 0.2.128 as `web/`'s) and a new root profile, `[profile.worker]` (release, `opt-level
+  = "s"`, LTO, one codegen unit, `panic = "abort"`); nothing native uses that profile.
+
+### The leader tab, and the other tabs (`web/hub.js`)
+
+A small script of the page's (plain JavaScript: the Web Locks API is unstable in `web-sys`, and
+this is the transport adapter of section 6), loaded before the page's wasm.
+
+- Every tab asks for one Web Lock, `pimble-server`. The tab granted it leads: it starts the
+  worker (`new Worker("/app/pimble-worker_loader.js")`), sends `start`, and says on a
+  `BroadcastChannel` (`pimble-server`) that it leads and how the stores are kept. The lock is
+  held until the tab goes.
+- **A connection** is `PimbleHub.connect()`: a `MessagePort` whose other end reaches the server.
+  In the leader, the hub relays it to a port of its own to the worker; in another tab, over the
+  channel, as `rpc { conn, text }` addressed by a connection id, which the leader relays to a
+  worker port of its own for that connection. JSON-RPC text is passed through as it is.
+- **When the leader goes** (closed, crashed: the lock passes with the tab), the next tab in the
+  lock's queue becomes the leader, starts its worker on the same OPFS files and says so; every tab
+  that hears another leader (or the old one's `bye`, sent on `pagehide` along with a `stop` to its
+  worker if the tab is given the moment) ends its connections. Ending one is `null` posted on the
+  client's port: `PortText` (`crates/pimble-client/src/message_port.rs`) now reads `null` as the
+  other side gone and ends, so the client over it is disconnected exactly as one whose WebSocket
+  closed. A tab whose connection ended was a follower whose relays end with it; the leader posts
+  `null` to the worker's end too, so the server's session for it ends.
+- The leader restarts its worker when it fails (`onerror`), and on `control`: `restart { mode }`
+  (sign-in asks to keep the stores in this browser) and `forget`; another tab's control goes to
+  the leader over the channel.
+- `PimbleHub.take(name)`: a Web Lock held by the page's Rust until dropped (`hub::exclusive`),
+  so only one tab at a time adds the account's stores.
+
+### The page's side (`web/src/worker_mode/`)
+
+- `mod.rs`: the switch; `begin()` starts the hub before routing, handing it the device this
+  browser reported as before (below); `start_app()` connects, asks `cloudStatus`, and builds the
+  app (the same `pimble_app::app::build_view`) with this backend, or sends the visitor to the
+  sign-in page; the account and sign-out hooks; `ask_to_persist()`.
+- `backend.rs`: the desktop's backend shape (`pimble-app/src/backend.rs`) over a `MessagePort`:
+  `Local` (the connection: a port from the hub, proved with `serverInfo`, made again with backoff
+  the moment it ends, `Connected`/`Disconnected` to the UI, the cloud connection's subscription
+  for the status bar), `LocalConnector` for `RpcBackend`, the command loop through
+  `process_command` (opens, the account and child loads beside the line, as on the desktop),
+  imports through the shared importer, and after a reconnect `Pimble::rewatch` and the store list
+  again. "New Store..." (`CreateHostedStore`) makes the store in this browser and hosts it
+  (`createStore`, then `cloudHostStore`): what the button has always made in the browser, an
+  encrypted store on the account, now by the desktop's path. Diagnostics answer that they are not
+  sent from the worker yet.
+- **The account's stores, kept here** (`keep_account_stores`, section 5): at connect and every
+  two minutes, under the `pimble-account-stores` lock: `cloudListHostedStores`, and for each
+  encrypted store not open here (or a share of one whose root is not), `cloudAddHostedStore`, the
+  desktop's "Add Hosted Store..." call; then `StoresListed`. A plain hosted store is logged and
+  skipped (below).
+- `pages.rs`: the sign-in page (email, password, "Don't remember this browser" with section 7's
+  sentence beside it in its words) and the account page (who is signed in, how the stores are
+  kept, "Sign Out", "Forget This Browser", "Sign in again"). Signing up, verifying and recovering
+  stay the page's own pages, which need no keys in the page.
+- `route.rs`: in worker mode `/app/login` and `/app/account` are these pages and the app starts
+  through `start_app`; `app_page.rs`'s open-link keepers are shared.
+
+### Sign-in through the server
+
+The sign-in page sends `cloudSignIn { url: <this origin>, email, password }` to the worker's
+server: the desktop's handler derives, logs in and unwraps through `FetchHttp` (which sends the
+session cookie too, so the account pages keep working), and keeps the session and the account's
+keys in its keystore, resting on the device key. No key enters the page. Before it: a sign-in as
+another account than the one the server last held forgets this browser first (section 7);
+"remember" with the server on memory asks the leader to restart it remembered; "don't remember"
+with a remembered server forgets this browser first. A remembered sign-in then asks for
+persistent storage (`navigator.storage.persist()`, section 10), and a refusal is said once in the
+app ("This browser did not agree to keep Pimble's storage: ..."). Sign Out: `cloudSignOut`, then
+forget (below), then the accounts service's logout (the cookie); Forget This Browser: forget.
+Either reloads at the sign-in page.
+
+### The disk: OPFS, sealed (`crates/pimble-host`)
+
+- **`SealedDisk`** (`src/disk/sealed.rs`, both targets): any `DiskBackend` under a key. Each
+  file is one `pimble_crypto::Blob` (XChaCha20-Poly1305) whose associated data is
+  `pimble_crypto::local_file_aad(path)` (`pimble-local/v1/<path>`, new), the path normalized
+  from the root; names pass through. The seal adds a constant 59 bytes, so `metadata` reports the
+  plain length. A rename or copy reads and seals again under the new path (a file moved below the
+  seal does not open); an append, a write at an offset and a range read are a read and a whole
+  write. The atomic compositions go to the backend below with the bytes sealed under the final
+  path.
+- **`OpfsDisk`** (`src/disk/opfs.rs`, wasm32): paths walked as directory handles from
+  `navigator.storage.getDirectory()`, the handles cached (a store's open reads hundreds of files
+  from one directory; the cache is emptied whenever a directory is removed or moved). A whole file
+  is written with `createWritable()` and `close()` (committed at `close`: a tab killed mid-write
+  leaves the old file), so the atomic compositions are one write. Where an engine has no
+  `createWritable` in a worker (Safari before 26), a sync access handle (truncate, write, flush;
+  waiting out one still held by a worker that is going), the contract's fallback. Errors carry
+  the kinds the server branches on (`NotFoundError` is `NotFound`). One file's operations are
+  taken one at a time. `OpfsDisk::clear()` empties OPFS.
+- **A file that does not open is a document that does not load**
+  (`pimble-store` `load_node_docs`): a sealed file written only in part (the fallback killed
+  midway) is skipped with a warning at open, as a document that does not decode always was, and a
+  peer sends it whole at the next reconcile, rather than failing the store's open. Natively a
+  read never answers `InvalidData`, so nothing changes there.
+
+### The device key (`crates/pimble-worker/src/device.rs`)
+
+One IndexedDB database, `pimble-device`, one object store, `keys`: `device` (an AES-GCM 256
+`CryptoKey` made with `extractable: false`; it never leaves WebCrypto), `disk` and `keystore`
+(each `{ iv, data }`, sealed under the device key with a fresh 12-byte iv). Opened per operation
+and closed after; a lookup never makes the database (asking whether this browser remembers itself
+after forgetting it leaves nothing behind). `DeviceKeyRest` is the worker's `KeyRest`.
+**Forgetting** deletes the `device` entry first, then the database, then every entry of OPFS:
+what remains if clearing is interrupted is unreadable. The page's own plugin database
+(`pimble-plugins`, plugins added in this browser, never uploaded) is not the account's and stays,
+as the desktop's plugins folder does.
+
+### The server's two new settings (`pimble-server`)
+
+- `ServerConfig.key_rest: Option<Arc<dyn KeyRest>>` (`RpcHandler::with_key_rest`): where the
+  keystore rests; `None` is `keys.json` as before.
+- `ServerConfig.inherited_device: Option<InheritedDevice>` (`RpcHandler::with_inherited_device`,
+  `devices.rs`): a browser's device id and, per store, the reports it had answered, from before
+  its server ran in a worker. A store's device entry made for the first time takes them; an entry
+  already made keeps its own. **The hand-over**: the page reads `pimble.vault-device` and every
+  `pimble.vault-answered.<store>` from its `localStorage` and passes them in `start`, so the
+  browser keeps its report slot and answers nothing twice. Both default to `None`; the relay
+  face's config names them.
+
+### Proof
+
+In Chromium (Playwright's, headless, on the local stack: `scripts/local-stack/up.sh`, alice's
+desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up accounts):
+
+- **First light**: `/app/?server=worker` goes to the worker's sign-in page; bob signs in
+  (remembered); his two shares of alice's `Family` arrive as one replica ("Shared by alice",
+  never "Family") 1.9 s after the sign-in; a reload opens it with no password (the store from
+  OPFS in 0.8 s, the tree's rows 1.8 s after the reload).
+- **The sharing walk-through** (`scripts/local-stack/README.md`, steps 4-8, bob the browser):
+  `cloudListShares` names "Holiday plans" (editor) and "Errands" (reader). The owner's computer
+  stopped: bob makes a folder, a note, types into the note in the editor, moves nodes; carol's
+  desktop has all of it; carol makes a note, moves it into bob's folder and deletes another, and
+  bob's server has it; bob's write under the read-only share answers "You can read this, not
+  change it." Nothing typed is under `$STACK/stores` (`grep` finds nothing). The owner back: its
+  tree has the folder, both notes, the moves and bob's text. The owner made bob a reader of
+  Holiday: within the link's two-minute grant check bob's replica reads as read-only and a write
+  is refused.
+- **The owner in a browser** (alice, remembered): both of her stores (Family, and Big: 681
+  nodes) replicated; keyword search over Big; with alice's desktop off, a note her browser moved
+  from her private folder into the share reached carol's desktop readable 9 s later (her
+  browser's server keeping the share up: `share.rs`, question 3).
+- **A reload with Pimble Cloud unreachable** (the hosted server and the accounts service stopped,
+  the edge still serving `/app/`): the store and its tree from OPFS in 2.1 s, the link `offline`;
+  a note made and text typed in the editor are kept across another reload; when Pimble Cloud is
+  back carol's desktop has the note and its text 7 s later. **With no network at all** the page
+  itself does not load (`net::ERR_INTERNET_DISCONNECTED`): nothing caches the page's own files
+  (below).
+- **Two tabs, the leader closed**: tab A leads, tab B follows (one server: B's node is in A's
+  answers 41-129 ms later, and both reach carol). Tab A closed: B leads 262-551 ms later and
+  reaches its own server 9-55 ms after that; a node it makes reaches carol and its tree shows it.
+  **Typing across the hand-over**: in B's editor, text typed before, during and after A's close
+  all reaches carol's desktop ("Before the close: apricot. During the close: bramble. After the
+  close: cloudberry.").
+- **Forget and sign-out**: remembered, OPFS held 26-35 files, every one sealed (`PB`) and none
+  holding a typed word, a title, the store's name or the email. After "Forget This Browser":
+  OPFS empty, `pimble-device` gone. Signed in again, then "Sign Out": the same. "Don't remember
+  this browser": the server on memory, OPFS empty, no device database, and a reload asks for the
+  password.
+- **`link_faults.rs` with a browser-configured device**: Alice's second device is a browser on
+  odd seeds (`PIMBLE_LINK_BROWSER=all|none` overrides): the server started in process as the
+  worker starts it, reached over an in-process connection with the `Service` principal, its
+  files on a memory disk that outlives each server (as OPFS outlives a leader tab) under a
+  `SealedDisk`, its keystore resting apart from the disk, and the device id handed over (checked:
+  the store's record reports as it). Its crash copies the disk below the seal, state directory
+  first. `PIMBLE_LINK_SEEDS=200 PIMBLE_LINK_PARALLEL=4`: all 200 converged (852 s), 100 of them
+  with the browser device, 219 crashes (38 of them the browser's), the count of the earlier waves.
+- Unit tests: `pimble-host` `disk::sealed::tests` (4: round trip with only ciphertext below and
+  the plain length; a file moved below the seal does not open; appends, writes at an offset,
+  ranges, renames of files and directories, copies, the compositions with no temporary left;
+  another key does not open it); `pimble-server` `devices::tests` (an inherited device is taken by
+  first entries only, and kept); `pimble-store` `local::tests::a_sealed_file_that_does_not_open_is_skipped`.
+- **The suites**: `cargo test --release --no-fail-fast -p pimble-server -p pimble-store -p
+  pimble-host -p pimble-search`: 418 passed, 0 failed, 1 ignored, on the machine's disk and with
+  `PIMBLE_TEST_DISK=memory` alike (the share-recipient test that flaked in waves 2 and 3 passed in
+  both; they ran with `tracing-wasm` still in the lock, whose two moved packages are a Windows
+  one and the desktop window's X11 loader, neither in these crates on Linux).
+- **The wasm smoke test** (`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  cargo test --target wasm32-unknown-unknown -p pimble-worker --test smoke`, runner 0.2.128): 2
+  passed. **Release builds**: `cargo build --release -p pimble-app -p pimble-cli -p pimble-mcp`
+  builds; `cd web && trunk build --release` builds the page and the worker.
+- **The switch off**: a fresh browser at `/app/login` signs in on the old path (keys in the page)
+  and shows the tree; the hub stays idle and no worker is started.
+
+### Measurements
+
+- **The worker's wasm**: 12.4 MB as built (`worker` profile, before wasm-bindgen), 6.45 MB after
+  wasm-bindgen and `wasm-opt -Oz`, **2.50 MB gzipped** (`gzip -9`); its JavaScript glue 51 KB (9.3 KB
+  gzipped). For comparison the page's own wasm is 14.0 MB (5.40 MB gzipped). Fetched only with
+  the switch on, by the leader tab, and cached after.
+- **Cold start, remembered** (Chromium, the browser started afresh on alice's profile, local
+  network, six runs over two builds): the worker loaded in 33-62 ms; the server up with both
+  stores open in 0.89-1.27 s (Big, 681 nodes and 2.8 MB, 0.79-1.12 s; Family 61-82 ms); **rows in
+  the tree 1.6-2.3 s after the page was asked for**. Before the directory-handle cache, Big alone took
+  about 6 s (every file's path walked from the OPFS root).
+- **Opening the biggest test store**: the 681-node store as above from OPFS, 0.8-1.1 s; its
+  first replication (an empty browser, signed in) listed 1.0 s after the sign-in, its row 3.7 s.
+  Its in-memory keyword index is built after the open, in the background (search found it
+  at once in the run).
+
+### Not done, and what is different from the contract
+
+- **The per-document log of section 4 is not built.** The browser's server writes documents on
+  the same 750 ms debounce as the desktop's. What a closed leader held only in memory is lost from
+  its disk, but not in practice from anywhere: a vault link appends every local update to the
+  hosted twin as it is taken (so only offline is there a window), and the other tabs' editors
+  reconcile on reconnect (the typing test above). Whether the browser (or both apps) adopts the
+  log is still wave 0's question.
+- **Plain hosted stores** are not replicated in the browser yet (section 5's second bullet): they
+  are logged and skipped. The link would be `addRemoteStore` with `AuthMethod::CloudSession` to
+  the session's `rpc_url`; not built or tried. The local stack makes only encrypted stores.
+- **No Settings switch**: `?server=worker` only. "Forget This Browser" is on the account page,
+  not in Settings.
+- **A reload with no network at all** does not load the page: nothing caches the page's or the
+  worker's files (no service worker; the edge says `no-store`). Offline use needs the page served
+  (or a service worker, which is a decision of its own).
+- A relayed store whose owner is away reads as plainly offline in the worker
+  (`owner_is_offline` is `false` there, as wave 3 left it).
+- Diagnostics are not sent from the worker; the old path's are untouched.
+- Semantic search in the browser is wave 6.
+- **Firefox and Safari were not run**: there is no Firefox in this machine's Playwright cache
+  (getting one is a download) and no Safari on Linux. What stays unproven there (section 10):
+  `createWritable` in a worker is missing before Safari 26, so the sync-access-handle fallback is
+  written but has run in no browser; it is not atomic against a kill mid-write (the seal then
+  reports the file as not opening, and the store's open skips it, above). Safari deletes all
+  script-writable storage of a site not visited for seven days unless it is installed to the home
+  screen (ITP), which would forget the browser and its unsent edits after a week away;
+  `navigator.storage.persist()` is honoured from Safari 17. Firefox's private windows had no OPFS
+  before 115 (the worker then starts on memory, said in the log). Web Locks and
+  `BroadcastChannel` are in every current engine.
+
+### Found while building
+
+- **A reader's replica says "1 note waiting"** for a read-only share root right after it is
+  added, on the desktop as in the browser (`getStoreSync.waiting`: the root with "You can read
+  this, not change it."): something writes to a document this device may only read. Seen first
+  in the browser; carol's desktop does the same. Not this wave's; worth a look.
+- **The worker's files are not hashed** (`pimble-worker_loader.js`, `pimble-worker.js`,
+  `pimble-worker_bg.wasm`): a deploy where the edge caches them could pair a new page with an old
+  worker. The local edge sends `no-store`; jkbase's caching of `/app/` should be checked before
+  the switch is turned on for anyone.
+- **The deploy now builds the worker** (trunk builds `crates/pimble-worker` for wasm32 with the
+  root lock, rhypedb included): the web build takes about two minutes more here.
+- **`Cargo.lock` moves when `tracing-wasm` joins the root workspace**: cargo then resolved
+  `windows-sys` afresh for about twenty packages and x11rb's `libloading` 0.8.9 -> 0.9.0, the
+  desktop's dependencies. The worker writes its log through a layer of its own instead, and the
+  lock gains dependency lines only.
+
+### Changes by file
+
+- `Cargo.toml`: `[profile.worker]`. `Cargo.lock`: dependency lines only (no package added or
+  moved).
+- `crates/pimble-crypto/src/lib.rs`: `LOCAL_FILE_VERSION`, `local_file_aad`.
+- `crates/pimble-host/`: `Cargo.toml` (`pimble-crypto`; the OPFS `web-sys` features);
+  `src/disk/sealed.rs`, `src/disk/opfs.rs` (new); `src/disk.rs`, `src/lib.rs` (exports).
+- `crates/pimble-store/`: `src/local.rs` (`load_node_docs` skips a file that does not open; its
+  test); `Cargo.toml` (`pimble-crypto` for the test).
+- `crates/pimble-server/`: `src/server.rs` (`key_rest`, `inherited_device`), `src/handler.rs`
+  (`with_key_rest`, `with_inherited_device`), `src/devices.rs` (`InheritedDevice`, its test),
+  `src/lib.rs` (export), `src/relay_face.rs` (the face's config names both);
+  `tests/link_faults.rs` (the browser-configured device).
+- `crates/pimble-client/src/message_port.rs`: `null` ends a `PortText`; `post_gone`; a closing
+  client says so.
+- `crates/pimble-worker/`: `Cargo.toml` (the `entry` feature; IndexedDB, WebCrypto and worker
+  `web-sys` features; `tracing-subscriber`, `getrandom`, `web-time`, `serde`, ...);
+  `src/lib.rs`; `src/worker.rs` (`start_browser`, `Keeping`, `forget_browser`, opening the
+  browser's stores, `stop`, `forget`); `src/device.rs`, `src/entry.rs` (new).
+- `web/`: `hub.js` (new); `index.html` (the hub and the worker's build); `Cargo.toml` (`web-sys`
+  features); `src/worker_mode/{mod,hub,backend,pages}.rs` (new); `src/main.rs`, `src/route.rs`,
+  `src/app_page.rs`; `README.md`.
+- `scripts/local-stack/README.md`: the switch, and checking the browser's server by hand.
+
+### What is left for wave 5
+
+- Delete the old path (`vault.rs`, `vault_backend.rs`, `routed.rs`, `endpoints.rs`, the old
+  backend loop, `session.rs`/`keys.rs`/`personal_sync.rs`/`diagnostics.rs` as they are, the old
+  login's unlock) and the switch, with the no-second-path check.
+- Before that, or with it: plain hosted stores as replicas; diagnostics from the worker (its
+  queue on the disk adapter); a relayed store's owner away; a Settings switch and "Forget This
+  Browser" in Settings; the per-document log, if wanted; whether the page and worker are cached
+  for offline (a service worker); Firefox and Safari runs (the fallback write path above);
+  the worker's files hashed or their caching checked on jkbase.

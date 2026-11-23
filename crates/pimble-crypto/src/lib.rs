@@ -611,6 +611,18 @@ pub fn dek_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}/dek").into_bytes()
 }
 
+/// The version of a sealed local file's associated data
+/// ([`local_file_aad`]).
+pub const LOCAL_FILE_VERSION: u8 = 1;
+
+/// The associated data a file the browser's server keeps on its own disk is
+/// sealed with (docs/ONE_CODEBASE_CONTRACT.md section 7): the file's path and
+/// a format version, so a file never opens under another name, and never as a
+/// document blob, a share's key or anything else sealed with other data.
+pub fn local_file_aad(path: &str) -> Vec<u8> {
+    format!("pimble-local/v{LOCAL_FILE_VERSION}/{path}").into_bytes()
+}
+
 // --- Internal helpers -------------------------------------------------------------
 
 fn b64_encode(bytes: &[u8]) -> String {

@@ -1441,6 +1441,22 @@ impl RpcHandler {
         self
     }
 
+    /// Where the keystore rests, in place of `keys.json` on the disk
+    /// (`ServerConfig::key_rest`). Call before the handler is cloned or
+    /// serves anything.
+    pub fn with_key_rest(mut self, rest: Arc<dyn pimble_host::KeyRest>) -> Self {
+        self.keystore = Arc::new(Keystore::resting(rest));
+        self
+    }
+
+    /// A browser's device id and answers from before its worker
+    /// (`ServerConfig::inherited_device`). Call before the handler is cloned
+    /// or serves anything.
+    pub fn with_inherited_device(mut self, inherited: crate::devices::InheritedDevice) -> Self {
+        self.devices = Arc::new(crate::devices::Devices::new(self.disk.clone()).inheriting(Some(inherited)));
+        self
+    }
+
     /// How this server reaches the accounts service.
     pub fn http(&self) -> &dyn pimble_host::http::Http {
         &*self.http

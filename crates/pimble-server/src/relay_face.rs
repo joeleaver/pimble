@@ -256,6 +256,9 @@ impl RelayHost {
             paths: pimble_host::Paths::in_dir(&self.dir.join(".face")),
             // A face calls the accounts service for nothing; the host's way all the same.
             http: std::sync::Arc::new(pimble_host::http::ReqwestHttp::default()),
+            // Signs in to nothing, so its keystore is the file above, empty.
+            key_rest: None,
+            inherited_device: None,
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;

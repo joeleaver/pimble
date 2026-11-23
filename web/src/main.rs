@@ -35,6 +35,7 @@ mod shortcuts;
 mod util;
 mod vault;
 mod vault_backend;
+mod worker_mode;
 
 use wasm_bindgen::prelude::*;
 
@@ -59,6 +60,9 @@ pub fn start() {
     let _ = console_log::init_with_level(log::Level::Info);
 
     shortcuts::install();
+    if worker_mode::enabled() {
+        worker_mode::begin();
+    }
     route::start();
 }
 

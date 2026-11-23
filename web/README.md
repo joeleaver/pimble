@@ -59,6 +59,17 @@ The backend loop supervises the endpoint the store list comes from, because that
 is the one whose absence means there is nothing to show. Any other endpoint
 connects the first time a store on it is touched.
 
+## The browser's own server (behind a switch)
+
+`?server=worker` turns on docs/ONE_CODEBASE_CONTRACT.md wave 4 for this browser
+(`?server=page` off). The page then runs the same Pimble server the desktop runs, in a
+dedicated worker of one leader tab (`hub.js`: a Web Lock, a `BroadcastChannel` for the other
+tabs), built by trunk from `crates/pimble-worker` (its `entry` feature, the `worker` profile)
+into `pimble-worker_loader.js`. `src/worker_mode/` is the page's side: the switch, the hub's
+bindings, the backend (the desktop's shape over `PimbleClient::over_message_port`), and the
+sign-in and account pages that talk to that server. Off, none of it runs and nothing above
+changes.
+
 ## The account pages
 
 `/app/signup`, `/app/login` and `/app/account` are rinch views in this same wasm

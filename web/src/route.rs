@@ -137,7 +137,14 @@ pub fn render(route: Route) {
             show(&app_host(), true);
             if !APP_STARTED.get() {
                 APP_STARTED.set(true);
-                crate::app_page::start();
+                if crate::worker_mode::enabled() {
+                    crate::worker_mode::start_app();
+                } else {
+                    crate::app_page::start();
+                }
+            } else if crate::worker_mode::enabled() {
+                // The browser's own server lists what the account holds by
+                // itself; nothing to mint again.
             } else {
                 // Coming back from the account pages, where a store may have
                 // been created or shared. The token this app holds predates
@@ -147,6 +154,8 @@ pub fn render(route: Route) {
             }
         }
         Route::Signup => mount_page(crate::pages::signup::signup_page),
+        Route::Login if crate::worker_mode::enabled() => mount_page(crate::worker_mode::pages::login_page),
+        Route::Account if crate::worker_mode::enabled() => mount_page(crate::worker_mode::pages::account_page),
         Route::Login => mount_page(crate::pages::login::login_page),
         Route::Forgot => mount_page(crate::pages::forgot::forgot_page),
         Route::Recover => mount_page(crate::pages::recover::recover_page),

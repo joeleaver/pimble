@@ -20,15 +20,36 @@ pimble-rpc = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["MessagePort"] }
+web-sys = { version = "0.3", features = [
+    "MessagePort", "MessageEvent", "DedicatedWorkerGlobalScope", "Event", "EventTarget", "console",
+    # The remembered device (src/device.rs): WebCrypto and IndexedDB.
+    "CryptoKey", "SubtleCrypto", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest",
+    "IdbObjectStore", "IdbTransaction", "IdbRequestReadyState", "IdbTransactionMode", "DomException", "DomStringList",
+] }
 tracing = { workspace = true }
 # A panic in the worker said in its console, not as "unreachable".
 console_error_panic_hook = "0.1"
+pimble-core = { workspace = true }
+pimble-crypto = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+getrandom = { version = "0.2", features = ["js"] }
+web-time = "1"
+# The server's log in the worker's console (src/entry.rs): a small layer of
+# its own over `console`, rather than tracing-wasm, whose addition moves other
+# packages in the lock.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+
+[features]
+# The worker's own script: `#[wasm_bindgen(start)]` answering the page's
+# messages (src/entry.rs). On in the page's build (web/index.html), off in the
+# tests, which drive the server themselves.
+entry = []
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 # tests/smoke.rs, in Node: wasm-bindgen-test-runner as the target's runner.
 wasm-bindgen-test = "0.3"
-pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 base64 = { workspace = true }
 web-sys = { version = "0.3", features = ["MessageChannel", "MessagePort"] }

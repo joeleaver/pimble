@@ -40,3 +40,5 @@ notify = { workspace = true }
 tempfile = "3"
 # `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).
 pimble-host = { workspace = true, features = ["test-disk"] }
+# A sealed disk's key in local.rs's test of a file that does not open.
+pimble-crypto = { workspace = true }

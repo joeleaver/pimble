@@ -10,22 +10,19 @@
 //! worker's module is built from this crate (a `cdylib`) and the page's from
 //! `web/`, and neither links the other's code.
 //!
-//! How a page starts it (wave 4: the leader tab):
-//!
-//! ```js
-//! // worker.js, a module worker: new Worker("worker.js", { type: "module" })
-//! import init, { startServer } from "./pimble_worker.js";
-//! await init();
-//! const server = await startServer();
-//! self.onmessage = (event) => {
-//!     // The page sends one end of a MessageChannel per connection.
-//!     if (event.data === "connect") server.connect(event.ports[0]);
-//! };
-//! ```
-//!
-//! and the page keeps the other end: `PimbleClient::over_message_port(port)`.
+//! How a page starts it (wave 4): the leader tab (`web/hub.js`) starts a
+//! dedicated worker from the loader trunk writes for this crate built with the
+//! `entry` feature; `entry.rs` then answers the page's messages (`start`,
+//! `connect` with a port, `stop`, `forget`). The server is kept on OPFS sealed
+//! with the remembered device's disk key, or on memory ("don't remember this
+//! browser"): `worker.rs` [`start_browser`], `device.rs`. The page keeps the
+//! other end of each port: `PimbleClient::over_message_port(port)`.
 //! Natively this crate is empty.
 
+#[cfg(target_arch = "wasm32")]
+mod device;
+#[cfg(all(target_arch = "wasm32", feature = "entry"))]
+mod entry;
 #[cfg(target_arch = "wasm32")]
 mod worker;
 

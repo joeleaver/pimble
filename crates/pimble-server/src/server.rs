@@ -122,6 +122,14 @@ pub struct ServerConfig {
     /// on the caller's runtime, on the desktop; `spawn_local` and
     /// `setTimeout` in a browser's worker.
     pub runtime: pimble_host::Runtime,
+    /// Where the keystore rests between runs (section 7, `KeyRest`): `None`
+    /// is `keys.json` (`keystore_path`) on `disk`, the desktop's; a browser's
+    /// worker hands its device-key store, or memory for "don't remember this
+    /// browser".
+    pub key_rest: Option<Arc<dyn pimble_host::KeyRest>>,
+    /// A browser's device id and answered reports from before its server ran
+    /// in a worker, taken by each store's first device entry (wave 4).
+    pub inherited_device: Option<crate::devices::InheritedDevice>,
 }
 
 impl Default for ServerConfig {
@@ -148,6 +156,8 @@ impl Default for ServerConfig {
             paths: default_paths(),
             http: default_http(),
             runtime: pimble_host::Runtime::default(),
+            key_rest: None,
+            inherited_device: None,
         }
     }
 }
@@ -403,6 +413,12 @@ impl PimbleServer {
         let keystore_path = self.config.keystore_path.clone().unwrap_or_else(|| self.config.paths.keystore());
         let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path).with_semantic_warmup(warmup, wanted);
         handler = handler.with_http(Arc::clone(&self.config.http));
+        if let Some(rest) = self.config.key_rest.clone() {
+            handler = handler.with_key_rest(rest);
+        }
+        if let Some(inherited) = self.config.inherited_device.clone() {
+            handler = handler.with_inherited_device(inherited);
+        }
         if let Some(relay_dir) = self.config.relay_dir.clone() {
             handler = handler.with_relay_dir(relay_dir);
         }

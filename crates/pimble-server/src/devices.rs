@@ -57,6 +57,18 @@ impl DeviceEntry {
     }
 }
 
+/// The device id and answered reports a browser used before its server ran in
+/// a worker (docs/ONE_CODEBASE_CONTRACT.md wave 4): one device id for the
+/// whole browser (`pimble.vault-device` in its `localStorage`) and, per store,
+/// which reports it had answered (`pimble.vault-answered.<store>`). A store's
+/// entry made for the first time on such a server takes them, so the browser
+/// keeps its report slot and answers nothing twice.
+#[derive(Debug, Clone, Default)]
+pub struct InheritedDevice {
+    pub device: String,
+    pub answered: HashMap<StoreId, Comparing>,
+}
+
 /// The entries, read from and written to each store's record. A store with
 /// no state directory (none on a server, which always has a state root)
 /// keeps its entry in memory for the life of the process.
@@ -64,16 +76,29 @@ pub(crate) struct Devices {
     /// The disk the records are on.
     disk: pimble_host::Disk,
     memory: tokio::sync::Mutex<HashMap<StoreId, DeviceEntry>>,
+    /// What a first entry takes in place of a fresh id, when the host handed
+    /// one over.
+    inherited: Option<InheritedDevice>,
 }
 
 impl Devices {
     pub(crate) fn new(disk: pimble_host::Disk) -> Self {
-        Self { disk, memory: Default::default() }
+        Self { disk, memory: Default::default(), inherited: None }
+    }
+
+    pub(crate) fn inheriting(mut self, inherited: Option<InheritedDevice>) -> Self {
+        self.inherited = inherited.filter(|i| !i.device.trim().is_empty());
+        self
     }
 
     /// `store_id`'s entry, made (with a fresh device id) the first time.
     pub(crate) async fn entry(&self, store_id: StoreId, state_dir: Option<&Path>) -> DeviceEntry {
         let fresh = || {
+            if let Some(inherited) = &self.inherited {
+                let entry = DeviceEntry { device: inherited.device.clone(), answered: inherited.answered.get(&store_id).cloned().unwrap_or_default() };
+                info!("Store {}: this browser reports as device {}, as it did before its server ran in a worker", store_id, entry.device);
+                return entry;
+            }
             let entry = DeviceEntry { device: Uuid::new_v4().to_string(), answered: Comparing::default() };
             info!("Store {}: this computer reports as device {}", store_id, entry.device);
             entry
@@ -97,5 +122,30 @@ impl Devices {
                 self.memory.lock().await.entry(store_id).or_insert_with(fresh).clone()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A browser's old device id and answers are what a store's first entry
+    /// takes; an entry already made keeps its own.
+    #[tokio::test]
+    async fn an_inherited_device_is_taken_by_first_entries_only() {
+        let disk = pimble_host::Disk::memory();
+        disk.create_dir_all("/state/a").await.unwrap();
+        disk.create_dir_all("/state/b").await.unwrap();
+        let (a, b) = (StoreId::new(), StoreId::new());
+        let answered: Comparing = serde_json::from_value(serde_json::json!({ "answered": { "doc": { "dev-2": "AA:" } } })).unwrap();
+
+        let before = Devices::new(disk.clone()).entry(b, Some(Path::new("/state/b"))).await;
+        let devices = Devices::new(disk.clone()).inheriting(Some(InheritedDevice { device: "browser-1".into(), answered: HashMap::from([(a, answered.clone())]) }));
+        let entry = devices.entry(a, Some(Path::new("/state/a"))).await;
+        assert_eq!(entry.device, "browser-1");
+        assert_eq!(entry.answered, answered);
+        assert_eq!(devices.entry(b, Some(Path::new("/state/b"))).await.device, before.device, "a store that had an entry keeps it");
+        // Written: a server without the hand-over reads the same.
+        assert_eq!(Devices::new(disk).entry(a, Some(Path::new("/state/a"))).await.device, "browser-1");
     }
 }

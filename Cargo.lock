@@ -5243,6 +5243,7 @@ dependencies = [
  "futures",
  "gloo-timers",
  "js-sys",
+ "pimble-crypto",
  "reqwest",
  "tempfile",
  "tokio",
@@ -5494,6 +5495,7 @@ dependencies = [
  "notify",
  "pimble-core",
  "pimble-crdt",
+ "pimble-crypto",
  "pimble-host",
  "serde",
  "serde_json",
@@ -5519,20 +5521,27 @@ dependencies = [
 name = "pimble-worker"
 version = "0.29.4"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "console_error_panic_hook",
+ "getrandom 0.2.17",
  "js-sys",
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
+ "pimble-crypto",
  "pimble-host",
  "pimble-rpc",
  "pimble-server",
+ "serde",
+ "serde_json",
  "tracing",
+ "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]

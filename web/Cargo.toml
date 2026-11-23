@@ -76,6 +76,13 @@ web-sys = { version = "0.3", features = [
     "RequestCredentials",
     "Response",
     "Headers",
+    # The browser's own server (src/worker_mode): its ports, the storage
+    # persistence request.
+    "MessagePort",
+    "Navigator",
+    "StorageManager",
+    "Storage",
+    "NodeList",
 ] }
 console_error_panic_hook = "0.1"
 console_log = "0.2"

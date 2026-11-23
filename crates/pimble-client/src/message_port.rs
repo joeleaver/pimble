@@ -6,8 +6,10 @@
 //! (crates/pimble-worker).
 //!
 //! A `MessagePort` says nothing when the other side goes: a worker that has
-//! stopped leaves this client's calls unanswered. Noticing that (the leader
-//! tab's lock passing) is the page's, in wave 4.
+//! stopped leaves this client's calls unanswered. So whoever notices (the
+//! page's hub, when the leader tab's lock passes or its worker is replaced;
+//! `web/hub.js`) posts `null` on the port: [`PortText`] ends there, and a
+//! client over it is disconnected, as one whose WebSocket closed.
 
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::client::{ClientBuilder, ReceivedMessage, TransportReceiverT, TransportSenderT};
@@ -29,7 +31,8 @@ pub struct PortError(String);
 
 /// The text messages arriving on a `MessagePort`, in order. Listening starts
 /// when this is made (`onmessage`, which also starts the port) and stops when
-/// it is dropped. A message that is not a string is not JSON-RPC text: it is
+/// it is dropped. `null` says the other side has gone: nothing arrives after
+/// it. Any other message that is not a string is not JSON-RPC text: it is
 /// skipped and logged.
 pub struct PortText {
     port: MessagePort,
@@ -41,11 +44,21 @@ pub struct PortText {
 impl PortText {
     pub fn listen(port: &MessagePort) -> Self {
         let (tx, rx) = unbounded_channel();
-        let listener = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| match event.data().as_string() {
-            Some(text) => {
-                let _ = tx.send(text);
+        let mut tx = Some(tx);
+        let listener = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let data = event.data();
+            match data.as_string() {
+                Some(text) => {
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(text);
+                    }
+                }
+                None if data.is_null() => {
+                    // The other side has gone: the channel ends.
+                    tx = None;
+                }
+                None => tracing::warn!("a message that is not JSON-RPC text arrived on the Pimble server's port; skipped"),
             }
-            None => tracing::warn!("a message that is not JSON-RPC text arrived on the Pimble server's port; skipped"),
         });
         port.set_onmessage(Some(listener.as_ref().unchecked_ref()));
         Self { port: port.clone(), rx, _listener: listener }
@@ -68,6 +81,11 @@ impl Drop for PortText {
     }
 }
 
+/// Say on `port` that this side has gone (see [`PortText`]).
+pub fn post_gone(port: &MessagePort) {
+    let _ = port.post_message(&JsValue::NULL);
+}
+
 /// Send one message of JSON-RPC text on `port`.
 pub fn post_text(port: &MessagePort, text: &str) -> Result<(), PortError> {
     port.post_message(&JsValue::from_str(text)).map_err(|e| PortError(e.as_string().unwrap_or_else(|| format!("{e:?}"))))
@@ -85,6 +103,7 @@ impl TransportSenderT for Sender {
     }
 
     async fn close(&mut self) -> Result<(), PortError> {
+        post_gone(&self.0);
         self.0.close();
         Ok(())
     }

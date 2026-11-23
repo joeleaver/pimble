@@ -975,7 +975,17 @@ impl LocalStore {
                     continue;
                 }
             };
-            let bytes = disk.read(&file).await?;
+            let bytes = match disk.read(&file).await {
+                Ok(bytes) => bytes,
+                // A file that does not open (a sealed disk's file written
+                // only in part: the browser's fallback write, killed midway)
+                // is skipped as a document that does not load is.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    warn!("Skipping node document {:?}: {}", file, e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             match NodeDoc::load(&bytes) {
                 Ok(doc) => {
                     loaded.hashes.insert(id, content_hash(&bytes));
@@ -1922,6 +1932,32 @@ mod tests {
 
         let store = LocalStore::open(&store_path).await.unwrap();
         assert!(store.tree.doc(a_id).unwrap().missing().is_some(), "still waiting after a restart, from the disk");
+    }
+
+    /// On a sealed disk (the browser's OPFS), a document file that does not
+    /// open (written only in part) is skipped at open, as a document that
+    /// does not load is: the store opens without it.
+    #[tokio::test]
+    async fn a_sealed_file_that_does_not_open_is_skipped() {
+        let below: std::sync::Arc<dyn pimble_host::DiskBackend> = std::sync::Arc::new(pimble_host::MemoryDisk::new());
+        let disk = Disk::new(pimble_host::SealedDisk::new(below.clone(), pimble_crypto::SymmetricKey::generate()));
+        let runtime = Runtime::default();
+        let path = Path::new("/pimble/replicas/s.pimble");
+        disk.create_dir_all(path.parent().unwrap()).await.unwrap();
+        let mut store = LocalStore::create_on(&disk, &runtime, path, "Store", None).await.unwrap();
+        let root_id = store.root_node_id();
+        let (a_id, _) = store.create_node(Node::document("A"), Some(root_id)).unwrap();
+        let (b_id, _) = store.create_node(Node::document("B"), Some(root_id)).unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+        // Half of the file, as a write killed midway leaves it.
+        let file = path.join("nodes").join(format!("{a_id}.yrs"));
+        let raw = Disk::from_arc(below);
+        let sealed = raw.read(&file).await.unwrap();
+        raw.write(&file, &sealed[..sealed.len() / 2]).await.unwrap();
+        let store = LocalStore::open_on(&disk, &runtime, path, None).await.unwrap();
+        assert!(store.tree.doc(a_id).is_none(), "the half-written document is left out");
+        assert!(store.tree.doc(b_id).is_some(), "the rest opens");
     }
 
     #[tokio::test]
