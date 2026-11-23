@@ -943,6 +943,14 @@ pub struct AppStore {
     /// and the discussions the open stores hold (`ListDiscussions`).
     pub discussions_modal: Signal<bool>,
     pub all_discussions: Signal<Vec<(StoreId, NodeId)>>,
+    /// The notices this device has received, newest first
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 5): what View > "Inbox..."
+    /// lists and the status bar counts (the unread ones, by the personal
+    /// document).
+    pub notices: Signal<Vec<pimble_rpc::Notice>>,
+    /// Whether notifications are on for the account (section 6): the switch
+    /// in the Account window and in Settings.
+    pub notifications_on: Signal<bool>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1228,6 +1236,8 @@ impl AppStore {
             attachments: Signal::new(HashMap::new()),
             read_version: Signal::new(0),
             personal_sync: Signal::new(crate::persistence::load_personal_sync()),
+            notices: Signal::new(Vec::new()),
+            notifications_on: Signal::new(true),
             discussions_modal: Signal::new(false),
             all_discussions: Signal::new(Vec::new()),
         }

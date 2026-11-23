@@ -129,6 +129,7 @@ impl Local {
         self.watch(client.clone());
         self.hear_cloud(client.clone());
         self.hear_links(client.clone());
+        self.hear_notices(client.clone());
         self.emit(BackendEvent::Connected { server_addr: server_addr(), client_id: self.client_id.clone() });
         Ok(client)
     }
@@ -162,6 +163,27 @@ impl Local {
             while let Some(Ok(connection)) = sub.next().await {
                 let Some(me) = me.upgrade() else { return };
                 me.emit(BackendEvent::CloudConnectionChanged { connection });
+            }
+        });
+    }
+
+    /// The notices this server receives for the signed-in account
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 4), for as long as `client`'s
+    /// connection lasts. A server from before wave 1 has no such
+    /// subscription, and nothing is heard.
+    fn hear_notices(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut sub = match client.subscribe_notices().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::debug!("No notices from this server: {e}");
+                    return;
+                }
+            };
+            while let Some(Ok(notice)) = sub.next().await {
+                let Some(me) = me.upgrade() else { return };
+                me.emit(BackendEvent::NoticeReceived { notice });
             }
         });
     }

@@ -12,6 +12,7 @@ pimble-crdt = { workspace = true }
 yrs = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 
 # uuid v4 needs a randomness backend in the browser; the native build has one.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

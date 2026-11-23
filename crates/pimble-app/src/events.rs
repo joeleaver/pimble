@@ -1506,6 +1506,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::CloudConnectionChanged { connection } => {
                 store.cloud_connection.set(connection.clone());
             }
+            BackendEvent::NoticeReceived { notice } => {
+                crate::inbox::received(store, notice.clone());
+            }
+            BackendEvent::NoticesListed { notices, on } => {
+                crate::inbox::listed(store, notices.clone(), *on);
+            }
             BackendEvent::AppLink { url, activation_token } => {
                 #[cfg(feature = "native")]
                 crate::app::bring_to_front(activation_token.as_deref());
@@ -1525,6 +1531,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     // email's local part with (docs/PRESENCE_CONTRACT.md
                     // section 3).
                     store.send(BackendCommand::CloudListShares);
+                    // The notices this device keeps (docs/NOTIFICATIONS_CONTRACT.md).
+                    store.send(BackendCommand::ListNotices);
                 } else {
                     crate::boards::set_author(None, None);
                 }
@@ -1576,6 +1584,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                     CloudOp::Shares => crate::shares::failed(store, message),
+                    CloudOp::Notifications => {
+                        // The switch did not take: it shows what holds, and why.
+                        store.send(BackendCommand::ListNotices);
+                        show_notice(store, format!("Notifications could not be changed: {message}"));
+                    }
                     CloudOp::HostStore => {
                         store.host_modal_busy.set(false);
                         store.host_modal_error.set(message.clone());

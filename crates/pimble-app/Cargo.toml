@@ -110,6 +110,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "Event", "EventTarget", "FileList", "File", "Blob",
     "DragEvent", "DataTransfer", "ClipboardEvent",
     "BlobPropertyBag", "Url", "HtmlAnchorElement",
+    # Notices shown by the browser (docs/NOTIFICATIONS_CONTRACT.md section 4).
+    "Notification", "NotificationOptions", "NotificationPermission",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 
@@ -151,6 +153,9 @@ native = [
     # Implies `rinch/desktop`; the browser build gets the same adapter through
     # `rinch-web/collaboration` instead.
     "rinch/collaboration",
+    # Operating-system notifications for notices (docs/NOTIFICATIONS_CONTRACT.md
+    # section 4): the freedesktop service, WinRT toasts, UserNotifications.
+    "rinch/notifications",
 ]
 web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "pimble-plugin-host/js-host"]
 onnx-download = ["native", "pimble-server/onnx-download"]

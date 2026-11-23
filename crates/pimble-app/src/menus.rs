@@ -319,7 +319,7 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
             crate::app::open_deleted_modal_for_selection(store)
         }),
         // docs/DISCUSSIONS_CONTRACT.md section 8: what is unread, everywhere.
-        MenuEntry::item("Discussions...", "", move || crate::discussions::open_unread(store)),
+        MenuEntry::item("Inbox...", "", move || crate::inbox::open_inbox(store)),
     ]
 }
 

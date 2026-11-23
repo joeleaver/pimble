@@ -5227,6 +5227,7 @@ dependencies = [
 name = "pimble-discussion"
 version = "0.30.1"
 dependencies = [
+ "chrono",
  "pimble-core",
  "pimble-crdt",
  "thiserror 2.0.21",
@@ -6604,8 +6605,10 @@ version = "0.1.0"
 source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "base64 0.22.1",
+ "block2 0.6.2",
  "bytemuck",
  "calloop-wayland-source",
+ "futures-lite",
  "futures-util",
  "js-sys",
  "keyboard-types 0.7.0",
@@ -6646,9 +6649,11 @@ dependencies = [
  "wayland-client",
  "web-sys",
  "wgpu",
+ "windows",
  "windows-sys 0.59.0",
  "winit",
  "x11rb 0.13.2",
+ "zbus",
 ]
 
 [[package]]

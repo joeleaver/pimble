@@ -639,20 +639,25 @@ fn render_inline(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ctx: 
     }
 }
 
-// ── View > "Discussions..." (contract section 8) ────────────────────────
+// ── View > "Inbox..." (contract section 8; docs/NOTIFICATIONS_CONTRACT.md
+// section 5, which renamed it from "Discussions...") ─────────────────────
 
-/// The window listing every discussion with unread messages in the open
-/// stores, newest first; a line opens its discussion in the focused pane.
+/// The window listing the notices this person received (mentions and
+/// replies, `crate::inbox`), then every discussion with unread messages in
+/// the open stores, newest first; a line opens where it points in the
+/// focused pane.
 pub(crate) fn render_unread_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let rows = move || unread_rows(store);
     rsx! {
         Modal {
             opened_fn: move || store.discussions_modal.get(),
             onclose: move || store.discussions_modal.set(false),
-            title: "Discussions",
+            title: "Inbox",
             size: "md",
+            {crate::inbox::render_notices(__scope, store)}
             div {
                 class: "pimble-discussions pimble-discussions--modal",
+                div { class: "pimble-inbox__heading", "Unread discussions" }
                 if rows().is_empty() {
                     div { class: "pimble-discussion__empty", "Nothing unread." }
                 }

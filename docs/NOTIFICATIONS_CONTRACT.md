@@ -1,7 +1,8 @@
 # Notifications contract: hearing that someone wrote to you
 
-Status: **design agreed 2026-11-23; wave 0 (mentions as text) built the same day**, see
-"Built in wave 0" at the end. Written from a conversation with Joe that
+Status: **design agreed 2026-11-23; wave 0 (mentions as text) and wave 1 (the inbox and
+the running app) built the same day**, see "Built in wave 0" and "Built in wave 1" at the
+end. Written from a conversation with Joe that
 day; his decisions are listed at the end. The details not named there are design choices
 made here that he has not reviewed yet.
 
@@ -310,3 +311,132 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   from posting or editing a message.
 - Editing a message shows its mentions as Markdown (`[@Will](pimble-person:...)`), as it
   already shows links.
+
+## Built in wave 1 (2026-11-23, branch `notifications`)
+
+### Decided here (small; Joe has not reviewed them)
+
+- **The notice key's envelope is the account's own `KeyEnvelope`**: the secret sealed to
+  the account's X25519 key and signed by its Ed25519 key, context `notice:<sub>`, key id
+  nil (`pimble_crypto::wrap_notice_key`/`unwrap_notice_key`). Unwrapping checks the
+  signature, the context and that the secret matches the published public half, so a
+  substituted envelope is refused. A second, different key is refused by the service
+  (409) and the device that lost the race fetches the first.
+- **A sealed notice** (`pimble_crypto::seal_notice`): version byte, an ephemeral X25519
+  key, a 24-byte nonce, XChaCha20-Poly1305 under HKDF-SHA256 (`"pimble-notice"`, salted
+  with both public keys), associated data `pimble-notice/<recipient sub>`. Unsigned: the
+  accounts service stamps the sender it authenticated beside the item, and the
+  recipient's server drops a notice whose own `from` differs.
+- **`anchor`** is the mention's id for a mention in a note's text and the message's id
+  for a discussion; **`node`** is the note, or a discussion's host (the discussion itself
+  when standalone), and **`discussion`** names the discussion.
+- **Which share addresses a notice**: the innermost share of the node's ancestry (a
+  discussion stands under its host) whose people name the recipient, else the whole
+  store's; `from_name` is what the sender goes by there (`ScopePeople.my_name`).
+- **Replies**: "the thread" is the whole discussion. A new message notifies everyone else
+  who wrote a message in it (agents' messages notify nobody, being nobody's inbox); a
+  person the message mentions gets the mention instead. An edited message notifies only
+  the mentions it added.
+- **What was notified** is remembered per `(store, node or discussion, mention id or
+  message id, recipient)` for 180 days (at most 20,000), in the account's own file. Undo
+  and redo, a restart, a re-sent edit: nobody again. The same mention pasted into another
+  note: notified (its key names the node). The wave 0 note that "pasting a mention of
+  Will into another note is not news to Will" is therefore superseded.
+- **The inbox API** (accounts service, `crates/pimble-cloud/src/routes/inbox.rs`):
+  `POST /api/v1/inbox/{sub} { store_id, root?, sealed }` (both accounts must reach that
+  share: the whole store, or that root; 60 per minute per sender; a recipient who turned
+  notifications off is answered `queued: false` and nothing is kept),
+  `GET /api/v1/inbox?after=<seq>&wait=<s>` (the long poll, at most 25 s: the items after
+  the cursor, `seq` being the row id), `POST /api/v1/inbox/ack { ids }` (deleted at once),
+  `DELETE /api/v1/inbox`, `PUT /api/v1/me/notice-key`, `PUT /api/v1/me/notifications
+  { on }`. Undelivered items older than a day are dropped, delivered ones seven days after
+  their first delivery (checked whenever the recipient drains). `GET /me` answers
+  `notifications`; `GET /me/keys` answers `notice_key { public_key, envelope }`;
+  `GET /users/lookup` and every person and member of `GET /stores/{id}/members` carry
+  `notice_key` (to every member: it is a public key).
+- **The long poll, not SSE**: the desktop's HTTP client has a 15 s timeout, so the server
+  asks with `wait=10`; each run starts from cursor 0 and takes each item once by id.
+- **Acknowledged = deleted.** Every device of the account drains every unacknowledged
+  item, so each shows it; the first one opened acknowledges it, and the personal document
+  clears it on the others.
+- **The switch is the account's**, kept by the accounts service (`User.notifications_off`)
+  and read by every device's server at the start of each run. The Account modal is
+  Settings > Account now, so the switch and its line live there once.
+
+### What was built, and where
+
+- `pimble-crypto`: `NoticeKey`, `wrap_notice_key`, `unwrap_notice_key`,
+  `notice_key_context`, `seal_notice`, `open_notice`.
+- `pimble-cloud`: `schema.rhype` (`User.notice_public_key`, `notice_key_envelope`,
+  `notifications_off`; `type InboxItem`), `db.rs`, `routes/inbox.rs`, the fields above on
+  `me`, `me/keys`, `users/lookup` and members, the inbox emptied with a deleted account,
+  a waker per recipient (`AppState::wake_inbox`).
+- `pimble-rpc`: `Notice`, `NoticeKind`, `listNotices`, `acknowledgeNotices`,
+  `setNotifications`, `subscribeNotices` (all `Service`-only), `Person.notice_key`;
+  `pimble-client` wrappers.
+- `pimble-server`:
+  - `keystore.rs`: the notice key with the account (`notice_key`, `set_notice_key`);
+    saves are now one at a time (two at once, a store key and the notice key, lost the
+    shared temporary file: found by the end-to-end test).
+  - `notices.rs`: `candidates` (the notices a write calls for, from the document before
+    and after), the per-account file `<data dir>/pimble/notices/<sub>.json` (what was
+    told, the outbox, what arrived, acknowledgements owed), `ensure_notice_key` (fetch, or
+    make and publish: existing accounts get one from their next signed-in device), and
+    the run while signed in and on: the outbox (sealed and posted, retried every 30 s,
+    dropped after a day or when the recipient cannot open the note) beside the inbox's
+    long poll.
+  - `handler.rs`: `applyEdit` (and `createNode`/`createAttachment` with content) hands
+    the write over when it is this device's (`Principal::Service` or an agent's
+    connection, never a `sync-link:`/`vault-link:` client, never a member's own token) and
+    could matter (the update carries `pimble-person:`, or the document is a discussion).
+    The detection runs off the request's path. Started with the server (not on a relay
+    face or a JWT-verifying server), again at sign-in, sign-out and the switch.
+  - The browser's server is the same code in its worker, so the browser sends and
+    receives exactly as the desktop does.
+- `pimble-discussion`: the personal document's `notices` root (`notice_read`,
+  `mark_notice_read`; forgotten after two months).
+- `pimble-app` (`inbox.rs`, both targets): `NoticeReceived`/`NoticesListed`, an OS
+  notification per new unread notice (rinch `notifications` on the desktop, the
+  browser's Notifications API, permission asked when the Inbox opens or the switch is
+  turned on), View > "Inbox..." (mentions and replies, unread first, then the unread
+  discussions as before; "Mark All Read"), a status bar count, the switch in Settings >
+  Account. Opening a notice marks it read in the personal document, acknowledges it and
+  opens the note at the mention (a deep link's quote: the snippet from the `@`) or the
+  discussion.
+
+### Verified
+
+- `pimble-crypto` 33 passed (two new: sealing, the envelope).
+- `pimble-cloud` against a real `rhypedb-server`:
+  `notices_go_between_members_of_a_share_only_sealed_to_the_notice_key` (the key's rules,
+  publication, a long poll woken by a post, opening, cursor, acknowledgement, outsiders
+  and other shares refused, the switch) and `a_sender_is_rate_limited`.
+- `pimble-server` lib: `notices` (5) and `keystore` (7) passed.
+- `pimble-server/tests/notices.rs` on the sharing harness (its stub gained the inbox,
+  notice keys and the switch): `a_mention_reaches_the_member_once_sealed_and_opened_by_their_server`
+  (Alice mentions Bob; Bob's server opens it; nothing of the note on the service;
+  undo/redo, the edit reaching Bob over his link and a restart of Alice's server notify
+  nobody again; the same mention in another note does; acknowledged; a mention of someone
+  outside the share tells nobody; switched off, nothing goes) and
+  `a_reply_in_a_discussion_tells_the_others_who_wrote_in_it`.
+- `pimble-server` `share` (20), `share_upkeep`, `startup`, `test_isolation`, `vault_link`
+  (15) all passed with the notices running beside them.
+- `pimble-discussion` `personal` (4, one new); `pimble-app` lib filtered to `inbox personal
+  discussions mentions menus events::`, 53 passed; the browser builds
+  (`--features web --target wasm32-unknown-unknown`, `web/`, `pimble-worker`).
+- Not seen in a running app: the OS notification, the Inbox window and the status bar
+  were not driven by hand on the local stack.
+
+### Not done in wave 1
+
+- The browser's notice key rests inside the server's keystore, which rests sealed under
+  the remembered device's non-extractable WebCrypto key in IndexedDB
+  (docs/ONE_CODEBASE_CONTRACT.md section 7). A key a service worker can open on its own
+  (section 2) is wave 2's, with web push.
+- A notice opens a discussion, not scrolled to the message (`anchor` names it).
+- No per-kind or per-channel switches (section 6): one switch for the account.
+- Out of band (email, push, the 15-minute acknowledgement rule) is wave 2.
+- Seen while testing, not investigated: a discussion the **owner** started on a note in a
+  share did not reach the member's replica within 30 seconds in the harness (one a member
+  started reaches the owner at once, as `share.rs`'s commenter test shows), so the reply
+  test has the member start the thread.

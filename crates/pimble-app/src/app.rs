@@ -48,6 +48,9 @@ const TREE_INDENT: f32 = 12.0;
 /// worse than not offering it, so the browser build hides them.
 const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
 
+/// The one line beside the notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
+const NOTIFICATIONS_LINE: &str = "People who share notes with you can notify you; Pimble Cloud cannot read what they say.";
+
 /// Whether this build can make a store on the signed-in account.
 ///
 /// The exact complement of [`CAN_ADMINISTER_STORES`] for creating one: a
@@ -3816,6 +3819,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                     "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
                 }
+                Checkbox {
+                    label: "Notifications",
+                    checked_fn: move || store.notifications_on.get(),
+                    onchange: move || crate::inbox::set_on(store, !untracked(|| store.notifications_on.get())),
+                }
+                div {
+                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                    {NOTIFICATIONS_LINE}
+                }
                 div {
                     style: "display: flex; gap: 8px;",
                     Button { variant: "default", size: "xs", onclick: run_account_action, "Your Account Page" }
@@ -3908,6 +3920,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             div {
                                 style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                                 "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
+                            }
+
+                            // docs/NOTIFICATIONS_CONTRACT.md section 6:
+                            // signing in turns notifications on; this is the
+                            // switch, for the whole account.
+                            Checkbox {
+                                label: "Notifications",
+                                checked_fn: move || store.notifications_on.get(),
+                                onchange: move || crate::inbox::set_on(store, !untracked(|| store.notifications_on.get())),
+                            }
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                {NOTIFICATIONS_LINE}
                             }
 
                             Button {
@@ -4849,6 +4874,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
 
                         div { style: "flex: 1;", }
+
+                        // Notices not opened yet (docs/NOTIFICATIONS_CONTRACT.md
+                        // section 5); a click opens the Inbox.
+                        span {
+                            class: "pimble-status-bar__inbox",
+                            title: "Mentions and replies you have not opened. Click to open the Inbox.",
+                            style: {move || if crate::inbox::unread_count(store) == 0 { "display: none;" } else { "" }},
+                            onclick: move || crate::inbox::open_inbox(store),
+                            {move || match crate::inbox::unread_count(store) {
+                                1 => "1 new mention or reply".to_string(),
+                                n => format!("{n} new mentions and replies"),
+                            }}
+                        }
 
                         // The window's zoom while it is not actual size
                         // (docs/ZOOM_CONTRACT.md); a click goes back to it.

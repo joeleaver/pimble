@@ -1054,6 +1054,38 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             }
         }
 
+        BackendCommand::ListNotices => {
+            let c = ctx.host.as_ref()?;
+            match c.list_notices().await {
+                Ok(listed) => Some(BackendEvent::NoticesListed { notices: listed.notices, on: listed.on }),
+                Err(e) => {
+                    tracing::debug!("notices not listed: {e}");
+                    None
+                }
+            }
+        }
+
+        BackendCommand::AcknowledgeNotices { ids } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.acknowledge_notices(ids).await {
+                tracing::debug!("notices not acknowledged: {e}");
+            }
+            None
+        }
+
+        BackendCommand::SetNotifications { on } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });
+            };
+            if let Err(e) = c.set_notifications(on).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() });
+            }
+            match c.list_notices().await {
+                Ok(listed) => Some(BackendEvent::NoticesListed { notices: listed.notices, on: listed.on }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() }),
+            }
+        }
+
         BackendCommand::CloudHostStore { store_id } => {
             let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::HostStore, message: "Not connected".into() });

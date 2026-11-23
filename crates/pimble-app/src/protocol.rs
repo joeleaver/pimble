@@ -338,6 +338,15 @@ pub enum BackendCommand {
     CloudSignIn { url: String, email: String, password: String },
     /// Forget the signed-in account (`CloudStatusChanged` with `signed_in: false`).
     CloudSignOut,
+    /// The notices this device has received, and whether notifications are
+    /// on (docs/NOTIFICATIONS_CONTRACT.md section 5). Answers `NoticesListed`.
+    ListNotices,
+    /// The person opened these notices: acknowledged to the accounts
+    /// service. Answers nothing.
+    AcknowledgeNotices { ids: Vec<String> },
+    /// Notifications on or off for the account (section 6). Answers
+    /// `NoticesListed`, or `CloudError { op: Notifications }`.
+    SetNotifications { on: bool },
     /// Host a local store's encrypted twin on Pimble Cloud (`CloudStoreHosted`).
     CloudHostStore { store_id: StoreId },
     /// Every store the signed-in account has a grant on (`CloudHostedStoresListed`).
@@ -463,6 +472,8 @@ pub enum CloudOp {
     StopSharing,
     /// The Shares dialog: listing shares, setting a name.
     Shares,
+    /// The notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
+    Notifications,
 }
 
 /// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
@@ -741,6 +752,12 @@ pub enum BackendEvent {
     /// the server whenever it changes; `None` while signed out (desktop only:
     /// the browser's connection is to Pimble Cloud itself).
     CloudConnectionChanged { connection: Option<pimble_rpc::CloudConnection> },
+    /// A notice arrived: someone mentioned this person, or answered them
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 4), heard from the server.
+    NoticeReceived { notice: pimble_rpc::Notice },
+    /// The notices this device keeps, newest first, and whether
+    /// notifications are on (`ListNotices`, `SetNotifications`).
+    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool },
     /// A `pimble:` link this computer was asked to open, handed to this window
     /// by the server (`openInApp`; desktop only), with the activation token
     /// the program that was asked came with, to come to the front with.

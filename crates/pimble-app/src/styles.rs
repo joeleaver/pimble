@@ -1634,6 +1634,71 @@ pub(crate) const APP_CSS: &str = "
     overflow: auto;
 }
 
+/* View > Inbox: mentions and replies (docs/NOTIFICATIONS_CONTRACT.md section 5). */
+.pimble-inbox {
+    max-height: 40vh;
+    overflow: auto;
+    margin-bottom: 12px;
+}
+
+.pimble-inbox__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.pimble-inbox__heading {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--rinch-color-dimmed);
+    padding: 6px 12px 4px;
+}
+
+.pimble-inbox__row {
+    padding: 8px 12px;
+    border-top: 1px solid var(--rinch-color-border);
+    cursor: pointer;
+}
+
+.pimble-inbox__row:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-inbox__row--unread .pimble-inbox__title {
+    font-weight: 600;
+}
+
+.pimble-inbox__row--unread .pimble-inbox__title::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--rinch-primary-color);
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+.pimble-inbox__title {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 14px;
+}
+
+.pimble-inbox__when,
+.pimble-inbox__where {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-inbox__snippet {
+    font-size: 13px;
+    margin-top: 2px;
+}
+
 .pimble-tree-discussions__unread {
     width: 6px;
     height: 6px;
@@ -4205,6 +4270,18 @@ pub(crate) const APP_CSS: &str = "
 
 /* Restart to update (docs/UPDATE_CONTRACT.md): the one thing on the bar that
    asks for a click, so in the accent. */
+.pimble-status-bar__inbox {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--rinch-primary-color-6);
+    cursor: pointer;
+    margin-right: 8px;
+}
+
+.pimble-status-bar__inbox:hover {
+    text-decoration: underline;
+}
+
 .pimble-status-bar__update {
     font-size: 11px;
     color: var(--rinch-primary-color-6);
