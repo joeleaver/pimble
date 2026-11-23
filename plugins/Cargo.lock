@@ -530,6 +530,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1502,7 +1508,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pimble-api"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1521,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-board"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -1539,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1553,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1570,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1590,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-discussion"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -1601,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-abi"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64 0.22.1",
  "pimble-api",
@@ -1632,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1654,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc-macros"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1664,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-sheet"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1677,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-ui"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "pimble-core",
  "rinch",
@@ -1910,7 +1916,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "js-sys",
  "log",
@@ -1919,6 +1925,7 @@ dependencies = [
  "rinch-core",
  "rinch-macros",
  "rinch-platform",
+ "rinch-spell",
  "rinch-theme",
  "tracing",
  "wasm-bindgen",
@@ -1929,7 +1936,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -1941,7 +1948,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -1951,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -1961,7 +1968,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -1973,7 +1980,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1983,15 +1990,26 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "web-time",
 ]
 
 [[package]]
+name = "rinch-spell"
+version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+dependencies = [
+ "icu_normalizer",
+ "icu_properties",
+ "spellbook",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "heck",
  "rinch-core",
@@ -2003,12 +2021,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#63195d41cce5fb3b0f961390721559dadf6b5f6b"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
 dependencies = [
  "regex",
  "unicode-segmentation",
@@ -2346,6 +2364,16 @@ dependencies = [
  "log",
  "rand",
  "sha1",
+]
+
+[[package]]
+name = "spellbook"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
+dependencies = [
+ "foldhash",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
