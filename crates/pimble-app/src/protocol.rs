@@ -738,8 +738,9 @@ pub enum BackendEvent {
     /// the browser's connection is to Pimble Cloud itself).
     CloudConnectionChanged { connection: Option<pimble_rpc::CloudConnection> },
     /// A `pimble:` link this computer was asked to open, handed to this window
-    /// by the server (`openInApp`; desktop only).
-    AppLink { url: String },
+    /// by the server (`openInApp`; desktop only), with the activation token
+    /// the program that was asked came with, to come to the front with.
+    AppLink { url: String, activation_token: Option<String> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.
     CloudError { op: CloudOp, message: String },

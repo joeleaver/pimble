@@ -1127,17 +1127,18 @@ impl PimbleClient {
             .map_err(rpc_error)
     }
 
-    /// Hand a `pimble:` link to a Pimble window on this server; `false` when
+    /// Hand a `pimble:` link to a Pimble window on this server, with the
+    /// activation token this program was started with, if any; `false` when
     /// no window listens.
-    pub async fn open_in_app(&self, url: &str) -> Result<bool> {
-        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string() }).await.map_err(rpc_error)?;
+    pub async fn open_in_app(&self, url: &str, activation_token: Option<String>) -> Result<bool> {
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token }).await.map_err(rpc_error)?;
         Ok(response.delivered)
     }
 
     /// As a Pimble window: hear the links `openInApp` hands this one.
-    pub async fn subscribe_app_links(&self) -> Result<jsonrpsee::core::client::Subscription<String>> {
+    pub async fn subscribe_app_links(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::HandedLink>> {
         self.client
-            .subscribe::<String, _>("pimble_subscribeAppLinks", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeAppLinks")
+            .subscribe::<pimble_rpc::HandedLink, _>("pimble_subscribeAppLinks", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeAppLinks")
             .await
             .map_err(rpc_error)
     }

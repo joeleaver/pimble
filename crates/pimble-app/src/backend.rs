@@ -180,9 +180,9 @@ impl Local {
                     return;
                 }
             };
-            while let Some(Ok(url)) = sub.next().await {
+            while let Some(Ok(link)) = sub.next().await {
                 let Some(me) = me.upgrade() else { return };
-                me.emit(BackendEvent::AppLink { url });
+                me.emit(BackendEvent::AppLink { url: link.url, activation_token: link.activation_token });
             }
         });
     }

@@ -74,6 +74,15 @@ fn attach_parent_console() {
 fn attach_parent_console() {}
 
 fn main() {
+    // The activation token the desktop started this program with (Wayland's
+    // `XDG_ACTIVATION_TOKEN`, set by the click on a `pimble:` link): taken
+    // before anything else runs, since taking it changes the environment, and
+    // so that nothing this program starts inherits it. It goes with the link
+    // to the Pimble already open, which comes to the front with it, or to
+    // this program's own first window (rinch #2880).
+    // SAFETY: first thing in `main`; no other thread exists yet.
+    let activation_token = unsafe { rinch::prelude::take_launch_activation_token() };
+
     // Anything but a lone `pimble:` link may print (an install, the usage, an
     // argument refused).
     if std::env::args().skip(1).any(|a| !a.starts_with("pimble:")) {
@@ -102,7 +111,7 @@ fn main() {
     // one is, and this process stops there.
     let (links, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.starts_with("pimble:"));
     if let Some(link) = links.into_iter().next() {
-        if hand_to_open_window(&link) {
+        if hand_to_open_window(&link, activation_token.clone()) {
             return;
         }
         pimble_app::links::set_launch_link(link);
@@ -143,18 +152,19 @@ fn main() {
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
-    pimble_app::app::run(renderer);
+    pimble_app::app::run(renderer, activation_token);
     pimble_server::diagnostics::quit();
 }
 
-/// Hand `link` to a Pimble window on this computer's server; whether one took
-/// it. No server, an older one, or no window listening: `false`.
-fn hand_to_open_window(link: &str) -> bool {
+/// Hand `link`, with the activation token this program was started with, to
+/// a Pimble window on this computer's server; whether one took it. No server,
+/// an older one, or no window listening: `false`.
+fn hand_to_open_window(link: &str, activation_token: Option<String>) -> bool {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return false };
     runtime.block_on(async {
         let asked = async {
             let client = pimble_client::PimbleClient::connect(pimble_server::local::server_url()).await.ok()?;
-            client.open_in_app(link).await.ok()
+            client.open_in_app(link, activation_token).await.ok()
         };
         matches!(tokio::time::timeout(std::time::Duration::from_secs(3), asked).await, Ok(Some(true)))
     })

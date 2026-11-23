@@ -53,6 +53,7 @@ use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
+    HandedLink,
     OpenInAppRequest, OpenInAppResponse,
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
@@ -1287,7 +1288,7 @@ pub struct RpcHandler {
     /// watch (`RelayHost::watch_tunnel`). `subscribeCloudConnection` hears both.
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The Pimble windows hearing `openInApp`, oldest first.
-    app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<HandedLink>>>>,
     /// Which pictures each document names, per its state vector
     /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
     pictures: Arc<crate::pictures::PictureRefs>,
@@ -4226,7 +4227,8 @@ impl PimbleApiServer for RpcHandler {
         let mut windows = self.app_links.lock().unwrap_or_else(|e| e.into_inner());
         // The oldest window still listening takes it; gone ones are dropped.
         windows.retain(|w| !w.is_closed());
-        let delivered = windows.iter().any(|w| w.send(request.url.clone()).is_ok());
+        let link = HandedLink { url: request.url, activation_token: request.activation_token };
+        let delivered = windows.iter().any(|w| w.send(link.clone()).is_ok());
         info!("openInApp: {}", if delivered { "handed to a window" } else { "no window is listening" });
         Ok(OpenInAppResponse { delivered })
     }
@@ -4237,14 +4239,14 @@ impl PimbleApiServer for RpcHandler {
             return Ok(());
         }
         let sink = pending.accept().await?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HandedLink>();
         self.app_links.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
         self.runtime.spawn(async move {
             loop {
                 tokio::select! {
-                    url = rx.recv() => {
-                        let Some(url) = url else { break };
-                        let Ok(msg) = SubscriptionMessage::from_json(&url) else { break };
+                    link = rx.recv() => {
+                        let Some(link) = link else { break };
+                        let Ok(msg) = SubscriptionMessage::from_json(&link) else { break };
                         if sink.send(msg).await.is_err() {
                             break;
                         }
