@@ -15,13 +15,13 @@
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <!-- The browser's own Pimble server (docs/ONE_CODEBASE_CONTRACT.md wave 4,
          the default; ?server=old for the old path until wave 5): the hub that elects the leader tab, and the
-         worker it starts, built from crates/pimble-worker with its `entry`
+         worker it starts, built from crates/pimble-worker (through web/worker) with its `entry`
          feature; build/post_build.sh renames its files by their contents and
          names the loader in the meta tag below. -->
-    <meta name="pimble-worker-loader" content="pimble-worker_loader.js">
+    <meta name="pimble-worker-loader" content="pimble-web-worker_loader.js">
     <script data-trunk src="hub.js"></script>
-    <link data-trunk rel="rust" href="../crates/pimble-worker/Cargo.toml" data-type="worker"
-          data-bindgen-target="no-modules" data-loader-shim data-cargo-features="entry"
+    <link data-trunk rel="rust" href="worker/Cargo.toml" data-type="worker"
+          data-bindgen-target="no-modules" data-loader-shim 
           data-cargo-profile-release="worker" data-wasm-opt="z" />
 </head>
 <body></body>
