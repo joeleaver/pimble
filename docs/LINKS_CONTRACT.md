@@ -268,7 +268,7 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    command) continues from there. A loop or more than `MAX_LINK_HOPS` (8) is `Missing`.
    The vault client's half is `resolve_in` (`web/src/vault.rs`), by the same rules; the
    app's is `BackendCommand::ResolveLink { url, hops }` -> `LinkResolved`, and
-   `follow_resolution` (`events.rs`) opens a live node through `AppStore::link_open`
+   `follow_resolution` (`events/links.rs`) opens a live node through `AppStore::link_open`
    (`open_node`, with the anchor waiting in `pending_anchor`), asks again when the chain
    stopped in another store the app holds, or shows the sentence. Built 2026-09-23.
 4. The PM's walk-through: both apps, a link across stores, across a mount, into a share a

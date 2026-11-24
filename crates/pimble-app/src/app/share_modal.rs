@@ -104,7 +104,7 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     // looking at the share they are in gets a third, read only
     // (`AppStore::share_modal_manages` decides). Every outcome
     // arrives as `CloudShareUpdated`, `CloudSharingStopped` or
-    // `CloudError { op }`, so `events.rs` fills the busy and error lines
+    // `CloudError { op }`, so `events/cloud.rs` fills the busy and error lines
     // without guessing which request answered (the Account modal's rule,
     // decision 3).
     //
@@ -447,7 +447,7 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                 // the owner's devices are handing over) is not this
                 // device's to report. The list is a courtesy: when it
                 // cannot be loaded the sentence stands alone, with no
-                // error line (`events.rs`, `CloudOp::ShareInfo`).
+                // error line (`events/cloud.rs`, `CloudOp::ShareInfo`).
                 if store.share_modal_face() == ShareFace::Member {
                     div {
                         style: "display: flex; flex-direction: column; gap: 10px;",

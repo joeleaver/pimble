@@ -123,7 +123,7 @@ pub hosted_modal_error: Signal<String>,
 `CloudHostedStoreInfo` is `Clone` but not `PartialEq`; if a reactive `for` needs it,
 resolve rows to a local `PartialEq` struct as `search_rows` does.
 
-## Events (`crates/pimble-app/src/events.rs`)
+## Events (`crates/pimble-app/src/events/cloud.rs`)
 
 - `CloudStatusChanged`: set the three `cloud_*` signals. If the account modal is busy
   (a sign-in or sign-out just answered): busy false, error empty, password cleared; on a

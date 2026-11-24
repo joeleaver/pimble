@@ -7,7 +7,7 @@ use super::*;
 thread_local! {
     /// The tree value (with any mount-path suffix, decision 7) of the last
     /// drag-and-drop target, set by `app.rs`'s `on_drop` right before sending
-    /// `MoveNode` and consumed once by the `NodeMoved` handler in `events.rs`
+    /// `MoveNode` and consumed once by the `NodeMoved` handler in `events/nodes.rs`
     /// to auto-expand exactly the place the user dropped into, rather than
     /// reconstructing an unqualified value that would not match a target
     /// reached only through a mount.

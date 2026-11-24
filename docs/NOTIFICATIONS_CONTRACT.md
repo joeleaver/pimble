@@ -935,7 +935,7 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
 - `crates/pimble-app/src/inbox.rs:133`: the OS notification is gated on
   `notifies_here()` (:162 native `instance::is_primary()`, :167 the browser always); a
   notice not shown is held back (:137); `took_over` (:146).
-- `crates/pimble-app/src/events.rs:1520`: `BackendEvent::AppLink` comes to the front,
+- `crates/pimble-app/src/events/mod.rs` (the dispatcher): `BackendEvent::AppLink` comes to the front,
   opens the link, then sends `BackendCommand::AppLinkTaken`.
 - `crates/pimble-rpc/src/app_links.rs` (new, out of `types.rs`): `OpenInAppRequest.confirm`,
   `HandedLink.ack`, `AppLinkTakenRequest`, `APP_LINK_CONFIRM_WAIT_MS`;

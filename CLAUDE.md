@@ -651,7 +651,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
 - `web/src/backend.rs` - the browser backend (token, connection, reconnect)
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
-- `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
+- `crates/pimble-app/src/events/` - `BackendEvent` -> UI state: `mod.rs` dispatches, a module per concern (`connection`, `stores`, `nodes`, `sync`, `cloud`, `view`, `links`)
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
 - `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties.rs` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter)
