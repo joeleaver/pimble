@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "kanban-viewer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pimble-plugin-sdk",
  "serde_json",
@@ -1508,7 +1508,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pimble-api"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-board"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-discussion"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "pimble-core",
  "pimble-crdt",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-abi"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "base64 0.22.1",
  "pimble-api",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc-macros"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-sheet"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-ui"
-version = "0.30.1"
+version = "0.30.2"
 dependencies = [
  "pimble-core",
  "rinch",
