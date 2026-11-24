@@ -427,7 +427,7 @@ target takes about 12 minutes to build.
   against a real `rhypedb-server` process (`~/dev/rhypedb/target/debug/rhypedb-server`) and
   skip when it is absent.
 - **App split.** `pimble-app` is a library: UI, state, events, editor wiring,
-  `protocol/` (`BackendCommand`/`BackendEvent`), `commands.rs` (the adapter onto
+  `protocol/` (`BackendCommand`/`BackendEvent`), `commands/` (the adapter onto
   `pimble_api::Pimble`, shared by both backends: `api_command` for every read and write of
   a store, `host_command` for the server operator's RPCs, `change_events` for what the API
   hears (the update for the views, the change, and `Shown` for the tree); docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
@@ -645,7 +645,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-app/src/app/` - the UI tree: `mod.rs` (`build_view`), `explorer.rs`, `tree_row.rs`, `explorer_menu.rs` (the tree, rename, drag-and-drop, the row menu), `shell.rs` (the page and status bar), `search.rs`, and the dialogs (`store_modals.rs`, `share_modal.rs`, `hosting.rs`, `account.rs`, ...)
 - `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
 - `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view/` - the split view: the tiling model, and the pane and divider slots
-- `crates/pimble-app/src/protocol/` - `BackendCommand` (`commands.rs`), `BackendEvent` (`events.rs`), `Asked`/`CloudOp` (`asked.rs`); `commands.rs` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
+- `crates/pimble-app/src/protocol/` - `BackendCommand` (`commands.rs`), `BackendEvent` (`events.rs`), `Asked`/`CloudOp` (`asked.rs`); `commands/` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
 - `crates/pimble-app/src/backend.rs` - desktop background thread, the API over RPC, and `Local` (the connection: join or start the embedded server, reconnect) (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema

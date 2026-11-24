@@ -18,7 +18,7 @@ app does, the way the app does it. Today there is no such "way": there are three
 ### Three layers, none of them "the API"
 
 1. **RPC** (`pimble-rpc`, 75 methods, `PimbleClient` a thin typed wrapper). Authorization,
-   notifications and `applyEdit` live here. Used by the app (through `commands.rs`), the
+   notifications and `applyEdit` live here. Used by the app (through `commands/`), the
    MCP, the CLI and the sync and vault links.
 2. **Document libraries** (`NodeDoc`, `Tree`, `markdown`, `pimble-board`, `pimble-sheet`,
    `pimble-discussion`). Pure and shared. In good shape.
@@ -317,7 +317,7 @@ API's held documents and change stream; `DocSession` replaces the five session c
 deleted. Error routing uses answers, not modal flags.
 
 Built 2026-11-02 (part; what is left is listed at the end). **The backend loop is over
-`Pimble`.** `crates/pimble-app/src/commands.rs` is the adapter: `api_command` answers every
+`Pimble`.** `crates/pimble-app/src/commands/` is the adapter: `api_command` answers every
 command that reads or writes a store with `Pimble` calls (`node`, the new `listing`,
 `attachments`, the new `discussions`, `apply`, `edit`, `delete`, `undelete`,
 `list_deleted`, the new `reconcile`, `watch`, `search`, `put_blob`/`get_blob`, and

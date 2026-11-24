@@ -220,7 +220,7 @@ snippet instead. Removing an agent removes its entry the same way.
   (name, reach in a line, last used, Edit, Remove), New Agent (name, which app, the
   picker), and a made agent's page (its key once, "Add to <app>", the snippet, Copy
   Setup). Commands `ListAgents`/`CreateAgent`/`UpdateAgent`/`RemoveAgent`, events
-  `AgentsListed`/`AgentCreated`/`AgentsError` (shared `commands.rs`).
+  `AgentsListed`/`AgentCreated`/`AgentsError` (shared `commands/host.rs`).
 - The picker is the open stores' tree, loaded as rows open, with None / Read / Edit per
   row; a row nothing is chosen on says what it inherits ("reads, from above"). A store's
   root node stands for the whole store.

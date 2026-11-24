@@ -219,7 +219,7 @@ GetStoreSyncResponse { /* … */ pub access: StoreAccess }                      
 `pimble-app` `protocol/`: `BackendCommand::{CloudShareNode, CloudShareInfo, CloudShareInvite,
 CloudShareRemoveMember, CloudStopSharing}`, `BackendEvent::{CloudShareUpdated { store_id,
 node_id, share, members }, CloudSharingStopped { store_id, node_id }}`, `CloudOp::{Share,
-ShareInfo, ShareInvite, ShareRemoveMember, StopSharing}`, wired through `commands.rs` to
+ShareInfo, ShareInvite, ShareRemoveMember, StopSharing}`, wired through `commands/cloud.rs` to
 the client by the PM.
 
 ## Accounts service (agent C, `crates/pimble-cloud`)
