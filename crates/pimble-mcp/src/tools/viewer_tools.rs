@@ -117,21 +117,25 @@ fn provider(id: &str) -> Option<Provider> {
 /// What a file was when it was compiled: its length and modified time.
 type Stamp = (u64, Option<std::time::SystemTime>);
 
-/// Plugins compiled so far, for as long as this process runs.
-static COMPILED: Mutex<Option<std::collections::HashMap<PathBuf, (Stamp, pimble_plugin_host::wasmtime_engine::Plugin)>>> = Mutex::new(None);
+/// What each plugin file compiled to so far, for as long as this process
+/// runs: the plugin, or why it was refused. A refusal is kept too, so a file
+/// that faults or runs past its time while it describes itself is run once
+/// per version of it, not on every call that asks which plugin it is.
+type Compiled = Result<pimble_plugin_host::wasmtime_engine::Plugin, String>;
+static COMPILED: Mutex<Option<std::collections::HashMap<PathBuf, (Stamp, Compiled)>>> = Mutex::new(None);
 
 /// The plugin at `path`, compiled once for each version of the file.
-fn compiled(path: &std::path::Path) -> Result<pimble_plugin_host::wasmtime_engine::Plugin, String> {
+fn compiled(path: &std::path::Path) -> Compiled {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let stamp: Stamp = (meta.len(), meta.modified().ok());
-    if let Some((was, plugin)) = COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(path) {
+    if let Some((was, outcome)) = COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(path) {
         if *was == stamp {
-            return Ok(plugin.clone());
+            return outcome.clone();
         }
     }
-    let plugin = pimble_plugin_host::wasmtime_engine::load_file(path, pimble_plugin_host::wasmtime_engine::DEFAULT_BUDGET).map_err(|refused| refused.sentence)?;
-    COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.to_path_buf(), (stamp, plugin.clone()));
-    Ok(plugin)
+    let outcome = pimble_plugin_host::wasmtime_engine::load_file(path, pimble_plugin_host::wasmtime_engine::DEFAULT_BUDGET).map_err(|refused| refused.sentence);
+    COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.to_path_buf(), (stamp, outcome.clone()));
+    outcome
 }
 
 /// Compile the installed plugins that have tools in the background, so the
@@ -423,6 +427,24 @@ impl Pimble {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_file_is_compiled_once_per_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.wasm");
+        std::fs::write(&junk, b"not a module").unwrap();
+        let first = compiled(&junk).err().expect("refused");
+        let cached = COMPILED.lock().unwrap().as_ref().and_then(|c| c.get(&junk).map(|(_, outcome)| outcome.clone()));
+        assert_eq!(cached.map(|o| o.err()), Some(Some(first.clone())), "the refusal is kept");
+        assert_eq!(compiled(&junk).err().expect("refused"), first);
+        assert_eq!(plugin_id(&junk), "junk", "a refused file is known by its name");
+        // A new version of the file is judged again.
+        std::fs::write(&junk, b"still not a module, longer").unwrap();
+        let again = COMPILED.lock().unwrap().as_ref().and_then(|c| c.get(&junk).map(|(stamp, _)| *stamp));
+        compiled(&junk).err().expect("refused");
+        let now = COMPILED.lock().unwrap().as_ref().and_then(|c| c.get(&junk).map(|(stamp, _)| *stamp));
+        assert_ne!(again, now);
+    }
 
     #[test]
     fn a_viewer_reads_as_an_agent_needs_it() {
