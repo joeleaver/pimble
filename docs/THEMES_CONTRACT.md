@@ -5,8 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered (2026-11-24): decisions 1 to 12. Open: 8b (how
-the fonts ship).
+has answered them. All answered by Joe on 2026-11-24: decisions 1 to 12 and 8b.
+Ready to build, wave by wave (section 13).
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
@@ -373,7 +373,7 @@ the first proposal's six. The list (a proposal; add or cut freely):
 Each family names its own fallbacks by kind (serif, sans-serif, monospace), so text draws
 while a face is not yet loaded.
 
-How they ship (decision 8b, open): about thirty families at a few weights each is 20–40 MB,
+How they ship (decision 8b, decided by Joe 2026-11-24 as recommended): about thirty families at a few weights each is 20–40 MB,
 too much to put in every desktop binary and web bundle. *Recommendation:* a **core set is
 bundled** (Inter, Source Serif 4, EB Garamond, JetBrains Mono, Atkinson Hyperlegible:
 enough for every built-in theme), and the rest form a **font library** on pimble.app,
@@ -597,9 +597,12 @@ cut or add.
    Themes inherit from a base and set only what they change; "Customize..." is how one is
    made (section 3.1).
 8. **Fonts. Decided (Joe, 2026-11-24):** only Pimble's own list, no installed system fonts,
-   and a longer list than first proposed (section 5). **8b, open:** how they ship.
-   *Recommendation:* a core set bundled, the rest a signed font library on pimble.app,
-   fetched on first use and kept offline.
+   and a longer list than first proposed (section 5). **8b, decided the same day:** a core
+   set bundled, the rest a signed font library on pimble.app, fetched on first use and kept
+   offline. Joe is edging toward supporting fonts installed on the desktop some day ("but...
+   no, for now"); if that comes, it needs an answer for a shared theme naming a font other
+   devices lack (the family's fallback draws there, and the theme editor says which devices
+   will not see it), and it is a change to section 5 only.
 9. **"Update from original". Decided (Joe, 2026-11-24):** yes, an explicit one-time re-copy,
    never automatic, in a later wave (section 6).
 10. **Plugins. Decided (Joe, 2026-11-24, "for now"):** no ABI change (section 8); revisit
@@ -610,7 +613,7 @@ cut or add.
     hidden by their kind, each kind shown or hidden on its own from View > "Show Internal"
     (section 3.1a). No Themes folder.
 
-## 13. Waves (once the decisions are in)
+## 13. Waves
 
 1. **Tokens and drawing.** `pimble-themes` (tokens, types, checks, built-ins, CSS
    generation), `custom_keys::THEME`, resolution (chain, base), `document_theme.css`, the
