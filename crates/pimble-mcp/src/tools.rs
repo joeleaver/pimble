@@ -35,6 +35,9 @@ mod large_notes_tests;
 #[cfg(test)]
 mod presence_tests;
 mod sheet_tools;
+mod text_edit_tools;
+#[cfg(test)]
+mod text_edit_tests;
 mod viewer_tools;
 
 const INSTRUCTIONS: &str = "\
@@ -75,11 +78,17 @@ Keep a mention's href as get_node shows it (its ?m= is the mention's own id, so 
 does not mention anyone again); a new mention is written without one.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
-section), replace_section (the blocks under a heading; a heading is named as get_node's \
-section names one), replace_text (an exact quote inside \
+section), replace_section (the blocks under a heading), replace_text (an exact quote inside \
 one paragraph, plain text), replace_block (one block replaced, or removed with empty \
 Markdown: a heading removed or re-levelled), remove_section (a heading and everything under \
-it). A quote must appear exactly once in the node. For restructuring, replace_content \
+it). Name a block by `quote` (some of its text, matched as text: \"13\" is the characters 1 and \
+3, never block 13) or by `block_index` (its number, as get_node's outline and blocks print it); \
+a heading by `heading` (as get_node's section names one) or by `block_index`. A quote that \
+appears in several places is refused with every place listed; `occurrence` (1, 2, ... or \
+\"last\") picks one. Removing a block by a quote under 12 characters, or one that reads like a \
+number, is refused: use block_index. Every edit answers what it took out (the old text's first \
+120 characters), its block numbers and its neighbors; `dry_run: true` answers the same and \
+writes nothing. For restructuring, replace_content \
 rewrites the whole content but writes only the blocks that differ, and the node keeps its \
 link: never delete and recreate a note to restructure it. create_node takes the new node's \
 first content. Inline code cannot also be bold, italic, struck through or a link. Deleting is undoable \
@@ -202,7 +211,7 @@ impl Pimble {
             api: Arc::new(api),
             tool_backend: None,
             last_store: std::sync::Mutex::new(None),
-            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router() + Self::viewer_router(),
+            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router() + Self::viewer_router() + Self::text_edit_router(),
         }
     }
 
@@ -494,82 +503,6 @@ pub struct CreateNodeParams {
     /// The new node's content, as Markdown.
     #[serde(default)]
     pub markdown: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct AppendParams {
-    /// The node to append to.
-    pub node: String,
-    /// What to append, as Markdown.
-    pub markdown: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct InsertAfterParams {
-    /// The node to insert into.
-    pub node: String,
-    /// Text that appears in exactly one block of the node: the new content goes after
-    /// that block (a list item's text names its whole list).
-    pub after: String,
-    /// When `after` names a heading: go after the whole section under it instead
-    /// (`after` may then be a heading path, as get_node's `section` takes).
-    #[serde(default)]
-    pub after_section: bool,
-    /// What to insert, as Markdown.
-    pub markdown: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ReplaceSectionParams {
-    /// The node.
-    pub node: String,
-    /// The heading whose section is replaced (the heading itself stays): some of
-    /// its text, or a heading path such as "Design/Roads" for one inside another's
-    /// section, as get_node's `section` takes.
-    pub heading: String,
-    /// The section's new content, as Markdown.
-    pub markdown: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ReplaceTextParams {
-    /// The node.
-    pub node: String,
-    /// The exact text to replace, appearing exactly once in the node, inside one
-    /// paragraph (plain text: no Markdown syntax).
-    pub quote: String,
-    /// What replaces it (plain text; empty deletes the quote).
-    pub text: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ReplaceBlockParams {
-    /// The node.
-    pub node: String,
-    /// Text that appears in exactly one block (a heading, a paragraph, a list item's
-    /// text names its whole list).
-    pub block: String,
-    /// What replaces that block, as Markdown; empty removes it.
-    #[serde(default)]
-    pub markdown: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct RemoveSectionParams {
-    /// The node.
-    pub node: String,
-    /// The heading to remove, together with everything under it: some of its
-    /// text, or a heading path, as get_node's `section` takes.
-    pub heading: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ReplaceContentParams {
-    /// The node.
-    pub node: String,
-    /// The node's whole new content, as Markdown. Blocks that stay the same are left
-    /// untouched; empty clears the content.
-    pub markdown: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1059,60 +992,6 @@ impl Pimble {
         Ok(format!("Created {}", self.describe(addr).await))
     }
 
-    /// Append Markdown after the node's content.
-    #[tool(name = "append")]
-    async fn append(&self, Parameters(p): Parameters<AppendParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.append_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
-        Ok(format!("Appended to {}.", addr.link()))
-    }
-
-    /// Insert Markdown after the block a quote names, or after a heading's whole
-    /// section.
-    #[tool(name = "insert_after")]
-    async fn insert_after(&self, Parameters(p): Parameters<InsertAfterParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.insert_markdown_after(&p.after, p.after_section, &p.markdown).map(drop).map_err(crdt)).await?;
-        Ok(format!("Inserted into {}.", addr.link()))
-    }
-
-    /// Replace the blocks under a heading (up to the next heading of its level or
-    /// higher); the heading stays.
-    #[tool(name = "replace_section")]
-    async fn replace_section(&self, Parameters(p): Parameters<ReplaceSectionParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.replace_section_markdown(&p.heading, &p.markdown).map(drop).map_err(crdt)).await?;
-        Ok(format!("Replaced the section under \"{}\" in {}.", p.heading, addr.link()))
-    }
-
-    /// Replace an exact quote inside one paragraph with new text.
-    #[tool(name = "replace_text")]
-    async fn replace_text(&self, Parameters(p): Parameters<ReplaceTextParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.replace_text(&p.quote, &p.text).map(drop).map_err(crdt)).await?;
-        Ok(format!("Replaced the text in {}.", addr.link()))
-    }
-
-    /// Replace one block (a heading, a paragraph, a list, a code block) with
-    /// Markdown, or remove it with empty Markdown: removing or re-levelling a heading,
-    /// turning a paragraph into a list.
-    #[tool(name = "replace_block")]
-    async fn replace_block(&self, Parameters(p): Parameters<ReplaceBlockParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.replace_block_markdown(&p.block, &p.markdown).map(drop).map_err(crdt)).await?;
-        let did = if p.markdown.trim().is_empty() { "Removed" } else { "Replaced" };
-        Ok(format!("{did} the block in {}.", addr.link()))
-    }
-
-    /// Remove a heading and everything under it, up to the next heading of its level
-    /// or higher.
-    #[tool(name = "remove_section")]
-    async fn remove_section(&self, Parameters(p): Parameters<RemoveSectionParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.remove_section(&p.heading).map(drop).map_err(crdt)).await?;
-        Ok(format!("Removed the section \"{}\" from {}.", p.heading, addr.link()))
-    }
-
     /// Split a long text note by its headings of one level (the highest level
     /// it has, unless `level` says): each section becomes a child note named by
     /// its heading and holding what was under it, in order after the note's
@@ -1139,16 +1018,6 @@ impl Pimble {
             out.push_str(&format!("- {title} ({})\n", child.link()));
         }
         Ok(out)
-    }
-
-    /// Replace the node's whole content, for restructuring. Only what differs is
-    /// written: blocks that read the same stay untouched (and so does anyone typing in
-    /// them), and the node keeps its link. Prefer the smaller edits for small changes.
-    #[tool(name = "replace_content")]
-    async fn replace_content(&self, Parameters(p): Parameters<ReplaceContentParams>) -> Result<String, String> {
-        let addr = self.resolve(&p.node).await?;
-        self.edit(addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
-        Ok(format!("Replaced the content of {}.", addr.link()))
     }
 
     /// What a metanode shows (docs/METANODES_CONTRACT.md): its source's nodes as an

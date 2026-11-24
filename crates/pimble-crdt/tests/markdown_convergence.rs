@@ -2,6 +2,7 @@
 //! against a concurrent edit on another replica: merged both ways, the two replicas
 //! end identical, and an edit outside the other's range survives it.
 
+use pimble_crdt::markdown::{BlockTarget, MarkdownEdit};
 use pimble_crdt::{CrdtError, NodeDoc};
 
 /// Two replicas of one node whose content is `md`.
@@ -181,7 +182,13 @@ fn random_edit(doc: &mut NodeDoc, rng: &mut Rng, step: usize) {
         2 => doc.insert_markdown_after(quote, rng.next().is_multiple_of(2), &format!("new {text}")),
         3 => doc.replace_section_markdown(quote, &format!("- {text}\n- more")),
         4 => doc.replace_text(quote, ""),
-        5 => doc.replace_block_markdown(quote, if rng.next().is_multiple_of(2) { "" } else { "## Groceries" }),
+        // Removing a block goes by its number: the words above are too short
+        // to remove one by (`markdown::MIN_DELETE_QUOTE`).
+        5 if rng.next().is_multiple_of(2) => {
+            let block = BlockTarget::Index((rng.next() % 8) as usize);
+            doc.edit_markdown(MarkdownEdit::ReplaceBlock { block, markdown: "" }).map(|(delta, _)| delta)
+        }
+        5 => doc.replace_block_markdown(quote, "## Groceries"),
         6 => doc.remove_section(quote),
         7 => {
             let current = doc.markdown().unwrap_or_default();
