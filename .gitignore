@@ -33,6 +33,8 @@ Thumbs.db
 
 # Debug/temp files
 *.txt
+# Font licenses ship with the fonts (assets/fonts/<family>/OFL.txt).
+!assets/fonts/*/OFL.txt
 *.png
 !assets/brand/png/*.png
 !site/brand/*.png

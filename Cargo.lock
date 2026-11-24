@@ -5710,7 +5710,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-themes"
-version = "0.31.1"
+version = "0.31.3"
 dependencies = [
  "serde_json",
 ]
