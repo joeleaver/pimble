@@ -456,7 +456,7 @@ fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool {
     crate::sheets::node_loaded(store);
     // An inline discussion may be waiting for it, and a notice for its name.
     crate::discussions::node_loaded(store, store_id, node_id, content_bytes);
-    crate::inbox::node_loaded(store, store_id, node_id);
+    crate::notice_show::names_arrived(store, &[(store_id, node_id)]);
 
     // Every pane opened on this node.
     for pane in store.panes_showing(store_id, node_id) {
@@ -1509,6 +1509,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
             BackendEvent::NoticeReceived { notice } => {
                 crate::inbox::received(store, notice.clone());
+            }
+            BackendEvent::NotesNamed { names } => {
+                crate::inbox::named(store, names.clone());
             }
             BackendEvent::NoticesListed { notices, on, email, push, push_key, watches } => {
                 crate::inbox::listed(store, notices.clone(), *on);

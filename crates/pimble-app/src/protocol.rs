@@ -92,8 +92,8 @@ pub enum BackendCommand {
     SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
     /// The notes notices name, read from this device's documents for the
-    /// names they are shown under (`crate::inbox`): each answered as
-    /// `NodeLoaded`; one this device cannot read is skipped without a word.
+    /// names they are shown under (`crate::inbox`): answered with their
+    /// names alone (`NotesNamed`), never as nodes for the tree.
     NameNodes { nodes: Vec<(StoreId, NodeId)> },
     /// What this device may do in a store changed (a role, a read-only
     /// root), which no document says: the server's judgement of these nodes
@@ -788,6 +788,9 @@ pub enum BackendEvent {
     /// A notice arrived: someone mentioned this person, or answered them
     /// (docs/NOTIFICATIONS_CONTRACT.md section 4), heard from the server.
     NoticeReceived { notice: pimble_rpc::Notice },
+    /// The names `NameNodes` asked for, as the explorer would show them;
+    /// `None` for a note this device cannot read.
+    NotesNamed { names: Vec<((StoreId, NodeId), Option<String>)> },
     /// The notices this device keeps, newest first, and whether
     /// notifications are on (`ListNotices`, `SetNotifications`).
     NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String>, watches: bool },

@@ -244,13 +244,18 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
         },
 
         C::NameNodes { nodes } => {
+            let mut names = Vec::with_capacity(nodes.len());
             for (store_id, node_id) in nodes {
-                match api.node(Addr::new(store_id, node_id)).await {
-                    Ok(node) => ctx.emit(BackendEvent::NodeLoaded { store_id, node }),
-                    Err(e) => tracing::debug!("The note {node_id} a notice names is not read here: {}", error_message(&e)),
-                }
+                let name = match api.node(Addr::new(store_id, node_id)).await {
+                    Ok(node) => Some(crate::state::display_label_from_node(&node)),
+                    Err(e) => {
+                        tracing::debug!("The note {node_id} a notice names is not read here: {}", error_message(&e));
+                        None
+                    }
+                };
+                names.push(((store_id, node_id), name));
             }
-            None
+            Some(BackendEvent::NotesNamed { names })
         }
 
         C::LoadChildren { store_id, nodes } => {

@@ -948,6 +948,9 @@ pub struct AppStore {
     /// lists and the status bar counts (the unread ones, by the personal
     /// document).
     pub notices: Signal<Vec<pimble_rpc::Notice>>,
+    /// The names of the notes notices name that no view holds, as this
+    /// device read them for the Inbox (`NotesNamed`, `crate::inbox::named`).
+    pub notice_names: Signal<std::collections::HashMap<(StoreId, NodeId), String>>,
     /// Whether notifications are on for the account (section 6): the switch
     /// in the Account window and in Settings.
     pub notifications_on: Signal<bool>,
@@ -1244,6 +1247,7 @@ impl AppStore {
             read_version: Signal::new(0),
             personal_sync: Signal::new(crate::persistence::load_personal_sync()),
             notices: Signal::new(Vec::new()),
+            notice_names: Signal::new(std::collections::HashMap::new()),
             notifications_on: Signal::new(true),
             notify_email: Signal::new(true),
             notify_push: Signal::new(true),

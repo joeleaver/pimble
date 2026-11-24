@@ -1,8 +1,7 @@
 //! The Inbox (docs/NOTIFICATIONS_CONTRACT.md sections 4 to 6): the notices
 //! this person has received — mentions of them, replies to them and others'
 //! changes to notes they watch (`crate::watches`) — shown
-//! as they arrive in an operating-system notification (rinch's
-//! `notifications` on the desktop, the Notifications API in the browser),
+//! as they arrive in an operating-system notification (`crate::notice_show`),
 //! listed in View > "Inbox..." newest first with the unread on top, and
 //! counted in the status bar. Opening one opens the note at the mention (or
 //! the discussion), marks it read in the personal document so it clears on
@@ -30,45 +29,85 @@ pub fn title_of(notice: &Notice) -> String {
 }
 
 /// What the system's notification says under the title: the words around a
-/// mention or of a reply, or the name of the note a watch notice is about
-/// (the accounts service never knows it; this device's own documents do,
-/// read through the app's API: [`ask_for_names`]).
-fn body_of(store: AppStore, notice: &Notice) -> String {
+/// mention or of a reply, or where a watch notice's change is
+/// ([`where_of`]).
+pub(crate) fn body_of(store: AppStore, notice: &Notice) -> String {
     match notice.kind {
-        NoticeKind::Watch => untracked(|| name_of(store, notice.store, notice.node)).unwrap_or_else(|| UNNAMED_NOTE.to_string()),
+        NoticeKind::Watch => untracked(|| where_of(store, notice.kind, (notice.store, notice.node))).unwrap_or_default(),
         _ => notice.snippet.clone(),
     }
 }
 
-/// A watch notice's body when this device cannot read the note it names.
+/// Where a watch notice's change is when this device cannot read the note
+/// it names.
 const UNNAMED_NOTE: &str = "A note you watch";
 
-/// The name of a note a notice names, as the explorer shows it, when the
-/// app holds it; tracked, so the Inbox's line fills in when it arrives.
-fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Option<String> {
-    let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied())?;
-    Some(node.with(crate::state::display_label_from_node))
+/// Where a notice points, the one wording for the Inbox's line and the
+/// system's notification: the note's name (the accounts service never knows
+/// it; this device's own documents do, [`ask_for_names`]), or for a watch
+/// notice whose note this device cannot read, [`UNNAMED_NOTE`]; tracked.
+pub(crate) fn where_of(store: AppStore, kind: NoticeKind, (store_id, node_id): (StoreId, NodeId)) -> Option<String> {
+    name_of(store, store_id, node_id).or_else(|| (kind == NoticeKind::Watch).then(|| UNNAMED_NOTE.to_string()))
+}
+
+/// The name of a note a notice names, as the explorer shows it: from the
+/// note itself when a view holds it (so a rename shows), else as this
+/// device read it for the notice ([`named`]); tracked, so the Inbox's line
+/// fills in when it arrives.
+pub(crate) fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Option<String> {
+    if let Some(node) = store.node_data.with(|map| map.get(&(store_id, node_id)).copied()) {
+        return Some(node.with(crate::state::display_label_from_node));
+    }
+    store.notice_names.with(|names| names.get(&(store_id, node_id)).cloned())
+}
+
+thread_local! {
+    /// The notes whose names were asked for and not answered yet, so a
+    /// notice arriving meanwhile asks for none of them again.
+    static ASKING: std::cell::RefCell<std::collections::HashSet<(StoreId, NodeId)>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// The app holds only the notes some view showed. A notice can name any
 /// note of the person's stores (a watched note deep in a folder nobody
-/// opened, on a device that never showed it), so the ones it does not hold
-/// are read from this device's documents (`BackendCommand::NameNodes`, the
-/// shared command path on the desktop and in the browser); each arrives as
-/// `NodeLoaded`, which names it in the Inbox and lets a notification waiting
-/// for its name go ([`node_loaded`]).
+/// opened, on a device that never showed it), so the names of the ones it
+/// neither holds, nor has named, nor is asking for already are read from
+/// this device's documents (`BackendCommand::NameNodes`, the shared command
+/// path on the desktop and in the browser), answered as names alone
+/// (`NotesNamed`, [`named`]): nothing of the tree changes for them.
 fn ask_for_names(store: AppStore, notices: &[Notice]) {
-    let held = |key: &(StoreId, NodeId)| store.get_node_signal(key.0, key.1).is_some();
-    let nodes = unnamed(notices.iter().map(|n| (n.store, n.node)), held);
+    let known = |key: &(StoreId, NodeId)| {
+        untracked(|| name_of(store, key.0, key.1)).is_some() || ASKING.with(|asking| asking.borrow().contains(key))
+    };
+    let nodes = unnamed(notices.iter().map(|n| (n.store, n.node)), known);
     if !nodes.is_empty() {
+        ASKING.with(|asking| asking.borrow_mut().extend(nodes.iter().copied()));
         store.send(BackendCommand::NameNodes { nodes });
     }
 }
 
-/// The notes in `named`, once each, that `held` says the app does not hold.
-fn unnamed(named: impl Iterator<Item = (StoreId, NodeId)>, held: impl Fn(&(StoreId, NodeId)) -> bool) -> Vec<(StoreId, NodeId)> {
+/// The names `NameNodes` read (`None` for a note this device cannot read):
+/// the Inbox's lines fill in, and the notices waiting to say them go
+/// (`crate::notice_show::names_arrived`). One not read is asked again with
+/// the next listing (its store may be open by then).
+pub(crate) fn named(store: AppStore, names: Vec<((StoreId, NodeId), Option<String>)>) {
+    let notes: Vec<(StoreId, NodeId)> = names.iter().map(|(key, _)| *key).collect();
+    ASKING.with(|asking| {
+        let mut asking = asking.borrow_mut();
+        for key in &notes {
+            asking.remove(key);
+        }
+    });
+    let read: Vec<((StoreId, NodeId), String)> = names.into_iter().filter_map(|(key, name)| Some((key, name?))).collect();
+    if !read.is_empty() {
+        store.notice_names.update(|held| held.extend(read));
+    }
+    crate::notice_show::names_arrived(store, &notes);
+}
+
+/// The notes in `named`, once each, that `known` says are not named yet.
+fn unnamed(named: impl Iterator<Item = (StoreId, NodeId)>, known: impl Fn(&(StoreId, NodeId)) -> bool) -> Vec<(StoreId, NodeId)> {
     let mut seen = std::collections::HashSet::new();
-    named.filter(|key| !held(key) && seen.insert(*key)).collect()
+    named.filter(|key| !known(key) && seen.insert(*key)).collect()
 }
 
 /// What the status bar says of the notices not opened yet, worded for what
@@ -110,18 +149,20 @@ pub fn unread_count(store: AppStore) -> usize {
 /// The notices as the Inbox lists them: unread first, then newest first;
 /// tracked. Each with whether it was read, and apart, the time it came and
 /// the note it names, which the row's live labels keep for themselves.
-pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool, String, (StoreId, NodeId))> {
-    let mut rows: Vec<(Notice, bool, String, (StoreId, NodeId))> = store.notices.get().into_iter().map(|n| {
+pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool, String, (NoticeKind, (StoreId, NodeId)))> {
+    let mut rows: Vec<(Notice, bool, String, (NoticeKind, (StoreId, NodeId)))> = store.notices.get().into_iter().map(|n| {
         let read = is_read(store, &n);
-        let (at, place) = (n.at.clone(), (n.store, n.node));
+        let (at, place) = (n.at.clone(), (n.kind, (n.store, n.node)));
         (n, read, at, place)
     }).collect();
     rows.sort_by(|(a, a_read, ..), (b, b_read, ..)| a_read.cmp(b_read).then_with(|| b.at.cmp(&a.at)));
     rows
 }
 
-/// The server's list arrived (at connect, or after the switch).
+/// The server's list arrived (at connect, or after the switch). A name
+/// asked for on an earlier connection and never answered is asked again.
 pub(crate) fn listed(store: AppStore, notices: Vec<Notice>, on: bool) {
+    ASKING.with(|asking| asking.borrow_mut().clear());
     ask_for_names(store, &notices);
     store.notices.set(notices);
     store.notifications_on.set(on);
@@ -190,60 +231,11 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
     if untracked(|| is_read(store, &notice)) {
         return;
     }
-    if notifies_here() {
-        show(store, notice);
+    if crate::notice_show::notifies_here() {
+        crate::notice_show::show(store, notice);
     } else {
         #[cfg(feature = "native")]
         crate::shown_notices::held_back(&notice.id);
-    }
-}
-
-thread_local! {
-    /// Watch notices waiting for the name of their note before the system
-    /// shows them ([`ask_for_names`]).
-    static AWAITING_NAME: std::cell::RefCell<Vec<Notice>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// How long a watch notice waits for its note's name before it is shown
-/// without it.
-const NAME_WAIT_MS: u32 = 3000;
-
-/// Show `notice` as the system's notification: at once, or, for a watch
-/// notice whose note the app does not hold yet, when its name arrives
-/// ([`node_loaded`]) or the wait for it runs out. Every show then goes
-/// through `show_system_notification`, which on the desktop asks
-/// `crate::shown_notices` first, so none is shown twice.
-fn show(store: AppStore, notice: Notice) {
-    let named = notice.kind != NoticeKind::Watch || store.get_node_signal(notice.store, notice.node).is_some();
-    if named {
-        show_system_notification(store, &notice);
-        return;
-    }
-    let id = notice.id.clone();
-    AWAITING_NAME.with(|a| a.borrow_mut().push(notice));
-    rinch::core::reactive::unowned(|| {
-        let _ = set_timeout(NAME_WAIT_MS, move || {
-            for late in take_awaiting(|n| n.id == id) {
-                show_system_notification(store, &late);
-            }
-        });
-    });
-}
-
-fn take_awaiting(which: impl Fn(&Notice) -> bool) -> Vec<Notice> {
-    AWAITING_NAME.with(|a| {
-        let mut all = a.borrow_mut();
-        let (taken, kept): (Vec<Notice>, Vec<Notice>) = all.drain(..).partition(|n| which(n));
-        *all = kept;
-        taken
-    })
-}
-
-/// A note arrived in the app (`crate::events`, `take_node`): the watch
-/// notices waiting to say its name are shown now.
-pub(crate) fn node_loaded(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    for ready in take_awaiting(|n| n.store == store_id && n.node == node_id) {
-        show_system_notification(store, &ready);
     }
 }
 
@@ -257,24 +249,9 @@ pub(crate) fn took_over(store: AppStore) {
     let unread = |id: &str| held.iter().find(|n| n.id == id).is_some_and(|n| !untracked(|| is_read(store, n)));
     for id in crate::shown_notices::take_over(unread) {
         if let Some(notice) = held.iter().find(|n| n.id == id) {
-            show(store, notice.clone());
+            crate::notice_show::show(store, notice.clone());
         }
     }
-}
-
-/// Whether this process shows the system's notifications: on the desktop
-/// only the window process that owns the tray (`crate::instance`), so two
-/// windows never notify twice; a browser tab always (the browser itself
-/// files them per site). Every window keeps the notice in its Inbox all the
-/// same.
-#[cfg(feature = "native")]
-fn notifies_here() -> bool {
-    crate::instance::is_primary()
-}
-
-#[cfg(not(feature = "native"))]
-fn notifies_here() -> bool {
-    true
 }
 
 /// Open a notice: where it points, read everywhere, acknowledged.
@@ -330,59 +307,6 @@ pub(crate) fn open_inbox(store: AppStore) {
     store.send(BackendCommand::ListNotices);
     crate::discussions::open_unread(store);
 }
-
-// ── The system's notification ─────────────────────────────────────────────
-
-#[cfg(feature = "native")]
-fn show_system_notification(store: AppStore, notice: &Notice) {
-    // Asked and written down first, in one place: a notice another window
-    // (or this one) showed is not shown again, and a window taking the tray
-    // over never shows this one again.
-    if !crate::shown_notices::first_show(&notice.id) {
-        return;
-    }
-    let clicked = notice.clone();
-    let shown = rinch::notification::Notification::new(title_of(notice))
-        .body(body_of(store, notice))
-        .icon_png(include_bytes!("../../../assets/brand/png/pimble-256.png"))
-        .on_click(move || {
-            crate::desktop::bring_to_front(None);
-            open(store, &clicked);
-        })
-        .on_error(|e| tracing::info!("A notice was not shown by the system: {e:?}"))
-        .show();
-    if let Err(e) = shown {
-        tracing::info!("A notice was not shown by the system: {e:?}");
-    }
-}
-
-#[cfg(all(feature = "web", not(feature = "native")))]
-fn show_system_notification(store: AppStore, notice: &Notice) {
-    use wasm_bindgen::closure::Closure;
-    use wasm_bindgen::JsCast;
-    if web_sys::Notification::permission() != web_sys::NotificationPermission::Granted {
-        return;
-    }
-    let options = web_sys::NotificationOptions::new();
-    options.set_body(&body_of(store, notice));
-    options.set_tag(&notice.id);
-    options.set_icon("/app/pimble-icon.svg");
-    let Ok(shown) = web_sys::Notification::new_with_options(&title_of(notice), &options) else { return };
-    let clicked = notice.clone();
-    let shown_again = shown.clone();
-    let onclick = Closure::<dyn FnMut()>::new(move || {
-        if let Some(window) = web_sys::window() {
-            let _ = window.focus();
-        }
-        shown_again.close();
-        open(store, &clicked);
-    });
-    shown.set_onclick(Some(onclick.as_ref().unchecked_ref()));
-    onclick.forget();
-}
-
-#[cfg(not(any(feature = "native", feature = "web")))]
-fn show_system_notification(_store: AppStore, _notice: &Notice) {}
 
 /// The browser asks the person once whether Pimble may show notifications,
 /// from something they did (opening the Inbox, turning the switch on).
@@ -572,7 +496,7 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
                     }
                     div {
                         class: "pimble-inbox__where",
-                        {move || name_of(store, place.0, place.1).unwrap_or_default()}
+                        {move || where_of(store, place.0, place.1).unwrap_or_default()}
                         // A change in a note watched: stop watching it from
                         // here (its own watch, or the subtree watch above).
                         if notice.kind == NoticeKind::Watch && crate::watches::can_watch(store) {
@@ -635,6 +559,49 @@ mod tests {
         let (s, held, missing) = (StoreId::new(), NodeId::new(), NodeId::new());
         let asked = unnamed([(s, held), (s, missing), (s, missing)].into_iter(), |key| key.1 == held);
         assert_eq!(asked, vec![(s, missing)]);
+    }
+
+    /// A store whose commands this test reads.
+    fn store_and_commands() -> (AppStore, crossbeam_channel::Receiver<BackendCommand>) {
+        let store = AppStore::new();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<BackendCommand>(16);
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(1);
+        store.backend.set(Some(crate::protocol::BackendHandle { cmd_tx, event_rx }));
+        (store, cmd_rx)
+    }
+
+    fn asked(commands: &crossbeam_channel::Receiver<BackendCommand>) -> Vec<Vec<(StoreId, NodeId)>> {
+        commands.try_iter().filter_map(|c| match c { BackendCommand::NameNodes { nodes } => Some(nodes), _ => None }).collect()
+    }
+
+    /// A name is asked for once: not again while it is asked, nor on a
+    /// reconnect once it came; it arrives as a name alone, which the Inbox
+    /// and the system's notification both say, and the tree does not move.
+    /// A note this device cannot read is said the same way in both, and
+    /// asked again with the next listing.
+    #[test]
+    fn names_are_asked_for_once_and_answered_without_the_tree() {
+        let (store, commands) = store_and_commands();
+        let watched = notice(NoticeKind::Watch, None, "");
+        let unreadable = Notice { id: "m".into(), node: NodeId::new(), ..notice(NoticeKind::Watch, None, "") };
+        let (here, there) = ((watched.store, watched.node), (unreadable.store, unreadable.node));
+        listed(store, vec![watched.clone(), unreadable.clone()], true);
+        assert_eq!(asked(&commands), vec![vec![here, there]]);
+        ask_for_names(store, std::slice::from_ref(&watched));
+        assert!(asked(&commands).is_empty(), "asked already");
+
+        let tree = untracked(|| store.tree_structure_version.get());
+        named(store, vec![(here, Some("Garden plan".into())), (there, None)]);
+        assert_eq!(untracked(|| store.tree_structure_version.get()), tree, "the tree is not touched");
+        assert!(store.get_node_signal(here.0, here.1).is_none(), "no node is taken for it");
+        assert_eq!(untracked(|| where_of(store, NoticeKind::Watch, here)).as_deref(), Some("Garden plan"));
+        assert_eq!(body_of(store, &watched), "Garden plan");
+        assert_eq!(untracked(|| where_of(store, NoticeKind::Watch, there)).as_deref(), Some(UNNAMED_NOTE), "the Inbox's line");
+        assert_eq!(body_of(store, &unreadable), UNNAMED_NOTE, "and the system's notification, alike");
+        assert_eq!(untracked(|| where_of(store, NoticeKind::Mention, there)), None, "a mention says its words instead");
+
+        listed(store, vec![watched, unreadable], true);
+        assert_eq!(asked(&commands), vec![vec![there]], "a reconnect asks only for what was not named");
     }
 
     #[test]

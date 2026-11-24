@@ -597,7 +597,10 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   following and per store as they change (documents registered, the watches switch, and
   every grant change: one made, a role or scope changed, one removed, a store deleted or
   revived, an account deleted). A store whose watched notes cannot be read is read again
-  with backoff (1 s doubling to a minute), not at once. The server tells nothing else, so the service never hears of a write to a
+  with backoff (1 s doubling to a minute), not at once, at a deadline set when it starts
+  waiting: the writes that keep arriving meanwhile never put it off (until 2026-11-23 the
+  follower's loop restarted the wait on every write, so under steady writing the store
+  was never read again). The server tells nothing else, so the service never hears of a write to a
   note nobody watches; it learns which documents are watched, never by whom. A relay face
   is the owner's own server and tells every write; the owner's posts are not filtered
   (filtering them would tell the owner's machine which of its documents others watch).
@@ -665,7 +668,15 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   took for 30 days (`RelayReport`, forgotten hourly) and answers one sent again
   `{ again: true }`, gathering nothing, so a report whose answer was lost (the app quit,
   the connection broke after the post) is not told twice. Reports are taken one at a
-  time (`relay_reports_lock`).
+  time (`relay_reports_lock`). The report is remembered after its writes are gathered,
+  so a report whose remembering failed is gathered again when it is sent again; each
+  batch holds the ids of the reports gathered into it (`WatchBatch.reports`, written in
+  the same query as the write), so none of their writes is gathered twice, even one whose
+  notice was queued in between: a pass takes such a batch's spells and keeps the row,
+  with no spells, until its reports are forgotten (30 days, hourly, with the reports). A
+  batch's `spells` are read as stored and never rebuilt from its first and last write
+  (that would lose its count); no batch without them exists, as `WatchBatch` never
+  shipped before them.
 - **Quitting loses no relay write.** At stop the relay face stops first, telling what it
   gathered and had not told yet, and then its reports are asked to stop: they keep all of
   it on disk and end, and are waited for, never aborted. A post under way is let go;
@@ -884,18 +895,27 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
     only the loopback names. `hold` (:76) and `resign` (:123) judge under one guard, so
     a lock the waiting thread takes after a resign is let go; `is_quitting` (:191).
   - `app_links.rs:91` `handed` (out of `events.rs`): a quitting window neither comes to
-    the front, opens the link, nor sends `appLinkTaken`; `backend.rs:209` drops the
-    link subscription when quitting, so the server hands the next link elsewhere.
+    the front, opens the link, nor sends `appLinkTaken`; `backend.rs` `pass_links` drops
+    the link subscription when quitting, so the server hands the next link elsewhere.
+    Both under test (`a_quitting_window_neither_opens_nor_confirms_a_handed_link`,
+    `a_quitting_window_stops_hearing_links`).
   - `inbox.rs:534` the Inbox's relative times tick each minute (`set_interval`, only
     the time labels read it, stopped with the Inbox).
   - `inbox.rs:60` `ask_for_names`: why the browser said "Untitled": both builds name a
     notice's note from `AppStore::node_data`, which holds only notes some view showed,
     and the desktop had shown the watched note while the browser had not. Every
     notice's note the app does not hold is now read from the device's own documents
-    through the shared command path (`BackendCommand::NameNodes`, `commands.rs:246`,
-    quiet when a note cannot be read), arriving as `NodeLoaded`; the Inbox's line is
-    reactive, and a watch notice's system notification waits up to 3 s for the name
-    (`inbox.rs:216` `show`, `:244` `node_loaded`), else says "A note you watch".
+    through the shared command path (`BackendCommand::NameNodes`, `commands.rs:246`),
+    answered with names alone (`BackendEvent::NotesNamed`, `None` for a note this
+    device cannot read, kept in `AppStore::notice_names`; nothing of the tree moves),
+    and asked for once: not again while asked, nor on a reconnect once named (a note
+    not read is asked again with the next listing). The Inbox's "where" line and the
+    system notification's body come from one place (`inbox.rs` `where_of`: the name,
+    or "A note you watch" for a watch notice whose note cannot be read here). A watch
+    notice's system notification waits up to 3 s for the name (`notice_show.rs`, out
+    of `inbox.rs`: `show`, `names_arrived`), shown once by whichever comes first, and
+    asks again when it goes (`still_shows`): a window that resigned the tray or is
+    quitting, or a notice read on another device during the wait, shows nothing.
   - `inbox.rs:76` `unread_line`: the status bar words the count for what it counts
     (mentions, replies, changes to notes you watch, or notices when mixed).
   - `notification_settings.rs` (new, out of `app.rs`, one component for the desktop's

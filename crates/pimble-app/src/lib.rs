@@ -37,6 +37,7 @@ pub mod events;
 pub mod fields;
 pub mod hashtags;
 pub mod inbox;
+mod notice_show;
 mod notification_settings;
 pub mod watches;
 pub mod import;

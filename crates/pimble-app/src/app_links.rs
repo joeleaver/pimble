@@ -89,7 +89,12 @@ pub fn open_app_link(store: crate::state::AppStore, text: &str) {
 /// that is quitting (`crate::instance::is_quitting`) does none of it, so the
 /// launch opens its own window rather than hand the link to one going away.
 pub(crate) fn handed(store: crate::state::AppStore, url: &str, activation_token: Option<&str>, ack: Option<u64>) {
-    if !takes_handed_links() {
+    handed_while(store, takes_handed_links(), url, activation_token, ack);
+}
+
+/// [`handed`], with whether this window takes links handed to it now.
+fn handed_while(store: crate::state::AppStore, takes: bool, url: &str, activation_token: Option<&str>, ack: Option<u64>) {
+    if !takes {
         tracing::info!("A link was handed to this window as it quits; the launch opens one of its own");
         return;
     }
@@ -130,7 +135,24 @@ pub(crate) fn take_launch_link() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::AppLink;
+    use crate::protocol::BackendCommand;
     use crate::settings::Section;
+    use rinch::prelude::*;
+
+    /// A window quitting takes nothing handed to it: it opens nothing and
+    /// says it took nothing, so the launch that handed the link opens a
+    /// window of its own.
+    #[test]
+    fn a_quitting_window_neither_opens_nor_confirms_a_handed_link() {
+        let store = crate::state::AppStore::new();
+        let (cmd_tx, commands) = crossbeam_channel::bounded::<BackendCommand>(4);
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(1);
+        store.backend.set(Some(crate::protocol::BackendHandle { cmd_tx, event_rx }));
+        let link = "pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f";
+        super::handed_while(store, false, link, Some("token"), Some(7));
+        assert!(commands.try_iter().next().is_none(), "no appLinkTaken, nothing asked");
+        assert!(untracked(|| store.link_open.get()).is_none(), "the link is not opened");
+    }
 
     #[test]
     fn settings_links_read_and_nothing_else_does() {
