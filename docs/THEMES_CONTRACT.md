@@ -342,8 +342,9 @@ What rinch gives today (read at `e8e04ccc`, paths under `crates/`):
   wrapper already carries per-pane state, and rules under it outrank the editor's
   `[data-pm-editor]` defaults.
 
-So the core needs **no rinch change**. Two general improvements are worth proposing
-upstream as PRs, neither naming a Pimble concept: `font-variant-caps: small-caps`
+So the core needs **no rinch change**. The four gaps are filed as joeleaver/rinch#3038
+(Joe, 2026-11-24: "a big deal"); tokens for small caps, drop caps and columns join
+section 2.1 when it lands. Of them, two matter most: `font-variant-caps: small-caps`
 (synthesized when the face has no `smcp`) in the desktop renderer, which would let
 headings use small caps; and `hyphens: auto` with a dictionary, which would make justified
 text good at any width. Until either lands, no token depends on it.
