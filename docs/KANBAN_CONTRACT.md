@@ -340,23 +340,43 @@ three lane sizes and folded columns, Done no taller than its row, and "Add card"
   hang above the board (Joe, 2026-11-05).
   A column folds by its name (in every lane) to a 44 px strip with its name turned on
   its side and its count; a click unfolds it.
-- **Done no taller than its row.** The last column's cell (where finished cards pile up,
-  open decision 5) is stretched to the row's tallest cell and its list scrolls inside it
-  (`position: absolute` in a stretched flex cell), so a long Done never makes its lane
-  taller.
+- **Columns grow with their cards** (2026-11-23, Joe's Done showed one card tall with a
+  tiny scrollbar): every cell is as tall as its cards, the row stretches the others to the
+  tallest, and the board scrolls. Only a minimized lane caps its cells (220 px of cards,
+  the rest scrolled inside the cell), and "show all" undoes it. The cap that replaced the
+  first cut's "Done no taller than its row" (the last column's list `position: absolute`
+  in its stretched cell) made a long Done a one-card window whenever the other columns
+  were short; it is gone.
+- **Every part of a cell takes a drop.** The cards' sortable list is the whole cell: it
+  carries the cell's padding and its foot itself (`cell_style`, `card_list_style`), so a
+  drag over the empty foot of a short column, the padding, or below the last card is over
+  the list and lands last. Before 2026-11-23 the list sat inside the padding and was only
+  as tall as its cards, so rinch's drag found no list there and offered no place, worst at
+  the bottom of a column.
 - **Add card on hover**: a small pill at the foot of a column's cell while the pointer is
-  over it (`onmouseenter`/`onmouseleave`, proxied by the host), not a line in every column.
+  over it (`onmouseenter`/`onmouseleave`, proxied by the host), not a line in every column;
+  hidden while a drag is on, so the foot is all drop.
 - A lane's row is drawn from the lane without its columns (rinch's `for` draws a row again
   when its item changes): its cells follow the board on their own, so an edit to one card
   redraws only its column's cell, never a card being dragged in another.
-- **Tests:** kanban-viewer 10 (`a_board_is_aligned_when_every_lane_has_the_same_columns`,
-  `the_look_is_remembered_as_json_and_read_back`); pimble-plugin-host kanban 5, updated
-  for the keyboard in place of "Move to", "Add card" on hover, and a drop into a mounted
-  column in place of its button.
+- **Tests:** kanban-viewer 12 (`a_board_is_aligned_when_every_lane_has_the_same_columns`,
+  `the_look_is_remembered_as_json_and_read_back`,
+  `a_column_grows_with_its_cards_unless_its_lane_is_minimized`); pimble-plugin-host kanban
+  6, updated for the keyboard in place of "Move to", "Add card" on hover, and a drop into a
+  mounted column in place of its button; `a_drop_in_the_foot_of_a_column_lands_last`
+  checks that the list is the cell's own and that a drop below every card lands last. The
+  mock DOM has no layout, so it cannot prove where a pointer falls on screen: the screen
+  check below is that proof.
 - **Checked in the release desktop app** (port 7473, scratch dirs): the shared header row
   over "Other cards" and Work; "Add card" on hover; Doing folded to a strip in both lanes;
-  Work collapsed to a bar; both still so after the app restarted; seven cards added to Done
-  from the CLI stayed inside a cell as tall as its row and scrolled there.
+  Work collapsed to a bar; both still so after the app restarted. Again on 2026-11-23
+  (installed release, port 7494, scratch dirs): Done with eight cards grows to all eight
+  and the other columns stretch to it; a card dropped in the empty foot of To do, at the
+  very bottom of Done, in the gap between Done's fourth and fifth cards and into an empty
+  Doing lands there; Done folds and unfolds; a minimized lane caps at about 262 px (220
+  of cards, padding and foot) and scrolls, and "Show every card" undoes it. Left for
+  rinch: the gap indicator shifts cards with a transform, so during a drag the tallest
+  column's last card is pushed past its cell's foot (the list does not grow by the gap).
 - **Not built:** the milestone party (petals every ten done; plugins cannot animate yet);
   assignee and tag filters; a folded column takes no drops; the browser was not tried.
 - **A mounted kanban from a store the plugin was not allowed** (Joe, 2026-11-04) showed as a

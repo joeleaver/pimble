@@ -357,6 +357,45 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     r.instance.unmount();
 }
 
+/// Joe, 2026-11-23: a drop below a column's last card, or in the empty foot
+/// of a column the row stretched, missed. The cards' list is the whole cell
+/// (its padding and foot are the list's own), so a drag over the cell
+/// anywhere but a card is a drag over the list, and with the pointer past
+/// every card it lands last.
+#[test]
+fn a_drop_in_the_foot_of_a_column_lands_last() {
+    if built_plugin("kanban_viewer").is_none() {
+        return;
+    }
+    let f = fixture("kanban");
+    let store = f.store;
+    let (_alpha, _bravo, charlie) = f.rt.block_on(async {
+        let a = f.service.create_node(store, Some(f.plan), "document", "Alpha").await.unwrap();
+        let b = f.service.create_node(store, Some(f.plan), "document", "Bravo").await.unwrap();
+        let c = f.service.create_node(store, Some(f.write), "document", "Charlie").await.unwrap();
+        (a, b, c)
+    });
+    let running = mount(&f, Approval { stores: Approved::All, write: true }, "kanban_viewer", "kanban");
+    let r = &running;
+    r.pump_until(&f, "the board", |r| r.text().contains("Charlie"));
+
+    let plan = cell(r, &key(store, f.plan));
+    let list = under(r, plan, "kanban__cards").expect("the Plan column's cards");
+    assert_eq!(r.doc.borrow().parent_node(list), Some(plan), "the list is the cell's own, not inside a box of it");
+
+    let card = sortable(r, &key(store, charlie));
+    fire(r, card, "data-ondragstart");
+    // Over the list itself, below both cards: no card under the pointer.
+    over(150.0, 600.0, 100.0, 60.0, 280.0, 560.0);
+    fire(r, list, "data-ondragover");
+    fire(r, card, "data-ondragmove");
+    fire(r, list, "data-ondrop");
+    fire(r, card, "data-ondragend");
+    r.pump_until(&f, "the drop in the foot", |_| children(&f, store, f.plan) == ["Alpha", "Bravo", "Charlie"]);
+    assert!(children(&f, store, f.write).is_empty());
+    r.instance.unmount();
+}
+
 fn lifted(r: &Running, card: DomId) -> bool {
     has_class(&r.doc.borrow(), card, "rinch-sortable__item--lifted")
 }
