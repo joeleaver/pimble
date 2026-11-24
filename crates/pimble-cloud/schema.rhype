@@ -334,8 +334,11 @@ type WatchedDoc {
 // is judged by the writes it falls between (`pimble_core::watch::Spells`);
 // `first_at` and `last_at` are the first and last of them. `root` is
 // the share the watcher was told through ("" for the whole store), checked
-// again when the notice is queued. Kept here, not in memory, so a deploy
-// loses none.
+// again when the notice is queued. `reports` is the relay reports gathered
+// into it, JSON `{ "<report id>": taken_ms }`, so a report sent again
+// gathers none of its writes twice; a batch a pass took while it names any
+// stays with no spells until they are forgotten (30 days). Kept here, not
+// in memory, so a deploy loses none.
 type WatchBatch {
     batch_key: String @unique
     watcher_uuid: String @indexed
@@ -347,6 +350,7 @@ type WatchBatch {
     spells: String
     first_at: DateTime
     last_at: DateTime
+    reports: String
 }
 
 // A relay report already taken (`POST /api/v1/watches/writes`'s `report`,

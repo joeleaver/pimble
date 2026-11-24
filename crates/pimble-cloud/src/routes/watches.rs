@@ -207,10 +207,11 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
         }
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let gathered = crate::watches::record_writes(&state, &store.store_id, &taken, now).await?;
-    // Remembered once gathered: a report that failed half way is gathered
-    // again when it is sent again, and a write gathered twice at the same
-    // moment adds no spell of editing.
+    let gathered = crate::watches::record_relay_writes(&state, &store.store_id, &report, &taken, now).await?;
+    // Remembered once gathered: a report that failed half way, or whose
+    // remembering failed, is gathered again when it is sent again, and each
+    // batch it reached already holds its id, so none of its writes is
+    // gathered twice, even one whose notice was queued meanwhile.
     state.db.remember_relay_report(&report, &store.store_id, now).await?;
     Ok(Json(json!({ "gathered": gathered, "refused": refused })))
 }

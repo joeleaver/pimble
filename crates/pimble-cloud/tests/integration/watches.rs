@@ -6,7 +6,7 @@
 
 use super::*;
 
-use pimble_cloud::watches::{all_interest, interest_of, record_writes, watch_pass};
+use pimble_cloud::watches::{all_interest, interest_of, record_relay_writes, record_writes, watch_pass};
 use pimble_core::watch::SPELL_GAP_MS;
 
 async fn put_json(stack: &Stack, cookie: &str, path: &str, body: Value) -> reqwest::Response {
@@ -374,6 +374,52 @@ async fn a_relay_report_is_taken_once_and_names_a_member_only_inside_their_share
     for id in &sent {
         assert!(!db.relay_report_taken(id).await.unwrap(), "{id} forgotten");
     }
+}
+
+/// A relay report gathered whose remembering then failed is sent again:
+/// none of its writes is gathered twice, not even one whose notice was
+/// queued in between, and the batch's record of it is forgotten with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_report_gathered_but_not_remembered_tells_its_writes_once() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, will_cookie, will_id, _hosted_id, _root, notice) = a_share_with_notice_keys(&stack, "watchresend").await;
+    let olga_id = uuid_of(&stack, "olga.watchresend@example.com").await;
+    let relayed = create_store_with_body(&stack, &olga_cookie, json!({ "name": "", "kind": "vault", "store_id": node_id(), "tier": "relay" })).await;
+    let relayed_id = relayed["store_id"].as_str().unwrap().to_string();
+    let garden = node_id();
+    let resp = put_member_with(&stack, &olga_cookie, &relayed_id, json!({ "email": "will.watchresend@example.com", "role": "editor", "root": garden, "name": "Garden" })).await;
+    assert_eq!(resp.status(), 200);
+    let doc = node_id();
+    assert_eq!(put_json(&stack, &will_cookie, &format!("/me/watches/stores/{relayed_id}"), json!({ "docs": [doc], "version": 0 })).await.status(), 200);
+    let state = &stack.app_state;
+    let report = node_id();
+    let olgas = pimble_cloud::watches::Write { last_ms: now_ms() - 20 * MIN, ..write(&doc, &olga_id, &[&garden]) };
+
+    // The first sending gathered it, and then remembering the report failed.
+    assert_eq!(record_relay_writes(state, &relayed_id, &report, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 1);
+    assert!(!state.db.relay_report_taken(&report).await.unwrap());
+    watch_pass(state, now_ms()).await.unwrap();
+    assert_eq!(watch_notices(&stack, &will_cookie, &notice, &will_id).await.len(), 1, "told");
+
+    // Sent again, directly and through the route: nothing more is gathered.
+    assert_eq!(record_relay_writes(state, &relayed_id, &report, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 0);
+    let body = json!({ "store_id": relayed_id, "report": report, "writes": [{ "doc": doc, "writer": olga_id, "roots": [garden], "last_ms": olgas.last_ms }] });
+    let resp = stack.http.post(format!("{}/watches/writes", stack.base_url)).header("Cookie", &olga_cookie).json(&body).send().await.unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 0 }));
+    assert!(state.db.relay_report_taken(&report).await.unwrap(), "remembered this time");
+    watch_pass(state, now_ms()).await.unwrap();
+    assert_eq!(watch_notices(&stack, &will_cookie, &notice, &will_id).await.len(), 1, "never told twice");
+
+    // The taken batch stays, with no spells, for as long as its report is
+    // remembered; another report's write is gathered into it as usual.
+    let batches = state.db.watch_batches_of(&will_id).await.unwrap();
+    assert_eq!((batches.len(), batches[0].count, batches[0].reports.contains_key(&report)), (1, 0, true));
+    let another = node_id();
+    assert_eq!(record_relay_writes(state, &relayed_id, &another, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 1);
+    assert_eq!(state.db.watch_batches_of(&will_id).await.unwrap()[0].count, 1);
+    state.db.forget_batch_reports_before(now_ms() + 1).await.unwrap();
+    let batch = &state.db.watch_batches_of(&will_id).await.unwrap()[0];
+    assert!(batch.reports.is_empty() && batch.count == 1, "the reports forgotten, the spell gathering kept");
 }
 
 /// A write told late, between two spells of editing gathered already and

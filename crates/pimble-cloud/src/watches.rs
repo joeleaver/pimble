@@ -169,6 +169,18 @@ pub async fn all_interest(state: &AppState) -> CloudResult<Vec<WriteInterest>> {
 /// Gather `writes` to `store_uuid` at `now_ms` for everyone watching them.
 /// Answers how many (watcher, write) pairs were gathered.
 pub async fn record_writes(state: &AppState, store_uuid: &str, writes: &[Write], now_ms: i64) -> CloudResult<usize> {
+    gather(state, store_uuid, writes, now_ms, None).await
+}
+
+/// [`record_writes`] for the relay report `report`: a write of it that a
+/// batch gathered already (an earlier sending that failed before the report
+/// was remembered) is not gathered again, even once its notice was queued
+/// (`WatchBatchRow::reports`).
+pub async fn record_relay_writes(state: &AppState, store_uuid: &str, report: &str, writes: &[Write], now_ms: i64) -> CloudResult<usize> {
+    gather(state, store_uuid, writes, now_ms, Some(report)).await
+}
+
+async fn gather(state: &AppState, store_uuid: &str, writes: &[Write], now_ms: i64, report: Option<&str>) -> CloudResult<usize> {
     let Some(store) = state.db.find_hosted_store(store_uuid).await? else { return Ok(0) };
     if store.deleted {
         return Ok(0);
@@ -188,8 +200,9 @@ pub async fn record_writes(state: &AppState, store_uuid: &str, writes: &[Write],
             let grants = state.db.grants_for_user_and_store(watcher.rid, store.rid).await?;
             let Some(root) = told_through(&grants, &reached) else { continue };
             let _one_at_a_time = state.watches_lock.lock().await;
-            state.db.gather_watch_write(&watcher.user_uuid, store_uuid, &write.doc, &write.writer, &root, at).await?;
-            gathered += 1;
+            if state.db.gather_watch_write(&watcher.user_uuid, store_uuid, &write.doc, &write.writer, &root, at, report.map(|r| (r, now_ms))).await? {
+                gathered += 1;
+            }
         }
     }
     Ok(gathered)
@@ -202,14 +215,15 @@ pub async fn record_writes(state: &AppState, store_uuid: &str, writes: &[Write],
 pub async fn watch_pass(state: &AppState, now_ms: i64) -> CloudResult<usize> {
     // Taken out under the lock a write is gathered under, so a write lands
     // in a batch before it is taken or in a new one after, never in one
-    // being taken. Gone before it is told, so a pass that fails half way
+    // being taken. Taken (gone, or left with no spells while it names relay
+    // reports) before it is told, so a pass that fails half way
     // never tells it twice.
     let due: Vec<WatchBatchRow> = {
         let _one_at_a_time = state.watches_lock.lock().await;
         let mut due = Vec::new();
         for batch in state.db.watch_batches().await? {
-            if batch.gathered().is_due(Window::NOTICE, now_ms) {
-                state.db.delete_watch_batch(batch.rid).await?;
+            if batch.gathered().is_some_and(|g| g.is_due(Window::NOTICE, now_ms)) {
+                state.db.take_watch_batch(&batch).await?;
                 due.push(batch);
             }
         }
@@ -326,7 +340,7 @@ async fn follow_hosted_writes(state: AppState) {
 /// and the hosted server told what is watched (so the connection was good).
 async fn follow(state: &AppState, client: &pimble_client::PimbleClient) -> bool {
     // Following first, so no write between the two is missed.
-    let mut writes = match client.subscribe_writes().await {
+    let writes = match client.subscribe_writes().await {
         Ok(writes) => writes,
         Err(e) => {
             tracing::warn!(error = %e, "the hosted server's writes could not be followed");
@@ -343,34 +357,86 @@ async fn follow(state: &AppState, client: &pimble_client::PimbleClient) -> bool 
         tracing::warn!(error = %e, "the hosted server could not be told which notes are watched");
         return false;
     }
+    follow_writes(&Hosted { state, client }, writes, &state.watch_interest).await
+}
+
+/// What [`follow_writes`] does with what it hears, apart from the loop
+/// itself: the hosted server and the database ([`Hosted`]), or a test's.
+trait Following {
+    /// Gather a write the hosted server told.
+    async fn record(&self, seen: pimble_rpc::WriteSeen);
+    /// What is watched in `store` now ([`interest_of`]).
+    async fn interest(&self, store: &str) -> CloudResult<Option<WriteInterest>>;
+    /// Tell the hosted server `stores`; whether it was told.
+    async fn tell(&self, stores: Vec<WriteInterest>) -> bool;
+}
+
+struct Hosted<'a> {
+    state: &'a AppState,
+    client: &'a pimble_client::PimbleClient,
+}
+
+impl Following for Hosted<'_> {
+    async fn record(&self, seen: pimble_rpc::WriteSeen) {
+        let write = Write {
+            doc: seen.doc_id.to_string(),
+            writer: seen.writer,
+            count: u64::from(seen.count),
+            roots: seen.roots.iter().map(|r| r.to_string()).collect(),
+            last_ms: seen.last_ms,
+        };
+        if let Err(e) = record_writes(self.state, &seen.store_id.to_string(), &[write], chrono::Utc::now().timestamp_millis()).await {
+            tracing::warn!(error = %e, "a write was not gathered for watches");
+        }
+    }
+
+    async fn interest(&self, store: &str) -> CloudResult<Option<WriteInterest>> {
+        interest_of(self.state, store).await
+    }
+
+    async fn tell(&self, stores: Vec<WriteInterest>) -> bool {
+        match self.client.set_write_interest(SetWriteInterestRequest { stores, whole: false }).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "the hosted server could not be told which notes are watched");
+                false
+            }
+        }
+    }
+}
+
+/// Follow `writes` until they end, telling the hosted server of each store
+/// whose watches change (`changes`). A store whose watched notes could not
+/// be read is read again at its one deadline ([`Unread::due`]): the writes
+/// arriving meanwhile never put it off. Answers whether the connection was
+/// good (false once telling failed).
+async fn follow_writes<S, E>(following: &impl Following, mut writes: S, changes: &InterestChanges) -> bool
+where
+    S: futures::Stream<Item = Result<pimble_rpc::WriteSeen, E>> + Unpin,
+{
+    use futures::StreamExt;
     let mut unread = Unread::default();
     loop {
+        // The deadline, not a wait from now: every turn of the loop sleeps
+        // until the same moment.
+        let due = unread.due;
         tokio::select! {
             seen = writes.next() => {
                 let Some(Ok(seen)) = seen else { return true };
-                let write = Write {
-                    doc: seen.doc_id.to_string(),
-                    writer: seen.writer,
-                    count: u64::from(seen.count),
-                    roots: seen.roots.iter().map(|r| r.to_string()).collect(),
-                    last_ms: seen.last_ms,
-                };
-                if let Err(e) = record_writes(state, &seen.store_id.to_string(), &[write], chrono::Utc::now().timestamp_millis()).await {
-                    tracing::warn!(error = %e, "a write was not gathered for watches");
-                }
+                following.record(seen).await;
             }
-            _ = state.watch_interest.wake.notified() => {
-                let mut changed = state.watch_interest.take();
+            _ = changes.wake.notified() => {
+                let mut changed = changes.take();
                 // A store waiting to be read again is read with the rest.
                 changed.extend(unread.take());
-                if !tell_interest(state, client, changed, &mut unread).await {
+                if !tell_interest(following, changed, &mut unread).await {
                     // Told whole on the next connection.
                     return true;
                 }
             }
-            _ = tokio::time::sleep(unread.wait), if !unread.stores.is_empty() => {
+            _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
                 let again = unread.take();
-                if !tell_interest(state, client, again, &mut unread).await {
+                if !tell_interest(following, again, &mut unread).await {
                     return true;
                 }
             }
@@ -382,11 +448,11 @@ async fn follow(state: &AppState, client: &pimble_client::PimbleClient) -> bool 
 /// watched notes could not be read waits in `unread` to be read again, with
 /// backoff (a database that fails at once would otherwise be asked again
 /// at once, for ever). Answers whether the hosted server was told.
-async fn tell_interest(state: &AppState, client: &pimble_client::PimbleClient, stores: BTreeSet<String>, unread: &mut Unread) -> bool {
+async fn tell_interest(following: &impl Following, stores: BTreeSet<String>, unread: &mut Unread) -> bool {
     let mut told = Vec::new();
     let mut failed = BTreeSet::new();
     for store in stores {
-        match interest_of(state, &store).await {
+        match following.interest(&store).await {
             Ok(Some(interest)) => told.push(interest),
             Ok(None) => {}
             Err(e) => {
@@ -395,45 +461,42 @@ async fn tell_interest(state: &AppState, client: &pimble_client::PimbleClient, s
             }
         }
     }
-    unread.failed(failed);
+    unread.failed(failed, tokio::time::Instant::now());
     if told.is_empty() {
         return true;
     }
-    match client.set_write_interest(SetWriteInterestRequest { stores: told, whole: false }).await {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "the hosted server could not be told which notes are watched");
-            false
-        }
-    }
+    following.tell(told).await
 }
 
-/// The stores whose watched notes could not be read, and how long to wait
-/// before reading them again: [`FIRST_INTEREST_WAIT`] after the first read
-/// that fails, doubling with each one after it that fails too, up to
-/// [`LONGEST_INTEREST_WAIT`]; a read that leaves nothing unread starts it
-/// over.
+/// The stores whose watched notes could not be read, and when to read them
+/// again: [`FIRST_INTEREST_WAIT`] after the first read that fails, doubling
+/// with each one after it that fails too, up to [`LONGEST_INTEREST_WAIT`];
+/// a read that leaves nothing unread starts it over.
 #[derive(Debug)]
 struct Unread {
     stores: BTreeSet<String>,
     wait: Duration,
     failing: bool,
+    /// When `stores` are read again; set when they start waiting and kept
+    /// until they are taken, whatever else happens meanwhile.
+    due: Option<tokio::time::Instant>,
 }
 
 impl Default for Unread {
     fn default() -> Self {
-        Self { stores: BTreeSet::new(), wait: FIRST_INTEREST_WAIT, failing: false }
+        Self { stores: BTreeSet::new(), wait: FIRST_INTEREST_WAIT, failing: false, due: None }
     }
 }
 
 impl Unread {
     /// The stores to read again now (they wait no more).
     fn take(&mut self) -> BTreeSet<String> {
+        self.due = None;
         std::mem::take(&mut self.stores)
     }
 
-    /// A read ended with `failed` unread: they wait.
-    fn failed(&mut self, failed: BTreeSet<String>) {
+    /// A read at `now` ended with `failed` unread: they wait.
+    fn failed(&mut self, failed: BTreeSet<String>, now: tokio::time::Instant) {
         if failed.is_empty() {
             if self.stores.is_empty() {
                 self.failing = false;
@@ -444,13 +507,15 @@ impl Unread {
         self.wait = if self.failing { (self.wait * 2).min(LONGEST_INTEREST_WAIT) } else { FIRST_INTEREST_WAIT };
         self.failing = true;
         self.stores.extend(failed);
+        self.due = Some(now + self.wait);
     }
 }
 
 /// Watches' jobs, for the life of the process: following the hosted
 /// server's writes, [`watch_pass`] every [`WATCH_PASS_EVERY`], and
 /// forgetting the relay reports taken more than
-/// [`RELAY_REPORT_REMEMBERED_MS`] ago every hour. Started
+/// [`RELAY_REPORT_REMEMBERED_MS`] ago every hour, both the reports and the
+/// batches' record of them. Started
 /// by `build_router` (the service), never by the tests.
 pub fn spawn(state: AppState) {
     tokio::spawn(follow_hosted_writes(state.clone()));
@@ -463,6 +528,10 @@ pub fn spawn(state: AppState) {
             let before = chrono::Utc::now().timestamp_millis() - RELAY_REPORT_REMEMBERED_MS;
             if let Err(e) = forgetting.db.forget_relay_reports_before(before).await {
                 tracing::warn!(error = %e, "the relay reports taken long ago could not be forgotten");
+            }
+            let _one_at_a_time = forgetting.watches_lock.lock().await;
+            if let Err(e) = forgetting.db.forget_batch_reports_before(before).await {
+                tracing::warn!(error = %e, "the relay reports batches gathered long ago could not be forgotten");
             }
         }
     });
@@ -481,6 +550,8 @@ pub fn spawn(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Instant;
 
     fn stores(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| n.to_string()).collect()
@@ -488,20 +559,95 @@ mod tests {
 
     #[test]
     fn a_store_that_cannot_be_read_waits_longer_each_time() {
+        let now = Instant::now();
         let mut unread = Unread::default();
-        unread.failed(BTreeSet::new());
-        assert!(unread.stores.is_empty(), "nothing failed: nothing waits");
-        unread.failed(stores(&["s"]));
+        unread.failed(BTreeSet::new(), now);
+        assert!(unread.stores.is_empty() && unread.due.is_none(), "nothing failed: nothing waits");
+        unread.failed(stores(&["s"]), now);
+        assert_eq!(unread.due, Some(now + FIRST_INTEREST_WAIT));
         assert_eq!((unread.wait, unread.take()), (FIRST_INTEREST_WAIT, stores(&["s"])));
+        assert_eq!(unread.due, None, "taken: nothing is due");
         let mut waits = Vec::new();
         for _ in 0..8 {
-            unread.failed(stores(&["s"]));
+            unread.failed(stores(&["s"]), now);
             waits.push(unread.wait.as_secs());
             unread.take();
         }
         assert_eq!(waits, vec![2, 4, 8, 16, 32, 60, 60, 60], "doubling, to a minute");
-        unread.failed(BTreeSet::new());
-        unread.failed(stores(&["t"]));
+        unread.failed(BTreeSet::new(), now);
+        unread.failed(stores(&["t"]), now);
         assert_eq!(unread.wait, FIRST_INTEREST_WAIT, "a read that worked starts it over");
+    }
+
+    /// A following whose reads of store "s" fail `failures` times, and that
+    /// notes when each read and each telling happened.
+    struct Fake {
+        start: Instant,
+        failures: AtomicUsize,
+        reads: Mutex<Vec<Duration>>,
+        told: Mutex<Vec<Duration>>,
+        recorded: AtomicUsize,
+    }
+
+    impl Fake {
+        fn failing(failures: usize) -> Fake {
+            Fake { start: Instant::now(), failures: AtomicUsize::new(failures), reads: Mutex::default(), told: Mutex::default(), recorded: AtomicUsize::new(0) }
+        }
+    }
+
+    impl Following for Fake {
+        async fn record(&self, _seen: pimble_rpc::WriteSeen) {
+            self.recorded.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn interest(&self, _store: &str) -> CloudResult<Option<WriteInterest>> {
+            self.reads.lock().unwrap().push(self.start.elapsed());
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(crate::error::CloudError::Internal("the database is away".into()));
+            }
+            Ok(Some(WriteInterest { store_id: StoreId::new(), docs: vec![NodeId::new()], roots: Vec::new() }))
+        }
+
+        async fn tell(&self, _stores: Vec<WriteInterest>) -> bool {
+            self.told.lock().unwrap().push(self.start.elapsed());
+            true
+        }
+    }
+
+    /// A hosted write every 300 ms, for ever.
+    fn writes_every_300ms() -> impl futures::Stream<Item = Result<pimble_rpc::WriteSeen, std::convert::Infallible>> + Unpin {
+        Box::pin(futures::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let seen = pimble_rpc::WriteSeen { store_id: StoreId::new(), doc_id: NodeId::new(), writer: "olga".into(), count: 1, roots: Vec::new(), last_ms: 0 };
+            Some((Ok(seen), ()))
+        }))
+    }
+
+    /// The loop itself, under writes arriving faster than the wait: a store
+    /// whose read failed is read again at its deadline (1 s, then 2 s after
+    /// that), not put off by every write.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_unread_is_read_again_while_writes_keep_coming() {
+        let fake = Fake::failing(2);
+        let changes = InterestChanges::default();
+        changes.changed(["s".to_string()]);
+        let followed = tokio::time::timeout(Duration::from_secs(5), follow_writes(&fake, writes_every_300ms(), &changes)).await;
+        assert!(followed.is_err(), "the writes never end: still following at the end of the test");
+        let secs = |all: &Mutex<Vec<Duration>>| all.lock().unwrap().iter().map(|d| d.as_millis()).collect::<Vec<_>>();
+        assert_eq!(secs(&fake.reads), vec![0, 1000, 3000], "read at once, failing; again after 1 s, failing; again 2 s later");
+        assert_eq!(secs(&fake.told), vec![3000], "told once the read worked");
+        assert_eq!(fake.recorded.load(Ordering::SeqCst), 16, "every write gathered meanwhile");
+    }
+
+    /// With nothing unread, the loop never wakes for a read of its own.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_unread_is_never_read_again() {
+        let fake = Fake::failing(0);
+        let changes = InterestChanges::default();
+        changes.changed(["s".to_string()]);
+        let _ = tokio::time::timeout(Duration::from_secs(5), follow_writes(&fake, writes_every_300ms(), &changes)).await;
+        assert_eq!(fake.reads.lock().unwrap().len(), 1);
+        assert_eq!(fake.told.lock().unwrap().len(), 1);
     }
 }

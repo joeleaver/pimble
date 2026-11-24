@@ -34,10 +34,16 @@ pub struct WatchBatchRow {
     pub root: String,
     /// Spells of editing: `spells.count()`.
     pub count: u64,
-    /// Their spans (`pimble_core::watch::Spells`).
+    /// Their spans (`pimble_core::watch::Spells`); none once a pass took
+    /// them while the row stays for its `reports`.
     pub spells: pimble_core::watch::Spells,
     pub first_at_ms: i64,
     pub last_at_ms: i64,
+    /// The relay reports gathered into this batch, each with when it was
+    /// gathered: a report sent again finds its writes here, told or not,
+    /// and gathers none of them twice. Forgotten with the reports
+    /// (`crate::watches::RELAY_REPORT_REMEMBERED_MS`).
+    pub reports: std::collections::BTreeMap<String, i64>,
 }
 
 impl WatchBatchRow {
@@ -46,9 +52,10 @@ impl WatchBatchRow {
         format!("{watcher}/{store}/{doc}/{writer}")
     }
 
-    /// What `pimble_core::watch` judges a batch by.
-    pub fn gathered(&self) -> pimble_core::watch::Gathered {
-        pimble_core::watch::Gathered { count: u32::try_from(self.count).unwrap_or(u32::MAX), first_ms: self.first_at_ms, last_ms: self.last_at_ms }
+    /// What `pimble_core::watch` judges a batch by; `None` once its spells
+    /// were taken.
+    pub fn gathered(&self) -> Option<pimble_core::watch::Gathered> {
+        self.spells.gathered()
     }
 }
 
@@ -62,25 +69,31 @@ fn watch_batch_from_object(o: &Object) -> CloudResult<WatchBatchRow> {
         writer_uuid: get_string(o, "writer_uuid")?.to_string(),
         root: get_string(o, "root")?.to_string(),
         count: get_u64(o, "count")?,
-        spells: spells_of(o)?,
+        spells: json_field(o, "spells")?,
         first_at_ms: get_datetime_ms(o, "first_at")?,
         last_at_ms: get_datetime_ms(o, "last_at")?,
+        // A batch from before reports were kept gathered none.
+        reports: match get_string_opt(o, "reports")? {
+            Some(text) => parse_json(text, "reports")?,
+            None => Default::default(),
+        },
     })
 }
 
-/// A batch's spans; a row that has none (or none that parse) is one span
-/// from its first write to its last.
-fn spells_of(o: &Object) -> CloudResult<pimble_core::watch::Spells> {
-    let parsed = get_string_opt(o, "spells")?.and_then(|text| serde_json::from_str::<pimble_core::watch::Spells>(text).ok()).filter(|s| s.count() > 0);
-    Ok(match parsed {
-        Some(spells) => spells,
-        None => {
-            let mut spells = pimble_core::watch::Spells::default();
-            spells.add(get_datetime_ms(o, "first_at")?);
-            spells.add(get_datetime_ms(o, "last_at")?);
-            spells
-        }
-    })
+/// A batch's spells: every batch is written with them (`WatchBatch` never
+/// shipped without them; a row with none is not rebuilt from its first and
+/// last write, which would lose its count), so one that does not parse is an
+/// error, not a guess.
+fn json_field<T: serde::de::DeserializeOwned>(o: &Object, field: &str) -> CloudResult<T> {
+    parse_json(get_string(o, field)?, field)
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(text: &str, field: &str) -> CloudResult<T> {
+    serde_json::from_str(text).map_err(|e| CloudError::Internal(format!("a watch batch's {field} do not read: {e}")))
+}
+
+fn json_text<T: serde::Serialize>(value: &T) -> CloudResult<String> {
+    serde_json::to_string(value).map_err(|e| CloudError::Internal(e.to_string()))
 }
 
 impl RhypeDb {
@@ -148,28 +161,42 @@ impl RhypeDb {
 
     /// A write by `writer` to `doc` at `at_ms`, gathered for `watcher`
     /// (told through `root`): a new batch, or added to the spells of
-    /// editing of the one gathering, wherever among them it falls.
-    /// A read and then a write: the caller holds `AppState::watches_lock`,
-    /// as `crate::watches::watch_pass` does to take batches out.
-    pub async fn gather_watch_write(&self, watcher: &str, store: &str, doc: &str, writer: &str, root: &str, at_ms: i64) -> CloudResult<()> {
+    /// editing of the one gathering, wherever among them it falls. A write
+    /// of a relay report (`report`: its id and when it is taken) that this
+    /// batch gathered already, told since or not, is not gathered again;
+    /// the batch and the report it names are written in one query, so a
+    /// report sent again after a failure gathers each write once. Answers
+    /// whether it was gathered. A read and then a write: the caller holds
+    /// `AppState::watches_lock`, as `crate::watches::watch_pass` does to
+    /// take batches out.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gather_watch_write(&self, watcher: &str, store: &str, doc: &str, writer: &str, root: &str, at_ms: i64, report: Option<(&str, i64)>) -> CloudResult<bool> {
         let key = WatchBatchRow::key(watcher, store, doc, writer);
         let held = self.find_watch_batch(&key).await?;
+        let mut reports = held.as_ref().map(|batch| batch.reports.clone()).unwrap_or_default();
+        if let Some((id, taken_ms)) = report {
+            if reports.contains_key(id) {
+                return Ok(false);
+            }
+            reports.insert(id.to_string(), taken_ms);
+        }
         let mut spells = held.as_ref().map(|batch| batch.spells.clone()).unwrap_or_default();
         spells.add(at_ms);
         let (first_ms, last_ms) = spells.span().unwrap_or((at_ms, at_ms));
-        let spans = serde_json::to_string(&spells).map_err(|e| CloudError::Internal(e.to_string()))?;
+        let (spans, reports) = (json_text(&spells)?, json_text(&reports)?);
         let q = match held {
             Some(batch) => format!(
-                "WatchBatch.get({}).update({{ count: {}, spells: {}, first_at: {}, last_at: {}, root: {} }})",
+                "WatchBatch.get({}).update({{ count: {}, spells: {}, first_at: {}, last_at: {}, root: {}, reports: {} }})",
                 batch.rid,
                 spells.count(),
                 ql_str(&spans),
                 datetime_literal(first_ms),
                 datetime_literal(last_ms),
                 ql_str(root),
+                ql_str(&reports),
             ),
             None => format!(
-                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, root: {}, count: {}, spells: {}, first_at: {}, last_at: {} }})",
+                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, root: {}, count: {}, spells: {}, first_at: {}, last_at: {}, reports: {} }})",
                 ql_str(&key),
                 ql_str(watcher),
                 ql_str(store),
@@ -180,9 +207,43 @@ impl RhypeDb {
                 ql_str(&spans),
                 datetime_literal(first_ms),
                 datetime_literal(last_ms),
+                ql_str(&reports),
             ),
         };
         self.objects(&q).await?;
+        Ok(true)
+    }
+
+    /// A pass took `batch`'s spells: gone, or, while it names relay
+    /// reports, kept with no spells so a report sent again still finds
+    /// them. The caller holds `AppState::watches_lock`.
+    pub async fn take_watch_batch(&self, batch: &WatchBatchRow) -> CloudResult<()> {
+        if batch.reports.is_empty() {
+            return self.delete_watch_batch(batch.rid).await;
+        }
+        let none = json_text(&pimble_core::watch::Spells::default())?;
+        self.objects(&format!("WatchBatch.get({}).update({{ count: 0, spells: {} }})", batch.rid, ql_str(&none))).await?;
+        Ok(())
+    }
+
+    /// Forget, in every batch, the relay reports gathered before
+    /// `before_ms`; a batch left with no spells and no reports is gone.
+    /// The caller holds `AppState::watches_lock`.
+    pub async fn forget_batch_reports_before(&self, before_ms: i64) -> CloudResult<()> {
+        for batch in self.watch_batches().await? {
+            if batch.reports.is_empty() {
+                continue;
+            }
+            let kept: std::collections::BTreeMap<String, i64> = batch.reports.iter().filter(|(_, at)| **at >= before_ms).map(|(id, at)| (id.clone(), *at)).collect();
+            if kept.len() == batch.reports.len() {
+                continue;
+            }
+            if kept.is_empty() && batch.spells.count() == 0 {
+                self.delete_watch_batch(batch.rid).await?;
+            } else {
+                self.objects(&format!("WatchBatch.get({}).update({{ reports: {} }})", batch.rid, ql_str(&json_text(&kept)?))).await?;
+            }
+        }
         Ok(())
     }
 

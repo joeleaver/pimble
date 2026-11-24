@@ -88,6 +88,9 @@ bytes = "1"
 
 [dev-dependencies]
 pimble-server = { workspace = true }
+# Paused time, for the loop that follows the hosted server's writes
+# (`watches::tests`).
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # Plain WebSocket clients for the relay's end-to-end tests (tests/integration.rs):
 # the owner's tunnel and members' connections, with close codes and custom
