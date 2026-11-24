@@ -133,3 +133,53 @@ fn no_parent_is_asked_for_a_scope_root_a_mount_or_a_node_no_pane_holds() {
         assert_eq!(asked_for(&sent, parent), 0, "asked for {parent:?}");
     }
 }
+
+/// A store closed and opened again with a pane restored on one of its
+/// columns asks for the column's kanban again: what was asked of the store
+/// before it closed answers nothing now.
+#[test]
+fn a_store_opened_again_asks_for_a_columns_kanban_again() {
+    let (store, events, commands) = store_with_events();
+    store.child_viewers.set(vec![column_viewer()]);
+    let store_id = StoreId::new();
+    let board = kanban("Board");
+    let column = column_under(board.id);
+    open_in_first_pane(store, store_id, column.id);
+
+    loaded(&events, store, store_id, &column);
+    let sent: Vec<BackendCommand> = commands.try_iter().collect();
+    assert_eq!(asked_for(&sent, board.id), 1);
+
+    store.remove_store(store_id);
+    open_in_first_pane(store, store_id, column.id);
+    loaded(&events, store, store_id, &column);
+    let sent: Vec<BackendCommand> = commands.try_iter().collect();
+    assert_eq!(asked_for(&sent, board.id), 1, "asked again once the store opened again");
+}
+
+/// A kanban that could not be read (offline, say) is asked for again the
+/// next time the pane needs it, and the failure still reaches the person as
+/// an error.
+#[test]
+fn a_kanban_that_failed_to_load_is_asked_for_again() {
+    let (store, events, commands) = store_with_events();
+    store.child_viewers.set(vec![column_viewer()]);
+    let store_id = StoreId::new();
+    let board = kanban("Board");
+    let column = column_under(board.id);
+    open_in_first_pane(store, store_id, column.id);
+
+    loaded(&events, store, store_id, &column);
+    let sent: Vec<BackendCommand> = commands.try_iter().collect();
+    assert_eq!(asked_for(&sent, board.id), 1);
+
+    events.send(BackendEvent::NodeNotLoaded { store_id, node_id: board.id, message: "Pimble's server is not connected; try again in a moment.".into() }).unwrap();
+    pump(store);
+    loaded(&events, store, store_id, &column);
+    let sent: Vec<BackendCommand> = commands.try_iter().collect();
+    assert_eq!(asked_for(&sent, board.id), 1, "asked again after the failure");
+    assert_eq!(shown_as_metanode(store), None);
+
+    loaded(&events, store, store_id, &board);
+    assert_eq!(shown_as_metanode(store), Some(column.id), "the kanban arriving shows the column");
+}

@@ -483,7 +483,7 @@ fn with_pictures(blocks: &[pimble_crdt::Block], src_of: &mut dyn FnMut(usize) ->
 
 fn unexpected(answer: Option<BackendEvent>) -> String {
     match answer {
-        Some(BackendEvent::Error { message }) => message,
+        Some(BackendEvent::Error { message }) | Some(BackendEvent::NodeNotLoaded { message, .. }) => message,
         Some(other) => format!("the backend answered {other:?}"),
         None => "the backend did not answer".to_string(),
     }

@@ -163,6 +163,19 @@ pub(crate) fn ask_for_parent(store: AppStore, store_id: StoreId, node: &Node) {
     }
 }
 
+/// `GetNode` of `(store_id, node_id)` failed: if `ask_for_parent` asked for
+/// it, the ask is forgotten, so the next time a pane needs it (the pane opened
+/// again, the store reconnected) it is asked for again.
+pub(crate) fn parent_not_loaded(store_id: StoreId, node_id: NodeId) {
+    PARENTS_ASKED.with(|asked| asked.borrow_mut().remove(&(store_id, node_id)));
+}
+
+/// Store `store_id` closed: the parents asked for in it are forgotten, so a
+/// pane showing one of its columns after it opens again asks afresh.
+pub(crate) fn store_closed(store_id: StoreId) {
+    PARENTS_ASKED.with(|asked| asked.borrow_mut().retain(|(s, _)| *s != store_id));
+}
+
 /// Show metanode `(store_id, node_id)` in pane `pane`, instead of whatever
 /// it held, and ask for its forest.
 pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId) {

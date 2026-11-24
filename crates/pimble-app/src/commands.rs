@@ -240,7 +240,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
     Ok(match cmd {
         C::GetNode { store_id, node_id } => match api.node(Addr::new(store_id, node_id)).await {
             Ok(node) => Some(BackendEvent::NodeLoaded { store_id, node }),
-            Err(e) => failed(e),
+            Err(e) => Some(BackendEvent::NodeNotLoaded { store_id, node_id, message: error_message(&e) }),
         },
 
         C::NameNodes { nodes } => {

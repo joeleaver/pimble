@@ -129,6 +129,7 @@ impl AppStore {
         self.sync_data.update(|map| { map.remove(&store_id); });
         self.set_owner_offline(store_id, false);
         self.set_waiting(store_id, Vec::new());
+        crate::metanodes::store_closed(store_id);
     }
 
     /// Get the per-store signal (untracked read of the registry).

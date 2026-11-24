@@ -586,6 +586,10 @@ pub enum BackendEvent {
     /// `off`: another device turned it off, and this one stops too.
     PersonalSynced { state: Vec<u8>, off: bool },
     NodeLoaded { store_id: StoreId, node: Node },
+    /// `GetNode` failed: the node named could not be read (offline, gone,
+    /// not readable here). The UI takes it as an `Error` and forgets that it
+    /// asked, so a later need asks again.
+    NodeNotLoaded { store_id: StoreId, node_id: NodeId, message: String },
     /// `children` live in `children_store_id`: the same as `store_id` for an
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.
     ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children_store_id: StoreId, children: Vec<Node> },

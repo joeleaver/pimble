@@ -134,6 +134,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::NodeNotLoaded { store_id, node_id, message } => {
+                crate::metanodes::parent_not_loaded(*store_id, *node_id);
+                connection::error(store, message);
+            }
+
             BackendEvent::Shown { view } => {
                 tracing::debug!("Shown in {:?}: {} rows, {} lists, {} gone", view.store, view.nodes.len(), view.lists.len(), view.gone.len());
                 apply_view(store, view);
