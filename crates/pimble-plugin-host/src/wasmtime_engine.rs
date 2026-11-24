@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use pimble_plugin_abi::{decode, encode, exports, imports, unpack, Answer, Manifest};
+use pimble_plugin_abi::{encode, exports, imports, unpack, Answer, Manifest};
 use wasmtime::{Caller, Config, Engine, Instance as WasmInstance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Trap, TypedFunc};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
@@ -418,30 +418,27 @@ fn compiled(bytes: &[u8]) -> wasmtime::Result<Module> {
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(2);
 
 /// Compile and describe the plugin at `path`, refusing one built for another ABI.
-/// The error is the sentence a person reads, with the manifest when there was one
-/// (so a refused plugin's viewers can say why they are missing).
-pub fn load_file(path: &Path, budget: Duration) -> Result<Plugin, (Option<Manifest>, String)> {
+/// The refusal is the sentence a person reads, with what the plugin said it is
+/// when it could say (so a refused plugin's viewers can say why they are
+/// missing, and the library can replace it).
+pub fn load_file(path: &Path, budget: Duration) -> Result<Plugin, NotLoaded> {
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-    let bytes = std::fs::read(path).map_err(|e| (None, format!("The plugin {file} could not be read: {e}.")))?;
+    let bytes = std::fs::read(path).map_err(|e| NotLoaded::new(format!("The plugin {file} could not be read: {e}.")))?;
     load_bytes(path, &bytes, budget)
 }
 
 /// [`load_file`] for a module already in memory.
-pub fn load_bytes(path: &Path, bytes: &[u8], budget: Duration) -> Result<Plugin, (Option<Manifest>, String)> {
+pub fn load_bytes(path: &Path, bytes: &[u8], budget: Duration) -> Result<Plugin, NotLoaded> {
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let module = compiled(bytes)
-        .map_err(|e| (None, format!("The plugin {file} is not a WebAssembly module Pimble can run: {}.", first_line(&e))))?;
-    let mut guest = WasmGuest::new(&module, 0, budget).map_err(|f| (None, f.sentence(&file)))?;
+        .map_err(|e| NotLoaded::new(format!("The plugin {file} is not a WebAssembly module Pimble can run: {}.", first_line(&e))))?;
+    let mut guest = WasmGuest::new(&module, 0, budget).map_err(|f| NotLoaded::new(f.sentence(&file)))?;
     let bytes = match guest.call(Call::Describe) {
         Ok(Answered::Bytes(bytes)) => bytes,
-        Ok(_) => return Err((None, format!("The plugin {file} did not describe itself."))),
-        Err(f) => return Err((None, f.sentence(&file))),
+        Ok(_) => return Err(NotLoaded::new(format!("The plugin {file} did not describe itself."))),
+        Err(f) => return Err(NotLoaded::new(f.sentence(&file))),
     };
-    let manifest: Manifest =
-        decode(&bytes).map_err(|_| (None, format!("The plugin {file} described itself in a form this Pimble cannot read.")))?;
-    if let Err(sentence) = crate::check_manifest(&manifest) {
-        return Err((Some(manifest), sentence));
-    }
+    let manifest = crate::describe(&file, &bytes)?;
     Ok(Plugin { manifest, path: path.to_path_buf(), module })
 }
 
@@ -458,7 +455,7 @@ impl Plugin {
 
 /// The plugins in a folder, and the ones refused.
 pub type Registry = crate::registry::Registry<Plugin>;
-pub use crate::registry::Refused;
+pub use crate::registry::{NotLoaded, Refused};
 /// What the app has for a viewer id, among plugins this engine loaded.
 pub type ViewerLookup<'a> = crate::registry::ViewerLookup<'a, Plugin>;
 

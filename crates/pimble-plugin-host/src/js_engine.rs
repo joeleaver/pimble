@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use js_sys::{Array, Function, Object, Reflect, Uint8Array, WebAssembly};
-use pimble_plugin_abi::{decode, encode, exports, imports, unpack, Answer, Manifest};
+use pimble_plugin_abi::{encode, exports, imports, unpack, Answer, Manifest};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -541,6 +541,7 @@ impl crate::registry::Loaded for Plugin {
 
 /// The plugins the page has loaded, and the ones refused.
 pub type Registry = crate::registry::Registry<Plugin>;
+pub use crate::registry::{NotLoaded, Refused};
 /// What the page has for a viewer id.
 pub type ViewerLookup<'a> = crate::registry::ViewerLookup<'a, Plugin>;
 
@@ -606,25 +607,24 @@ impl Plugin {
 }
 
 /// Compile and describe a plugin the person added (`name` is its file's name),
-/// refusing one built for another ABI, and make an instance ready. The error is
-/// the sentence a person reads, with the manifest when there was one.
-pub async fn load_bytes(name: &str, bytes: &[u8], budget: Duration) -> Result<Plugin, (Option<Manifest>, String)> {
+/// refusing one built for another ABI, and make an instance ready. The refusal
+/// is the sentence a person reads, with what the plugin said it is when it
+/// could say.
+pub async fn load_bytes(name: &str, bytes: &[u8], budget: Duration) -> Result<Plugin, NotLoaded> {
     let path = Path::new(name).to_path_buf();
     let compiled = JsFuture::from(WebAssembly::compile(&Uint8Array::from(bytes).into())).await;
     let module: WebAssembly::Module = compiled
         .ok()
         .and_then(|m| m.dyn_into().ok())
-        .ok_or_else(|| (None, format!("The plugin {name} is not a WebAssembly module Pimble can run.")))?;
+        .ok_or_else(|| NotLoaded::new(format!("The plugin {name} is not a WebAssembly module Pimble can run.")))?;
     // The instance that describes it is the first one taken: describing touches
     // nothing a mount reads.
-    let mut guest = JsGuest::new(&module, budget).await.map_err(|f| (None, f.sentence(name)))?;
+    let mut guest = JsGuest::new(&module, budget).await.map_err(|f| NotLoaded::new(f.sentence(name)))?;
     let described = match guest.call(Call::Describe) {
         Ok(Answered::Bytes(bytes)) => bytes,
-        Ok(_) => return Err((None, format!("The plugin {name} did not describe itself."))),
-        Err(f) => return Err((None, f.sentence(name))),
+        Ok(_) => return Err(NotLoaded::new(format!("The plugin {name} did not describe itself."))),
+        Err(f) => return Err(NotLoaded::new(f.sentence(name))),
     };
-    let manifest: Manifest =
-        decode(&described).map_err(|_| (None, format!("The plugin {name} described itself in a form this Pimble cannot read.")))?;
-    crate::check_manifest(&manifest).map_err(|sentence| (Some(manifest.clone()), sentence))?;
+    let manifest = crate::describe(name, &described)?;
     Ok(Plugin { manifest, path, module, budget, ready: Rc::new(RefCell::new(Some(guest))), warming: Rc::default(), broken: Rc::default() })
 }

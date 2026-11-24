@@ -41,11 +41,39 @@ pub use bridge::{Approval, Approved};
 pub use instance::{host_calls, Answered, ApiSide, Call, Failure, GuestEngine, HostCalls, HostKey, Instance, InstanceOptions};
 pub use pimble_plugin_abi as abi;
 
-use pimble_plugin_abi::{refusal_for_abi, Manifest, ABI_VERSION};
+use pimble_plugin_abi::{refusal_for_abi, Manifest, ManifestHead, ABI_VERSION};
+pub use registry::NotLoaded;
 
 /// The rinch git revision the app is built against (from the workspace's
 /// `Cargo.lock`), to compare with the one each plugin's manifest names.
 pub const HOST_RINCH_REVISION: &str = env!("PIMBLE_RINCH_REVISION");
+
+/// What a plugin's `describe` answered (`described`; `file` is its file's
+/// name): the manifest of a plugin this app runs, or why not, with what it
+/// said it is as far as that could be read. A manifest built for another ABI
+/// may not decode in full; its head still names the plugin, so the library can
+/// replace it (docs/PLUGINS_CONTRACT.md section 7).
+pub fn describe(file: &str, described: &[u8]) -> Result<Manifest, NotLoaded> {
+    match pimble_plugin_abi::decode::<Manifest>(described) {
+        Ok(manifest) => match check_manifest(&manifest) {
+            Ok(()) => Ok(manifest),
+            Err(sentence) => Err(NotLoaded::described(manifest, sentence)),
+        },
+        Err(_) => match ManifestHead::decode(described) {
+            Ok(head) if head.abi != ABI_VERSION => {
+                let name = if head.name.is_empty() { head.id.as_str() } else { head.name.as_str() };
+                let sentence = refusal_for_abi(name, head.abi);
+                Err(NotLoaded::headed(head, sentence))
+            }
+            Ok(head) => Err(NotLoaded::headed(head, unreadable(file))),
+            Err(_) => Err(NotLoaded::new(unreadable(file))),
+        },
+    }
+}
+
+fn unreadable(file: &str) -> String {
+    format!("The plugin {file} described itself in a form this Pimble cannot read.")
+}
 
 /// Whether the app runs a plugin that describes itself as `manifest`, or the
 /// sentence a person reads when it does not.

@@ -6,7 +6,6 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 pub const CAN_ADD: bool = true;
-pub const REMOVABLE: bool = true;
 pub const WHERE: &str = "Plugins added here are kept in this browser only, never uploaded. Each asks once in this browser before it reads or changes anything.";
 
 const APPROVALS_KEY: &str = "pimble.plugins.approvals";
@@ -212,7 +211,7 @@ pub fn pick() {
 async fn add(name: &str, bytes: &[u8]) {
     match put(name, bytes, None).await {
         Ok((id, line)) => {
-            forget_library(&id);
+            forget_library(&id, false);
             say(line);
         }
         Err(e) => say(e),
@@ -223,7 +222,7 @@ async fn add(name: &str, bytes: &[u8]) {
 /// library, the one `entry` lists) is kept in this browser, replacing an
 /// earlier version of the same plugin, and swapped in.
 async fn put(name: &str, bytes: &[u8], entry: Option<&Entry>) -> Result<(String, String), String> {
-    let plugin = load_bytes(name, bytes, DEFAULT_BUDGET).await.map_err(|(_, sentence)| sentence)?;
+    let plugin = load_bytes(name, bytes, DEFAULT_BUDGET).await.map_err(|refused| refused.sentence)?;
     if let Some(entry) = entry {
         library::matches(entry, &plugin.manifest)?;
     }
@@ -235,7 +234,7 @@ async fn put(name: &str, bytes: &[u8], entry: Option<&Entry>) -> Result<(String,
     // An earlier version of the same plugin goes, with any pane showing it.
     let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
     registry.plugins.retain(|p| p.manifest.id != id);
-    registry.refused.retain(|r| r.file() != format!("{id}.wasm"));
+    registry.refused.retain(|r| r.id() != id);
     let line = format!("Added the {} plugin {}.", plugin.manifest.name, plugin.manifest.version);
     registry.take(format!("{id}.wasm").into(), Ok(plugin));
     swapped(registry, std::slice::from_ref(&id));
@@ -253,9 +252,10 @@ pub fn remove(id: &str) {
         let name = manifest_of(&id).map_or(id.clone(), |m| m.name);
         APPROVALS.with(|a| a.borrow_mut().remove(&id));
         write_approvals_now();
-        forget_library(&id);
+        forget_library(&id, true);
         let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
         registry.plugins.retain(|p| p.manifest.id != id);
+        registry.refused.retain(|r| r.id() != id);
         swapped(registry, std::slice::from_ref(&id));
         say(format!("Removed the {name} plugin from this browser."));
     });

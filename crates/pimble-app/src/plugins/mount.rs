@@ -120,6 +120,9 @@ fn show_viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> 
         None => return Outcome::Missing,
     };
     let manifest = plugin.manifest.clone();
+    if is_off(&manifest.id) {
+        return Outcome::Outline(turned_off_sentence(&manifest.name));
+    }
     let approval = approval_of(&manifest.id);
     let shown = |instance: Option<Instance>, stopped: Option<String>| Shown {
         metanode: forest.metanode,

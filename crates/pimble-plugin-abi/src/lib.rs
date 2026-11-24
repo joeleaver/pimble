@@ -38,7 +38,7 @@ mod query;
 
 pub use events::{dispatched, handler_kind, Click, Event, EventData, HandlerKind, Key, Modifiers, Wheel, HANDLER_ATTRIBUTES};
 pub use host::{HostRequest, HostState, NodePeople, PresentPerson};
-pub use manifest::{refusal_for_abi, ChildViewerDecl, Manifest, Permissions, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl};
+pub use manifest::{refusal_for_abi, ChildViewerDecl, Manifest, ManifestHead, Permissions, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl};
 pub use mount::{MountArgs, NodeAddr, Props, MAX_REMEMBERED};
 pub use ops::Op;
 pub use query::{Answer, Query};
