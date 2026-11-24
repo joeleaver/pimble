@@ -501,6 +501,20 @@ first plugin.
    splits the plugin's pane to the right when there is none, uses another pane shown when
    four are open, and the plugin's own pane when it is the only one. A guest that wants a
    double-click times its clicks itself: WASI's clock answers on both hosts.
+   **ABI 7** (2026-11-23, Joe: a kanban's column opened on its own shows as a column, and
+   its row looks like one): `Provision::ChildViewer(ChildViewerDecl { id, name, of, icon })`
+   (`sdk::child_viewer`) is a viewer for the children of the plugin's own viewer `of`'s
+   metanodes. Nothing is stored on a child (Joe chose "derived from place"): the app
+   shows a node with it because its parent is a metanode shown with `of`, so a column
+   moved out of a kanban is a plain node again and one moved in becomes a column. It
+   mounts as any viewer (`MountArgs::viewer` is its id, the props' metanode the child,
+   whose source is its children); its `icon` is what the children's rows show when they
+   have none of their own. `check_manifest` refuses a child viewer of a viewer the plugin
+   does not provide (no plugin decides how another's metanodes' children look) and one
+   whose id is also a viewer's. `Registry::child_viewer(of)` finds it; `Registry::viewer`
+   mounts it. The kanban provides `kanban-column` ("Kanban column", `layout-columns`).
+   The app side (opening such a child with it, its rows' icon) waits for the
+   notifications branch to merge.
 
 ## 5. How it is checked
 

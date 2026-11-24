@@ -34,7 +34,7 @@ pub mod guide;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -225,6 +225,28 @@ pub enum Provision {
     /// A way to make a new node, offered in the explorer's new-node menu
     /// ("New Kanban").
     Recipe(RecipeDecl),
+    /// A viewer for the children of another of the plugin's viewers'
+    /// metanodes: a kanban's column opened on its own shows as a column.
+    ChildViewer(ChildViewerDecl),
+}
+
+/// A viewer a plugin provides for the children of its own viewer's
+/// metanodes. Nothing is stored on such a child: the app shows a node with
+/// it because of where the node is (its parent is a metanode shown with
+/// [`ChildViewerDecl::of`]), and the node gets it back or loses it as it
+/// moves. It is mounted as any viewer, with the child as the props'
+/// metanode, whose source is its children.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildViewerDecl {
+    /// Unique among the plugin's viewers: `kanban-column`.
+    pub id: String,
+    /// What a person reads in a menu: "Kanban column".
+    pub name: String,
+    /// The plugin's own viewer whose metanodes' children it shows: `kanban`.
+    pub of: String,
+    /// The icon the children's rows show when they have none of their own
+    /// (a Tabler icon name): "layout-columns".
+    pub icon: Option<String>,
 }
 
 /// A recipe a plugin registers: what a new node of its kind starts as, as
@@ -280,6 +302,20 @@ impl Manifest {
             Provision::Viewer(v) => Some(v),
             _ => None,
         })
+    }
+
+    /// The viewers this plugin provides for its viewers' metanodes' children.
+    pub fn child_viewers(&self) -> impl Iterator<Item = &ChildViewerDecl> {
+        self.provides.iter().filter_map(|p| match p {
+            Provision::ChildViewer(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Whether the plugin mounts viewer `id`: one of its viewers, or of its
+    /// child viewers.
+    pub fn mounts(&self, id: &str) -> bool {
+        self.viewers().any(|v| v.id == id) || self.child_viewers().any(|c| c.id == id)
     }
 
     /// The recipes this plugin registers.
@@ -664,12 +700,20 @@ mod tests {
                     depth: 2,
                     children: vec!["To do".into(), "Doing".into(), "Done".into()],
                 }),
+                Provision::ChildViewer(ChildViewerDecl {
+                    id: "kanban-column".into(),
+                    name: "Kanban column".into(),
+                    of: "kanban".into(),
+                    icon: Some("layout-columns".into()),
+                }),
             ],
             asks: Permissions { stores: StoreAsk::Chosen, write: true, network: false },
         };
         assert_eq!(decode::<Manifest>(&encode(&manifest)).unwrap(), manifest);
         assert_eq!(manifest.viewers().count(), 1);
         assert_eq!(manifest.recipes().next().map(|r| r.children.len()), Some(3));
+        assert_eq!(manifest.child_viewers().map(|c| c.of.as_str()).collect::<Vec<_>>(), ["kanban"]);
+        assert!(manifest.mounts("hello") && manifest.mounts("kanban-column") && !manifest.mounts("kanban"));
         let state = HostState {
             dark: true,
             people: vec![NodePeople { node: NodeAddr { store: "s".into(), node: "n".into() }, people: vec![PresentPerson { key: "k".into(), agent: true, ..Default::default() }] }],

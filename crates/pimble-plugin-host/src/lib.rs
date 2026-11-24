@@ -68,6 +68,17 @@ pub fn check_manifest(manifest: &Manifest) -> Result<(), String> {
     if manifest.viewers().any(|v| v.id.is_empty()) {
         return Err(format!("The {name} plugin provides a viewer with no id."));
     }
+    if manifest.child_viewers().any(|c| c.id.is_empty()) {
+        return Err(format!("The {name} plugin provides a viewer with no id."));
+    }
+    // A child viewer shows the children of the plugin's own viewer: no
+    // plugin decides how another's metanodes' children look.
+    if let Some(child) = manifest.child_viewers().find(|c| !manifest.viewers().any(|v| v.id == c.of)) {
+        return Err(format!("The {name} plugin's {} viewer is for the children of a {} viewer it does not provide.", child.name, child.of));
+    }
+    if let Some(child) = manifest.child_viewers().find(|c| manifest.viewers().any(|v| v.id == c.id)) {
+        return Err(format!("The {name} plugin provides two viewers named {}.", child.id));
+    }
     // Decision 6: no plugin reaches the network in these waves, so one that
     // needs it would not work if it ran.
     if manifest.asks.network {
@@ -79,7 +90,7 @@ pub fn check_manifest(manifest: &Manifest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pimble_plugin_abi::{Provision, SourceShape, ViewerDecl};
+    use pimble_plugin_abi::{ChildViewerDecl, Provision, SourceShape, ViewerDecl};
 
     fn manifest(abi: u32) -> Manifest {
         Manifest {
@@ -108,5 +119,22 @@ mod tests {
         let mut online = manifest(ABI_VERSION);
         online.asks.network = true;
         assert_eq!(check_manifest(&online).unwrap_err(), "The Hello viewer plugin asks to use the network, which Pimble does not allow plugins yet.");
+    }
+
+    fn with_child(id: &str, of: &str) -> Manifest {
+        let mut m = manifest(ABI_VERSION);
+        m.provides.push(Provision::ChildViewer(ChildViewerDecl { id: id.into(), name: "Hello child".into(), of: of.into(), icon: None }));
+        m
+    }
+
+    #[test]
+    fn a_child_viewer_is_for_the_plugins_own_viewer() {
+        assert_eq!(check_manifest(&with_child("hello-child", "hello")), Ok(()));
+        assert_eq!(
+            check_manifest(&with_child("hello-child", "kanban")).unwrap_err(),
+            "The Hello viewer plugin's Hello child viewer is for the children of a kanban viewer it does not provide."
+        );
+        assert_eq!(check_manifest(&with_child("hello", "hello")).unwrap_err(), "The Hello viewer plugin provides two viewers named hello.");
+        assert!(check_manifest(&with_child("", "hello")).is_err());
     }
 }

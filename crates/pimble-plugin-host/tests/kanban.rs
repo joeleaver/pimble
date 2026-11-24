@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{built_plugin, fixture, mount, Fixture, Running};
+use common::{built_plugin, fixture, mount, mount_on, Fixture, Running};
 use pimble_api::Addr;
 use pimble_core::plan::Refusal;
 use pimble_core::{NodeId, Place, StoreId};
@@ -393,6 +393,32 @@ fn a_drop_in_the_foot_of_a_column_lands_last() {
     fire(r, card, "data-ondragend");
     r.pump_until(&f, "the drop in the foot", |_| children(&f, store, f.plan) == ["Alpha", "Bravo", "Charlie"]);
     assert!(children(&f, store, f.write).is_empty());
+    r.instance.unmount();
+}
+
+/// A kanban's column opened on its own (the `kanban-column` child viewer)
+/// shows that column alone, its cards in order, with nothing to add beside
+/// it; a card added there lands in it.
+#[test]
+fn a_column_opened_on_its_own_shows_as_that_column() {
+    if built_plugin("kanban_viewer").is_none() {
+        return;
+    }
+    let f = fixture("kanban");
+    let store = f.store;
+    f.rt.block_on(async {
+        f.service.create_node(store, Some(f.plan), "document", "Alpha").await.unwrap();
+        f.service.create_node(store, Some(f.plan), "document", "Bravo").await.unwrap();
+        f.service.create_node(store, Some(f.write), "document", "Charlie").await.unwrap();
+    });
+    let running = mount_on(&f, Approval { stores: Approved::All, write: true }, "kanban_viewer", "kanban-column", f.plan);
+    let r = &running;
+    r.pump_until(&f, "the column", |r| r.text().contains("Bravo"));
+    let text = r.text();
+    assert!(text.contains("Plan") && text.contains("Alpha"), "the column's name and cards: {text}");
+    assert!(!text.contains("Write it") && !text.contains("Charlie"), "no other column: {text}");
+    assert!(!text.contains("+ Add column") && !text.contains("+ Add lane"), "nothing to add beside it: {text}");
+    assert!(text.find("Alpha") < text.find("Bravo"), "cards in their order: {text}");
     r.instance.unmount();
 }
 

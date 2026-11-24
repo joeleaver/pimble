@@ -69,7 +69,7 @@ pub use pimble_core;
 /// Node documents, for an `edit` that writes a plugin's own data finely
 /// (`NodeDoc::edit_data`).
 pub use pimble_crdt;
-pub use pimble_plugin_abi::{HostState, Manifest, NodeAddr, Permissions, PresentPerson, Props, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
+pub use pimble_plugin_abi::{ChildViewerDecl, HostState, Manifest, NodeAddr, Permissions, PresentPerson, Props, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
 /// Pimble's own components (presence, icons, colors), drawn alike by the app
 /// and by plugins.
 pub use pimble_ui;
@@ -109,7 +109,7 @@ pub use rinch;
 pub mod prelude {
     pub use crate::{pimble_api, rinch};
     pub use crate::{ToolAnswer, ToolFuture, ToolRequest};
-    pub use crate::{clicked_again, display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
+    pub use crate::{child_viewer, clicked_again, display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
     pub use crate::pimble_ui;
     pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Judged, MetanodeEdit, Pimble};
     pub use pimble_core::Place;
@@ -135,6 +135,14 @@ pub fn manifest(id: &str, name: &str, version: &str) -> Manifest {
 /// showing sources of the shapes `takes`.
 pub fn viewer(id: &str, name: &str, takes: &[SourceShape]) -> Provision {
     Provision::Viewer(ViewerDecl { id: id.to_string(), name: name.to_string(), takes: takes.to_vec() })
+}
+
+/// A viewer with id `id`, read as `name`, for the children of this plugin's
+/// viewer `of`'s metanodes, whose rows show `icon` when they have none of
+/// their own. The app shows a node with it because of where the node is;
+/// nothing is stored on the node.
+pub fn child_viewer(id: &str, name: &str, of: &str, icon: Option<&str>) -> Provision {
+    Provision::ChildViewer(ChildViewerDecl { id: id.to_string(), name: name.to_string(), of: of.to_string(), icon: icon.map(str::to_string) })
 }
 
 /// A recipe "New <thing>" (`label`) making a metanode titled `title`, shown
