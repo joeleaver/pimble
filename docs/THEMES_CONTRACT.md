@@ -6,7 +6,8 @@ stores, plugins themed, about a dozen built in, maybe replacing the paragraph se
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
 has answered them. Answered so far (2026-11-24): decisions 2 (themes replace paragraph spacing), 3 (looked up
-from the nearest ancestor), 4 (shares), 5 (mounts keep their native look) and 7 (palette, and themes
+from the nearest ancestor), 4 (shares), 5 (mounts keep their native look), 6 (app themes
+follow the account) and 7 (palette, and themes
 that inherit and set only what they change).
 
 **Two kinds, kept apart:**
@@ -240,18 +241,43 @@ the chain, and a change to the theme document or its base.
 
 ### 3.3 App themes
 
-An app theme is chosen **per device**, like `dark_mode` and zoom today: `state.json`
-`app_theme` (and `localStorage` in the browser). It names a built-in (`builtin:pimble-dark`)
-or a theme node (`pimble:` link) whose `data.theme.kind` is `app`. So a person's own app
-themes are made, edited and copied the same way document themes are (one model, one
-editor), while choosing one is personal and edits nobody's document (decision 6). If the
-named node's store is not open, the device falls back to the built-in of the same scheme
-and says so once in Settings. View > "Toggle Dark Mode" becomes "switch to the other
-scheme's theme": the last-used theme of the other scheme.
+**Decided (Joe, 2026-11-24, decision 6): app themes follow the account.** They are never
+store content: a store holds how its trees read, not how one person's window looks, and a
+theme kept in a store would leave the chrome depending on that store being open.
 
-Following the account (the personal document) is possible later; the per-device choice
-matches what Joe decided for places and views (window sizes and screens differ, and so do
-displays), so it is the recommendation.
+- **Where.** The personal document (`docs/DISCUSSIONS_CONTRACT.md` section 8,
+  `crates/pimble-app/src/personal.rs`), the one yrs document per account edited only by
+  that person's devices, gains two entries:
+  ```
+  app_themes: Map<theme id, Map>   a person's own app themes: name, base, scheme, tokens
+  app_theme:  String               the one in use: a built-in id or an app_themes id
+  ```
+  Signed out, it stays on the device (`personal.yrs`, IndexedDB in the browser), as read
+  state does. Signed in, it is encrypted for the person's own devices and synced, under
+  the switch that already governs the personal document (`personal_sync`). This is the
+  kind of account data CLAUDE.md allows ("a person's own state ... account data encrypted
+  for their own devices"); it adds no store content to Pimble Cloud. CLAUDE.md's rule
+  names this addition when it is built.
+- **Same model as document themes.** An app theme has a base (a built-in or another of the
+  person's app themes), sets only what it changes, and is edited in the same theme editor
+  with "Customize..." (section 3.1); its tokens are section 2.2's. A personal app theme is
+  edited by one person's devices only, so concurrent edits are that person's own on two
+  devices, merged as any map.
+- **No fallback puzzle.** The personal document is always present on every device that
+  runs Pimble, so the theme in use is always there. The only fallback left is a built-in
+  that a newer release removed, or a base deleted on another device: the chain then reads
+  Default for what is missing.
+- **Dark and light.** The `dark_mode` preference becomes the app theme's scheme. View >
+  "Toggle Dark Mode" switches to the last-used app theme of the other scheme
+  (`app_theme_last_dark`, `app_theme_last_light` beside `app_theme`). The first start after
+  this ships seeds `app_theme` from `state.json` `dark_mode` (`builtin:pimble-dark` or
+  `-light`), so nothing changes on screen.
+- **Giving an app theme to someone else** is not in the first waves: there is no store to
+  carry it. Later: "Copy as text" and "Paste theme" (the tokens as JSON, checked by type on
+  the way in), which needs no new sync path.
+- **A device of its own.** Should one device ever want a different theme from the account
+  (a projector, a work screen), a per-device override in `state.json` can be added
+  later; it is not in the first waves.
 
 ### 3.4 Built-ins
 
@@ -430,9 +456,9 @@ text good at any width. Until either lands, no token depends on it.
   sample text
   under it drawn live, and a scheme switch to preview dark and light. Edits are `applyEdit`s
   of `data.theme`, so two people editing a theme see each other's changes as they land.
-- **Settings > General > Theme**: the app theme, from built-ins and the app themes in open
-  stores, with "New App Theme..." (makes a theme node of kind `app` in a store the person
-  picks, based on the current one).
+- **Settings > General > Theme**: the app theme, from the built-ins and the person's own
+  app themes, with "Customize..." (a new personal app theme based on the one in use, opened
+  in the theme editor).
 - **Read-only**: a node this device may only read shows the picker disabled with
   `StoreAccess::READ_ONLY_REFUSAL`'s sentence, as every other edit does.
 
@@ -504,11 +530,9 @@ cut or add.
    a node in members' trees.
 5. **Mounts. Decided (Joe, 2026-11-24):** a mounted node keeps its native look: its theme
    is resolved in its own store, and the picker on a mount row acts on the source node.
-6. **App themes are theme nodes of kind `app`, chosen per device** (section 3.3).
-   *Recommendation: yes*: one model and one editor for making and copying themes, while
-   choosing one stays personal and per device like dark mode and zoom. Alternatives: app
-   themes kept as device files only (no co-editing, no copying through stores), or the
-   choice following the account through the personal document.
+6. **App themes. Decided (Joe, 2026-11-24):** they follow the account: a person's app themes
+   and the one in use live in the personal document, synced to their own devices when
+   signed in, never in a store (section 3.3).
 7. **Colors in document themes. Decided (Joe, 2026-11-24):** optional, as a palette of
    named slots, each a light and dark pair, the values drawn as chosen (section 2.1).
    Themes inherit from a base and set only what they change; "Customize..." is how one is
@@ -539,8 +563,9 @@ cut or add.
    targets).
 2. **Theme nodes.** `node_type = "theme"`, the theme editor pane, New Theme, bases, the
    picker's store group, copying from other open stores.
-3. **App themes.** The app token set, Settings > General, the viewer surface variables,
-   the two stock themes as data, Paper and Midnight.
+3. **App themes.** The app token set, the personal document's `app_themes` and
+   `app_theme`, Settings > General, the viewer surface variables, the two stock themes as
+   data, Paper and Midnight.
 4. **Shares and mounts** per decisions 4 and 5, with the sharing harness
    (`crates/pimble-server/tests/common`) covering a member who holds neither the
    ancestors nor the theme node, at each of the three theme accesses; the Share dialog's
