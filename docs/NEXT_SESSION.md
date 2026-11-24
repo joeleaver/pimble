@@ -11,6 +11,9 @@ Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all
   its branch tip and Joe's open decisions to the master and does not merge or release itself.
 - Bear liaison: local_9f92929f (`bear-liaison`). It handles Shared Pimble Notes and the Pimble To
   Do board, and posts release summaries only once a release is published.
+- Waiting on rinch: a code block can't grow past one line (Enter has no `newlineInCode`;
+  Shift+Enter's hard break isn't allowed in code). Sent to the Rinch master 2026-11-23; move
+  the pin when it merges.
 - The old-path inventory for wave 5 is in the side-session notes folder (`wave5-inventory.md`).
 
 **2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
