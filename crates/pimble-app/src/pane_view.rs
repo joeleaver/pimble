@@ -195,7 +195,8 @@ pub(crate) fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> 
         .map(|sig| {
             sig.with(|n| {
                 let query = n.metadata.metanode.as_ref().is_some_and(|m| m.is_query());
-                let icon = (n.metadata.icon().is_some() || query || crate::metanodes::is_metanode(n)).then(|| store.node_icon(n));
+                let shown_by_a_viewer = crate::metanodes::is_metanode(n) || store.child_viewer(store_id, n).is_some();
+                let icon = (n.metadata.icon().is_some() || query || shown_by_a_viewer).then(|| store.node_icon(store_id, n));
                 let color = n.metadata.color().map(|hex| display_color(hex, dark)).or_else(|| query.then(|| pimble_ui::appearance::gathered_violet(dark).to_string()));
                 (icon, color)
             })

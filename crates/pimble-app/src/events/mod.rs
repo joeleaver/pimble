@@ -21,11 +21,13 @@ mod cloud;
 mod connection;
 mod links;
 mod nodes;
+mod panes;
 mod stores;
 mod sync;
 mod view;
 
 pub(crate) use links::{follow_resolution, reveal_in_tree};
+pub(crate) use panes::rejudge_panes;
 use links::restore_resolved;
 use view::{apply_view, take_node};
 

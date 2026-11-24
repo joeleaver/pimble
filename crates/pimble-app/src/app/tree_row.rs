@@ -145,13 +145,17 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
     // A query metanode, a query metanode: violet, its own icon unless
     // the person chose one (section 6).
     let is_query = !is_store_root && node_sig.is_some_and(|sig| sig.with(crate::metanodes::is_query));
-    // A metanode with no icon of its own shows its viewer's.
+    // A metanode with no icon of its own shows its viewer's, and a node a
+    // child viewer shows (a kanban's column) that viewer's.
     let viewer_icon = if is_store_root {
         None
     } else {
+        let child_icon = |n: &pimble_core::Node| parsed.and_then(|(s_id, _)| store.child_viewer(s_id, n)).and_then(|c| c.icon);
         node_sig
-            .and_then(|sig| sig.with(|n| n.metadata.metanode.as_ref().map(|m| m.viewer.clone())))
-            .and_then(|viewer| store.viewer_icon(&viewer))
+            .and_then(|sig| sig.with(|n| match n.metadata.metanode.as_ref() {
+                Some(m) => store.viewer_icon(&m.viewer),
+                None => child_icon(n),
+            }))
             .and_then(|name| icon_by_name(&name))
     };
     let (custom_icon, node_color, row_color) = appearance_sig

@@ -39,6 +39,7 @@ mod share_words;
 mod stores;
 mod tree_rows;
 mod values;
+mod viewers;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -470,6 +471,9 @@ pub struct AppStore {
     /// The recipes installed plugins register ("New Kanban"), offered in the
     /// explorer's new-node menu (`crate::plugins`).
     pub recipes: Signal<Vec<PluginRecipe>>,
+    /// The child viewers installed plugins provide (a kanban's column), each
+    /// for the children of a viewer's metanodes (`viewers.rs`).
+    pub child_viewers: Signal<Vec<pimble_plugin_abi::ChildViewerDecl>>,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -665,6 +669,7 @@ impl AppStore {
             shares_ui: crate::shares::SharesUi::new(),
             presence: Signal::new(HashMap::new()),
             recipes: Signal::new(Vec::new()),
+            child_viewers: Signal::new(Vec::new()),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),

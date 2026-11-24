@@ -131,6 +131,23 @@ pub(crate) fn is_metanode(node: &Node) -> bool {
     node.metadata.metanode.is_some()
 }
 
+/// Whether a pane shows `node` (of `store_id`) as a metanode: it is one, or
+/// a child viewer shows it from where it is (a kanban's column opened on its
+/// own, docs/PLUGINS_CONTRACT.md ABI 7; `AppStore::child_viewer`).
+pub(crate) fn shows_as_metanode(store: AppStore, store_id: StoreId, node: &Node) -> bool {
+    is_metanode(node) || store.child_viewer(store_id, node).is_some()
+}
+
+/// A pane holds `node` (of `store_id`), whose parent the window does not
+/// have: it is asked for, since a child viewer of the parent's may show the
+/// node, and the parent's arrival judges the pane again.
+pub(crate) fn ask_for_parent(store: AppStore, store_id: StoreId, node: &Node) {
+    let Some(parent) = node.parent_id.filter(|_| !is_metanode(node)) else { return };
+    if store.get_node_signal(store_id, parent).is_none() {
+        store.send(BackendCommand::GetNode { store_id, node_id: parent });
+    }
+}
+
 /// Show metanode `(store_id, node_id)` in pane `pane`, instead of whatever
 /// it held, and ask for its forest.
 pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId) {
@@ -333,8 +350,15 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     let mut newer = None;
     // A query metanode shows its setup, built into the app.
     let setup = forest.spec.as_ref().is_some_and(|spec| spec.shows_setup());
-    if let Some(spec) = forest.spec.as_ref().filter(|_| !setup) {
-        match viewer(store, pane, &spec.viewer, forest) {
+    // Its own viewer, or (a node with none) the child viewer its place gives
+    // it: the forest of a kanban's column is the column's children.
+    let shown_by = match forest.spec.as_ref() {
+        Some(_) if setup => None,
+        Some(spec) => Some(spec.viewer.clone()),
+        None => store.child_viewer(forest.metanode.store, &forest.node).map(|c| c.id),
+    };
+    if let Some(shown_by) = shown_by {
+        match viewer(store, pane, &shown_by, forest) {
             Viewer::Plugin => plugin = true,
             Viewer::PluginAsking(sentence) => {
                 plugin = true;
@@ -346,7 +370,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             }
             Viewer::Outline(sentence) => lines.push(sentence),
             Viewer::Ask(sentence) => asking = Some(sentence),
-            Viewer::Missing => lines.push(outline_line(&spec.viewer)),
+            Viewer::Missing => lines.push(outline_line(&shown_by)),
         }
     }
     if let Some(why) = forest.not_understood() {
@@ -360,7 +384,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             node_id: entry.addr.node,
             depth: entry.depth,
             label: display_label_from_node(&entry.node),
-            icon: store.node_icon(&entry.node),
+            icon: store.node_icon(entry.addr.store, &entry.node),
             color: entry.node.metadata.color().map(str::to_string),
         })
         .collect();
@@ -439,9 +463,11 @@ fn decline_plugin(store: AppStore, pane: PaneId) {
     crate::plugins::decline(store, pane);
 }
 
-/// The plugins folder finished loading: every pane showing a metanode looks for
-/// its viewer again.
+/// The plugins folder finished loading: every pane is judged again (a child
+/// viewer may show its node now, or no longer), and every pane showing a
+/// metanode looks for its viewer again.
 pub(crate) fn plugins_ready(store: AppStore) {
+    crate::events::rejudge_panes(store);
     for pane in PaneId::ALL {
         let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { continue };
         let forest = FORESTS.with(|f| f.borrow().get(&(held.store_id, held.node_id)).cloned());

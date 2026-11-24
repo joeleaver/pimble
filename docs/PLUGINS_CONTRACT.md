@@ -513,8 +513,18 @@ first plugin.
    does not provide (no plugin decides how another's metanodes' children look) and one
    whose id is also a viewer's. `Registry::child_viewer(of)` finds it; `Registry::viewer`
    mounts it. The kanban provides `kanban-column` ("Kanban column", `layout-columns`).
-   The app side (opening such a child with it, its rows' icon) waits for the
-   notifications branch to merge.
+   The app (both targets) keeps the loaded plugins' child viewers in
+   `AppStore::child_viewers`; `AppStore::child_viewer(store, node)` is the one judgement
+   (no viewer of its own, a parent held whose non-query metanode's viewer has one), and
+   `metanodes::shows_as_metanode` is what every open asks. A pane showing such a node is a
+   metanode pane: its forest is the node's children (`Forest.spec` is `None`) and `fill`
+   mounts the child viewer. The row, the pane's strip and the outline take its icon
+   (`AppStore::node_icon(store, node)`, part of the row's snapshot). A pane is judged again
+   when what decides it changes elsewhere (`events/panes.rs`): the parent arriving or
+   changing (a pane holding a node whose parent the window lacks asks for it,
+   `metanodes::ask_for_parent`), and the plugins loading or changing
+   (`events::rejudge_panes` from `metanodes::plugins_ready`). Every plugin is built
+   again for ABI 7 and ships with the release that brings it.
 
 ## 5. How it is checked
 

@@ -6,7 +6,6 @@
 use pimble_core::{Node, NodeId, StoreId};
 use rinch::prelude::*;
 
-use crate::editor::start_editing;
 use crate::panes::PaneId;
 use crate::protocol::BackendCommand;
 use super::show_notice;
@@ -167,65 +166,11 @@ pub(super) fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool
     crate::discussions::node_loaded(store, store_id, node_id, content_bytes);
     crate::notice_show::names_arrived(store, &[(store_id, node_id)]);
 
-    // Every pane opened on this node.
-    for pane in store.panes_showing(store_id, node_id) {
-        if pane == store.focused() {
-            store.node_title.set(store.display_label(store_id, node_id));
-        }
-        // First load of the pane's document — start the editing/collab
-        // session. Guard against restarting an already-active session.
-        let state = store.pane(pane);
-        let already_editing = untracked(|| state.active_edit.get())
-            .map_or(false, |e| e.store_id == store_id && e.node_id == node_id);
-        let already_boarding = untracked(|| state.board.get())
-            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
-        let already_sheeting = untracked(|| state.sheet.get())
-            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
-        let already_discussing = untracked(|| state.discussion.get())
-            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
-        // A metanode shows its outline (docs/METANODES_CONTRACT.md); one that
-        // stopped being one shows as its type again, below.
-        let already_metanode = untracked(|| state.metanode.get())
-            .is_some_and(|m| m.store_id == store_id && m.node_id == node_id);
-        if crate::metanodes::is_metanode(node) {
-            if !already_metanode {
-                crate::metanodes::start(store, pane, store_id, node_id);
-            }
-            continue;
-        }
-        if already_metanode {
-            crate::metanodes::stop(store, pane);
-        }
-        if node.node_type == pimble_core::node_types::DISCUSSION && !already_discussing {
-            // A discussion (docs/DISCUSSIONS_CONTRACT.md).
-            state.show_editor.set(false);
-            state.show_board.set(false);
-            state.show_sheet.set(false);
-            state.show_discussion.set(true);
-            crate::discussions::start(store, pane, store_id, node_id, content_bytes);
-        }
-        if node.node_type == pimble_core::node_types::SHEET && !already_sheeting {
-            // A sheet node (docs/SHEETS_CONTRACT.md section 1).
-            state.show_editor.set(false);
-            state.show_board.set(false);
-            state.show_sheet.set(true);
-            crate::sheets::start(store, pane, store_id, node_id, content_bytes);
-        }
-        if node.node_type == pimble_core::node_types::BOARD && !already_boarding {
-            // A board node (docs/IMAGE_MARKUP_CONTRACT.md): the pane shows
-            // its board, its editor hidden.
-            state.show_editor.set(false);
-            state.show_board.set(true);
-            crate::boards::start(store, pane, store_id, node_id, content_bytes);
-        }
-        if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
-            // `open_node` could not tell this was a document (a search hit
-            // the tree had not loaded), so the pane is still hidden: show
-            // it with the session.
-            state.show_editor.set(true);
-            start_editing(store, pane, store_id, node_id, content_bytes);
-        }
-    }
+    // Every pane opened on this node, and every pane holding one of its
+    // children (it may have just become a kanban, or arrived as a column's
+    // parent).
+    super::panes::open_in_panes(store, store_id, node);
+    super::panes::rejudge_children(store, store_id, node_id);
     row_changed
 }
 

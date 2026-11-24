@@ -66,46 +66,26 @@ impl AppStore {
     /// its custom icon, colour and row colour, and whether it is shared. Part of the row's
     /// `TreeNodeData` label so a change re-renders the row (rinch #714), and
     /// nothing reads it back.
-    /// The icon a viewer's metanodes show when they have none of their own:
-    /// the one its plugin's recipe makes them with ("layout-kanban"), so a
-    /// node turned into a kanban looks like one made with New > Kanban.
-    pub fn viewer_icon(&self, viewer: &str) -> Option<String> {
-        untracked(|| self.recipes.with(|rs| rs.iter().find(|r| r.recipe.viewer == viewer).and_then(|r| r.recipe.icon.clone())))
-    }
-
-    /// The icon `node`'s row shows: its own, else a query metanode's, else its
-    /// viewer's (`viewer_icon`), else its type's.
-    pub fn node_icon(&self, node: &Node) -> String {
-        if node.metadata.icon().is_none() {
-            if let Some(m) = node.metadata.metanode.as_ref().filter(|m| !m.is_query()) {
-                if let Some(icon) = self.viewer_icon(&m.viewer) {
-                    return icon;
-                }
-            }
-        }
-        pimble_ui::appearance::node_icon(node)
-    }
-
-    fn row_snapshot(&self, store_id: StoreId, node_id: NodeId) -> String {
-        self.node_data.with(|map| {
-            map.get(&(store_id, node_id))
-                .map(|sig| {
-                    sig.with(|n| {
-                        format!(
-                            "{}|{}|{}|{}|{}",
-                            n.metadata.icon().unwrap_or(""),
-                            n.metadata.color().unwrap_or(""),
-                            n.metadata.background().unwrap_or(""),
-                            if n.metadata.share().is_some() { "shared" } else { "" },
-                            // A query metanode looks like one (its icon and
-                            // violet), and stops when its source changes.
-                            n.metadata.metanode.as_ref().map_or(String::new(), |m| {
-                                format!("{}{}|{}", m.viewer, if m.is_query() { " query" } else { "" }, self.viewer_icon(&m.viewer).unwrap_or_default())
-                            }),
-                        )
-                    })
-                })
-                .unwrap_or_default()
+    pub(super) fn row_snapshot(&self, store_id: StoreId, node_id: NodeId) -> String {
+        let Some(sig) = self.node_data.with(|map| map.get(&(store_id, node_id)).copied()) else {
+            return String::new();
+        };
+        sig.with(|n| {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                n.metadata.icon().unwrap_or(""),
+                n.metadata.color().unwrap_or(""),
+                n.metadata.background().unwrap_or(""),
+                if n.metadata.share().is_some() { "shared" } else { "" },
+                // A query metanode looks like one (its icon and
+                // violet), and stops when its source changes.
+                n.metadata.metanode.as_ref().map_or(String::new(), |m| {
+                    format!("{}{}|{}", m.viewer, if m.is_query() { " query" } else { "" }, self.viewer_icon(&m.viewer).unwrap_or_default())
+                }),
+                // A kanban's column looks like one once the plugin
+                // providing its child viewer is known.
+                self.child_viewer(store_id, n).and_then(|c| c.icon).unwrap_or_default(),
+            )
         })
     }
 
@@ -425,7 +405,7 @@ mod tests {
         let (app, store_id, child_id) = store_with_a_child();
         let mut node = Node::document("Board");
         node.metadata.metanode = pimble_core::metanode::Metanode::from_stored(Some("kanban"), Some("children 2"));
-        assert_eq!(app.node_icon(&node), "file");
+        assert_eq!(app.node_icon(store_id, &node), "file");
         let before = app.row_snapshot(store_id, child_id);
         app.recipes.set(vec![PluginRecipe {
             plugin: "kanban".into(),
@@ -439,19 +419,20 @@ mod tests {
                 children: Vec::new(),
             },
         }]);
-        assert_eq!(app.node_icon(&node), "layout-kanban");
+        assert_eq!(app.node_icon(store_id, &node), "layout-kanban");
         node.metadata.set_icon(Some("star".into()));
-        assert_eq!(app.node_icon(&node), "star");
+        assert_eq!(app.node_icon(store_id, &node), "star");
         let mut other = Node::document("Gallery");
         other.metadata.metanode = pimble_core::metanode::Metanode::from_stored(Some("gallery"), None);
-        assert_eq!(app.node_icon(&other), "file");
+        assert_eq!(app.node_icon(store_id, &other), "file");
         // The row of a kanban metanode re-renders once the kanban's recipe is known.
         let mut board = Node::document("Recipes");
         board.id = child_id;
         board.metadata.metanode = pimble_core::metanode::Metanode::from_stored(Some("kanban"), None);
         app.upsert_node(store_id, board);
         let with = app.row_snapshot(store_id, child_id);
-        assert!(with.ends_with("kanban|layout-kanban"), "{with}");
+        // The last segment is the child viewer's icon: a kanban of its own has none.
+        assert!(with.ends_with("kanban|layout-kanban|"), "{with}");
         assert_ne!(before, with);
     }
 

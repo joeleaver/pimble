@@ -97,7 +97,10 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                     let board = node.node_type == pimble_core::node_types::BOARD;
                     let sheet = node.node_type == pimble_core::node_types::SHEET;
                     let discussion = node.node_type == pimble_core::node_types::DISCUSSION;
-                    let metanode = crate::metanodes::is_metanode(node);
+                    // A node with no viewer of its own may be shown by its
+                    // parent's child viewer (a kanban's column).
+                    crate::metanodes::ask_for_parent(store, s_id, node);
+                    let metanode = crate::metanodes::shows_as_metanode(store, s_id, node);
                     (label, node.content.clone(), is_doc, board, sheet, discussion, metanode)
                 })
             });

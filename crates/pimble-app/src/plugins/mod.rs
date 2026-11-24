@@ -158,6 +158,9 @@ fn loaded(registry: Registry) {
     if let Some(store) = STORE.with(Cell::get) {
         // What the explorer's new-node menu offers from them.
         store.recipes.set(recipes());
+        // The child viewers they provide (a kanban's column), for the
+        // children of their viewers' metanodes.
+        store.child_viewers.set(child_viewers());
         // Rows of metanodes with no icon of their own show their viewer's.
         store.bump_tree_structure();
         crate::metanodes::plugins_ready(store);
@@ -230,6 +233,11 @@ fn recipes() -> Vec<crate::state::PluginRecipe> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// The child viewers every loaded plugin provides, in the folder's order.
+fn child_viewers() -> Vec<pimble_plugin_abi::ChildViewerDecl> {
+    with_registry(|registry| registry.plugins.iter().flat_map(|p| p.manifest.child_viewers().cloned()).collect()).unwrap_or_default()
 }
 
 /// A row's recipe item: make what `recipe` says under `parent`, through the
