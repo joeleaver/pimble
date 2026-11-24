@@ -1,5 +1,6 @@
 //! The Inbox (docs/NOTIFICATIONS_CONTRACT.md sections 4 to 6): the notices
-//! this person has received — mentions of them and replies to them — shown
+//! this person has received — mentions of them, replies to them and others'
+//! changes to notes they watch (`crate::watches`) — shown
 //! as they arrive in an operating-system notification (rinch's
 //! `notifications` on the desktop, the Notifications API in the browser),
 //! listed in View > "Inbox..." newest first with the unread on top, and
@@ -24,6 +25,17 @@ pub fn title_of(notice: &Notice) -> String {
         (NoticeKind::Mention, false) => format!("{who} mentioned you"),
         (NoticeKind::Mention, true) => format!("{who} mentioned you in a discussion"),
         (NoticeKind::Reply, _) => format!("{who} replied in a discussion"),
+        (NoticeKind::Watch, _) => format!("{who}: {}", pimble_core::watch::changes_line(notice.count)),
+    }
+}
+
+/// What the system's notification says under the title: the words around a
+/// mention or of a reply, or the name of the note a watch notice is about
+/// (the accounts service never knows it; this device does).
+fn body_of(store: AppStore, notice: &Notice) -> String {
+    match notice.kind {
+        NoticeKind::Watch => untracked(|| store.display_label(notice.store, notice.node)),
+        _ => notice.snippet.clone(),
     }
 }
 
@@ -181,7 +193,7 @@ pub(crate) fn open_inbox(store: AppStore) {
 fn show_system_notification(store: AppStore, notice: &Notice) {
     let clicked = notice.clone();
     let shown = rinch::notification::Notification::new(title_of(notice))
-        .body(notice.snippet.clone())
+        .body(body_of(store, notice))
         .icon_png(include_bytes!("../../../assets/brand/png/pimble-256.png"))
         .on_click(move || {
             crate::app::bring_to_front(None);
@@ -202,7 +214,7 @@ fn show_system_notification(store: AppStore, notice: &Notice) {
         return;
     }
     let options = web_sys::NotificationOptions::new();
-    options.set_body(&notice.snippet);
+    options.set_body(&body_of(store, notice));
     options.set_tag(&notice.id);
     options.set_icon("/app/pimble-icon.svg");
     let Ok(shown) = web_sys::Notification::new_with_options(&title_of(notice), &options) else { return };
@@ -368,7 +380,7 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
             class: "pimble-inbox",
             div {
                 class: "pimble-inbox__head",
-                span { class: "pimble-inbox__heading", "Mentions and replies" }
+                span { class: "pimble-inbox__heading", "Notices" }
                 if unread_count(store) > 0 {
                     Button { variant: "subtle", size: "xs", onclick: move || mark_all_read(store), "Mark All Read" }
                 }
@@ -380,7 +392,7 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
                 div { class: "pimble-discussion__empty", "Notifications are off (Settings > Account)." }
             }
             if store.cloud_signed_in.get() && store.notifications_on.get() && store.notices.get().is_empty() {
-                div { class: "pimble-discussion__empty", "Nobody has mentioned you or replied to you yet." }
+                div { class: "pimble-discussion__empty", "Nothing yet: mentions, replies and changes to notes you watch show here." }
             }
             for (notice, read) in rows(store) {
                 div {
@@ -395,8 +407,26 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
                         {title_of(&notice)}
                         span { class: "pimble-inbox__when", {crate::discussions::ago(&notice.at, crate::boards::now_ms())} }
                     }
-                    div { class: "pimble-inbox__snippet", {notice.snippet.clone()} }
-                    div { class: "pimble-inbox__where", {store.display_label(notice.store, notice.node)} }
+                    if !notice.snippet.is_empty() {
+                        div { class: "pimble-inbox__snippet", {notice.snippet.clone()} }
+                    }
+                    div {
+                        class: "pimble-inbox__where",
+                        {store.display_label(notice.store, notice.node)}
+                        // A change in a note watched: stop watching it from
+                        // here (its own watch, or the subtree watch above).
+                        if notice.kind == NoticeKind::Watch && crate::watches::can_watch(store) {
+                            Button {
+                                variant: "subtle",
+                                size: "xs",
+                                onclick: {
+                                    let (s_id, n_id) = (notice.store, notice.node);
+                                    move || crate::watches::unwatch(store, s_id, n_id)
+                                },
+                                "Unwatch"
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -408,7 +438,7 @@ mod tests {
     use super::*;
 
     fn notice(kind: NoticeKind, discussion: Option<NodeId>, snippet: &str) -> Notice {
-        Notice { id: "n".into(), kind, from: "joe".into(), from_name: "Joe".into(), store: StoreId::new(), node: NodeId::new(), discussion, anchor: Some("m1".into()), snippet: snippet.into(), at: "2026-11-23T10:00:00.000Z".into() }
+        Notice { id: "n".into(), kind, from: "joe".into(), from_name: "Joe".into(), store: StoreId::new(), node: NodeId::new(), discussion, anchor: Some("m1".into()), snippet: snippet.into(), at: "2026-11-23T10:00:00.000Z".into(), count: 0 }
     }
 
     #[test]
@@ -419,6 +449,12 @@ mod tests {
         let mut nameless = notice(NoticeKind::Reply, None, "");
         nameless.from_name = " ".into();
         assert_eq!(title_of(&nameless), "Someone replied in a discussion");
+        let mut watched = notice(NoticeKind::Watch, None, "");
+        watched.count = 3;
+        assert_eq!(title_of(&watched), "Joe: 3 changes in a note you watch");
+        let (_, node, anchor) = target_of(&watched);
+        assert_eq!(node, watched.node, "a watch notice opens the note changed");
+        assert!(anchor.is_none());
     }
 
     #[test]

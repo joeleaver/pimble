@@ -1099,6 +1099,50 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             }
         }
 
+        BackendCommand::SetWatchesOn { on } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });
+            };
+            if let Err(e) = c.set_watches_on(on).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() });
+            }
+            match c.list_watches().await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::WatchNode { store_id, node_id, subtree } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Watches, message: "Not connected".into() });
+            };
+            match c.watch_node(store_id, node_id, subtree).await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Watches, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::UnwatchNode { store_id, node_id } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Watches, message: "Not connected".into() });
+            };
+            match c.unwatch_node(store_id, node_id).await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Watches, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListWatches => {
+            let c = ctx.host.as_ref()?;
+            match c.list_watches().await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => {
+                    tracing::debug!("watches not listed: {e}");
+                    None
+                }
+            }
+        }
+
         BackendCommand::RegisterPush { endpoint, p256dh, auth } => {
             let c = ctx.host.as_ref()?;
             if let Err(e) = c.register_push(endpoint, p256dh, auth).await {
@@ -1381,5 +1425,9 @@ mod tests {
 }
 
 fn notices_listed(listed: pimble_rpc::ListNoticesResponse) -> BackendEvent {
-    BackendEvent::NoticesListed { notices: listed.notices, on: listed.on, email: listed.email, push: listed.push, push_key: listed.push_key }
+    BackendEvent::NoticesListed { notices: listed.notices, on: listed.on, email: listed.email, push: listed.push, push_key: listed.push_key, watches: listed.watches }
+}
+
+fn watches_listed(listed: pimble_rpc::ListWatchesResponse) -> BackendEvent {
+    BackendEvent::WatchesListed { watches: listed.watches, on: listed.on }
 }

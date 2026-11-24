@@ -123,6 +123,11 @@ function noticeRecord() {
 function titleOf(notice) {
     const who = (notice.from_name || "").trim() || "Someone";
     if (notice.kind === "reply") return who + " replied in a discussion";
+    // Wave 3: as `pimble_core::watch::changes_line` says it.
+    if (notice.kind === "watch") {
+        const n = notice.count || 1;
+        return who + ": " + (n <= 1 ? "1 change" : n + " changes") + " in a note you watch";
+    }
     return notice.discussion ? who + " mentioned you in a discussion" : who + " mentioned you";
 }
 

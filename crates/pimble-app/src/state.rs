@@ -954,6 +954,10 @@ pub struct AppStore {
     /// Wave 2: the email fallback's switch, and web push's.
     pub notify_email: Signal<bool>,
     pub notify_push: Signal<bool>,
+    /// Wave 3: whether changes to watched notes are told, and the watches
+    /// the account chose (`crate::watches`); nothing is watched by default.
+    pub notify_watches: Signal<bool>,
+    pub watches: Signal<Vec<pimble_rpc::WatchEntry>>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1243,6 +1247,8 @@ impl AppStore {
             notifications_on: Signal::new(true),
             notify_email: Signal::new(true),
             notify_push: Signal::new(true),
+            notify_watches: Signal::new(true),
+            watches: Signal::new(Vec::new()),
             discussions_modal: Signal::new(false),
             all_discussions: Signal::new(Vec::new()),
         }

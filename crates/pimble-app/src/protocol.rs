@@ -350,6 +350,20 @@ pub enum BackendCommand {
     /// Wave 2's channels for the account, one or both: the email fallback,
     /// web push. Answers `NoticesListed`, or `CloudError { op: Notifications }`.
     SetNotificationChannels { email: Option<bool>, push: Option<bool> },
+    /// Wave 3: watched notes on or off for the account; off deletes every
+    /// watch. Answers `NoticesListed` and then `WatchesListed`, or
+    /// `CloudError { op: Notifications }`.
+    SetWatchesOn { on: bool },
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3). Answers `WatchesListed`, or `CloudError { op: Watches }`
+    /// with the sentence that refused it.
+    WatchNode { store_id: StoreId, node_id: NodeId, subtree: bool },
+    /// Stop watching a node: its own watch, or else the subtree watch that
+    /// reaches it from nearest above. Answers `WatchesListed`, or
+    /// `CloudError { op: Watches }`.
+    UnwatchNode { store_id: StoreId, node_id: NodeId },
+    /// The watches the account chose. Answers `WatchesListed`.
+    ListWatches,
     /// This browser subscribed to web push (wave 2): handed to the server,
     /// which gives it to the accounts service and takes it back at sign-out.
     /// Answers nothing.
@@ -483,6 +497,8 @@ pub enum CloudOp {
     Shares,
     /// The notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
     Notifications,
+    /// Watching or unwatching a node (section 3, wave 3).
+    Watches,
 }
 
 /// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
@@ -766,7 +782,10 @@ pub enum BackendEvent {
     NoticeReceived { notice: pimble_rpc::Notice },
     /// The notices this device keeps, newest first, and whether
     /// notifications are on (`ListNotices`, `SetNotifications`).
-    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String> },
+    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String>, watches: bool },
+    /// The watches the account chose, and whether watched notes are on
+    /// (`ListWatches`, `WatchNode`, `UnwatchNode`, `SetWatchesOn`).
+    WatchesListed { watches: Vec<pimble_rpc::WatchEntry>, on: bool },
     /// A `pimble:` link this computer was asked to open, handed to this window
     /// by the server (`openInApp`; desktop only), with the activation token
     /// the program that was asked came with, to come to the front with.

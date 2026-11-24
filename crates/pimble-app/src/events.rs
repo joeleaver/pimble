@@ -1509,9 +1509,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::NoticeReceived { notice } => {
                 crate::inbox::received(store, notice.clone());
             }
-            BackendEvent::NoticesListed { notices, on, email, push, push_key } => {
+            BackendEvent::NoticesListed { notices, on, email, push, push_key, watches } => {
                 crate::inbox::listed(store, notices.clone(), *on);
                 crate::inbox::channels(store, *email, *push, push_key.clone());
+                store.notify_watches.set(*watches);
+            }
+            BackendEvent::WatchesListed { watches, on } => {
+                crate::watches::listed(store, watches.clone(), *on);
             }
             BackendEvent::AppLink { url, activation_token } => {
                 #[cfg(feature = "native")]
@@ -1534,8 +1538,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.send(BackendCommand::CloudListShares);
                     // The notices this device keeps (docs/NOTIFICATIONS_CONTRACT.md).
                     store.send(BackendCommand::ListNotices);
+                    store.send(BackendCommand::ListWatches);
                 } else {
                     crate::boards::set_author(None, None);
+                    store.watches.set(Vec::new());
                 }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
                 store.cloud_answer.set(crate::state::CloudAnswer::Answered);
@@ -1590,6 +1596,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         store.send(BackendCommand::ListNotices);
                         show_notice(store, format!("Notifications could not be changed: {message}"));
                     }
+                    CloudOp::Watches => show_notice(store, message.clone()),
                     CloudOp::HostStore => {
                         store.host_modal_busy.set(false);
                         store.host_modal_error.set(message.clone());

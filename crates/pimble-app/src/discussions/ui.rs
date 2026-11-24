@@ -655,6 +655,7 @@ pub(crate) fn render_unread_modal(__scope: &mut RenderScope, store: AppStore) ->
             title: "Inbox",
             size: "md",
             {crate::inbox::render_notices(__scope, store)}
+            {crate::watches::render_watched(__scope, store)}
             div {
                 class: "pimble-discussions pimble-discussions--modal",
                 div { class: "pimble-inbox__heading", "Unread discussions" }

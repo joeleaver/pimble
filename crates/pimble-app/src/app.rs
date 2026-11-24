@@ -1629,6 +1629,22 @@ fn explorer_menu(
     let on_rename = move || {
         start_rename(store, tree_state, &row());
     };
+    // "Watch" (docs/NOTIFICATIONS_CONTRACT.md section 3): hear when others
+    // change this note, or anything under it; nothing is watched by default.
+    let on_watch = move |subtree: bool| {
+        if let Some((s_id, n_id)) = node_of() {
+            crate::watches::watch(store, s_id, n_id, subtree);
+        }
+    };
+    let on_unwatch = move || {
+        if let Some((s_id, n_id)) = node_of() {
+            crate::watches::unwatch(store, s_id, n_id);
+        }
+    };
+    let watch_menu = move || match node_of() {
+        Some((s_id, n_id)) => store.watches.with(|all| crate::watches::menu_state(all, s_id, n_id)),
+        None => crate::watches::MenuState { watch: false, watch_subtree: false, unwatch: false },
+    };
     // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision 2): the
     // focused pane is split to the right and this document opens in the new
     // half. Off with four panes open.
@@ -1843,6 +1859,29 @@ fn explorer_menu(
                         disabled: {move || !menu.can_comment.get()},
                         onclick: on_start_discussion,
                         "Discuss"
+                    }
+                    DropdownMenuSub {
+                        label: "Watch",
+                        left_section: TablerIcon::Eye,
+                        disabled: {move || several() || !crate::watches::can_watch(store)},
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Eye,
+                            disabled: {move || !watch_menu().watch},
+                            onclick: move || on_watch(false),
+                            "Watch"
+                        }
+                        DropdownMenuItem {
+                            left_section: TablerIcon::Eye,
+                            disabled: {move || !watch_menu().watch_subtree},
+                            onclick: move || on_watch(true),
+                            "Watch with Subtree"
+                        }
+                        DropdownMenuItem {
+                            left_section: TablerIcon::EyeOff,
+                            disabled: {move || !watch_menu().unwatch},
+                            onclick: on_unwatch,
+                            "Unwatch"
+                        }
                     }
                     DropdownMenuDivider {}
                     DropdownMenuItem {
@@ -3846,6 +3885,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                     {CHANNELS_LINE}
                 }
+                Checkbox {
+                    label: "Tell me when others change notes I watch",
+                    checked_fn: move || store.notify_watches.get(),
+                    onchange: move || crate::watches::set_on(store, !untracked(|| store.notify_watches.get())),
+                }
                 div {
                     style: "display: flex; gap: 8px;",
                     Button { variant: "default", size: "xs", onclick: run_account_action, "Your Account Page" }
@@ -3965,6 +4009,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             div {
                                 style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                                 {CHANNELS_LINE}
+                            }
+                            Checkbox {
+                                label: "Tell me when others change notes I watch",
+                                checked_fn: move || store.notify_watches.get(),
+                                onchange: move || crate::watches::set_on(store, !untracked(|| store.notify_watches.get())),
                             }
 
                             Button {
