@@ -14,6 +14,11 @@ Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all
 - Waiting on rinch: a code block can't grow past one line (Enter has no `newlineInCode`;
   Shift+Enter's hard break isn't allowed in code). Sent to the Rinch master 2026-11-23; move
   the pin when it merges.
+- Kanban worker local_97f04d79 (`kanban-fixes`): its drop and column-height fixes are on
+  `claude/kanban-drops-height-38d78a` (0b7f4d7), under review, then the master merges them. Next is Joe's
+  column view (a column node opens as one kanban column, with a column icon; ABI 7
+  `Provision::ChildViewer`). Its ABI, SDK and plugin parts can be built now. Its app edits, with the splits
+  of app.rs, state.rs, events.rs and plugins.rs, wait until notifications merges.
 - The old-path inventory for wave 5 is in the side-session notes folder (`wave5-inventory.md`).
 
 **2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
