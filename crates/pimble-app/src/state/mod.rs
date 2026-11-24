@@ -223,8 +223,9 @@ pub struct AppStore {
     // filters the icon grid over the whole Tabler set. Tags are the
     // Properties panel's (docs/PROPERTIES_CONTRACT.md).
     pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
-    /// The node the Theme picker is open for (Format > Theme..., a row's
-    /// "Theme...", docs/THEMES_CONTRACT.md section 9); `None` when closed.
+    /// The node the Theme picker is open for (Node > Theme..., a row's
+    /// "Theme...", the Properties panel, docs/THEMES_CONTRACT.md section 9);
+    /// `None` when closed.
     pub theme_picker_node: Signal<Option<(StoreId, NodeId)>>,
     pub appearance_icon_query: Signal<String>,
 

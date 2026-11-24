@@ -90,7 +90,7 @@ fn a_name_no_theme_answers_is_skipped_and_said() {
     assert_eq!(in_force.unresolved, vec![(1, "a-theme-node-this-device-lacks".to_string())]);
     assert_eq!(
         unresolved_sentences(&in_force, &walk),
-        vec!["The theme 'Folder' names is not one this device has, so the one above it is used.".to_string()]
+        vec!["The theme that 'Folder' names is not one this device has, so the one above it is used.".to_string()]
     );
 }
 

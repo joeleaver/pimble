@@ -181,6 +181,11 @@
     border-radius: 6px;
     padding: 0.5em 0.9em;
 }
+/* The bar's color per scheme above is more specific than the frame; the left
+   edge is the frame's too. */
+.pimble-editor__content-wrap--quote-boxed > [data-pm-editor][data-pm-theme] blockquote {
+    border-left-color: var(--pd-rule, var(--rinch-color-border));
+}
 
 /* ── Code ───────────────────────────────────────────────────────── */
 .pimble-editor__content-wrap > [data-pm-editor] code,

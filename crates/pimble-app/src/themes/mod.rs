@@ -204,7 +204,7 @@ pub(crate) fn unresolved_sentences(in_force: &InForce, walk: &Walk) -> Vec<Strin
         .unresolved
         .iter()
         .map(|(depth, _)| match walk.steps.get(*depth) {
-            Some(step) => format!("The theme '{}' names is not one this device has, so the one above it is used.", step.label),
+            Some(step) => format!("The theme that '{}' names is not one this device has, so the one above it is used.", step.label),
             None => "A theme named above this note is not one this device has.".to_string(),
         })
         .collect()

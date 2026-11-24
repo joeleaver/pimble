@@ -86,6 +86,12 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
         }
         None => String::new(),
     };
+    // What "Use the parent's" reads in: the theme above, else the note's
+    // paragraphs fallback (Document for a note spaced before themes).
+    let parent_hint = move || match target() {
+        Some((s_id, n_id)) => format!("Reads in {} here.", themes::theme_name(&themes::in_force_without_own(store, s_id, n_id).id)),
+        None => String::new(),
+    };
     let send = move |theme: Option<String>| {
         let Some((store_id, node_id)) = untracked(target) else { return };
         // A native control cannot always be greyed out in time, so the
@@ -195,7 +201,7 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                             onmouseenter: move || previewed.set(Some(Choice::Parent)),
                             onclick: move || send(None),
                             div { "Use the parent's" }
-                            div { class: "pimble-theme-choice__hint", "Reads in the theme above it, or Default." }
+                            div { class: "pimble-theme-choice__hint", {move || parent_hint()} }
                         }
                         div { class: "pimble-appearance__label", "Built-in" }
                         {builtin_rows}

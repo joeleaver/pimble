@@ -42,14 +42,19 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
         store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.background().map(String::from))
     };
     // The document theme in force on the node and where it comes from
-    // (docs/THEMES_CONTRACT.md section 9); "Theme..." opens its picker.
+    // (docs/THEMES_CONTRACT.md section 9); "Theme..." opens its picker. On a
+    // mount both are the source node's, as everywhere a theme is chosen.
+    let theme_node = move || {
+        let (s_id, n_id) = store.appearance_modal_node.get()?;
+        super::theme_picker::theme_target(store, s_id, n_id)
+    };
     let theme_line = move || -> String {
-        let Some((s_id, n_id)) = store.appearance_modal_node.get() else { return String::new() };
+        let Some((s_id, n_id)) = theme_node() else { return String::new() };
         let (in_force, walk) = crate::themes::resolve(store, s_id, n_id);
         crate::themes::in_force_sentence(&in_force, &walk)
     };
     let open_theme = move || {
-        if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
+        if let Some((store_id, node_id)) = untracked(theme_node) {
             store.appearance_modal_node.set(None);
             super::theme_picker::open_theme_picker(store, store_id, node_id);
         }
