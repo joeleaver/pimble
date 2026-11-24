@@ -642,7 +642,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
-- `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
+- `crates/pimble-app/src/app/` - the UI tree: `mod.rs` (`build_view`), `explorer.rs`, `tree_row.rs`, `explorer_menu.rs` (the tree, rename, drag-and-drop, the row menu), `shell.rs` (the page and status bar), `search.rs`, and the dialogs (`store_modals.rs`, `share_modal.rs`, `hosting.rs`, `account.rs`, ...)
 - `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
 - `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view.rs` - the split view: the tiling model, and the pane and divider slots
 - `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document

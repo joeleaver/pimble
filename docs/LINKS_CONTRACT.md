@@ -136,7 +136,7 @@ ever leaves the app without the modifier.
   link over the query text as typed.
 - **The picker is built** (2026-09-23, on rinch #916's `on_key`, `on_selection_change`,
   `on_caret_moved`, `caret_rect`; `link_picker.rs`, `LinksPlugin`'s `[[` rule and Mod-L,
-  the popup in `app.rs`) and checked in the app: `[[vend`, Down, Enter makes "Vendors" a
+  the popup in `app/shell.rs`) and checked in the app: `[[vend`, Down, Enter makes "Vendors" a
   link with the next words unlinked; Ctrl+L over a word, typing an address, Enter links
   it; Ctrl+L on a link offers "Remove Link" first. In a Ctrl+L picker the query is typed
   into the popup through `on_key` (the editor keeps focus, the same code on both
@@ -147,7 +147,7 @@ ever leaves the app without the modifier.
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).
   With nothing selected and not in a link it does nothing.
 - **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard (a
-  store row: its root; built 2026-09-23, `app.rs` `copy_link`, `links::copy_text`: rinch's
+  store row: its root; built 2026-09-23, `app/rows.rs` `copy_link`, `links::copy_text`: rinch's
   clipboard on the desktop, `navigator.clipboard` in the browser; "Link copied." in the
   status bar).
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the

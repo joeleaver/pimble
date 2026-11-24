@@ -149,7 +149,7 @@ sends `CloudListHostedStores` at once; not signed in: the hosted modal shows
 "Sign in first" with a button that opens the Account modal). Update the test's
 minimum count if it matters.
 
-## App (`crates/pimble-app/src/app.rs`)
+## App (`crates/pimble-app/src/app/`: `account.rs`, `hosting.rs`)
 
 - `open_account_modal(store, hint: &str)`, `open_host_modal(store, store_id)`,
   `open_hosted_modal(store)`; the three modals rendered beside the existing ones (both
