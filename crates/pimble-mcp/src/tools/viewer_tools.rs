@@ -15,6 +15,9 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use pimble_plugin_host::library;
+use pimble_plugin_host::registry::id_from_file;
+
 use super::{crdt, Pimble};
 
 /// The viewer Pimble itself provides: a query metanode's list.
@@ -42,11 +45,33 @@ struct Installed {
     file: String,
     path: PathBuf,
     guide: Option<Result<guide::Guide, String>>,
+    /// The person turned it off in Settings > Plugins: its viewers show
+    /// nothing and its tools do not run (docs/PLUGINS_CONTRACT.md section 7).
+    off: bool,
+}
+
+/// The plugins turned off in Settings > Plugins, by id.
+fn turned_off() -> std::collections::BTreeSet<String> {
+    let read = std::fs::read(plugins_dir().join(library::PROVENANCE_FILE));
+    read.map(|bytes| library::Provenance::parse(&bytes).off).unwrap_or_default()
+}
+
+/// The plugin a file holds: its manifest's id (the file compiled, once per
+/// version of it), else its name read as one, as the app reads it.
+fn plugin_id(path: &std::path::Path) -> String {
+    compiled(path).map(|plugin| plugin.manifest.id).unwrap_or_else(|_| id_from_file(path))
+}
+
+/// The sentence for a turned-off plugin's tool.
+fn turned_off_sentence(plugin: &str) -> String {
+    format!("Nothing was run: the plugin providing {plugin} is turned off in Pimble (Settings > Plugins).")
 }
 
 /// Every plugin installed here, read now: a handful of file reads, so a
-/// plugin added or updated since is seen at once.
+/// plugin added or updated since is seen at once. Which are turned off is
+/// known by their ids, so their files are compiled only when any is off.
 fn installed() -> Vec<Installed> {
+    let off = turned_off();
     let mut found: Vec<Installed> = std::fs::read_dir(plugins_dir())
         .map(|entries| {
             entries
@@ -55,7 +80,8 @@ fn installed() -> Vec<Installed> {
                 .filter_map(|path| {
                     let bytes = std::fs::read(&path).ok()?;
                     let file = path.file_name()?.to_string_lossy().into_owned();
-                    Some(Installed { file, guide: guide::read(&bytes), path })
+                    let off = !off.is_empty() && off.contains(&plugin_id(&path));
+                    Some(Installed { file, guide: guide::read(&bytes), path, off })
                 })
                 .collect()
         })
@@ -66,19 +92,24 @@ fn installed() -> Vec<Installed> {
 
 /// The guide for viewer `id`, from whichever installed plugin provides it.
 fn viewer_guide(id: &str) -> Option<ViewerGuide> {
-    provider(id).and_then(|(_, g)| g.viewer(id).cloned())
+    provider(id).and_then(|p| p.guide.viewer(id).cloned())
+}
+
+/// An installed plugin with a guide.
+struct Provider {
+    path: PathBuf,
+    guide: guide::Guide,
+    off: bool,
 }
 
 /// The installed plugin that provides viewer `id`, or whose file is `id`
-/// (`timeline_viewer`, `timeline-viewer`), with its guide.
-fn provider(id: &str) -> Option<(PathBuf, guide::Guide)> {
-    let stem = id.trim().trim_end_matches(".wasm").replace('-', "_");
-    let all: Vec<(PathBuf, String, guide::Guide)> =
-        installed().into_iter().filter_map(|p| Some((p.path, p.file.trim_end_matches(".wasm").to_string(), p.guide?.ok()?))).collect();
-    all.iter()
-        .find(|(_, _, g)| g.viewer(id).is_some())
-        .or_else(|| all.iter().find(|(_, file, _)| *file == stem))
-        .map(|(path, _, g)| (path.clone(), g.clone()))
+/// (`timeline-viewer`, or the build's `timeline_viewer`), with its guide.
+fn provider(id: &str) -> Option<Provider> {
+    let wanted = id_from_file(std::path::Path::new(&format!("{}.wasm", id.trim().trim_end_matches(".wasm"))));
+    let all: Vec<Provider> = installed().into_iter().filter_map(|p| Some(Provider { guide: p.guide?.ok()?, path: p.path, off: p.off })).collect();
+    let by_viewer = all.iter().position(|p| p.guide.viewer(id).is_some());
+    let at = by_viewer.or_else(|| all.iter().position(|p| id_from_file(&p.path) == wanted))?;
+    all.into_iter().nth(at)
 }
 
 // ── Running a plugin's tools (docs/AGENT_GUIDES_CONTRACT.md section 8) ─────
@@ -107,7 +138,7 @@ fn compiled(path: &std::path::Path) -> Result<pimble_plugin_host::wasmtime_engin
 /// first check an agent's write makes does not wait for the compiler.
 pub(super) fn warm() {
     let _ = std::thread::Builder::new().name("pimble-mcp-plugins".into()).spawn(|| {
-        for plugin in installed() {
+        for plugin in installed().into_iter().filter(|p| !p.off) {
             if plugin.guide.as_ref().is_some_and(|g| g.as_ref().is_ok_and(|g| !g.tools.is_empty())) {
                 if let Err(e) = compiled(&plugin.path) {
                     tracing::warn!("plugin {} cannot run its tools: {e}", plugin.file);
@@ -150,7 +181,8 @@ impl Pimble {
             if metanode.source.depth() < distance {
                 continue;
             }
-            let Some((path, g)) = provider(&metanode.viewer) else { continue };
+            // A turned-off plugin runs nothing, its checks included.
+            let Some(Provider { path, guide: g, off: false }) = provider(&metanode.viewer) else { continue };
             if g.tool(guide::CHECK_FIELD).is_none() {
                 continue;
             }
@@ -269,7 +301,12 @@ impl Pimble {
     async fn list_viewers(&self) -> Result<String, String> {
         let mut out = String::from("The viewers installed on this computer (set_metanode's viewer):\n\n");
         let mut without = Vec::new();
+        let mut off = Vec::new();
         for plugin in installed() {
+            if plugin.off {
+                off.push(plugin.file);
+                continue;
+            }
             match plugin.guide {
                 Some(Ok(g)) => {
                     for v in &g.viewers {
@@ -300,6 +337,12 @@ impl Pimble {
         if !without.is_empty() {
             out.push_str(&format!("\nInstalled without a guide (their viewers work in Pimble, but say nothing here): {}.\n", without.join(", ")));
         }
+        if !off.is_empty() {
+            out.push_str(&format!(
+                "\nTurned off in Pimble's Settings > Plugins (their viewers show nothing and their tools do not run until the person turns them on): {}.\n",
+                off.join(", ")
+            ));
+        }
         Ok(out)
     }
 
@@ -309,9 +352,12 @@ impl Pimble {
     /// by what the plugin asks for.
     #[tool(name = "call_plugin_tool")]
     async fn call_plugin_tool(&self, Parameters(p): Parameters<CallPluginToolParams>) -> Result<String, String> {
-        let Some((path, g)) = provider(&p.plugin) else {
+        let Some(Provider { path, guide: g, off }) = provider(&p.plugin) else {
             return Err(format!("No plugin installed here provides {} or is called that. list_viewers lists them.", p.plugin));
         };
+        if off {
+            return Err(turned_off_sentence(&p.plugin));
+        }
         let Some(tool) = g.tool(&p.tool) else {
             let names: Vec<&str> = g.tools.iter().map(|t| t.name.as_str()).collect();
             return Err(format!("{} has no tool {}; its tools: {}.", p.plugin, p.tool, if names.is_empty() { "none".to_string() } else { names.join(", ") }));
@@ -356,10 +402,10 @@ impl Pimble {
         if let Err(e) = guide::check(&settings.schema, &p.settings) {
             return Err(format!("Nothing was written: {e}. list_viewers shows the {viewer} viewer's schema and an example."));
         }
-        // The plugin's own check, which knows what the settings mean.
+        // The plugin's own check, which knows what the settings mean (a
+        // turned-off plugin runs nothing, its check included).
         let mut said = String::new();
-        if let Some((path, g)) = provider(&viewer).filter(|(_, g)| g.tool(guide::CHECK_SETTINGS).is_some()) {
-            let _ = g;
+        if let Some(Provider { path, .. }) = provider(&viewer).filter(|p| !p.off && p.guide.tool(guide::CHECK_SETTINGS).is_some()) {
             let args = serde_json::json!({ "viewer": viewer, "metanode": addr.link(), "settings": p.settings });
             let answer = self.run_tool(path, guide::CHECK_SETTINGS, args).await?;
             if !answer.ok {
@@ -518,6 +564,23 @@ mod against_a_server {
         assert!(refused.starts_with("Nothing was run: the arguments needs text"), "{refused}");
         let refused = pimble.call_plugin_tool(p(json!({ "plugin": "timeline", "tool": "fly", "arguments": {} }))).await.unwrap_err();
         assert!(refused.contains("has no tool fly; its tools: check_settings, check_field, read_date"), "{refused}");
+        // A plugin is named by its id too, in either spelling of its file.
+        for named in ["timeline-viewer", "timeline_viewer"] {
+            let tried = pimble.call_plugin_tool(p(json!({ "plugin": named, "tool": "read_date", "arguments": { "calendar": cal_link, "text": "Fir 3, 1 YF" } }))).await;
+            assert!(tried.is_ok(), "{named}: {tried:?}");
+        }
+
+        // Turned off in Settings > Plugins (docs/PLUGINS_CONTRACT.md section
+        // 7): listed as off, and nothing of it runs.
+        let mut provenance = super::library::Provenance::default();
+        provenance.off.insert("timeline-viewer".into());
+        std::fs::write(super::plugins_dir().join(super::library::PROVENANCE_FILE), provenance.to_json()).unwrap();
+        let listed = pimble.list_viewers().await.unwrap();
+        assert!(!listed.contains("## timeline (") && listed.contains("Turned off in Pimble's Settings > Plugins") && listed.contains("timeline_viewer.wasm"), "{listed}");
+        let refused = pimble.call_plugin_tool(p(json!({ "plugin": "timeline", "tool": "read_date", "arguments": { "calendar": cal_link, "text": "Fir 3, 1 YF" } }))).await.unwrap_err();
+        assert!(refused.starts_with("Nothing was run: the plugin providing timeline is turned off"), "{refused}");
+        let wrote = pimble.set_fields(p(json!({ "node": "World/Chronicle/The Founding", "fields": { "date": "Blorpuary 99, banana" } }))).await.unwrap();
+        assert!(!wrote.contains("Founding calendar"), "its field check did not run: {wrote}");
         let _ = server.stop().await;
     }
 }

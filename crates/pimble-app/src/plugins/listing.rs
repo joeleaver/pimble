@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pimble_plugin_host::abi::{Manifest, Permissions, StoreAsk};
-use pimble_plugin_host::library::{self, Entry, Have, Index, Offer, Provenance};
+use pimble_plugin_host::library::{self, Entry, Have, Index, Offer, Provenance, Runs};
 
 /// A plugin installed here, as loading left it.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,6 +16,8 @@ pub(super) struct Installed {
     pub(super) name: String,
     /// Its version, when it could say.
     pub(super) version: Option<String>,
+    /// The plugin ABI it was built for, when it could say.
+    pub(super) abi: Option<u32>,
     /// Why this Pimble does not run it; `None` when it runs.
     pub(super) refusal: Option<String>,
     /// The viewers it provides ("Kanban"), when it runs.
@@ -32,6 +34,7 @@ impl Installed {
             id: manifest.id.clone(),
             name: manifest.name.clone(),
             version: Some(manifest.version.clone()),
+            abi: Some(manifest.abi),
             refusal: None,
             viewers: manifest.viewers().map(|v| v.name.clone()).collect(),
             asks: Some(manifest.asks),
@@ -45,6 +48,7 @@ impl Installed {
             id: refused.id(),
             name: head.map(|h| h.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| refused.file()),
             version: head.map(|h| h.version.clone()),
+            abi: head.map(|h| h.abi),
             refusal: Some(refused.sentence.clone()),
             viewers: Vec::new(),
             asks: None,
@@ -52,7 +56,12 @@ impl Installed {
         }
     }
 
-    fn runs(&self) -> bool {
+    /// Whether this Pimble runs it, as the library judges it.
+    pub(super) fn runs(&self) -> Runs {
+        Runs::judged(self.refusal.is_some(), self.abi)
+    }
+
+    fn is_running(&self) -> bool {
         self.refusal.is_none()
     }
 }
@@ -172,8 +181,9 @@ fn row(inputs: &Inputs<'_>, have: Option<&Installed>, entry: Option<&Entry>) -> 
     let (mut state, button) = match (have, &offer) {
         (None, Some(Offer::NeedsNewer)) => ("Needs a newer Pimble".to_string(), None),
         (None, _) => (entry.map(|e| capitalized(asks_sentence(&e.asks)) + ".").unwrap_or_default(), Some(Action::Install)),
-        (Some(h), Some(Offer::Update { .. })) if !h.runs() => (format!("{} The library's version replaces it.", h.refusal.clone().unwrap_or_default()), Some(Action::Update)),
-        (Some(h), _) if !h.runs() => (h.refusal.clone().unwrap_or_default(), None),
+        (Some(h), Some(Offer::Update { .. })) if !h.is_running() => (format!("{} The library's version replaces it.", h.refusal.clone().unwrap_or_default()), Some(Action::Update)),
+        (Some(h), Some(Offer::Replace { .. })) => (h.refusal.clone().unwrap_or_default(), Some(Action::UseLibrary)),
+        (Some(h), _) if !h.is_running() => (h.refusal.clone().unwrap_or_default(), None),
         (Some(_), _) if off => ("Turned off".to_string(), Some(Action::TurnOn)),
         (Some(_), Some(Offer::Update { .. })) => (format!("Version {} is in the library.", entry.map(|e| e.version.as_str()).unwrap_or_default()), Some(Action::Update)),
         (Some(_), Some(Offer::FromFile)) => ("From a file".to_string(), Some(Action::UseLibrary)),
@@ -185,6 +195,7 @@ fn row(inputs: &Inputs<'_>, have: Option<&Installed>, entry: Option<&Entry>) -> 
             (None, Some(Offer::Install)) => format!("Press Install to add {name}."),
             (None, _) => format!("{name} needs a newer Pimble. Update Pimble first."),
             (Some(_), Some(Offer::Update { .. })) => format!("Press Update to get {}.", entry.map(|e| e.version.as_str()).unwrap_or_default()),
+            (Some(_), Some(Offer::Replace { .. })) => format!("Press Use Library Version to get {}.", entry.map(|e| e.version.as_str()).unwrap_or_default()),
             (Some(_), _) => format!("{name} is installed already."),
         };
     }
@@ -207,7 +218,7 @@ fn row(inputs: &Inputs<'_>, have: Option<&Installed>, entry: Option<&Entry>) -> 
     }
     let mut more = Vec::new();
     if let Some(h) = have {
-        if h.runs() {
+        if h.is_running() {
             more.push(if off { Action::TurnOn } else { Action::TurnOff });
         }
         more.push(Action::Remove);
@@ -245,6 +256,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             version: Some(version.into()),
+            abi: Some(ABI_VERSION),
             refusal: None,
             viewers: vec![name.into()],
             asks: Some(Permissions::default()),
@@ -310,6 +322,24 @@ mod tests {
         let junk = by_id(&rows, "junk");
         assert_eq!((junk.title.as_str(), junk.state.as_str(), junk.button), ("junk.wasm", "Not a module.", None));
         assert_eq!(junk.more, vec![Action::Remove]);
+    }
+
+    #[test]
+    fn a_build_ahead_of_this_pimble_or_one_refused_otherwise_is_only_offered_the_library() {
+        let ahead_head = pimble_plugin_host::abi::ManifestHead { id: "kanban-viewer".into(), name: "Kanban".into(), version: "0.3.0".into(), abi: ABI_VERSION + 1 };
+        let ahead = Refused { path: "kanban-viewer.wasm".into(), viewers: Vec::new(), sentence: "Built for a later ABI.".into(), head: Some(ahead_head) };
+        // It ran past its time describing itself: nothing of it was read.
+        let stuck = Refused { path: "todo-viewer.wasm".into(), viewers: Vec::new(), sentence: "It ran past its time.".into(), head: None };
+        let installed = vec![Installed::refused(&ahead), Installed::refused(&stuck)];
+        let index = Index { v: 1, plugins: vec![entry("kanban-viewer", "Kanban", "0.2.0", ABI_VERSION), entry("todo-viewer", "Todo list", "0.1.2", ABI_VERSION)] };
+        let rows = list(&installed, &index, &Provenance::default(), &HashMap::new(), None);
+        for id in ["kanban-viewer", "todo-viewer"] {
+            let row = by_id(&rows, id);
+            assert_eq!(row.button, Some(Action::UseLibrary), "{id}");
+            assert_eq!(row.more, vec![Action::Remove], "{id}");
+        }
+        assert_eq!(by_id(&rows, "kanban-viewer").state, "Built for a later ABI.");
+        assert_eq!(by_id(&rows, "todo-viewer").state, "It ran past its time.");
     }
 
     #[test]

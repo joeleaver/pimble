@@ -600,11 +600,19 @@ runs (the entry's ABI is the app's):
 
 - it is updated when the library's version is newer than the installed one, wherever the
   installed one came from;
-- it is updated when the installed one does not run here (refused: built for another plugin
-  ABI, typically an older one after the app updated), whatever its version, since a plugin
-  that does not run has nothing to keep;
+- it is updated when the installed one was built for an earlier plugin ABI (refused after
+  the app updated), whatever its version, since a plugin that does not run has nothing to
+  keep (`Runs::BuiltFor`, judged from its manifest's head);
+- one refused for anything else is left alone and its row offers "Use Library Version"
+  (`Offer::Replace`): one built for a later ABI (a development build ahead of this Pimble),
+  and one refused for another reason (it faulted or ran past its time while it described
+  itself, its description could not be read), since the library's version may not settle
+  that, and replacing it on its own would repeat at every check;
 - a file at the library's version or later (a development build, or a version that is not
   a version) is left alone; its row offers "Use Library Version".
+
+Installing bytes identical to the file already there writes nothing, and the folder's next
+scan judges that file again (a refusal cached from a bad moment does not outlive it).
 
 Nothing is asked: the person did nothing to get an update, and what each plugin was allowed
 carries over (a version that asks for more asks the way a first use does). A refused plugin
@@ -625,7 +633,12 @@ beside the library version of each plugin installed from it; an older Pimble ign
 "Turn Off" keeps a plugin installed and updating but not running: its viewers' metanodes
 show the outline under "Shown as an outline: the Kanban plugin is turned off (Settings >
 Plugins).", its recipes leave the new-node menu, its child viewers stop applying, and panes
-showing it stop. "Turn On" brings it back in place. Remove forgets that it was off.
+showing it stop. "Turn On" brings it back in place. Remove forgets that it was off. The
+MCP reads the same `library.json`: `list_viewers` lists a turned-off plugin's file under
+"Turned off", `call_plugin_tool` refuses its tools with a sentence that says so, and
+`set_viewer_settings` and `set_fields` do not run its checks (the guide's schema still
+applies). It learns which file holds which id by compiling the files, only while any plugin
+is off.
 
 **One list** (`crates/pimble-app/src/plugins/listing.rs` decides, `window.rs` draws).
 Settings > Plugins is one list, each plugin once, from the union of what is installed here
@@ -642,13 +655,15 @@ provides), one state, and at most one button:
 | Updating, updated while open, downloading | "Updating to 0.2.0...", "Updated to 0.2.0." | |
 | From a file, not in the library | "From a file" | |
 | From a file at the library's version or later | "From a file" | Use Library Version |
-| Does not run here | the refusal, then "The library's version replaces it." when it does | Update / none |
+| Built for an earlier ABI | the refusal, then "The library's version replaces it." | Update |
+| Does not run here otherwise | the refusal | Use Library Version, when the library has it |
 | Library's needs a newer Pimble | "Needs a newer Pimble" | |
 | Turned off | "Turned off" | Turn On |
 
 "Details" opens the row under it: what it asks for, where it came from and its file, the
 library's version when it differs, what it was allowed here, and the actions that apply
-(Turn Off / Turn On, Remove, Revoke). A `pimble:settings/plugins?install=<id>` link marks
+(Turn Off / Turn On, Remove, Revoke). Remove deletes every file of the plugin; a file that
+will not go is named, and the plugin keeps what it was allowed until Remove finishes. A `pimble:settings/plugins?install=<id>` link marks
 the plugin's row and shows All.
 
 **Known limit.** `library.json` names the plugins the app installed from the library; a

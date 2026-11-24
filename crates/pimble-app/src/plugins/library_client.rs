@@ -155,7 +155,7 @@ fn update_what_is_due() {
         installed.iter().find(|h| h.id == id).map(|h| Have {
             version: h.version.as_deref().unwrap_or_default(),
             from_library: provenance.from_library(id),
-            runs: h.refusal.is_none(),
+            runs: h.runs(),
         })
     };
     for entry in library::updates_due(&index, have) {

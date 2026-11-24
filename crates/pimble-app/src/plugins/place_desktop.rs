@@ -127,7 +127,7 @@ fn approvals_path() -> PathBuf {
 }
 
 fn provenance_path() -> PathBuf {
-    plugins_dir().join("library.json")
+    plugins_dir().join(library::PROVENANCE_FILE)
 }
 
 pub fn read_provenance() -> Provenance {
@@ -275,7 +275,12 @@ fn put(dir: &Path, bytes: &[u8], manifest: &Manifest) -> Result<(), String> {
     let id = &manifest.id;
     let dest = dir.join(format!("{id}.wasm"));
     let others: Vec<PathBuf> = files_of(id).into_iter().filter(|p| *p != dest).collect();
-    if !std::fs::read(&dest).is_ok_and(|have| have == bytes) {
+    if std::fs::read(&dest).is_ok_and(|have| have == bytes) {
+        // The same bytes are there already, and they just loaded: whatever the
+        // folder's last scan made of the file (refused once, say, when its
+        // description ran past its time under load) is judged again.
+        CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|cache| cache.remove(&dest));
+    } else {
         let partial = dest.with_extension("wasm.partial");
         let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, bytes)).and_then(|_| std::fs::rename(&partial, &dest));
         written.map_err(|e| {
@@ -299,16 +304,21 @@ pub fn remove(id: &str) {
         return;
     }
     let name = manifest_of(id).map_or(id.to_string(), |m| m.name);
-    for path in &files {
-        if let Err(e) = std::fs::remove_file(path) {
-            return say(format!("The {name} plugin could not be removed from {}: {e}.", path.display()));
-        }
+    // Every file is tried: one that will not go does not keep the others.
+    let failed: Vec<String> = files
+        .iter()
+        .filter_map(|path| std::fs::remove_file(path).err().map(|e| format!("{} ({e})", path.display())))
+        .collect();
+    let dir = plugins_dir();
+    let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
+    if !failed.is_empty() {
+        // Something of it stays, so it keeps what it was allowed and where it
+        // came from; Remove again finishes the job.
+        return say(format!("The {name} plugin could not be removed: {} could not be deleted.", failed.join(", ")));
     }
     APPROVALS.with(|a| a.borrow_mut().remove(id));
     super::write_approvals();
     forget_library(id, true);
-    let dir = plugins_dir();
-    let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
     say(format!("Removed the {name} plugin."));
 }
 

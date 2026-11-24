@@ -244,6 +244,8 @@ fn set_off(id: &str, off: bool) {
         return;
     }
     write_provenance();
+    // The row says what it is now, not what came of its last update.
+    ROW_LINES.with(|l| l.borrow_mut().remove(id));
     if off {
         stop_everywhere(id);
     }
