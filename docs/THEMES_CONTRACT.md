@@ -526,7 +526,12 @@ text good at any width. Until either lands, no token depends on it.
   a node, or clear it: one `custom["theme"]` edit; a theme from another store is copied as
   the picker does), `create_theme` / `update_theme` (tokens by name, checked by type; a
   bad value refused with a sentence naming the token and its range). `get_node` adds one
-  line: the theme in force and where from.
+  line: the theme in force and where from. Building and editing themes through the MCP
+  is a requirement, not a nicety (Joe, 2026-11-24): an agent must be able to make a
+  theme from a description, adjust it token by token, and do the same for app themes
+  (the account's, in the personal document), so `create_theme` / `update_theme` take
+  `kind: document | app`, `list_themes` lists both, and `delete_theme` removes a store
+  theme (refused, with the nodes that name it, while any does).
 - **Export, later.** A document theme is the natural style sheet for exporting a tree:
   Markdown export ignores it (Markdown has no styling), HTML export writes the same CSS
   the panes use, and a future PDF/EPUB export of a tree (a manuscript to a book) maps the
