@@ -65,6 +65,7 @@ pub mod themes;
 pub mod sheets;
 pub mod settings;
 pub mod shortcuts;
+pub mod spelling;
 pub mod splitting;
 pub mod shares;
 pub mod discussions;
@@ -107,6 +108,7 @@ pub(crate) const RELEASE_KEY: &str = include_str!("../update-key.pub");
 pub mod plugins;
 /// Plugins' calls through the Pimble API, on either backend.
 pub mod plugin_calls;
+pub mod task_lists;
 pub mod tree_drop;
 pub mod tree_keys;
 pub mod tree_view;

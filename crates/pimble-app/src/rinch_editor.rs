@@ -24,6 +24,9 @@ pub use rinch_web::{
     NodeViewRegistration, NodeViewSpec, ScrollAlign, SelectionAnchor,
 };
 
+/// The editor's spellchecker (`spelling.rs`), shared by both backends.
+pub use rinch_editor_view::{SpellcheckPlugin, SPELLCHECK_KEY};
+
 /// An embed atom's attributes for the editor (`pimble_crdt::markdown::Embed`
 /// says what each one carries).
 pub fn embed_attrs(embed: &pimble_crdt::markdown::Embed) -> rinch_editor_core::Attrs {
