@@ -30,9 +30,8 @@ use uuid::Uuid;
 
 use crate::principal::{Grant, Principal, Role};
 
-/// What every agent key starts with, so a key is recognisable for what it is
-/// (and never mistaken for a JWT or the server's static token).
-pub const KEY_PREFIX: &str = "pmbl_agent_";
+/// What every agent key starts with (`pimble_rpc::agent_key`).
+pub use pimble_rpc::AGENT_KEY_PREFIX as KEY_PREFIX;
 
 /// The `sub` prefix of an agent's principal.
 pub const AGENT_SUB_PREFIX: &str = "agent:";
@@ -198,14 +197,7 @@ fn new_key(id: Uuid) -> String {
     let mut secret = [0u8; 32];
     rand::fill(&mut secret);
     let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
-    format!("{KEY_PREFIX}{}_{secret}", id.simple())
-}
-
-/// The agent id a key names, if it is shaped like an agent key.
-fn id_of_key(key: &str) -> Option<Uuid> {
-    let rest = key.strip_prefix(KEY_PREFIX)?;
-    let (id, _) = rest.split_once('_')?;
-    Uuid::parse_str(id).ok()
+    pimble_rpc::agent_key(id, &secret)
 }
 
 /// The agents of this device.
@@ -247,7 +239,7 @@ impl AgentRegistry {
 
     /// The principal `key` stands for, when it is a current agent's key.
     pub fn principal_for_key(&self, key: &str) -> Option<Principal> {
-        let id = id_of_key(key)?;
+        let id = pimble_rpc::agent_id_of_key(key)?;
         let hash = sha256_hex(key);
         let agents = self.agents.read().ok()?;
         let agent = agents.iter().find(|a| a.id == id)?;
