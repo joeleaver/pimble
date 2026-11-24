@@ -3807,7 +3807,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-metanode__plugin {
-    /* A plugin's view (plugins.rs): its menus and modals portal to this area, so
+    /* A plugin's view (plugins/mount.rs): its menus and modals portal to this area, so
        it is their containing box. */
     position: relative;
 }

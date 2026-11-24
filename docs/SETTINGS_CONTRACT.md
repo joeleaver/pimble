@@ -59,7 +59,7 @@ as a shortcut for the same setting.
 ## 3. Plugin changes take effect at once (wave 1)
 
 The browser already does this (`place::add`, `place::remove` in
-`crates/pimble-app/src/plugins.rs`). The desktop does the same:
+`crates/pimble-app/src/plugins/place_browser.rs`). The desktop does the same:
 
 - **Add, replace and remove** from Settings. The plugin loads (or is checked and compiled) on
   a background thread. Every pane showing the old version stops it (`stop_everywhere`) and
@@ -233,7 +233,7 @@ release app on the scratch copy, with the browser checked on the local stack.
     name never changes its bytes.
   - `GET /releases` no longer lists the library's files, so the download page shows
     packages only.
-- **The app** (`crates/pimble-app/src/plugins.rs`):
+- **The app** (`crates/pimble-app/src/plugins/`):
   - Settings > Plugins has a Library below the installed plugins. Each row shows the name
     and version, the summary, what the plugin asks for, and its button or label.
   - Installed plugins say "From the library." or "Added from a file.".

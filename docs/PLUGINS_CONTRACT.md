@@ -196,7 +196,7 @@ first plugin.
    not what section 3.5 says:** rinch is 0.1.0 at every revision and revisions have no
    order outside its repository, so the host checks the ABI exactly and only logs a
    plugin built against another rinch revision; an exact match would refuse every plugin
-   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins.rs`,
+   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins/`,
    desktop only): the folder loads off the UI thread at start; a pane opening a metanode
    whose viewer a loaded plugin provides mounts it in a slot in `render_metanode` (props
    updated in place as the forest changes); a refused plugin's viewer, or a plugin that
@@ -342,7 +342,7 @@ first plugin.
    `HostLink::request`, `recipe(..)`, `display_label(node)` (the explorer's label),
    `person(..)`, re-exports `pimble_ui`. **Host:** `Instance::on_request`,
    `Instance::set_host_state`, `Call::HostState`, the engine links the import and needs
-   the export. **App:** `plugins.rs` pushes host state from one effect over presence, the
+   the export. **App:** `plugins/host.rs` pushes host state from one effect over presence, the
    theme and every pane's following; answers `Open` with the pane's link-open, `Focus`
    with `presence::say_within`, `Follow` with `follow::start`; lists every loaded
    plugin's recipes in `AppStore::recipes`, offered in the explorer's row and store menus,
@@ -391,9 +391,9 @@ first plugin.
    made says why. **Shared code:** the applier, bridge, instance and approvals are
    unchanged; the registry moved out of the wasmtime engine (`registry.rs`, generic
    over an engine's loaded plugin; `wasmtime_engine::load_dir` is the folder loader).
-   `crates/pimble-app/src/plugins.rs` is one module for both targets, with only a
-   `place` per target (engine, where plugins and approvals are kept, the window's
-   add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
+   `crates/pimble-app/src/plugins/` is one module for both targets, with only a
+   `place` per target (`place_desktop.rs`, `place_browser.rs`: engine, where plugins and
+   approvals are kept, the window's add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
    the desktop, `spawn_local` in the page). **Where plugins live in the browser:** there
    is no folder, so the Plugins window (File > "Plugins...") has "Add plugin...", which
    takes a `.wasm` file the person picks, compiles and describes it in the page, and
