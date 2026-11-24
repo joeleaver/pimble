@@ -15,8 +15,9 @@
    a rule here outranks it by specificity rather than by order. Its rules are
    `[data-pm-editor] x` (0,1,1), its dark scheme's `[data-pm-editor][data-pm-theme="dark"] x`
    (0,2,1). Layout rules here are `WRAP > [data-pm-editor] x` (0,2,1) and
-   colors carry the scheme attribute as well (0,3,1). The rules for the
-   theme picker's samples are at the end. */
+   colors carry the scheme attribute as well (0,3,1). The theme picker's
+   preview (app/theme_preview.rs) is a wrap of its own and takes these same
+   rules. */
 
 /* ── Page and body ──────────────────────────────────────────────── */
 .pimble-editor__content-wrap > [data-pm-editor] {
@@ -295,59 +296,28 @@
 }
 
 /* ── Measure ────────────────────────────────────────────────────── */
-/* A theme with a measure keeps each block of the text that wide at most,
-   centered in the pane; last, so its side margins outrank the blocks' own. */
-.pimble-editor__content-wrap--measured > [data-pm-editor] > p,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h1,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h2,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h3,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h4,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h5,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > h6,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > ul,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > ol,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > blockquote,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > pre,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > table,
-.pimble-editor__content-wrap--measured > [data-pm-editor] > [data-pm-type="embed"] {
-    max-width: var(--pd-page-measure);
+/* A theme with a measure keeps the text a column that wide at most, centered
+   in the pane, and every block keeps its own indent inside it.
+   The column is the editor itself, not the blocks' margins: rinch writes each
+   text block's indent as an inline `margin-left`, which no rule outranks, and
+   a measure in a heading's own `em` would make it wider than the paragraphs.
+   The editor's `em` is the body size. It keeps the page's padding and the
+   discussions' gutter inside it, so a pane narrower than the measure reads as
+   a pane without one. No percentage is mixed into a calc() here: rinch
+   resolves one only against a width it can prove definite, and a pane's is
+   not, so it would drop the percentage. The wrap paints the page beside the
+   column in the editor's colors, and the pointer there reaches the wrap, not
+   the editor. */
+.pimble-editor__content-wrap--measured > [data-pm-editor] {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: calc(var(--pd-page-measure) + 2 * var(--pd-page-padding, 20px) + 14px);
     margin-left: auto;
     margin-right: auto;
 }
-
-/* ── The theme picker's samples (app/theme_picker.rs) ───────────── */
-/* A few lines in a theme: its body and h2 tokens and its paragraph spacing,
-   a little smaller than a note draws them. Never `data-pm-editor`, so none of
-   the rules above reach a sample. */
-.pimble-theme-sample {
-    font-family: var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif);
-    font-size: calc(var(--pd-body-size, 15px) * 0.8);
-    line-height: var(--pd-body-line-height, 1.7);
-    letter-spacing: var(--pd-body-letter-spacing, normal);
-    text-align: var(--pd-body-align, start);
+.pimble-editor__content-wrap--measured.pimble-editor__content-wrap--dark {
     background: var(--pd-page, var(--rinch-color-body));
-    color: var(--pd-text, var(--rinch-color-text));
-    border: 1px solid var(--rinch-color-border);
-    border-radius: 6px;
-    padding: 8px 12px;
 }
-.pimble-theme-sample__heading {
-    font-family: var(--pd-h2-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
-    font-size: var(--pd-h2-size, 1.5em);
-    font-weight: var(--pd-h2-weight, 700);
-    text-transform: var(--pd-h2-case, none);
-    letter-spacing: var(--pd-h2-tracking, var(--pd-body-letter-spacing, normal));
-    text-align: var(--pd-h2-align, start);
-    color: var(--pd-h2-color, var(--pd-text, var(--rinch-color-text)));
-    line-height: 1.3;
-    margin: 0 0 0.3em 0;
-}
-.pimble-theme-sample p {
-    margin: 0;
-}
-.pimble-theme-sample--para-spaced p {
-    margin: 0 0 var(--pd-paragraph-gap, 0.75em) 0;
-}
-.pimble-theme-sample--para-indented p + p {
-    text-indent: var(--pd-paragraph-indent, 1.5em);
+.pimble-editor__content-wrap--measured.pimble-editor__content-wrap--light {
+    background: var(--pd-page, var(--rinch-color-surface));
 }

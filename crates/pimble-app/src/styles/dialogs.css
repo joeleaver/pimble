@@ -151,14 +151,37 @@
     color: var(--rinch-color-dimmed);
     margin-bottom: 8px;
 }
+.pimble-theme-picker__columns {
+    display: flex;
+    gap: 16px;
+    height: 480px;
+}
 .pimble-theme-picker__list {
+    flex: 0 0 200px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    max-height: 420px;
+    gap: 2px;
     overflow-y: auto;
 }
+.pimble-theme-picker__preview-column {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+.pimble-theme-picker__caption {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    margin-bottom: 6px;
+}
+/* The preview is a pane's wrap (themes::WRAP_CLASS), so the note's own rules
+   draw it; this only frames it. */
+.pimble-theme-picker__preview {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 6px;
+}
 .pimble-theme-choice {
+    font-size: 13px;
     padding: 6px 8px;
     border-radius: 6px;
     border: 2px solid transparent;
@@ -170,15 +193,14 @@
 .pimble-theme-choice--active {
     border-color: var(--rinch-primary-color-5);
 }
+/* The row the preview shows. */
+.pimble-theme-choice--previewed {
+    background: var(--rinch-color-option-hover);
+}
 /* A node this device may only read: the rows show, and take no choice. */
 .pimble-theme-choice--disabled {
     opacity: 0.5;
     cursor: default;
-}
-.pimble-theme-choice__name {
-    font-size: 13px;
-    font-weight: 600;
-    margin-bottom: 4px;
 }
 .pimble-theme-choice__hint {
     font-size: 12px;

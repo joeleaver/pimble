@@ -130,3 +130,16 @@ fn classes_name_each_modifier_on_the_block() {
     );
     assert_eq!(classes(WRAP_CLASS, &Drawn::default()), WRAP_CLASS);
 }
+
+#[test]
+fn a_wrap_names_its_scheme_after_the_theme() {
+    let drawn = Drawn { style: String::new(), modifiers: vec!["measured"] };
+    assert_eq!(
+        wrap_classes(&drawn, true),
+        "pimble-editor__content-wrap pimble-editor__content-wrap--measured pimble-editor__content-wrap--dark"
+    );
+    assert_eq!(
+        wrap_classes(&Drawn::default(), false),
+        "pimble-editor__content-wrap pimble-editor__content-wrap--light"
+    );
+}

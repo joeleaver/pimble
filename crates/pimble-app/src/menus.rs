@@ -64,7 +64,7 @@ pub fn menu_spec(store: AppStore) -> Vec<MenuSection> {
     #[cfg(feature = "native")]
     sections.push(MenuSection { title: "Account", entries: account_entries(store) });
     sections.push(MenuSection { title: "Edit", entries: edit_entries(store) });
-    sections.push(MenuSection { title: "Format", entries: format_entries(store) });
+    sections.push(MenuSection { title: "Node", entries: node_entries(store) });
     sections.push(MenuSection { title: "View", entries: view_entries(store) });
     sections.push(MenuSection {
         title: "Help",
@@ -221,64 +221,76 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
 }
 
 fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
-    // The explorer's selected row, as its menu's Cut, Copy and Paste
-    // (docs/MENUS_CONTRACT.md section 3.1). No shortcuts: Ctrl+X, C and V are
-    // the text's in a note, and the explorer's own in the explorer.
-    let selected = move || untracked(|| store.selected_id.get());
+    // The focused pane's note, at its caret. What acts on a node as a whole
+    // is in the Node menu.
     vec![
-        MenuEntry::item("Cut Node", "", move || {
-            if let Some(row) = selected().filter(|v| matches!(crate::state::parse_tree_value(v), Some((_, Some(_))))) {
-                crate::tree_keys::set_cut(store, vec![row]);
-            }
-        }),
-        MenuEntry::item("Copy Node", "", move || {
-            if let Some(row) = selected() {
-                crate::app::copy_rows(store, &[row]);
-            }
-        }),
-        MenuEntry::item("Paste into Node...", "", move || {
-            if let Some(row) = selected() {
-                crate::pasting::paste(store, &row);
-            }
-        }),
-        MenuEntry::Separator,
         // Into the focused pane's note, at its caret: the toolbar's Insert
         // group, the same list (`toolbar::inserts`). With no note there, or
         // one this device may only read, it says so.
         MenuEntry::Sub { label: "Insert", entries: insert_entries(store) },
         // The toolbar's Text Color swatches (docs/TEXT_COLOR_CONTRACT.md).
         MenuEntry::Sub { label: "Text Color", entries: text_color_entries(store) },
-        // Nodes, where the explorer's "+" makes them: File > New's list.
-        MenuEntry::Sub { label: "New", entries: new_entries(store) },
+        MenuEntry::Separator,
         // docs/SPLIT_CONTRACT.md: Scrivener's keys (Ctrl+K, Ctrl+M).
         MenuEntry::item("Split Note at Caret", crate::shortcuts::chord(crate::shortcuts::SPLIT), move || crate::splitting::split_here(store)),
         MenuEntry::item("Join Note Below", crate::shortcuts::chord(crate::shortcuts::JOIN), move || crate::splitting::join_below(store)),
-        // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
-        // A discussion at the caret, drawn in the margin (commenters too).
+        // docs/DISCUSSIONS_CONTRACT.md: a discussion at the caret, drawn in
+        // the margin (commenters too).
         MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
-        MenuEntry::item("Discuss", "", move || crate::discussions::start_on_focused(store)),
-        MenuEntry::Separator,
-        MenuEntry::item("Delete", "", move || {
-        // A native menu item cannot be greyed out reactively, so the check a
-        // row's "Delete" makes at render time is made here when it runs: a
-        // node shared with this device to read changes in no way
-        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). An editor
-        // deletes like anyone else.
-        if let Some((store_id, node_id)) = store.selected_store_and_node() {
-            if let Err(refusal) = pimble_core::plan::can_delete(&store.view(), &[(store_id, node_id)]) {
-                tracing::info!("Delete refused: {:?}/{:?}: {refusal}", store_id, node_id);
-                return;
-            }
-            store.send(crate::protocol::BackendCommand::DeleteNode { store_id, node_id });
-        }
-        }),
     ]
 }
 
-/// How the focused pane's note reads (docs/THEMES_CONTRACT.md section 9):
-/// its document theme, which replaces Edit > "Compact Paragraphs".
-fn format_entries(store: AppStore) -> Vec<MenuEntry> {
-    vec![MenuEntry::item("Theme...", "", move || crate::app::open_theme_picker_for_focused(store))]
+/// The Node menu (docs/MENUS_CONTRACT.md section 11): what acts on a node as
+/// a whole, the explorer's selected row, as that row's own menu does (Joe,
+/// 2026-11-24). How a node and its subtree are drawn (its theme) lives here
+/// and in the row menu, never as a format of the text.
+fn node_entries(store: AppStore) -> Vec<MenuEntry> {
+    // The explorer's selected row, as its menu's Cut, Copy and Paste
+    // (docs/MENUS_CONTRACT.md section 3.1). No shortcuts: Ctrl+X, C and V are
+    // the text's in a note, and the explorer's own in the explorer.
+    let selected = move || untracked(|| store.selected_id.get());
+    vec![
+        // Nodes, where the explorer's "+" makes them: File > New's list.
+        MenuEntry::Sub { label: "New", entries: new_entries(store) },
+        // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
+        MenuEntry::item("Discuss", "", move || crate::discussions::start_on_focused(store)),
+        MenuEntry::Separator,
+        MenuEntry::item("Appearance...", "", move || crate::app::open_appearance_for_selected(store)),
+        // docs/THEMES_CONTRACT.md section 9: the document theme the node and
+        // its subtree read in.
+        MenuEntry::item("Theme...", "", move || crate::app::open_theme_picker_for_selected(store)),
+        MenuEntry::Separator,
+        MenuEntry::item("Cut", "", move || {
+            if let Some(row) = selected().filter(|v| matches!(crate::state::parse_tree_value(v), Some((_, Some(_))))) {
+                crate::tree_keys::set_cut(store, vec![row]);
+            }
+        }),
+        MenuEntry::item("Copy", "", move || {
+            if let Some(row) = selected() {
+                crate::app::copy_rows(store, &[row]);
+            }
+        }),
+        MenuEntry::item("Paste...", "", move || {
+            if let Some(row) = selected() {
+                crate::pasting::paste(store, &row);
+            }
+        }),
+        MenuEntry::Separator,
+        MenuEntry::item("Delete", "", move || {
+            // A native menu item cannot be greyed out reactively, so the check
+            // a row's "Delete" makes at render time is made here when it runs:
+            // a node shared with this device to read changes in no way
+            // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). An editor
+            // deletes like anyone else.
+            if let Some((store_id, node_id)) = store.selected_store_and_node() {
+                if let Err(refusal) = pimble_core::plan::can_delete(&store.view(), &[(store_id, node_id)]) {
+                    tracing::info!("Delete refused: {:?}/{:?}: {refusal}", store_id, node_id);
+                    return;
+                }
+                store.send(crate::protocol::BackendCommand::DeleteNode { store_id, node_id });
+            }
+        }),
+    ]
 }
 
 fn view_entries(store: AppStore) -> Vec<MenuEntry> {
@@ -389,5 +401,35 @@ mod tests {
             }
         }
         assert!(items >= 5, "a menu bar with {items} items is not one");
+    }
+
+    fn labels(entries: &[MenuEntry]) -> Vec<&'static str> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, .. } | MenuEntry::Check { label, .. } | MenuEntry::Sub { label, .. } => Some(*label),
+                MenuEntry::Separator => None,
+            })
+            .collect()
+    }
+
+    /// What acts on a node as a whole is in the Node menu, after Edit, and
+    /// nowhere else on the bar; a theme is never a Format of the text
+    /// (docs/MENUS_CONTRACT.md section 11).
+    #[test]
+    fn node_actions_are_in_the_node_menu() {
+        let spec = menu_spec(AppStore::new());
+        let titles: Vec<_> = spec.iter().map(|s| s.title).collect();
+        assert!(!titles.contains(&"Format"));
+        let edit = titles.iter().position(|t| *t == "Edit").unwrap();
+        assert_eq!(titles[edit + 1], "Node");
+        let node = labels(&spec[edit + 1].entries);
+        for label in ["New", "Discuss", "Appearance...", "Theme...", "Cut", "Copy", "Paste...", "Delete"] {
+            assert!(node.contains(&label), "Node lacks {label}");
+        }
+        let edit_labels = labels(&spec[edit].entries);
+        for label in ["New", "Discuss", "Delete", "Cut Node", "Copy Node", "Paste into Node..."] {
+            assert!(!edit_labels.contains(&label), "Edit still has {label}");
+        }
     }
 }

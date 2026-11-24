@@ -541,6 +541,16 @@ impl AppStore {
         Some((store_id, node_id))
     }
 
+    /// The node the explorer's selected row stands for: a node row's node, a
+    /// store row's root node. What the menu bar's Node menu acts on, as a
+    /// row's own menu does (`app/explorer_menu.rs`).
+    pub fn selected_row_node(&self) -> Option<(StoreId, NodeId)> {
+        let selected_id = self.selected_id.get()?;
+        let (store_id, node_id) = parse_tree_value(&selected_id)?;
+        let node_id = node_id.or_else(|| self.root_node_id(store_id))?;
+        Some((store_id, node_id))
+    }
+
     /// Send a command to the backend if connected.
     pub fn send(&self, cmd: crate::protocol::BackendCommand) {
         self.backend.with(|b| {

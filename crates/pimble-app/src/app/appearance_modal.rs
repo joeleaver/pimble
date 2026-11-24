@@ -14,6 +14,15 @@ pub(super) fn open_appearance_modal(store: AppStore, store_id: pimble_core::Stor
     store.appearance_modal_node.set(Some((store_id, node_id)));
 }
 
+/// Node > "Appearance...": the picker for the explorer's selected row (a
+/// store row edits its root node), as that row's own item opens it.
+pub(crate) fn open_appearance_for_selected(store: AppStore) {
+    match untracked(|| store.selected_row_node()) {
+        Some((store_id, node_id)) => open_appearance_modal(store, store_id, node_id),
+        None => crate::events::show_notice(store, "Select a node to change its appearance.".to_string()),
+    }
+}
+
 /// The "Appearance..." modal.
 pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     // ── "Appearance..." modal (node context menu) ───────────────────

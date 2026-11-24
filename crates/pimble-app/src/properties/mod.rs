@@ -16,7 +16,8 @@
 //! `BackendCommand::GetReferences`, asked when the panel shows another node
 //! and again once changes anywhere have rested (`store_changed`).
 //!
-//! The panel is split by what it shows: `tags`, `fields`, `place` (where
+//! The panel is split by what it shows: `tags`, `fields`, `theme` (the
+//! document theme in force, and the way to its picker), `place` (where
 //! the node lives and its times) and `references` (what points at it); this
 //! module holds what they share and draws the panel around them.
 
@@ -24,6 +25,7 @@ mod fields;
 mod place;
 mod references;
 mod tags;
+mod theme;
 
 use std::cell::RefCell;
 
@@ -161,6 +163,7 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
 
     let tags = tags::render_tags(__scope, store);
     let fields = fields::render_fields(__scope, store);
+    let theme = theme::render_theme(__scope, store);
     let lives_in = place::render_lives_in(__scope, store);
     let [shown_in, links_here, rows_here] = references::render_references(__scope, store);
     let times = place::render_times(__scope, store);
@@ -233,6 +236,7 @@ pub(crate) fn render_panel(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     }
                     {tags}
                     {fields}
+                    {theme}
                     {lives_in}
                     {shown_in}
                     {links_here}

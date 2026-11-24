@@ -6,7 +6,8 @@ stores, plugins themed, about a dozen built in, maybe replacing the paragraph se
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
 has answered them. All answered by Joe on 2026-11-24: decisions 1 to 12 and 8b.
-Ready to build, wave by wave (section 13).
+Wave 1 built 2026-11-24 on branch `worktree-agent-a964be6c8bb927ecf`, not merged
+("Built: wave 1" at the end of section 13); waves 2 to 5 not started.
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
@@ -91,7 +92,7 @@ so nothing a theme holds can end a declaration or open a rule. One stylesheet
 
 | Group | Tokens |
 | --- | --- |
-| Page | `measure` (max line length: `none` or 40–100 `em`, centered when set), `page_padding` (length); the colors are the palette below |
+| Page | `measure` (max line length: `none` or 30–100 `em`, centered when set; 30, not 40, because Book and Journal below are narrower than 40), `page_padding` (length); the colors are the palette below |
 | Body | `font_body`, `size` (12–24 px), `line_height` (1.0–2.2), `letter_spacing` (optional), `align` (`start`, `justify`) |
 | Paragraph | `spacing` (`compact`, `spaced`, `indented`: a book's first-line indent and no gap, the first paragraph after a heading not indented), `indent` (length, for `indented`), `gap` (length, for `spaced`) |
 | Headings 1–6 | per level: `font` (default: `font_heading`), `size` (ratio of body), `weight` (`normal`, `medium`, `bold`), `case` (`none`, `upper`), `tracking` (letter spacing), `align` (`start`, `center`), `space_before`, `space_after`, `color` (optional), `rule_below` (bool) |
@@ -496,11 +497,28 @@ text good at any width. Until either lands, no token depends on it.
 
 ## 9. The interface
 
-- **Format > Theme...** (both targets; Edit > "Compact Paragraphs" leaves): the picker for
-  the focused pane's node. Three groups: This store's themes, Built-in, and From other open
-  stores (section 6). Each row draws a small sample in that theme. A line says what is in
-  force and where it comes from ("Book, from 'Novel'", "Book, set here"), and "Use the
-  parent's" clears the key. The store row's menu and "Appearance..." get the same item.
+- **The Theme picker** (both targets; Edit > "Compact Paragraphs" leaves), opened by
+  "Theme..." in a node's, a store's and a mount's row menu (beside "Appearance...", acting
+  on that node and so its subtree; a mount row's on its source node), by Node > "Theme..."
+  in the menu bar (the selected row), by the Theme line of the Properties panel (the
+  focused pane's node: the theme in force, where it comes from, "Choose theme..."), and by
+  the Appearance picker's Theme row. Never a Format menu: a theme is how a node and its
+  subtree are drawn, not a format of the text (Joe, 2026-11-24; docs/MENUS_CONTRACT.md
+  section 11). The picker has two columns (Joe, 2026-11-24). On the left the list: "Use
+  the parent's" (clears the key), then three groups: This store's themes, Built-in, and
+  From other open stores (section 6); the theme the node names is outlined. On the right a
+  live preview of how the node's content reads in the theme under the pointer (or, before
+  the pointer has been over a row, the theme in force; "Use the parent's" previews what
+  the node would read in without a theme of its own). The preview is the note's own
+  blocks, read once when the picker opens from an editor holding the node, drawn with the
+  editor's elements inside a pane wrap of its own, so the very rules that draw the note
+  draw it (`themes::preview`, `app/theme_preview.rs`); pictures, canvases, sheets and
+  embeds are left out, and no more than the first 40 blocks (and 40 rows of a table) are
+  read. A node no pane holds
+  (the row menu on a closed note) previews a few sample lines, and the caption says so.
+  A click applies at once, as every appearance choice does; the row last under the pointer
+  stays previewed while the pointer crosses to the preview. A line above the columns says
+  what is in force and where it comes from ("Book, from 'Novel'", "Book, set here").
 - **A theme node opens as the theme editor**: the tokens in groups (section 2.1), each with
   a control fitting its type; a token it does not set shows the inherited value greyed with
   where it comes from ("17 px, from Book"), a token it sets has a reset that clears it back
@@ -576,7 +594,8 @@ cut or add.
 2. **Paragraph spacing. Decided (Joe, 2026-11-24):** themes replace Compact/Spaced: no new
    writes of `custom["paragraphs"]`, a read-time fallback to `builtin:document` so every
    existing note looks the same, importers name `builtin:document`, and Edit > "Compact
-   Paragraphs" becomes Format > Theme (section 4).
+   Paragraphs" becomes Format > Theme (section 4; the picker moved to the row menu, Node
+   > Theme... and the Properties panel the same day, section 9).
 3. **Looked up, not copied. Decided (Joe, 2026-11-24):** the theme in force is the one named
    by the node or its nearest ancestor, so a theme on any node with children applies to its
    whole subtree, notes already there included (section 3.2).
@@ -617,7 +636,7 @@ cut or add.
 
 1. **Tokens and drawing.** `pimble-themes` (tokens, types, checks, built-ins, CSS
    generation), `custom_keys::THEME`, resolution (chain, base), `document_theme.css`, the
-   pane wrapper, bundled fonts, the paragraphs fallback, Format > Theme with built-ins only.
+   pane wrapper, bundled fonts, the paragraphs fallback, the Theme picker with built-ins only.
    Default and Document are pixel-identical to today (checked by screenshot on both
    targets).
 2. **Theme nodes.** `node_type = "theme"`, internal kinds and View > "Show Internal"
@@ -631,6 +650,57 @@ cut or add.
    ancestors nor the theme node, at each of the three theme accesses; the Share dialog's
    theme access choice.
 5. **MCP** tools, and "Update from original".
+
+### Built: wave 1 (2026-11-24, not merged)
+
+- **`crates/pimble-themes`**: the document tokens of section 2.1 with their checks, the
+  nine built-ins of section 11 (`builtins()`), resolution over a chain (`in_force`: the
+  node's own theme, else the nearest ancestor's, else the paragraphs fallback), and
+  `draw`, which answers `Drawn { style, modifiers }`: `--pd-*` declarations and the
+  modifier class names, nothing else. The bundled fonts are in `assets/fonts/` (Inter,
+  Source Serif 4, EB Garamond, JetBrains Mono, Atkinson Hyperlegible, each with its OFL).
+- **The pane**: `pane_view/pane.rs` puts the drawn theme on the pane's
+  `.pimble-editor__content-wrap` (`themes::WRAP_CLASS`), and `styles/document_theme.css`
+  reads it; every rule falls back to the look before themes, so a note naming no theme
+  draws as it did (`styles/document_theme_tests.rs` holds every fallback to the values
+  of before). `custom_keys::THEME` names a node's theme; `GetThemeChain` /
+  `ThemeChainLoaded` bring a node's ancestors' names. Compact Paragraphs and the
+  paragraph writes are gone (section 4); a new node no longer copies its parent's
+  paragraphs, and the importer names Document on its top node only.
+- **The measure** makes the editor itself a centered column (its `em` is the body size,
+  and it keeps the page padding and the discussions' gutter inside it), not the blocks'
+  margins: rinch writes each text block's indent as an inline `margin-left`, which no rule
+  outranks, and a measure in a heading's own `em` would make it wider than the
+  paragraphs. The wrap paints the page beside the column (`<wrap>--dark`/`--light` say
+  its scheme). A click beside the column reaches the wrap, not the editor. Centering by
+  the editor's padding instead (`calc((100% - measure) / 2)`) is not possible on the
+  desktop yet: rinch resolves a percentage inside a calc only against a width it can prove
+  definite, and a pane's is not.
+- **The interface**: the Theme picker of section 9 with built-ins only (the store group and
+  "From other open stores" come with wave 2), opened by Node > "Theme...", "Theme..." in
+  the row menus, the Properties panel's Theme line and the Appearance picker's Theme row.
+  The Node menu is docs/MENUS_CONTRACT.md section 11.
+- **Read as follows where the sections above left room** (reported to Joe):
+  - the measure range is 30–100 em (section 2.1); `semibold` joins the weights; the font
+    catalog is the bundled families plus System, each with a kind (sans, serif, book,
+    mono, readable) that names its generic fallback;
+  - quotes: `indent` is a deeper indent and no bar, `italic` is italic and no bar, `boxed`
+    a bordered box;
+  - the rule ornament is a short centered double line drawn by the rule's border, since
+    generated content inside the editor misplaces the caret (joeleaver/rinch#891); Report's
+    "numbered-feeling" headings are semibold with a rule below, without numbers;
+  - a theme name this device does not know is skipped up the chain, and the picker says
+    so; `custom_keys::INHERITED` is not used (section 4 drops it);
+  - a note naming no theme reads in Document when its own paragraphs are spaced, otherwise
+    in Default (section 4);
+  - "Theme..." on a mount row acts on the source node (decision 5).
+- **Checked**: unit tests in `pimble-themes`, `pimble-app` (`themes/`, `themes/preview.rs`,
+  `menus.rs`, the stylesheet tests). Screens, desktop GPU, against `807a5ea` in a scratch
+  app: Default and a note naming no theme are pixel-identical to before in the content
+  area, dark and light, top and bottom of the note; Document is pixel-identical to a
+  spaced note before (only the title in the pane's header differs, the notes being
+  different); each built-in was looked at in a pane and in the picker's preview. Not yet:
+  `--cpu`, and the browser side by side.
 
 ## 14. How it is checked
 

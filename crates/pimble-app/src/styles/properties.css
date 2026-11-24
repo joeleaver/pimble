@@ -248,3 +248,8 @@
     color: var(--rinch-color-dimmed);
 }
 
+
+/* The document theme in force (properties/theme.rs). */
+.pimble-properties__theme {
+    line-height: 1.5;
+}

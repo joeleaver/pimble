@@ -84,7 +84,7 @@ pub(super) fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: Pane
     let drawn = rinch::core::reactive::Memo::new(move || crate::themes::pane_drawn(store, pane));
     let content_wrap = rsx! {
         div {
-            class: {move || crate::themes::classes(crate::themes::WRAP_CLASS, &drawn.get())},
+            class: {move || crate::themes::wrap_classes(&drawn.get(), store.dark_mode.get())},
             // Hidden under a picture's board view while it is marked up.
             style: {move || {
                 let shown = state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get();

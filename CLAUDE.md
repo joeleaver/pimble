@@ -67,6 +67,7 @@ the hosted server to this version together.
 | `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server, canvases included (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
 | `pimble-import` | Scrivener + RTF import | Complete |
 | `pimble-ui` | rinch components with no app state, drawn alike by the app and plugins: presence chips and dots, icons, theme colors | Complete |
+| `pimble-themes` | document themes as data: the token table (today's look as every default), typed checks, the nine built-ins, bases, the theme in force on a chain, `draw` to `--pd-*` properties and modifier classes, the bundled fonts (`docs/THEMES_CONTRACT.md`) | Wave 1 done; theme nodes, app themes to come |
 | `pimble-plugin-abi` / `-host` / `-sdk` | plugins: the ABI (6), the host (wasmtime on the desktop, the page's WebAssembly in the browser), the guest SDK in the `plugins/` workspace (with `hello-viewer`, `stuck-viewer`, `kanban-viewer`, `todo-viewer`, `timeline-viewer`; `scripts/plugins/install.sh`; viewers share `pimble_ui::viewer`, the kanban's look) | Desktop and browser hosts built (docs/PLUGINS_CONTRACT.md) |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
@@ -361,6 +362,34 @@ clicks and keys select several rows; drops, keyboard moves, Delete, cut/paste an
 menu act on the selection; several nodes of one store move with the `moveNodes` RPC (all
 judged first, one refusal refuses all).
 
+### Document themes (wave 1 built 2026-11-24, not merged)
+
+Contract: `docs/THEMES_CONTRACT.md` (wave 1 in section 13, "Built" at the end). A node
+names a theme in `custom["theme"]` (`custom_keys::THEME`, `NodeMetadata::theme`), written
+through `SetNodeAppearance` like an icon; the theme in force is the node's or its nearest
+ancestor's, looked up and never copied (`themes::resolve`, `pimble_themes::in_force`; a
+missing ancestor is fetched once with `GetThemeChain`). With none, a note whose
+paragraphs were spaced before themes reads in Document, every other in Default;
+`custom["paragraphs"]` is only read now and Edit > "Compact Paragraphs" is gone. A mount
+reads as its source does. Each pane's `.pimble-editor__content-wrap` carries the theme
+drawn (`themes::pane_drawn`): `--pd-*` custom properties inline and modifier classes,
+which `styles/document_theme.css` reads with the look before themes as every fallback,
+so Default and Document draw exactly as before. A measure makes the editor a centered
+column, never the blocks' margins (rinch writes each text block's indent as an inline
+`margin-left`, and a heading's `em` is not the body's); no calc() there mixes in a
+percentage (rinch drops it against a pane's width, which it cannot prove definite). Built-ins only so far (Default,
+Document, Book, Manuscript, Code, Markdown, Report, Journal, Compact). Fonts: Inter,
+Source Serif 4, EB Garamond, JetBrains Mono, Atkinson Hyperlegible in `assets/fonts/`
+(OFL), registered with `App::fonts` on the desktop and served as `@font-face` from
+`/app/fonts/` in the browser. A row's "Theme..." (beside "Appearance..."), Node >
+"Theme..." in the menu bar (the Node menu holds what acts on the selected node: New,
+Discuss, Appearance, Theme, Cut, Copy, Paste, Delete; docs/MENUS_CONTRACT.md section 11),
+the Properties panel's Theme line and the Appearance picker's Theme row open the picker: the themes on the left,
+a live preview on the right of the node's own text in the theme under the pointer
+(`themes::preview` reads the editor's blocks, `app/theme_preview.rs` draws them in a wrap
+of its own so the same rules apply). Theme nodes, app themes, shares and MCP are waves 2
+to 5.
+
 ### Tree appearance (done 2026-09-15)
 
 A node's custom icon and colour live in `metadata.custom` under
@@ -653,6 +682,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
 - `crates/pimble-app/src/events/` - `BackendEvent` -> UI state: `mod.rs` dispatches, a module per concern (`connection`, `stores`, `nodes`, `sync`, `cloud`, `view`, `links`)
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
+- `docs/THEMES_CONTRACT.md`, `crates/pimble-themes/`, `crates/pimble-app/src/themes/`, `styles/document_theme.css` - document themes: tokens, resolution, drawing per pane, the picker
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
 - `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties/` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter); `mod.rs` draws the panel, `tags.rs`, `fields.rs`, `place.rs` and `references.rs` its sections
 

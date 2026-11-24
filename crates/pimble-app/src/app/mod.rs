@@ -36,6 +36,7 @@ mod status;
 mod store_modals;
 mod theme;
 mod theme_picker;
+mod theme_preview;
 mod tree_row;
 #[cfg(test)]
 mod tests;
@@ -54,8 +55,9 @@ pub use share_modal::open_share_modal;
 #[cfg(feature = "native")]
 pub use store_modals::{pick_and_create_store, pick_and_open_store};
 pub use store_modals::{open_connect_modal, open_mount_picker, open_new_store_modal};
+pub(crate) use appearance_modal::open_appearance_for_selected;
 pub use theme::{apply_theme, theme_css, theme_props, toggle_dark_mode};
-pub(crate) use theme_picker::open_theme_picker_for_focused;
+pub(crate) use theme_picker::{open_theme_picker, open_theme_picker_for_selected};
 
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
@@ -300,7 +302,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let connect_modal = store_modals::render_connect_modal(__scope, store);
         let link_modal = store_modals::render_link_modal(__scope, store);
         let appearance_modal = appearance_modal::render(__scope, store);
-        // Format > Theme... (docs/THEMES_CONTRACT.md section 9).
+        // The Theme picker (docs/THEMES_CONTRACT.md section 9).
         let theme_picker = theme_picker::render(__scope, store);
         // Paste with several things it could do (`crate::pasting`).
         let paste_chooser = crate::pasting::render_chooser(__scope, store);

@@ -139,6 +139,27 @@ pub(crate) fn resolve(store: AppStore, store_id: StoreId, node_id: NodeId) -> (I
     (in_force_of(&walk, &Builtins), walk)
 }
 
+/// The theme `(store_id, node_id)` would read in without a theme of its own
+/// (the picker's "Use the parent's"), tracked: its parent's chain, with the
+/// node's own paragraphs still deciding the fallback.
+pub(crate) fn in_force_without_own(store: AppStore, store_id: StoreId, node_id: NodeId) -> InForce {
+    let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
+    let (parent_id, spaced) = node.map(|n| n.with(|n| (n.parent_id, n.metadata.spaced_paragraphs()))).unwrap_or((None, false));
+    let above = parent_id.map(|parent| resolve(store, store_id, parent).1).unwrap_or_default();
+    let chain = std::iter::once(Link { theme: None }).chain(above.steps.iter().map(|s| Link { theme: s.theme.as_deref() }));
+    pimble_themes::in_force(chain, spaced, &Builtins)
+}
+
+/// What the picker previews for `(store_id, node_id)`: the note's own blocks
+/// from an editor holding it, or the sample when none does. Untracked: read
+/// once, when the picker opens.
+pub(crate) fn preview_blocks(store: AppStore, store_id: StoreId, node_id: NodeId) -> (Vec<preview::Block>, bool) {
+    match store.panes_editing(store_id, node_id).first() {
+        Some(pane) => (preview::of_doc(&crate::editor::editor(*pane).doc()), true),
+        None => (preview::sample(), false),
+    }
+}
+
 /// Asks for `node_id` and the nodes above it, unless that is already asked.
 fn ask(store_id: StoreId, node_id: NodeId) {
     if ASKED.with(|asked| asked.borrow_mut().insert((store_id, node_id))) {
@@ -216,6 +237,20 @@ pub(crate) fn classes(block: &str, drawn: &Drawn) -> String {
     }
     out
 }
+
+/// A pane wrap's classes: the drawn theme's (`classes`), then the scheme
+/// (`<WRAP_CLASS>--dark` or `--light`). The editor inside says its scheme
+/// with `data-pm-theme`; the wrap needs its own to paint the page beside a
+/// measured column (`document_theme.css`, "Measure").
+pub(crate) fn wrap_classes(drawn: &Drawn, dark: bool) -> String {
+    let mut out = classes(WRAP_CLASS, drawn);
+    out.push(' ');
+    out.push_str(WRAP_CLASS);
+    out.push_str(if dark { "--dark" } else { "--light" });
+    out
+}
+
+pub(crate) mod preview;
 
 #[cfg(test)]
 mod tests;
