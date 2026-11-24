@@ -216,7 +216,6 @@ pub(crate) fn cells_row(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown
 /// else in the cell would find no list and offer no place. It grows with its
 /// cards; only a minimized lane caps it, at about three cards, and scrolls.
 /// A folded column is a narrow strip with its name and count.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column, folded: bool, size: Size, lane_writable: bool, judge: SortJudge) -> NodeHandle {
     let addr = column.addr;
     let name = column.label.clone();

@@ -176,7 +176,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         spawn_local(async move {
             let mut forests = k.read().await;
             while let Some(change) = k.api.next_change().await {
-                if forests.as_ref().map_or(true, |fs| fs.iter().any(|f| f.touched_by(&change))) {
+                if forests.as_ref().is_none_or(|fs| fs.iter().any(|f| f.touched_by(&change))) {
                     forests = k.read().await.or(forests);
                 }
             }
