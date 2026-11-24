@@ -516,8 +516,11 @@ Each app theme has a light and a dark half:
 12. **Contrast**: pure white or near-black surfaces, strong borders, saturated accent: for
     bright rooms, projectors and low vision.
 13. **Dusk**: muted, low-contrast, cool grays in both halves: long sessions, late at night.
+14. **Grove**: green-based (Joe, 2026-11-24: "some people just love green"): sage-tinted
+    surfaces and a forest-green accent in light, deep green-black surfaces and a soft
+    leaf-green accent in dark.
 
-That is nine document themes and four app themes (thirteen); decision 11 asks which to
+That is nine document themes and five app themes (fourteen); decision 11 asks which to
 cut or add.
 
 ## 12. Decisions for Joe
