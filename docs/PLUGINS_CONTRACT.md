@@ -525,6 +525,11 @@ first plugin.
    `metanodes::ask_for_parent`), and the plugins loading or changing
    (`events::rejudge_panes` from `metanodes::plugins_ready`). Every plugin is built
    again for ABI 7 and ships with the release that brings it.
+   Checked 2026-11-23 in a scratch release app (port 7494) with the kanban built for
+   ABI 7: a kanban's columns show `layout-columns` in the explorer and a lane keeps the
+   kanban's icon; opening Done shows that one column (its 8 cards, no lane or "+ Add
+   column"), with the column icon in the pane's strip; it comes back the same after a
+   restart; a card under it still opens as text.
 
 ## 5. How it is checked
 
