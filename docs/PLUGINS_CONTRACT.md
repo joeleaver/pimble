@@ -196,7 +196,7 @@ first plugin.
    not what section 3.5 says:** rinch is 0.1.0 at every revision and revisions have no
    order outside its repository, so the host checks the ABI exactly and only logs a
    plugin built against another rinch revision; an exact match would refuse every plugin
-   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins.rs`,
+   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins/`,
    desktop only): the folder loads off the UI thread at start; a pane opening a metanode
    whose viewer a loaded plugin provides mounts it in a slot in `render_metanode` (props
    updated in place as the forest changes); a refused plugin's viewer, or a plugin that
@@ -342,7 +342,7 @@ first plugin.
    `HostLink::request`, `recipe(..)`, `display_label(node)` (the explorer's label),
    `person(..)`, re-exports `pimble_ui`. **Host:** `Instance::on_request`,
    `Instance::set_host_state`, `Call::HostState`, the engine links the import and needs
-   the export. **App:** `plugins.rs` pushes host state from one effect over presence, the
+   the export. **App:** `plugins/host.rs` pushes host state from one effect over presence, the
    theme and every pane's following; answers `Open` with the pane's link-open, `Focus`
    with `presence::say_within`, `Follow` with `follow::start`; lists every loaded
    plugin's recipes in `AppStore::recipes`, offered in the explorer's row and store menus,
@@ -391,9 +391,9 @@ first plugin.
    made says why. **Shared code:** the applier, bridge, instance and approvals are
    unchanged; the registry moved out of the wasmtime engine (`registry.rs`, generic
    over an engine's loaded plugin; `wasmtime_engine::load_dir` is the folder loader).
-   `crates/pimble-app/src/plugins.rs` is one module for both targets, with only a
-   `place` per target (engine, where plugins and approvals are kept, the window's
-   add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
+   `crates/pimble-app/src/plugins/` is one module for both targets, with only a
+   `place` per target (`place_desktop.rs`, `place_browser.rs`: engine, where plugins and
+   approvals are kept, the window's add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
    the desktop, `spawn_local` in the page). **Where plugins live in the browser:** there
    is no folder, so the Plugins window (File > "Plugins...") has "Add plugin...", which
    takes a `.wasm` file the person picks, compiles and describes it in the page, and
@@ -501,6 +501,35 @@ first plugin.
    splits the plugin's pane to the right when there is none, uses another pane shown when
    four are open, and the plugin's own pane when it is the only one. A guest that wants a
    double-click times its clicks itself: WASI's clock answers on both hosts.
+   **ABI 7** (2026-11-23, Joe: a kanban's column opened on its own shows as a column, and
+   its row looks like one): `Provision::ChildViewer(ChildViewerDecl { id, name, of, icon })`
+   (`sdk::child_viewer`) is a viewer for the children of the plugin's own viewer `of`'s
+   metanodes. Nothing is stored on a child (Joe chose "derived from place"): the app
+   shows a node with it because its parent is a metanode shown with `of`, so a column
+   moved out of a kanban is a plain node again and one moved in becomes a column. It
+   mounts as any viewer (`MountArgs::viewer` is its id, the props' metanode the child,
+   whose source is its children); its `icon` is what the children's rows show when they
+   have none of their own. `check_manifest` refuses a child viewer of a viewer the plugin
+   does not provide (no plugin decides how another's metanodes' children look) and one
+   whose id is also a viewer's. `Registry::child_viewer(of)` finds it; `Registry::viewer`
+   mounts it. The kanban provides `kanban-column` ("Kanban column", `layout-columns`).
+   The app (both targets) keeps the loaded plugins' child viewers in
+   `AppStore::child_viewers`; `AppStore::child_viewer(store, node)` is the one judgement
+   (no viewer of its own, a parent held whose non-query metanode's viewer has one), and
+   `metanodes::shows_as_metanode` is what every open asks. A pane showing such a node is a
+   metanode pane: its forest is the node's children (`Forest.spec` is `None`) and `fill`
+   mounts the child viewer. The row, the pane's strip and the outline take its icon
+   (`AppStore::node_icon(store, node)`, part of the row's snapshot). A pane is judged again
+   when what decides it changes elsewhere (`events/panes.rs`): the parent arriving or
+   changing (a pane holding a node whose parent the window lacks asks for it,
+   `metanodes::ask_for_parent`), and the plugins loading or changing
+   (`events::rejudge_panes` from `metanodes::plugins_ready`). Every plugin is built
+   again for ABI 7 and ships with the release that brings it.
+   Checked 2026-11-23 in a scratch release app (port 7494) with the kanban built for
+   ABI 7: a kanban's columns show `layout-columns` in the explorer and a lane keeps the
+   kanban's icon; opening Done shows that one column (its 8 cards, no lane or "+ Add
+   column"), with the column icon in the pane's strip; it comes back the same after a
+   restart; a card under it still opens as text.
 
 ## 5. How it is checked
 

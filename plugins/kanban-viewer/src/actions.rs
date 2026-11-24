@@ -12,55 +12,74 @@ impl Kanban {
         // column's store closed since is refused at the caret, not after
         // the drop.
         let _ = self.api.stores().await;
-        match self.api.metanode_source(self.metanode).await {
-            Ok(forest) => {
-                // The tops that are kanbans are lanes: a kanban itself, or a
-                // mount of one (read from its source).
-                let tops: Vec<(Addr, pimble_plugin_sdk::pimble_core::Node)> = forest.tops().map(|t| (t.addr, t.node.clone())).collect();
-                let mut lanes: Vec<(Addr, Forest)> = Vec::new();
-                for (top, node) in tops {
-                    let source = if is_kanban(&node) {
-                        Some(top)
-                    } else if let Some(m) = node.mount_ref() {
-                        let source = Addr::new(m.source_store, m.source_node);
-                        self.api.node(source).await.ok().filter(is_kanban).map(|_| source)
-                    } else {
-                        None
-                    };
-                    let Some(source) = source else { continue };
-                    match self.api.metanode_source(source).await {
-                        Ok(lane) => lanes.push((top, lane)),
-                        Err(e) => self.status.set(e.sentence()),
-                    }
-                }
-                let board = board_of(&forest, &lanes, display_label);
-                // Something chosen that is no longer on the board is let go,
-                // unless it is being named: a card just made is chosen before
-                // the board has read it.
-                let naming = untracked(|| self.renaming.get());
-                if let Some(chosen) = untracked(|| self.chosen.get()).filter(|c| Some(c.addr()) != naming) {
-                    let there = match chosen {
-                        Chosen::Card(a) => board.find_card(a).is_some(),
-                        Chosen::Column(a) => board.find_column(a).is_some(),
-                        Chosen::Lane(a) => board.lane_of_node(a).is_some(),
-                    };
-                    if !there {
-                        self.choose(None);
-                    }
-                }
-                if untracked(|| self.board.get()) != board {
-                    self.board.set(board);
-                }
-                self.loaded.set(true);
-                let mut forests = vec![forest];
-                forests.extend(lanes.into_iter().map(|(_, lane)| lane));
-                Some(forests)
+        let read = if self.column_only { self.read_column().await } else { self.read_board().await };
+        let (board, forests) = match read {
+            Ok(read) => read,
+            Err(sentence) => {
+                self.status.set(sentence);
+                return None;
             }
-            Err(e) => {
-                self.status.set(e.sentence());
-                None
+        };
+        // Something chosen that is no longer on the board is let go,
+        // unless it is being named: a card just made is chosen before
+        // the board has read it.
+        let naming = untracked(|| self.renaming.get());
+        if let Some(chosen) = untracked(|| self.chosen.get()).filter(|c| Some(c.addr()) != naming) {
+            let there = match chosen {
+                Chosen::Card(a) => board.find_card(a).is_some(),
+                Chosen::Column(a) => board.find_column(a).is_some(),
+                Chosen::Lane(a) => board.lane_of_node(a).is_some(),
+            };
+            if !there {
+                self.choose(None);
             }
         }
+        if untracked(|| self.board.get()) != board {
+            self.board.set(board);
+        }
+        self.loaded.set(true);
+        Some(forests)
+    }
+
+    /// The board of the kanban this viewer shows, and the forests read: the
+    /// kanban's, then each lane's.
+    async fn read_board(&self) -> Result<(Board, Vec<Forest>), String> {
+        let forest = self.api.metanode_source(self.metanode).await.map_err(|e| e.sentence())?;
+        // The tops that are kanbans are lanes: a kanban itself, or a
+        // mount of one (read from its source).
+        let tops: Vec<(Addr, pimble_plugin_sdk::pimble_core::Node)> = forest.tops().map(|t| (t.addr, t.node.clone())).collect();
+        let mut lanes: Vec<(Addr, Forest)> = Vec::new();
+        for (top, node) in tops {
+            let source = if is_kanban(&node) {
+                Some(top)
+            } else if let Some(m) = node.mount_ref() {
+                let source = Addr::new(m.source_store, m.source_node);
+                self.api.node(source).await.ok().filter(is_kanban).map(|_| source)
+            } else {
+                None
+            };
+            let Some(source) = source else { continue };
+            match self.api.metanode_source(source).await {
+                Ok(lane) => lanes.push((top, lane)),
+                Err(e) => self.status.set(e.sentence()),
+            }
+        }
+        let board = board_of(&forest, &lanes, display_label);
+        let mut forests = vec![forest];
+        forests.extend(lanes.into_iter().map(|(_, lane)| lane));
+        Ok((board, forests))
+    }
+
+    /// A column opened on its own (`kanban-column`): its kanban's board, the
+    /// column alone in it, read from the kanban the column is a child of,
+    /// so cards move and are judged there as on the board.
+    async fn read_column(&self) -> Result<(Board, Vec<Forest>), String> {
+        let column = self.api.node(self.metanode).await.map_err(|e| e.sentence())?;
+        let gone = || "This column is not in a kanban any more.".to_string();
+        let kanban = Addr::new(self.metanode.store, column.parent_id.ok_or_else(gone)?);
+        let forest = self.api.metanode_source(kanban).await.map_err(|e| e.sentence())?;
+        let board = column_board(board_of(&forest, &[], display_label), self.metanode).ok_or_else(gone)?;
+        Ok((board, vec![forest]))
     }
 
     /// A click on `card`: it opens beside the board, or with Ctrl (Cmd)

@@ -273,7 +273,7 @@ Each item of the earlier inventory, framed as what becomes of it.
 - The app's own settings (`persistence.rs`: `state.json` vs `localStorage`): one settings
   record over a key-value adapter.
 - Plugins: wasmtime vs the page's WebAssembly (`pimble-plugin-host`), and where plugins are
-  found (`plugins.rs` `place`, 1157 vs 1459).
+  found (`plugins/place_desktop.rs` vs `plugins/place_browser.rs`).
 - Operating-system edges: file dialogs and reading files (pictures, import, export, SVG
   import, pasting), the native menu bar vs rinch-web's (`menus.rs`, `web/src/menu.rs`), the
   window, self-update (`update.rs`), the MCP agents' config files (`agents.rs`).

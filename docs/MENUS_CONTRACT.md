@@ -22,9 +22,9 @@ as recommended, and Joe's idea for copying (section 3.1). Submenus asked of rinc
   "Start a Discussion" (a discussion on this node). Three "paste"-like items each paste
   one kind of thing (Paste Picture, Paste Mount Here, and Edit's paste of cut nodes).
 - **The explorer's "+"** makes an empty text node under the root of the selected row's
-  store (`app.rs` `on_new_node`). Canvases, sheets, discussions and kanbans exist only in
+  store (`app/shell.rs` `on_new_node`). Canvases, sheets, discussions and kanbans exist only in
   the row menu.
-- The New items are written out twice, once per menu (`app.rs`), with the plugins'
+- The New items are written out twice, once per menu (`app/shell.rs`, `app/explorer_menu.rs`), with the plugins'
   recipes (`AppStore::recipes`) appended to each.
 - **rinch**: the app menu bar and the tray have submenus; `DropdownMenu` and
   `ContextMenu` do not (only a separate dropdown opened by click inside one). Cascading

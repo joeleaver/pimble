@@ -57,8 +57,8 @@ Zoom In, Zoom Out, Actual Size, the way a browser zooms a page.
   saved value, labels and aliases.
 - `boards.rs`: the camera kept across a change of scale (`Session::presented_scale`).
 - `menus.rs` (View: Zoom In, Zoom Out, Actual Size), `persistence.rs`
-  (`load_zoom`/`save_zoom`), `app.rs` (restore and listener at start, the status bar's
-  zoom), `editor.rs` (the aliases in the editor's key hook), `styles.rs`
+  (`load_zoom`/`save_zoom`), `app/shell.rs` (restore and listener at start, the status bar's
+  zoom), `editor.rs` (the aliases in the editor's key hook), `styles/status_bar.css`
   (`.pimble-status-bar__zoom`).
 
 ## Audit of Pimble's pixel math

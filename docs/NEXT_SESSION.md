@@ -414,7 +414,7 @@ Windows user reported no File/Edit/View menu and a console window beside the app
 growth fixed.** Joe's window reached 5 GB while an agent wrote notes: every note
 rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context menu), and
 rinch never frees a discarded node (rinch#723). Fixed by:
-- **One explorer menu** (`ExplorerMenu`, `explorer_menu` in `app.rs`): a right press on a
+- **One explorer menu** (`ExplorerMenu` in `app/row_menu.rs`, `explorer_menu` in `app/explorer_menu.rs`): a right press on a
   row aims it; one signal per flag, written only on change.
 - **rinch#2573** (on rinch main since 758adc72, with #2549, the scrollbar over an editor):
   a change under a tree row redraws that row's list only. All three locks pin 758adc72.

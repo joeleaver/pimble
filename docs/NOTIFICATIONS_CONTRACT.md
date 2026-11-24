@@ -732,9 +732,9 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   `store_keys.rs`, each under 700 lines).
 - `pimble-app`: `watches.rs` (state, the row menu's states, the switch, the Inbox's
   "Watching" list with "Unwatch"), the row menu's "Watch" submenu (Watch, Watch with
-  Subtree, Unwatch) in `app.rs`, the switch in the Account modal and Settings, watch
+  Subtree, Unwatch) in `app/explorer_menu.rs`, the switch in the Account modal and Settings, watch
   notices in `inbox.rs` (title, the note's name as the system notification's body,
-  "Unwatch" on the row), `protocol.rs`/`commands.rs`/`events.rs`. One code base for the
+  "Unwatch" on the row), `protocol/`/`commands/`/`events.rs`. One code base for the
   desktop and the browser; `web/build/sw.template.js` titles a pushed watch notice.
 
 ### Verified
@@ -909,7 +909,7 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
     notice's note from `AppStore::node_data`, which holds only notes some view showed,
     and the desktop had shown the watched note while the browser had not. Every
     notice's note the app does not hold is now read from the device's own documents
-    through the shared command path (`BackendCommand::NameNodes`, `commands.rs:246`),
+    through the shared command path (`BackendCommand::NameNodes`, `commands/api.rs`),
     answered with names alone (`BackendEvent::NotesNamed`, `None` for a note this
     device cannot read, kept in `AppStore::notice_names`; nothing of the tree moves),
     and asked for once: not again while asked, nor on a reconnect once named (a note
@@ -935,7 +935,7 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
 - `crates/pimble-app/src/inbox.rs:133`: the OS notification is gated on
   `notifies_here()` (:162 native `instance::is_primary()`, :167 the browser always); a
   notice not shown is held back (:137); `took_over` (:146).
-- `crates/pimble-app/src/events.rs:1520`: `BackendEvent::AppLink` comes to the front,
+- `crates/pimble-app/src/events/mod.rs` (the dispatcher): `BackendEvent::AppLink` comes to the front,
   opens the link, then sends `BackendCommand::AppLinkTaken`.
 - `crates/pimble-rpc/src/app_links.rs` (new, out of `types.rs`): `OpenInAppRequest.confirm`,
   `HandedLink.ack`, `AppLinkTakenRequest`, `APP_LINK_CONFIRM_WAIT_MS`;

@@ -1,0 +1,139 @@
+/* ── Appearance picker ──────────────────────────────────────── */
+.pimble-appearance__label {
+    font-size: 12px;
+    opacity: 0.7;
+    margin: 10px 0 6px 0;
+}
+.pimble-appearance__row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.pimble-swatch {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    cursor: pointer;
+}
+.pimble-swatch--active {
+    border-color: var(--rinch-color-text);
+}
+.pimble-swatch--none {
+    background: transparent;
+    border: 2px dashed var(--rinch-color-placeholder);
+    color: var(--rinch-color-dimmed);
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: auto;
+    padding: 0 8px;
+}
+/* One of two named choices (the picker's Paragraphs row), not an absence. */
+.pimble-swatch--choice {
+    border-style: solid;
+}
+/* The chosen one of those, None and Default included: `--none`'s border
+   comes after `--active`'s and would otherwise hide which is chosen. */
+.pimble-swatch--none.pimble-swatch--active {
+    border-color: var(--rinch-color-text);
+    color: var(--rinch-color-text);
+}
+.pimble-icon-choice {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background: var(--rinch-color-surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+.pimble-icon-choice--active {
+    border-color: var(--rinch-primary-color-5);
+}
+.pimble-icon-choice svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* ── Share modal ────────────────────────────────────────────── */
+
+.pimble-share__note {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    line-height: 1.5;
+}
+
+/* One of the two ways to share from a store that is not hosted: its button,
+   then its sentence. */
+.pimble-share__way {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
+.pimble-share__members {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-share__member {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+.pimble-share__member:last-child {
+    border-bottom: none;
+}
+
+.pimble-share__member-email {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pimble-share__member-status {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+}
+
+.pimble-share__invite {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+/* ── "Recently Deleted..." modal ──────────────────────────────── */
+
+.pimble-deleted__list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.pimble-deleted__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+.pimble-deleted__row:last-child {
+    border-bottom: none;
+}
+

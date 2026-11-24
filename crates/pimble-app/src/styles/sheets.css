@@ -1,0 +1,584 @@
+/* ── Sheets (docs/SHEETS_CONTRACT.md) ─────────────────────────── */
+
+/* A sheet pane: its tables stacked, scrolling as one. Typed cells are plain,
+   computed ones tinted; a header is one line, its type a faint mark. */
+.pimble-sheet {
+    flex: 1;
+    overflow: auto;
+    padding: 16px 20px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-height: 0;
+}
+
+/* A table in a note's text: no pane padding, and it scrolls sideways
+   itself rather than the text. */
+.pimble-sheet--in-text {
+    flex: none;
+    overflow: visible;
+    padding: 0;
+    gap: 6px;
+    font-size: 14px;
+}
+
+/* A sheet node shown in the text: its title, a link to it. */
+.pimble-sheet__embed-title {
+    font-size: 12px;
+    color: var(--rinch-primary-color);
+    cursor: pointer;
+    padding: 0 2px;
+}
+
+/* The tables no longer in the text, listed under it. */
+.pimble-sheet-lost {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 24px 32px;
+    padding: 8px 10px;
+    border: 1px dashed var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    font-size: 13px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet-lost__item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-sheet__message {
+    padding: 6px 10px;
+    border-radius: var(--rinch-radius-sm);
+    border: 1px solid var(--rinch-color-red-6);
+    color: var(--rinch-color-red-6);
+    font-size: 13px;
+}
+
+.pimble-sheet__table {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+    min-width: 0;
+}
+
+/* The title row is one line whatever it holds (docs/SHEETS_CONTRACT.md
+   Layout): the name, kind, count and buttons keep their size, and the
+   formula bar takes what is left and scrolls inside itself. */
+.pimble-sheet__title {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    overflow: hidden;
+    min-width: 0;
+}
+
+.pimble-sheet__title > * {
+    flex: none;
+}
+
+.pimble-sheet__name {
+    font-weight: 600;
+    font-size: 14px;
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-text);
+    padding: 2px 4px;
+    max-width: 24em;
+    min-width: 0;
+    flex: 0 1 auto;
+}
+
+.pimble-sheet__kind {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--rinch-color-dimmed);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    padding: 0 5px;
+}
+
+.pimble-sheet__title > .pimble-sheet__source,
+.pimble-sheet__title > .pimble-sheet__formula {
+    flex: 1 1 0;
+    width: 0;
+    min-width: 60px;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.pimble-sheet__source,
+.pimble-sheet__formula {
+    font-family: monospace;
+    font-size: 13px;
+    padding: 3px 6px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-surface);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__note,
+.pimble-sheet__error,
+.pimble-sheet__form-error {
+    color: var(--rinch-color-red-6);
+    font-size: 12px;
+}
+
+/* The formula bar's sentence: one line, cut short, all of it in its tooltip. */
+.pimble-sheet__title > .pimble-sheet__note {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 40%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pimble-sheet__error {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__count {
+    margin-left: auto;
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+}
+
+.pimble-sheet__delete-table,
+.pimble-sheet__delete-row {
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 6px;
+}
+
+.pimble-sheet__scroll {
+    overflow-x: auto;
+}
+
+.pimble-sheet__scroll--open {
+    overflow: visible;
+}
+
+.pimble-sheet__grid {
+    display: grid;
+    font-size: 13px;
+}
+
+/* A row is only a grouping: its cells are the grid's own items, so every
+   row's columns line up. */
+.pimble-sheet__row {
+    display: contents;
+}
+
+/* Moving rows and columns (sheets/moving.rs): a grip shows while the pointer
+   is over its row or its column's header, and is dragged. A plain table's
+   rows keep theirs in a gutter before the first column. */
+.pimble-sheet__gutter {
+    position: relative;
+    border-bottom: 1px solid transparent;
+}
+
+.pimble-sheet__move {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 100%;
+    color: var(--rinch-color-dimmed);
+    cursor: grab;
+    opacity: 0;
+    user-select: none;
+}
+
+.pimble-sheet__move--on {
+    opacity: 1;
+}
+
+.pimble-sheet__move:hover {
+    color: var(--rinch-primary-color-6);
+}
+
+/* A column's: at the top of its header, in the middle. */
+.pimble-sheet__move--col {
+    position: absolute;
+    top: -2px;
+    left: 50%;
+    margin-left: -8px;
+    height: 12px;
+}
+
+/* A rotated table's field: at the left of its name. */
+.pimble-sheet__move--field {
+    position: absolute;
+    top: 0;
+    left: -2px;
+    bottom: 0;
+    height: auto;
+}
+
+/* A rotated table's record: beside its delete button, under it. */
+.pimble-sheet__move--inline {
+    height: 20px;
+}
+
+/* Room for a rotated table's field grip before its name. */
+.pimble-sheet__rot-name .pimble-sheet__head {
+    padding-left: 16px;
+}
+
+.pimble-sheet__rot-tail {
+    display: flex;
+    align-items: center;
+}
+
+/* A header's grid cell: the header, and the grip on its right edge that
+   changes the column's width. */
+.pimble-sheet__head-wrap {
+    position: relative;
+    min-width: 0;
+    border-bottom: 1px solid var(--rinch-color-border);
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__head {
+    text-align: left;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 5px 8px;
+    cursor: pointer;
+}
+
+.pimble-sheet__grip {
+    position: absolute;
+    top: 0;
+    right: -1px;
+    bottom: 0;
+    width: 7px;
+    cursor: col-resize;
+    user-select: none;
+}
+
+.pimble-sheet__grip:hover {
+    background: var(--rinch-primary-color-6);
+    opacity: 0.5;
+}
+
+.pimble-sheet__head:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-sheet__mark {
+    margin-left: 6px;
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__add-col {
+    width: 28px;
+    text-align: center;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__cell {
+    position: relative;
+    padding: 5px 8px;
+    /* A whole number of pixels, so every row is too and its 1px lines land on
+       the pixel grid (fractional rows drew some of them faint or not at all). */
+    line-height: 20px;
+    min-width: 0;
+    border-bottom: 1px solid var(--rinch-color-border);
+    border-right: 1px solid var(--rinch-color-border);
+    white-space: nowrap;
+    cursor: text;
+}
+
+/* A cell's text stays in its column, cut short with an ellipsis; the cell
+   itself does not clip, so a link cell's choices can hang below it. */
+.pimble-sheet__text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-sheet__num {
+    text-align: right;
+}
+
+.pimble-sheet__cell--computed {
+    background: var(--rinch-color-surface);
+    cursor: default;
+}
+
+.pimble-sheet__cell--error {
+    color: var(--rinch-color-red-6);
+}
+
+.pimble-sheet__cell--placeholder {
+    color: var(--rinch-color-placeholder);
+}
+
+.pimble-sheet__new-row .pimble-sheet__cell--computed {
+    background: transparent;
+}
+
+.pimble-sheet__tail {
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+/* Summary rows and groups (docs/SHEETS_CONTRACT.md section 4b). */
+.pimble-sheet__summary-cell {
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--rinch-color-surface);
+    border-top: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__summary-row--sub .pimble-sheet__summary-cell {
+    font-weight: 500;
+    background: transparent;
+    border-top: none;
+}
+
+/* The first cell carries the row's name at its left, its value at its right. */
+.pimble-sheet__summary-cell--named {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.pimble-sheet__summary-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__summary-cell--named .pimble-sheet__text {
+    flex: 0 1 auto;
+}
+
+.pimble-sheet__group {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 8px 4px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.pimble-sheet__group-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-sheet__group-chevron {
+    width: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+/* A rotated table (docs/SHEETS_CONTRACT.md section 4c): field names down
+   the left, the first field's row as the records' headers. */
+.pimble-sheet__rot-name {
+    border-right: 1px solid var(--rinch-color-border);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__rot-head {
+    font-weight: 600;
+}
+
+.pimble-sheet__rot-corner {
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__rot-stub {
+    min-width: 24px;
+    background: var(--rinch-color-surface);
+}
+
+.pimble-sheet__group--band {
+    grid-column: auto;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__summary-cell--sub {
+    font-weight: 500;
+    background: transparent;
+}
+
+.pimble-sheet__group-count {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+/* A plain inline span: its padding takes room on its line (rinch #1426), and
+   a cell's ellipsis cuts it at paint time with its background kept (#1100). */
+.pimble-sheet__chip {
+    line-height: 18px;
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--rinch-primary-color);
+    color: var(--rinch-color-white);
+    font-size: 12px;
+}
+
+/* What a cell shows, kept under its edit box so the cell keeps its size. */
+.pimble-sheet__under {
+    visibility: hidden;
+}
+
+/* The edit box covers its cell and takes no room of its own, its text
+   where the cell's was: typing in a cell looks like the cell itself taking
+   a caret, with only a faint tint to say which one. */
+.pimble-sheet__edit {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    text-align: inherit;
+    border: none;
+    outline: none;
+    border-radius: 0;
+    padding: 5px 8px;
+    margin: 0;
+    background: var(--rinch-color-option-hover);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__choices {
+    position: absolute;
+    left: 0;
+    top: 100%;
+    z-index: 5;
+    min-width: 180px;
+    max-height: 220px;
+    overflow: auto;
+    padding: 4px;
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-sheet__choice {
+    padding: 5px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.pimble-sheet__choice:hover,
+.pimble-sheet__choice--on {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-sheet__empty {
+    padding: 8px 10px;
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+}
+
+.pimble-sheet__form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    padding: 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    background: var(--rinch-color-surface);
+}
+
+.pimble-sheet__form label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__form input,
+.pimble-sheet__form select {
+    font-size: 13px;
+    padding: 3px 6px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__form-formula {
+    flex: 1 1 280px;
+}
+
+.pimble-sheet__form-formula input {
+    font-family: monospace;
+}
+
+.pimble-sheet__form-hint {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__form-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-left: auto;
+}
+
+.pimble-sheet__form-buttons button,
+.pimble-sheet__adder {
+    font-size: 13px;
+    padding: 4px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    cursor: pointer;
+}
+
+.pimble-sheet__primary {
+    background: var(--rinch-primary-color) !important;
+    color: var(--rinch-color-white) !important;
+    border-color: transparent !important;
+}
+
+.pimble-sheet__danger {
+    color: var(--rinch-color-red-6) !important;
+}
+
+.pimble-sheet__adders {
+    display: flex;
+    gap: 8px;
+}
+

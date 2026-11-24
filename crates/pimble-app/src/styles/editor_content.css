@@ -1,0 +1,215 @@
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] {
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    border-color: var(--rinch-color-border);
+    font-size: 15px;
+    line-height: 1.7;
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h1,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h2,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h3,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h4 {
+    color: var(--rinch-color-text);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h5,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h6 {
+    color: var(--rinch-color-dimmed);
+}
+
+/* Links, Pimble and web alike (docs/LINKS_CONTRACT.md "What a link looks like"):
+   the link color, underlined only under the pointer. The contract's arrow after a
+   web link waits for rinch: generated content (`::after`) inside the editor puts the
+   caret beside the wrong character (joeleaver/rinch#891). */
+.pimble-editor__content-wrap > [data-pm-editor] a {
+    color: var(--rinch-primary-color-6);
+    text-decoration: none;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] a {
+    color: var(--rinch-primary-color-4);
+}
+.pimble-editor__content-wrap > [data-pm-editor] a:hover {
+    text-decoration: underline;
+}
+
+/* Hashtags (docs/HASHTAGS_CONTRACT.md): the accent, as links are, and nothing
+   else: no padding, border, weight or size, so the text lays out as before and
+   the caret, selection and typing are untouched. Ctrl/Cmd+click searches. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-hashtag {
+    color: var(--rinch-primary-color-6);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-hashtag {
+    color: var(--rinch-primary-color-4);
+}
+
+/* Mentions (docs/NOTIFICATIONS_CONTRACT.md section 1, mentions.rs): the accent on a
+   tint, which neither pads nor sizes anything, so the text lays out as before. A
+   mention of someone who can no longer open the note is greyed. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention {
+    color: var(--rinch-primary-color-7);
+    background: var(--rinch-primary-color-0);
+    border-radius: 3px;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-mention {
+    color: var(--rinch-primary-color-3);
+    background: rgba(255, 255, 255, 0.06);
+}
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention.pimble-mention--gone,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-mention.pimble-mention--gone {
+    color: var(--rinch-color-dimmed);
+    background: transparent;
+}
+
+/* Text color (docs/TEXT_COLOR_CONTRACT.md, text_color.rs). The stored color is the
+   mark's inline color, on the mark's span; the decoration's span inside it carries
+   `pimble-tc` and, where the stored color would not read on this theme (always for a
+   palette color), `pimble-tc-fix-light`/`-dark` with the palette class to show
+   instead. Color only, so nothing lays out differently. A hashtag in colored text
+   takes the text's color: first the rule that hands it back, then the palette rules,
+   which outrank or follow it. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-hashtag.pimble-tc,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-hashtag.pimble-tc {
+    color: inherit;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-neutral,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-neutral {
+    color: var(--rinch-color-text);
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-gray {
+    color: #6b7280;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-red {
+    color: #c92a2a;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-orange {
+    color: #c2410c;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-yellow {
+    color: #a16207;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-green {
+    color: #2b7a3b;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-teal {
+    color: #0f766e;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-blue {
+    color: #1971c2;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-purple {
+    color: #7c3aed;
+}
+.pimble-editor__content-wrap > [data-pm-editor]:not([data-pm-theme="dark"]) .pimble-tc-fix-light.pimble-tc-pink {
+    color: #c2255c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-gray {
+    color: #a8adb7;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-red {
+    color: #ff8787;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-orange {
+    color: #ffa94d;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-yellow {
+    color: #ffd43b;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-green {
+    color: #69db7c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-teal {
+    color: #38d9a9;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-blue {
+    color: #74c0fc;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-purple {
+    color: #b197fc;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-tc-fix-dark.pimble-tc-pink {
+    color: #f783ac;
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] code {
+    background: var(--rinch-color-option-hover);
+    color: #e06c75;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] pre {
+    background: var(--rinch-color-surface);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] pre code {
+    background: none;
+    color: #abb2bf;
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] blockquote {
+    border-left-color: var(--rinch-primary-color-7);
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] hr {
+    border-top-color: var(--rinch-color-border);
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th {
+    border-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th {
+    background: var(--rinch-color-surface);
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] [data-pm-placeholder] {
+    color: var(--rinch-color-dimmed);
+}
+
+/* The light scheme, the same rules over rinch's GitHub-light palette: the app's
+   tokens, the dark scheme's size and leading, and code in a muted red as dark's
+   is in a bright one. */
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] {
+    background: var(--rinch-color-surface);
+    color: var(--rinch-color-text);
+    border-color: var(--rinch-color-border);
+    font-size: 15px;
+    line-height: 1.7;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h1,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h2,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h3,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h4 {
+    color: var(--rinch-color-text);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h5,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h6 {
+    color: var(--rinch-color-dimmed);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] code {
+    background: #eef1f4;
+    color: #a3404c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] pre {
+    background: var(--rinch-color-body);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] pre code {
+    background: none;
+    color: #383a42;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] blockquote {
+    border-left-color: var(--rinch-primary-color-3);
+    color: var(--rinch-color-dimmed);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] hr {
+    border-top-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
+    border-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
+    background: var(--rinch-color-body);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] [data-pm-placeholder] {
+    color: var(--rinch-color-dimmed);
+}

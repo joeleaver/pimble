@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use pimble_plugin_abi::Manifest;
+use pimble_plugin_abi::{ChildViewerDecl, Manifest};
 
 /// A plugin an engine loaded: what it said it is.
 pub trait Loaded {
@@ -71,7 +71,9 @@ impl<P: Loaded> Registry<P> {
             }
             Err((manifest, sentence)) => {
                 tracing::warn!("{sentence}");
-                let viewers = manifest.map(|m| m.viewers().map(|v| v.id.clone()).collect()).unwrap_or_default();
+                let viewers = manifest
+                    .map(|m| m.viewers().map(|v| v.id.clone()).chain(m.child_viewers().map(|c| c.id.clone())).collect())
+                    .unwrap_or_default();
                 self.refused.push(Refused { path, viewers, sentence });
             }
         }
@@ -79,7 +81,7 @@ impl<P: Loaded> Registry<P> {
 
     /// The plugin providing viewer `id`, or why there is none to run.
     pub fn viewer(&self, id: &str) -> ViewerLookup<'_, P> {
-        if let Some(plugin) = self.plugins.iter().find(|p| p.manifest().viewers().any(|v| v.id == id)) {
+        if let Some(plugin) = self.plugins.iter().find(|p| p.manifest().mounts(id)) {
             return ViewerLookup::Ready(plugin);
         }
         match self.refused.iter().find(|r| r.viewers.iter().any(|v| v == id)) {
@@ -88,8 +90,63 @@ impl<P: Loaded> Registry<P> {
         }
     }
 
+    /// The viewer for the children of viewer `of`'s metanodes, when a loaded
+    /// plugin provides one: what a kanban's column opens as.
+    pub fn child_viewer(&self, of: &str) -> Option<&ChildViewerDecl> {
+        self.plugins.iter().flat_map(|p| p.manifest().child_viewers()).find(|c| c.of == of)
+    }
+
     /// The plugin whose id is `id`.
     pub fn plugin(&self, id: &str) -> Option<&P> {
         self.plugins.iter().find(|p| p.manifest().id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pimble_plugin_abi::{Provision, SourceShape, ViewerDecl, ABI_VERSION};
+
+    struct Fake(Manifest);
+
+    impl Loaded for Fake {
+        fn manifest(&self) -> &Manifest {
+            &self.0
+        }
+    }
+
+    fn kanban() -> Manifest {
+        Manifest {
+            id: "kanban-viewer".into(),
+            name: "Kanban".into(),
+            version: "0.1.0".into(),
+            abi: ABI_VERSION,
+            rinch: String::new(),
+            provides: vec![
+                Provision::Viewer(ViewerDecl { id: "kanban".into(), name: "Kanban".into(), takes: vec![SourceShape::Children] }),
+                Provision::ChildViewer(ChildViewerDecl {
+                    id: "kanban-column".into(),
+                    name: "Kanban column".into(),
+                    of: "kanban".into(),
+                    icon: Some("layout-columns".into()),
+                }),
+            ],
+            asks: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_child_viewer_is_found_by_its_parents_viewer_and_mounts_as_a_viewer() {
+        let mut loaded = Registry::default();
+        loaded.take(PathBuf::from("kanban.wasm"), Ok(Fake(kanban())));
+        assert_eq!(loaded.child_viewer("kanban").map(|c| c.id.as_str()), Some("kanban-column"));
+        assert!(loaded.child_viewer("hello").is_none());
+        assert!(matches!(loaded.viewer("kanban-column"), ViewerLookup::Ready(_)));
+
+        // A refused plugin's child viewer says why, as its viewers do.
+        let mut refused: Registry<Fake> = Registry::default();
+        refused.take(PathBuf::from("kanban.wasm"), Err((Some(kanban()), "Refused.".into())));
+        assert!(matches!(refused.viewer("kanban-column"), ViewerLookup::Refused("Refused.")));
+        assert!(refused.child_viewer("kanban").is_none());
     }
 }

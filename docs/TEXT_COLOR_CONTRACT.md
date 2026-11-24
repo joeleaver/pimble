@@ -5,7 +5,7 @@ both light/dark mode."
 
 Status: **built 2026-11-21**, not merged or released. Code: `crates/pimble-app/src/text_color.rs`
 (palette, plugin, apply), `toolbar.rs` (`render_color_btn`), `menus.rs` (Edit > Text Color),
-`styles.rs` (`EDITOR_CSS`, "Text color"; the swatches beside `.pimble-toolbar__label`).
+`styles/editor_content.css` (`EDITOR_CSS`, "Text color") and `styles/toolbar.css` (the swatches beside `.pimble-toolbar__label`).
 
 ## 1. Palette
 

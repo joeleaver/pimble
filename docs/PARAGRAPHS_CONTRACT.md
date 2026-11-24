@@ -43,6 +43,6 @@ says which it is.
 
 ## How it is drawn
 
-`pane_view.rs` gives the pane's `.pimble-editor__content-wrap` the class
+`pane_view/pane.rs` gives the pane's `.pimble-editor__content-wrap` the class
 `--spaced` when its note is spaced; the stylesheet sets `p { margin: 0 }` in the
 editor and restores rinch's `0 0 0.75em` under `--spaced`. Desktop and browser alike.

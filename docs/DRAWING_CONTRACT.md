@@ -372,7 +372,7 @@ still lists every entry flat, groups included, until the canvas UI shell is buil
 
 Built 2026-11-14 in `crates/pimble-app` (both apps, one code path), on the model above.
 The canvas fills the pane and everything floats over it; the app's toolbar shows nothing of
-the canvas and dims for a canvas pane as for a pane with no document (`pane_view.rs`: the
+the canvas and dims for a canvas pane as for a pane with no document (`pane_view/mod.rs`: the
 board toolbar is gone, `usable`/`commentable` are false while the focused pane shows a
 board).
 
@@ -594,7 +594,7 @@ cache, at a constant size on screen) and `repivot` made public.
   pickers), `boards.rs` (`Tool`, `StyleUi`, `Popup`, the gestures and the session's `pen`,
   `points`, `alt` and held undo clock), `boards/ui.rs` (an effect per pane: another tool
   finishes the Pen's path and lets go of Direct select's points, run on the next turn),
-  `styles.rs`. **Fixed on the way**: `after_change` set the pins signal while it held the
+  `styles/` (the canvas's `.css` files). **Fixed on the way**: `after_change` set the pins signal while it held the
   session, so an effect run by that set and reading the session panicked ("RefCell already
   borrowed", found switching tools in the test app); the pins are set after it lets go.
   A context-bar picker whose face is words or a number now has a width class
@@ -876,7 +876,7 @@ Built 2026-11-17 in `crates/pimble-app` (both apps, one code path), on the model
   picker, gradient swatches), `boards.rs` (`StyleUi.fill_gradient`, `stroke_gradient`,
   `stop`; `Popup::Combine`; `Gesture::GradientHandle`; `local_edit_said`, which says every
   refusal), `boards/points.rs` (the overlay shows the handles), `boards/ui.rs` (an effect
-  per pane redraws the overlay when the picker opens or the gradient changes), `styles.rs`.
+  per pane redraws the overlay when the picker opens or the gradient changes), `styles/` (the canvas's `.css` files).
 - **Combine**: with two or more selected, the context bar shows a Combine picker (Tabler's
   `layers-union`, `layers-subtract`, `layers-intersect`, `layers-difference`): Union,
   Subtract ("the back one minus the rest", the model's rule), Intersect, Exclude. The
@@ -1231,7 +1231,7 @@ Wave 4 (defaults the PM chose on 2026-11-17 so the UI could proceed; Joe has not
   arrives redraws them), `boards/tools.rs` (routing, pressure, keys), `boards/rail.rs`
   (the Paint group, the context bar's paint pickers, `[`/`]` from the chrome),
   `boards/layers.rs` (thumbnails, New Paint Layer), `boards/points.rs` (the cursor in the
-  edit overlay), `text_boards.rs` (the shared cache), `styles.rs`.
+  edit overlay), `text_boards.rs` (the shared cache), `styles/` (the canvas's `.css` files).
 - **Tools and letters**: the rail is Select (V), Direct select (A), Hand (H) | Pen (P),
   Pencil (N), the shapes flyout (Rectangle U, Ellipse O, Diamond D, Polygon Y, Star K,
   Line L, Arrow W) | the Paint flyout (Brush B, Highlighter M), Eraser (E), Eyedropper (I) |
@@ -1591,7 +1591,7 @@ drawn as marching ants: a white line under a dashed one).
   `Popup::Tolerance`/`FillMode`/`Strength`, `PaneUi.rasterizing`, `Gesture::PaintSelect`
   and `PaintSelDrag`, the session's `paint_sel` and `ants`, `seed_picture`, the handles of
   a paint selection), `boards/tools.rs` (routing, keys), `boards/rail.rs` (the rail, the
-  context bar), `boards/points.rs` (the overlay), `styles.rs`.
+  context bar), `boards/points.rs` (the overlay), `styles/` (the canvas's `.css` files).
 - **The rail's Paint group**: the brush flyout (Brush, Highlighter), Eraser, a **fill
   flyout** (Fill, Smudge, Blur), a **selection flyout** (Rectangle select, Lasso select),
   Eyedropper. Each flyout remembers its face as the others do.

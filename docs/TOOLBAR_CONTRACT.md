@@ -93,14 +93,14 @@ text toolbar's contents are unchanged.
 
 ## Built (2026-11-21, v2)
 
-`toolbar.rs` (`Item`, `Picked`, `which`, `item_changed`), `state.rs` (`PaneState::item`),
+`toolbar.rs` (`Item`, `Picked`, `which`, `item_changed`), `state/pane_state.rs` (`PaneState::item`),
 `editor.rs` (the selection callback), `text_boards.rs` (`selected_item`, `embed_raw`,
-`mark_up_at` for embeds), `pane_view.rs` (one rule; the release that ends a text table's
+`mark_up_at` for embeds), `pane_view/mod.rs` (one rule), `pane_view/pane.rs` (the release that ends a text table's
 cell), `boards/toolbar.rs` (Canvas group, contextual groups, embeds), `boards/rail.rs`
 (`render_context_bar` answers the controls and their pickers; `context_label`, `context_shown`,
 `status_hint`), `boards/ui.rs` (no bar), `boards/tools.rs` (Escape), `boards/export.rs`
 (embeds, names), `sheets.rs` (`pressed_outside`), `sheets/toolbar.rs` (in-text sheets, the
-selected table), `sheets/in_text.rs`, `app.rs` (the status bar hint), `styles.rs`.
+selected table), `sheets/in_text.rs`, `app/shell.rs` (the status bar hint), `styles/toolbar.css` and `styles/status_bar.css`.
 
 Tests: the rule over every pane kind and item; a selection of exactly a picture or an embedded
 canvas node (not a caret beside it); export names all different; the opening zoom; the groups.
@@ -215,7 +215,7 @@ strip goes.
 ### Built (2026-11-21)
 
 - `crates/pimble-app/src/boards/toolbar.rs`: `render_canvas_toolbar`, rendered once and
-  following `focused_pane`, like the sheet's toolbar. `pane_view.rs` shows it instead of the
+  following `focused_pane`, like the sheet's toolbar. `pane_view/mod.rs` shows it instead of the
   text toolbar while the focused pane shows a board (`show_board`, so a picture in text being
   marked up counts; Done puts the text groups back) and no discussion. The text toolbar is
   hidden there, not dimmed.
@@ -271,7 +271,7 @@ groups when the selection leaves it.
 Built: `crates/pimble-app/src/boards/toolbar.rs` (`Aim::Board` or `Aim::Picked`),
 `toolbar.rs` (`Picked`, `picked()`, refreshed by the toolbar's watcher from the focused pane's
 editor), `text_boards.rs` (`selected_canvas`, `raw_board`, `mark_up_at`), `boards/export.rs`
-(`copy_picked`, `save_picked`, `save_picked_original`, `flatten_picked`), `pane_view.rs`.
+(`copy_picked`, `save_picked`, `save_picked_original`, `flatten_picked`), `pane_view/`.
 Tests: a selection of exactly a picture (not a caret beside it, not an embed), the opening zoom.
 Walked on the desktop in both themes: selecting the picture, Save as PNG / SVG / Original
 from it (files right), zoom in from it (the canvas opens at 125%, Edit Canvas lit), Edit Canvas

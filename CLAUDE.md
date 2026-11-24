@@ -256,7 +256,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
 - A document this device may only read is locked with rinch's `EditorHandle::set_read_only`
-  (joeleaver/rinch#832), driven by an effect per pane in `pane_view.rs` over
+  (joeleaver/rinch#832), driven by an effect per pane in `pane_view/pane.rs` over
   `AppStore::node_access` of that pane's node (`editor::set_read_only`), so a role that
   changes while the document is open flips it in every pane holding it; remote changes keep
   applying while locked. The outbound closure's access
@@ -285,7 +285,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 
 Contract: `docs/SPLIT_VIEW_CONTRACT.md`. The area beside the explorer is a `Tiling`
 (`pimble-app/src/panes.rs`: a binary tree of at most four `PaneId` leaves, with pure
-`split`/`close`/`rects`/`dividers`/`drag_ratio` and serde). `pane_view.rs` renders four pane
+`split`/`close`/`rects`/`dividers`/`drag_ratio` and serde). `pane_view/` renders four pane
 slots and three divider slots once and positions them in percent from the tiling; a slot
 not in the tiling is `display: none`. Splitting, closing and dragging change styles only.
 `AppStore` holds `tiling`, `focused_pane` and `panes: [PaneState; 4]` (`selected`,
@@ -427,7 +427,7 @@ target takes about 12 minutes to build.
   against a real `rhypedb-server` process (`~/dev/rhypedb/target/debug/rhypedb-server`) and
   skip when it is absent.
 - **App split.** `pimble-app` is a library: UI, state, events, editor wiring,
-  `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (the adapter onto
+  `protocol/` (`BackendCommand`/`BackendEvent`), `commands/` (the adapter onto
   `pimble_api::Pimble`, shared by both backends: `api_command` for every read and write of
   a store, `host_command` for the server operator's RPCs, `change_events` for what the API
   hears (the update for the views, the change, and `Shown` for the tree); docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
@@ -642,19 +642,19 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
-- `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
+- `crates/pimble-app/src/app/` - the UI tree: `mod.rs` (`build_view`), `explorer.rs`, `tree_row.rs`, `explorer_menu.rs` (the tree, rename, drag-and-drop, the row menu), `shell.rs` (the page and status bar), `search.rs`, and the dialogs (`store_modals.rs`, `share_modal.rs`, `hosting.rs`, `account.rs`, ...)
 - `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
-- `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view.rs` - the split view: the tiling model, and the pane and divider slots
-- `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
+- `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view/` - the split view: the tiling model, and the pane and divider slots
+- `crates/pimble-app/src/protocol/` - `BackendCommand` (`commands.rs`), `BackendEvent` (`events.rs`), `Asked`/`CloudOp` (`asked.rs`); `commands/` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
 - `crates/pimble-app/src/backend.rs` - desktop background thread, the API over RPC, and `Local` (the connection: join or start the embedded server, reconnect) (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
 - `web/src/backend.rs` - the browser backend (token, connection, reconnect)
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
-- `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
+- `crates/pimble-app/src/events/` - `BackendEvent` -> UI state: `mod.rs` dispatches, a module per concern (`connection`, `stores`, `nodes`, `sync`, `cloud`, `view`, `links`)
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
-- `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties.rs` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter)
+- `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties/` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter); `mod.rs` draws the panel, `tags.rs`, `fields.rs`, `place.rs` and `references.rs` its sections
 
 ## Build & Run
 

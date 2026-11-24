@@ -136,7 +136,7 @@ ever leaves the app without the modifier.
   link over the query text as typed.
 - **The picker is built** (2026-09-23, on rinch #916's `on_key`, `on_selection_change`,
   `on_caret_moved`, `caret_rect`; `link_picker.rs`, `LinksPlugin`'s `[[` rule and Mod-L,
-  the popup in `app.rs`) and checked in the app: `[[vend`, Down, Enter makes "Vendors" a
+  the popup in `app/shell.rs`) and checked in the app: `[[vend`, Down, Enter makes "Vendors" a
   link with the next words unlinked; Ctrl+L over a word, typing an address, Enter links
   it; Ctrl+L on a link offers "Remove Link" first. In a Ctrl+L picker the query is typed
   into the popup through `on_key` (the editor keeps focus, the same code on both
@@ -147,7 +147,7 @@ ever leaves the app without the modifier.
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).
   With nothing selected and not in a link it does nothing.
 - **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard (a
-  store row: its root; built 2026-09-23, `app.rs` `copy_link`, `links::copy_text`: rinch's
+  store row: its root; built 2026-09-23, `app/rows.rs` `copy_link`, `links::copy_text`: rinch's
   clipboard on the desktop, `navigator.clipboard` in the browser; "Link copied." in the
   status bar).
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
@@ -176,7 +176,7 @@ ever leaves the app without the modifier.
 ## What a link looks like
 
 The link colour (`--rinch-primary-color-4` dark, `-6` light), no underline until hover
-(built 2026-09-23, `styles.rs`; the hover underline does not show on the desktop yet).
+(built 2026-09-23, `styles/editor_content.css`; the hover underline does not show on the desktop yet).
 Hover and Ctrl/Cmd+click are built on rinch PR joeleaver/rinch#892 (`on_link_hover`,
 `on_link_click`, wired in `editor::start_editing`): the tooltip (`links::hover_link`,
 `tooltip_target`: the note's title and store as the app knows them, or a web link's URL,
@@ -268,7 +268,7 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    command) continues from there. A loop or more than `MAX_LINK_HOPS` (8) is `Missing`.
    The vault client's half is `resolve_in` (`web/src/vault.rs`), by the same rules; the
    app's is `BackendCommand::ResolveLink { url, hops }` -> `LinkResolved`, and
-   `follow_resolution` (`events.rs`) opens a live node through `AppStore::link_open`
+   `follow_resolution` (`events/links.rs`) opens a live node through `AppStore::link_open`
    (`open_node`, with the anchor waiting in `pending_anchor`), asks again when the chain
    stopped in another store the app holds, or shows the sentence. Built 2026-09-23.
 4. The PM's walk-through: both apps, a link across stores, across a mount, into a share a

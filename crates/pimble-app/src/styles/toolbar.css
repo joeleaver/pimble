@@ -1,0 +1,250 @@
+/* The header band under the menu bar: the search bar over the explorer and the
+   toolbar over the panes, one height so the line under them is one line. */
+:root {
+    --pimble-header-height: 48px;
+}
+
+/* ── Title bar brand (brand.rs) ─────────────────────────────── */
+
+.pimble-titlebar-brand {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    /* 4px on top centres the lockup 2px lower in the 36px row, which puts the
+       word's baseline on the menu labels' (measured on the release build). */
+    padding: 4px 12px 0 10px;
+    gap: 4px;
+}
+
+.pimble-titlebar-brand__mark {
+    display: flex;
+    align-items: center;
+}
+
+/* ── Editor toolbar (toolbar.rs) ──────────────────────────────── */
+
+.pimble-toolbar {
+    display: flex;
+    /* One row at any width (toolbar_fit.rs): groups fold into More instead. */
+    flex-wrap: nowrap;
+    min-width: 0;
+    align-items: flex-start;
+    gap: 4px 0;
+    padding: 4px 8px 2px 8px;
+    /* The header band's height, shared with the search bar beside it
+       (--pimble-header-height), so the line under both is one line across
+       the window. A narrow window that wraps the groups grows it. */
+    box-sizing: border-box;
+    min-height: var(--pimble-header-height);
+}
+
+/* A labeled run of buttons; a hairline separates it from the one before. */
+.pimble-toolbar__group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 8px;
+    border-left: 1px solid var(--rinch-color-border);
+}
+
+.pimble-toolbar__group:first-child {
+    border-left: none;
+}
+
+.pimble-toolbar__group {
+    flex-shrink: 0;
+}
+
+/* More: the groups that did not fit, each a row with its label. */
+.pimble-toolbar__more {
+    flex-shrink: 0;
+    padding: 0 4px;
+    border-left: 1px solid var(--rinch-color-border);
+}
+.pimble-toolbar__more-menu {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+/* Each folded group: its label over its buttons, so the menu is no wider
+   than the widest group and stays over the panes, which clip it. */
+.pimble-toolbar__more-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+}
+.pimble-toolbar__more-label {
+    font-size: 9px;
+    line-height: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+}
+
+.pimble-toolbar__buttons {
+    display: flex;
+    gap: 2px;
+}
+
+/* The Text Color button and its swatches (docs/TEXT_COLOR_CONTRACT.md section 4). */
+.pimble-tc-button {
+    position: relative;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.pimble-tc-button__bar {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    bottom: -3px;
+    height: 3px;
+    border-radius: 1px;
+}
+.pimble-tc-swatches {
+    display: grid;
+    grid-template-columns: repeat(5, 28px);
+    gap: 4px;
+}
+.pimble-tc-swatch {
+    width: 28px;
+    height: 28px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+}
+.pimble-tc-swatch:hover {
+    background: var(--rinch-color-option-hover);
+}
+.pimble-tc-swatch--on {
+    border-color: var(--rinch-primary-color-6);
+}
+.pimble-tc-swatch__letter {
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 16px;
+}
+.pimble-tc-swatch__bar {
+    width: 16px;
+    height: 3px;
+    border-radius: 1px;
+    background: currentColor;
+}
+
+.pimble-toolbar__label {
+    font-size: 9px;
+    line-height: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--rinch-color-dimmed);
+    user-select: none;
+}
+
+/* The canvas's groups (boards/toolbar.rs, docs/TOOLBAR_CONTRACT.md):
+   the canvas zoom percentage as a button of its own width, and the
+   dropdowns' rows. */
+.pimble-ctb__zoom-button {
+    width: auto;
+    min-width: 48px;
+    padding: 0 4px;
+    box-sizing: border-box;
+}
+.pimble-ctb__zoom {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--rinch-color-text);
+    user-select: none;
+}
+.pimble-ctb__face {
+    display: inline-flex;
+    width: 18px;
+    height: 18px;
+    align-items: center;
+    justify-content: center;
+}
+.pimble-ctb__menu {
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+}
+
+/* One family (docs/TOOLBAR_CONTRACT.md, One family): the canvas and sheet
+   groups' buttons the size and colors of the text groups' (toolbar.rs
+   `btn_style`). */
+.pimble-toolbar .pimble-board-tool {
+    width: 30px;
+    height: 30px;
+    box-sizing: border-box;
+    color: var(--pimble-toolbar-icon);
+}
+.pimble-toolbar .pimble-board-tool--active {
+    border-color: var(--pimble-toolbar-active-border);
+    background: var(--pimble-toolbar-active-bg);
+    color: var(--pimble-toolbar-active-fg);
+}
+
+/* Edit Canvas, and Done while the canvas is being edited. */
+.pimble-ctb__edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 30px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    color: var(--pimble-toolbar-icon);
+    user-select: none;
+}
+.pimble-ctb__edit--done {
+    background: var(--rinch-primary-color-6);
+    border-color: var(--rinch-primary-color-6);
+    color: #ffffff;
+}
+.pimble-ctb__edit-label {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* The selection's group: the canvas's own controls in the toolbar, their
+   pickers under it, over the canvas. */
+.pimble-ctb__selection {
+    position: relative;
+}
+.pimble-toolbar .pimble-board__context {
+    padding: 0;
+    overflow: visible;
+    max-width: none;
+}
+.pimble-toolbar .pimble-board__context > .pimble-board__ctx-group {
+    margin-top: 0;
+}
+.pimble-toolbar .pimble-board__context .pimble-board-tool {
+    width: 30px;
+    height: 30px;
+}
+.pimble-ctb__popups {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    pointer-events: none;
+}
+.pimble-ctb__popups > div {
+    pointer-events: auto;
+}
+

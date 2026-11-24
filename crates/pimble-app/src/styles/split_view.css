@@ -1,0 +1,36 @@
+/* ── Editor panel ───────────────────────────────────────────── */
+
+.pimble-editor {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--rinch-color-body);
+}
+
+/* ── The split view (docs/SPLIT_VIEW_CONTRACT.md) ───────────── */
+
+/* The toolbar above the tiled area, then the tiled area. */
+.pimble-panes-area {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* The panes, then the Properties panel on their right. */
+.pimble-panes-row {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+}
+
+/* The tiled area: every pane and divider slot is positioned inside it. */
+.pimble-panes {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+    overflow: hidden;
+}
+

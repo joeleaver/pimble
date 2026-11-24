@@ -107,7 +107,7 @@ pub(crate) fn set_dark_mode(dark: bool) {
 
 /// A key was pressed in pane `pane`'s editor, so that is where the keyboard
 /// is and the pane has the focus (a press of the pointer reaches the pane
-/// itself: `pane_view::render_pane`). The link picker belongs to the pane it
+/// itself: `pane_view::pane::render_pane`). The link picker belongs to the pane it
 /// was opened in and closes when the focus leaves it.
 fn editor_took_focus(store: AppStore, pane: PaneId) {
     crate::pane_view::focus_pane(store, pane);

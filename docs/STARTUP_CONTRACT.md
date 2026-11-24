@@ -233,7 +233,7 @@ The causes, each fixed:
   `index_states_say_what_they_are`; app: `a_saved_store_has_its_row_while_it_opens_and_says_why_if_it_cannot`,
   `a_branch_slow_to_load_shows_a_spinner_until_its_children_arrive`,
   `a_store_being_indexed_says_so_on_its_row_and_in_search`, `starting_up_is_said_as_it_happens`,
-  and the status bar's words in `app.rs`.
+  and the status bar's words in `app/status.rs`.
 - The real app on fixture copies (`PIMBLE_APP_ADDR=127.0.0.1:7483`, scratch config and data):
   the timeline above, and screenshots of the opening rows, a store that could not open, and the
   restored tree and panes.
