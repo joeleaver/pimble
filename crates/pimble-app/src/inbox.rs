@@ -31,12 +31,67 @@ pub fn title_of(notice: &Notice) -> String {
 
 /// What the system's notification says under the title: the words around a
 /// mention or of a reply, or the name of the note a watch notice is about
-/// (the accounts service never knows it; this device does).
+/// (the accounts service never knows it; this device's own documents do,
+/// read through the app's API: [`ask_for_names`]).
 fn body_of(store: AppStore, notice: &Notice) -> String {
     match notice.kind {
-        NoticeKind::Watch => untracked(|| store.display_label(notice.store, notice.node)),
+        NoticeKind::Watch => untracked(|| name_of(store, notice.store, notice.node)).unwrap_or_else(|| UNNAMED_NOTE.to_string()),
         _ => notice.snippet.clone(),
     }
+}
+
+/// A watch notice's body when this device cannot read the note it names.
+const UNNAMED_NOTE: &str = "A note you watch";
+
+/// The name of a note a notice names, as the explorer shows it, when the
+/// app holds it; tracked, so the Inbox's line fills in when it arrives.
+fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Option<String> {
+    let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied())?;
+    Some(node.with(crate::state::display_label_from_node))
+}
+
+/// The app holds only the notes some view showed. A notice can name any
+/// note of the person's stores (a watched note deep in a folder nobody
+/// opened, on a device that never showed it), so the ones it does not hold
+/// are read from this device's documents (`BackendCommand::NameNodes`, the
+/// shared command path on the desktop and in the browser); each arrives as
+/// `NodeLoaded`, which names it in the Inbox and lets a notification waiting
+/// for its name go ([`node_loaded`]).
+fn ask_for_names(store: AppStore, notices: &[Notice]) {
+    let held = |key: &(StoreId, NodeId)| store.get_node_signal(key.0, key.1).is_some();
+    let nodes = unnamed(notices.iter().map(|n| (n.store, n.node)), held);
+    if !nodes.is_empty() {
+        store.send(BackendCommand::NameNodes { nodes });
+    }
+}
+
+/// The notes in `named`, once each, that `held` says the app does not hold.
+fn unnamed(named: impl Iterator<Item = (StoreId, NodeId)>, held: impl Fn(&(StoreId, NodeId)) -> bool) -> Vec<(StoreId, NodeId)> {
+    let mut seen = std::collections::HashSet::new();
+    named.filter(|key| !held(key) && seen.insert(*key)).collect()
+}
+
+/// What the status bar says of the notices not opened yet, worded for what
+/// it counts; `None` when there are none.
+pub(crate) fn unread_line(mentions: usize, replies: usize, watches: usize) -> Option<String> {
+    let total = mentions + replies + watches;
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    Some(match (mentions, replies, watches) {
+        (0, 0, 0) => return None,
+        (_, 0, 0) => plural(mentions, "new mention", "new mentions"),
+        (0, _, 0) => plural(replies, "new reply", "new replies"),
+        (0, 0, _) => plural(watches, "change to a note you watch", "changes to notes you watch"),
+        (_, _, 0) => format!("{total} new mentions and replies"),
+        _ => plural(total, "new notice", "new notices"),
+    })
+}
+
+/// The status bar's line for the notices not opened yet; tracked.
+pub fn unread_status(store: AppStore) -> Option<String> {
+    let notices = store.notices.get();
+    let unread: Vec<&Notice> = notices.iter().filter(|n| !is_read(store, n)).collect();
+    let of = |kind: NoticeKind| unread.iter().filter(|n| n.kind == kind).count();
+    unread_line(of(NoticeKind::Mention), of(NoticeKind::Reply), of(NoticeKind::Watch))
 }
 
 /// Whether the person has opened `notice`, on any of their devices; tracked
@@ -52,18 +107,22 @@ pub fn unread_count(store: AppStore) -> usize {
     notices.iter().filter(|n| !is_read(store, n)).count()
 }
 
-/// The notices as the Inbox lists them: unread first, then newest first; tracked.
-pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool)> {
-    let mut rows: Vec<(Notice, bool)> = store.notices.get().into_iter().map(|n| {
+/// The notices as the Inbox lists them: unread first, then newest first;
+/// tracked. Each with whether it was read, and apart, the time it came and
+/// the note it names, which the row's live labels keep for themselves.
+pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool, String, (StoreId, NodeId))> {
+    let mut rows: Vec<(Notice, bool, String, (StoreId, NodeId))> = store.notices.get().into_iter().map(|n| {
         let read = is_read(store, &n);
-        (n, read)
+        let (at, place) = (n.at.clone(), (n.store, n.node));
+        (n, read, at, place)
     }).collect();
-    rows.sort_by(|(a, a_read), (b, b_read)| a_read.cmp(b_read).then_with(|| b.at.cmp(&a.at)));
+    rows.sort_by(|(a, a_read, ..), (b, b_read, ..)| a_read.cmp(b_read).then_with(|| b.at.cmp(&a.at)));
     rows
 }
 
 /// The server's list arrived (at connect, or after the switch).
 pub(crate) fn listed(store: AppStore, notices: Vec<Notice>, on: bool) {
+    ask_for_names(store, &notices);
     store.notices.set(notices);
     store.notifications_on.set(on);
     open_wanted(store);
@@ -122,6 +181,7 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
     if !fresh {
         return;
     }
+    ask_for_names(store, std::slice::from_ref(&notice));
     store.notices.update(|all| all.insert(0, notice.clone()));
     if WANTED.with(|w| w.borrow().as_deref() == Some(notice.id.as_str())) {
         open_wanted(store);
@@ -131,10 +191,59 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
         return;
     }
     if notifies_here() {
-        show_system_notification(store, &notice);
+        show(store, notice);
     } else {
         #[cfg(feature = "native")]
         crate::shown_notices::held_back(&notice.id);
+    }
+}
+
+thread_local! {
+    /// Watch notices waiting for the name of their note before the system
+    /// shows them ([`ask_for_names`]).
+    static AWAITING_NAME: std::cell::RefCell<Vec<Notice>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How long a watch notice waits for its note's name before it is shown
+/// without it.
+const NAME_WAIT_MS: u32 = 3000;
+
+/// Show `notice` as the system's notification: at once, or, for a watch
+/// notice whose note the app does not hold yet, when its name arrives
+/// ([`node_loaded`]) or the wait for it runs out. Every show then goes
+/// through `show_system_notification`, which on the desktop asks
+/// `crate::shown_notices` first, so none is shown twice.
+fn show(store: AppStore, notice: Notice) {
+    let named = notice.kind != NoticeKind::Watch || store.get_node_signal(notice.store, notice.node).is_some();
+    if named {
+        show_system_notification(store, &notice);
+        return;
+    }
+    let id = notice.id.clone();
+    AWAITING_NAME.with(|a| a.borrow_mut().push(notice));
+    rinch::core::reactive::unowned(|| {
+        let _ = set_timeout(NAME_WAIT_MS, move || {
+            for late in take_awaiting(|n| n.id == id) {
+                show_system_notification(store, &late);
+            }
+        });
+    });
+}
+
+fn take_awaiting(which: impl Fn(&Notice) -> bool) -> Vec<Notice> {
+    AWAITING_NAME.with(|a| {
+        let mut all = a.borrow_mut();
+        let (taken, kept): (Vec<Notice>, Vec<Notice>) = all.drain(..).partition(|n| which(n));
+        *all = kept;
+        taken
+    })
+}
+
+/// A note arrived in the app (`crate::events`, `take_node`): the watch
+/// notices waiting to say its name are shown now.
+pub(crate) fn node_loaded(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    for ready in take_awaiting(|n| n.store == store_id && n.node == node_id) {
+        show_system_notification(store, &ready);
     }
 }
 
@@ -148,7 +257,7 @@ pub(crate) fn took_over(store: AppStore) {
     let unread = |id: &str| held.iter().find(|n| n.id == id).is_some_and(|n| !untracked(|| is_read(store, n)));
     for id in crate::shown_notices::take_over(unread) {
         if let Some(notice) = held.iter().find(|n| n.id == id) {
-            show_system_notification(store, notice);
+            show(store, notice.clone());
         }
     }
 }
@@ -226,8 +335,12 @@ pub(crate) fn open_inbox(store: AppStore) {
 
 #[cfg(feature = "native")]
 fn show_system_notification(store: AppStore, notice: &Notice) {
-    // Written down first: a window taking the tray over never shows it again.
-    crate::shown_notices::showing(&notice.id);
+    // Asked and written down first, in one place: a notice another window
+    // (or this one) showed is not shown again, and a window taking the tray
+    // over never shows this one again.
+    if !crate::shown_notices::first_show(&notice.id) {
+        return;
+    }
     let clicked = notice.clone();
     let shown = rinch::notification::Notification::new(title_of(notice))
         .body(body_of(store, notice))
@@ -410,8 +523,15 @@ pub mod browser_push {
 
 // ── The Inbox's rows ──────────────────────────────────────────────────────
 
+/// How often the Inbox's relative times are told again.
+const TICK_MS: u32 = 60_000;
+
 /// The notices section of View > "Inbox...".
 pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    // "just now" and "5 min ago" move on while the Inbox is open: a tick a
+    // minute, read only by the time labels; it stops with the Inbox.
+    let now = Signal::new(crate::boards::now_ms());
+    let _ = set_interval(TICK_MS, move || now.set(crate::boards::now_ms()));
     rsx! {
         div {
             class: "pimble-inbox",
@@ -431,7 +551,7 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
             if store.cloud_signed_in.get() && store.notifications_on.get() && store.notices.get().is_empty() {
                 div { class: "pimble-discussion__empty", "Nothing yet: mentions, replies and changes to notes you watch show here." }
             }
-            for (notice, read) in rows(store) {
+            for (notice, read, at, place) in rows(store) {
                 div {
                     key: format!("{}:{read}", notice.id),
                     class: if read { "pimble-inbox__row" } else { "pimble-inbox__row pimble-inbox__row--unread" },
@@ -442,14 +562,17 @@ pub(crate) fn render_notices(__scope: &mut RenderScope, store: AppStore) -> Node
                     div {
                         class: "pimble-inbox__title",
                         {title_of(&notice)}
-                        span { class: "pimble-inbox__when", {crate::discussions::ago(&notice.at, crate::boards::now_ms())} }
+                        span {
+                            class: "pimble-inbox__when",
+                            {move || crate::discussions::ago(&at, now.get())}
+                        }
                     }
                     if !notice.snippet.is_empty() {
                         div { class: "pimble-inbox__snippet", {notice.snippet.clone()} }
                     }
                     div {
                         class: "pimble-inbox__where",
-                        {store.display_label(notice.store, notice.node)}
+                        {move || name_of(store, place.0, place.1).unwrap_or_default()}
                         // A change in a note watched: stop watching it from
                         // here (its own watch, or the subtree watch above).
                         if notice.kind == NoticeKind::Watch && crate::watches::can_watch(store) {
@@ -492,6 +615,26 @@ mod tests {
         let (_, node, anchor) = target_of(&watched);
         assert_eq!(node, watched.node, "a watch notice opens the note changed");
         assert!(anchor.is_none());
+    }
+
+    #[test]
+    fn the_status_bar_says_what_it_counts() {
+        assert_eq!(unread_line(0, 0, 0), None);
+        assert_eq!(unread_line(1, 0, 0).as_deref(), Some("1 new mention"));
+        assert_eq!(unread_line(0, 2, 0).as_deref(), Some("2 new replies"));
+        assert_eq!(unread_line(2, 1, 0).as_deref(), Some("3 new mentions and replies"));
+        assert_eq!(unread_line(0, 0, 1).as_deref(), Some("1 change to a note you watch"));
+        assert_eq!(unread_line(0, 0, 4).as_deref(), Some("4 changes to notes you watch"));
+        assert_eq!(unread_line(1, 0, 1).as_deref(), Some("2 new notices"), "a watch notice is not called a mention");
+    }
+
+    /// The notes notices name that the app does not hold are asked for, each
+    /// once.
+    #[test]
+    fn the_notes_not_held_are_asked_for_once() {
+        let (s, held, missing) = (StoreId::new(), NodeId::new(), NodeId::new());
+        let asked = unnamed([(s, held), (s, missing), (s, missing)].into_iter(), |key| key.1 == held);
+        assert_eq!(asked, vec![(s, missing)]);
     }
 
     #[test]

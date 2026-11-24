@@ -37,6 +37,9 @@ pub fn run(renderer: Renderer, activation_token: Option<String>) {
     // (docs/ZOOM_CONTRACT.md).
     crate::zoom::restore();
     let (store, build_component) = crate::app::build_view();
+    // Reachable from the start for what runs outside the view (the tray's
+    // takeover, Quit), not only once a note is opened in an editor.
+    crate::links::set_app_store(store);
     crate::zoom::listen(store);
     crate::update::start(store);
     crate::diagnostics_ui::notice_once(store);
@@ -53,17 +56,19 @@ pub fn run(renderer: Renderer, activation_token: Option<String>) {
     // window is there: making it asks the desktop's tray host, which a hung
     // one makes wait up to five seconds (rinch's bound), and the first window
     // must not wait on that. A window process that does not own the tray
-    // waits to take it over; every one follows the setting as stored, which
-    // another window's Settings can change.
+    // starts waiting to take it over only then too (`crate::tray::window_up`):
+    // a takeover needs the window and the app store, so one that came during
+    // startup would otherwise lose the notices held for it. Every window
+    // follows the setting as stored, which another window's Settings can
+    // change.
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
         // Armed as the window's view is first built, outside its ownership,
         // so it runs on the next turn of the event loop, the window made.
         rinch::core::reactive::unowned(|| {
-            let _ = set_timeout(0, crate::tray::start);
+            let _ = set_timeout(0, crate::tray::window_up);
         });
         build_component(__scope)
     };
-    crate::instance::wait_to_become_primary(crate::tray::became_primary);
     crate::tray::follow_setting();
 
     // A close by the system (Alt+F4, the taskbar); the window's own close

@@ -65,13 +65,27 @@ impl WindowLock {
         if file.try_lock().is_err() {
             return false;
         }
-        self.hold(file);
+        self.hold(file)
+    }
+
+    /// Keep `file`'s lock and become the primary, unless this process
+    /// resigned: then the file is dropped and the lock goes at once. Judged
+    /// under the same guard [`resign`](Self::resign) takes, so a resign
+    /// that lands while the waiting thread is taking the lock is never
+    /// undone by it; whether this became the primary.
+    fn hold(&self, file: File) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if self.resigned.load(Ordering::SeqCst) {
+            return false;
+        }
+        *held = Some(file);
+        self.primary.store(true, Ordering::SeqCst);
         true
     }
 
-    fn hold(&self, file: File) {
-        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
-        self.primary.store(true, Ordering::SeqCst);
+    /// Whether this process resigned: it is quitting.
+    pub(crate) fn is_resigned(&self) -> bool {
+        self.resigned.load(Ordering::SeqCst)
     }
 
     /// Wait for the lock in a thread of its own; when its holder quits (or
@@ -93,10 +107,9 @@ impl WindowLock {
                 tracing::warn!("Waiting for the window lock failed ({e}); this window stays without a tray");
                 return;
             }
-            if self.resigned.load(Ordering::SeqCst) {
+            if !self.hold(file) {
                 return;
             }
-            self.hold(file);
             tracing::info!("The window that owned the tray quit; this one owns it now");
             became();
         });
@@ -108,9 +121,12 @@ impl WindowLock {
     /// This process is quitting: it shows nothing more and lets the lock go
     /// now, so a window waiting for it takes over at once.
     pub(crate) fn resign(&self) {
-        self.resigned.store(true, Ordering::SeqCst);
-        self.primary.store(false, Ordering::SeqCst);
-        let file = self.held.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let file = {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            self.resigned.store(true, Ordering::SeqCst);
+            self.primary.store(false, Ordering::SeqCst);
+            held.take()
+        };
         drop(file);
     }
 }
@@ -169,24 +185,39 @@ pub fn resign() {
     LOCK.resign();
 }
 
-/// The one spelling of a server address the lock is named after: the
-/// address it resolves to (the lowest, when a name resolves to several),
-/// with every loopback or unspecified address (`localhost`, `127.0.0.1`,
-/// `[::1]`, `0.0.0.0`: all this computer's one server on that port) as
-/// `127.0.0.1`. Something that is no address at all is kept as written.
+/// Whether this process is quitting: it takes no link handed to it and
+/// says it took none (`appLinkTaken`), so the launch that handed it opens a
+/// window of its own.
+pub fn is_quitting() -> bool {
+    LOCK.is_resigned()
+}
+
+/// The one spelling of a server address the lock is named after. The
+/// loopback names (`localhost`, `127.0.0.1`, `::1`, bracketed or not) are
+/// this computer's one server on that port, `127.0.0.1:<port>`; any other
+/// address is kept as it parses (another loopback address such as
+/// `127.0.0.2` can be another server, so it is not folded in); a host name
+/// is resolved, to the lowest address when it names several. Something that
+/// is no address at all is kept as written. Resolving a name can block, so
+/// this is worked out once per process ([`lock_path`]).
 pub(crate) fn lock_key(addr: &str) -> String {
-    let mut resolved: Vec<SocketAddr> = match addr.parse::<SocketAddr>() {
-        Ok(one) => vec![one],
-        Err(_) => addr.to_socket_addrs().map(|all| all.collect()).unwrap_or_default(),
-    };
-    resolved.sort();
-    let Some(first) = resolved.first() else { return addr.to_string() };
-    let local = resolved.iter().any(|a| a.ip().is_loopback() || a.ip().is_unspecified());
-    if local {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, first.port())).to_string()
-    } else {
-        first.to_string()
+    if let Some(port) = loopback_port(addr) {
+        return SocketAddr::from((Ipv4Addr::LOCALHOST, port)).to_string();
     }
+    if let Ok(one) = addr.parse::<SocketAddr>() {
+        return one.to_string();
+    }
+    let mut resolved: Vec<SocketAddr> = addr.to_socket_addrs().map(|all| all.collect()).unwrap_or_default();
+    resolved.sort();
+    resolved.first().map_or_else(|| addr.to_string(), SocketAddr::to_string)
+}
+
+/// The port of `host:port` when the host is one of the loopback names.
+fn loopback_port(addr: &str) -> Option<u16> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1").then_some(port)
 }
 
 /// The lock file's name for a normalized server address: `127.0.0.1:7462`
@@ -206,11 +237,17 @@ pub(crate) fn lock_name(key: &str) -> String {
     }
 }
 
-/// Where this process's server's lock lives.
+/// Where this process's server's lock lives: worked out the first time it
+/// is asked for (the claim, before the window opens) and kept, so no notice
+/// shown later ([`crate::shown_notices`]) waits on a name lookup.
 pub(crate) fn lock_path() -> PathBuf {
-    let config = pimble_server::local::state_file_path();
-    let dir = config.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    dir.join(lock_name(&lock_key(&pimble_server::local::server_addr())))
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let config = pimble_server::local::state_file_path();
+        let dir = config.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+        dir.join(lock_name(&lock_key(&pimble_server::local::server_addr())))
+    })
+    .clone()
 }
 
 /// Open (creating) the lock file at `path`.
@@ -265,12 +302,22 @@ mod tests {
     fn one_server_has_one_lock_whatever_its_address_is_spelled() {
         let one = lock_key("127.0.0.1:7462");
         assert_eq!(one, "127.0.0.1:7462");
-        for spelling in ["localhost:7462", "[::1]:7462", "0.0.0.0:7462", "127.0.0.2:7462"] {
+        for spelling in ["localhost:7462", "LOCALHOST:7462", "[::1]:7462", "::1:7462"] {
             assert_eq!(lock_key(spelling), one, "{spelling}");
         }
         assert_ne!(lock_key("127.0.0.1:7473"), one, "another port is another server");
         assert_eq!(lock_key("192.0.2.5:7462"), "192.0.2.5:7462", "an address elsewhere is kept");
         assert_eq!(lock_key("not an address"), "not an address");
+    }
+
+    /// Only the loopback names are folded into one: another loopback
+    /// address, or the unspecified one, can be a server of its own.
+    #[test]
+    fn only_the_loopback_names_are_one_host() {
+        assert_eq!(lock_key("127.0.0.2:7462"), "127.0.0.2:7462");
+        assert_eq!(lock_key("0.0.0.0:7462"), "0.0.0.0:7462");
+        assert_eq!(lock_key("[::2]:7462"), "[::2]:7462");
+        assert_eq!(loopback_port("localhost:notaport"), None);
     }
 
     #[test]
@@ -315,6 +362,22 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5)).expect("took over");
         assert!(waiting.is_primary());
         assert!(!leaked().claim(&path), "and holds it");
+    }
+
+    /// The waiting thread's take and a resign judged under one guard: once
+    /// resigned, a lock taken after it is let go, never held.
+    #[test]
+    fn a_lock_taken_after_the_resign_is_not_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = lock_in(&dir);
+        let quitting = leaked();
+        quitting.resign();
+        assert!(quitting.is_resigned());
+        let file = open_lock(&path).unwrap();
+        file.try_lock().unwrap();
+        assert!(!quitting.hold(file), "resigned: not held");
+        assert!(!quitting.is_primary());
+        assert!(leaked().claim(&path), "and the lock went at once");
     }
 
     /// A process that resigned while it waited (it is quitting) does not take

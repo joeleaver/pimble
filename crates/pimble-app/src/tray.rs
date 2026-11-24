@@ -190,6 +190,18 @@ pub fn start() {
     }
 }
 
+/// The first window is up and the app store made (`crate::desktop::run`,
+/// the next turn of the event loop after its view was built): the icon goes
+/// up if this process owns the tray, and one that does not starts waiting
+/// to take it over. The wait starts here rather than before the window, so
+/// a primary that quits during startup hands over to a window that can show
+/// what it held back: the lock simply waits for this, nothing is dropped,
+/// and the notices heard meanwhile stay held back.
+pub fn window_up() {
+    start();
+    crate::instance::wait_to_become_primary(became_primary);
+}
+
 /// Take the icon down (the setting turned off).
 fn stop() {
     // Dropped outside the borrow: dropping it releases its menu callbacks.

@@ -48,13 +48,6 @@ const TREE_INDENT: f32 = 12.0;
 /// worse than not offering it, so the browser build hides them.
 const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
 
-/// The one line beside the notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
-const NOTIFICATIONS_LINE: &str = "People who share notes with you can notify you; Pimble Cloud cannot read what they say.";
-
-/// What the two channels below the switch do (docs/NOTIFICATIONS_CONTRACT.md
-/// section 4, wave 2).
-const CHANNELS_LINE: &str = "When none of your devices sees a notice within 15 minutes, Pimble Cloud emails you who wrote and in which share, never what they said, at most once an hour. A browser you allowed shows notices even when Pimble is closed in it.";
-
 /// Whether this build can make a store on the signed-in account.
 ///
 /// The exact complement of [`CAN_ADMINISTER_STORES`] for creating one: a
@@ -3862,34 +3855,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                     "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
                 }
-                Checkbox {
-                    label: "Notifications",
-                    checked_fn: move || store.notifications_on.get(),
-                    onchange: move || crate::inbox::set_on(store, !untracked(|| store.notifications_on.get())),
-                }
-                div {
-                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                    {NOTIFICATIONS_LINE}
-                }
-                Checkbox {
-                    label: "Email me what I miss",
-                    checked_fn: move || store.notify_email.get(),
-                    onchange: move || crate::inbox::set_email(store, !untracked(|| store.notify_email.get())),
-                }
-                Checkbox {
-                    label: "Notify this browser when it is closed",
-                    checked_fn: move || store.notify_push.get(),
-                    onchange: move || crate::inbox::set_push(store, !untracked(|| store.notify_push.get())),
-                }
-                div {
-                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                    {CHANNELS_LINE}
-                }
-                Checkbox {
-                    label: "Tell me when others change notes I watch",
-                    checked_fn: move || store.notify_watches.get(),
-                    onchange: move || crate::watches::set_on(store, !untracked(|| store.notify_watches.get())),
-                }
+                {crate::notification_settings::render(__scope, store, "Notify this browser when it is closed")}
                 div {
                     style: "display: flex; gap: 8px;",
                     Button { variant: "default", size: "xs", onclick: run_account_action, "Your Account Page" }
@@ -3984,37 +3950,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
                             }
 
-                            // docs/NOTIFICATIONS_CONTRACT.md section 6:
-                            // signing in turns notifications on; this is the
-                            // switch, for the whole account.
-                            Checkbox {
-                                label: "Notifications",
-                                checked_fn: move || store.notifications_on.get(),
-                                onchange: move || crate::inbox::set_on(store, !untracked(|| store.notifications_on.get())),
-                            }
-                            div {
-                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                                {NOTIFICATIONS_LINE}
-                            }
-                            Checkbox {
-                                label: "Email me what I miss",
-                                checked_fn: move || store.notify_email.get(),
-                                onchange: move || crate::inbox::set_email(store, !untracked(|| store.notify_email.get())),
-                            }
-                            Checkbox {
-                                label: "Notify my browsers when Pimble is closed",
-                                checked_fn: move || store.notify_push.get(),
-                                onchange: move || crate::inbox::set_push(store, !untracked(|| store.notify_push.get())),
-                            }
-                            div {
-                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                                {CHANNELS_LINE}
-                            }
-                            Checkbox {
-                                label: "Tell me when others change notes I watch",
-                                checked_fn: move || store.notify_watches.get(),
-                                onchange: move || crate::watches::set_on(store, !untracked(|| store.notify_watches.get())),
-                            }
+                            // docs/NOTIFICATIONS_CONTRACT.md section 6.
+                            {crate::notification_settings::render(__scope, store, "Notify my browsers when Pimble is closed")}
 
                             Button {
                                 variant: "light",
@@ -4960,13 +4897,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         // section 5); a click opens the Inbox.
                         span {
                             class: "pimble-status-bar__inbox",
-                            title: "Mentions and replies you have not opened. Click to open the Inbox.",
+                            title: "Notices you have not opened. Click to open the Inbox.",
                             style: {move || if crate::inbox::unread_count(store) == 0 { "display: none;" } else { "" }},
                             onclick: move || crate::inbox::open_inbox(store),
-                            {move || match crate::inbox::unread_count(store) {
-                                1 => "1 new mention or reply".to_string(),
-                                n => format!("{n} new mentions and replies"),
-                            }}
+                            {move || crate::inbox::unread_status(store).unwrap_or_default()}
                         }
 
                         // The window's zoom while it is not actual size

@@ -82,6 +82,39 @@ pub fn open_app_link(store: crate::state::AppStore, text: &str) {
     }
 }
 
+/// A link handed to this window over `openInApp` (`BackendEvent::AppLink`):
+/// it comes to the front, opens the link, and then, from this, the window's
+/// own thread, says it took it (`appLinkTaken`): a hung window says nothing,
+/// and the launch that handed it over opens a window of its own. A window
+/// that is quitting (`crate::instance::is_quitting`) does none of it, so the
+/// launch opens its own window rather than hand the link to one going away.
+pub(crate) fn handed(store: crate::state::AppStore, url: &str, activation_token: Option<&str>, ack: Option<u64>) {
+    if !takes_handed_links() {
+        tracing::info!("A link was handed to this window as it quits; the launch opens one of its own");
+        return;
+    }
+    #[cfg(feature = "native")]
+    crate::desktop::bring_to_front(activation_token);
+    #[cfg(not(feature = "native"))]
+    let _ = activation_token;
+    open_app_link(store, url);
+    if let Some(ack) = ack {
+        store.send(crate::protocol::BackendCommand::AppLinkTaken { ack });
+    }
+}
+
+/// Whether this window takes links handed to it: not once it is quitting.
+pub(crate) fn takes_handed_links() -> bool {
+    #[cfg(feature = "native")]
+    {
+        !crate::instance::is_quitting()
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        true
+    }
+}
+
 /// The link this process was started with, opened once the app has
 /// connected (`set_launch_link`, `take_launch_link`).
 static LAUNCH_LINK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);

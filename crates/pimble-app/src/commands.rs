@@ -243,6 +243,16 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Err(e) => failed(e),
         },
 
+        C::NameNodes { nodes } => {
+            for (store_id, node_id) in nodes {
+                match api.node(Addr::new(store_id, node_id)).await {
+                    Ok(node) => ctx.emit(BackendEvent::NodeLoaded { store_id, node }),
+                    Err(e) => tracing::debug!("The note {node_id} a notice names is not read here: {}", error_message(&e)),
+                }
+            }
+            None
+        }
+
         C::LoadChildren { store_id, nodes } => {
             use futures::StreamExt;
             let listings = nodes.into_iter().map(|node_id| async move { (node_id, api.listing(Addr::new(store_id, node_id)).await) });

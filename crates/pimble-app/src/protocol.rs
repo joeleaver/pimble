@@ -91,6 +91,10 @@ pub enum BackendCommand {
     /// when nobody is signed in.
     SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
+    /// The notes notices name, read from this device's documents for the
+    /// names they are shown under (`crate::inbox`): each answered as
+    /// `NodeLoaded`; one this device cannot read is skipped without a word.
+    NameNodes { nodes: Vec<(StoreId, NodeId)> },
     /// What this device may do in a store changed (a role, a read-only
     /// root), which no document says: the server's judgement of these nodes
     /// (the ones the window shows) is asked again, once, and answered as

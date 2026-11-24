@@ -807,13 +807,18 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   ruled out. The owner (the primary) holds an exclusive OS lock (`flock` on Linux,
   `LockFileEx` on Windows) on `<config dir>/pimble/app-<server address>.lock`; it goes
   with the process, a crash included, so nothing goes stale. The address is normalized
-  first (resolved, every loopback or unspecified address as `127.0.0.1`), so
-  `localhost:7462` and `127.0.0.1:7462` are one lock. Any other window process
+  first, once per process (the loopback names `localhost`, `127.0.0.1` and `::1` as
+  `127.0.0.1`; another loopback or the unspecified address is kept, as it can be a
+  server of its own; any other host name resolved), so `localhost:7462` and
+  `127.0.0.1:7462` are one lock and no notice shown waits on a name lookup. Any other window process
   shows no icon and no OS notification (its Inbox list and count still fill), waits on
   the lock in a thread, and takes the tray when the owner quits. A primary that quits
   (tray Quit, File > Quit, a close that quits) gives the lock up first, then writes what
   it remembers.
-- **No notice is lost in a takeover, and none is shown twice.** The primary writes the id
+- **No notice is lost in a takeover, and none is shown twice.** Every show asks the
+  record first and writes it down in the same step (`shown_notices::first_show`), so a
+  notice the old primary showed is not shown again when this window's own copy of it
+  arrives only after the takeover. The primary writes the id
   of each notice it shows beside the lock (`app-<server address>.shown`, the last 200);
   a window that is not the primary keeps the ids it did not show. The window taking
   over shows the ones it kept that the old primary never wrote and the person has not
@@ -867,6 +872,36 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   armed once the window is built (:62), the wait for the lock, the setting followed,
   `on_close_requested`), `remember_views`, `close_window` (:136, the titlebar's close
   asks the same question).
+- **Fixes after the review and the walk-through** (2026-11-23):
+  - `shown_notices.rs:42` `first_show`: the one check and record every show makes,
+    called first in `inbox.rs` `show_system_notification` (desktop).
+  - `tray.rs:200` `window_up`: armed from `desktop.rs` once the first window's view is
+    built; puts the icon up, then starts the wait for the lock, so a takeover always
+    finds the window and the app store (`desktop.rs:42` sets the store at start, not
+    only once a note opens); a primary that quits during startup leaves the lock free
+    and the wait takes it then, the notices held back meanwhile kept.
+  - `instance.rs:243` `lock_path` computed once (`OnceLock`); `lock_key` (:203) folds
+    only the loopback names. `hold` (:76) and `resign` (:123) judge under one guard, so
+    a lock the waiting thread takes after a resign is let go; `is_quitting` (:191).
+  - `app_links.rs:91` `handed` (out of `events.rs`): a quitting window neither comes to
+    the front, opens the link, nor sends `appLinkTaken`; `backend.rs:209` drops the
+    link subscription when quitting, so the server hands the next link elsewhere.
+  - `inbox.rs:534` the Inbox's relative times tick each minute (`set_interval`, only
+    the time labels read it, stopped with the Inbox).
+  - `inbox.rs:60` `ask_for_names`: why the browser said "Untitled": both builds name a
+    notice's note from `AppStore::node_data`, which holds only notes some view showed,
+    and the desktop had shown the watched note while the browser had not. Every
+    notice's note the app does not hold is now read from the device's own documents
+    through the shared command path (`BackendCommand::NameNodes`, `commands.rs:246`,
+    quiet when a note cannot be read), arriving as `NodeLoaded`; the Inbox's line is
+    reactive, and a watch notice's system notification waits up to 3 s for the name
+    (`inbox.rs:216` `show`, `:244` `node_loaded`), else says "A note you watch".
+  - `inbox.rs:76` `unread_line`: the status bar words the count for what it counts
+    (mentions, replies, changes to notes you watch, or notices when mixed).
+  - `notification_settings.rs` (new, out of `app.rs`, one component for the desktop's
+    and the browser's Account page): with Notifications off, the Email, browser and
+    watched-notes switches show unticked and cannot be changed, and the line under them
+    says notifications are off.
 - `crates/pimble-app/src/inbox.rs:133`: the OS notification is gated on
   `notifies_here()` (:162 native `instance::is_primary()`, :167 the browser always); a
   notice not shown is held back (:137); `took_over` (:146).
@@ -896,6 +931,11 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   primary goes and not before, a window that resigned while waiting lets the lock go),
   `shown_notices.rs` (4: what nobody showed or opened is shown, once; the record keeps
   the last 200; what the old primary wrote down is not shown again), `main.rs`
+  (and after the walk-through: `instance.rs` only the loopback names are one host, a
+  lock taken after the resign is not held; `shown_notices.rs` a notice shown before
+  the takeover is not shown when it arrives after; `inbox.rs` the status bar says
+  what it counts, the notes not held are asked for once; `notification_settings.rs`
+  with notifications off the channels show off; the fixes were not seen on screen),
   (`--new-window` beside the renderer), `app_links.rs` (`pimble:` and `pimble://` are
   the window), `pimble-server/tests/app_links.rs` (3 more: the `ack` on the wire, a
   confirmed link delivered when the window says so, one no window acts on answers
@@ -931,6 +971,19 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   icon's build off the main thread's path entirely: it is made after the first window is
   up now, but a hung host still holds the main thread for up to 5 s then (the window is
   drawn, and stalls once).
+- **The icon's build still runs on the main thread**, so a hung tray host freezes the
+  open window for up to 5 s. rinch's tray API cannot do it elsewhere: `TrayIconBuilder`
+  holds the menu's and `on_activate`'s `Rc` callbacks, `TrayIcon` is `!Send`, and
+  `build()` blocks on the host's registration (rinch `tray.rs`, `BUILD_WAIT`). What
+  rinch would need, general and with no Pimble concept in it:
+  `TrayIconBuilder::build_in_background(self, done: impl FnOnce(TrayResult<TrayIcon>) +
+  'static)`, which registers the callbacks on the calling (main) thread, runs the host
+  wait and the D-Bus registration on a thread of rinch's own, and calls `done` on the
+  main thread with the icon or the error (`NoHost` included) when it is settled; the
+  caller never blocks. With it, `tray::start` would set `TrayStatus` from `done`.
+- A mention whose quote starts at an earlier "@" within about 40 characters still opens
+  at that earlier "@": telling them apart needs the mention's position in the sealed
+  notice, a format decision for Joe.
 - A hung primary that recovers after the acknowledgement's wait also comes to the
   front, so both windows show.
 - A hung primary's own server (the embedded one, in the same process) makes a launch
@@ -943,4 +996,7 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   server's watch and relay code).
 - A real crash of the owner was not staged; the lock's release is the OS's (covered by
   the test that drops the holder).
-- `app.rs`, `events.rs` and `state.rs` are still far over 700 lines (see wave 3).
+- `app.rs`, `events.rs` and `state.rs` are still far over 700 lines (see wave 3), and
+  so are `commands.rs` and `protocol.rs`; the fixes after the walk-through moved
+  pieces out of `app.rs` and `events.rs` (`notification_settings.rs`,
+  `app_links::handed`) and added one command to the last two, splitting none of them.

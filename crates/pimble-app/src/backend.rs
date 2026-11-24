@@ -203,6 +203,12 @@ impl Local {
                 }
             };
             while let Some(Ok(link)) = sub.next().await {
+                // Quitting: the subscription is dropped, so the server hands
+                // the next link to a window that stays, and this one is not
+                // acted on (`crate::app_links::handed` says why).
+                if crate::instance::is_quitting() {
+                    return;
+                }
                 let Some(me) = me.upgrade() else { return };
                 me.emit(BackendEvent::AppLink { url: link.url, activation_token: link.activation_token, ack: link.ack });
             }

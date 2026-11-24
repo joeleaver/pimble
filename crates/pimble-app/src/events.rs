@@ -454,8 +454,9 @@ fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool {
     store.upsert_node(store_id, node.clone());
     // A formula in a sheet may name this node (its tables, its title).
     crate::sheets::node_loaded(store);
-    // An inline discussion may be waiting for it.
+    // An inline discussion may be waiting for it, and a notice for its name.
     crate::discussions::node_loaded(store, store_id, node_id, content_bytes);
+    crate::inbox::node_loaded(store, store_id, node_id);
 
     // Every pane opened on this node.
     for pane in store.panes_showing(store_id, node_id) {
@@ -1518,17 +1519,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::watches::listed(store, watches.clone(), *on);
             }
             BackendEvent::AppLink { url, activation_token, ack } => {
-                #[cfg(feature = "native")]
-                crate::desktop::bring_to_front(activation_token.as_deref());
-                #[cfg(not(feature = "native"))]
-                let _ = activation_token;
-                crate::app_links::open_app_link(store, url);
-                // Said only once this, the window's own thread, has acted on
-                // it: a hung window says nothing, and the launch that handed
-                // it over opens a window of its own.
-                if let Some(ack) = *ack {
-                    store.send(BackendCommand::AppLinkTaken { ack });
-                }
+                crate::app_links::handed(store, url, activation_token.as_deref(), *ack);
             }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md

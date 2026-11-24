@@ -35,11 +35,25 @@ pub(crate) fn held_back(id: &str) {
     HELD_BACK.with(|held| keep_last(&mut held.borrow_mut(), id));
 }
 
-/// The primary is showing `id`: written down for whoever takes over.
-pub(crate) fn showing(id: &str) {
-    if let Err(e) = record(&path(), id) {
+/// The primary is about to show `id`: whether it may, and if so it is
+/// written down, for itself and for whoever takes over. Every show asks
+/// here first (`crate::inbox`), so a notice the old primary showed and that
+/// reaches this window only once it took over is not shown again.
+pub(crate) fn first_show(id: &str) -> bool {
+    first_show_in(&path(), id)
+}
+
+/// [`first_show`] against the record at `path`. A record that cannot be
+/// written does not stop the show: a rare second notification is better
+/// than none.
+pub(crate) fn first_show_in(path: &Path, id: &str) -> bool {
+    if read(path).contains(id) {
+        return false;
+    }
+    if let Err(e) = record(path, id) {
         tracing::debug!("The notice shown was not written down ({e}); a window taking over may show it again");
     }
+    true
 }
 
 /// This process became the primary: the ids of the notices it held back
@@ -67,7 +81,8 @@ fn keep_last(list: &mut VecDeque<String>, id: &str) {
     }
 }
 
-/// Beside this server's window lock.
+/// Beside this server's window lock (its path worked out once, no lookup
+/// per notice).
 fn path() -> PathBuf {
     crate::instance::lock_path().with_extension("shown")
 }
@@ -133,6 +148,19 @@ mod tests {
         assert!(!shown.contains("n0"), "the oldest went");
         assert!(shown.contains("n10") && shown.contains(&format!("n{}", KEPT + 4)));
         assert!(!path.with_extension("shown.partial").exists(), "nothing half-written is left");
+    }
+
+    /// The old primary showed X and quit; this window took over, and only
+    /// then did its own copy of X arrive: it is not shown again. A new one
+    /// is, once.
+    #[test]
+    fn a_notice_shown_before_the_takeover_is_not_shown_when_it_arrives_after() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("app-127.0.0.1-1.shown");
+        assert!(first_show_in(&path, "x"), "the old primary shows it");
+        assert!(!first_show_in(&path, "x"), "the new primary's copy is not shown");
+        assert!(first_show_in(&path, "y"));
+        assert!(!first_show_in(&path, "y"), "each once");
     }
 
     /// The whole hand-over: what the old primary showed and wrote down is
