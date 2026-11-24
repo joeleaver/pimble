@@ -376,13 +376,28 @@ pub struct NoticeLine {
     pub share: String,
     /// How many items this line stands for.
     pub count: usize,
+    /// For watch notices (wave 3): how many changes those items stand for
+    /// together; 0 for any other kind.
+    pub changes: u64,
 }
 
 impl NoticeLine {
-    /// "Joe mentioned you in Shared with Will", "(3 times)" when several.
+    /// "Joe mentioned you in Shared with Will", "(3 times)" when several;
+    /// "Joe made 3 changes in a note you watch in Garden".
     pub fn text(&self) -> String {
         let sender = display_name(&self.sender);
         let share = display_name(&self.share);
+        if self.kind == "watch" {
+            let changes = match self.changes.max(1) {
+                1 => "a change".to_string(),
+                n => format!("{n} changes"),
+            };
+            let notes = match self.count {
+                0 | 1 => "a note".to_string(),
+                n => format!("{n} notes"),
+            };
+            return format!("{sender} made {changes} in {notes} you watch in {share}");
+        }
         let verb = match self.kind.as_str() {
             "mention" => "mentioned you in",
             "reply" => "replied in a discussion in",
@@ -525,8 +540,8 @@ mod tests {
     #[test]
     fn a_notice_email_says_who_and_where_and_nothing_else() {
         let lines = vec![
-            NoticeLine { sender: "Joe".into(), kind: "mention".into(), share: "Shared with Will".into(), count: 1 },
-            NoticeLine { sender: "Ann\n<b>".into(), kind: "reply".into(), share: "Garden".into(), count: 2 },
+            NoticeLine { sender: "Joe".into(), kind: "mention".into(), share: "Shared with Will".into(), count: 1, changes: 0 },
+            NoticeLine { sender: "Ann\n<b>".into(), kind: "reply".into(), share: "Garden".into(), count: 2, changes: 0 },
         ];
         assert_eq!(lines[0].text(), "Joe mentioned you in Shared with Will");
         let (subject, text, html) = notices_email(&lines, 1, "https://pimble.app/app/?inbox");
@@ -537,6 +552,18 @@ mod tests {
         assert!(html.contains("Ann&lt;b&gt;"), "{html}");
         let (subject, ..) = notices_email(&lines[..1], 0, "x");
         assert_eq!(subject, "Joe mentioned you in Shared with Will");
+    }
+
+    #[test]
+    fn a_watch_line_counts_changes_and_notes_and_names_no_note() {
+        let one = NoticeLine { sender: "Joe".into(), kind: "watch".into(), share: "Garden".into(), count: 1, changes: 3 };
+        assert_eq!(one.text(), "Joe made 3 changes in a note you watch in Garden");
+        let single = NoticeLine { changes: 1, ..one.clone() };
+        assert_eq!(single.text(), "Joe made a change in a note you watch in Garden");
+        let several = NoticeLine { count: 2, changes: 7, ..one.clone() };
+        assert_eq!(several.text(), "Joe made 7 changes in 2 notes you watch in Garden");
+        let (subject, ..) = notices_email(&[one], 0, "x");
+        assert_eq!(subject, "Joe made 3 changes in a note you watch in Garden");
     }
 
     #[test]

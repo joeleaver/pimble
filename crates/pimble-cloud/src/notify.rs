@@ -87,7 +87,8 @@ pub fn seen_token_valid(state: &AppState, item_uuid: &str, token: &str) -> bool 
 /// The line an item is told in, from what the service knows.
 pub async fn line_of(state: &AppState, item: &InboxItemRow) -> CloudResult<NoticeLine> {
     let (sender, share) = crate::routes::inbox::names_for(state, item).await?;
-    Ok(NoticeLine { sender, kind: item.kind.clone(), share, count: 1 })
+    let changes = if item.kind == "watch" { item.count.max(1) } else { 0 };
+    Ok(NoticeLine { sender, kind: item.kind.clone(), share, count: 1, changes })
 }
 
 // ── Web push ──────────────────────────────────────────────────────────────
@@ -211,7 +212,10 @@ pub async fn email_pass(state: &AppState, now_ms: i64) -> CloudResult<usize> {
         for item in &due {
             let line = line_of(state, item).await?;
             match lines.iter_mut().find(|l| l.sender == line.sender && l.kind == line.kind && l.share == line.share) {
-                Some(same) => same.count += 1,
+                Some(same) => {
+                    same.count += 1;
+                    same.changes += line.changes;
+                }
                 None => lines.push(line),
             }
         }

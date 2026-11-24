@@ -5287,6 +5287,7 @@ dependencies = [
  "pimble-client",
  "pimble-core",
  "pimble-crypto",
+ "pimble-rpc",
  "pimble-server",
  "rand 0.9.2",
  "rand_core 0.6.4",

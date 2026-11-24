@@ -17,6 +17,7 @@ pimble-core = { workspace = true }
 # calling it instead of connecting over a raw jsonrpsee client — no direct
 # `pimble-rpc`/`jsonrpsee` dependency needed any more.
 pimble-client = { workspace = true }
+pimble-rpc = { workspace = true }
 # Request/response shapes for the crypto endpoints (docs/CRYPTO_CONTRACT.md,
 # "Accounts service endpoints"): `KdfParams`, `AccountPublicKeys`,
 # `AccountKeyBlob`, `KeyEnvelope`. Not in `[workspace.dependencies]` (that

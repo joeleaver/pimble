@@ -4,6 +4,7 @@ pub mod inbox;
 mod misc;
 mod people;
 mod stores;
+mod watches;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -31,6 +32,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/me/personal", get(accounts::get_personal).put(accounts::put_personal).delete(accounts::delete_personal))
         .route("/api/v1/me/notice-key", axum::routing::put(inbox::put_notice_key))
         .route("/api/v1/me/notifications", axum::routing::put(inbox::put_notifications))
+        .route("/api/v1/me/watches", get(watches::get_watches))
+        .route("/api/v1/me/watches/choices", axum::routing::put(watches::put_choices))
+        .route("/api/v1/me/watches/stores/:store_id", axum::routing::put(watches::put_store_docs))
+        .route("/api/v1/watches/writes", post(watches::post_relay_writes))
         .route("/api/v1/inbox", get(inbox::drain).delete(inbox::clear))
         .route("/api/v1/inbox/ack", post(inbox::ack))
         .route("/api/v1/inbox/seen/:item", post(inbox::seen))

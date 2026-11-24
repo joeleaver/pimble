@@ -74,6 +74,9 @@ pub struct Inner {
     /// One personal-document write at a time, so a version check and its
     /// write are one step (docs/DISCUSSIONS_CONTRACT.md section 8).
     pub personal_lock: tokio::sync::Mutex<()>,
+    /// One write of watches at a time, so a version check and its write are
+    /// one step (docs/NOTIFICATIONS_CONTRACT.md section 3).
+    pub watches_lock: tokio::sync::Mutex<()>,
     /// Notices one sender may queue (docs/NOTIFICATIONS_CONTRACT.md section 2).
     pub inbox_quota: QuotaLimiter,
     /// Wakes a recipient's waiting drain when a notice is queued for them.
@@ -165,6 +168,7 @@ impl AppState {
             kdf_decoy_secret,
             relay,
             personal_lock: tokio::sync::Mutex::new(()),
+            watches_lock: tokio::sync::Mutex::new(()),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),
             vapid,

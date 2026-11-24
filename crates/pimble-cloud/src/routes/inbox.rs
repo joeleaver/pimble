@@ -6,9 +6,12 @@
 //!   the account's own (signed by it, sealed to it, for this account's notice
 //!   key). A second, different key is refused (409): the device that lost
 //!   the race fetches the first one from `GET /me/keys`.
-//! - `PUT /api/v1/me/notifications { on?, email?, push? }`: the switches.
+//! - `PUT /api/v1/me/notifications { on?, email?, push?, watches? }`: the switches.
 //!   `on` off drops everything queued for the account and refuses new
-//!   notices to it; `email` and `push` (wave 2) turn one channel off alone.
+//!   notices to it; `email` and `push` (wave 2) turn one channel off alone;
+//!   `watches` (wave 3) turns watched notes off, deleting every watch the
+//!   account chose and registered and what was gathered for them (as `on`
+//!   off does too).
 //! - `POST /api/v1/me/push { endpoint, keys: { p256dh, auth } }` and
 //!   `DELETE /api/v1/me/push { endpoint }`: a browser's push subscription
 //!   (wave 2), one per endpoint.
@@ -96,6 +99,9 @@ pub struct PutNotifications {
     /// Wave 2: web push, apart from the rest.
     #[serde(default)]
     pub push: Option<bool>,
+    /// Wave 3: watched notes, apart from the rest. Off deletes the watches.
+    #[serde(default)]
+    pub watches: Option<bool>,
 }
 
 pub async fn put_notifications(State(state): State<AppState>, authed: AuthedUser, Json(body): Json<PutNotifications>) -> CloudResult<Json<Value>> {
@@ -106,15 +112,25 @@ pub async fn put_notifications(State(state): State<AppState>, authed: AuthedUser
             for item in state.db.inbox_of(&user.user_uuid).await? {
                 state.db.delete_inbox_item(item.rid).await?;
             }
+            let _one_at_a_time = state.watches_lock.lock().await;
+            state.db.delete_watches_of(&user.user_uuid).await?;
         }
     }
     if body.email.is_some() || body.push.is_some() {
         state.db.set_notify_channels(user.rid, body.email.map(|on| !on), body.push.map(|on| !on)).await?;
     }
+    if let Some(on) = body.watches {
+        state.db.set_notify_watches_off(user.rid, !on).await?;
+        if !on {
+            let _one_at_a_time = state.watches_lock.lock().await;
+            state.db.delete_watches_of(&user.user_uuid).await?;
+        }
+    }
     Ok(Json(json!({
         "on": body.on.unwrap_or(!user.notifications_off),
         "email": body.email.unwrap_or(!user.notify_email_off),
         "push": body.push.unwrap_or(!user.notify_push_off),
+        "watches": body.watches.unwrap_or(!user.notify_watches_off),
     })))
 }
 

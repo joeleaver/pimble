@@ -130,6 +130,8 @@ pub struct UserView {
     notification_email: bool,
     /// Wave 2: whether the browsers they subscribed are pushed their items.
     notification_push: bool,
+    /// Wave 3: watched notes.
+    notification_watches: bool,
     /// Wave 2, `GET /me` only: the service's VAPID public key, the
     /// `applicationServerKey` a browser subscribes with; absent when this
     /// service sends no pushes.
@@ -147,6 +149,7 @@ impl From<&UserRow> for UserView {
             notifications: !user.notifications_off,
             notification_email: !user.notify_email_off,
             notification_push: !user.notify_push_off,
+            notification_watches: !user.notify_watches_off,
             push_key: None,
         }
     }
