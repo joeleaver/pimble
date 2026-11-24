@@ -54,6 +54,7 @@ pub(crate) fn candidates(node: NodeId, before: Option<&[u8]>, after: &[u8]) -> V
         return Vec::new();
     }
     let text = after_doc.text();
+    let placed = pimble_crdt::mentions::placed_in(after);
     added
         .into_iter()
         .map(|m| Candidate {
@@ -62,7 +63,9 @@ pub(crate) fn candidates(node: NodeId, before: Option<&[u8]>, after: &[u8]) -> V
             recipient: m.account.clone(),
             node,
             discussion: None,
-            snippet: snippet_around(&text, &m.words()),
+            // Around this mention, not the first words like it: a note can
+            // name the same person many times.
+            snippet: snippet_at(&text, placed.iter().find(|(p, _)| *p == m).map(|(_, at)| *at).unwrap_or(0)),
             anchor: m.id,
         })
         .collect()
@@ -128,16 +131,21 @@ fn message_candidates(
     out
 }
 
-/// About [`SNIPPET_CHARS`] of `text` around the first `needle`, on one line,
-/// with an ellipsis where it was cut.
-pub(crate) fn snippet_around(text: &str, needle: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let chars: Vec<char> = flat.chars().collect();
-    if chars.len() <= SNIPPET_CHARS {
-        return flat;
-    }
-    let at = flat.find(needle).map(|byte| flat[..byte].chars().count()).unwrap_or(0);
-    let start = at.saturating_sub(SNIPPET_CHARS / 3).min(chars.len() - SNIPPET_CHARS);
+/// About [`SNIPPET_CHARS`] of `text` around the char at `at` (where a
+/// mention starts), on one line, with an ellipsis where it was cut.
+pub(crate) fn snippet_at(text: &str, at: usize) -> String {
+    let chars: Vec<char> = one_line(text).chars().collect();
+    // Where `at` falls once the text is on one line: the words before it,
+    // and the space after them when it starts a word of its own.
+    let before: String = text.chars().take(at).collect();
+    let words_before = one_line(&before);
+    let gap = usize::from(!words_before.is_empty() && before.ends_with(char::is_whitespace));
+    let at = words_before.chars().count() + gap;
+    // A third before the mention at most, never more to fill the window in
+    // a short note or near the end: the app opens a notice at the words from
+    // the snippet's first `@` (`inbox::target_of`), so words reaching back to
+    // an earlier mention would open that one.
+    let start = at.saturating_sub(SNIPPET_CHARS / 3).min(chars.len());
     let end = (start + SNIPPET_CHARS).min(chars.len());
     let mut out = String::new();
     if start > 0 {
@@ -150,8 +158,13 @@ pub(crate) fn snippet_around(text: &str, needle: &str) -> String {
     out
 }
 
+/// `text`'s words on one line, one space between each.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clip(text: &str, max: usize) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = one_line(text);
     if flat.chars().count() <= max {
         return flat;
     }
@@ -220,10 +233,34 @@ mod tests {
     #[test]
     fn a_snippet_is_about_120_characters_around_the_mention() {
         let long = format!("{} @Will here {}", "a".repeat(300), "b".repeat(300));
-        let s = snippet_around(&long, "@Will");
+        let s = snippet_at(&long, 301);
         assert!(s.contains("@Will here"), "{s}");
         assert!(s.starts_with('…') && s.ends_with('…'));
         assert!(s.chars().count() <= SNIPPET_CHARS + 2);
-        assert_eq!(snippet_around("short\n\ntext", "x"), "short text");
+        assert_eq!(snippet_at("short\n\ntext", 0), "short text");
+        let short = format!("{} @Will hi", "x".repeat(60));
+        assert_eq!(snippet_at(&short, 61), format!("…{} @Will hi", "x".repeat(39)), "a short note is cut too, the mention near the start");
+        // Runs of whitespace before the place fold as the text does.
+        let spaced = format!("{}\n\n   @Will there {}", "a ".repeat(150), "b".repeat(300));
+        let at = spaced.find('@').unwrap();
+        assert!(snippet_at(&spaced, at).contains("@Will there"));
+    }
+
+    #[test]
+    fn a_second_mention_of_the_same_person_is_told_from_its_own_words() {
+        // Found walking the notifications through on the local stack: the
+        // second mention of Ben in a note said the words around the first,
+        // and opening it selected the first.
+        let node = NodeId::new();
+        let first = "We fly out on Friday. The hotel is booked near the old harbour.\n\n\
+                     [@Ben](pimble-person:ben?m=one) can you check the hotel dates before Friday?";
+        let before = note_with(first);
+        let after = note_with(&format!("{first}\n\n[@Ben](pimble-person:ben?m=two) the window is closed, does this still reach you?"));
+        let got = candidates(node, Some(&before), &after);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].anchor.as_deref(), Some("two"));
+        assert!(got[0].snippet.contains("@Ben the window is closed, does this still reach you?"), "{}", got[0].snippet);
+        let from_the_at = &got[0].snippet[got[0].snippet.find('@').unwrap()..];
+        assert!(from_the_at.starts_with("@Ben the window"), "the words from the first @ are this mention's: {from_the_at}");
     }
 }
