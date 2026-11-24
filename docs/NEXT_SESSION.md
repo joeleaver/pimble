@@ -14,9 +14,19 @@ Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all
 - Waiting on rinch: a code block can't grow past one line (Enter has no `newlineInCode`;
   Shift+Enter's hard break isn't allowed in code). Sent to the Rinch master 2026-11-23; move
   the pin when it merges.
-- Kanban drop and column-height fixes merged (0ed2349, reviewed twice). Release 0.30.2 (kanban
-  0.1.2) is committed and pushed; tag `v0.30.2` waits for CI run 45304589117 to pass. Then come the
-  Release run, install-release.sh, `git push jkbase`, sw.js 200, and the Bear liaison's summary.
+- Release 0.30.2 (kanban 0.1.2: drops and column heights) shipped 2026-11-23: tag `v0.30.2`,
+  Release run green, installed here, web on jkbase v65 (sw.js 200), Bear summary asked of the liaison.
+- Notifications (worker local_29e8b449, branch `notifications` in /home/joe/dev/pimble-notifications,
+  not pushed): waves 0-4 built, walk-through passed, master merged in (cc5f404). Two independent
+  reviews of the round-2 fixes are done (cc5f404..393ff27 fixed 6 of 7; it added one undercount bug
+  in `gather_watch_write`, plus two Inbox lows). Joe said "Fix, check, merge": the worker is fixing
+  those three; one narrow review of that diff, then merge to master, release, set the VAPID key
+  before deploy, and put Joe's notification decisions to him (list in the side notes'
+  `notifications-ready.md`). Then the worker starts wave 5 from master.
+- Possibly flaky on master under load (passed 3 of 3 reruns): pimble-server `--test search`
+  `a_locked_index_is_waited_for_and_never_rebuilt`, `--test vault_link`
+  `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`.
+- Card proposed to Joe (task_9911cfe9): an owner's discussion on a shared note never reaches the member.
 - Kanban worker local_97f04d79 (`kanban-fixes`): `claude/kanban-column-view` (07cb523) holds stage 1. Next is Joe's
   column view (a column node opens as one kanban column, with a column icon; ABI 7
   `Provision::ChildViewer`). Its ABI, SDK and plugin parts can be built now. Its app edits, with the splits
