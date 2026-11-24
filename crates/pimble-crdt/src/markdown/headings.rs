@@ -9,11 +9,19 @@ use crate::error::Result;
 
 /// How an edit names a heading: some of its text or a heading path
 /// ([`find_heading`]), or its top-level block number, as get_node's outline
-/// numbers it.
+/// numbers it, with optionally some text that must be in that heading now
+/// (`expect`, as [`super::BlockTarget::Index`] takes it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadingTarget<'a> {
     Name(&'a str),
-    Index(usize),
+    Index { index: usize, expect: Option<&'a str> },
+}
+
+impl<'a> HeadingTarget<'a> {
+    /// The heading at `index`, with nothing expected of it.
+    pub fn index(index: usize) -> Self {
+        HeadingTarget::Index { index, expect: None }
+    }
 }
 
 /// A heading's text made loose for comparing: lowercase, curly apostrophes and
@@ -122,6 +130,13 @@ fn path_segments(name: &str) -> Option<Vec<&str>> {
     (segments.len() > 1 && segments.iter().all(|s| !s.trim().is_empty())).then_some(segments)
 }
 
+/// The heading a name names last: the last segment of a heading path, or the
+/// whole name when it is not one.
+pub(super) fn last_segment(name: &str) -> &str {
+    let name = name.trim();
+    path_segments(name).and_then(|segments| segments.last().copied()).unwrap_or(name).trim()
+}
+
 /// The one top-level heading `name` names: some of its text (a heading whose
 /// text is exactly it, ignoring case and punctuation, wins over headings that
 /// merely contain it), or a heading path such as "Design/The county's edges"
@@ -166,16 +181,18 @@ pub fn find_heading(doc: &Node, name: &str) -> Result<Heading> {
 }
 
 /// The one top-level heading `target` names: by name ([`find_heading`]), or
-/// the heading at that block number, refused when the block is not a heading.
+/// the heading at that block number, refused when the block is not a heading
+/// or does not hold what `expect` says it should.
 pub fn target_heading(doc: &Node, target: HeadingTarget<'_>) -> Result<Heading> {
-    let index = match target {
+    let (index, expect) = match target {
         HeadingTarget::Name(name) => return find_heading(doc, name),
-        HeadingTarget::Index(index) => index,
+        HeadingTarget::Index { index, expect } => (index, expect),
     };
     let count = block_count(doc);
     if index >= count {
         return Err(super::quotes::no_such_block(count, index));
     }
+    super::quotes::check_expected(doc, index, expect)?;
     if let Some(h) = headings(doc).into_iter().find(|h| h.index == index) {
         return Ok(h);
     }

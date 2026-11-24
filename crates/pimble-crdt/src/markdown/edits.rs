@@ -10,7 +10,8 @@ use rinch_editor_core::{Fragment, Node, Schema};
 
 use super::echo::{self, Echo};
 use super::headings::{headings, target_heading, Heading, HeadingTarget};
-use super::quotes::{is_blank, judge_delete_quote, matches, pick, target_block, BlockTarget, Occurrence};
+use super::judge::{judge_delete_heading, judge_delete_quote, judge_delete_text};
+use super::quotes::{is_blank, matches, pick, target_block, BlockTarget, Quote};
 use super::{collab, parse, refused, render, ATOM};
 use crate::error::Result;
 
@@ -29,13 +30,14 @@ pub enum InsertAt<'a> {
 pub enum MarkdownEdit<'a> {
     /// `markdown` after a block or a section.
     InsertAfter { at: InsertAt<'a>, markdown: &'a str },
-    /// The blocks under a heading (the heading stays) replaced by `markdown`.
+    /// The blocks under a heading (the heading stays) replaced by `markdown`;
+    /// emptied (an empty `markdown`) only when the heading is named surely.
     ReplaceSection { heading: HeadingTarget<'a>, markdown: &'a str },
     /// A quote inside one paragraph replaced by plain `text`.
-    ReplaceText { quote: &'a str, occurrence: Option<Occurrence>, text: &'a str },
+    ReplaceText { quote: Quote<'a>, text: &'a str },
     /// One top-level block replaced by `markdown`, or removed when it is empty.
     ReplaceBlock { block: BlockTarget<'a>, markdown: &'a str },
-    /// A heading and its section removed.
+    /// A heading and its section removed, the heading named surely.
     RemoveSection { heading: HeadingTarget<'a> },
     /// The whole content rewritten as the fewest block edits.
     ReplaceContent { markdown: &'a str },
@@ -49,7 +51,7 @@ pub(crate) fn steps(schema: &Rc<Schema>, doc: &Node, edit: MarkdownEdit<'_>) -> 
     Ok(match edit {
         MarkdownEdit::InsertAfter { at, markdown } => one(insert_after(schema, doc, at, markdown)?),
         MarkdownEdit::ReplaceSection { heading, markdown } => one(replace_section(schema, doc, heading, markdown)?),
-        MarkdownEdit::ReplaceText { quote, occurrence, text } => one(replace_text(schema, doc, quote, occurrence, text)?),
+        MarkdownEdit::ReplaceText { quote, text } => one(replace_text(schema, doc, quote, text)?),
         MarkdownEdit::ReplaceBlock { block, markdown } => one(replace_block(schema, doc, block, markdown)?),
         MarkdownEdit::RemoveSection { heading } => one(remove_section(schema, doc, heading)?),
         MarkdownEdit::ReplaceContent { markdown } => replace_content(schema, doc, markdown)?,
@@ -104,9 +106,14 @@ pub(crate) fn insert_after(schema: &Rc<Schema>, doc: &Node, at: InsertAt<'_>, md
 }
 
 /// The blocks under the heading `heading` names (the heading itself stays), up
-/// to the next heading of its level or higher.
+/// to the next heading of its level or higher. Emptying it (an empty `md`) by a
+/// short or number-like part of the heading's text is refused
+/// ([`judge_delete_heading`]).
 pub(crate) fn replace_section(schema: &Rc<Schema>, doc: &Node, heading: HeadingTarget<'_>, md: &str) -> Result<(Node, Echo)> {
     let h = target_heading(doc, heading)?;
+    if md.trim().is_empty() {
+        judge_delete_heading(doc, heading, &h, "empty")?;
+    }
     let blocks = parsed_blocks(schema, md)?;
     let echo = echo::of_blocks(schema, doc, h.index + 1, h.end)?;
     Ok((splice(doc, h.index + 1, h.end, &blocks), echo))
@@ -128,8 +135,8 @@ fn with_blocks(schema: &Rc<Schema>, doc: &Node, mut children: Vec<Node>) -> Resu
 /// [`BlockTarget::Index`].
 pub(crate) fn replace_block(schema: &Rc<Schema>, doc: &Node, block: BlockTarget<'_>, md: &str) -> Result<(Node, Echo)> {
     let removing = md.trim().is_empty();
-    if let (true, BlockTarget::Quote { quote, occurrence }) = (removing, block) {
-        judge_delete_quote(doc, quote, occurrence)?;
+    if let (true, BlockTarget::Quote(quote)) = (removing, block) {
+        judge_delete_quote(doc, quote)?;
     }
     let index = target_block(doc, block)?;
     let blocks = if removing { Vec::new() } else { parsed_blocks(schema, md)? };
@@ -139,9 +146,11 @@ pub(crate) fn replace_block(schema: &Rc<Schema>, doc: &Node, block: BlockTarget<
 }
 
 /// The heading `heading` names and everything under it, up to the next heading
-/// of its level or higher, removed.
+/// of its level or higher, removed. Naming the heading by a short or
+/// number-like part of its text is refused ([`judge_delete_heading`]).
 pub(crate) fn remove_section(schema: &Rc<Schema>, doc: &Node, heading: HeadingTarget<'_>) -> Result<(Node, Echo)> {
     let h = target_heading(doc, heading)?;
+    judge_delete_heading(doc, heading, &h, "remove")?;
     let echo = echo::of_blocks(schema, doc, h.index, h.end)?;
     let after = splice(doc, h.index, h.end, &[]);
     Ok((with_blocks(schema, &after, after.content().children().to_vec())?, echo))
@@ -231,25 +240,24 @@ pub(crate) fn replace_content(schema: &Rc<Schema>, doc: &Node, md: &str) -> Resu
     Ok((steps, echoes))
 }
 
-/// The occurrence of `quote` (the only one, unless `occurrence` picks one)
+/// The occurrence of `quote` (the only one, unless its occurrence picks one)
 /// replaced by `text` inside its textblock. Text the two
 /// share at either end is left alone; the rest of the new text takes the marks of the
 /// first character it replaces, as typing over a selection does, and everything else
-/// keeps its own. An empty `text` deletes the quote.
-pub(crate) fn replace_text(
-    schema: &Rc<Schema>,
-    doc: &Node,
-    quote: &str,
-    occurrence: Option<Occurrence>,
-    text: &str,
-) -> Result<(Node, Echo)> {
-    if quote.contains('\n') || text.contains('\n') {
+/// keeps its own. An empty `text` deletes the quote, refused for a short or
+/// number-like quote ([`judge_delete_text`]).
+pub(crate) fn replace_text(schema: &Rc<Schema>, doc: &Node, quote: Quote<'_>, text: &str) -> Result<(Node, Echo)> {
+    if quote.text.contains('\n') || text.contains('\n') {
         return Err(refused("Replacing text works inside one paragraph; a quote or replacement with a line break spans more."));
     }
-    if quote.is_empty() {
+    if quote.text.is_empty() {
         return Err(refused("Name the text to replace with an exact quote of it."));
     }
-    let found = pick(matches(doc, quote, |_| true), quote, occurrence, "paragraph", "{n} times", false)?;
+    if text.is_empty() {
+        judge_delete_text(doc, quote)?;
+    }
+    let found = pick(matches(doc, quote.text, |_| true), quote, "paragraph")?;
+    let quote = quote.text;
     let echo = echo::of_quote(&found);
     // Only what differs is replaced: the text the quote and its replacement share at
     // either end stays where it is, marks and all (and so does anyone's caret in it).

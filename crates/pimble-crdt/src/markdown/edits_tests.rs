@@ -29,7 +29,7 @@ fn sect(s: &Rc<Schema>, d: &Node, heading: &str, md: &str) -> crate::Result<Node
 }
 
 fn text(s: &Rc<Schema>, d: &Node, quote: &str, new: &str) -> crate::Result<Node> {
-    replace_text(s, d, quote, None, new).map(|(after, _)| after)
+    replace_text(s, d, Quote::alone(quote), new).map(|(after, _)| after)
 }
 
 fn block(s: &Rc<Schema>, d: &Node, quote: &str, md: &str) -> crate::Result<Node> {
@@ -143,7 +143,9 @@ fn replace_text_keeps_marks_outside_the_quote() {
     assert!(after.is_err(), "markdown syntax is not in the text");
     // The space before "here" is bold in the document; Markdown writes whitespace
     // at a mark's edge outside it, and a paragraph's trailing space not at all.
-    let after = text(&s, &d, "here end", "").unwrap();
+    // (Deleting "here end" by itself is too short a quote to delete by: it goes
+    // with the text before it given back.)
+    let after = text(&s, &d, "s here end", "s ").unwrap();
     assert_eq!(render(&after), "plain **bold words**");
 }
 
@@ -161,7 +163,7 @@ fn replace_block_re_levels_or_removes_one_block() {
     let d = doc("# Title\n\nintro\n\n## Old heading\n\nbody");
     assert_eq!(render(&block(&s, &d, "Old heading", "### New heading").unwrap()), "# Title\n\nintro\n\n### New heading\n\nbody");
     // Removing goes by its number, or a quote long enough to be sure of.
-    assert_eq!(render(&replace_block(&s, &d, BlockTarget::Index(2), "").unwrap().0), "# Title\n\nintro\n\nbody");
+    assert_eq!(render(&replace_block(&s, &d, BlockTarget::index(2), "").unwrap().0), "# Title\n\nintro\n\nbody");
     let d = doc("# Title\n\nintro\n\n## The old heading\n\nbody");
     assert_eq!(render(&block(&s, &d, "The old heading", "").unwrap()), "# Title\n\nintro\n\nbody");
     assert_eq!(render(&block(&s, &d, "intro", "- a\n- b").unwrap()), "# Title\n\n- a\n- b\n\n## The old heading\n\nbody");

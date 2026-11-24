@@ -181,11 +181,14 @@ fn random_edit(doc: &mut NodeDoc, rng: &mut Rng, step: usize) {
         1 => doc.replace_text(quote, &text),
         2 => doc.insert_markdown_after(quote, rng.next().is_multiple_of(2), &format!("new {text}")),
         3 => doc.replace_section_markdown(quote, &format!("- {text}\n- more")),
-        4 => doc.replace_text(quote, ""),
+        // Deleting a word: the words above are too short to delete by alone
+        // (`markdown::MIN_DELETE_QUOTE`), so the space before it is quoted and
+        // given back, and only the word goes.
+        4 => doc.replace_text(&format!(" {quote}"), " "),
         // Removing a block goes by its number: the words above are too short
         // to remove one by (`markdown::MIN_DELETE_QUOTE`).
         5 if rng.next().is_multiple_of(2) => {
-            let block = BlockTarget::Index((rng.next() % 8) as usize);
+            let block = BlockTarget::index((rng.next() % 8) as usize);
             doc.edit_markdown(MarkdownEdit::ReplaceBlock { block, markdown: "" }).map(|(delta, _)| delta)
         }
         5 => doc.replace_block_markdown(quote, "## Groceries"),

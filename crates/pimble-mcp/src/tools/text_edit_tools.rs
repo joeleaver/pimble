@@ -7,7 +7,7 @@
 //! ("What an edit says it did").
 
 use pimble_api::Addr;
-use pimble_crdt::markdown::{BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit, Occurrence};
+use pimble_crdt::markdown::{BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit, Narrowing, Occurrence, Quote};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
@@ -57,11 +57,19 @@ pub struct InsertAfterParams {
     #[serde(default)]
     pub quote: Option<String>,
     /// The number of the block to insert after (with `after_section`, of the
-    /// heading whose section to insert after), as get_node's `outline` and
-    /// `blocks` number them, from 0. Give this or `quote`.
+    /// heading whose section to insert after), from 0. Read it from get_node
+    /// with `outline: true` or `blocks` (they print the numbers), or try
+    /// `dry_run: true` first: a number from before the note changed names
+    /// another block. Give this or `quote`.
     #[serde(default)]
     pub block_index: Option<usize>,
-    /// When `quote` appears in several blocks: which, 1 for the first, or "last".
+    /// With `block_index`: some text the block must contain (for a section, its
+    /// heading), to be sure the number still names it. When it does not,
+    /// nothing is written and the answer says what that block reads now.
+    #[serde(default)]
+    pub expect: Option<String>,
+    /// When `quote` appears several times, in one block or several (overlapping
+    /// places count): which, 1 for the first, or "last".
     #[serde(default)]
     pub occurrence: Option<OccurrenceParam>,
     /// Go after the whole section under the heading named, not just the heading.
@@ -84,10 +92,17 @@ pub struct ReplaceSectionParams {
     /// another's section, as get_node's `section` takes. Give this or `block_index`.
     #[serde(default)]
     pub heading: Option<String>,
-    /// The heading's block number, as get_node's `outline` prints it. Give this
-    /// or `heading`.
+    /// The heading's block number, from 0. Read it from get_node with
+    /// `outline: true` or `blocks` (they print the numbers), or try
+    /// `dry_run: true` first: a number from before the note changed names
+    /// another block. Give this or `heading`.
     #[serde(default)]
     pub block_index: Option<usize>,
+    /// With `block_index`: some text the block must contain (for a section, its
+    /// heading), to be sure the number still names it. When it does not,
+    /// nothing is written and the answer says what that block reads now.
+    #[serde(default)]
+    pub expect: Option<String>,
     /// The section's new content, as Markdown.
     pub markdown: String,
     /// Say what would be replaced, and write nothing.
@@ -103,10 +118,12 @@ pub struct ReplaceTextParams {
     /// The exact text to replace, inside one paragraph (plain text: no Markdown
     /// syntax).
     pub quote: String,
-    /// When `quote` appears several times: which, 1 for the first, or "last".
+    /// When `quote` appears several times (overlapping places count): which, 1
+    /// for the first, or "last".
     #[serde(default)]
     pub occurrence: Option<OccurrenceParam>,
-    /// What replaces it (plain text; empty deletes the quote).
+    /// What replaces it (plain text; empty deletes the quote, refused for a
+    /// quote under 12 characters or one that reads like a number).
     pub text: String,
     /// Say what would be replaced, and write nothing.
     #[serde(default)]
@@ -123,11 +140,19 @@ pub struct ReplaceBlockParams {
     /// and 3, never block 13. Give this or `block_index`.
     #[serde(default)]
     pub quote: Option<String>,
-    /// The block's number, as get_node's `outline` and `blocks` number them,
-    /// from 0. Give this or `quote`.
+    /// The block's number, from 0. Read it from get_node with `outline: true`
+    /// or `blocks` (they print the numbers), or try `dry_run: true` first: a
+    /// number from before the note changed names another block. Give this or
+    /// `quote`.
     #[serde(default)]
     pub block_index: Option<usize>,
-    /// When `quote` appears in several blocks: which, 1 for the first, or "last".
+    /// With `block_index`: some text the block must contain (for a section, its
+    /// heading), to be sure the number still names it. When it does not,
+    /// nothing is written and the answer says what that block reads now.
+    #[serde(default)]
+    pub expect: Option<String>,
+    /// When `quote` appears several times, in one block or several (overlapping
+    /// places count): which, 1 for the first, or "last".
     #[serde(default)]
     pub occurrence: Option<OccurrenceParam>,
     /// What replaces that block, as Markdown; empty removes it.
@@ -148,10 +173,17 @@ pub struct RemoveSectionParams {
     /// `block_index`.
     #[serde(default)]
     pub heading: Option<String>,
-    /// The heading's block number, as get_node's `outline` prints it. Give this
-    /// or `heading`.
+    /// The heading's block number, from 0. Read it from get_node with
+    /// `outline: true` or `blocks` (they print the numbers), or try
+    /// `dry_run: true` first: a number from before the note changed names
+    /// another block. Give this or `heading`.
     #[serde(default)]
     pub block_index: Option<usize>,
+    /// With `block_index`: some text the block must contain (for a section, its
+    /// heading), to be sure the number still names it. When it does not,
+    /// nothing is written and the answer says what that block reads now.
+    #[serde(default)]
+    pub expect: Option<String>,
     /// Say what would be removed, and write nothing.
     #[serde(default)]
     pub dry_run: bool,
@@ -175,33 +207,46 @@ fn occurrence(param: &Option<OccurrenceParam>) -> Result<Option<Occurrence>, Str
     param.as_ref().map(OccurrenceParam::get).transpose()
 }
 
-/// The block a tool's `quote`, `block_index` and `occurrence` name: exactly
-/// one of the first two.
-fn block_target<'a>(quote: Option<&'a str>, index: Option<usize>, occurrence: Option<Occurrence>) -> Result<BlockTarget<'a>, String> {
+/// The block a tool's `quote`, `block_index`, `occurrence` and `expect` name:
+/// exactly one of the first two. Such a tool takes both ways of narrowing a
+/// quote, so its refusals offer both.
+fn block_target<'a>(
+    quote: Option<&'a str>,
+    index: Option<usize>,
+    occurrence: Option<Occurrence>,
+    expect: Option<&'a str>,
+) -> Result<BlockTarget<'a>, String> {
     match (quote, index) {
         (Some(_), Some(_)) => Err("Give `quote` or `block_index`, not both.".into()),
         (None, None) => Err(
-            "Name the block: `quote` (some of its text) or `block_index` (its number, as get_node's `outline` and `blocks` print it)."
+            "Name the block: `quote` (some of its text) or `block_index` (its number, as get_node prints it with `outline: true` or `blocks`)."
                 .into(),
         ),
         (None, Some(_)) if occurrence.is_some() => {
             Err("`occurrence` picks one of the places a quote appears; with `block_index` leave it out.".into())
         }
-        (None, Some(index)) => Ok(BlockTarget::Index(index)),
-        (Some(quote), None) => Ok(BlockTarget::Quote { quote, occurrence }),
+        (None, Some(index)) => Ok(BlockTarget::Index { index, expect }),
+        (Some(_), None) if expect.is_some() => Err(EXPECT_WITH_QUOTE.into()),
+        (Some(text), None) => Ok(BlockTarget::Quote(Quote { text, occurrence, narrowing: Narrowing::OccurrenceOrBlockIndex })),
     }
 }
 
-/// The heading a tool's `heading` and `block_index` name: exactly one of them.
-fn heading_target(heading: Option<&str>, index: Option<usize>) -> Result<HeadingTarget<'_>, String> {
+/// The refusal of `expect` given beside a quote, which already names its block
+/// by text.
+const EXPECT_WITH_QUOTE: &str = "`expect` checks the block a `block_index` names; with `quote` leave it out.";
+
+/// The heading a tool's `heading`, `block_index` and `expect` name: exactly one
+/// of the first two.
+fn heading_target<'a>(heading: Option<&'a str>, index: Option<usize>, expect: Option<&'a str>) -> Result<HeadingTarget<'a>, String> {
     match (heading, index) {
         (Some(_), Some(_)) => Err("Give `heading` or `block_index`, not both.".into()),
         (None, None) => Err(
-            "Name the heading: `heading` (some of its text, or a heading path) or `block_index` (its number, as get_node's `outline` prints it)."
+            "Name the heading: `heading` (some of its text, or a heading path) or `block_index` (its number, as get_node prints it with `outline: true`)."
                 .into(),
         ),
+        (Some(_), None) if expect.is_some() => Err(EXPECT_WITH_QUOTE.replace("`quote`", "`heading`")),
         (Some(name), None) => Ok(HeadingTarget::Name(name)),
-        (None, Some(index)) => Ok(HeadingTarget::Index(index)),
+        (None, Some(index)) => Ok(HeadingTarget::Index { index, expect }),
     }
 }
 
@@ -275,8 +320,10 @@ impl Pimble {
     }
 
     /// Name where by `quote` (some of a block's text, never its number) or by
-    /// `block_index` (its number, as get_node's `outline` and `blocks` print
-    /// it); `occurrence` picks one of several blocks a quote appears in.
+    /// `block_index` (its number, from get_node with `outline: true` or
+    /// `blocks`, which print the numbers; or try `dry_run: true` first), with
+    /// `expect` some text that block must contain; `occurrence` picks one of
+    /// several places a quote appears.
     /// Inserts Markdown after that block, or with `after_section` after the
     /// whole section under the heading named. Answers where it went, between
     /// which blocks; `dry_run: true` answers that and writes nothing.
@@ -287,9 +334,9 @@ impl Pimble {
             if occurrence.is_some() {
                 return Err("`occurrence` picks among a quote's places in the text; name a section by its heading's text, a heading path or `block_index`.".into());
             }
-            InsertAt::Section(heading_target(p.quote.as_deref(), p.block_index)?)
+            InsertAt::Section(heading_target(p.quote.as_deref(), p.block_index, p.expect.as_deref())?)
         } else {
-            InsertAt::Block(block_target(p.quote.as_deref(), p.block_index, occurrence)?)
+            InsertAt::Block(block_target(p.quote.as_deref(), p.block_index, occurrence, p.expect.as_deref())?)
         };
         let (addr, echoes) = self.edit_text(&p.node, MarkdownEdit::InsertAfter { at, markdown: &p.markdown }, p.dry_run).await?;
         let at = echoes.first().map_or(0, |e| e.from);
@@ -298,14 +345,18 @@ impl Pimble {
     }
 
     /// Name the heading by `heading` (some of its text or a heading path,
-    /// never its number) or by `block_index` (its number, as get_node's
-    /// `outline` prints it). Replaces the blocks under it, up to the next
-    /// heading of its level or higher; the heading stays. Answers what was
+    /// never its number) or by `block_index` (its number, from get_node with
+    /// `outline: true`, which prints the numbers; or try `dry_run: true`
+    /// first), with `expect` some of the heading's text. Replaces the blocks
+    /// under it, up to the next heading of its level or higher; the heading
+    /// stays. Emptying a section by a name under 12 characters, or one that
+    /// reads like a number, that is only part of the heading's text is
+    /// refused: give the whole heading or `block_index`. Answers what was
     /// there (its first 120 characters), its block numbers and its neighbors;
     /// `dry_run: true` answers that and writes nothing.
     #[tool(name = "replace_section")]
     pub(super) async fn replace_section(&self, Parameters(p): Parameters<ReplaceSectionParams>) -> Result<String, String> {
-        let heading = heading_target(p.heading.as_deref(), p.block_index)?;
+        let heading = heading_target(p.heading.as_deref(), p.block_index, p.expect.as_deref())?;
         let (addr, echoes) = self.edit_text(&p.node, MarkdownEdit::ReplaceSection { heading, markdown: &p.markdown }, p.dry_run).await?;
         let e = &echoes[0];
         let what = format!("{} of {}, the section under the heading at block {}", blocks(e.from, e.to), addr.link(), e.from.saturating_sub(1));
@@ -314,22 +365,28 @@ impl Pimble {
 
     /// `quote` is the exact text to replace (plain text inside one paragraph,
     /// never a block number); `occurrence` picks one when it appears several
-    /// times, and several without it are refused with every place listed.
-    /// Replaces it with new text. Answers the old text, its block number and
+    /// times (overlapping places count), and several without it are refused
+    /// with every place listed. Replaces it with new text. Deleting (empty
+    /// `text`) by a quote under 12 characters, or one that reads like a
+    /// number, is refused: quote the words either side and give them back
+    /// without it. Answers the old text, its block number and
     /// the text either side of it; `dry_run: true` answers that and writes
     /// nothing.
     #[tool(name = "replace_text")]
     pub(super) async fn replace_text(&self, Parameters(p): Parameters<ReplaceTextParams>) -> Result<String, String> {
-        let edit = MarkdownEdit::ReplaceText { quote: &p.quote, occurrence: occurrence(&p.occurrence)?, text: &p.text };
+        let quote = Quote { text: &p.quote, occurrence: occurrence(&p.occurrence)?, narrowing: Narrowing::Occurrence };
+        let edit = MarkdownEdit::ReplaceText { quote, text: &p.text };
         let (addr, echoes) = self.edit_text(&p.node, edit, p.dry_run).await?;
         let what = format!("text in block {} of {}", echoes[0].from, addr.link());
         Ok(answer(p.dry_run, format!("Replaced {what}"), format!("replace {what}"), &echoes))
     }
 
     /// Name the block by `quote` (some of its text, never its number) or by
-    /// `block_index` (its number, as get_node's `outline` and `blocks` print
-    /// it); `occurrence` picks one of several blocks a quote appears in, and
-    /// several without it are refused with every place listed. Replaces that
+    /// `block_index` (its number, from get_node with `outline: true` or
+    /// `blocks`, which print the numbers; or try `dry_run: true` first), with
+    /// `expect` some text that block must contain; `occurrence` picks one of
+    /// several places a quote appears, and several without it are refused
+    /// with every place listed. Replaces that
     /// one block (a heading, a paragraph, a list, a code block) with Markdown,
     /// or removes it with empty Markdown: removing or re-levelling a heading,
     /// turning a paragraph into a list. Removing by a quote under 12
@@ -339,7 +396,7 @@ impl Pimble {
     /// nothing.
     #[tool(name = "replace_block")]
     pub(super) async fn replace_block(&self, Parameters(p): Parameters<ReplaceBlockParams>) -> Result<String, String> {
-        let block = block_target(p.quote.as_deref(), p.block_index, occurrence(&p.occurrence)?)?;
+        let block = block_target(p.quote.as_deref(), p.block_index, occurrence(&p.occurrence)?, p.expect.as_deref())?;
         let (addr, echoes) = self.edit_text(&p.node, MarkdownEdit::ReplaceBlock { block, markdown: &p.markdown }, p.dry_run).await?;
         let what = format!("{} of {}", blocks(echoes[0].from, echoes[0].to), addr.link());
         let (done, would) = if p.markdown.trim().is_empty() { ("Removed", "remove") } else { ("Replaced", "replace") };
@@ -347,14 +404,18 @@ impl Pimble {
     }
 
     /// Name the heading by `heading` (some of its text or a heading path,
-    /// never its number) or by `block_index` (its number, as get_node's
-    /// `outline` prints it). Removes it and everything under it, up to the next
-    /// heading of its level or higher. Answers what was there (its first 120
+    /// never its number) or by `block_index` (its number, from get_node with
+    /// `outline: true`, which prints the numbers; or try `dry_run: true`
+    /// first), with `expect` some of the heading's text. Removes it and
+    /// everything under it, up to the next heading of its level or higher. A
+    /// name under 12 characters, or one that reads like a number, that is only
+    /// part of the heading's text is refused: give the whole heading or
+    /// `block_index`. Answers what was there (its first 120
     /// characters), its block numbers and its neighbors; `dry_run: true`
     /// answers that and writes nothing.
     #[tool(name = "remove_section")]
     pub(super) async fn remove_section(&self, Parameters(p): Parameters<RemoveSectionParams>) -> Result<String, String> {
-        let heading = heading_target(p.heading.as_deref(), p.block_index)?;
+        let heading = heading_target(p.heading.as_deref(), p.block_index, p.expect.as_deref())?;
         let (addr, echoes) = self.edit_text(&p.node, MarkdownEdit::RemoveSection { heading }, p.dry_run).await?;
         let what = format!("{} of {}, a heading and its section", blocks(echoes[0].from, echoes[0].to), addr.link());
         Ok(answer(p.dry_run, format!("Removed {what}"), format!("remove {what}"), &echoes))

@@ -550,7 +550,7 @@ fn the_caret_after_an_edit_is_at_the_end_of_what_it_wrote() {
     assert_eq!(at(&doc, doc.sticky_after_change(&before).unwrap()), (1, 13));
 
     let before = doc.textblock_texts();
-    doc.replace_text("second ", "").unwrap();
+    doc.replace_text("a second line", "a line").unwrap();
     assert_eq!(at(&doc, doc.sticky_after_change(&before).unwrap()), (1, 2));
 
     // Nothing changed in the text: no caret.

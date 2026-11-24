@@ -5,7 +5,7 @@
 //! `occurrence` picks one, every edit says what it took out, and a preview says
 //! exactly that while writing nothing.
 
-use pimble_crdt::markdown::{BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit, Occurrence, EXCERPT};
+use pimble_crdt::markdown::{BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit, Narrowing, Occurrence, Quote, EXCERPT};
 use pimble_crdt::NodeDoc;
 
 fn note(md: &str) -> NodeDoc {
@@ -26,8 +26,19 @@ fn remove(block: BlockTarget<'_>) -> MarkdownEdit<'_> {
     MarkdownEdit::ReplaceBlock { block, markdown: "" }
 }
 
+/// A block named by a quote as replace_block and insert_after name one: with
+/// `occurrence` and `block_index` on offer.
 fn quoted(quote: &str, occurrence: Option<Occurrence>) -> BlockTarget<'_> {
-    BlockTarget::Quote { quote, occurrence }
+    BlockTarget::Quote(Quote { text: quote, occurrence, narrowing: Narrowing::OccurrenceOrBlockIndex })
+}
+
+fn by_quote(quote: &str) -> BlockTarget<'_> {
+    quoted(quote, None)
+}
+
+/// A quote as replace_text names one: with `occurrence` on offer.
+fn text_quote(quote: &str, occurrence: Option<Occurrence>) -> Quote<'_> {
+    Quote { text: quote, occurrence, narrowing: Narrowing::Occurrence }
 }
 
 /// Blocks 0-4; block 2 holds "13" and block 4 is the thirteenth line's words.
@@ -38,30 +49,30 @@ const LIST: &str = "# Shopping\n\nApples for the pie.\n\nWe need 13 eggs for the
 #[test]
 fn a_number_like_quote_removes_nothing_and_says_what_it_would_have() {
     let mut doc = note(LIST);
-    let err = refusal(&mut doc, remove(BlockTarget::quote("13")));
+    let err = refusal(&mut doc, remove(by_quote("13")));
     assert!(err.contains("reads like a block number"), "{err}");
     assert!(err.contains("block 2") && err.contains("block 4"), "both blocks holding \"13\" are listed: {err}");
     assert!(err.contains("block_index"), "{err}");
     for quote in ["#13", "13.", "4-6"] {
-        let err = refusal(&mut doc, remove(BlockTarget::quote(quote)));
+        let err = refusal(&mut doc, remove(by_quote(quote)));
         assert!(err.contains("reads like a block number"), "{quote}: {err}");
     }
     // A block number that exists is offered.
     let mut short = note("one\n\ntwo\n\nthree");
-    let err = refusal(&mut short, remove(BlockTarget::quote("2")));
+    let err = refusal(&mut short, remove(by_quote("2")));
     assert!(err.contains("It names no block") && err.contains("If you meant block 2, give `block_index: 2`"), "{err}");
 }
 
 #[test]
 fn a_short_quote_removes_nothing() {
     let mut doc = note(LIST);
-    let err = refusal(&mut doc, remove(BlockTarget::quote("Apples")));
+    let err = refusal(&mut doc, remove(by_quote("Apples")));
     assert!(err.contains("shorter than 12 characters"), "{err}");
     assert!(err.contains("It would have removed block 1 (\"Apples for the pie.\")"), "{err}");
     assert!(err.contains("`block_index: 1`"), "{err}");
     // Replacing by a short quote is still fine, and so is removing by a long one.
-    doc.edit_markdown(MarkdownEdit::ReplaceBlock { block: BlockTarget::quote("Apples"), markdown: "Pears for the pie." }).unwrap();
-    let (_, echo) = doc.edit_markdown(remove(BlockTarget::quote("Flour, the strong"))).unwrap();
+    doc.edit_markdown(MarkdownEdit::ReplaceBlock { block: by_quote("Apples"), markdown: "Pears for the pie." }).unwrap();
+    let (_, echo) = doc.edit_markdown(remove(by_quote("Flour, the strong"))).unwrap();
     assert_eq!(echo[0].from, 3);
     assert!(!doc.markdown().unwrap().contains("Flour"));
 }
@@ -69,7 +80,7 @@ fn a_short_quote_removes_nothing() {
 #[test]
 fn a_block_is_named_by_its_number() {
     let mut doc = note(LIST);
-    let (_, echo) = doc.edit_markdown(remove(BlockTarget::Index(2))).unwrap();
+    let (_, echo) = doc.edit_markdown(remove(BlockTarget::index(2))).unwrap();
     assert_eq!(
         echo,
         vec![Echo {
@@ -82,11 +93,11 @@ fn a_block_is_named_by_its_number() {
         }]
     );
     assert_eq!(doc.markdown().unwrap(), "# Shopping\n\nApples for the pie.\n\nFlour, the strong kind.\n\nAsk about block 13 at the shop.");
-    let err = refusal(&mut doc, remove(BlockTarget::Index(9)));
+    let err = refusal(&mut doc, remove(BlockTarget::index(9)));
     assert_eq!(err, "This node has blocks 0 to 3, so there is no block 9.");
     // Inserting after a block by its number, and after a section by its heading's.
-    doc.edit_markdown(MarkdownEdit::InsertAfter { at: InsertAt::Block(BlockTarget::Index(1)), markdown: "Sugar." }).unwrap();
-    let (_, echo) = doc.edit_markdown(MarkdownEdit::InsertAfter { at: InsertAt::Section(HeadingTarget::Index(0)), markdown: "The end." }).unwrap();
+    doc.edit_markdown(MarkdownEdit::InsertAfter { at: InsertAt::Block(BlockTarget::index(1)), markdown: "Sugar." }).unwrap();
+    let (_, echo) = doc.edit_markdown(MarkdownEdit::InsertAfter { at: InsertAt::Section(HeadingTarget::index(0)), markdown: "The end." }).unwrap();
     assert_eq!((echo[0].from, echo[0].to, echo[0].after.clone()), (5, 5, None), "after the last block");
     assert!(doc.markdown().unwrap().starts_with("# Shopping\n\nApples for the pie.\n\nSugar.\n\nFlour"));
     assert!(doc.markdown().unwrap().ends_with("at the shop.\n\nThe end."));
@@ -95,14 +106,14 @@ fn a_block_is_named_by_its_number() {
 #[test]
 fn a_section_is_named_by_its_headings_number() {
     let mut doc = note("intro\n\n# A\n\na1\n\n## A.1\n\na11\n\n# B\n\nb1");
-    let err = refusal(&mut doc, MarkdownEdit::RemoveSection { heading: HeadingTarget::Index(2) });
+    let err = refusal(&mut doc, MarkdownEdit::RemoveSection { heading: HeadingTarget::index(2) });
     assert!(err.starts_with("Block 2 is a paragraph, not a heading (\"a1\")"), "{err}");
-    let (_, echo) = doc.edit_markdown(MarkdownEdit::RemoveSection { heading: HeadingTarget::Index(1) }).unwrap();
+    let (_, echo) = doc.edit_markdown(MarkdownEdit::RemoveSection { heading: HeadingTarget::index(1) }).unwrap();
     assert_eq!((echo[0].from, echo[0].to), (1, 5));
     assert_eq!(echo[0].old, "# A a1 ## A.1 a11");
     assert_eq!((echo[0].before.as_deref(), echo[0].after.as_deref()), (Some("intro"), Some("B")));
     assert_eq!(doc.markdown().unwrap(), "intro\n\n# B\n\nb1");
-    let (_, echo) = doc.edit_markdown(MarkdownEdit::ReplaceSection { heading: HeadingTarget::Index(1), markdown: "b2" }).unwrap();
+    let (_, echo) = doc.edit_markdown(MarkdownEdit::ReplaceSection { heading: HeadingTarget::index(1), markdown: "b2" }).unwrap();
     assert_eq!((echo[0].from, echo[0].to, echo[0].old.as_str()), (2, 3, "b1"));
 }
 
@@ -113,8 +124,8 @@ fn an_ambiguous_quote_lists_every_place_and_occurrence_picks_one() {
     let same = "The same words here.";
     let md = format!("# Notes\n\n{same}\n\n{same}\n\n{same}");
     let mut doc = note(&md);
-    let err = refusal(&mut doc, remove(BlockTarget::quote(same)));
-    assert!(err.contains("appears in 3 blocks"), "{err}");
+    let err = refusal(&mut doc, remove(by_quote(same)));
+    assert!(err.contains("appears 3 times"), "{err}");
     for (n, block) in [(1, 1), (2, 2), (3, 3)] {
         assert!(err.contains(&format!("({n}) block {block}: \"{same}\"")), "{err}");
     }
@@ -136,9 +147,9 @@ fn an_ambiguous_quote_lists_every_place_and_occurrence_picks_one() {
 #[test]
 fn replace_text_takes_an_occurrence_and_echoes_the_quote_in_place() {
     let mut doc = note("one fish, two fish, red fish");
-    let err = refusal(&mut doc, MarkdownEdit::ReplaceText { quote: "fish", occurrence: None, text: "cat" });
+    let err = refusal(&mut doc, MarkdownEdit::ReplaceText { quote: text_quote("fish", None), text: "cat" });
     assert!(err.contains("\"fish\" appears 3 times") && err.contains("(3) block 0: \"one fish, two fish, red fish\""), "{err}");
-    let edit = MarkdownEdit::ReplaceText { quote: "fish", occurrence: Some(Occurrence::Nth(2)), text: "cat" };
+    let edit = MarkdownEdit::ReplaceText { quote: text_quote("fish", Some(Occurrence::Nth(2))), text: "cat" };
     let (_, echo) = doc.edit_markdown(edit).unwrap();
     assert_eq!(doc.markdown().unwrap(), "one fish, two cat, red fish");
     let e = &echo[0];
@@ -150,7 +161,7 @@ fn replace_text_takes_an_occurrence_and_echoes_the_quote_in_place() {
 fn the_echo_keeps_the_first_characters_and_says_it_cut() {
     let long = "word ".repeat(60);
     let mut doc = note(&format!("short\n\n{}\n\nend", long.trim()));
-    let (_, echo) = doc.edit_markdown(remove(BlockTarget::Index(1))).unwrap();
+    let (_, echo) = doc.edit_markdown(remove(BlockTarget::index(1))).unwrap();
     assert_eq!(echo[0].old.chars().count(), EXCERPT + 1);
     assert!(echo[0].old.ends_with('…') && echo[0].old.starts_with("word word"));
 }
@@ -168,12 +179,12 @@ fn replace_content_echoes_each_changed_stretch() {
 #[test]
 fn a_dry_run_says_what_the_edit_would_do_and_writes_nothing() {
     let edits = [
-        remove(BlockTarget::Index(2)),
-        MarkdownEdit::ReplaceText { quote: "strong", occurrence: None, text: "weak" },
+        remove(BlockTarget::index(2)),
+        MarkdownEdit::ReplaceText { quote: text_quote("strong", None), text: "weak" },
         MarkdownEdit::RemoveSection { heading: HeadingTarget::Name("Shopping") },
         MarkdownEdit::ReplaceSection { heading: HeadingTarget::Name("Shopping"), markdown: "nothing" },
         MarkdownEdit::ReplaceContent { markdown: "# Shopping\n\nbread" },
-        MarkdownEdit::InsertAfter { at: InsertAt::Block(BlockTarget::quote("Flour")), markdown: "Salt." },
+        MarkdownEdit::InsertAfter { at: InsertAt::Block(by_quote("Flour")), markdown: "Salt." },
     ];
     for edit in edits {
         let doc = note(LIST);
@@ -185,8 +196,8 @@ fn a_dry_run_says_what_the_edit_would_do_and_writes_nothing() {
         assert_eq!(preview, echo, "{edit:?}");
     }
     let doc = note(LIST);
-    let err = doc.preview_markdown(remove(BlockTarget::quote("13"))).unwrap_err().to_string();
+    let err = doc.preview_markdown(remove(by_quote("13"))).unwrap_err().to_string();
     assert!(err.contains("reads like a block number"), "{err}");
-    let same = MarkdownEdit::ReplaceText { quote: "strong", occurrence: None, text: "strong" };
+    let same = MarkdownEdit::ReplaceText { quote: text_quote("strong", None), text: "strong" };
     assert!(doc.preview_markdown(same).unwrap_err().to_string().contains("would change nothing"));
 }

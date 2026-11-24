@@ -435,6 +435,7 @@ impl Embed {
 mod echo;
 mod edits;
 mod headings;
+mod judge;
 mod quotes;
 #[cfg(test)]
 mod edits_tests;
@@ -444,6 +445,7 @@ mod tests;
 pub use echo::{excerpt, Echo, EXCERPT, NEIGHBOR};
 pub use edits::{InsertAt, MarkdownEdit};
 pub use headings::{blocks_markdown, find_heading, headings, loose, target_heading, Heading, HeadingTarget, PATH_SEPARATOR};
-pub use quotes::{BlockTarget, Occurrence, MIN_DELETE_QUOTE};
+pub use judge::MIN_DELETE_QUOTE;
+pub use quotes::{BlockTarget, Narrowing, Occurrence, Quote};
 pub(crate) use edits::{append, cut_sections, steps, write_new};
 pub(crate) use quotes::is_blank;

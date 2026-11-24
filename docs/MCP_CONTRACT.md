@@ -260,15 +260,30 @@ mistaken for each other, and every tool's description opens with that rule:
   `remove_section`, `insert_after` with `after_section`) is the block's number as
   `get_node`'s `outline` and `blocks` print it: top-level blocks from 0, none in an empty
   note. A number past the last is refused with the range there is; a section named by a
-  block that is not a heading is refused with what that block is.
+  block that is not a heading is refused with what that block is. Every description of
+  `block_index` says where the numbers come from: read the note with `get_node`'s
+  `outline` or `blocks` first (they print them), or try the edit with `dry_run`.
+- **`expect`** (with `block_index`, on every tool that takes one) is some text that must be
+  in that block now (for a heading, in the heading), matched as a quote is. A number read
+  before the note changed names another block; with `expect` given and absent, nothing is
+  written and the refusal says what the block is and reads now, and to read the outline
+  or blocks again (`markdown::quotes::check_expected`, 2026-11-24). It does not go with
+  `quote`/`heading`.
 - **`heading`** (`replace_section`, `remove_section`) is some of a heading's text or a
   heading path, found as above.
 - Exactly one of `quote`/`heading` and `block_index`; both or neither is refused.
-- **`occurrence`** (1, 2, ... or `"last"`) picks among the places a quote appears: for a
-  block, the blocks it appears in; for `replace_text`, every place in the text. Without
-  it a quote must appear once; several are refused with every place listed, numbered as
-  `occurrence` counts, each with its block number and the 30 characters either side
-  (`markdown::quotes::pick`). It does not go with `block_index`.
+- **`occurrence`** (1, 2, ... or `"last"`) picks among the places a quote appears: every
+  place in the text, for a block as for `replace_text` (a quote twice in one block, as in
+  two items of one list, is two places; until 2026-11-24 a block counted once and such a
+  quote removed the whole list unasked). Overlapping places count too, each its own
+  occurrence: "aa" appears twice in "aaa", and either can be chosen. Without `occurrence`
+  a quote must appear exactly once; several are refused with every place listed, numbered
+  as `occurrence` counts, each with its block number and the 30 characters either side
+  (`markdown::quotes::pick`). The refusal advises only what the caller takes
+  (`markdown::Narrowing`): `occurrence` or `block_index` for `replace_block` and
+  `insert_after`, `occurrence` for `replace_text`, and quoting more for the tools that
+  take a quote alone (`after_text` of `create_table`, `move_table` and
+  `start_discussion`). It does not go with `block_index`.
 
 The parameters were renamed (`block` and `after` became `quote`), and the edit tools'
 parameters deny unknown fields, so a call with an old name is refused by name rather than
@@ -283,7 +298,22 @@ says what it would have removed ("It would have removed block 2 (...); to remove
 block give `block_index: 2`"), every block when the quote appears in several, and when
 the quote is a number of a block that exists, "If you meant block 13, give
 `block_index: 13`". Replacing by a short quote stays allowed: what was there comes back in
-the answer.
+the answer. The same refusal (`markdown::judge`, 2026-11-24) covers the other ways to
+delete by a name:
+
+- **A heading named for removal or emptying** (`remove_section`, and `replace_section` with
+  empty Markdown): headings match by part of their text, so `remove_section(heading: "3")`
+  would take out "Phase 3". A name (for a heading path, its last segment) that is short or
+  reads like a number is refused when it matches only part of the heading's text, saying
+  which heading and block it names and to give the heading's whole text or its block
+  number. A name that is the heading's whole text (as `find_heading` compares, ignoring
+  case and punctuation) is sure however short: a heading titled "3" is removed by "3", and
+  "Plan/3" removes the "3" under "Plan". Replacing a section with something stays allowed
+  by any name.
+- **Text deleted by `replace_text`** (an empty `text`) by a quote that is short or reads
+  like a number: refused with where it appears, and the sure way, which deletes exactly the
+  same: quote it with the words either side and give those words back without it (quote
+  "the 13 apples", text "the apples"); only what differs changes.
 
 ### What an edit says it did
 

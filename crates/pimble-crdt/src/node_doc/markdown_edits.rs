@@ -11,7 +11,7 @@ use super::split::data_keys_named;
 use super::NodeDoc;
 use crate::content_doc::{model_edit_delta, model_edit_steps, model_of};
 use crate::error::{CrdtError, Result};
-use crate::markdown::{self, BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit};
+use crate::markdown::{self, BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit, Quote};
 
 impl NodeDoc {
     // ── Content as Markdown (docs/MCP_CONTRACT.md) ───────────────────────
@@ -75,7 +75,9 @@ impl NodeDoc {
     }
 
     /// `md` after the top-level block `quote` names, or with `after_section`
-    /// after the section under the heading it names.
+    /// after the section under the heading it names. The quote must appear
+    /// exactly once: a caller of this offers nothing else to choose by, so a
+    /// refusal of one that appears several times asks for more of the text.
     pub fn insert_markdown_after(&mut self, quote: &str, after_section: bool, md: &str) -> Result<Vec<u8>> {
         let at = if after_section { InsertAt::Section(HeadingTarget::Name(quote)) } else { InsertAt::Block(BlockTarget::quote(quote)) };
         Ok(self.edit_markdown(MarkdownEdit::InsertAfter { at, markdown: md })?.0)
@@ -88,20 +90,25 @@ impl NodeDoc {
     }
 
     /// The one occurrence of `quote` in the content replaced by `text` (plain
-    /// text, taking the marks of the quote's first character).
+    /// text, taking the marks of the quote's first character). Deleting (an
+    /// empty `text`) by a short or number-like quote is refused; quote the
+    /// words either side and give them back instead.
     pub fn replace_text(&mut self, quote: &str, text: &str) -> Result<Vec<u8>> {
-        Ok(self.edit_markdown(MarkdownEdit::ReplaceText { quote, occurrence: None, text })?.0)
+        Ok(self.edit_markdown(MarkdownEdit::ReplaceText { quote: Quote::alone(quote), text })?.0)
     }
 
     /// The top-level block `quote` names replaced by `md`, or removed when `md`
     /// is empty (one heading removed or re-levelled, a paragraph made a list).
     /// Removing by a short or number-like quote is refused
-    /// (`markdown::MIN_DELETE_QUOTE`); name the block by its number instead.
+    /// (`markdown::MIN_DELETE_QUOTE`); name the block by its number instead
+    /// ([`NodeDoc::edit_markdown`] with `BlockTarget::index`).
     pub fn replace_block_markdown(&mut self, quote: &str, md: &str) -> Result<Vec<u8>> {
         Ok(self.edit_markdown(MarkdownEdit::ReplaceBlock { block: BlockTarget::quote(quote), markdown: md })?.0)
     }
 
-    /// The heading `heading` names and everything under it removed.
+    /// The heading `heading` names and everything under it removed. A short or
+    /// number-like name that matches only part of the heading's text is
+    /// refused; the heading's whole text is always sure.
     pub fn remove_section(&mut self, heading: &str) -> Result<Vec<u8>> {
         Ok(self.edit_markdown(MarkdownEdit::RemoveSection { heading: HeadingTarget::Name(heading) })?.0)
     }

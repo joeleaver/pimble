@@ -2,8 +2,9 @@
 //! (docs/MCP_CONTRACT.md "Naming what an edit touches", "What an edit says it
 //! did", "Dry runs"): a block named by its number, a number-like quote that
 //! removes nothing, an ambiguous quote refused with every place, `occurrence`,
-//! the echo in every answer, a dry run that writes nothing, and the old
-//! parameter names refused rather than read as something else.
+//! the echo in every answer, a dry run that writes nothing, the old parameter
+//! names refused rather than read as something else, `expect` on a block
+//! number, and a heading or text removed by too little of it refused.
 
 use std::sync::Arc;
 
@@ -30,16 +31,22 @@ async fn read(pimble: &Pimble) -> String {
 
 const NOTE: &str = "# Shopping\n\nApples for the pie.\n\nWe need 13 eggs for the cake.\n\nFlour, the strong kind.\n\nAsk about block 13 at the shop.";
 
-#[tokio::test]
-async fn edits_name_blocks_surely_and_say_what_they_took_out() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut server = PimbleServer::with_config(ServerConfig { ..ServerConfig::in_dir(dir.path()) });
+/// A server in `dir` with the store "Notes" holding the node "List" of `note`.
+async fn serve(dir: &std::path::Path, note: &str) -> (PimbleServer, Pimble) {
+    let mut server = PimbleServer::with_config(ServerConfig { ..ServerConfig::in_dir(dir) });
     server.start().await.expect("server starts");
     let url = format!("http://{}", server.addr());
     let service = PimbleClient::connect(&url).await.unwrap();
-    service.create_store(dir.path().join("notes.pimble"), "Notes").await.unwrap();
+    service.create_store(dir.join("notes.pimble"), "Notes").await.unwrap();
     let pimble = Pimble::new(Arc::new(Connection::with_client(PimbleClient::connect(&url).await.unwrap())));
-    pimble.create_node(p(json!({ "parent": "Notes", "title": "List", "markdown": NOTE }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Notes", "title": "List", "markdown": note }))).await.unwrap();
+    (server, pimble)
+}
+
+#[tokio::test]
+async fn edits_name_blocks_surely_and_say_what_they_took_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, pimble) = serve(dir.path(), NOTE).await;
 
     // The incident: "13" meant block 13. Now it removes nothing.
     let refused = pimble.replace_block(p(json!({ "node": "Notes/List", "quote": "13", "markdown": "" }))).await.unwrap_err();
@@ -70,7 +77,7 @@ async fn edits_name_blocks_surely_and_say_what_they_took_out() {
     // A quote in several places is refused with each; `occurrence` picks one.
     pimble.append(p(json!({ "node": "Notes/List", "markdown": "Flour, the strong kind." }))).await.unwrap();
     let ambiguous = pimble.replace_block(p(json!({ "node": "Notes/List", "quote": "Flour, the strong", "markdown": "Rye flour." }))).await.unwrap_err();
-    assert!(ambiguous.contains("appears in 2 blocks") && ambiguous.contains("(1) block 2") && ambiguous.contains("(2) block 4"), "{ambiguous}");
+    assert!(ambiguous.contains("appears 2 times") && ambiguous.contains("(1) block 2") && ambiguous.contains("(2) block 4"), "{ambiguous}");
     let picked = pimble.replace_block(p(json!({ "node": "Notes/List", "quote": "Flour, the strong", "occurrence": "last", "markdown": "Rye flour." }))).await.unwrap();
     assert!(picked.starts_with("Replaced block 4"), "{picked}");
     let text = pimble.replace_text(p(json!({ "node": "Notes/List", "quote": "strong", "occurrence": 1, "text": "white" }))).await.unwrap();
@@ -88,5 +95,33 @@ async fn edits_name_blocks_surely_and_say_what_they_took_out() {
     // A whole rewrite lists each changed stretch.
     let content = pimble.replace_content(p(json!({ "node": "Notes/List", "markdown": "# Shopping\n\nBring bags.\n\nApples for the pie." }))).await.unwrap();
     assert!(content.contains("changed stretch") && content.contains("was \"Flour, the white kind."), "{content}");
+    let _ = server.stop().await;
+}
+
+#[tokio::test]
+async fn a_block_number_is_checked_and_loose_names_remove_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, pimble) = serve(dir.path(), "# Plan\n\nintro\n\n## Phase 3\n\nbuild it\n\nWe need 13 eggs.").await;
+    // `expect` catches a number that names another block now.
+    let stale = pimble.replace_block(p(json!({ "node": "Notes/List", "block_index": 1, "expect": "build", "markdown": "" }))).await.unwrap_err();
+    assert!(stale.contains("block 1 does not contain \"build\"") && stale.contains("reads \"intro\""), "{stale}");
+    let with_quote = pimble.replace_block(p(json!({ "node": "Notes/List", "quote": "intro", "expect": "intro", "markdown": "x" }))).await.unwrap_err();
+    assert!(with_quote.contains("with `quote` leave it out"), "{with_quote}");
+    let with_heading = pimble.remove_section(p(json!({ "node": "Notes/List", "heading": "Plan", "expect": "Plan" }))).await.unwrap_err();
+    assert!(with_heading.contains("with `heading` leave it out"), "{with_heading}");
+    let heading = pimble.replace_section(p(json!({ "node": "Notes/List", "block_index": 2, "expect": "Phase", "markdown": "rebuilt", "dry_run": true }))).await.unwrap();
+    assert!(heading.starts_with("Dry run"), "{heading}");
+    // A heading named by a short part of its text is not removed or emptied.
+    let loose = pimble.remove_section(p(json!({ "node": "Notes/List", "heading": "3" }))).await.unwrap_err();
+    assert!(loose.contains("\"Phase 3\" (block 2)") && loose.contains("block number, 2"), "{loose}");
+    let empty = pimble.replace_section(p(json!({ "node": "Notes/List", "heading": "Phase", "markdown": "" }))).await.unwrap_err();
+    assert!(empty.contains("to empty that section"), "{empty}");
+    // Text deleted by a short quote: refused, and the words around it work.
+    let short = pimble.replace_text(p(json!({ "node": "Notes/List", "quote": "13 ", "text": "" }))).await.unwrap_err();
+    assert!(short.contains("Nothing was deleted") && short.contains("words either side"), "{short}");
+    pimble.replace_text(p(json!({ "node": "Notes/List", "quote": "need 13 eggs", "text": "need eggs" }))).await.unwrap();
+    pimble.remove_section(p(json!({ "node": "Notes/List", "block_index": 2, "expect": "Phase 3" }))).await.unwrap();
+    let left = read(&pimble).await;
+    assert!(left.trim_end().ends_with("---\n# Plan\n\nintro"), "{left}");
     let _ = server.stop().await;
 }
