@@ -124,6 +124,9 @@ pub(crate) enum TunnelState {
 struct Inner {
     face: Option<Face>,
     tunnel: Option<pimble_host::Task>,
+    /// What reports the face's writes for watches (`crate::relay_writes`),
+    /// while the face runs.
+    reporting: Option<pimble_host::Task>,
     /// The relayed stores open here: `true` once the tunnel announces them.
     stores: HashMap<StoreId, bool>,
 }
@@ -198,6 +201,8 @@ impl RelayHost {
         if inner.face.is_none() {
             let face = self.start_face(account, issuer).await?;
             *self.url.lock().unwrap() = Some(face.url.clone());
+            let writes = face.handler.writes().subscribe();
+            inner.reporting = Some(self.runtime.spawn(crate::relay_writes::run(handler.clone(), writes, self.serve.subscribe())));
             inner.face = Some(face);
         }
         let face = inner.face.as_ref().expect("started above");
@@ -398,6 +403,9 @@ impl RelayHost {
             task.abort();
         }
         self.set_tunnel_state(TunnelState::Idle);
+        if let Some(task) = inner.reporting.take() {
+            task.abort();
+        }
         inner.stores.clear();
         self.publish(inner);
         *self.url.lock().unwrap() = None;

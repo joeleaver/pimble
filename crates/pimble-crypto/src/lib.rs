@@ -530,6 +530,13 @@ pub fn personal_aad(user_id: &str) -> Vec<u8> {
     format!("pimble-personal/{user_id}").into_bytes()
 }
 
+/// The associated data the account's chosen watches are sealed with
+/// (docs/NOTIFICATIONS_CONTRACT.md section 3), under [`personal_key`]: apart
+/// from the personal document's, so neither blob opens as the other.
+pub fn watches_aad(user_id: &str) -> Vec<u8> {
+    format!("pimble-watches/{user_id}").into_bytes()
+}
+
 /// The associated data for a document's blobs.
 pub fn blob_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}").into_bytes()
@@ -869,6 +876,16 @@ mod tests {
         let blob = super::Blob::encrypt(&super::personal_key(&keys), uuid::Uuid::nil(), &aad, b"read state");
         assert_eq!(super::Blob::decrypt(&super::personal_key(&keys), &aad, &blob).unwrap(), b"read state");
         assert!(super::Blob::decrypt(&super::personal_key(&keys), &super::personal_aad("sub-2"), &blob).is_err());
+    }
+
+    #[test]
+    fn the_chosen_watches_do_not_open_as_the_personal_document() {
+        let keys = super::AccountKeys::generate();
+        let key = super::personal_key(&keys);
+        let blob = super::Blob::encrypt(&key, uuid::Uuid::nil(), &super::watches_aad("sub-1"), b"[]");
+        assert_eq!(super::Blob::decrypt(&key, &super::watches_aad("sub-1"), &blob).unwrap(), b"[]");
+        assert!(super::Blob::decrypt(&key, &super::personal_aad("sub-1"), &blob).is_err());
+        assert!(super::Blob::decrypt(&key, &super::watches_aad("sub-2"), &blob).is_err());
     }
 
     use super::*;

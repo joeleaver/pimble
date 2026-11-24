@@ -521,6 +521,7 @@ impl PimbleServer {
             handler.stop_notices();
             handler.stop_links().await;
             handler.relay().stop().await;
+            handler.stop_writes();
         }
 
         // Flush any pending tree/content changes before the handle stops, so

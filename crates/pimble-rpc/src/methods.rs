@@ -11,6 +11,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc_macros::pimble_api;
 
+use crate::notices::*;
 use crate::types::*;
 
 /// Pimble RPC API
@@ -402,22 +403,23 @@ pub trait PimbleApi {
 
     /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
     /// section 3, wave 3): kept with the signed-in account, so every device of
-    /// theirs watches it. `Service`-only, as are the two below.
+    /// theirs watches it, and registered as opaque document ids. Answers the
+    /// watches as they are now. `Service`-only, as are the two below.
     #[method(name = "watchNode", with_extensions)]
-    async fn watch_node(&self, request: WatchNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn watch_node(&self, request: WatchNodeRequest) -> Result<ListWatchesResponse, ErrorObjectOwned>;
 
-    /// Stop watching a node.
+    /// Stop watching a node (or the subtree watch that reaches it).
     #[method(name = "unwatchNode", with_extensions)]
-    async fn unwatch_node(&self, request: UnwatchNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn unwatch_node(&self, request: UnwatchNodeRequest) -> Result<ListWatchesResponse, ErrorObjectOwned>;
 
-    /// The watches the signed-in account chose.
+    /// The watches the signed-in account chose, and whether they are on.
     #[method(name = "listWatches", with_extensions)]
     async fn list_watches(&self) -> Result<ListWatchesResponse, ErrorObjectOwned>;
 
-    /// Hear the writes other accounts make to node documents on this server
-    /// (section 3): what the accounts service gathers watches from, on the
-    /// hosted server, and an owner's server from its relay face.
-    /// `Service`-only.
+    /// Hear the writes signed-in people make to node documents on this
+    /// server (section 3): what the accounts service gathers watches from on
+    /// the hosted server. (An owner's server hears its relay face's in its
+    /// own process.) `Service`-only.
     #[subscription(name = "subscribeWrites" => "writeSeen", unsubscribe = "unsubscribeWrites", item = WriteSeen, with_extensions)]
     async fn subscribe_writes(&self) -> SubscriptionResult;
 

@@ -43,12 +43,14 @@ mod presence;
 mod presence_link;
 pub mod principal;
 pub mod relay_face;
+mod relay_writes;
 #[cfg(not(target_arch = "wasm32"))]
 mod relay_tunnel;
 pub mod server;
 pub mod share;
 pub mod sync_link;
 pub mod vault_link;
+pub mod writes;
 
 /// What the core asks of the native-only modules, answered in a browser's
 /// worker: no diagnostics yet (section 6, item 10: the worker's own, on its

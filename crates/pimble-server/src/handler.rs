@@ -1300,6 +1300,8 @@ pub struct RpcHandler {
     app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<HandedLink>>>>,
     /// Notices sent and received (docs/NOTIFICATIONS_CONTRACT.md, `crate::notices`).
     notices: Arc<crate::notices::Notices>,
+    /// Writes signed-in people made here, for watches (`crate::writes`).
+    writes: Arc<crate::writes::Writes>,
     /// Which pictures each document names, per its state vector
     /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
     pictures: Arc<crate::pictures::PictureRefs>,
@@ -1429,6 +1431,7 @@ impl RpcHandler {
             relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), runtime.clone(), relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(disk.clone())),
             notices: Arc::new(crate::notices::Notices::new(crate::notices::Notices::beside(&replicas_dir))),
+            writes: Arc::new(crate::writes::Writes::new()),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -2142,6 +2145,26 @@ impl RpcHandler {
     /// This server's notices (`crate::notices`).
     pub(crate) fn notices(&self) -> Arc<crate::notices::Notices> {
         Arc::clone(&self.notices)
+    }
+
+    /// The writes signed-in people made here (`crate::writes`).
+    pub(crate) fn writes(&self) -> Arc<crate::writes::Writes> {
+        Arc::clone(&self.writes)
+    }
+
+    /// A signed-in person wrote `node_id`'s document: gathered for whoever
+    /// evaluates watches, when anybody does. The operator's own writes
+    /// (`Principal::Service`) are nobody's to tell apart.
+    fn note_write(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) {
+        let Principal::User { sub, .. } = principal else { return };
+        if self.writes.record(store_id, node_id, sub, crate::writes::now_ms()) {
+            self.writes.keep_telling(&self.runtime);
+        }
+    }
+
+    /// The server stops: the gathered writes are told now.
+    pub(crate) fn stop_writes(&self) {
+        self.writes.stop();
     }
 
     /// Start, or start again, receiving and sending notices for whoever is
@@ -3867,6 +3890,9 @@ impl PimbleApiServer for RpcHandler {
             manager.vault_extend_scope_blobs(request.store_id, &roots, node_id, blob).await.map_err(to_rpc_error)?;
         }
         drop(manager);
+        if let VaultDocId::Node(node_id) = request.doc_id {
+            self.note_write(&principal, request.store_id, node_id);
+        }
 
         // A picture is never announced: nobody holds one open, every reader
         // fetches it when a document names it, and a client from before
@@ -4296,7 +4322,56 @@ impl PimbleApiServer for RpcHandler {
             self.notices.set_on(self, on).await.map_err(to_rpc_error)?;
         }
         self.notices.set_channels(self, request.email, request.push).await.map_err(to_rpc_error)?;
+        if let Some(on) = request.watches {
+            self.notices.set_watches_on(self, on).await.map_err(to_rpc_error)?;
+        }
         Ok(EmptyResponse {})
+    }
+
+    async fn watch_node(&self, ext: &Extensions, request: pimble_rpc::WatchNodeRequest) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "watchNode")?;
+        let entry = pimble_rpc::WatchEntry { store_id: request.store_id, node_id: request.node_id, subtree: request.subtree };
+        self.notices.watch(self, entry).await.map_err(to_rpc_error)
+    }
+
+    async fn unwatch_node(&self, ext: &Extensions, request: pimble_rpc::UnwatchNodeRequest) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "unwatchNode")?;
+        self.notices.unwatch(self, request.store_id, request.node_id).await.map_err(to_rpc_error)
+    }
+
+    async fn list_watches(&self, ext: &Extensions) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listWatches")?;
+        Ok(self.notices.list_watches(self).await)
+    }
+
+    async fn subscribe_writes(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeWrites") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let mut writes = self.writes.subscribe();
+        self.runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    seen = writes.recv() => match seen {
+                        Ok(seen) => {
+                            let Ok(msg) = SubscriptionMessage::from_json(&seen) else { break };
+                            if sink.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("subscribeWrites: {} writes were not told (the listener fell behind)", n);
+                            continue;
+                        }
+                        Err(_) => break,
+                    },
+                    _ = sink.closed() => break,
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn register_push(&self, ext: &Extensions, request: pimble_rpc::RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
@@ -6313,6 +6388,9 @@ impl PimbleApiServer for RpcHandler {
             if effect.changed {
                 self.notice_write(request.store_id, request.node_id, before);
             }
+        }
+        if effect.changed {
+            self.note_write(&principal, request.store_id, request.node_id);
         }
 
         Ok(ApplyEditResponse {})

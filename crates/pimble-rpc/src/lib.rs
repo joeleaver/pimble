@@ -8,12 +8,14 @@
 pub mod dispatch;
 pub mod error;
 pub mod methods;
+pub mod notices;
 pub mod types;
 pub mod vault;
 pub mod vault_cursor;
 
 pub use error::*;
 pub use methods::*;
+pub use notices::*;
 pub use types::*;
 pub use vault_cursor::VaultCursor;
 

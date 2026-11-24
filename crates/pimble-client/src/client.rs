@@ -1157,14 +1157,14 @@ impl PimbleClient {
 
     /// Turn notifications on or off for the signed-in account.
     pub async fn set_notifications(&self, on: bool) -> Result<()> {
-        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: Some(on), email: None, push: None }).await.map_err(rpc_error)?;
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: Some(on), ..Default::default() }).await.map_err(rpc_error)?;
         Ok(())
     }
 
     /// Turn one channel (wave 2: email, web push) on or off, the rest as
     /// they are.
     pub async fn set_notification_channels(&self, email: Option<bool>, push: Option<bool>) -> Result<()> {
-        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: None, email, push }).await.map_err(rpc_error)?;
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { email, push, ..Default::default() }).await.map_err(rpc_error)?;
         Ok(())
     }
 
@@ -1188,25 +1188,30 @@ impl PimbleClient {
             .map_err(rpc_error)
     }
 
+    /// Turn watched notes (wave 3) on or off; off deletes every watch.
+    pub async fn set_watches_on(&self, on: bool) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { watches: Some(on), ..Default::default() }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
     /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
-    /// section 3).
-    pub async fn watch_node(&self, store_id: StoreId, node_id: NodeId, subtree: bool) -> Result<()> {
-        self.client.watch_node(pimble_rpc::WatchNodeRequest { store_id, node_id, subtree }).await.map_err(rpc_error)?;
-        Ok(())
+    /// section 3); answers the account's watches as they are now.
+    pub async fn watch_node(&self, store_id: StoreId, node_id: NodeId, subtree: bool) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.watch_node(pimble_rpc::WatchNodeRequest { store_id, node_id, subtree }).await.map_err(rpc_error)
     }
 
-    /// Stop watching a node.
-    pub async fn unwatch_node(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
-        self.client.unwatch_node(pimble_rpc::UnwatchNodeRequest { store_id, node_id }).await.map_err(rpc_error)?;
-        Ok(())
+    /// Stop watching a node, or the subtree watch that reaches it.
+    pub async fn unwatch_node(&self, store_id: StoreId, node_id: NodeId) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.unwatch_node(pimble_rpc::UnwatchNodeRequest { store_id, node_id }).await.map_err(rpc_error)
     }
 
-    /// The watches the signed-in account chose.
-    pub async fn list_watches(&self) -> Result<Vec<pimble_rpc::WatchEntry>> {
-        Ok(self.client.list_watches().await.map_err(rpc_error)?.watches)
+    /// The watches the signed-in account chose, and whether they are on.
+    pub async fn list_watches(&self) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.list_watches().await.map_err(rpc_error)
     }
 
-    /// Hear the writes other accounts make on this server (`Service`-only).
+    /// Hear the writes signed-in people make on this server (`Service`-only):
+    /// what the accounts service gathers watches from.
     pub async fn subscribe_writes(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::WriteSeen>> {
         self.client
             .subscribe::<pimble_rpc::WriteSeen, _>("pimble_subscribeWrites", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeWrites")
