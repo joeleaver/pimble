@@ -74,7 +74,7 @@ impl ClientApp {
     fn add_hint(self) -> &'static str {
         match self {
             ClientApp::Claude => {
-                "Claude keeps one Pimble agent: this replaces any Pimble agent already in Claude, and an agent it replaces that no other app here uses is removed from Pimble."
+                "Claude keeps one Pimble agent: this replaces any Pimble entry already in Claude's settings, and an agent it replaces that no other app here uses is removed from Pimble."
             }
             _ => "This replaces an entry of the same name in its settings.",
         }
@@ -194,7 +194,9 @@ pub(crate) fn created(store: AppStore, agent: &AgentInfo, key: &str) {
 pub(crate) fn failed(store: AppStore, message: &str) {
     let ui = store.agents_ui;
     ui.busy.set(false);
-    ui.removing.set(BTreeSet::new());
+    // `removing` is left as it is: an agent whose removal failed is still
+    // listed, so `listed` never takes its entries out, and another removal
+    // waiting for its answer still gets its entries taken out.
     ui.error.set(message.to_string());
 }
 
@@ -320,25 +322,17 @@ fn set_up(store: AppStore) {
     let (Some(at), Ok(id)) = (setup::Locations::here(), Uuid::parse_str(&agent.id)) else { return };
     let (name, mcp) = (client_config::entry_name(&agent.name), mcp_path());
     let added = setup::add(&at, app, NewEntry { name: &name, command: &mcp, key: &key, stdio_type: false }, id);
-    let still = setup::holders(&at);
-    let names = untracked(|| ui.agents.get());
-    let name_of = |id: &Uuid| names.iter().find(|a| Uuid::parse_str(&a.id).ok() == Some(*id)).map(|a| a.name.clone());
-    let (mut removed, mut kept) = (Vec::new(), Vec::new());
-    for old in &added.replaced {
-        // Only this device's own agents: a key from elsewhere names nobody here.
-        let Some(old_name) = name_of(old) else { continue };
-        if still.contains_key(old) {
-            kept.push(old_name);
-        } else {
-            removed.push(old_name);
-            ui.removing.update(|r| {
-                r.insert(*old);
-            });
-            store.send(BackendCommand::RemoveAgent { id: old.to_string() });
-        }
+    let held = setup::holders(&at);
+    let agents: Vec<(Uuid, String)> = untracked(|| ui.agents.get()).into_iter().filter_map(|a| Uuid::parse_str(&a.id).ok().map(|id| (id, a.name))).collect();
+    let settled = setup::settle(app, &added, &held, &agents);
+    for old in &settled.remove {
+        ui.removing.update(|r| {
+            r.insert(*old);
+        });
+        store.send(BackendCommand::RemoveAgent { id: old.to_string() });
     }
-    ui.placed.set(still);
-    ui.setup.set(setup::added_sentence(app, &added, &removed, &kept));
+    ui.placed.set(held.by_agent);
+    ui.setup.set(setup::added_sentence(app, &added, &settled));
 }
 
 #[cfg(not(feature = "native"))]
@@ -347,7 +341,7 @@ fn set_up(_store: AppStore) {}
 /// Which apps each agent is set up in.
 #[cfg(feature = "native")]
 fn placements() -> HashMap<Uuid, Vec<ClientApp>> {
-    setup::Locations::here().map(|at| setup::holders(&at)).unwrap_or_default()
+    setup::Locations::here().map(|at| setup::holders(&at).by_agent).unwrap_or_default()
 }
 
 #[cfg(not(feature = "native"))]

@@ -115,8 +115,16 @@ pub struct Added {
     pub written: Vec<ConfigFile>,
     /// A sentence per file that could not be written.
     pub failed: Vec<String>,
+    /// The entries it took out that were not the added agent's own, by name,
+    /// with the agent each one's key names (none for an entry without one).
+    pub dropped: Vec<(String, Option<Uuid>)>,
+}
+
+impl Added {
     /// The agents, other than the one added, whose entries it replaced.
-    pub replaced: BTreeSet<Uuid>,
+    pub fn replaced(&self) -> BTreeSet<Uuid> {
+        self.dropped.iter().filter_map(|(_, id)| *id).collect()
+    }
 }
 
 /// Add agent `agent` (its entry `entry`) to `app`. For Claude, every Pimble
@@ -136,7 +144,12 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
         match client_config::apply(&at.path(file), file.format(), &change) {
             Ok(changed) => {
                 added.written.push(file);
-                added.replaced.extend(changed.dropped.iter().filter_map(|(_, e)| e.agent()).filter(|id| *id != agent));
+                for (name, e) in changed.dropped {
+                    let id = e.agent();
+                    if id != Some(agent) && !added.dropped.iter().any(|(n, i)| *n == name && *i == id) {
+                        added.dropped.push((name, id));
+                    }
+                }
             }
             Err(e) => added.failed.push(e),
         }
@@ -166,18 +179,73 @@ pub fn forget(at: &Locations, agent: Uuid) -> Forgotten {
     out
 }
 
-/// Which apps each agent is set up in, read from every file Pimble knows (a
-/// file it cannot read counts as holding nothing).
-pub fn holders(at: &Locations) -> HashMap<Uuid, Vec<ClientApp>> {
-    let mut out: HashMap<Uuid, Vec<ClientApp>> = HashMap::new();
+/// Which apps each agent is set up in, read from every file Pimble knows.
+#[derive(Debug, Default)]
+pub struct Holders {
+    pub by_agent: HashMap<Uuid, Vec<ClientApp>>,
+    /// Some file could not be read, so any agent may be in it.
+    pub unreadable: bool,
+}
+
+pub fn holders(at: &Locations) -> Holders {
+    let mut out = Holders::default();
     for file in ConfigFile::ALL {
-        for (_, entry) in client_config::read_entries(&at.path(file), file.format()).unwrap_or_default() {
+        let Ok(entries) = client_config::read_entries(&at.path(file), file.format()) else {
+            out.unreadable = true;
+            continue;
+        };
+        for (_, entry) in entries {
             if let (true, Some(id)) = (entry.runs_pimble(), entry.agent()) {
-                let apps = out.entry(id).or_default();
+                let apps = out.by_agent.entry(id).or_default();
                 if !apps.contains(&file.app()) {
                     apps.push(file.app());
                 }
             }
+        }
+    }
+    out
+}
+
+/// What becomes of the agents an "Add" replaced.
+#[derive(Debug, Default, PartialEq)]
+pub struct Settled {
+    /// To remove from Pimble: in no file Pimble knows any more.
+    pub remove: Vec<Uuid>,
+    /// Their names, to say so.
+    pub removed: Vec<String>,
+    /// Replaced but kept: still set up in another app, or a file could not
+    /// be read or written, so Pimble cannot tell.
+    pub kept: Vec<String>,
+    /// Pimble entries taken out that name no agent of this computer.
+    pub others: Vec<String>,
+}
+
+/// Decide what becomes of the agents adding to `app` replaced, given who
+/// still holds what and this computer's agents (id and name). Only Claude
+/// removes them: it keeps one Pimble agent, so the ones it replaced were
+/// Claude's. The other apps replace an entry of the same name and remove
+/// nobody, as before. Nothing is removed when a file failed or could not be
+/// read, since a replaced agent may still be set up there.
+pub fn settle(app: ClientApp, added: &Added, held: &Holders, agents: &[(Uuid, String)]) -> Settled {
+    let mut out = Settled::default();
+    if app != ClientApp::Claude {
+        return out;
+    }
+    let unsure = held.unreadable || !added.failed.is_empty();
+    let mut seen = BTreeSet::new();
+    for (entry, id) in &added.dropped {
+        let Some((id, name)) = id.and_then(|id| agents.iter().find(|(a, _)| *a == id)) else {
+            out.others.push(entry.clone());
+            continue;
+        };
+        if !seen.insert(*id) {
+            continue;
+        }
+        if unsure || held.by_agent.contains_key(id) {
+            out.kept.push(name.clone());
+        } else {
+            out.remove.push(*id);
+            out.removed.push(name.clone());
         }
     }
     out
@@ -202,10 +270,9 @@ pub fn placed_line(apps: Option<&Vec<ClientApp>>) -> String {
     }
 }
 
-/// What "Add to Claude" did, in sentences: where it went, how to connect it,
-/// what it replaced. `removed` and `kept` name the replaced agents Pimble
-/// removed and the ones another app still uses.
-pub fn added_sentence(app: ClientApp, added: &Added, removed: &[String], kept: &[String]) -> String {
+/// What "Add to <app>" did, in sentences: where it went, how to connect it,
+/// what it replaced.
+pub fn added_sentence(app: ClientApp, added: &Added, settled: &Settled) -> String {
     let mut out = Vec::new();
     let wrote = |f| added.written.contains(&f);
     if app == ClientApp::Claude {
@@ -231,11 +298,17 @@ pub fn added_sentence(app: ClientApp, added: &Added, removed: &[String], kept: &
     } else if !added.written.is_empty() {
         out.push(format!("Added to {}. Quit {} and open it again to connect it.", app.name(), app.name()));
     }
-    if !removed.is_empty() {
-        out.push(format!("It replaces {}, removed from Pimble.", quoted(removed)));
+    if !settled.removed.is_empty() {
+        out.push(format!("It replaces {}, removed from Pimble.", quoted(&settled.removed)));
     }
-    if !kept.is_empty() {
-        out.push(format!("It replaces {} in {}; still set up in another app, so kept.", quoted(kept), app.name()));
+    if !settled.kept.is_empty() {
+        out.push(format!("It replaces {} in {}; kept in Pimble, as another app may still use it.", quoted(&settled.kept), app.name()));
+    }
+    if !settled.others.is_empty() {
+        out.push(format!(
+            "It also took out {}, Pimble's for no agent on this computer (the old file is kept beside it as .pimble-backup).",
+            quoted(&settled.others)
+        ));
     }
     for e in &added.failed {
         out.push(format!("{e}. Copy the setup below into {} instead.", app.name()));

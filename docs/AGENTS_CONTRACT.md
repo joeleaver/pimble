@@ -165,13 +165,22 @@ an entry of the same name.
 **Replaced agents are removed.** A key names its agent (`pmbl_agent_<id>_...`,
 `pimble_rpc::agent_id_of_key`), so Pimble knows whose entries an "Add" replaced. Each of
 this device's agents whose entry was replaced and that no file in this section still holds
-is removed from Pimble (its key revoked); one still set up in another app is kept. The
+is removed from Pimble (its key revoked); one still set up in another app is kept, and so
+is every one when a file could not be read or written (it may still be there). A Pimble
+entry whose key names no agent on this computer is taken out too, and named. Only Claude
+removes agents: the other apps replace an entry of the same name and leave its agent. The
 page says so under "Add to Claude" before it is pressed, and names them after.
 
 **Removing an agent takes its entries out of every file in this section**, the same way
 (backup, rename), once the server's list says it is gone; the page says which apps' settings
 changed. The list shows under each agent the apps it is set up in, or that it is in no app
-Pimble knows here (an agent left over from by-hand setups, to remove).
+Pimble knows here (an agent left over from by-hand setups, to remove). Pimble reads and writes
+only `~/.claude.json`'s user-scope `mcpServers`: an entry added by hand in a project's scope
+(`claude mcp add` without `--scope user`) is the person's to manage. Claude and its apps
+rewrite these files themselves; an edit of theirs landing between Pimble's read and its
+rename would be lost (not seen; the window is a few milliseconds). Files keep their
+permissions, and adding the same entry again rewrites nothing, so `.pimble-backup` keeps the
+file as it was before Pimble's last real change.
 
 ## 7. Waves
 

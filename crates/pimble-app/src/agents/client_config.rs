@@ -133,13 +133,22 @@ pub fn apply(path: &Path, format: Format, change: &Change) -> Result<Changed, St
         Format::Json => change_json(path, text.as_deref(), change)?,
         Format::Toml => change_toml(path, text.as_deref(), change)?,
     };
-    if dropped.is_empty() && change.add.is_none() {
+    // Nothing changed (the same entry added again): the file, and the backup
+    // of what it was before Pimble's last real change, stay as they are.
+    if (dropped.is_empty() && change.add.is_none()) || text.as_deref() == Some(new_text.as_str()) {
         return Ok(Changed { dropped, written: false });
     }
+    // Agent keys sit in these files: the new file and the backup keep the
+    // old file's permissions (a 0600 file stays 0600).
+    let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
     if let Some(old) = &text {
-        std::fs::write(backup_path(path), old).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
+        let backup = backup_path(path);
+        std::fs::write(&backup, old).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
+        if let Some(p) = &permissions {
+            std::fs::set_permissions(&backup, p.clone()).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
+        }
     }
-    write_replacing(path, &new_text)?;
+    write_replacing(path, &new_text, permissions)?;
     Ok(Changed { dropped, written: true })
 }
 
@@ -234,12 +243,15 @@ fn parse_toml(path: &Path, text: &str) -> Result<toml_edit::Document, String> {
     text.parse().map_err(|_| format!("{} is not TOML Pimble can read, so it was left alone", path.display()))
 }
 
-fn write_replacing(path: &Path, text: &str) -> Result<(), String> {
+fn write_replacing(path: &Path, text: &str, permissions: Option<std::fs::Permissions>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("pimble-tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+    if let Some(p) = permissions {
+        std::fs::set_permissions(&tmp, p).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
@@ -307,6 +319,33 @@ mod tests {
         let none = |_: &str, _: &Entry| false;
         let changed = apply(&path, Format::Json, &Change { drop: &none, add: None }).unwrap();
         assert!(!changed.written && !backup_path(&path).exists(), "nothing to change, nothing written");
+    }
+
+    #[test]
+    fn adding_the_same_entry_again_keeps_the_file_and_its_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, r#"{"mine":1}"#).unwrap();
+        let drop = by_name("pimble-x");
+        let change = Change { drop: &drop, add: Some(new("pimble-x", "k", false)) };
+        assert!(apply(&path, Format::Json, &change).unwrap().written);
+        let again = apply(&path, Format::Json, &change).unwrap();
+        assert!(!again.written, "nothing changed");
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), r#"{"mine":1}"#, "the backup still holds the person's own file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let drop = by_name("pimble-x");
+        apply(&path, Format::Json, &Change { drop: &drop, add: Some(new("pimble-x", "k", false)) }).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(backup_path(&path)).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

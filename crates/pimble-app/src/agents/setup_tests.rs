@@ -44,7 +44,7 @@ fn claude_is_one_entry_written_alike_to_both_files() {
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
     assert!(added.failed.is_empty(), "{:?}", added.failed);
     assert_eq!(added.written, vec![ConfigFile::ClaudeApp, ConfigFile::ClaudeCli]);
-    assert!(added.replaced.is_empty());
+    assert!(added.replaced().is_empty());
 
     let app = servers(&at, ConfigFile::ClaudeApp);
     let cli = servers(&at, ConfigFile::ClaudeCli);
@@ -57,7 +57,7 @@ fn claude_is_one_entry_written_alike_to_both_files() {
     let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeCli)).unwrap();
     assert!(text.contains("numStartups"), "the rest of ~/.claude.json stays");
 
-    assert_eq!(holders(&at).get(&id), Some(&vec![ClientApp::Claude]), "one app, not two");
+    assert_eq!(holders(&at).by_agent.get(&id), Some(&vec![ClientApp::Claude]), "one app, not two");
 }
 
 #[test]
@@ -87,13 +87,13 @@ fn the_old_split_entries_are_replaced_and_their_agents_reported() {
     let id = Uuid::new_v4();
     let k = key(id);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
-    assert_eq!(added.replaced, [desktop, code].into_iter().collect());
+    assert_eq!(added.replaced(), [desktop, code].into_iter().collect());
     let app = servers(&at, ConfigFile::ClaudeApp);
     let cli = servers(&at, ConfigFile::ClaudeCli);
     assert_eq!(app.keys().filter(|n| n.starts_with("pimble")).collect::<Vec<_>>(), vec!["pimble-claude"]);
     assert!(app.contains_key("postrinch-claude-desktop"), "another app's server stays");
     assert_eq!(cli.keys().collect::<Vec<_>>(), vec!["pimble-claude"]);
-    let held = holders(&at);
+    let held = holders(&at).by_agent;
     assert!(!held.contains_key(&desktop) && !held.contains_key(&code));
 }
 
@@ -109,7 +109,7 @@ fn a_hand_made_pair_under_an_old_name_is_replaced_too() {
     let id = Uuid::new_v4();
     let k = key(id);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
-    assert_eq!(added.replaced, [desktop].into_iter().collect());
+    assert_eq!(added.replaced(), [desktop].into_iter().collect());
     for file in [ConfigFile::ClaudeApp, ConfigFile::ClaudeCli] {
         assert_eq!(servers(&at, file).keys().collect::<Vec<_>>(), vec!["pimble-claude"], "{file:?}");
     }
@@ -123,12 +123,12 @@ fn adding_again_leaves_one_entry_and_replaces_the_stale_one() {
     add(&at, ClientApp::Claude, entry("pimble-claude", &k1), first);
     // Added again under the same name with the same key: nothing replaced.
     let again = add(&at, ClientApp::Claude, entry("pimble-claude", &k1), first);
-    assert!(again.replaced.is_empty());
+    assert!(again.replaced().is_empty());
 
     let second = Uuid::new_v4();
     let k2 = key(second);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k2), second);
-    assert_eq!(added.replaced, [first].into_iter().collect(), "the stale entry's agent");
+    assert_eq!(added.replaced(), [first].into_iter().collect(), "the stale entry's agent");
     for file in [ConfigFile::ClaudeApp, ConfigFile::ClaudeCli] {
         let s = servers(&at, file);
         assert_eq!(s.len(), 1);
@@ -145,12 +145,12 @@ fn removing_an_agent_takes_it_out_of_every_app() {
     add(&at, ClientApp::Cursor, entry("pimble-cursor", &kg), gone);
     add(&at, ClientApp::ChatGpt, entry("pimble-chatgpt", &ks), stays);
     add(&at, ClientApp::Cursor, entry("pimble-other", &ks), stays);
-    assert_eq!(holders(&at)[&gone].len(), 2);
+    assert_eq!(holders(&at).by_agent[&gone].len(), 2);
 
     let out = forget(&at, gone);
     assert!(out.failed.is_empty(), "{:?}", out.failed);
     assert_eq!(out.changed, vec![ConfigFile::ClaudeApp, ConfigFile::ClaudeCli, ConfigFile::Cursor]);
-    let held = holders(&at);
+    let held = holders(&at).by_agent;
     assert!(!held.contains_key(&gone));
     assert_eq!(held[&stays], vec![ClientApp::ChatGpt, ClientApp::Cursor], "another agent's entries stay");
     assert!(servers(&at, ConfigFile::ClaudeApp).is_empty());
@@ -167,7 +167,7 @@ fn other_apps_replace_only_an_entry_of_the_same_name() {
     add(&at, ClientApp::Cursor, entry("pimble-work", &ka), a);
     add(&at, ClientApp::Cursor, entry("pimble-home", &kb), b);
     let added = add(&at, ClientApp::Cursor, entry("pimble-work", &kc), c);
-    assert_eq!(added.replaced, [a].into_iter().collect());
+    assert_eq!(added.replaced(), [a].into_iter().collect());
     let s = servers(&at, ConfigFile::Cursor);
     assert_eq!(s.len(), 2);
     assert_eq!(s["pimble-home"]["env"]["PIMBLE_AGENT_KEY"], kb.as_str());
@@ -176,9 +176,81 @@ fn other_apps_replace_only_an_entry_of_the_same_name() {
 #[test]
 fn sentences_say_where_it_went_and_what_it_replaced() {
     let added = Added { written: vec![ConfigFile::ClaudeApp, ConfigFile::ClaudeCli], ..Added::default() };
-    let s = added_sentence(ClientApp::Claude, &added, &["Claude Desktop".into(), "Claude Code".into()], &[]);
+    let settled = Settled { removed: vec!["Claude Desktop".into(), "Claude Code".into()], ..Settled::default() };
+    let s = added_sentence(ClientApp::Claude, &added, &settled);
     assert!(s.starts_with("Added to Claude: the Chat and Code tabs"), "{s}");
     assert!(s.contains("It replaces “Claude Desktop” and “Claude Code”, removed from Pimble."), "{s}");
     assert_eq!(app_list(&[ClientApp::Claude, ClientApp::Cursor, ClientApp::ChatGpt]), "Claude, Cursor and ChatGPT / Codex");
     assert_eq!(placed_line(None), "Not in the settings of any app Pimble knows here");
+}
+
+#[test]
+fn replaced_claude_agents_are_removed_unless_still_used_or_unsure() {
+    let (_dir, at) = computer();
+    let (desktop, code, foreign) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    write(&at, ConfigFile::ClaudeApp, serde_json::json!({ "mcpServers": { "pimble-claude-desktop": pimble(&key(desktop)), "pimble-dev": pimble(&key(foreign)) } }));
+    write(&at, ConfigFile::ClaudeCli, serde_json::json!({ "mcpServers": { "pimble-claude-code": pimble(&key(code)) } }));
+    // The old Claude Code agent's key is in Cursor too.
+    write(&at, ConfigFile::Cursor, serde_json::json!({ "mcpServers": { "pimble-cursor": pimble(&key(code)) } }));
+    let agents = vec![(desktop, "Claude Desktop".to_string()), (code, "Claude Code".to_string())];
+
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    let settled = settle(ClientApp::Claude, &added, &holders(&at), &agents);
+    assert_eq!(settled.remove, vec![desktop]);
+    assert_eq!(settled.removed, vec!["Claude Desktop".to_string()]);
+    assert_eq!(settled.kept, vec!["Claude Code".to_string()], "still in Cursor");
+    assert_eq!(settled.others, vec!["pimble-dev".to_string()], "named, not silently gone");
+
+    // A file that could not be read might hold any of them: nobody is removed.
+    let unsure = Holders { unreadable: true, ..Holders::default() };
+    let settled = settle(ClientApp::Claude, &added, &unsure, &agents);
+    assert!(settled.remove.is_empty());
+    assert_eq!(settled.kept.len(), 2);
+}
+
+#[test]
+fn one_claude_file_failing_removes_nobody() {
+    let (_dir, at) = computer();
+    let old = Uuid::new_v4();
+    let pair = serde_json::json!({ "mcpServers": { "pimble-claude-desktop": pimble(&key(old)) } });
+    write(&at, ConfigFile::ClaudeApp, pair);
+    std::fs::write(at.path(ConfigFile::ClaudeCli), "{ half written").unwrap();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert_eq!(added.written, vec![ConfigFile::ClaudeApp]);
+    assert_eq!(added.failed.len(), 1);
+    let held = holders(&at);
+    assert!(held.unreadable);
+    let settled = settle(ClientApp::Claude, &added, &held, &[(old, "Claude Desktop".into())]);
+    assert!(settled.remove.is_empty(), "it may still be in the file that failed");
+    assert_eq!(std::fs::read_to_string(at.path(ConfigFile::ClaudeCli)).unwrap(), "{ half written", "left alone");
+}
+
+#[test]
+fn other_apps_remove_no_agent_they_replace() {
+    let (_dir, at) = computer();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let (ka, kb) = (key(a), key(b));
+    add(&at, ClientApp::Cursor, entry("pimble-cursor", &ka), a);
+    let added = add(&at, ClientApp::Cursor, entry("pimble-cursor", &kb), b);
+    assert_eq!(added.replaced(), [a].into_iter().collect());
+    let settled = settle(ClientApp::Cursor, &added, &holders(&at), &[(a, "Cursor".into())]);
+    assert_eq!(settled, Settled::default(), "as before: the old agent stays");
+}
+
+#[test]
+fn removing_takes_an_agent_out_of_codex_too() {
+    let (_dir, at) = computer();
+    std::fs::create_dir_all(&at.codex).unwrap();
+    std::fs::write(at.path(ConfigFile::Codex), "# mine\n[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    add(&at, ClientApp::ChatGpt, entry("pimble-chatgpt", &k), id);
+    assert_eq!(holders(&at).by_agent[&id], vec![ClientApp::ChatGpt]);
+    assert_eq!(forget(&at, id).changed, vec![ConfigFile::Codex]);
+    let text = std::fs::read_to_string(at.path(ConfigFile::Codex)).unwrap();
+    assert!(!text.contains("pimble-chatgpt") && text.contains("# mine") && text.contains("[mcp_servers.other]"), "{text}");
 }
