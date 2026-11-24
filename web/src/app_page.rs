@@ -88,7 +88,7 @@ pub fn start() {
         // stamps carry instead of the email's local part.
         store.send(pimble_app::protocol::BackendCommand::CloudListShares);
         if let Some(link) = take_open_link() {
-            pimble_app::links::set_launch_link(link);
+            pimble_app::app_links::set_launch_link(link);
         }
         pimble_app::diagnostics_ui::notice_once(store);
         pimble_app::inbox::browser_push::hear_clicks(store);

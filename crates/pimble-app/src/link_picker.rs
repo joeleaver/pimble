@@ -7,7 +7,7 @@ use pimble_core::{NodeId, PimbleUrl, StoreId};
 use pimble_rpc::SearchResultItem;
 use rinch_editor_core::{AttrValue, Attrs, Fragment, Mark};
 
-use crate::links::web_url;
+use crate::web_links::web_url;
 use crate::rinch_editor::EditorHandle;
 
 /// How many notes the picker lists.

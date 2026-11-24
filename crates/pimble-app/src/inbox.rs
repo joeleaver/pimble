@@ -130,7 +130,24 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
     if untracked(|| is_read(store, &notice)) {
         return;
     }
-    show_system_notification(store, &notice);
+    if notifies_here() {
+        show_system_notification(store, &notice);
+    }
+}
+
+/// Whether this process shows the system's notifications: on the desktop
+/// only the window process that owns the tray (`crate::instance`), so two
+/// windows never notify twice; a browser tab always (the browser itself
+/// files them per site). Every window keeps the notice in its Inbox all the
+/// same.
+#[cfg(feature = "native")]
+fn notifies_here() -> bool {
+    crate::instance::is_primary()
+}
+
+#[cfg(not(feature = "native"))]
+fn notifies_here() -> bool {
+    true
 }
 
 /// Open a notice: where it points, read everywhere, acknowledged.
@@ -196,7 +213,7 @@ fn show_system_notification(store: AppStore, notice: &Notice) {
         .body(body_of(store, notice))
         .icon_png(include_bytes!("../../../assets/brand/png/pimble-256.png"))
         .on_click(move || {
-            crate::app::bring_to_front(None);
+            crate::desktop::bring_to_front(None);
             open(store, &clicked);
         })
         .on_error(|e| tracing::info!("A notice was not shown by the system: {e:?}"))

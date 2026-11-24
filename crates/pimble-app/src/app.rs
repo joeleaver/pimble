@@ -5075,7 +5075,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // own doc comment says to wire.
                 on_minimize: || minimize_current_window(),
                 on_maximize: || toggle_maximize_current_window(),
-                on_close: || close_window(),
+                on_close: || crate::desktop::close_window(),
 
                 style { {APP_CSS} }
                 style { {pimble_ui::STYLES} }
@@ -5144,107 +5144,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     (store, app_component)
 }
 
-/// A link from outside reached this window: show it and bring it to the
-/// front. On Wayland a window may only take the focus with the activation
-/// token the click that started `pimble <link>` gave it (rinch #2880), which
-/// that program handed over with the link; without one (X11, Windows, a
-/// launch with none) the window asks for the focus itself.
-#[cfg(feature = "native")]
-pub(crate) fn bring_to_front(activation_token: Option<&str>) {
-    show_current_window();
-    match activation_token {
-        Some(token) => activate_current_window_with_token(token),
-        None => focus_current_window(),
-    }
-}
-
-/// Open the desktop window: the same UI [`build_view`] builds, wrapped in a
-/// native menu bar, the borderless window and the saved theme. `renderer` is
-/// the GPU with a fall back to software unless the command line chose
-/// (`pimble --cpu`); `RINCH_RENDERER` overrides either. `activation_token`
-/// is the one this program was started with, if any, which the first window
-/// takes the focus with (rinch #2880).
-#[cfg(feature = "native")]
-pub fn run(renderer: Renderer, activation_token: Option<String>) {
-    use std::sync::Arc;
-
-    // The zoom this device saved, before the window is made, so the first
-    // frame is drawn at it; and the zoom keys the menu's chords do not cover
-    // (docs/ZOOM_CONTRACT.md).
-    crate::zoom::restore();
-    let (store, app_component) = build_view();
-    crate::zoom::listen(store);
-    crate::update::start(store);
-    crate::diagnostics_ui::notice_once(store);
-
-    // One spec, two shells: `crates/pimble-app/src/menus.rs` says what the
-    // menus hold and which target each item belongs on, so the browser's menu
-    // bar cannot drift from this one.
-    let menus = crate::menus::build_menus(store);
-
-    // Theme
-    let theme = theme_props(untracked(|| store.dark_mode.get()));
-
-    // Save-on-close (an OS close; the app's own close button and File >
-    // Exit go through `close_window`): register a thread-local that the close callback invokes.
-    // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
-    // so we use the same thread-local pattern as EVENT_PROCESSOR.
-    thread_local! {
-        static CLOSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
-    }
-    CLOSE_HANDLER.with(|cell| {
-        *cell.borrow_mut() = Some(Box::new(move || {
-            // Edits persist live through the collab relay. What this device
-            // remembers of how things looked is written now, with every
-            // pane's place and board camera as they are.
-            remember_views(Some(store));
-        }));
-    });
-    let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
-        CLOSE_HANDLER.with(|cell| {
-            if let Some(f) = cell.borrow().as_ref() {
-                f();
-            }
-        });
-        true // proceed with close
-    });
-
-    // The size and place it closed at on this device.
-    let saved_window = crate::persistence::load_window();
-    let (width, height, place) = saved_window.as_ref().and_then(|w| w.sane()).unwrap_or((1200, 800, None));
-    let props = WindowProps {
-        title: "Pimble".into(),
-        width,
-        height,
-        x: place.map(|p| p.0),
-        y: place.map(|p| p.1),
-        maximized: saved_window.as_ref().is_some_and(|w| w.maximized),
-        // The monitor the place is on, only with a place to put there.
-        monitor: saved_window.and_then(|w| w.monitor).filter(|_| place.is_some()),
-        borderless: true,
-        transparent: true,
-        resizable: true,
-        menu_in_titlebar: true,
-        icon: Some(include_bytes!("../../../assets/brand/png/pimble-256.png")),
-        on_close_requested: Some(on_close),
-        ..Default::default()
-    };
-
-    App::new(app_component)
-        .window_props(props)
-        .theme(theme)
-        .menu(menus)
-        .renderer(renderer)
-        .activation_token(activation_token)
-        .run();
-
-    EVENT_PROCESSOR.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
-    CLOSE_HANDLER.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
-}
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5620,37 +5519,4 @@ mod tests {
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
     }
-}
-
-/// What this device remembers of how things looked (`views.rs`), written now
-/// with every pane's place and board camera as they are: the window is
-/// closing.
-#[cfg(feature = "native")]
-fn remember_views(store: Option<AppStore>) {
-    if let Some(store) = store.or_else(|| crate::links::with_app_store(|store| store)) {
-        crate::places::remember_all(store);
-    }
-    crate::boards::remember_all();
-    crate::views::save_now();
-    // The window's own size and place (as it is when not maximized, where
-    // the platform says), and whether it is maximized.
-    if let Some(window) = rinch::prelude::current_window_restore() {
-        crate::persistence::save_window(&crate::persistence::WindowGeometry {
-            width: window.size.0,
-            height: window.size.1,
-            x: window.position.map(|p| p.0),
-            y: window.position.map(|p| p.1),
-            maximized: window.maximized,
-            monitor: window.monitor,
-        });
-    }
-}
-
-/// Close the window (its close button, File > Exit), writing first what
-/// this device remembers of how things looked. Rinch's own close control
-/// exits without asking `on_close_requested`.
-#[cfg(feature = "native")]
-pub(crate) fn close_window() {
-    remember_views(None);
-    close_current_window();
 }

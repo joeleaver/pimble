@@ -15,7 +15,7 @@
 use rinch::prelude::Renderer;
 
 const USAGE: &str = "\
-Usage: pimble [--cpu | --renderer <auto|gpu|cpu>] [<pimble: link>]
+Usage: pimble [--new-window] [--cpu | --renderer <auto|gpu|cpu>] [<pimble: link>]
        pimble --install
 
   <pimble: link>    open a link in Pimble: a note's (Copy Link), or
@@ -25,6 +25,9 @@ Usage: pimble [--cpu | --renderer <auto|gpu|cpu>] [<pimble: link>]
   --install         put this copy in your home folder (on the menu and the PATH),
                     where it keeps itself up to date
 
+  --new-window      open another window even when Pimble is already running
+                    (without it, the Pimble already running comes to the front)
+
   --renderer auto   draw on the GPU, and with the CPU if the GPU will not start (the default)
   --renderer gpu    draw on the GPU, and stop if it will not start
   --renderer cpu    draw with the CPU (software rendering)
@@ -32,14 +35,27 @@ Usage: pimble [--cpu | --renderer <auto|gpu|cpu>] [<pimble: link>]
 
 The RINCH_RENDERER environment variable (auto, gpu, cpu) overrides the flag.";
 
-/// The renderer the command line asks for, or the message to exit with.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String> {
+/// What the command line asks for.
+#[derive(Debug, Clone, PartialEq)]
+struct Options {
+    renderer: Renderer,
+    /// `--new-window`: a window of its own even when Pimble is running.
+    new_window: bool,
+}
+
+/// What the command line asks for, or the message to exit with.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut renderer = Renderer::Auto;
+    let mut new_window = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let value = match arg.as_str() {
             "--cpu" => {
                 renderer = Renderer::Software;
+                continue;
+            }
+            "--new-window" => {
+                new_window = true;
                 continue;
             }
             "--renderer" => args.next().ok_or("--renderer needs a value")?,
@@ -52,7 +68,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String
         renderer = Renderer::parse(&value)
             .ok_or_else(|| format!("unknown renderer {value:?}; use auto, gpu or cpu"))?;
     }
-    Ok(renderer)
+    Ok(Options { renderer, new_window })
 }
 
 /// Windows: borrow the console of the terminal this was started from, if it
@@ -110,15 +126,17 @@ fn main() {
     // click in a browser or a mail app) goes to the Pimble already open, if
     // one is, and this process stops there.
     let (links, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.starts_with("pimble:"));
+    let mut untaken_link = false;
     if let Some(link) = links.into_iter().next() {
         if hand_to_open_window(&link, activation_token.clone()) {
             return;
         }
-        pimble_app::links::set_launch_link(link);
+        pimble_app::app_links::set_launch_link(link);
+        untaken_link = true;
     }
 
-    let renderer = match parse_args(args) {
-        Ok(renderer) => renderer,
+    let options = match parse_args(args) {
+        Ok(options) => options,
         Err(message) => {
             if message.is_empty() {
                 println!("{USAGE}");
@@ -148,11 +166,25 @@ fn main() {
             .init();
     }
 
+    // One window process owns the tray and the notifications
+    // (docs/NOTIFICATIONS_CONTRACT.md "Built in wave 4"). A plain launch while
+    // it runs brings it to the front, with this launch's activation token so
+    // that on Wayland it may raise itself (rinch #2880), and stops; if no
+    // window takes that, this one opens after all.
+    let primary = pimble_app::instance::claim();
+    if pimble_app::instance::launch(options.new_window || untaken_link, primary) == pimble_app::instance::Launch::HandOver {
+        if hand_to_open_window(pimble_app::app_links::COME_TO_FRONT, activation_token.clone()) {
+            tracing::info!("Pimble is already running; it came to the front");
+            return;
+        }
+        tracing::info!("Pimble is running but no window took the launch; opening one here");
+    }
+
     pimble_app::startup::began();
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
-    pimble_app::app::run(renderer, activation_token);
+    pimble_app::desktop::run(options.renderer, activation_token);
     pimble_server::diagnostics::quit();
 }
 
@@ -172,10 +204,17 @@ fn hand_to_open_window(link: &str, activation_token: Option<String>) -> bool {
 
 #[cfg(test)]
 mod args_tests {
-    use super::{Renderer, parse_args};
+    use super::{Options, Renderer, parse_args};
 
     fn parse(args: &[&str]) -> Result<Renderer, String> {
-        parse_args(args.iter().map(|a| a.to_string()))
+        parse_args(args.iter().map(|a| a.to_string())).map(|o| o.renderer)
+    }
+
+    #[test]
+    fn new_window_is_asked_for_beside_the_renderer() {
+        let parsed = |args: &[&str]| parse_args(args.iter().map(|a| a.to_string()));
+        assert_eq!(parsed(&[]), Ok(Options { renderer: Renderer::Auto, new_window: false }));
+        assert_eq!(parsed(&["--new-window", "--cpu"]), Ok(Options { renderer: Renderer::Software, new_window: true }));
     }
 
     #[test]

@@ -4127,6 +4127,9 @@ pub(crate) const APP_CSS: &str = "
     flex-direction: column;
     gap: 10px;
 }
+.pimble-settings__section + .pimble-settings__section {
+    margin-top: 24px;
+}
 
 .pimble-settings__heading {
     font-size: 14px;

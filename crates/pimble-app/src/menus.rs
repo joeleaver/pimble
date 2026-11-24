@@ -3,7 +3,7 @@
 //! The desktop turns this into `rinch::menu::Menu`s for its native menu bar
 //! ([`build_menus`]); the browser will hand the same spec to rinch-web's
 //! DOM menu bar once `rinch::menu` compiles without the `desktop` feature.
-//! Keeping the content here rather than inline in [`crate::app::run`] is what
+//! Keeping the content here rather than inline in [`crate::desktop::run`] is what
 //! stops the two drifting, and it is why the spec carries no rinch type: it has
 //! to build on a target where `rinch::menu` does not exist yet.
 //!
@@ -197,9 +197,10 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
         // agents and updates in one window.
         entries.push(MenuEntry::item("Settings...", crate::shortcuts::chord(crate::shortcuts::SETTINGS), move || crate::settings::open(store)));
         entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::item("Exit", "Alt+F4", || {
-            crate::app::close_window()
-        }));
+        // Quit leaves the tray too; closing the window (Alt+F4, its close
+        // button) only hides it there (docs/NOTIFICATIONS_CONTRACT.md
+        // section 4).
+        entries.push(MenuEntry::item("Quit", "Ctrl+Q", crate::tray::quit));
     }
 
     // A browser has an account behind it, and the way out of one.

@@ -182,7 +182,7 @@ fn choice_class(on: bool) -> &'static str {
     if on { "pimble-settings__choice pimble-settings__choice--on" } else { "pimble-settings__choice" }
 }
 
-/// General: the theme.
+/// General: the theme, and on the desktop what closing the window does.
 fn render_general(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let pick = move |dark: bool| {
         move || {
@@ -193,16 +193,50 @@ fn render_general(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     };
     rsx! {
         div {
-            class: "pimble-settings__section",
-            div { class: "pimble-settings__heading", "Theme" }
             div {
-                class: "pimble-settings__choices",
-                div { class: {move || choice_class(store.dark_mode.get())}, onclick: pick(true), "Dark" }
-                div { class: {move || choice_class(!store.dark_mode.get())}, onclick: pick(false), "Light" }
+                class: "pimble-settings__section",
+                div { class: "pimble-settings__heading", "Theme" }
+                div {
+                    class: "pimble-settings__choices",
+                    div { class: {move || choice_class(store.dark_mode.get())}, onclick: pick(true), "Dark" }
+                    div { class: {move || choice_class(!store.dark_mode.get())}, onclick: pick(false), "Light" }
+                }
+                div { class: "pimble-settings__note", "View > Toggle Dark Mode switches it too." }
             }
-            div { class: "pimble-settings__note", "View > Toggle Dark Mode switches it too." }
+            {render_tray(__scope)}
         }
     }
+}
+
+/// "When the window closes" (docs/NOTIFICATIONS_CONTRACT.md section 4): the
+/// switch, and a sentence saying what closing does now.
+#[cfg(feature = "native")]
+fn render_tray(__scope: &mut RenderScope) -> NodeHandle {
+    let keep = Signal::new(crate::persistence::load_tray_settings().keep_running);
+    let status = crate::tray::status();
+    let flip = move || {
+        let on = !untracked(|| keep.get());
+        keep.set(on);
+        crate::tray::set_keep_running(on);
+    };
+    rsx! {
+        div {
+            class: "pimble-settings__section",
+            div { class: "pimble-settings__heading", "When the window closes" }
+            Checkbox {
+                label: crate::tray::SETTING_LABEL,
+                checked_fn: move || keep.get(),
+                onchange: move || flip(),
+            }
+            div { class: "pimble-settings__note", {move || crate::tray::status_line(status.get())} }
+        }
+    }
+}
+
+/// The browser has no tray: closing the tab closes Pimble there.
+#[cfg(not(feature = "native"))]
+fn render_tray(__scope: &mut RenderScope) -> NodeHandle {
+    rsx! { div {} }
 }
 
 /// Keyboard: every shortcut that can be changed (`crate::shortcuts`), typed
