@@ -317,6 +317,7 @@ buttons go ("we can drag").
 Joe asked what the kanban could take from kobayban (`~/dev/kobayban`, the board he uses
 every day) and chose four (2026-11-04): one header row with lane names down the left,
 three lane sizes and folded columns, Done no taller than its row, and "Add card" on hover.
+The height cap was taken back on 2026-11-23 (see "Columns grow with their cards" below).
 
 - **One header row.** When every lane has the same columns (by name, case and spacing
   ignored: `Board::aligned`), the board draws one header row above the lanes, each
