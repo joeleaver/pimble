@@ -114,6 +114,7 @@ fn shown(store_id: StoreId, nodes: Vec<Node>, lists: Vec<(NodeId, Vec<Node>)>, g
     BackendEvent::Shown { view: pimble_api::View { store: store_id, nodes, lists, gone } }
 }
 
+mod column_view;
 mod nodes;
 mod replicas;
 mod sharing;

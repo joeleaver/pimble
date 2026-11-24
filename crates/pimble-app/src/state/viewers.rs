@@ -22,11 +22,13 @@ impl AppStore {
     /// where it is: its parent is a metanode, and an installed plugin provides
     /// a child viewer for the parent's viewer. A metanode of its own is shown
     /// by its own viewer, and a query metanode's children are not what it
-    /// shows, so neither has one. `None` too while the parent is not held:
-    /// the parent arriving judges the panes holding its children again
-    /// (`crate::events`, `take_node`).
+    /// shows, so neither has one. A mount is not shown by one either: the
+    /// kanban reads a mount under it as a lane (a mounted kanban), and the
+    /// mount's row and pane stay a mount's. `None` too while the parent is
+    /// not held: the parent arriving judges the panes holding its children
+    /// again (`crate::events`, `take_node`).
     pub fn child_viewer(&self, store_id: StoreId, node: &Node) -> Option<ChildViewerDecl> {
-        if node.metadata.metanode.is_some() {
+        if node.metadata.metanode.is_some() || node.is_mount() {
             return None;
         }
         let parent = node.parent_id?;
@@ -94,6 +96,10 @@ mod tests {
         let mut own = column.clone();
         own.metadata.metanode = pimble_core::metanode::Metanode::from_stored(Some("kanban"), Some("children 2"));
         assert_eq!(app.child_viewer(store_id, &own), None, "a lane is a kanban of its own");
+        let mut mounted = Node::mount(store_id, child_id);
+        mounted.parent_id = Some(parent_id);
+        assert_eq!(app.child_viewer(store_id, &mounted), None, "a mount under a kanban is a lane, never a column");
+        assert_eq!(app.node_icon(store_id, &mounted), pimble_ui::appearance::node_icon(&mounted));
         let mut elsewhere = column.clone();
         elsewhere.parent_id = None;
         assert_eq!(app.child_viewer(store_id, &elsewhere), None);

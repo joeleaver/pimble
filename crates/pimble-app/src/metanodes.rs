@@ -18,7 +18,7 @@
 //! wait until changes rest ([`REREAD_MS`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pimble_api::Forest;
 use pimble_core::metanode::outline_line;
@@ -104,6 +104,8 @@ thread_local! {
     /// Forests a change touched, waiting for changes to rest.
     static TOUCHED: RefCell<Vec<(StoreId, NodeId)>> = const { RefCell::new(Vec::new()) };
     static REREAD: RefCell<Option<rinch::prelude::TimeoutHandle>> = const { RefCell::new(None) };
+    /// The parents `ask_for_parent` asked for: each is asked once.
+    static PARENTS_ASKED: RefCell<HashSet<(StoreId, NodeId)>> = RefCell::new(HashSet::new());
 }
 
 /// Whether `node` is a query metanode, whose row shows what it finds.
@@ -139,11 +141,24 @@ pub(crate) fn shows_as_metanode(store: AppStore, store_id: StoreId, node: &Node)
 }
 
 /// A pane holds `node` (of `store_id`), whose parent the window does not
-/// have: it is asked for, since a child viewer of the parent's may show the
-/// node, and the parent's arrival judges the pane again.
+/// have: it is asked for, once, since a child viewer of the parent's may show
+/// the node, and the parent's arrival judges the pane again. Nothing is asked
+/// for a node no pane holds, for a root the explorer shows of its store (a
+/// share's scope root on a member's replica has a parent outside what this
+/// device may read), or for a metanode or a mount (no child viewer shows
+/// them).
 pub(crate) fn ask_for_parent(store: AppStore, store_id: StoreId, node: &Node) {
-    let Some(parent) = node.parent_id.filter(|_| !is_metanode(node)) else { return };
-    if store.get_node_signal(store_id, parent).is_none() {
+    if is_metanode(node) || node.is_mount() {
+        return;
+    }
+    let Some(parent) = node.parent_id else { return };
+    if store.panes_showing(store_id, node.id).is_empty()
+        || store.shown_roots(store_id).contains(&node.id)
+        || store.get_node_signal(store_id, parent).is_some()
+    {
+        return;
+    }
+    if PARENTS_ASKED.with(|asked| asked.borrow_mut().insert((store_id, parent))) {
         store.send(BackendCommand::GetNode { store_id, node_id: parent });
     }
 }
@@ -151,7 +166,8 @@ pub(crate) fn ask_for_parent(store: AppStore, store_id: StoreId, node: &Node) {
 /// Show metanode `(store_id, node_id)` in pane `pane`, instead of whatever
 /// it held, and ask for its forest.
 pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId) {
-    // A pane holds one thing: whatever it held goes.
+    // A pane holds one thing: whatever it held goes (`stop_editing` stops a
+    // board and a discussion too).
     crate::editor::stop_editing(store, pane);
     crate::sheets::stop(store, pane);
     let state = store.pane(pane);
