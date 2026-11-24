@@ -180,6 +180,12 @@ and then that parse.
   sub/superscript are written as the HTML tags `<u>`, `<mark>`, `<span style="color:..">`,
   `<sub>`, `<sup>`, and read back from them only.
 - A link is a Markdown link; a Pimble link's href is its `pimble:` URL.
+- **A mention** of a person (docs/NOTIFICATIONS_CONTRACT.md section 1, 2026-11-23) is a link
+  to their account: `[@Will](pimble-person:<sub>?m=<id>)`. `?m=` is the mention's own id;
+  a mention written without one is given one where it enters the document
+  (`pimble_crdt::mentions::with_ids`), and get_node shows it, so a rewrite that keeps the
+  href mentions nobody again. A `pimble-person:` href that names no account is refused.
+  `list_people` says whom a note can mention.
 - Hard breaks (a trailing backslash, or `<br>` where that does not read back) and
   horizontal rules (`---`) map both ways.
 - **Block quotes and tables** (in since rinch `51cb7c7`, joeleaver/rinch#1229 and #1233):
@@ -266,6 +272,7 @@ Read:
 | `search` | keyword or semantic (`search`, `semantic` flag), with snippets; each hit says where in the note it is (`in: Design > The county's edges`), a heading path `get_node`'s `section` takes as it is. Without `store`, every open store is searched and the hits of the store this session last worked in come first (below) |
 | `resolve_link` | where a `pimble:` URL points now (follows `became`) |
 | `list_deleted` | a store's recently deleted nodes |
+| `list_people` | who can open a node: the members of the shares it is in, by the name each goes by there, each with the Markdown that mentions them (docs/NOTIFICATIONS_CONTRACT.md section 1) |
 | `get_metanode` | what a metanode shows (docs/METANODES_CONTRACT.md): its source's forest as an indented outline in the tree's order, each line with its link, under a sentence saying what it is; a node with no viewer is read as its children |
 
 Write:

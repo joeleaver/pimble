@@ -7,7 +7,7 @@ use pimble_core::{NodeId, PimbleUrl, StoreId};
 use pimble_rpc::SearchResultItem;
 use rinch_editor_core::{AttrValue, Attrs, Fragment, Mark};
 
-use crate::links::web_url;
+use crate::web_links::web_url;
 use crate::rinch_editor::EditorHandle;
 
 /// How many notes the picker lists.
@@ -22,6 +22,11 @@ pub enum PickerRow {
     Web { href: String },
     /// A note the search found.
     Node { store_id: StoreId, node_id: NodeId, title: String, store_name: Option<String> },
+    /// `@`: a person who can open the note, by the name they go by in its
+    /// share (docs/NOTIFICATIONS_CONTRACT.md section 1).
+    Person { account: String, name: String },
+    /// `@`: "Share this with someone...", the Share dialog for the note.
+    ShareThis,
 }
 
 impl PickerRow {
@@ -31,6 +36,9 @@ impl PickerRow {
             PickerRow::RemoveLink => String::new(),
             PickerRow::Web { href } => href.clone(),
             PickerRow::Node { store_id, node_id, .. } => PimbleUrl::node(*store_id, *node_id).to_string(),
+            // Without an id: a pick makes the mention, and its id, once.
+            PickerRow::Person { account, .. } => pimble_core::mention::href(account, None),
+            PickerRow::ShareThis => String::new(),
         }
     }
 
@@ -38,7 +46,8 @@ impl PickerRow {
     /// as it was typed.
     pub fn link_text(&self, query: &str) -> String {
         match self {
-            PickerRow::RemoveLink => String::new(),
+            PickerRow::RemoveLink | PickerRow::ShareThis => String::new(),
+            PickerRow::Person { name, .. } => format!("@{name}"),
             PickerRow::Web { .. } => query.trim().to_string(),
             PickerRow::Node { title, .. } if title.trim().is_empty() => "Untitled".to_string(),
             PickerRow::Node { title, .. } => title.clone(),
@@ -86,6 +95,10 @@ pub enum PickerKind {
     /// the query is typed in the popup, only sheet nodes are offered, and a
     /// pick is embedded live at `at`.
     Sheet { at: usize },
+    /// `@` typed at `from` (docs/NOTIFICATIONS_CONTRACT.md section 1): the
+    /// query is the text typed after it, in the note; the rows are the people
+    /// who can open the note, and a pick replaces `@query` with a mention.
+    Mention { from: usize },
 }
 
 /// The open picker, as `AppStore::link_picker` holds it.
@@ -95,6 +108,10 @@ pub struct PickerView {
     pub query: String,
     pub rows: Vec<PickerRow>,
     pub selected: usize,
+    /// Whether the highlight was moved with the arrows: "Share this with
+    /// someone..." is taken by Enter only then, so `@` and Enter in a note
+    /// nobody else can open is a new line, not a dialog.
+    pub moved: bool,
     /// Where the popup sits (`position: fixed` coordinates): under the caret
     /// or the selection's start.
     pub x: f32,
@@ -115,7 +132,7 @@ const SEARCH_DEBOUNCE_MS: u32 = 120;
 /// Open the picker (`kind`) under `(x, y)`, its query empty.
 pub fn open(store: crate::state::AppStore, kind: PickerKind, x: f32, y: f32) {
     HITS.with(|h| h.borrow_mut().clear());
-    let view = PickerView { kind, query: String::new(), rows: Vec::new(), selected: 0, x, y };
+    let view = PickerView { kind, query: String::new(), rows: Vec::new(), selected: 0, moved: false, x, y };
     store.link_picker.set(Some(rebuilt(store, view)));
 }
 
@@ -143,7 +160,19 @@ pub fn set_query(store: crate::state::AppStore, query: String) {
     }
     view.query = query.clone();
     view.selected = 0;
-    store.link_picker.set(Some(rebuilt(store, view)));
+    let view = rebuilt(store, view);
+    // `@` and words nobody here is called: the picker steps aside and the
+    // words are just words.
+    if matches!(view.kind, PickerKind::Mention { .. }) {
+        let anyone = view.rows.iter().any(|r| matches!(r, PickerRow::Person { .. }));
+        if !anyone && !query.is_empty() {
+            close(store);
+        } else {
+            store.link_picker.set(Some(view));
+        }
+        return;
+    }
+    store.link_picker.set(Some(view));
     if let Some(pending) = SEARCH_TIMER.with(|t| t.borrow_mut().take()) {
         rinch::prelude::clear_timeout(pending);
     }
@@ -176,6 +205,7 @@ pub fn search_answered(store: crate::state::AppStore, results: &Result<Vec<Searc
 pub fn step(store: crate::state::AppStore, delta: isize) {
     let Some(mut view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
     view.selected = step_selection(view.selected, view.rows.len(), delta);
+    view.moved = true;
     store.link_picker.set(Some(view));
 }
 
@@ -215,6 +245,22 @@ pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize
             crate::sheets::in_text::insert_node_embed(store, store.focused(), *store_id, *node_id, Some((at, to.unwrap_or(at))))
         }
         (PickerKind::Sheet { .. }, _) => false,
+        (PickerKind::Mention { from }, PickerRow::Person { account, name }) => {
+            let to = handle.selection().head().0;
+            let mention = pimble_core::mention::Mention::new(account, name);
+            let (text, href) = (mention.words(), mention.href());
+            handle.update(move |state| {
+                let mut tr = link_transaction(state, from, to, &text, &href, false)?;
+                // A space after it, so what is typed next is a new word.
+                tr.insert_text(" ").ok()?;
+                Some(tr)
+            })
+        }
+        (PickerKind::Mention { .. }, PickerRow::ShareThis) => {
+            crate::mentions::share_focused(store);
+            true
+        }
+        (PickerKind::Mention { .. }, _) => false,
     }
 }
 
@@ -228,6 +274,7 @@ fn rebuilt(store: crate::state::AppStore, mut view: PickerView) -> PickerView {
             let sheets: Vec<SearchResultItem> = h.borrow().iter().filter(|hit| hit.node_type == pimble_core::node_types::SHEET).cloned().collect();
             picker_rows("", &sheets, store_name)
         }),
+        PickerKind::Mention { .. } => crate::mentions::picker_rows(store, &view.query),
         _ => HITS.with(|h| picker_rows(&view.query, &h.borrow(), store_name)),
     };
     if let PickerKind::Selection { editing: true, .. } = view.kind {
@@ -261,14 +308,32 @@ pub fn lines(view: &PickerView) -> Vec<PickerLine> {
                     if title.trim().is_empty() { "Untitled".to_string() } else { title.clone() },
                     store_name.clone().unwrap_or_default(),
                 ),
+                PickerRow::Person { name, .. } => (name.clone(), String::new()),
+                PickerRow::ShareThis => ("Share this with someone...".to_string(), String::new()),
             };
             PickerLine { key: format!("{index}:{label}"), index, label, detail, selected: index == view.selected }
         })
         .collect()
 }
 
+/// What the popup says under its rows; empty when it says nothing.
+pub fn quiet_line(view: &PickerView) -> &'static str {
+    if let PickerKind::Mention { .. } = view.kind {
+        let anyone = view.rows.iter().any(|r| matches!(r, PickerRow::Person { .. }));
+        return if anyone { "" } else { "Only you can open this note" };
+    }
+    if view.rows.is_empty() {
+        empty_line(view)
+    } else {
+        ""
+    }
+}
+
 /// What the popup says with no rows.
 pub fn empty_line(view: &PickerView) -> &'static str {
+    if let PickerKind::Mention { .. } = view.kind {
+        return "Only you can open this note";
+    }
     if let PickerKind::Sheet { .. } = view.kind {
         return if view.query.trim().is_empty() { "Type to find a sheet" } else { "No sheets match" };
     }
@@ -308,6 +373,30 @@ pub fn start_typed(store: crate::state::AppStore, handle: &EditorHandle, from: u
     }
 }
 
+/// `@` was typed at `from` (docs/NOTIFICATIONS_CONTRACT.md section 1): the
+/// picker of the people who can open the note, under the caret.
+pub fn start_mention(store: crate::state::AppStore, handle: &EditorHandle, from: usize) {
+    let (x, y) = below(handle.caret_rect(handle.selection().head()).map(|r| (r.x, r.y, r.height)));
+    open(store, PickerKind::Mention { from }, x, y);
+    match typed_mention_query(&handle.doc(), from, handle.selection()) {
+        Some(query) => set_query(store, query),
+        None => close(store),
+    }
+}
+
+/// The query of an `@` picker whose `@` is at `from`, with the caret at
+/// `selection`: what follows the `@`, in the same textblock, up to the
+/// caret. `None` when the caret left it, the `@` is gone, or what follows is
+/// longer than a name (40 characters, or more than three words).
+pub fn typed_mention_query(doc: &rinch_editor_core::Node, from: usize, selection: rinch_editor_core::selection::Selection) -> Option<String> {
+    if selection.head().0 < from + 1 {
+        return None;
+    }
+    let text = text_up_to_caret(doc, from, selection)?;
+    let query = text.strip_prefix('@')?;
+    (query.chars().count() <= 40 && query.matches(' ').count() <= 3 && !query.contains('\u{fffc}')).then(|| query.to_string())
+}
+
 /// The editor's selection changed: a `[[` picker follows what is typed
 /// after the brackets and closes when the caret leaves them; a Ctrl+L
 /// picker closes when the selection moves at all.
@@ -323,6 +412,10 @@ pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
             }
         }
         PickerKind::Typed { from } => match typed_query(&handle.doc(), from, handle.selection()) {
+            Some(query) => set_query(store, query),
+            None => close(store),
+        },
+        PickerKind::Mention { from } => match typed_mention_query(&handle.doc(), from, handle.selection()) {
             Some(query) => set_query(store, query),
             None => close(store),
         },
@@ -387,13 +480,27 @@ pub fn key(store: crate::state::AppStore, handle: &EditorHandle, key: &str, modi
         "ArrowDown" => step(store, 1),
         "ArrowUp" => step(store, -1),
         "Escape" => close(store),
+        // `@`: Enter takes a person, and "Share this with someone..." only
+        // when the arrows chose it; otherwise it is the note's Enter.
+        "Enter" | "Tab" if matches!(view.kind, PickerKind::Mention { .. }) => {
+            let takes = match view.rows.get(view.selected) {
+                Some(PickerRow::Person { .. }) => true,
+                Some(PickerRow::ShareThis) => view.moved,
+                _ => false,
+            };
+            if !takes {
+                close(store);
+                return false;
+            }
+            accept(store, handle, view.selected);
+        }
         "Enter" | "Tab" if !view.rows.is_empty() => {
             accept(store, handle, view.selected);
         }
         "Enter" | "Tab" => close(store),
         _ => match view.kind {
-            // A `[[` query is typed in the note itself.
-            PickerKind::Typed { .. } => return false,
+            // A `[[` or `@` query is typed in the note itself.
+            PickerKind::Typed { .. } | PickerKind::Mention { .. } => return false,
             PickerKind::Selection { .. } | PickerKind::Sheet { .. } if key == "Backspace" => {
                 let mut query = view.query.clone();
                 query.pop();
@@ -415,7 +522,7 @@ pub fn key(store: crate::state::AppStore, handle: &EditorHandle, key: &str, modi
 /// The caret moved after layout (its rectangle is known now): a `[[`
 /// picker sits under it.
 pub fn caret_moved(store: crate::state::AppStore, handle: &EditorHandle) {
-    let Some(PickerView { kind: PickerKind::Typed { .. }, .. }) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    let Some(PickerView { kind: PickerKind::Typed { .. } | PickerKind::Mention { .. }, .. }) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
     if let Some(rect) = handle.caret_rect(handle.selection().head()) {
         let (x, y) = below(Some((rect.x, rect.y, rect.height)));
         place(store, x, y);
@@ -625,6 +732,91 @@ mod tests {
         assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(3))), None, "before them");
         assert_eq!(typed_query(&doc, 5, Selection::text(Pos(7), Pos(10))), None, "a range");
         assert_eq!(typed_query(&doc, 4, Selection::cursor(Pos(10))), None, "no brackets there");
+    }
+
+    /// An app whose focused pane holds a note of a store shared with Will and
+    /// Sam (and this account, which `@` never offers).
+    fn shared_note(people: bool) -> (crate::state::AppStore, StoreId, NodeId) {
+        let store = crate::state::AppStore::new();
+        let (s, n) = (StoreId::new(), NodeId::new());
+        if people {
+            let person = |id: &str, name: &str| pimble_rpc::Person { user_id: id.into(), name: name.into(), notice_key: None };
+            let scope = pimble_rpc::ScopePeople {
+                root: None,
+                people: vec![person("will", "Will"), person("sam", "Sam"), person("wilma", "Wilma")],
+                my_name: "Joe".into(),
+                my_name_chosen: true,
+                share_name: String::new(),
+            };
+            store.shares_ui.people.set(std::collections::HashMap::from([(s, pimble_rpc::StorePeople { scopes: vec![scope] })]));
+        }
+        store.pane(store.focused()).active_edit.set(Some(crate::state::ActiveEdit { store_id: s, node_id: n }));
+        (store, s, n)
+    }
+
+    #[test]
+    fn at_offers_the_notes_people_and_a_pick_writes_a_mention() {
+        let (store, _, _) = shared_note(true);
+        let handle = crate::rinch_editor::create_editor();
+        typed(&handle, "ask @wi");
+        // "ask " is 1..5: the `@` is at 5.
+        open(store, PickerKind::Mention { from: 5 }, 0.0, 0.0);
+        set_query(store, "wi".into());
+        let rows = store.link_picker.get().unwrap().rows;
+        assert_eq!(rows, vec![PickerRow::Person { account: "will".into(), name: "Will".into() }, PickerRow::Person { account: "wilma".into(), name: "Wilma".into() }]);
+        assert!(accept(store, &handle, 0));
+        let r = runs(&handle);
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert_eq!((r[0].0.as_str(), r[1].0.as_str(), r[2].0.as_str()), ("ask ", "@Will", " "));
+        let href = r[1].1.clone().unwrap();
+        let mention = pimble_core::mention::Mention::from_link(&href, &r[1].0).unwrap();
+        assert_eq!((mention.account.as_str(), mention.name.as_str()), ("will", "Will"));
+        assert!(mention.id.is_some(), "a picked mention has its id");
+        assert_eq!(pimble_crdt::mentions::of_model(&handle.doc()), vec![mention.clone()]);
+
+        // Undo and redo put the same mention back, id and all: nobody is
+        // told twice (pimble_core::mention::added says why).
+        assert!(handle.command("undo"));
+        assert!(pimble_crdt::mentions::of_model(&handle.doc()).is_empty());
+        assert!(handle.command("redo"));
+        assert_eq!(pimble_crdt::mentions::of_model(&handle.doc()), vec![mention]);
+    }
+
+    #[test]
+    fn at_steps_aside_for_words_nobody_is_called() {
+        let (store, _, _) = shared_note(true);
+        open(store, PickerKind::Mention { from: 5 }, 0.0, 0.0);
+        set_query(store, "home".into());
+        assert_eq!(store.link_picker.get(), None, "no Will called home: the words are words");
+    }
+
+    #[test]
+    fn at_in_a_note_nobody_else_can_open_offers_only_sharing_and_enter_is_a_new_line() {
+        let (store, _, _) = shared_note(false);
+        let handle = crate::rinch_editor::create_editor();
+        open(store, PickerKind::Mention { from: 1 }, 0.0, 0.0);
+        let view = store.link_picker.get().unwrap();
+        assert_eq!(view.rows, vec![PickerRow::ShareThis]);
+        assert_eq!(quiet_line(&view), "Only you can open this note");
+        assert!(!key(store, &handle, "Enter", false), "Enter goes to the note");
+        assert_eq!(store.link_picker.get(), None);
+        // Chosen with the arrows, it is taken.
+        open(store, PickerKind::Mention { from: 1 }, 0.0, 0.0);
+        step(store, 1);
+        assert!(store.link_picker.get().unwrap().moved);
+    }
+
+    #[test]
+    fn the_mention_query_is_what_follows_the_at() {
+        use rinch_editor_core::selection::Selection;
+        use rinch_editor_core::Pos;
+        let handle = crate::rinch_editor::create_editor();
+        typed(&handle, "hi @Will Sm");
+        let doc = handle.doc();
+        assert_eq!(typed_mention_query(&doc, 4, Selection::cursor(Pos(5))).as_deref(), Some(""));
+        assert_eq!(typed_mention_query(&doc, 4, Selection::cursor(Pos(12))).as_deref(), Some("Will Sm"));
+        assert_eq!(typed_mention_query(&doc, 4, Selection::cursor(Pos(3))), None, "before it");
+        assert_eq!(typed_mention_query(&doc, 3, Selection::cursor(Pos(8))), None, "no @ there");
     }
 
     #[test]

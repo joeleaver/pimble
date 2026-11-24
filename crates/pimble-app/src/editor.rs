@@ -58,6 +58,8 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::presence::text::PresencePlugin));
                 // Hashtags colored in the text (docs/HASHTAGS_CONTRACT.md).
                 handle.add_plugin(std::rc::Rc::new(crate::hashtags::HashtagsPlugin));
+                // Mentions drawn in the text (docs/NOTIFICATIONS_CONTRACT.md section 1).
+                handle.add_plugin(std::rc::Rc::new(crate::mentions::MentionsPlugin { pane }));
                 // Colored text legible in either theme (docs/TEXT_COLOR_CONTRACT.md).
                 handle.add_plugin(std::rc::Rc::new(crate::text_color::TextColorPlugin));
                 // Typing, commands and remote deltas all land here; the
@@ -166,7 +168,7 @@ pub(crate) fn start_editing(
     crate::pictures::opening(store, pane);
     // An unmounted or switched editor says nothing more about its hovered
     // link (rinch #892): the tooltip goes with the note it was over.
-    crate::links::hover_link(store, None);
+    crate::links::hover_link(store, None, None);
     // Links (docs/LINKS_CONTRACT.md): Ctrl/Cmd+click follows one, a plain
     // click places the caret as ever; resting on one shows where it leads.
     // A link followed from this pane opens in this pane.
@@ -180,7 +182,7 @@ pub(crate) fn start_editing(
         crate::hashtags::link_followed();
         true
     });
-    handle.on_link_hover(move |hover| crate::links::hover_link(store, hover));
+    handle.on_link_hover(move |hover| crate::links::hover_link(store, Some((store_id, node_id)), hover));
     // Pictures in text (docs/IMAGE_MARKUP_CONTRACT.md sections 2 and 5): the
     // floating controls over the one under the pointer.
     handle.on_image_hover(move |hover| crate::text_boards::hovered(store, pane, hover));
@@ -368,7 +370,7 @@ pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
         }
     }
     handle.stop_collaboration();
-    crate::links::hover_link(store, None);
+    crate::links::hover_link(store, None, None);
     crate::text_boards::host_closed(store, pane);
     crate::sheets::text_closed(store, pane);
     if store.focused() == pane {

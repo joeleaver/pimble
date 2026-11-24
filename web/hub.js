@@ -411,5 +411,58 @@
         };
     }
 
-    window.PimbleHub = { start, connect, control, status, take, leaveOffline };
+    // ---- Web push (docs/NOTIFICATIONS_CONTRACT.md, wave 2) ----
+
+    function b64urlBytes(text) {
+        const raw = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+        return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+    }
+
+    function pushRegistration() {
+        if (!("serviceWorker" in navigator) || !("PushManager" in self) || !self.Notification) return Promise.resolve(null);
+        return navigator.serviceWorker.getRegistration("/app/").then((reg) => reg || null, () => null);
+    }
+
+    // This browser's push subscription for `key` (the accounts service's
+    // VAPID public key, base64url), made if there is none, and remade when it
+    // was made for another key: `{ endpoint, p256dh, auth }`, or null when
+    // this browser cannot take pushes or was not allowed to show them.
+    async function pushSubscribe(key) {
+        if (!self.Notification || Notification.permission !== "granted") return null;
+        const reg = await pushRegistration();
+        if (!reg) return null;
+        const appKey = b64urlBytes(key);
+        let sub = await reg.pushManager.getSubscription();
+        const had = sub && sub.options && sub.options.applicationServerKey ? new Uint8Array(sub.options.applicationServerKey) : null;
+        if (sub && had && (had.length !== appKey.length || had.some((b, i) => b !== appKey[i]))) {
+            await sub.unsubscribe();
+            sub = null;
+        }
+        if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
+        const json = sub.toJSON();
+        return { endpoint: json.endpoint, p256dh: json.keys.p256dh, auth: json.keys.auth };
+    }
+
+    // End this browser's push subscription: its endpoint, or null when it had none.
+    async function pushUnsubscribe() {
+        const reg = await pushRegistration();
+        const sub = reg && (await reg.pushManager.getSubscription());
+        if (!sub) return null;
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        return endpoint;
+    }
+
+    // A notification the service worker showed was clicked while this page
+    // was open: the page opens it (`pimble-open-notice` on the window, which
+    // the app hears), the service worker only focuses it.
+    if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener("message", (event) => {
+            if (event.data && event.data.t === "pimble-open-notice") {
+                dispatchEvent(new CustomEvent("pimble-open-notice", { detail: { notice: event.data.notice || null, inbox: !!event.data.inbox } }));
+            }
+        });
+    }
+
+    window.PimbleHub = { start, connect, control, status, take, leaveOffline, pushSubscribe, pushUnsubscribe };
 })();

@@ -74,6 +74,39 @@ pub struct Inner {
     /// One personal-document write at a time, so a version check and its
     /// write are one step (docs/DISCUSSIONS_CONTRACT.md section 8).
     pub personal_lock: tokio::sync::Mutex<()>,
+    /// One write of watches at a time, so a version check and its write are
+    /// one step (docs/NOTIFICATIONS_CONTRACT.md section 3).
+    pub watches_lock: tokio::sync::Mutex<()>,
+    /// One relay report taken at a time, so a report sent twice at once is
+    /// gathered once (`POST /api/v1/watches/writes`).
+    pub relay_reports_lock: tokio::sync::Mutex<()>,
+    /// The hosted stores whose watched documents (or their watchers' shares)
+    /// changed, for the hosted server to be told (`crate::watches`).
+    pub watch_interest: crate::watches::InterestChanges,
+    /// Notices one sender may queue (docs/NOTIFICATIONS_CONTRACT.md section 2).
+    pub inbox_quota: QuotaLimiter,
+    /// Wakes a recipient's waiting drain when a notice is queued for them.
+    pub inbox_wakers: crate::routes::InboxWakers,
+    /// This service's Web Push key, when one is configured
+    /// (`PIMBLE_VAPID_PRIVATE_KEY`).
+    pub vapid: Option<crate::webpush::VapidKey>,
+    /// What pushes go out on: short timeouts, no redirects.
+    pub push_http: reqwest::Client,
+}
+
+impl Inner {
+    /// The waker of `recipient`'s drains.
+    pub fn inbox_waker(&self, recipient: &str) -> Arc<tokio::sync::Notify> {
+        let mut wakers = self.inbox_wakers.lock().expect("inbox wakers poisoned");
+        Arc::clone(wakers.entry(recipient.to_string()).or_default())
+    }
+
+    /// A notice was queued for `recipient`: every drain of theirs that waits answers.
+    pub fn wake_inbox(&self, recipient: &str) {
+        if let Some(wake) = self.inbox_wakers.lock().expect("inbox wakers poisoned").get(recipient) {
+            wake.notify_waiters();
+        }
+    }
 }
 
 impl std::ops::Deref for AppState {
@@ -110,6 +143,22 @@ impl AppState {
     pub fn new(config: Config, db: RhypeDb, pimble: PimbleService, signer: JwtSigner, releases: ReleasesCache, mailer: Arc<dyn Mailer>) -> Self {
         let kdf_decoy_secret = resolve_kdf_decoy_secret(&config);
         let relay = Relay::new(config.relay.clone());
+        let vapid = match config.vapid_private_key.as_deref().map(crate::webpush::VapidKey::from_private) {
+            Some(Ok(key)) => Some(key),
+            Some(Err(e)) => {
+                tracing::error!("PIMBLE_VAPID_PRIVATE_KEY is not a VAPID key ({e}); web push is off");
+                None
+            }
+            None => {
+                tracing::warn!("PIMBLE_VAPID_PRIVATE_KEY is not set; web push is off");
+                None
+            }
+        };
+        let push_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
         AppState(Arc::new(Inner {
             config,
             db,
@@ -125,6 +174,13 @@ impl AppState {
             kdf_decoy_secret,
             relay,
             personal_lock: tokio::sync::Mutex::new(()),
+            watches_lock: tokio::sync::Mutex::new(()),
+            relay_reports_lock: tokio::sync::Mutex::new(()),
+            watch_interest: crate::watches::InterestChanges::default(),
+            inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
+            inbox_wakers: Default::default(),
+            vapid,
+            push_http,
         }))
     }
 }

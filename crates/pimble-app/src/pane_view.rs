@@ -314,6 +314,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // remote ones keep landing, so a reader's keystroke changes nothing on
     // screen. The effect lives as long as the app.
     let _ = rinch::Effect::new(move || crate::editor::set_read_only(pane, editor_read_only(store, pane)));
+    // The people who can open the pane's note, for how its mentions look
+    // (docs/NOTIFICATIONS_CONTRACT.md section 1). Lives as long as the app.
+    let _ = rinch::Effect::new(move || crate::mentions::follow_members(store, pane));
 
     // A board node's view (docs/IMAGE_MARKUP_CONTRACT.md "Showing one"),
     // beside the editor and rendered once with it; shown instead of it.

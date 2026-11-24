@@ -117,6 +117,7 @@ impl Local {
         self.generation.set(self.generation.get() + 1);
         self.watch(client.clone());
         self.hear_cloud(client.clone());
+        self.hear_notices(client.clone());
         self.emit(BackendEvent::Connected { server_addr: "this browser".to_string(), client_id: self.client_id.clone() });
         Ok(client)
     }
@@ -144,7 +145,8 @@ impl Local {
         let held = self.client.lock().await.clone();
         match held {
             Some(client) if client.is_connected() => {
-                self.hear_cloud(client);
+                self.hear_cloud(client.clone());
+                self.hear_notices(client);
                 self.emit(BackendEvent::Connected { server_addr: "this browser".to_string(), client_id: self.client_id.clone() });
             }
             _ => {
@@ -186,6 +188,22 @@ impl Local {
             while let Some(Ok(connection)) = sub.next().await {
                 let Some(me) = me.upgrade() else { return };
                 me.emit(BackendEvent::CloudConnectionChanged { connection });
+            }
+        });
+    }
+}
+
+impl Local {
+    /// The notices this browser's server receives for the account
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 4), for as long as `client`'s
+    /// connection lasts.
+    fn hear_notices(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        spawn_local(async move {
+            let Ok(mut sub) = client.subscribe_notices().await else { return };
+            while let Some(Ok(notice)) = sub.next().await {
+                let Some(me) = me.upgrade() else { return };
+                me.emit(BackendEvent::NoticeReceived { notice });
             }
         });
     }

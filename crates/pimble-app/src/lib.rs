@@ -5,7 +5,7 @@
 //! UI. Everything they share lives here:
 //!
 //! - [`app::build_view`] makes the application state and the root component.
-//!   [`app::run`] is the desktop entry point: it wraps that component in a
+//!   [`desktop::run`] is the desktop entry point: it wraps that component in a
 //!   window, a menu bar and the theme. The web entry point hands the same
 //!   component to `rinch_web::mount`.
 //! - [`protocol`] is the seam between the UI and whatever is behind it: the UI
@@ -36,9 +36,16 @@ pub mod editor;
 pub mod events;
 pub mod fields;
 pub mod hashtags;
+pub mod inbox;
+mod notice_show;
+mod notification_settings;
+pub mod watches;
 pub mod import;
 pub mod link_picker;
 pub mod links;
+pub mod app_links;
+pub mod web_links;
+pub mod mentions;
 pub mod menus;
 pub mod metanodes;
 pub mod metanode_setup;
@@ -71,6 +78,20 @@ pub mod toolbar;
 pub mod toolbar_fit;
 #[cfg(feature = "native")]
 pub mod update;
+/// The desktop window's life: opening, bringing to the front, closing into
+/// the tray or out of the app.
+#[cfg(feature = "native")]
+pub mod desktop;
+/// Which window process owns the tray and the notifications.
+#[cfg(feature = "native")]
+pub mod instance;
+/// The notices the window owning the tray showed, so one taking over shows
+/// the rest once.
+#[cfg(feature = "native")]
+mod shown_notices;
+/// The tray icon and closing the window into it.
+#[cfg(feature = "native")]
+pub mod tray;
 /// The Ed25519 key releases are signed with, the raw 32 bytes in base64
 /// (`tools/update-key.sh` writes it): desktop updates and the plugin library's
 /// plugins verify against it. Anything that is not such a key refuses both.

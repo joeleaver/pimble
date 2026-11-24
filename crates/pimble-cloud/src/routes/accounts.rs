@@ -122,11 +122,36 @@ pub struct UserView {
     /// What they are called where nothing more particular applies: the
     /// chosen name, else the local part of the email.
     name: String,
+    /// Whether people who share notes with them can notify them
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 6): on from sign-in.
+    notifications: bool,
+    /// Wave 2: whether an inbox item nobody has seen in fifteen minutes is
+    /// emailed (section 4).
+    notification_email: bool,
+    /// Wave 2: whether the browsers they subscribed are pushed their items.
+    notification_push: bool,
+    /// Wave 3: watched notes.
+    notification_watches: bool,
+    /// Wave 2, `GET /me` only: the service's VAPID public key, the
+    /// `applicationServerKey` a browser subscribes with; absent when this
+    /// service sends no pushes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_key: Option<String>,
 }
 
 impl From<&UserRow> for UserView {
     fn from(user: &UserRow) -> Self {
-        Self { id: user.user_uuid.clone(), email: user.email.clone(), display_name: user.display_name.clone(), name: user.default_name() }
+        Self {
+            id: user.user_uuid.clone(),
+            email: user.email.clone(),
+            display_name: user.display_name.clone(),
+            name: user.default_name(),
+            notifications: !user.notifications_off,
+            notification_email: !user.notify_email_off,
+            notification_push: !user.notify_push_off,
+            notification_watches: !user.notify_watches_off,
+            push_key: None,
+        }
     }
 }
 
@@ -296,7 +321,7 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
     // been invited to shares before it had an account. Best effort — a share
     // that cannot be handed over right now must not make verification itself
     // fail; the next login claims it.
-    super::stores::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user).await;
     Ok(redirect_to("/app/login?verified=1"))
 }
 
@@ -339,7 +364,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     // (claiming runs at every login). Verification
     // usually does this first; login covers an invitation sent afterwards,
     // and any claim that failed then.
-    super::stores::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user).await;
     issue_session(&state, &user).await
 }
 
@@ -349,8 +374,10 @@ pub async fn logout(State(state): State<AppState>, authed: AuthedUser) -> CloudR
     Ok((StatusCode::OK, [(SET_COOKIE, cookie)], Json(json!({}))).into_response())
 }
 
-pub async fn me(authed: AuthedUser) -> Json<UserView> {
-    Json(UserView::from(&authed.user))
+pub async fn me(State(state): State<AppState>, authed: AuthedUser) -> Json<UserView> {
+    let mut view = UserView::from(&authed.user);
+    view.push_key = state.vapid.as_ref().map(|v| v.public());
+    Json(view)
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────
@@ -360,6 +387,18 @@ pub struct MeKeysResponse {
     public_keys: AccountPublicKeys,
     kdf: KdfParams,
     account_key_blob: AccountKeyBlob,
+    /// The notice key (docs/NOTIFICATIONS_CONTRACT.md section 2), absent
+    /// until the account's first signed-in device of wave 1 makes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<NoticeKeyView>,
+}
+
+/// An account's notice key as its own devices fetch it: the public half and
+/// the secret sealed to the account.
+#[derive(Serialize)]
+pub struct NoticeKeyView {
+    public_key: String,
+    envelope: Value,
 }
 
 /// `GET /api/v1/me/keys` — never the recovery blob (docs/CRYPTO_CONTRACT.md).
@@ -377,7 +416,13 @@ pub async fn me_keys(authed: AuthedUser) -> CloudResult<Json<MeKeysResponse>> {
     let account_key_blob_json = user.account_key_blob.as_deref().ok_or_else(no_keys)?;
     let account_key_blob: AccountKeyBlob =
         serde_json::from_str(account_key_blob_json).map_err(|e| CloudError::Internal(format!("stored account_key_blob is not valid JSON: {e}")))?;
-    Ok(Json(MeKeysResponse { public_keys, kdf, account_key_blob }))
+    let notice_key = if user.notice_public_key.is_empty() {
+        None
+    } else {
+        let envelope = serde_json::from_str(&user.notice_key_envelope).map_err(|e| CloudError::Internal(format!("stored notice key envelope is not valid JSON: {e}")))?;
+        Some(NoticeKeyView { public_key: user.notice_public_key.clone(), envelope })
+    };
+    Ok(Json(MeKeysResponse { public_keys, kdf, account_key_blob, notice_key }))
 }
 
 #[derive(Deserialize)]
@@ -389,6 +434,9 @@ pub struct UsersLookupQuery {
 pub struct UserLookupResponse {
     id: String,
     public_keys: AccountPublicKeys,
+    /// The notice key's public half, absent until the account has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice_key: Option<String>,
 }
 
 /// `GET /api/v1/users/lookup?email=` — a verified user's id and public keys
@@ -411,7 +459,8 @@ pub async fn users_lookup(State(state): State<AppState>, authed: AuthedUser, Que
         .filter(|u| u.verified && u.has_key_material())
         .ok_or_else(|| CloudError::NotFound("no such user".to_string()))?;
     let public_keys = user.public_keys().ok_or_else(|| CloudError::Internal("user has key material but public_keys() failed".to_string()))?;
-    Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys }))
+    let notice_key = Some(user.notice_public_key.clone()).filter(|k| !k.is_empty());
+    Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys, notice_key }))
 }
 
 // ── Recovery (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ─────────────────────
@@ -595,6 +644,9 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
             }
         }
         state.db.delete_grant(grant.rid).await?;
+        // The account held the store through this grant: what its watchers
+        // hold changed.
+        state.watch_interest.changed([grant.store_uuid.clone()]);
     }
     for key_grant in state.db.key_grants_for_user(user.rid).await? {
         state.db.delete_key_grant(key_grant.rid).await?;
@@ -603,6 +655,12 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
         state.db.delete_session(session.rid).await?;
     }
     state.db.delete_share_names_for_user(user.rid).await?;
+    for item in state.db.inbox_of(&user.user_uuid).await? {
+        state.db.delete_inbox_item(item.rid).await?;
+    }
+    for sub in state.db.push_subscriptions_of(&user.user_uuid).await? {
+        state.db.delete_push_subscription(sub.rid).await?;
+    }
     state.db.delete_user(user.rid).await?;
 
     Ok(Json(json!({})))

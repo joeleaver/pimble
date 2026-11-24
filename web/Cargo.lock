@@ -2327,6 +2327,7 @@ dependencies = [
 name = "pimble-discussion"
 version = "0.30.2"
 dependencies = [
+ "chrono",
  "pimble-core",
  "pimble-crdt",
  "thiserror 2.0.20",
@@ -2475,6 +2476,7 @@ name = "pimble-server"
 version = "0.30.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",

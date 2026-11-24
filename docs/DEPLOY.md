@@ -67,6 +67,8 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 | `PIMBLE_MAIL_FROM` | `Pimble <no-reply@m.pimble.app>` |
 | `PIMBLE_CLOUD_PUBLIC_URL` | `https://pimble.app` -- used for the session cookie's `Secure` flag and, in development-signing mode only, as the fallback token issuer |
 | `PIMBLE_STORES_DIR` | `/app/data/stores` -- must match the path `pimble-cli server --stores-dir` is given in `jkbase.toml`; `pimble-cloud` uses this same value when it asks the server to create a store |
+| `PIMBLE_VAPID_PRIVATE_KEY` | This service's Web Push (VAPID) key for notifications (docs/NOTIFICATIONS_CONTRACT.md, wave 2): run `pimble-cloud --generate-vapid-key` once and set the private value it prints. Keep it: browsers subscribe to the matching public key, so a new key ends every existing push subscription (they come back as each browser next opens Pimble). Unset means no web push; the switch still shows and email still works |
+| `PIMBLE_VAPID_SUBJECT` | `mailto:no-reply@m.pimble.app` (the default) -- the contact push services may use about this service's pushes |
 
 `pimble-cloud`'s own `RHYPEDB_ADDR` (`127.0.0.1:4201`) and `PIMBLE_SERVER_URL`
 (`http://127.0.0.1:7462`) are the loopback defaults baked into the same VM and don't need a

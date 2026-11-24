@@ -1405,6 +1405,37 @@ pub(crate) const APP_CSS: &str = "
     cursor: pointer;
 }
 
+.pimble-discussion__mention {
+    color: var(--rinch-primary-color);
+    font-weight: 600;
+}
+
+.pimble-discussion__mention-offers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 4px 0;
+}
+
+.pimble-discussion__mention-offer {
+    border: 1px solid var(--rinch-color-default-border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 12px;
+    background: var(--rinch-color-default);
+    color: var(--rinch-color-text);
+    cursor: pointer;
+}
+
+.pimble-discussion__mention-offer:first-child {
+    border-color: var(--rinch-primary-color);
+}
+
+.pimble-discussion__mention--gone {
+    color: var(--rinch-color-dimmed);
+    font-weight: normal;
+}
+
 .pimble-discussion__actions {
     display: flex;
     gap: 10px;
@@ -1601,6 +1632,71 @@ pub(crate) const APP_CSS: &str = "
     margin: 0;
     max-height: 60vh;
     overflow: auto;
+}
+
+/* View > Inbox: mentions and replies (docs/NOTIFICATIONS_CONTRACT.md section 5). */
+.pimble-inbox {
+    max-height: 40vh;
+    overflow: auto;
+    margin-bottom: 12px;
+}
+
+.pimble-inbox__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.pimble-inbox__heading {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--rinch-color-dimmed);
+    padding: 6px 12px 4px;
+}
+
+.pimble-inbox__row {
+    padding: 8px 12px;
+    border-top: 1px solid var(--rinch-color-border);
+    cursor: pointer;
+}
+
+.pimble-inbox__row:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-inbox__row--unread .pimble-inbox__title {
+    font-weight: 600;
+}
+
+.pimble-inbox__row--unread .pimble-inbox__title::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--rinch-primary-color);
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+.pimble-inbox__title {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 14px;
+}
+
+.pimble-inbox__when,
+.pimble-inbox__where {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-inbox__snippet {
+    font-size: 13px;
+    margin-top: 2px;
 }
 
 .pimble-tree-discussions__unread {
@@ -4031,6 +4127,9 @@ pub(crate) const APP_CSS: &str = "
     flex-direction: column;
     gap: 10px;
 }
+.pimble-settings__section + .pimble-settings__section {
+    margin-top: 24px;
+}
 
 .pimble-settings__heading {
     font-size: 14px;
@@ -4174,6 +4273,18 @@ pub(crate) const APP_CSS: &str = "
 
 /* Restart to update (docs/UPDATE_CONTRACT.md): the one thing on the bar that
    asks for a click, so in the accent. */
+.pimble-status-bar__inbox {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--rinch-primary-color-6);
+    cursor: pointer;
+    margin-right: 8px;
+}
+
+.pimble-status-bar__inbox:hover {
+    text-decoration: underline;
+}
+
 .pimble-status-bar__update {
     font-size: 11px;
     color: var(--rinch-primary-color-6);
@@ -4341,6 +4452,24 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-hashtag {
     color: var(--rinch-primary-color-4);
+}
+
+/* Mentions (docs/NOTIFICATIONS_CONTRACT.md section 1, mentions.rs): the accent on a
+   tint, which neither pads nor sizes anything, so the text lays out as before. A
+   mention of someone who can no longer open the note is greyed. */
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention {
+    color: var(--rinch-primary-color-7);
+    background: var(--rinch-primary-color-0);
+    border-radius: 3px;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-mention {
+    color: var(--rinch-primary-color-3);
+    background: rgba(255, 255, 255, 0.06);
+}
+.pimble-editor__content-wrap > [data-pm-editor] .pimble-mention.pimble-mention--gone,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] .pimble-mention.pimble-mention--gone {
+    color: var(--rinch-color-dimmed);
+    background: transparent;
 }
 
 /* Text color (docs/TEXT_COLOR_CONTRACT.md, text_color.rs). The stored color is the

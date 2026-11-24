@@ -369,6 +369,11 @@ impl PimbleServer {
         let handler = self.make_handler(agents, jwt_configured, true);
         // The keystore is read before the first call, as it always was.
         handler.keystore().load().await;
+        // Notices for whoever is signed in; never on a relay face or a
+        // server that verifies Pimble Cloud's tokens (nobody signs in there).
+        if !self.face && !jwt_configured {
+            handler.restart_notices();
+        }
         let methods = handler.clone().into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);
@@ -467,6 +472,9 @@ impl PimbleServer {
         };
         let handler = self.make_handler(agents, false, false);
         handler.keystore().load().await;
+        if !self.face {
+            handler.restart_notices();
+        }
         Ok(())
     }
 
@@ -510,8 +518,10 @@ impl PimbleServer {
             // The folder watches too, for the same reason: each is a task
             // that merges into the stores this server holds.
             handler.stop_folder_watches();
+            handler.stop_notices();
             handler.stop_links().await;
             handler.relay().stop().await;
+            handler.stop_writes();
         }
 
         // Flush any pending tree/content changes before the handle stops, so

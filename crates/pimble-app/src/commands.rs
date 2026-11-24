@@ -243,6 +243,21 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Err(e) => failed(e),
         },
 
+        C::NameNodes { nodes } => {
+            let mut names = Vec::with_capacity(nodes.len());
+            for (store_id, node_id) in nodes {
+                let name = match api.node(Addr::new(store_id, node_id)).await {
+                    Ok(node) => Some(crate::state::display_label_from_node(&node)),
+                    Err(e) => {
+                        tracing::debug!("The note {node_id} a notice names is not read here: {}", error_message(&e));
+                        None
+                    }
+                };
+                names.push(((store_id, node_id), name));
+            }
+            Some(BackendEvent::NotesNamed { names })
+        }
+
         C::LoadChildren { store_id, nodes } => {
             use futures::StreamExt;
             let listings = nodes.into_iter().map(|node_id| async move { (node_id, api.listing(Addr::new(store_id, node_id)).await) });
@@ -1054,6 +1069,119 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             }
         }
 
+        BackendCommand::ListNotices => {
+            let c = ctx.host.as_ref()?;
+            match c.list_notices().await {
+                Ok(listed) => Some(notices_listed(listed)),
+                Err(e) => {
+                    tracing::debug!("notices not listed: {e}");
+                    None
+                }
+            }
+        }
+
+        BackendCommand::AcknowledgeNotices { ids } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.acknowledge_notices(ids).await {
+                tracing::debug!("notices not acknowledged: {e}");
+            }
+            None
+        }
+
+        BackendCommand::AppLinkTaken { ack } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.app_link_taken(ack).await {
+                tracing::debug!("the link taken was not confirmed: {e}");
+            }
+            None
+        }
+
+        BackendCommand::SetNotifications { on } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });
+            };
+            if let Err(e) = c.set_notifications(on).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() });
+            }
+            match c.list_notices().await {
+                Ok(listed) => Some(notices_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::SetNotificationChannels { email, push } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });
+            };
+            if let Err(e) = c.set_notification_channels(email, push).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() });
+            }
+            match c.list_notices().await {
+                Ok(listed) => Some(notices_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::SetWatchesOn { on } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });
+            };
+            if let Err(e) = c.set_watches_on(on).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() });
+            }
+            match c.list_watches().await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::WatchNode { store_id, node_id, subtree } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Watches, message: "Not connected".into() });
+            };
+            match c.watch_node(store_id, node_id, subtree).await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Watches, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::UnwatchNode { store_id, node_id } => {
+            let Some(c) = ctx.host.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Watches, message: "Not connected".into() });
+            };
+            match c.unwatch_node(store_id, node_id).await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Watches, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListWatches => {
+            let c = ctx.host.as_ref()?;
+            match c.list_watches().await {
+                Ok(listed) => Some(watches_listed(listed)),
+                Err(e) => {
+                    tracing::debug!("watches not listed: {e}");
+                    None
+                }
+            }
+        }
+
+        BackendCommand::RegisterPush { endpoint, p256dh, auth } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.register_push(endpoint, p256dh, auth).await {
+                tracing::info!("this browser's push subscription was not registered: {e}");
+            }
+            None
+        }
+
+        BackendCommand::UnregisterPush { endpoint } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.unregister_push(endpoint).await {
+                tracing::debug!("this browser's push subscription was not taken back: {e}");
+            }
+            None
+        }
+
         BackendCommand::CloudHostStore { store_id } => {
             let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::HostStore, message: "Not connected".into() });
@@ -1317,4 +1445,12 @@ mod tests {
         let wide = described(&"ééééé", 4);
         assert!(wide.starts_with("\"é") && wide.ends_with("..."), "{wide}");
     }
+}
+
+fn notices_listed(listed: pimble_rpc::ListNoticesResponse) -> BackendEvent {
+    BackendEvent::NoticesListed { notices: listed.notices, on: listed.on, email: listed.email, push: listed.push, push_key: listed.push_key, watches: listed.watches }
+}
+
+fn watches_listed(listed: pimble_rpc::ListWatchesResponse) -> BackendEvent {
+    BackendEvent::WatchesListed { watches: listed.watches, on: listed.on }
 }

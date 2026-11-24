@@ -89,6 +89,20 @@ mod imp {
         write_state(&state);
     }
 
+    /// Whether closing the window keeps Pimble in the tray, and whether the
+    /// notice saying so was shown (`crate::tray`; on and not yet shown when
+    /// nothing is saved).
+    pub(crate) fn load_tray_settings() -> crate::tray::TraySettings {
+        crate::tray::TraySettings::from_state(&read_state())
+    }
+
+    /// Save the tray's settings, keeping every other saved preference.
+    pub(crate) fn save_tray_settings(settings: crate::tray::TraySettings) {
+        let mut state = read_state();
+        settings.write_into(&mut state);
+        write_state(&state);
+    }
+
     /// The window's zoom on this device (docs/ZOOM_CONTRACT.md), actual
     /// size when nothing is saved.
     pub(crate) fn load_zoom() -> f64 {
@@ -493,7 +507,7 @@ pub(crate) use imp::{
 pub(crate) use imp::{load_zoom, save_zoom};
 pub(crate) use imp::{load_views_json, save_views_json};
 #[cfg(feature = "native")]
-pub(crate) use imp::{load_window, save_window};
+pub(crate) use imp::{load_tray_settings, load_window, save_tray_settings, save_window};
 
 #[cfg(test)]
 mod tests {

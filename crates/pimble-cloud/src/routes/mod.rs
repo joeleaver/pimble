@@ -1,13 +1,19 @@
 mod accounts;
 mod diagnostics;
+pub mod inbox;
+mod members;
 mod misc;
 mod people;
+mod store_keys;
 mod stores;
+mod watches;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::state::AppState;
+
+pub use inbox::InboxWakers;
 
 /// Everything under `/api/v1` (docs/CLOUD_CONTRACT.md: "serving under
 /// `/api/v1`", including `/health` and `/.well-known/jwks.json` — see
@@ -26,6 +32,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/me/shares/:store_id", axum::routing::put(people::put_share_name))
         .route("/api/v1/me/keys", get(accounts::me_keys))
         .route("/api/v1/me/personal", get(accounts::get_personal).put(accounts::put_personal).delete(accounts::delete_personal))
+        .route("/api/v1/me/notice-key", axum::routing::put(inbox::put_notice_key))
+        .route("/api/v1/me/notifications", axum::routing::put(inbox::put_notifications))
+        .route("/api/v1/me/watches", get(watches::get_watches))
+        .route("/api/v1/me/watches/choices", axum::routing::put(watches::put_choices))
+        .route("/api/v1/me/watches/stores/:store_id", axum::routing::put(watches::put_store_docs))
+        .route("/api/v1/watches/writes", post(watches::post_relay_writes))
+        .route("/api/v1/inbox", get(inbox::drain).delete(inbox::clear))
+        .route("/api/v1/inbox/ack", post(inbox::ack))
+        .route("/api/v1/inbox/seen/:item", post(inbox::seen))
+        .route("/api/v1/me/push", post(inbox::post_push).delete(inbox::delete_push))
+        .route("/api/v1/inbox/:recipient", post(inbox::post_notice))
         .route("/api/v1/me/password", post(accounts::change_password))
         .route("/api/v1/me/recovery-code", post(accounts::change_recovery_code))
         .route("/api/v1/users/lookup", get(accounts::users_lookup))
@@ -36,10 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/token", post(accounts::mint_token))
         .route("/api/v1/stores", get(stores::list_stores).post(stores::create_store))
         .route("/api/v1/stores/:id", delete(stores::delete_store))
-        .route("/api/v1/stores/:id/members", get(stores::list_members).put(stores::put_member))
-        .route("/api/v1/stores/:id/members/:user_id", delete(stores::delete_member))
-        .route("/api/v1/stores/:id/invitations/:email", delete(stores::delete_invitation))
-        .route("/api/v1/stores/:id/keys", get(stores::get_store_keys).put(stores::put_store_keys))
+        .route("/api/v1/stores/:id/members", get(members::list_members).put(members::put_member))
+        .route("/api/v1/stores/:id/members/:user_id", delete(members::delete_member))
+        .route("/api/v1/stores/:id/invitations/:email", delete(members::delete_invitation))
+        .route("/api/v1/stores/:id/keys", get(store_keys::get_store_keys).put(store_keys::put_store_keys))
         // The relay (docs/RELAY_CONTRACT.md), both WebSockets: the owner's
         // tunnel, and a member's connection to the store behind one.
         .route("/api/v1/relay", get(crate::relay::owner_tunnel))

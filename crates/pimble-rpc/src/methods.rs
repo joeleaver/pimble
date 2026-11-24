@@ -11,6 +11,8 @@ use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc_macros::pimble_api;
 
+use crate::app_links::*;
+use crate::notices::*;
 use crate::types::*;
 
 /// Pimble RPC API
@@ -369,9 +371,71 @@ pub trait PimbleApi {
     /// or a mail app starts `pimble <link>`): handed to one Pimble window
     /// listening through `subscribeAppLinks`, the one open longest.
     /// `delivered` is false when none is, and the caller opens a window of its
-    /// own. `Service`-only.
+    /// own. With `confirm`, `delivered` waits for the window's
+    /// `appLinkTaken`, and is false if none comes within
+    /// `APP_LINK_CONFIRM_WAIT_MS`. `Service`-only.
     #[method(name = "openInApp", with_extensions)]
     async fn open_in_app(&self, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned>;
+
+    /// A window acted on a link `subscribeAppLinks` handed it with an `ack`
+    /// (it came to the front and opened it): the `openInApp` waiting on it
+    /// answers `delivered`. `Service`-only.
+    #[method(name = "appLinkTaken", with_extensions)]
+    async fn app_link_taken(&self, request: AppLinkTakenRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// The notices this device has received (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 5), and whether notifications are on. `Service`-only, as are
+    /// the three below.
+    #[method(name = "listNotices", with_extensions)]
+    async fn list_notices(&self) -> Result<ListNoticesResponse, ErrorObjectOwned>;
+
+    /// The person opened these notices: the accounts service may forget them.
+    #[method(name = "acknowledgeNotices", with_extensions)]
+    async fn acknowledge_notices(&self, request: AcknowledgeNoticesRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Turn notifications on or off for the signed-in account.
+    #[method(name = "setNotifications", with_extensions)]
+    async fn set_notifications(&self, request: SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// A browser subscribed to web push (wave 2): the subscription goes to
+    /// the accounts service, and is taken back when the account signs out.
+    #[method(name = "registerPush", with_extensions)]
+    async fn register_push(&self, request: RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// A browser's push subscription ended.
+    #[method(name = "unregisterPush", with_extensions)]
+    async fn unregister_push(&self, request: UnregisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Hear each notice as it arrives, opened.
+    #[subscription(name = "subscribeNotices" => "noticeReceived", unsubscribe = "unsubscribeNotices", item = Notice, with_extensions)]
+    async fn subscribe_notices(&self) -> SubscriptionResult;
+
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3, wave 3): kept with the signed-in account, so every device of
+    /// theirs watches it, and registered as opaque document ids. Answers the
+    /// watches as they are now. `Service`-only, as are the two below.
+    #[method(name = "watchNode", with_extensions)]
+    async fn watch_node(&self, request: WatchNodeRequest) -> Result<ListWatchesResponse, ErrorObjectOwned>;
+
+    /// Stop watching a node (or the subtree watch that reaches it).
+    #[method(name = "unwatchNode", with_extensions)]
+    async fn unwatch_node(&self, request: UnwatchNodeRequest) -> Result<ListWatchesResponse, ErrorObjectOwned>;
+
+    /// The watches the signed-in account chose, and whether they are on.
+    #[method(name = "listWatches", with_extensions)]
+    async fn list_watches(&self) -> Result<ListWatchesResponse, ErrorObjectOwned>;
+
+    /// Hear the writes signed-in people make to node documents on this
+    /// server (section 3): what the accounts service gathers watches from on
+    /// the hosted server. (An owner's server hears its relay face's in its
+    /// own process.) `Service`-only.
+    #[subscription(name = "subscribeWrites" => "writeSeen", unsubscribe = "unsubscribeWrites", item = WriteSeen, with_extensions)]
+    async fn subscribe_writes(&self) -> SubscriptionResult;
+
+    /// Name the documents whose writes `subscribeWrites` tells (section 3):
+    /// the hosted server tells nothing else. `Service`-only.
+    #[method(name = "setWriteInterest", with_extensions)]
+    async fn set_write_interest(&self, request: SetWriteInterestRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
     /// A Pimble window hears the links `openInApp` hands it, each with the
     /// activation token it came with, if any. `Service`-only.

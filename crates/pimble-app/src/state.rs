@@ -468,6 +468,8 @@ pub fn display_label_from_node(node: &Node) -> String {
 pub struct LinkTooltip {
     /// The target: a note's title and store, a sentence, or a web link's URL.
     pub target: String,
+    /// The line under it: how to open the link (nothing for a mention).
+    pub hint: &'static str,
     pub x: f32,
     pub y: f32,
 }
@@ -941,6 +943,24 @@ pub struct AppStore {
     /// and the discussions the open stores hold (`ListDiscussions`).
     pub discussions_modal: Signal<bool>,
     pub all_discussions: Signal<Vec<(StoreId, NodeId)>>,
+    /// The notices this device has received, newest first
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 5): what View > "Inbox..."
+    /// lists and the status bar counts (the unread ones, by the personal
+    /// document).
+    pub notices: Signal<Vec<pimble_rpc::Notice>>,
+    /// The names of the notes notices name that no view holds, as this
+    /// device read them for the Inbox (`NotesNamed`, `crate::inbox::named`).
+    pub notice_names: Signal<std::collections::HashMap<(StoreId, NodeId), String>>,
+    /// Whether notifications are on for the account (section 6): the switch
+    /// in the Account window and in Settings.
+    pub notifications_on: Signal<bool>,
+    /// Wave 2: the email fallback's switch, and web push's.
+    pub notify_email: Signal<bool>,
+    pub notify_push: Signal<bool>,
+    /// Wave 3: whether changes to watched notes are told, and the watches
+    /// the account chose (`crate::watches`); nothing is watched by default.
+    pub notify_watches: Signal<bool>,
+    pub watches: Signal<Vec<pimble_rpc::WatchEntry>>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1226,6 +1246,13 @@ impl AppStore {
             attachments: Signal::new(HashMap::new()),
             read_version: Signal::new(0),
             personal_sync: Signal::new(crate::persistence::load_personal_sync()),
+            notices: Signal::new(Vec::new()),
+            notice_names: Signal::new(std::collections::HashMap::new()),
+            notifications_on: Signal::new(true),
+            notify_email: Signal::new(true),
+            notify_push: Signal::new(true),
+            notify_watches: Signal::new(true),
+            watches: Signal::new(Vec::new()),
             discussions_modal: Signal::new(false),
             all_discussions: Signal::new(Vec::new()),
         }

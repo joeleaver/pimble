@@ -91,6 +91,10 @@ pub enum BackendCommand {
     /// when nobody is signed in.
     SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
+    /// The notes notices name, read from this device's documents for the
+    /// names they are shown under (`crate::inbox`): answered with their
+    /// names alone (`NotesNamed`), never as nodes for the tree.
+    NameNodes { nodes: Vec<(StoreId, NodeId)> },
     /// What this device may do in a store changed (a role, a read-only
     /// root), which no document says: the server's judgement of these nodes
     /// (the ones the window shows) is asked again, once, and answered as
@@ -338,6 +342,42 @@ pub enum BackendCommand {
     CloudSignIn { url: String, email: String, password: String },
     /// Forget the signed-in account (`CloudStatusChanged` with `signed_in: false`).
     CloudSignOut,
+    /// The notices this device has received, and whether notifications are
+    /// on (docs/NOTIFICATIONS_CONTRACT.md section 5). Answers `NoticesListed`.
+    ListNotices,
+    /// The person opened these notices: acknowledged to the accounts
+    /// service. Answers nothing.
+    AcknowledgeNotices { ids: Vec<String> },
+    /// This window acted on the link the server handed it with `ack`
+    /// (`BackendEvent::AppLink`): it came to the front and opened it, and the
+    /// launch that handed it over may stop (`appLinkTaken`). Answers nothing.
+    AppLinkTaken { ack: u64 },
+    /// Notifications on or off for the account (section 6). Answers
+    /// `NoticesListed`, or `CloudError { op: Notifications }`.
+    SetNotifications { on: bool },
+    /// Wave 2's channels for the account, one or both: the email fallback,
+    /// web push. Answers `NoticesListed`, or `CloudError { op: Notifications }`.
+    SetNotificationChannels { email: Option<bool>, push: Option<bool> },
+    /// Wave 3: watched notes on or off for the account; off deletes every
+    /// watch. Answers `NoticesListed` and then `WatchesListed`, or
+    /// `CloudError { op: Notifications }`.
+    SetWatchesOn { on: bool },
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3). Answers `WatchesListed`, or `CloudError { op: Watches }`
+    /// with the sentence that refused it.
+    WatchNode { store_id: StoreId, node_id: NodeId, subtree: bool },
+    /// Stop watching a node: its own watch, or else the subtree watch that
+    /// reaches it from nearest above. Answers `WatchesListed`, or
+    /// `CloudError { op: Watches }`.
+    UnwatchNode { store_id: StoreId, node_id: NodeId },
+    /// The watches the account chose. Answers `WatchesListed`.
+    ListWatches,
+    /// This browser subscribed to web push (wave 2): handed to the server,
+    /// which gives it to the accounts service and takes it back at sign-out.
+    /// Answers nothing.
+    RegisterPush { endpoint: String, p256dh: String, auth: String },
+    /// This browser's push subscription ended. Answers nothing.
+    UnregisterPush { endpoint: String },
     /// Host a local store's encrypted twin on Pimble Cloud (`CloudStoreHosted`).
     CloudHostStore { store_id: StoreId },
     /// Every store the signed-in account has a grant on (`CloudHostedStoresListed`).
@@ -463,6 +503,10 @@ pub enum CloudOp {
     StopSharing,
     /// The Shares dialog: listing shares, setting a name.
     Shares,
+    /// The notifications switch (docs/NOTIFICATIONS_CONTRACT.md section 6).
+    Notifications,
+    /// Watching or unwatching a node (section 3, wave 3).
+    Watches,
 }
 
 /// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
@@ -741,10 +785,24 @@ pub enum BackendEvent {
     /// the server whenever it changes; `None` while signed out (desktop only:
     /// the browser's connection is to Pimble Cloud itself).
     CloudConnectionChanged { connection: Option<pimble_rpc::CloudConnection> },
+    /// A notice arrived: someone mentioned this person, or answered them
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 4), heard from the server.
+    NoticeReceived { notice: pimble_rpc::Notice },
+    /// The names `NameNodes` asked for, as the explorer would show them;
+    /// `None` for a note this device cannot read.
+    NotesNamed { names: Vec<((StoreId, NodeId), Option<String>)> },
+    /// The notices this device keeps, newest first, and whether
+    /// notifications are on (`ListNotices`, `SetNotifications`).
+    NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String>, watches: bool },
+    /// The watches the account chose, and whether watched notes are on
+    /// (`ListWatches`, `WatchNode`, `UnwatchNode`, `SetWatchesOn`).
+    WatchesListed { watches: Vec<pimble_rpc::WatchEntry>, on: bool },
     /// A `pimble:` link this computer was asked to open, handed to this window
     /// by the server (`openInApp`; desktop only), with the activation token
-    /// the program that was asked came with, to come to the front with.
-    AppLink { url: String, activation_token: Option<String> },
+    /// the program that was asked came with, to come to the front with, and
+    /// the number to confirm it with once acted on (`AppLinkTaken`), when
+    /// the launch that handed it waits to hear.
+    AppLink { url: String, activation_token: Option<String>, ack: Option<u64> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.
     CloudError { op: CloudOp, message: String },

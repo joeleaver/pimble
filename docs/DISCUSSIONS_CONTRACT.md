@@ -443,7 +443,9 @@ member's reply reaching the owner.
 
 - **@mentions**, once people and presence exist (Joe, 2026-10-21: wanted, deferred until
   presence). A mention is a node-link-like atom naming an account `sub`. The mentioned
-  person's unread view lifts it, and nothing is sent anywhere.
+  person's unread view lifts it, and nothing is sent anywhere. **Superseded** by
+  docs/NOTIFICATIONS_CONTRACT.md section 1; mentions as text were built there in wave 0
+  (2026-11-23), as a link to `pimble-person:<sub>`.
 - **Comments on a range of text**: an anchor with two sticky positions instead of one,
   shown as a highlight and the margin marker (it needs a third general rinch mechanism:
   decorations over a range that aren't marks in the document).

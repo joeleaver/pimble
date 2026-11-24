@@ -72,7 +72,97 @@ impl Body {
         let chars: Vec<char> = md.trim().chars().collect();
         let mut out = Vec::new();
         parse(&chars, Format::default(), &mut out);
-        Self { spans: out }.normalized()
+        Self { spans: out }.normalized().with_mention_ids()
+    }
+
+    /// Every mention of a person in the body (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 1): a link to a `pimble-person:` href, adjacent spans with the
+    /// same href one mention.
+    pub fn mentions(&self) -> Vec<pimble_core::mention::Mention> {
+        let mut out: Vec<pimble_core::mention::Mention> = Vec::new();
+        let mut open: Option<(&str, String)> = None;
+        for span in &self.spans {
+            match (span.link.as_deref().filter(|h| pimble_core::mention::parse_href(h).is_some()), open.as_mut()) {
+                (Some(href), Some((current, words))) if *current == href => words.push_str(&span.text),
+                (Some(href), _) => {
+                    if let Some((href, words)) = open.take() {
+                        out.extend(pimble_core::mention::Mention::from_link(href, &words));
+                    }
+                    open = Some((href, span.text.clone()));
+                }
+                (None, _) => {
+                    if let Some((href, words)) = open.take() {
+                        out.extend(pimble_core::mention::Mention::from_link(href, &words));
+                    }
+                }
+            }
+        }
+        if let Some((href, words)) = open.take() {
+            out.extend(pimble_core::mention::Mention::from_link(href, &words));
+        }
+        out
+    }
+
+    /// The body with every `@Name` typed as plain text, for a `(name,
+    /// account)` in `picked`, made a mention of that account (the message box
+    /// shows `@Name` as it was picked, and this links it as the message is
+    /// sent). The longest name is tried first, so `@Will Smith` is not taken
+    /// for `@Will`; text in links is left alone.
+    pub fn with_picked_mentions(self, picked: &[(String, String)]) -> Self {
+        if picked.is_empty() {
+            return self;
+        }
+        let mut names: Vec<&(String, String)> = picked.iter().filter(|(name, _)| !name.trim().is_empty()).collect();
+        names.sort_by_key(|(name, _)| std::cmp::Reverse(name.chars().count()));
+        let mut spans = Vec::new();
+        for span in self.spans {
+            if span.link.is_some() {
+                spans.push(span);
+                continue;
+            }
+            let mut rest = span.text.as_str();
+            'scan: while !rest.is_empty() {
+                let mut search_from = 0;
+                while let Some(at) = rest[search_from..].find('@').map(|i| i + search_from) {
+                    let starts_word = rest[..at].chars().last().map_or(true, |c| c.is_whitespace() || "([{\"'".contains(c));
+                    let after = &rest[at + 1..];
+                    let hit = starts_word.then(|| names.iter().find(|(name, _)| {
+                        after.starts_with(name.as_str()) && after[name.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric())
+                    })).flatten();
+                    if let Some((name, account)) = hit {
+                        spans.push(Span { text: rest[..at].to_string(), ..span.clone() });
+                        let mention = pimble_core::mention::Mention::new(account, name);
+                        spans.push(Span { text: mention.words(), link: Some(mention.href()), ..span.clone() });
+                        rest = &after[name.len()..];
+                        continue 'scan;
+                    }
+                    search_from = at + 1;
+                }
+                spans.push(Span { text: rest.to_string(), ..span.clone() });
+                break;
+            }
+        }
+        Self { spans }.normalized()
+    }
+
+    /// Each mention written without an id given one, the spans of one mention
+    /// one id.
+    fn with_mention_ids(mut self) -> Self {
+        let mut last: Option<(String, String)> = None;
+        for span in &mut self.spans {
+            let Some((account, None)) = span.link.as_deref().and_then(pimble_core::mention::parse_href) else {
+                last = None;
+                continue;
+            };
+            let written = span.link.clone().unwrap_or_default();
+            let given = match &last {
+                Some((was, given)) if *was == written => given.clone(),
+                _ => pimble_core::mention::href(&account, Some(&pimble_core::mention::new_id())),
+            };
+            last = Some((written, given.clone()));
+            span.link = Some(given);
+        }
+        self
     }
 
     /// The body as the Markdown [`Body::from_markdown`] reads back as it.
@@ -253,6 +343,32 @@ mod tests {
 
     fn span(text: &str, bold: bool, italic: bool, link: Option<&str>) -> Span {
         Span { text: text.into(), bold, italic, link: link.map(str::to_string) }
+    }
+
+    #[test]
+    fn picked_names_become_mentions_as_the_message_is_sent() {
+        let picked = vec![("Will".to_string(), "w1".to_string()), ("Will Smith".to_string(), "w2".to_string())];
+        let body = Body::from_markdown("@Will Smith and @Will, not me@Will or @Willow, see [@Will](https://x)").with_picked_mentions(&picked);
+        let found = body.mentions();
+        assert_eq!(found.iter().map(|m| (m.account.as_str(), m.name.as_str())).collect::<Vec<_>>(), vec![("w2", "Will Smith"), ("w1", "Will")]);
+        assert!(found.iter().all(|m| m.id.is_some()));
+        assert!(body.text().contains("me@Will or @Willow"), "inside a word, or a longer word, is text: {}", body.text());
+        assert_eq!(Body::from_markdown("plain").with_picked_mentions(&picked), Body::plain("plain"));
+    }
+
+    #[test]
+    fn mentions_are_links_to_a_person_and_keep_their_ids() {
+        let body = Body::from_markdown("[@Will](pimble-person:w1?m=aa) can you check? cc [@Sam **S**](pimble-person:s2)");
+        let found = body.mentions();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!((found[0].account.as_str(), found[0].id.as_deref(), found[0].name.as_str()), ("w1", Some("aa"), "Will"));
+        assert_eq!((found[1].account.as_str(), found[1].name.as_str()), ("s2", "Sam S"));
+        let minted = found[1].id.clone().expect("a mention typed without an id is given one");
+        // Editing the message writes it back with the ids, so an edit adds no mention.
+        let again = Body::from_markdown(&body.to_markdown());
+        assert_eq!(again.mentions(), found);
+        assert!(again.to_markdown().contains(&format!("pimble-person:s2?m={minted}")));
+        assert!(pimble_core::mention::added(&found, &again.mentions(), None).is_empty());
     }
 
     #[test]

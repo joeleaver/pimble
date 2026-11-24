@@ -58,6 +58,11 @@ struct AccountSession {
     session: String,
     encryption_secret: String,
     signing_secret: String,
+    /// The account's notice key, unwrapped (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 2): its secret, base64url. Absent until this device has
+    /// fetched or made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notice_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +102,10 @@ pub struct Keystore {
     /// elsewhere): nothing that needs it is tried again until a sign-in.
     /// In memory: a restart tries once, and learns it again.
     expired: std::sync::atomic::AtomicBool,
+    /// One save at a time, each of what is held when it starts: two saves
+    /// at once (a store key added while the notice key is kept) wrote the
+    /// same temporary file and the second rename found it gone.
+    saving: tokio::sync::Mutex<()>,
 }
 
 impl Keystore {
@@ -113,7 +122,7 @@ impl Keystore {
     /// The keystore resting wherever `rest` keeps it. Nothing is read until
     /// [`Keystore::load`] or the first use.
     pub fn resting(rest: Arc<dyn KeyRest>) -> Self {
-        Self { rest, data: OnceCell::new(), expired: std::sync::atomic::AtomicBool::new(false) }
+        Self { rest, data: OnceCell::new(), expired: std::sync::atomic::AtomicBool::new(false), saving: tokio::sync::Mutex::new(()) }
     }
 
     /// Read what rests, once. A missing, unreadable or unparseable keystore
@@ -171,6 +180,8 @@ impl Keystore {
         session: String,
         keys: &AccountKeys,
     ) -> io::Result<()> {
+        // Whichever account was signed in, its notice key leaves the rest.
+        self.rest_notice_key(None).await;
         let snapshot = {
             let mut data = self.data().await.write().await;
             crate::diagnostics::set_account(Some(user_id.clone()));
@@ -182,6 +193,7 @@ impl Keystore {
                 session,
                 encryption_secret: b64_encode(&keys.encryption_secret),
                 signing_secret: b64_encode(&keys.signing_secret),
+                notice_secret: None,
             });
             data.clone()
         };
@@ -193,6 +205,7 @@ impl Keystore {
     /// future sign-in (even to a different account, if this store is
     /// shared) can reuse them without re-fetching envelopes.
     pub async fn sign_out(&self) -> io::Result<()> {
+        self.rest_notice_key(None).await;
         let snapshot = {
             let mut data = self.data().await.write().await;
             data.account = None;
@@ -218,6 +231,50 @@ impl Keystore {
             session: account.session.clone(),
             keys: AccountKeys { encryption_secret, signing_secret },
         })
+    }
+
+    /// The signed-in account's notice key, once this device holds it.
+    pub async fn notice_key(&self) -> Option<pimble_crypto::NoticeKey> {
+        let data = self.data().await.read().await;
+        let secret = b64_decode_32(data.account.as_ref()?.notice_secret.as_deref()?)?;
+        Some(pimble_crypto::NoticeKey { secret })
+    }
+
+    /// Hand the signed-in account's notice key to the rest (wave 2: the
+    /// browser's service worker opens pushes with it), or take it back.
+    /// Best effort: a push it cannot open is shown as a plain line.
+    async fn rest_notice_key(&self, account: Option<(&str, &[u8; 32])>) {
+        if let Err(e) = self.rest.notice_key(account).await {
+            tracing::debug!("the notice key was not handed to the key rest: {}", e);
+        }
+    }
+
+    /// The signed-in account's notice key, handed to the rest again: at
+    /// every start of the notices' work, so a rest that keeps a copy has the
+    /// one in use.
+    pub async fn publish_notice_key(&self) {
+        let held = {
+            let data = self.data().await.read().await;
+            data.account.as_ref().and_then(|a| Some((a.user_id.clone(), b64_decode_32(a.notice_secret.as_deref()?)?)))
+        };
+        match held {
+            Some((user_id, secret)) => self.rest_notice_key(Some((&user_id, &secret))).await,
+            None => self.rest_notice_key(None).await,
+        }
+    }
+
+    /// Keep the signed-in account's notice key; nothing when nobody is
+    /// signed in, or another account is (`user_id` names whose it is).
+    pub async fn set_notice_key(&self, user_id: &str, key: &pimble_crypto::NoticeKey) -> io::Result<()> {
+        let snapshot = {
+            let mut data = self.data().await.write().await;
+            match data.account.as_mut() {
+                Some(account) if account.user_id == user_id => account.notice_secret = Some(b64_encode(&key.secret)),
+                _ => return Ok(()),
+            }
+            data.clone()
+        };
+        self.write_atomic(&snapshot).await
     }
 
     /// Record a store key, replacing any existing entry for the same
@@ -271,8 +328,12 @@ impl Keystore {
             .collect()
     }
 
-    async fn write_atomic(&self, data: &KeystoreData) -> io::Result<()> {
-        let json = serde_json::to_vec_pretty(data).map_err(io::Error::other)?;
+    /// Save what is held now (the change the caller just made, and any made
+    /// since), never two saves at once.
+    async fn write_atomic(&self, _changed: &KeystoreData) -> io::Result<()> {
+        let _one = self.saving.lock().await;
+        let data = self.data().await.read().await.clone();
+        let json = serde_json::to_vec_pretty(&data).map_err(io::Error::other)?;
         self.rest.save(&json).await
     }
 }
@@ -368,6 +429,26 @@ mod tests {
         let reloaded = Keystore::new(path);
         assert!(reloaded.store_key(store, kept).await.is_some());
         assert!(reloaded.store_key(store, dropped).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_notice_key_is_kept_with_the_account_and_goes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let ks = Keystore::new(path.clone());
+        let notice = pimble_crypto::NoticeKey::generate();
+        ks.set_notice_key("id", &notice).await.unwrap();
+        assert!(ks.notice_key().await.is_none(), "nobody signed in: nothing kept");
+        ks.sign_in("u".into(), "e".into(), "id".into(), "s".into(), &keys()).await.unwrap();
+        ks.set_notice_key("someone else", &notice).await.unwrap();
+        assert!(ks.notice_key().await.is_none(), "another account's: not kept");
+        ks.set_notice_key("id", &notice).await.unwrap();
+        assert_eq!(Keystore::new(path.clone()).notice_key().await.unwrap().secret, notice.secret, "kept across a restart");
+        ks.sign_in("u".into(), "e".into(), "id".into(), "s2".into(), &keys()).await.unwrap();
+        assert!(ks.notice_key().await.is_none(), "a fresh sign-in fetches it again");
+        ks.set_notice_key("id", &notice).await.unwrap();
+        ks.sign_out().await.unwrap();
+        assert!(ks.notice_key().await.is_none());
     }
 
     #[tokio::test]

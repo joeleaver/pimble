@@ -129,6 +129,7 @@ impl Local {
         self.watch(client.clone());
         self.hear_cloud(client.clone());
         self.hear_links(client.clone());
+        self.hear_notices(client.clone());
         self.emit(BackendEvent::Connected { server_addr: server_addr(), client_id: self.client_id.clone() });
         Ok(client)
     }
@@ -166,6 +167,27 @@ impl Local {
         });
     }
 
+    /// The notices this server receives for the signed-in account
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 4), for as long as `client`'s
+    /// connection lasts. A server from before wave 1 has no such
+    /// subscription, and nothing is heard.
+    fn hear_notices(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut sub = match client.subscribe_notices().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::debug!("No notices from this server: {e}");
+                    return;
+                }
+            };
+            while let Some(Ok(notice)) = sub.next().await {
+                let Some(me) = me.upgrade() else { return };
+                me.emit(BackendEvent::NoticeReceived { notice });
+            }
+        });
+    }
+
     /// The `pimble:` links this computer is asked to open (`openInApp`), handed
     /// to this window for as long as `client`'s connection lasts. A server from
     /// before 0.20 has no such subscription, and a link then opens a window of
@@ -180,10 +202,8 @@ impl Local {
                     return;
                 }
             };
-            while let Some(Ok(link)) = sub.next().await {
-                let Some(me) = me.upgrade() else { return };
-                me.emit(BackendEvent::AppLink { url: link.url, activation_token: link.activation_token });
-            }
+            let emit = |event| me.upgrade().map(|me| me.emit(event)).is_some();
+            pass_links(&mut sub, crate::instance::is_quitting, emit).await;
         });
     }
 
@@ -327,6 +347,76 @@ struct Desktop<'a, 'b> {
 impl crate::import::Runner for Desktop<'_, '_> {
     async fn run(&mut self, cmd: BackendCommand) -> Option<BackendEvent> {
         process_command(self.ctx, cmd).await
+    }
+}
+
+/// Pass the links `links` hands on as `BackendEvent::AppLink` (`emit`, false
+/// once the window is gone) until they end. Quitting (`quitting`), it stops
+/// at once: the subscription is dropped, so the server hands the next link
+/// to a window that stays, and this one is not acted on
+/// (`crate::app_links::handed` says why).
+async fn pass_links<S, E>(links: &mut S, quitting: impl Fn() -> bool, mut emit: impl FnMut(BackendEvent) -> bool)
+where
+    S: futures::Stream<Item = Result<pimble_rpc::HandedLink, E>> + Unpin,
+{
+    use futures::StreamExt;
+    while let Some(Ok(link)) = links.next().await {
+        if quitting() {
+            return;
+        }
+        if !emit(BackendEvent::AppLink { url: link.url, activation_token: link.activation_token, ack: link.ack }) {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn link(ack: u64) -> Result<pimble_rpc::HandedLink, std::convert::Infallible> {
+        Ok(pimble_rpc::HandedLink { url: "pimble:settings".into(), activation_token: None, ack: Some(ack) })
+    }
+
+    fn ack_of(event: &BackendEvent) -> Option<u64> {
+        match event {
+            BackendEvent::AppLink { ack, .. } => *ack,
+            _ => None,
+        }
+    }
+
+    /// Once the window is quitting, the next link is not passed on and the
+    /// links stop being heard (the subscription is dropped, so the server
+    /// hands the rest to a window that stays).
+    #[tokio::test]
+    async fn a_quitting_window_stops_hearing_links() {
+        let quitting = AtomicBool::new(false);
+        let mut links = futures::stream::iter(vec![link(1), link(2), link(3)]);
+        let mut passed = Vec::new();
+        pass_links(&mut links, || quitting.load(Ordering::SeqCst), |event| {
+            passed.push(ack_of(&event));
+            // Quitting begins once the first link is passed on.
+            quitting.store(true, Ordering::SeqCst);
+            true
+        })
+        .await;
+        assert_eq!(passed, vec![Some(1)]);
+        let rest: Vec<_> = futures::StreamExt::collect::<Vec<_>>(links).await.into_iter().map(|l| l.unwrap().ack).collect();
+        assert_eq!(rest, vec![Some(3)], "stopped at the link it heard while quitting");
+    }
+
+    /// A window gone stops hearing links too.
+    #[tokio::test]
+    async fn a_window_gone_stops_hearing_links() {
+        let mut links = futures::stream::iter(vec![link(1), link(2)]);
+        let mut passed = 0;
+        pass_links(&mut links, || false, |_| {
+            passed += 1;
+            false
+        })
+        .await;
+        assert_eq!(passed, 1);
     }
 }
 

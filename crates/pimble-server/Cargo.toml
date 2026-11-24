@@ -41,6 +41,9 @@ rand = "0.9"
 subtle = "2.6"
 sha2 = "0.10"
 futures = { workspace = true }
+# relay_writes.rs's `Owner`: what its reports need of the owner's server, an
+# `async_trait` trait as `pimble_host::http::Http` is (a test stands in).
+async-trait = { workspace = true }
 
 # The desktop's server: jsonrpsee's HTTP/WebSocket server and the HTTP edge in
 # front of it, tokio's whole runtime, the platform's directories, and the
@@ -92,6 +95,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# notices.rs's tests build a discussion's document the way the app does.
+yrs = { workspace = true }
 # `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).
 pimble-host = { workspace = true, features = ["test-disk"] }
 # tests/search.rs makes a board node the way the app does (its board written

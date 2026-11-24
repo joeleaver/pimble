@@ -104,6 +104,10 @@ pub struct DiscussionUi {
     pub show_deleted: Signal<bool>,
     /// The message being typed, as Markdown.
     pub draft: Signal<String>,
+    /// The people picked for an `@` in the message being typed, `(name,
+    /// account)`: linked as the message is sent
+    /// (docs/NOTIFICATIONS_CONTRACT.md section 1).
+    pub mentioned: Signal<Vec<(String, String)>>,
     /// The message replied to: (id, its author or a preview).
     pub replying_to: Signal<Option<(String, String)>>,
     /// The message being edited, and its text.
@@ -129,6 +133,7 @@ impl DiscussionUi {
             deleted: Signal::new(Vec::new()),
             show_deleted: Signal::new(false),
             draft: Signal::new(String::new()),
+            mentioned: Signal::new(Vec::new()),
             replying_to: Signal::new(None),
             editing: Signal::new(None),
             edit_text: Signal::new(String::new()),
@@ -652,7 +657,7 @@ pub(crate) fn host_unread(store: AppStore, store_id: StoreId, host: NodeId) -> u
 pub(crate) fn post(store: AppStore, slot: Slot) {
     let Some(ui) = ui_of(store, slot) else { return };
     let draft = untracked(|| ui.draft.get());
-    let body = Body::from_markdown(&draft);
+    let body = Body::from_markdown(&draft).with_picked_mentions(&untracked(|| ui.mentioned.get()));
     if body.is_blank() {
         return;
     }
@@ -662,6 +667,7 @@ pub(crate) fn post(store: AppStore, slot: Slot) {
     let posted = local_edit(store, slot, |t| t.post(Stamp::new(me.as_ref(), &now), reply_to.as_deref(), &body).map(|_| ()));
     if posted {
         ui.draft.set(String::new());
+        ui.mentioned.set(Vec::new());
         ui.replying_to.set(None);
         ui.emoji.set(None);
     }
@@ -777,6 +783,16 @@ pub(crate) fn begin_composing(_store: AppStore, slot: Slot, which: Composer) {
 /// whether the box keeps the key from its default.
 pub(crate) fn composer_key(store: AppStore, p: Slot, which: Composer, key: &str, shift: bool) -> bool {
     COMPOSING.with(|c| c.set(Some((p, which))));
+    // Tab or Enter with people offered for the `@` the box ends in picks the
+    // first (docs/NOTIFICATIONS_CONTRACT.md section 1).
+    if which == Composer::New && (key == "Tab" || (key == "Enter" && !shift)) {
+        if let Some(ui) = ui_of(store, p) {
+            if let Some(first) = untracked(|| crate::mentions::box_offers(store, p, ui)).into_iter().next() {
+                let _ = set_timeout(0, move || crate::mentions::box_pick(ui, &first));
+                return true;
+            }
+        }
+    }
     let escape = match key {
         "Enter" if !shift => false,
         "Escape" => true,

@@ -454,8 +454,9 @@ fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool {
     store.upsert_node(store_id, node.clone());
     // A formula in a sheet may name this node (its tables, its title).
     crate::sheets::node_loaded(store);
-    // An inline discussion may be waiting for it.
+    // An inline discussion may be waiting for it, and a notice for its name.
     crate::discussions::node_loaded(store, store_id, node_id, content_bytes);
+    crate::notice_show::names_arrived(store, &[(store_id, node_id)]);
 
     // Every pane opened on this node.
     for pane in store.panes_showing(store_id, node_id) {
@@ -664,9 +665,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::pictures::retry_missing();
                 // The link this process was started with, once the stores
                 // it names have had a moment to open.
-                if let Some(link) = crate::links::take_launch_link() {
+                if let Some(link) = crate::app_links::take_launch_link() {
                     rinch::core::reactive::unowned(|| {
-                        let _ = rinch::prelude::set_timeout(1500, move || crate::links::open_app_link(store, &link));
+                        let _ = rinch::prelude::set_timeout(1500, move || crate::app_links::open_app_link(store, &link));
                     });
                 }
 
@@ -706,6 +707,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::Disconnected => {
                 tracing::info!("Disconnected from backend");
+                crate::inbox::answers_lost();
                 store.connection.set(ConnectionState::Disconnected);
                 store.connection_status.set("Disconnected".to_string());
                 // The account is asked again on the next connection; until
@@ -762,6 +764,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::Error { message } => {
                 tracing::error!("Backend error: {}", message);
+                crate::inbox::answers_lost();
                 if untracked(|| store.deleted_modal_pending.get()) {
                     // "Put Back" on a node no list names is an ordinary
                     // `MoveNode`, so its failure is not told apart by the
@@ -1184,6 +1187,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Whoever made it, it may change what points at the node
                 // the Properties panel shows.
                 crate::properties::store_changed(store);
+                // A note a notice named may be named differently now.
+                if let pimble_rpc::StoreChangeKind::MetadataUpdated { node_id } | pimble_rpc::StoreChangeKind::ContentUpdated { node_id } = change_kind {
+                    crate::inbox::note_changed(store, *store_id, *node_id);
+                }
                 // Skip our own echoes
                 let my_id = untracked(|| store.client_id.get());
                 if let Some(source) = source_client_id {
@@ -1506,12 +1513,22 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::CloudConnectionChanged { connection } => {
                 store.cloud_connection.set(connection.clone());
             }
-            BackendEvent::AppLink { url, activation_token } => {
-                #[cfg(feature = "native")]
-                crate::app::bring_to_front(activation_token.as_deref());
-                #[cfg(not(feature = "native"))]
-                let _ = activation_token;
-                crate::links::open_app_link(store, url);
+            BackendEvent::NoticeReceived { notice } => {
+                crate::inbox::received(store, notice.clone());
+            }
+            BackendEvent::NotesNamed { names } => {
+                crate::inbox::named(store, names.clone());
+            }
+            BackendEvent::NoticesListed { notices, on, email, push, push_key, watches } => {
+                crate::inbox::listed(store, notices.clone(), *on);
+                crate::inbox::channels(store, *email, *push, push_key.clone());
+                store.notify_watches.set(*watches);
+            }
+            BackendEvent::WatchesListed { watches, on } => {
+                crate::watches::listed(store, watches.clone(), *on);
+            }
+            BackendEvent::AppLink { url, activation_token, ack } => {
+                crate::app_links::handed(store, url, activation_token.as_deref(), *ack);
             }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
@@ -1525,8 +1542,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     // email's local part with (docs/PRESENCE_CONTRACT.md
                     // section 3).
                     store.send(BackendCommand::CloudListShares);
+                    // The notices this device keeps (docs/NOTIFICATIONS_CONTRACT.md).
+                    store.send(BackendCommand::ListNotices);
+                    store.send(BackendCommand::ListWatches);
                 } else {
                     crate::boards::set_author(None, None);
+                    store.watches.set(Vec::new());
                 }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
                 store.cloud_answer.set(crate::state::CloudAnswer::Answered);
@@ -1576,6 +1597,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                     CloudOp::Shares => crate::shares::failed(store, message),
+                    CloudOp::Notifications => {
+                        // The switch did not take: it shows what holds, and why.
+                        store.send(BackendCommand::ListNotices);
+                        show_notice(store, format!("Notifications could not be changed: {message}"));
+                    }
+                    CloudOp::Watches => show_notice(store, message.clone()),
                     CloudOp::HostStore => {
                         store.host_modal_busy.set(false);
                         store.host_modal_error.set(message.clone());

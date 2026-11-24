@@ -7,6 +7,9 @@
 //!                       watermark: String?   every message created at or before it is read
 //!                       seen: Map<message id, true>   read messages newer than the watermark
 //!                    }>
+//! root map "notices": Map<notice id, String>   the notices opened, each with
+//!                    when (RFC 3339; docs/NOTIFICATIONS_CONTRACT.md section 4:
+//!                    read anywhere clears everywhere)
 //! root map "places": no longer written: where someone was in each node is
 //!                    kept per device (Joe, 2026-10-23), and what earlier
 //!                    versions wrote is emptied (`drop_places`)
@@ -26,6 +29,10 @@ use crate::thread::DiscussionSnapshot;
 
 const READ: &str = "read";
 const PLACES: &str = "places";
+const NOTICES: &str = "notices";
+/// Opened notices are remembered this long: the accounts service keeps
+/// nothing past seven days, and a device keeps its notices thirty.
+const NOTICE_READ_KEPT_DAYS: i64 = 60;
 const WATERMARK: &str = "watermark";
 const SEEN: &str = "seen";
 
@@ -45,6 +52,7 @@ pub struct Personal {
     doc: Doc,
     read: MapRef,
     places: MapRef,
+    notices: MapRef,
 }
 
 impl Default for Personal {
@@ -58,7 +66,8 @@ impl Personal {
         let doc = Doc::with_options(yrs::Options { offset_kind: OffsetKind::Utf16, ..Default::default() });
         let read = doc.get_or_insert_map(READ);
         let places = doc.get_or_insert_map(PLACES);
-        Self { doc, read, places }
+        let notices = doc.get_or_insert_map(NOTICES);
+        Self { doc, read, places, notices }
     }
 
     /// From saved bytes; an empty or unreadable save is an empty document.
@@ -186,6 +195,35 @@ impl Personal {
         changed
     }
 
+    // ── Notices ─────────────────────────────────────────────────────────
+
+    /// Whether notice `id` has been opened, on any of the person's devices.
+    pub fn notice_read(&self, id: &str) -> bool {
+        self.notices.get(&self.doc.transact(), id).is_some()
+    }
+
+    /// Notice `id` was opened at `at` (RFC 3339); entries older than about
+    /// two months are forgotten on the way. `true` when it was not read yet.
+    pub fn mark_notice_read(&self, id: &str, at: &str) -> bool {
+        let mut txn = self.doc.transact_mut();
+        if self.notices.get(&txn, id).is_some() {
+            return false;
+        }
+        self.notices.insert(&mut txn, id, at.to_string());
+        if let Some(cutoff) = chrono::DateTime::parse_from_rfc3339(at).ok().map(|t| t - chrono::Duration::days(NOTICE_READ_KEPT_DAYS)) {
+            let stale: Vec<String> = self
+                .notices
+                .iter(&txn)
+                .filter(|(_, when)| matches!(when, Out::Any(Any::String(s)) if chrono::DateTime::parse_from_rfc3339(s).is_ok_and(|t| t < cutoff)))
+                .map(|(k, _)| k.to_string())
+                .collect();
+            for k in stale {
+                self.notices.remove(&mut txn, &k);
+            }
+        }
+        true
+    }
+
     // ── Places ──────────────────────────────────────────────────────────
 
     /// Empty the places earlier versions kept here; they are per device now
@@ -259,6 +297,20 @@ mod tests {
         // At worst something read shows unread again; never the reverse.
         assert!(a.unread("s", "d", &snap, None).len() <= 2);
         assert!(a.unread("s", "d", &snap, None).contains(&ids[1]));
+    }
+
+    #[test]
+    fn a_notice_opened_on_one_device_is_read_on_the_other() {
+        let a = Personal::new();
+        let b = Personal::load(&a.save());
+        assert!(!a.notice_read("n1"));
+        assert!(a.mark_notice_read("n1", "2026-11-23T10:00:00Z"));
+        assert!(!a.mark_notice_read("n1", "2026-11-23T10:00:01Z"), "already read");
+        a.mark_notice_read("old", "2026-08-01T00:00:00Z");
+        b.merge(&a.save());
+        assert!(b.notice_read("n1"));
+        assert!(b.mark_notice_read("n2", "2026-11-23T11:00:00Z"));
+        assert!(!b.notice_read("old"), "two months on, forgotten");
     }
 
     #[test]

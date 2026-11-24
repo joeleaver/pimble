@@ -3,6 +3,15 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `pimble-cloud --generate-vapid-key`: a new VAPID key pair for web push
+    // (docs/NOTIFICATIONS_CONTRACT.md, wave 2), printed for the deployment's
+    // secrets; nothing is started.
+    if std::env::args().any(|a| a == "--generate-vapid-key") {
+        let key = pimble_cloud::webpush::VapidKey::generate();
+        println!("PIMBLE_VAPID_PRIVATE_KEY={}", key.private());
+        println!("# public key (what browsers subscribe with): {}", key.public());
+        return Ok(());
+    }
     // `RUST_LOG` still overrides this; started without it, the service
     // otherwise logs nothing at all — not even the LogMailer warning or the
     // verification link, since `fmt::init()`'s own default filter admits no

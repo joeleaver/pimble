@@ -18,7 +18,8 @@
 //!   "link":        { "last_sync": "...", "last_seq": { "node:<id>": 12 } },
 //!   "device":      { "device": "<uuid>", "answered": { ... } },
 //!   "vault":       { "epoch": "...", "pushed_sv": { ... }, "dirty": [ ... ], "dirty_all": false, "cursor_version": 1, "rekeying": [ ... ] },
-//!   "convergence": { "parked": { ... }, "set_aside": { ... } }
+//!   "convergence": { "parked": { ... }, "set_aside": { ... } },
+//!   "relay_writes": { "writes": [ ... ] }
 //! }
 //! ```
 //!
@@ -26,7 +27,10 @@
 //! ([`migrate`]) copies values and interprets none of them. Who writes each:
 //! `link` the store itself (`LocalStore::write_sync_config`, `last_sync`) and
 //! the vault link (`last_seq`, only through documents already on disk);
-//! `device`, `vault` and `convergence` the vault link (`pimble-server`).
+//! `device`, `vault` and `convergence` the vault link (`pimble-server`);
+//! `relay_writes` the owner's report of a relayed store's writes, kept until
+//! the accounts service has taken them (`pimble-server`'s `relay_writes`,
+//! docs/NOTIFICATIONS_CONTRACT.md section 3).
 //!
 //! What every computer opening the store's folder shares (the remote, the
 //! mode, the access: the folder's `sync.json`) is not here and never moves
@@ -54,6 +58,9 @@ pub const DEVICE: &str = "device";
 pub const VAULT: &str = "vault";
 /// `convergence.json`'s keys.
 pub const CONVERGENCE: &str = "convergence";
+/// The writes a relayed store's members made that the accounts service has
+/// not taken yet: `writes`.
+pub const RELAY_WRITES: &str = "relay_writes";
 
 /// The per-store files the record replaces, each with its section. Renamed
 /// `<name>.migrated` once their contents are in the record, kept for a

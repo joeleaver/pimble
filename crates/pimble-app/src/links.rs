@@ -1,12 +1,13 @@
 //! Links in the editor (docs/LINKS_CONTRACT.md): the editor plugin that
-//! carries pimble's link behaviour, and the rules for what counts as a web
-//! link.
+//! carries pimble's link behaviour. What counts as a web link is
+//! `crate::web_links`'s.
 //!
 //! A link, Pimble or web, is rinch's `link` mark; nothing here stores links
 //! anywhere else.
 
-use rinch_editor_core::commands::range_has_mark;
-use rinch_editor_core::{AttrValue, Attrs, InputRule, Mark, Plugin, PluginKey, Pos};
+use rinch_editor_core::{InputRule, Plugin, PluginKey, Pos};
+
+use crate::web_links::{autolink_rule, web_url};
 
 /// The plugin pimble adds to each pane's editor before any content loads
 /// (adding a plugin resets history). It knows which pane's editor it is in,
@@ -21,7 +22,7 @@ impl Plugin for LinksPlugin {
     }
 
     fn input_rules(&self) -> Vec<InputRule> {
-        vec![autolink_rule(), picker_rule(self.pane)]
+        vec![autolink_rule(), picker_rule(self.pane), mention_rule(self.pane)]
     }
 
     /// A pasted link (docs/LINKS_CONTRACT.md "Making a link"): a Pimble or
@@ -145,6 +146,24 @@ fn picker_rule(pane: crate::panes::PaneId) -> InputRule {
     })
 }
 
+/// Typing `@` at the start of a word opens the picker of the people who can
+/// open the note (docs/NOTIFICATIONS_CONTRACT.md section 1). An `@` inside a
+/// word (an email address) is only an `@`. The rule types the `@` itself and
+/// opens the picker once the dispatch is over.
+fn mention_rule(pane: crate::panes::PaneId) -> InputRule {
+    InputRule::new(r#"(?:^|[\s(\[{"'])@$"#, move |state, _caps, _start, end| {
+        // Not in a link's words or in inline code.
+        let marks = state.doc.resolve(Pos(end)).ok()?.marks();
+        if marks.iter().any(|m| m.type_name() == "code") {
+            return None;
+        }
+        let mut tr = state.tr();
+        tr.insert_text("@").ok()?;
+        later(move |store| crate::link_picker::start_mention(store, &crate::editor::editor(pane), end));
+        Some(tr)
+    })
+}
+
 thread_local! {
     /// The app's store, for the editor's own commands (set by
     /// `editor::start_editing`; an `AppStore` is a handful of signal ids).
@@ -159,84 +178,6 @@ pub fn set_app_store(store: crate::state::AppStore) {
 /// Read the app's state from inside an editor plugin, when there is an app.
 pub(crate) fn with_app_store<T>(f: impl FnOnce(crate::state::AppStore) -> T) -> Option<T> {
     APP_STORE.with(|s| s.get()).map(f)
-}
-
-// ── Links from outside the app (docs/SETTINGS_CONTRACT.md section 12) ───────
-
-/// A `pimble:` link this app was asked to open from outside it: a click in a
-/// browser or a mail app (the operating system starts `pimble <link>`, which
-/// hands it to the window already open), or the web app's `?open=` parameter.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppLink {
-    /// A link to a node, as Copy Link makes one.
-    Node(pimble_core::PimbleUrl),
-    /// `pimble:settings`, `pimble:settings/<section>`, and
-    /// `pimble:settings/plugins?install=<id>`: Settings at that section, and
-    /// at that plugin's row in the library with Install ready. Nothing is
-    /// installed until the person presses it.
-    Settings { section: Option<crate::settings::Section>, install: Option<String> },
-}
-
-impl AppLink {
-    pub fn parse(text: &str) -> Option<AppLink> {
-        let text = text.trim();
-        if let Some(url) = pimble_core::PimbleUrl::parse(text) {
-            return Some(AppLink::Node(url));
-        }
-        let rest = text.strip_prefix("pimble:")?.trim_start_matches("//");
-        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-        let mut parts = path.trim_end_matches('/').split('/');
-        if parts.next()? != "settings" {
-            return None;
-        }
-        let section = match parts.next() {
-            None | Some("") => None,
-            Some(key) => Some(crate::settings::Section::from_key(key)?),
-        };
-        if parts.next().is_some() {
-            return None;
-        }
-        let install = query.split('&').find_map(|pair| pair.strip_prefix("install=")).filter(|id| {
-            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        });
-        let install = match (section, install) {
-            (Some(crate::settings::Section::Plugins), Some(id)) => Some(id.to_string()),
-            _ => None,
-        };
-        Some(AppLink::Settings { section, install })
-    }
-}
-
-/// Open a link that came from outside the app; anything else is said and
-/// ignored.
-pub fn open_app_link(store: crate::state::AppStore, text: &str) {
-    match AppLink::parse(text) {
-        Some(AppLink::Node(_)) => {
-            follow_href(store, text.trim());
-        }
-        Some(AppLink::Settings { section, install }) => {
-            match section {
-                Some(section) => crate::settings::open_at(store, section),
-                None => crate::settings::open(store),
-            }
-            if let Some(id) = install {
-                crate::plugins::offer_install(&id);
-            }
-        }
-        None => crate::events::show_notice(store, format!("Pimble does not know how to open {text}.")),
-    }
-}
-
-/// The link this process was started with, opened once the app has
-/// connected (`set_launch_link`, `take_launch_link`).
-static LAUNCH_LINK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-pub fn set_launch_link(link: String) {
-    *LAUNCH_LINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(link);
-}
-
-pub(crate) fn take_launch_link() -> Option<String> {
-    LAUNCH_LINK.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// "Copy Link to Here" (docs/LINKS_CONTRACT.md "Making a link"): a deep link
@@ -385,7 +326,7 @@ thread_local! {
 /// The editor's hover callback: the link under the pointer changed
 /// (`None`: it left every link). The tooltip shows after the pointer has
 /// rested for [`HOVER_DELAY_MS`] and goes at once when it leaves.
-pub fn hover_link(store: crate::state::AppStore, hover: Option<&crate::rinch_editor::LinkHover>) {
+pub fn hover_link(store: crate::state::AppStore, node: Option<(pimble_core::StoreId, pimble_core::NodeId)>, hover: Option<&crate::rinch_editor::LinkHover>) {
     use rinch::prelude::{clear_timeout, set_timeout};
     if let Some(pending) = HOVER_TIMER.with(|t| t.borrow_mut().take()) {
         clear_timeout(pending);
@@ -394,8 +335,15 @@ pub fn hover_link(store: crate::state::AppStore, hover: Option<&crate::rinch_edi
         store.link_hover.set(None);
         return;
     };
+    let mention = pimble_core::mention::is_mention_href(&hover.link.href);
     let tooltip = crate::state::LinkTooltip {
-        target: tooltip_target(store, &hover.link.href),
+        target: if mention {
+            crate::mentions::tooltip(store, node, &hover.link.href, hover.link.from.0, hover.link.to.0)
+        } else {
+            tooltip_target(store, &hover.link.href)
+        },
+        // A mention leads nowhere to open.
+        hint: if mention { "" } else { OPEN_HINT },
         x: hover.rect.x,
         y: hover.rect.y + hover.rect.height + 4.0,
     };
@@ -474,91 +422,6 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         });
         Ok(())
     }
-}
-
-/// `text` as a web link's href, or `None`: an `http:`/`https:` URL with a
-/// host, or a bare domain with a path or not (`example.com/x`), which
-/// becomes `https://`. What the Ctrl+L picker offers as "Link to <url>" and
-/// what a paste links (docs/LINKS_CONTRACT.md "One experience for both
-/// kinds").
-pub fn web_url(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() || text.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let lower = text.to_ascii_lowercase();
-    let candidate = if lower.starts_with("http://") || lower.starts_with("https://") {
-        text.to_string()
-    } else if lower.contains("://") || lower.starts_with("pimble:") || lower.starts_with("mailto:") {
-        return None;
-    } else {
-        // A bare domain: a dot in the host, with letters after the last one.
-        let host = text.split(['/', '?', '#']).next().unwrap_or("");
-        let tld = host.rsplit('.').next().unwrap_or("");
-        if !host.contains('.') || tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
-            return None;
-        }
-        format!("https://{text}")
-    };
-    let parsed = url::Url::parse(&candidate).ok()?;
-    matches!(parsed.scheme(), "http" | "https").then_some(())?;
-    parsed.host_str().filter(|h| !h.is_empty())?;
-    Some(candidate)
-}
-
-/// The URL at the end of `typed` with the punctuation a sentence puts after
-/// one taken off: `.`, `,`, `;`, `:`, `!`, `?`, quotes, and a `)` with no
-/// `(` of its own in the URL.
-fn trim_url_end(url: &str) -> &str {
-    let mut end = url.len();
-    loop {
-        let head = &url[..end];
-        let Some(last) = head.chars().last() else { break };
-        let unbalanced_paren = last == ')' && head.matches('(').count() < head.matches(')').count();
-        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'') || unbalanced_paren {
-            end -= last.len_utf8();
-        } else {
-            break;
-        }
-    }
-    &url[..end]
-}
-
-/// Typing a web URL followed by a space links it (docs/LINKS_CONTRACT.md
-/// "Making a link"). The rule's transaction replaces the plain insert, so it
-/// types the space itself, with the marks the text there had but the link,
-/// so the words after it are not linked. One undo step takes the link and
-/// the space back.
-fn autolink_rule() -> InputRule {
-    InputRule::new(r"(?:^|\s)(https?://\S+)(\s)$", |state, caps, start, end| {
-        let whole = caps.get(0)?;
-        let url_match = caps.get(1)?;
-        let typed = caps.get(2)?.as_str();
-        let url = trim_url_end(url_match.as_str());
-        let href = web_url(url)?;
-        // `start` is where the match begins in the document; the URL starts
-        // as many characters in as precede it in the match.
-        let lead = whole.as_str()[..url_match.start() - whole.start()].chars().count();
-        let from = start + lead;
-        let to = from + url.chars().count();
-        let link = state.schema().mark_type("link")?.clone();
-        if range_has_mark(&state.doc, from, to, &link) {
-            return None;
-        }
-        let kept: Vec<Mark> = state
-            .doc
-            .resolve(Pos(end))
-            .ok()?
-            .marks()
-            .into_iter()
-            .filter(|m| m.type_name() != "link")
-            .collect();
-        let mut tr = state.tr();
-        tr.add_mark(from, to, Mark::new(link, Attrs::from_iter([("href", AttrValue::from(href))]))).ok()?;
-        tr.set_stored_marks(Some(kept));
-        tr.insert_text(typed).ok()?;
-        Some(tr)
-    })
 }
 
 #[cfg(test)]
@@ -727,133 +590,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn web_urls_and_bare_domains_are_web_links_and_nothing_else_is() {
-        for (text, want) in [
-            ("https://example.com", Some("https://example.com")),
-            ("http://example.com/a?b=c#d", Some("http://example.com/a?b=c#d")),
-            ("  HTTPS://Example.com/x  ", Some("HTTPS://Example.com/x")),
-            ("example.com", Some("https://example.com")),
-            ("docs.rs/yrs/latest", Some("https://docs.rs/yrs/latest")),
-            ("not a url", None),
-            ("hello", None),
-            ("version 1.2", None),
-            ("v1.23", None),
-            ("pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f", None),
-            ("ftp://example.com", None),
-            ("mailto:a@example.com", None),
-            ("https://", None),
-            ("", None),
-        ] {
-            assert_eq!(web_url(text).as_deref(), want, "{text:?}");
-        }
-    }
-
-    use rinch_editor_core::state::EditorState;
-    use rinch_editor_core::{apply_input_rules, default_plugins, Fragment, Schema};
-    use std::rc::Rc;
-
-    /// A one-paragraph document holding `text`, the caret at its end, with
-    /// this plugin: typing `typed` there, as the editor types it (the rules
-    /// first, a plain insert when none fires).
-    fn type_after(text: &str, typed: &str) -> EditorState {
-        let schema = Rc::new(Schema::starter_kit());
-        let para = schema.branch("paragraph", Fragment::from_node(schema.text(text).unwrap())).unwrap();
-        let doc = schema.branch(&schema.top_node, Fragment::from_children(vec![para])).unwrap();
-        let mut plugins = default_plugins();
-        plugins.push(Rc::new(LinksPlugin { pane: crate::panes::PaneId::FIRST }) as Rc<dyn Plugin>);
-        let mut state = EditorState::create(schema, doc, plugins);
-        let end = 1 + text.chars().count();
-        let mut tr = state.tr();
-        tr.set_selection(rinch_editor_core::selection::Selection::cursor(Pos(end)));
-        state = state.apply(tr);
-        let rules = LinksPlugin { pane: crate::panes::PaneId::FIRST }.input_rules();
-        let tr = apply_input_rules(&state, &rules, end, typed).unwrap_or_else(|| {
-            let mut tr = state.tr();
-            tr.insert_text(typed).unwrap();
-            tr
-        });
-        state.apply(tr)
-    }
-
-    /// Each text run of the paragraph with its link's href, if any.
-    fn runs(state: &EditorState) -> Vec<(String, Option<String>)> {
-        let para = state.doc.child(0);
-        (0..para.child_count())
-            .map(|i| {
-                let run = para.child(i);
-                let href = run.marks().iter().find(|m| m.type_name() == "link").and_then(|m| m.attrs.get_str("href")).map(str::to_string);
-                (run.text().unwrap_or_default().to_string(), href)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_typed_url_followed_by_a_space_becomes_a_link_and_the_next_word_does_not() {
-        let state = type_after("see https://example.com/a.", " ");
-        assert_eq!(
-            runs(&state),
-            vec![
-                ("see ".into(), None),
-                ("https://example.com/a".into(), Some("https://example.com/a".into())),
-                (". ".into(), None),
-            ]
-        );
-        let state = type_after("(see https://example.com)", " ");
-        assert_eq!(
-            runs(&state),
-            vec![("(see ".into(), None), ("https://example.com".into(), Some("https://example.com".into())), (") ".into(), None)]
-        );
-        let state = type_after("https://example.com", " ");
-        assert_eq!(runs(&state), vec![("https://example.com".into(), Some("https://example.com".into())), (" ".into(), None)]);
-    }
-
-    #[test]
-    fn a_space_after_anything_else_is_only_a_space() {
-        for text in ["see example.com", "just words", "pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f", "https://"] {
-            let state = type_after(text, " ");
-            assert_eq!(runs(&state), vec![(format!("{text} "), None)], "{text:?}");
-        }
-    }
-
-    #[test]
-    fn sentence_punctuation_after_a_url_is_not_part_of_it() {
-        for (typed, want) in [
-            ("https://example.com.", "https://example.com"),
-            ("https://example.com/a,", "https://example.com/a"),
-            ("https://example.com/x?\"", "https://example.com/x"),
-            ("https://en.wikipedia.org/wiki/Rust_(programming_language)", "https://en.wikipedia.org/wiki/Rust_(programming_language)"),
-            ("https://example.com)", "https://example.com"),
-            ("https://example.com/a).", "https://example.com/a"),
-        ] {
-            assert_eq!(trim_url_end(typed), want, "{typed:?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod app_link_tests {
-    use super::AppLink;
-    use crate::settings::Section;
-
-    #[test]
-    fn settings_links_read_and_nothing_else_does() {
-        assert_eq!(AppLink::parse("pimble:settings"), Some(AppLink::Settings { section: None, install: None }));
-        assert_eq!(AppLink::parse("pimble:settings/keyboard"), Some(AppLink::Settings { section: Some(Section::Keyboard), install: None }));
-        assert_eq!(
-            AppLink::parse("pimble:settings/plugins?install=kanban-viewer"),
-            Some(AppLink::Settings { section: Some(Section::Plugins), install: Some("kanban-viewer".into()) })
-        );
-        assert_eq!(AppLink::parse("pimble://settings/plugins/?install=todo-viewer").map(|l| matches!(l, AppLink::Settings { install: Some(_), .. })), Some(true));
-        // An install only means something at Plugins, and an id is a plain one.
-        assert_eq!(AppLink::parse("pimble:settings/general?install=kanban-viewer"), Some(AppLink::Settings { section: Some(Section::General), install: None }));
-        assert_eq!(AppLink::parse("pimble:settings/plugins?install=../x"), Some(AppLink::Settings { section: Some(Section::Plugins), install: None }));
-        assert_eq!(AppLink::parse("pimble:settings/nowhere"), None);
-        assert_eq!(AppLink::parse("pimble:settings/plugins/more"), None);
-        assert_eq!(AppLink::parse("https://pimble.app"), None);
-        assert!(matches!(
-            AppLink::parse("pimble:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/0b7e7c4d-1f2a-4c1b-8e3d-5a6b7c8d9e0f"),
-            Some(AppLink::Node(_))
-        ));
-    }
 }

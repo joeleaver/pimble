@@ -53,8 +53,7 @@ use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
-    HandedLink,
-    OpenInAppRequest, OpenInAppResponse,
+    AppLinkTakenRequest, OpenInAppRequest, OpenInAppResponse,
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
@@ -132,6 +131,15 @@ fn now() -> String {
 /// carries that says so.
 fn is_link_client(client_id: &str) -> bool {
     client_id.starts_with("sync-link:") || client_id.starts_with("vault-link:")
+}
+
+/// Whether a call's writes are this device's own: the operator's (the app,
+/// the CLI, an MCP server on loopback) or an agent's acting for the account
+/// signed in here. A member connected with their own token (to a hosted
+/// server, a relay face) writes on their own device, which notifies for
+/// them (docs/NOTIFICATIONS_CONTRACT.md section 1).
+fn writes_here(ext: &Extensions, principal: &Principal) -> bool {
+    matches!(principal, Principal::Service) || ext.get::<crate::agents::AgentConnection>().is_some()
 }
 
 /// The documents a principal scoped to `roots` reaches in `store_id`
@@ -1288,7 +1296,11 @@ pub struct RpcHandler {
     /// watch (`RelayHost::watch_tunnel`). `subscribeCloudConnection` hears both.
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The Pimble windows hearing `openInApp`, oldest first.
-    app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<HandedLink>>>>,
+    app_links: Arc<crate::app_links::AppLinks>,
+    /// Notices sent and received (docs/NOTIFICATIONS_CONTRACT.md, `crate::notices`).
+    notices: Arc<crate::notices::Notices>,
+    /// Writes signed-in people made here, for watches (`crate::writes`).
+    writes: Arc<crate::writes::Writes>,
     /// Which pictures each document names, per its state vector
     /// (docs/IMAGES_CONTRACT.md "Who may read a blob", "Replication").
     pictures: Arc<crate::pictures::PictureRefs>,
@@ -1417,6 +1429,8 @@ impl RpcHandler {
             link_faults: None,
             relay: Arc::new(crate::relay_face::RelayHost::new(disk.clone(), runtime.clone(), relay_dir_beside(&replicas_dir))),
             devices: Arc::new(crate::devices::Devices::new(disk.clone())),
+            notices: Arc::new(crate::notices::Notices::new(crate::notices::Notices::beside(&replicas_dir))),
+            writes: Arc::new(crate::writes::Writes::new()),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
             hand_over: Arc::new(std::sync::Mutex::new(None)),
@@ -1424,7 +1438,7 @@ impl RpcHandler {
             version: Arc::from(env!("CARGO_PKG_VERSION")),
             presence: Arc::new(crate::presence::PresenceHub::new(runtime.clone())),
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
-            app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_links: Arc::new(crate::app_links::AppLinks::default()),
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
             folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2125,6 +2139,75 @@ impl RpcHandler {
 
     pub(crate) fn relay(&self) -> &crate::relay_face::RelayHost {
         &self.relay
+    }
+
+    /// This server's notices (`crate::notices`).
+    pub(crate) fn notices(&self) -> Arc<crate::notices::Notices> {
+        Arc::clone(&self.notices)
+    }
+
+    /// The writes signed-in people made here (`crate::writes`).
+    pub(crate) fn writes(&self) -> Arc<crate::writes::Writes> {
+        Arc::clone(&self.writes)
+    }
+
+    /// A signed-in person wrote `node_id`'s document: gathered for whoever
+    /// evaluates watches, when they want it told (`crate::writes`), with
+    /// the shared roots that reach it judged once per gathering. The
+    /// operator's own writes (`Principal::Service`) are nobody's to tell
+    /// apart. Call with the store manager unlocked.
+    async fn note_write(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) {
+        use crate::writes::Recorded;
+        let Principal::User { sub, .. } = principal else { return };
+        let now = crate::writes::now_ms();
+        match self.writes.record(store_id, node_id, sub, now) {
+            Recorded::Unwanted => return,
+            Recorded::Added => {}
+            Recorded::Starts(candidates) => {
+                let roots = {
+                    let manager = self.store_manager.read().await;
+                    crate::writes::roots_reaching(&manager, store_id, node_id, &candidates)
+                };
+                self.writes.start(store_id, node_id, sub, now, roots);
+            }
+        }
+        self.writes.keep_telling(&self.runtime);
+    }
+
+    /// The server stops: the gathered writes are told now.
+    pub(crate) fn stop_writes(&self) {
+        self.writes.stop();
+    }
+
+    /// Start, or start again, receiving and sending notices for whoever is
+    /// signed in (`PimbleServer::start`, sign-in and out).
+    pub fn restart_notices(&self) {
+        self.notices.restart(self);
+    }
+
+    /// Stop the notices' work (the server stops).
+    pub fn stop_notices(&self) {
+        self.notices.stop();
+    }
+
+    /// A person (or their agent) wrote `node_id` here: the notices the write
+    /// calls for go out (docs/NOTIFICATIONS_CONTRACT.md section 1). `before`
+    /// is the whole document before the write, `None` for one it made; what
+    /// it is after is read now. Off the request's path.
+    pub(crate) fn notice_write(&self, store_id: StoreId, node_id: NodeId, before: Option<Vec<u8>>) {
+        let handler = self.clone();
+        self.runtime.spawn(async move {
+            let after = {
+                let manager = handler.store_manager.read().await;
+                let Ok(tree) = manager.tree(store_id) else { return };
+                let Some(doc) = tree.doc(node_id) else { return };
+                doc.save()
+            };
+            let found = handler.runtime.run_heavy(move || crate::notices::candidates(node_id, before.as_deref(), &after)).await.unwrap_or_default();
+            if !found.is_empty() {
+                handler.notices.queue(&handler, store_id, found).await;
+            }
+        });
     }
 
     /// `store_id`'s vault link state; `None` when it has no vault link.
@@ -3819,6 +3902,9 @@ impl PimbleApiServer for RpcHandler {
             manager.vault_extend_scope_blobs(request.store_id, &roots, node_id, blob).await.map_err(to_rpc_error)?;
         }
         drop(manager);
+        if let VaultDocId::Node(node_id) = request.doc_id {
+            self.note_write(&principal, request.store_id, node_id).await;
+        }
 
         // A picture is never announced: nobody holds one open, every reader
         // fetches it when a document names it, and a client from before
@@ -4080,6 +4166,11 @@ impl PimbleApiServer for RpcHandler {
         let me_keys = crate::cloud::me_keys(self.http(), &request.url, &login.session).await.map_err(to_rpc_error)?;
         let account_keys = pimble_crypto::unwrap_account_keys(&me_keys.account_key_blob, &password_keys.kek).map_err(to_rpc_error)?;
 
+        // Another account replaces the one signed in: the pushes this browser
+        // took for the old one stop first (wave 2).
+        if self.keystore.account().await.is_some_and(|a| a.user_id != login.user.id) {
+            self.notices.signing_out(self).await;
+        }
         self.keystore
             .sign_in(request.url.clone(), login.user.email.clone(), login.user.id.clone(), login.session.clone(), &account_keys)
             .await
@@ -4087,6 +4178,8 @@ impl PimbleApiServer for RpcHandler {
         // A tunnel to the relay is opened with the account's session.
         self.relay.account_changed(self).await;
         self.cloud_changed();
+        // The notice key, the inbox and the outbox are the account's.
+        self.notices.restart(self);
 
         Ok(EmptyResponse {})
     }
@@ -4094,10 +4187,12 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_sign_out(&self, ext: &Extensions) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudSignOut")?;
         info!("Signing out of Pimble Cloud");
+        self.notices.signing_out(self).await;
         self.keystore.sign_out().await.map_err(to_rpc_error)?;
         // Nothing is served to anyone on a session that was given up.
         self.relay.account_changed(self).await;
         self.cloud_changed();
+        self.notices.restart(self);
         Ok(EmptyResponse {})
     }
 
@@ -4222,15 +4317,134 @@ impl PimbleApiServer for RpcHandler {
         Ok(())
     }
 
+    async fn list_notices(&self, ext: &Extensions) -> Result<pimble_rpc::ListNoticesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listNotices")?;
+        Ok(self.notices.list(self).await)
+    }
+
+    async fn acknowledge_notices(&self, ext: &Extensions, request: pimble_rpc::AcknowledgeNoticesRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "acknowledgeNotices")?;
+        self.notices.acknowledge(self, &request.ids).await;
+        Ok(EmptyResponse {})
+    }
+
+    async fn set_notifications(&self, ext: &Extensions, request: pimble_rpc::SetNotificationsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setNotifications")?;
+        if let Some(on) = request.on {
+            self.notices.set_on(self, on).await.map_err(to_rpc_error)?;
+        }
+        self.notices.set_channels(self, request.email, request.push).await.map_err(to_rpc_error)?;
+        if let Some(on) = request.watches {
+            self.notices.set_watches_on(self, on).await.map_err(to_rpc_error)?;
+        }
+        Ok(EmptyResponse {})
+    }
+
+    async fn watch_node(&self, ext: &Extensions, request: pimble_rpc::WatchNodeRequest) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "watchNode")?;
+        let entry = pimble_rpc::WatchEntry { store_id: request.store_id, node_id: request.node_id, subtree: request.subtree };
+        self.notices.watch(self, entry).await.map_err(to_rpc_error)
+    }
+
+    async fn unwatch_node(&self, ext: &Extensions, request: pimble_rpc::UnwatchNodeRequest) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "unwatchNode")?;
+        self.notices.unwatch(self, request.store_id, request.node_id).await.map_err(to_rpc_error)
+    }
+
+    async fn list_watches(&self, ext: &Extensions) -> Result<pimble_rpc::ListWatchesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listWatches")?;
+        Ok(self.notices.list_watches(self).await)
+    }
+
+    async fn subscribe_writes(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeWrites") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let mut writes = self.writes.subscribe();
+        self.runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    seen = writes.recv() => match seen {
+                        Ok(seen) => {
+                            let Ok(msg) = SubscriptionMessage::from_json(&seen) else { break };
+                            if sink.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("subscribeWrites: {} writes were not told (the listener fell behind)", n);
+                            continue;
+                        }
+                        Err(_) => break,
+                    },
+                    _ = sink.closed() => break,
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn set_write_interest(&self, ext: &Extensions, request: pimble_rpc::SetWriteInterestRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setWriteInterest")?;
+        self.writes.set_interest(request);
+        Ok(EmptyResponse {})
+    }
+
+    async fn register_push(&self, ext: &Extensions, request: pimble_rpc::RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "registerPush")?;
+        self.notices.register_push(self, &request.endpoint, &request.p256dh, &request.auth).await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn unregister_push(&self, ext: &Extensions, request: pimble_rpc::UnregisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "unregisterPush")?;
+        self.notices.unregister_push(self, &request.endpoint).await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn subscribe_notices(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
+        if let Err(e) = authorize_service_only(&principal_of(ext), "subscribeNotices") {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let sink = pending.accept().await?;
+        let mut notices = self.notices.subscribe();
+        self.runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    notice = notices.recv() => match notice {
+                        Ok(notice) => {
+                            let Ok(msg) = SubscriptionMessage::from_json(&notice) else { break };
+                            if sink.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
+                    _ = sink.closed() => break,
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn open_in_app(&self, ext: &Extensions, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "openInApp")?;
-        let mut windows = self.app_links.lock().unwrap_or_else(|e| e.into_inner());
-        // The oldest window still listening takes it; gone ones are dropped.
-        windows.retain(|w| !w.is_closed());
-        let link = HandedLink { url: request.url, activation_token: request.activation_token };
-        let delivered = windows.iter().any(|w| w.send(link.clone()).is_ok());
-        info!("openInApp: {}", if delivered { "handed to a window" } else { "no window is listening" });
+        let wait = Duration::from_millis(pimble_rpc::APP_LINK_CONFIRM_WAIT_MS);
+        let delivered = self.app_links.hand(&self.runtime, request.url, request.activation_token, request.confirm, wait).await;
+        info!("openInApp: {}", if delivered { "a window took it" } else if request.confirm { "no window took it" } else { "no window is listening" });
         Ok(OpenInAppResponse { delivered })
+    }
+
+    async fn app_link_taken(&self, ext: &Extensions, request: AppLinkTakenRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "appLinkTaken")?;
+        if !self.app_links.taken(request.ack) {
+            debug!("appLinkTaken: nobody waits for link {} any more", request.ack);
+        }
+        Ok(EmptyResponse {})
     }
 
     async fn subscribe_app_links(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
@@ -4239,8 +4453,7 @@ impl PimbleApiServer for RpcHandler {
             return Ok(());
         }
         let sink = pending.accept().await?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HandedLink>();
-        self.app_links.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        let mut rx = self.app_links.listen();
         self.runtime.spawn(async move {
             loop {
                 tokio::select! {
@@ -4974,6 +5187,7 @@ impl PimbleApiServer for RpcHandler {
             request.node_type, request.title, request.store_id
         );
 
+        let notices_wanted = writes_here(ext, &principal) && request.content.is_some();
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;
         // What the node starts with goes in with the create, one edit
@@ -5012,6 +5226,9 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::NodeCreated { node_id, parent_id })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        if notices_wanted {
+            self.notice_write(request.store_id, node_id, None);
+        }
 
         Ok(CreateNodeResponse { node_id })
     }
@@ -5026,6 +5243,7 @@ impl PimbleApiServer for RpcHandler {
         self.reject_if_vault(request.store_id).await?;
         info!("Creating {} attachment of node {} in store {}", request.node_type, request.host_id, request.store_id);
 
+        let notices_wanted = writes_here(ext, &principal) && request.content.is_some();
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;
         if let Some(content) = &request.content {
@@ -5060,6 +5278,9 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::AttachmentChanged { node_id, host_id, live: true })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        if notices_wanted {
+            self.notice_write(request.store_id, node_id, None);
+        }
         Ok(CreateNodeResponse { node_id })
     }
 
@@ -6125,9 +6346,16 @@ impl PimbleApiServer for RpcHandler {
             .decode(changes)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
 
+        // A write of this device's (a person's, or their agent's) may tell
+        // someone they were written to: the document as it was, kept when
+        // the write could (`crate::notices`).
+        let mut notice_before: Option<Option<Vec<u8>>> = None;
         {
             let manager = self.store_manager.read().await;
             let held = manager.tree(request.store_id).is_ok_and(|tree| tree.doc(request.node_id).is_some());
+            if writes_here(ext, &principal) && !is_link_client(&request.client_id) && (crate::notices::may_mention(&bytes) || (held && manager.is_discussion(request.store_id, request.node_id))) {
+                notice_before = Some(manager.tree(request.store_id).ok().and_then(|tree| tree.doc(request.node_id)).map(|doc| doc.save()));
+            }
             // A document the store holds is judged by where it is; one it
             // does not hold yet, by the parent its first update names (a
             // create is the node's document and the parent's list, and a
@@ -6177,6 +6405,14 @@ impl PimbleApiServer for RpcHandler {
         // travels as its own update.
         if (effect.content || effect.data) && !is_link_client(&request.client_id) {
             self.note_content_edit(request.store_id, request.node_id);
+        }
+        if let Some(before) = notice_before {
+            if effect.changed {
+                self.notice_write(request.store_id, request.node_id, before);
+            }
+        }
+        if effect.changed {
+            self.note_write(&principal, request.store_id, request.node_id).await;
         }
 
         Ok(ApplyEditResponse {})

@@ -1691,6 +1691,11 @@ pub struct ScopePeople {
 pub struct Person {
     pub user_id: String,
     pub name: String,
+    /// Their notice key's public half (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 2): what a notice to them is sealed with. `None` until their
+    /// account has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_key: Option<String>,
 }
 
 impl StorePeople {
@@ -1705,6 +1710,60 @@ impl StorePeople {
             .find(|scope| scope.root == root)
             .and_then(|scope| find(scope, user_id))
             .or_else(|| self.scopes.iter().find_map(|scope| find(scope, user_id)))
+    }
+
+    /// The people who can open a node (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 1: whom `@` offers there), from the node's ancestry (`chain`:
+    /// the node and its ancestors, nearest first): every scope rooted at one
+    /// of them, and the whole store's, each person once, by the name of the
+    /// innermost scope that names them.
+    pub fn members_of(&self, chain: &[NodeId]) -> Vec<Person> {
+        let depth = |root: Option<NodeId>| match root {
+            Some(root) => chain.iter().position(|n| *n == root),
+            None => Some(chain.len()),
+        };
+        let mut scopes: Vec<(usize, &ScopePeople)> = self.scopes.iter().filter_map(|s| depth(s.root).map(|d| (d, s))).collect();
+        scopes.sort_by_key(|(d, _)| *d);
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, scope) in scopes {
+            for person in &scope.people {
+                if seen.insert(person.user_id.clone()) {
+                    out.push(person.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod people_tests {
+    use super::*;
+
+    fn person(id: &str, name: &str) -> Person {
+        Person { user_id: id.into(), name: name.into(), notice_key: None }
+    }
+
+    fn scope(root: Option<NodeId>, people: Vec<Person>) -> ScopePeople {
+        ScopePeople { root, people, my_name: String::new(), my_name_chosen: true, share_name: String::new() }
+    }
+
+    #[test]
+    fn the_people_who_can_open_a_note_are_its_shares_members_by_their_innermost_names() {
+        let (note, folder, elsewhere) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let people = StorePeople {
+            scopes: vec![
+                scope(None, vec![person("joe", "Joe"), person("ann", "Ann (whole store)")]),
+                scope(Some(folder), vec![person("joe", "Joe"), person("will", "Will"), person("ann", "Ann")]),
+                scope(Some(elsewhere), vec![person("sam", "Sam")]),
+            ],
+        };
+        let members = people.members_of(&[note, folder]);
+        let names: Vec<_> = members.iter().map(|p| (p.user_id.as_str(), p.name.as_str())).collect();
+        assert_eq!(names, vec![("joe", "Joe"), ("will", "Will"), ("ann", "Ann")], "the share's names first, the store's after; Sam's share is elsewhere");
+        assert_eq!(people.members_of(&[elsewhere]).len(), 3, "the whole store's and Sam's");
+        assert!(StorePeople::default().members_of(&[note]).is_empty(), "no shares: nobody");
     }
 }
 
@@ -2101,65 +2160,4 @@ pub struct UpdateAgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveAgentRequest {
     pub id: String,
-}
-
-/// `openInApp`: a `pimble:` link to hand to a Pimble window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OpenInAppRequest {
-    pub url: String,
-    /// The activation token the program that was asked to open the link was
-    /// started with (Wayland's `XDG_ACTIVATION_TOKEN`), so the window that
-    /// takes the link may come to the front with it. A server from before it
-    /// ignores the field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activation_token: Option<String>,
-}
-
-/// What `subscribeAppLinks` hands a window: a link, and the activation token
-/// it came with. Sent as the bare URL string when there is no token (what a
-/// window from before the token reads), as `{ url, activation_token }` when
-/// there is one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandedLink {
-    pub url: String,
-    pub activation_token: Option<String>,
-}
-
-impl Serialize for HandedLink {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct WithToken<'a> {
-            url: &'a str,
-            activation_token: &'a str,
-        }
-        match &self.activation_token {
-            None => serializer.serialize_str(&self.url),
-            Some(token) => WithToken { url: &self.url, activation_token: token }.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for HandedLink {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Url(String),
-            WithToken {
-                url: String,
-                #[serde(default)]
-                activation_token: Option<String>,
-            },
-        }
-        Ok(match Wire::deserialize(deserializer)? {
-            Wire::Url(url) => HandedLink { url, activation_token: None },
-            Wire::WithToken { url, activation_token } => HandedLink { url, activation_token },
-        })
-    }
-}
-
-/// Whether a window took the link.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OpenInAppResponse {
-    pub delivered: bool,
 }

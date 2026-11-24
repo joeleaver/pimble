@@ -10,9 +10,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::members::Names;
 use super::stores::{
-    is_store_owner, normalize_root, require_live_store, require_role_for_scope, root_view, row_name, shared_by, stored_name_or_empty, Names, UNNAMED_SHARE,
-    WHOLE_STORE,
+    is_store_owner, normalize_root, require_live_store, require_role_for_scope, root_view, row_name, shared_by, stored_name_or_empty, UNNAMED_SHARE, WHOLE_STORE,
 };
 use crate::error::{CloudError, CloudResult};
 use crate::session::AuthedUser;

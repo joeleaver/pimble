@@ -1131,8 +1131,23 @@ impl PimbleClient {
     /// activation token this program was started with, if any; `false` when
     /// no window listens.
     pub async fn open_in_app(&self, url: &str, activation_token: Option<String>) -> Result<bool> {
-        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token }).await.map_err(rpc_error)?;
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token, confirm: false }).await.map_err(rpc_error)?;
         Ok(response.delivered)
+    }
+
+    /// [`open_in_app`](Self::open_in_app), answering `true` only once the
+    /// window says it acted on the link (`appLinkTaken`), and `false` when it
+    /// has not within `pimble_rpc::APP_LINK_CONFIRM_WAIT_MS`: a hung window,
+    /// or one partway through quitting, does not swallow the link.
+    pub async fn open_in_app_confirmed(&self, url: &str, activation_token: Option<String>) -> Result<bool> {
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token, confirm: true }).await.map_err(rpc_error)?;
+        Ok(response.delivered)
+    }
+
+    /// As a Pimble window: the link handed with `ack` was acted on.
+    pub async fn app_link_taken(&self, ack: u64) -> Result<()> {
+        self.client.app_link_taken(pimble_rpc::AppLinkTakenRequest { ack }).await.map_err(rpc_error)?;
+        Ok(())
     }
 
     /// As a Pimble window: hear the links `openInApp` hands this one.
@@ -1141,6 +1156,89 @@ impl PimbleClient {
             .subscribe::<pimble_rpc::HandedLink, _>("pimble_subscribeAppLinks", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeAppLinks")
             .await
             .map_err(rpc_error)
+    }
+
+    /// The notices this device has received, newest first, and whether
+    /// notifications are on (docs/NOTIFICATIONS_CONTRACT.md).
+    pub async fn list_notices(&self) -> Result<pimble_rpc::ListNoticesResponse> {
+        self.client.list_notices().await.map_err(rpc_error)
+    }
+
+    /// The person opened these notices.
+    pub async fn acknowledge_notices(&self, ids: Vec<String>) -> Result<()> {
+        self.client.acknowledge_notices(pimble_rpc::AcknowledgeNoticesRequest { ids }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Turn notifications on or off for the signed-in account.
+    pub async fn set_notifications(&self, on: bool) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { on: Some(on), ..Default::default() }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Turn one channel (wave 2: email, web push) on or off, the rest as
+    /// they are.
+    pub async fn set_notification_channels(&self, email: Option<bool>, push: Option<bool>) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { email, push, ..Default::default() }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// This browser subscribed to web push.
+    pub async fn register_push(&self, endpoint: String, p256dh: String, auth: String) -> Result<()> {
+        self.client.register_push(pimble_rpc::RegisterPushRequest { endpoint, p256dh, auth }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// This browser's push subscription ended.
+    pub async fn unregister_push(&self, endpoint: String) -> Result<()> {
+        self.client.unregister_push(pimble_rpc::UnregisterPushRequest { endpoint }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Hear each notice as it arrives, opened.
+    pub async fn subscribe_notices(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::Notice>> {
+        self.client
+            .subscribe::<pimble_rpc::Notice, _>("pimble_subscribeNotices", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeNotices")
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Turn watched notes (wave 3) on or off; off deletes every watch.
+    pub async fn set_watches_on(&self, on: bool) -> Result<()> {
+        self.client.set_notifications(pimble_rpc::SetNotificationsRequest { watches: Some(on), ..Default::default() }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Watch a node, alone or with its subtree (docs/NOTIFICATIONS_CONTRACT.md
+    /// section 3); answers the account's watches as they are now.
+    pub async fn watch_node(&self, store_id: StoreId, node_id: NodeId, subtree: bool) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.watch_node(pimble_rpc::WatchNodeRequest { store_id, node_id, subtree }).await.map_err(rpc_error)
+    }
+
+    /// Stop watching a node, or the subtree watch that reaches it.
+    pub async fn unwatch_node(&self, store_id: StoreId, node_id: NodeId) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.unwatch_node(pimble_rpc::UnwatchNodeRequest { store_id, node_id }).await.map_err(rpc_error)
+    }
+
+    /// The watches the signed-in account chose, and whether they are on.
+    pub async fn list_watches(&self) -> Result<pimble_rpc::ListWatchesResponse> {
+        self.client.list_watches().await.map_err(rpc_error)
+    }
+
+    /// Hear the writes signed-in people make on this server (`Service`-only):
+    /// what the accounts service gathers watches from.
+    pub async fn subscribe_writes(&self) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::WriteSeen>> {
+        self.client
+            .subscribe::<pimble_rpc::WriteSeen, _>("pimble_subscribeWrites", jsonrpsee::core::params::ArrayParams::new(), "pimble_unsubscribeWrites")
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Name the documents whose writes [`Self::subscribe_writes`] tells
+    /// (`Service`-only).
+    pub async fn set_write_interest(&self, request: pimble_rpc::SetWriteInterestRequest) -> Result<()> {
+        self.client.set_write_interest(request).await.map_err(rpc_error)?;
+        Ok(())
     }
 
     /// Hear how this computer's connections to Pimble Cloud are doing, the

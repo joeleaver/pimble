@@ -25,6 +25,14 @@ pub trait KeyRest: Send + Sync + std::fmt::Debug {
     async fn save(&self, bytes: &[u8]) -> io::Result<()>;
     /// Where it rests, for a log line.
     fn describe(&self) -> String;
+    /// The signed-in account's notice key (docs/NOTIFICATIONS_CONTRACT.md,
+    /// wave 2), `(user id, X25519 secret)`, or `None` once nobody is signed
+    /// in: for a rest that hands it to something outside the server that
+    /// opens notices on its own, the browser's service worker showing a push
+    /// while no page is open. Nothing by default: the desktop shows its own.
+    async fn notice_key(&self, _account: Option<(&str, &[u8; 32])>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A file on a [`Disk`], readable by this user alone: the desktop's
