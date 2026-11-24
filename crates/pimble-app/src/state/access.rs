@@ -51,7 +51,7 @@ impl AppStore {
 
     /// [`AppStore::node_access`], tracked, for a reactive closure: one signal
     /// read at a time (a tracked read inside another signal's `with` panics,
-    /// see `pane_view::editor_read_only`).
+    /// see `pane_view::document::editor_read_only`).
     pub fn node_access_tracked(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
         // The rule is `pimble_core::plan::node_access`; this only reads what
         // it judges from, tracked.

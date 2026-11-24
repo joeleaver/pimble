@@ -314,7 +314,7 @@ struct Shown {
 }
 
 /// The tags and fields of `(s, n)` as this window has them, tracked: one
-/// signal read at a time (`pane_view::editor_read_only`).
+/// signal read at a time (`pane_view::document::editor_read_only`).
 fn node_values(store: AppStore, node: Option<(StoreId, NodeId)>) -> Option<Shown> {
     let (s, n) = node?;
     let sig = store.node_data.with(|map| map.get(&(s, n)).copied())?;

@@ -1238,7 +1238,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 /* A split's whole space, which lets every press through but the ones on
-   its line (see `pane_view::render_divider`). */
+   its line (see `pane_view::divider::render_divider`). */
 .pimble-pane-split {
     position: absolute;
     z-index: 5;

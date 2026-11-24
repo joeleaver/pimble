@@ -372,7 +372,7 @@ still lists every entry flat, groups included, until the canvas UI shell is buil
 
 Built 2026-11-14 in `crates/pimble-app` (both apps, one code path), on the model above.
 The canvas fills the pane and everything floats over it; the app's toolbar shows nothing of
-the canvas and dims for a canvas pane as for a pane with no document (`pane_view.rs`: the
+the canvas and dims for a canvas pane as for a pane with no document (`pane_view/mod.rs`: the
 board toolbar is gone, `usable`/`commentable` are false while the focused pane shows a
 board).
 

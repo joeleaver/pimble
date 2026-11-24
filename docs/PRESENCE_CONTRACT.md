@@ -218,7 +218,7 @@ There is a new item, Account > "Shares...", on the desktop and in the browser.
 
 ## 6. Who is here: panes and tree rows
 
-- **Pane title strip** (`pane_view.rs`, `pimble-pane__title`): a row of initials circles
+- **Pane title strip** (`pane_view/pane.rs`, `pimble-pane__title`): a row of initials circles
   after the name, one per person holding the document (sessions merged by `sub`). It
   shows up to four, then "+n". Hovering one names the person and their device, and
   clicking one follows them (section 7).

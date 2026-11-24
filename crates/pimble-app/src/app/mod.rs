@@ -262,7 +262,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
         // The split view: one to four panes beside the explorer, each with
         // its own title strip, toolbar and editor
-        // (docs/SPLIT_VIEW_CONTRACT.md; `pane_view.rs` draws it).
+        // (docs/SPLIT_VIEW_CONTRACT.md; `pane_view/` draws it).
         let mut empty_hints: Vec<&'static str> = Vec::new();
         if CAN_ADMINISTER_STORES {
             empty_hints.push("Or press Ctrl+N to create a new store");
