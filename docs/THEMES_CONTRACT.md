@@ -5,8 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered (2026-11-24): decisions 1 to 11. Open: 8b (how the fonts
-ship) and 12 (where theme nodes live, and hiding them).
+has answered them. Answered (2026-11-24): decisions 1 to 11. Decision 12 the
+same day. Open: 8b (how the fonts ship).
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
@@ -175,8 +175,41 @@ store first copies that theme into this store (section 6), then bases the new on
 copy. A base in another store is not allowed (it would make one store's look depend on
 another being open).
 
-Where theme nodes sit in the tree is the person's business; "New Theme" offers a
-**Themes** folder at the store root, made on first use, so they do not clutter writing.
+### 3.1a Internal nodes, hidden by kind
+
+Decided (Joe, 2026-11-24, decision 12): theme nodes are nodes of the tree, and they are
+**internal**: hidden by their type, with each kind of internal node shown or hidden on its
+own. Pimble will have several kinds (themes now; templates, saved queries and the like
+later), so this is a general mechanism, not a theme feature:
+
+- **A node type says whether it is internal.** `pimble_core` keeps the list of internal
+  kinds (`NodeType::internal_kind() -> Option<InternalKind>`; `InternalKind::Theme` first),
+  with each kind's name for menus ("Themes"). Nothing is set on the node: a theme node is
+  internal because it is a theme. A plugin's node types (later) may declare a kind of their
+  own in their manifest.
+- **Hidden means not shown, never not there.** An internal node, and anything under it, is
+  left out of the explorer, search results, metanode sources, the Properties panel's
+  references and the MCP's `list_children` and `search`, unless its kind is shown. It
+  still replicates, encrypts, is reached by shares (section 3.2), opens by link, and is
+  listed by the tools made for it (the Theme picker, `list_themes`).
+- **Show or hide each kind.** View > "Show Internal" is a submenu with one check item per
+  kind ("Themes", ...), all off by default. A shown kind's nodes appear where they are in the
+  tree, dimmed and marked with the kind's icon, and can be moved, renamed and deleted like
+  any node. The choice is a view preference kept per device with the explorer's expanded
+  rows (`views.json`, `localStorage` in the browser), because it is how one window shows
+  the tree, not anything about the store. The MCP takes `include_internal: [kinds]` on its
+  listing tools.
+- **Where new themes go.** Anywhere: "New Theme", "Customize..." and a copy make the theme
+  node as a child of the store root by default, since it is hidden there and a root is in
+  every store; a person who shows Themes may move one anywhere (into a share, to give its
+  members the theme with the share's own access). There is no Themes folder: hiding by
+  kind does what the folder was for.
+- **Reaching a hidden theme.** The Theme picker lists every theme in the store wherever it
+  sits; "Edit Theme..." beside one opens its node in the focused pane. A link to a theme
+  node opens it whether or not Themes are shown.
+- **Counting.** The store row's tooltip says how many internal nodes are hidden ("12 themes
+  hidden"), so a store is never silently larger than it looks.
+
 
 ### 3.2 Applying a document theme
 
@@ -195,7 +228,7 @@ already in it.
 Lookup has two edges the copy rule never had:
 
 - **Shares.** A member's partial replica holds the share's root and below, not its
-  ancestors, and may not hold the theme node either (it may sit in a Themes folder outside
+  ancestors, and may not hold the theme node either (it may sit outside
   the share). **Decided (Joe, 2026-11-24, decision 4): a scope's reach includes the
   theme documents in force in it**: the theme named by the share root's nearest themed
   ancestor, every theme named inside the share, and their bases. The owner's share upkeep
@@ -216,8 +249,8 @@ Lookup has two edges the copy rule never had:
      too."). Offered only to a share whose role is editor; a reader share is always
      read-only.
   3. **Copy a theme for this share.** The theme in force is copied once (section 6's copy,
-     within the store) into a new theme node, "<Theme> for <share name>", in the store's
-     Themes folder; the share root names the copy; members get write on the copy only.
+     within the store) into a new theme node, "<Theme> for <share name>", made where new
+     themes are made (section 3.1a); the share root names the copy; members get write on the copy only.
      Members restyle their share freely and nothing else in the owner's store changes. The
      owner sees the copy's look on that subtree too, because it is applied there.
 
@@ -361,7 +394,7 @@ Joe asked that themes be easy to copy from any other open store, "seamlessly in 
 background". What can and cannot be seamless:
 
 - **Copying is explicit and one time.** Picking a theme from another open store in the
-  Theme picker copies it into this store (a new theme node in this store's Themes folder,
+  Theme picker copies it into this store (a new theme node made where new themes are made, section 3.1a,
   its tokens and its title, with `data.theme.copied_from = { store, node, at }` for
   provenance), then applies the copy. One click; no "import" step to think about. A base
   that is a built-in carries over by id; a base that is another theme node of the source
@@ -551,8 +584,8 @@ cut or add.
    force in it, at a theme access chosen when the share is made: read-only (the default),
    write, or a copy of the theme made for this share that members may edit (section 3.2).
    Open detail: *recommendation:* write is offered only to editor shares, and the copy
-   lives in the store's Themes folder, outside the shared subtree, so it does not appear as
-   a node in members' trees.
+   is made under the store root, outside the shared subtree; being internal (section 3.1a),
+   it would not show in members' trees anyway.
 5. **Mounts. Decided (Joe, 2026-11-24):** a mounted node keeps its native look: its theme
    is resolved in its own store, and the picker on a mount row acts on the source node.
 6. **App themes. Decided (Joe, 2026-11-24):** they follow the account: a person's app themes
@@ -573,10 +606,9 @@ cut or add.
     when a plugin needs theme values in code.
 11. **The starting set. Decided (Joe, 2026-11-24):** section 11's nine document themes and
     five app themes, Grove (green) added at his request.
-12. **Where theme nodes go.** *Recommendation:* anywhere; "New Theme" makes a Themes folder
-    at the store root on first use. Alternative: themes kept out of the explorer, listed
-    only in the picker (would need a place in the store that is not the tree, which node
-    documents do not have).
+12. **Where theme nodes live. Decided (Joe, 2026-11-24):** in the tree, as internal nodes
+    hidden by their kind, each kind shown or hidden on its own from View > "Show Internal"
+    (section 3.1a). No Themes folder.
 
 ## 13. Waves (once the decisions are in)
 
@@ -585,8 +617,9 @@ cut or add.
    pane wrapper, bundled fonts, the paragraphs fallback, Format > Theme with built-ins only.
    Default and Document are pixel-identical to today (checked by screenshot on both
    targets).
-2. **Theme nodes.** `node_type = "theme"`, the theme editor pane, New Theme, bases, the
-   picker's store group, copying from other open stores.
+2. **Theme nodes.** `node_type = "theme"`, internal kinds and View > "Show Internal"
+   (section 3.1a), the theme editor pane, New Theme, bases, the picker's store group,
+   copying from other open stores.
 3. **App themes.** The app token set, the personal document's `app_themes` and
    `app_theme`, Settings > General, the viewer surface variables, Pimble (today's two
    schemes as one theme), Paper, Contrast and Dusk.
