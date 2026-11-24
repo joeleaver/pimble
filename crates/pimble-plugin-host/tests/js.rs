@@ -98,18 +98,20 @@ fn start(plugin: &Plugin) -> (Rc<RefCell<MockDomDocument>>, NodeId, Instance, Rc
 #[wasm_bindgen_test]
 async fn a_plugin_built_for_another_abi_is_refused_at_load() {
     let module = guest(&manifest(ABI_VERSION + 1, "old"), "", &[]);
-    let Err((described, sentence)) = load_bytes("old.wasm", &module, Duration::from_secs(1)).await else {
+    let Err(not_loaded) = load_bytes("old.wasm", &module, Duration::from_secs(1)).await else {
         panic!("a plugin for another ABI loads");
     };
     assert_eq!(
-        sentence,
+        not_loaded.sentence,
         format!("The old test plugin was built for plugin ABI {}, and this Pimble runs ABI {ABI_VERSION} plugins.", ABI_VERSION + 1)
     );
-    assert_eq!(described.map(|m| m.id), Some("old-test".to_string()));
-    let Err((None, sentence)) = load_bytes("junk.wasm", b"\0asm junk", Duration::from_secs(1)).await else {
+    assert_eq!(not_loaded.manifest.map(|m| m.id), Some("old-test".to_string()));
+    assert_eq!(not_loaded.head.map(|h| (h.id, h.abi)), Some(("old-test".to_string(), ABI_VERSION + 1)));
+    let Err(junk) = load_bytes("junk.wasm", b"\0asm junk", Duration::from_secs(1)).await else {
         panic!("junk loads");
     };
-    assert!(sentence.starts_with("The plugin junk.wasm is not a WebAssembly module"), "{sentence}");
+    assert!(junk.head.is_none() && junk.manifest.is_none());
+    assert!(junk.sentence.starts_with("The plugin junk.wasm is not a WebAssembly module"), "{}", junk.sentence);
 }
 
 #[wasm_bindgen_test]

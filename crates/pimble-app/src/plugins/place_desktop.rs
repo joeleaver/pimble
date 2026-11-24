@@ -5,16 +5,16 @@ use std::time::{Duration, SystemTime};
 use super::library_client::{forget_library, install_failed, installed_from_library};
 use super::window::say;
 use super::*;
-use pimble_plugin_host::wasmtime_engine::{load_bytes, load_file, DEFAULT_BUDGET};
+use pimble_plugin_host::registry::id_from_file;
+use pimble_plugin_host::wasmtime_engine::{load_bytes, load_file, NotLoaded, DEFAULT_BUDGET};
 
 pub const CAN_ADD: bool = true;
-pub const REMOVABLE: bool = true;
 
 pub static WHERE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!("Plugins are .wasm files in {}. One added there, replaced or removed takes effect at once. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
 });
 
-type Loaded = Result<Plugin, (Option<Manifest>, String)>;
+type Loaded = Result<Plugin, NotLoaded>;
 
 /// What a file was when it was loaded: its length and modified time.
 type Stamp = (u64, Option<SystemTime>);
@@ -28,12 +28,20 @@ fn stamp(path: &Path) -> Option<Stamp> {
     Some((meta.len(), meta.modified().ok()))
 }
 
-fn id_of(loaded: &Loaded) -> Option<String> {
+/// The plugin a file holds: its manifest's id, as far as that was read, else
+/// its name read as one (the same rule as `Refused::id`).
+fn id_of(path: &Path, loaded: &Loaded) -> String {
     match loaded {
-        Ok(plugin) => Some(plugin.manifest.id.clone()),
-        Err((Some(manifest), _)) => Some(manifest.id.clone()),
-        Err((None, _)) => None,
+        Ok(plugin) => plugin.manifest.id.clone(),
+        Err(NotLoaded { head: Some(head), .. }) if !head.id.is_empty() => head.id.clone(),
+        Err(_) => id_from_file(path),
     }
+}
+
+/// Every file in the folder that holds plugin `id`, as last scanned.
+fn files_of(id: &str) -> Vec<PathBuf> {
+    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|cache| cache.iter().filter(|(path, (_, loaded))| id_of(path, loaded) == id).map(|(path, _)| path.clone()).collect()).unwrap_or_default()
 }
 
 /// Every `.wasm` file in `dir`, each compiled again only when its file
@@ -46,11 +54,9 @@ fn scan(dir: &Path) -> (Registry, Vec<String>) {
         .unwrap_or_default();
     paths.sort();
     let mut changed: Vec<String> = Vec::new();
-    let mut note = |id: Option<String>| {
-        if let Some(id) = id {
-            if !changed.contains(&id) {
-                changed.push(id);
-            }
+    let mut note = |id: String| {
+        if !changed.contains(&id) {
+            changed.push(id);
         }
     };
     let mut registry = Registry::default();
@@ -59,10 +65,10 @@ fn scan(dir: &Path) -> (Registry, Vec<String>) {
         let same = now.is_some() && cache.get(path).is_some_and(|(was, _)| Some(*was) == now);
         if !same {
             if let Some((_, old)) = cache.get(path) {
-                note(id_of(old));
+                note(id_of(path, old));
             }
             let loaded = load_file(path, DEFAULT_BUDGET);
-            note(id_of(&loaded));
+            note(id_of(path, &loaded));
             cache.insert(path.clone(), (now.unwrap_or((0, None)), loaded));
         }
         let (_, loaded) = &cache[path];
@@ -71,7 +77,7 @@ fn scan(dir: &Path) -> (Registry, Vec<String>) {
     let gone: Vec<PathBuf> = cache.keys().filter(|p| !paths.contains(p)).cloned().collect();
     for path in gone {
         if let Some((_, old)) = cache.remove(&path) {
-            note(id_of(&old));
+            note(id_of(&path, &old));
         }
     }
     (registry, changed)
@@ -166,7 +172,7 @@ pub fn install(entry: Entry, bytes: Vec<u8>) {
     let dir = plugins_dir();
     let spawned = std::thread::Builder::new().name("pimble-plugin-install".into()).spawn(move || {
         let put = load_bytes(Path::new(&entry.wasm), &bytes, DEFAULT_BUDGET)
-            .map_err(|(_, sentence)| sentence)
+            .map_err(|refused| refused.sentence)
             .and_then(|plugin| library::matches(&entry, &plugin.manifest).map(|_| plugin))
             .and_then(|plugin| put(&dir, &bytes, &plugin.manifest));
         match put {
@@ -231,7 +237,7 @@ pub fn pick() {
         let (id, line) = add(&dir, &picked);
         rinch::core::reactive::run_on_main_thread(move || {
             if let Some(id) = id {
-                forget_library(&id);
+                forget_library(&id, false);
             }
             say(line);
         });
@@ -250,7 +256,7 @@ fn add(dir: &Path, picked: &Path) -> (Option<String>, String) {
     };
     let plugin = match load_bytes(picked, &bytes, DEFAULT_BUDGET) {
         Ok(plugin) => plugin,
-        Err((_, sentence)) => return (None, sentence),
+        Err(refused) => return (None, refused.sentence),
     };
     let m = &plugin.manifest;
     if let Err(e) = put(dir, &bytes, m) {
@@ -260,38 +266,62 @@ fn add(dir: &Path, picked: &Path) -> (Option<String>, String) {
     (Some(m.id.clone()), format!("Added the {} plugin {}.", m.name, m.version))
 }
 
-/// Write `bytes`, a plugin that loaded as `manifest`, into the folder:
-/// over the file that holds the same plugin now, so a new version replaces
-/// the old, else as `<id>.wasm`; beside it and renamed over it, so the
-/// watcher never reads half a plugin.
+/// Write `bytes`, a plugin that loaded as `manifest`, into the folder as
+/// `<id>.wasm` (beside it and renamed over it, so the watcher never reads
+/// half a plugin), and take away every other file that held the same plugin
+/// (an earlier version, one built for another ABI, `scripts/plugins/install.sh`'s
+/// old `kanban_viewer.wasm`): one plugin is one file.
 fn put(dir: &Path, bytes: &[u8], manifest: &Manifest) -> Result<(), String> {
     let id = &manifest.id;
-    let holding = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|cache| {
-        cache.iter().find(|(_, (_, loaded))| id_of(loaded).as_deref() == Some(id.as_str())).map(|(path, _)| path.clone())
-    });
-    let dest = holding.unwrap_or_else(|| dir.join(format!("{id}.wasm")));
-    if std::fs::read(&dest).is_ok_and(|have| have == bytes) {
-        return Ok(());
+    let dest = dir.join(format!("{id}.wasm"));
+    let others: Vec<PathBuf> = files_of(id).into_iter().filter(|p| *p != dest).collect();
+    if !std::fs::read(&dest).is_ok_and(|have| have == bytes) {
+        let partial = dest.with_extension("wasm.partial");
+        let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, bytes)).and_then(|_| std::fs::rename(&partial, &dest));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("The {} plugin could not be put in {}: {e}.", manifest.name, dir.display())
+        })?;
     }
-    let partial = dest.with_extension("wasm.partial");
-    let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&partial, bytes)).and_then(|_| std::fs::rename(&partial, &dest));
-    written.map_err(|e| {
-        let _ = std::fs::remove_file(&partial);
-        format!("The {} plugin could not be put in {}: {e}.", manifest.name, dir.display())
-    })
+    for other in others {
+        if let Err(e) = std::fs::remove_file(&other) {
+            tracing::warn!("plugins: {} (an earlier file of {id}) could not be removed: {e}", other.display());
+        }
+    }
+    Ok(())
 }
 
-/// "Remove": the plugin's file leaves the folder, with what it was allowed.
+/// "Remove": the plugin's files leave the folder (a refused one's too), with
+/// what it was allowed.
 pub fn remove(id: &str) {
-    let Some(path) = with_registry(|r| r.plugin(id).map(|p| p.path.clone())).flatten() else { return };
+    let files = files_of(id);
+    if files.is_empty() {
+        return;
+    }
     let name = manifest_of(id).map_or(id.to_string(), |m| m.name);
-    if let Err(e) = std::fs::remove_file(&path) {
-        return say(format!("The {name} plugin could not be removed from {}: {e}.", path.display()));
+    for path in &files {
+        if let Err(e) = std::fs::remove_file(path) {
+            return say(format!("The {name} plugin could not be removed from {}: {e}.", path.display()));
+        }
     }
     APPROVALS.with(|a| a.borrow_mut().remove(id));
     super::write_approvals();
-    forget_library(id);
+    forget_library(id, true);
     let dir = plugins_dir();
     let _ = std::thread::Builder::new().name("pimble-plugin-remove".into()).spawn(move || rescan(&dir));
     say(format!("Removed the {name} plugin."));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_its_plugin_by_its_manifest_or_its_name() {
+        let head = pimble_plugin_host::abi::ManifestHead { id: "kanban-viewer".into(), name: "Kanban".into(), version: "0.1.2".into(), abi: 6 };
+        let old: Loaded = Err(NotLoaded::headed(head, "Old.".into()));
+        assert_eq!(id_of(Path::new("/p/whatever.wasm"), &old), "kanban-viewer");
+        let junk: Loaded = Err(NotLoaded::new("Junk.".into()));
+        assert_eq!(id_of(Path::new("/p/todo_viewer.wasm"), &junk), "todo-viewer");
+    }
 }

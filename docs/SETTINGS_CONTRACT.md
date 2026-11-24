@@ -122,12 +122,18 @@ neither needs an account: plugins are public code, not anyone's data.
 from the library, at which version. A failure is said in a sentence on the plugin's row:
 "The download did not verify, so nothing was installed."
 
-**The Library list in Settings** shows every plugin in the index: its screenshot, name,
+**The Library list in Settings** (since 2026-11-24 one list with the installed plugins,
+docs/PLUGINS_CONTRACT.md section 7) shows every plugin in the index: its screenshot, name,
 summary, version, and what it will ask for ("Reads and changes the stores you choose"). The
 row's button reads Install, Installed or Update. A plugin the running Pimble cannot load (a
 newer ABI) says "Needs a newer Pimble" and has no button.
 
 ## 5. Updates (wave 3)
+
+(Amended 2026-11-24 by docs/PLUGINS_CONTRACT.md section 7: every installed plugin the
+library lists follows it, including one added from a file, and one built for an older ABI
+is replaced; Settings > Plugins is one list instead of an installed list and a Library
+list.)
 
 When the app starts, and every 6 hours after, it reads the index. Each library plugin with a
 newer version that the running Pimble can load is downloaded, verified and installed as in

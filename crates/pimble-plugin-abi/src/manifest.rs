@@ -168,7 +168,74 @@ impl Manifest {
     }
 }
 
+/// The first four fields of a [`Manifest`]: what a plugin is, read from a
+/// manifest this Pimble may not read in full. Every ABI has encoded these four
+/// first and alike, so a plugin built for another ABI is still known by its id
+/// and version (docs/PLUGINS_CONTRACT.md section 7: one built for an older ABI is
+/// updated from the library, not only refused). Never reorder them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestHead {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub abi: u32,
+}
+
+impl ManifestHead {
+    /// Read the head of an encoded manifest, whatever follows it.
+    pub fn decode(bytes: &[u8]) -> Result<ManifestHead, String> {
+        postcard::take_from_bytes(bytes).map(|(head, _)| head).map_err(|e| e.to_string())
+    }
+}
+
+impl Manifest {
+    /// What this plugin is, without what it provides and asks.
+    pub fn head(&self) -> ManifestHead {
+        ManifestHead { id: self.id.clone(), name: self.name.clone(), version: self.version.clone(), abi: self.abi }
+    }
+}
+
 /// The sentence a person reads when a plugin built for another ABI is refused.
 pub fn refusal_for_abi(name: &str, abi: u32) -> String {
     format!("The {name} plugin was built for plugin ABI {abi}, and this Pimble runs ABI {ABI_VERSION} plugins.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_head_reads_from_a_manifest_whose_tail_this_abi_cannot() {
+        let manifest = Manifest {
+            id: "kanban-viewer".into(),
+            name: "Kanban".into(),
+            version: "0.1.2".into(),
+            abi: ABI_VERSION - 1,
+            rinch: "abc".into(),
+            provides: Vec::new(),
+            asks: Permissions::default(),
+        };
+        assert_eq!(ManifestHead::decode(&crate::encode(&manifest)), Ok(manifest.head()));
+        // Another ABI's manifest: whatever follows the head is not read.
+        #[derive(Serialize)]
+        struct Elsewhere {
+            id: String,
+            name: String,
+            version: String,
+            abi: u32,
+            tail: Vec<(u8, String)>,
+            more: Option<u64>,
+        }
+        let elsewhere = Elsewhere {
+            id: "kanban-viewer".into(),
+            name: "Kanban".into(),
+            version: "0.0.9".into(),
+            abi: 3,
+            tail: vec![(9, "x".into())],
+            more: Some(7),
+        };
+        let head = ManifestHead::decode(&crate::encode(&elsewhere)).unwrap();
+        assert_eq!((head.id.as_str(), head.version.as_str(), head.abi), ("kanban-viewer", "0.0.9", 3));
+        assert!(ManifestHead::decode(b"\x05ab").is_err());
+    }
 }

@@ -98,7 +98,7 @@ fn compiled(path: &std::path::Path) -> Result<pimble_plugin_host::wasmtime_engin
             return Ok(plugin.clone());
         }
     }
-    let plugin = pimble_plugin_host::wasmtime_engine::load_file(path, pimble_plugin_host::wasmtime_engine::DEFAULT_BUDGET).map_err(|(_, sentence)| sentence)?;
+    let plugin = pimble_plugin_host::wasmtime_engine::load_file(path, pimble_plugin_host::wasmtime_engine::DEFAULT_BUDGET).map_err(|refused| refused.sentence)?;
     COMPILED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.to_path_buf(), (stamp, plugin.clone()));
     Ok(plugin)
 }

@@ -1,10 +1,11 @@
-//! The app's side of the plugin library (docs/SETTINGS_CONTRACT.md section 4;
-//! `pimble_plugin_host::library` reads and checks what it serves): its index, the
-//! rows Settings > Plugins lists from it, verified installs, and updates on
-//! their own (section 5).
+//! The app's side of the plugin library (docs/SETTINGS_CONTRACT.md section 4,
+//! docs/PLUGINS_CONTRACT.md section 7; `pimble_plugin_host::library` reads,
+//! judges and checks what it serves): its index, verified installs, and every
+//! installed plugin the library can replace kept up to date on its own.
 
-use super::window::{asks_sentence, refresh_window, LibraryRow};
+use super::window::refresh_window;
 use super::*;
+use pimble_plugin_host::library::Have;
 
 /// Where the library's index (`None`) or one of its files is.
 fn library_url(file: Option<&str>) -> String {
@@ -15,26 +16,38 @@ fn library_url(file: Option<&str>) -> String {
     }
 }
 
-/// Read the index again, as Settings > Plugins is shown.
+/// Read the index again, as Settings > Plugins is shown, saying on the page
+/// what kept it from being read.
 pub(super) fn read_library() {
     if INDEX.with(|i| i.borrow().is_none()) {
         library_said("Looking at the library...".to_string());
     }
-    place::fetch(library_url(None), |fetched| {
-        let read = fetched.and_then(|bytes| Index::parse(&bytes));
-        match read {
+    read_index(true);
+}
+
+/// Read the index, keep it, and install every update it has for this device
+/// (docs/PLUGINS_CONTRACT.md section 7). `on_page` says what came of reading
+/// it on Settings > Plugins; the timer's reads only log.
+fn read_index(on_page: bool) {
+    place::fetch(library_url(None), move |fetched| {
+        match fetched.and_then(|bytes| Index::parse(&bytes)) {
             Ok(index) => {
                 let empty = index.plugins.is_empty();
                 INDEX.with(|i| *i.borrow_mut() = Some(index));
-                library_said(if empty { "The library has no plugins yet.".to_string() } else { String::new() });
+                if on_page {
+                    library_said(if empty { "The library has no plugins yet.".to_string() } else { String::new() });
+                }
+                update_what_is_due();
             }
             Err(e) => {
-                tracing::warn!("plugins: the library could not be read: {e}");
+                tracing::info!("plugins: the library could not be read: {e}");
                 let known = INDEX.with(|i| i.borrow().is_some());
-                library_said(if known { String::new() } else { format!("The library could not be reached ({e}).") });
+                if on_page {
+                    library_said(if known { String::new() } else { format!("The library could not be reached ({e}).") });
+                }
             }
         }
-        refresh_library();
+        refresh_window();
     });
 }
 
@@ -44,51 +57,12 @@ fn library_said(line: String) {
     }
 }
 
-fn library_rows() -> Vec<LibraryRow> {
-    let Some(index) = INDEX.with(|i| i.borrow().clone()) else { return Vec::new() };
-    index
-        .plugins
-        .iter()
-        .map(|entry| {
-            let installed = manifest_of(&entry.id).map(|m| m.version);
-            let from_library = PROVENANCE.with(|p| p.borrow().from_library(&entry.id));
-            let offer = library::offer(entry, installed.as_deref(), from_library);
-            let mut asks = asks_sentence(&entry.asks).to_string();
-            if let Some(first) = asks.get_mut(..1) {
-                first.make_ascii_uppercase();
-            }
-            let asked = ASKED.with(|a| a.borrow().as_deref() == Some(entry.id.as_str()));
-            let line = ROW_LINES.with(|l| l.borrow().get(&entry.id).cloned()).unwrap_or_else(|| match (&offer, asked) {
-                (Offer::Install, true) => format!("Press Install to add {}.", entry.name),
-                (Offer::Update { from }, true) => format!("You have {from}. Press Update to get {}.", entry.version),
-                (Offer::Update { from }, false) => format!("You have {from}."),
-                (Offer::Installed, true) => format!("{} is installed already.", entry.name),
-                (Offer::FromFile, true) => format!("{} was added from a file. Remove it above to install the library's.", entry.name),
-                (Offer::NeedsNewer, true) => format!("{} needs a newer Pimble. Update Pimble first.", entry.name),
-                _ => String::new(),
-            });
-            let button = match offer {
-                Offer::Install => Some("Install"),
-                Offer::Update { .. } => Some("Update"),
-                _ => None,
-            };
-            LibraryRow { asked, button, id: entry.id.clone(), title: format!("{} {}", entry.name, entry.version), summary: entry.summary.clone(), asks: format!("{asks}."), offer, line }
-        })
-        .collect()
-}
-
-pub(super) fn refresh_library() {
-    if let Some(ui) = UI.with(Cell::get) {
-        ui.library.set(library_rows());
-    }
-}
-
 fn row_said(id: &str, line: String) {
     ROW_LINES.with(|l| l.borrow_mut().insert(id.to_string(), line));
-    refresh_library();
+    refresh_window();
 }
 
-/// "Install" or "Update".
+/// "Install", "Update" or "Use Library Version".
 pub(super) fn install_from_library(id: &str) {
     let Some(entry) = INDEX.with(|i| i.borrow().as_ref().and_then(|index| index.plugins.iter().find(|e| e.id == id).cloned())) else {
         return;
@@ -125,10 +99,9 @@ pub(super) fn installed_from_library(entry: &Entry) {
     let quiet = QUIET.with(|q| q.borrow_mut().remove(&entry.id));
     PROVENANCE.with(|p| p.borrow_mut().plugins.insert(entry.id.clone(), entry.version.clone()));
     write_provenance();
-    let line = if quiet { format!("{} updated to {}.", entry.name, entry.version) } else { format!("Installed {} {}.", entry.name, entry.version) };
-    tracing::info!("plugins: {line}");
+    let line = if quiet { format!("Updated to {}.", entry.version) } else { format!("Installed {} {}.", entry.name, entry.version) };
+    tracing::info!("plugins: {} {line}", entry.id);
     row_said(&entry.id, line);
-    refresh_window();
     if quiet {
         // Panes showing it say a newer version is ready.
         if let Some(store) = STORE.with(Cell::get) {
@@ -147,7 +120,7 @@ pub(super) fn install_failed(entry: &Entry, line: String) {
     row_said(&entry.id, line);
 }
 
-// ── Updates on their own (docs/SETTINGS_CONTRACT.md section 5) ───────────────
+// ── Updates on their own (docs/PLUGINS_CONTRACT.md section 7) ────────────────
 
 /// The first look at the library after the app starts, then one every six
 /// hours.
@@ -157,109 +130,62 @@ const UPDATE_CHECK_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
 pub(super) fn schedule_update_check(after_ms: u32) {
     rinch::core::reactive::unowned(|| {
         let _ = rinch::core::set_timeout(after_ms, || {
-            check_for_updates();
+            read_index(false);
             schedule_update_check(UPDATE_CHECK_EVERY_MS);
         });
     });
 }
 
-/// Read the index, and install every newer version of a plugin that came from
-/// the library and that this Pimble can load, without asking. A plugin added
-/// from a file is never touched; what each was allowed carries over, and a
-/// new version that asks for more asks the way a first use does.
-fn check_for_updates() {
-    place::fetch(library_url(None), |fetched| {
-        let index = match fetched.and_then(|bytes| Index::parse(&bytes)) {
-            Ok(index) => index,
-            Err(e) => return tracing::info!("plugins: no update check this time: {e}"),
-        };
-        INDEX.with(|i| *i.borrow_mut() = Some(index.clone()));
-        let due = updates_due(&index, |id| manifest_of(id).map(|m| m.version), |id| PROVENANCE.with(|p| p.borrow().from_library(id)));
-        refresh_library();
-        for entry in due {
-            if !QUIET.with(|q| q.borrow_mut().insert(entry.id.clone())) {
-                continue;
-            }
-            tracing::info!("plugins: updating {} to {}", entry.id, entry.version);
-            fetch_and_install(entry);
-        }
-    });
-}
-
-/// The entries of `index` that are updates to install on their own: newer
-/// than the version installed, of a plugin installed from the library, for
-/// this Pimble's plugin ABI.
-fn updates_due(index: &Index, installed: impl Fn(&str) -> Option<String>, from_library: impl Fn(&str) -> bool) -> Vec<Entry> {
-    index
-        .plugins
-        .iter()
-        .filter(|entry| {
-            let have = installed(&entry.id);
-            matches!(library::offer(entry, have.as_deref(), from_library(&entry.id)), Offer::Update { .. })
+/// Install, without asking, every update the index has for a plugin
+/// installed here: a newer version this Pimble runs, wherever the installed
+/// one came from, or any version this Pimble runs of one it does not (built
+/// for an older ABI). A development build at the library's version or later is
+/// left alone. What each was allowed carries over, and a new version that asks
+/// for more asks the way a first use does.
+fn update_what_is_due() {
+    let Some(index) = INDEX.with(|i| i.borrow().clone()) else { return };
+    // Nothing is judged before the plugins here have loaded: a plugin not
+    // loaded yet would read as not installed.
+    if REGISTRY.with(|r| r.borrow().is_none()) {
+        return;
+    }
+    let installed = super::window::installed();
+    let provenance = PROVENANCE.with(|p| p.borrow().clone());
+    let have = |id: &str| {
+        installed.iter().find(|h| h.id == id).map(|h| Have {
+            version: h.version.as_deref().unwrap_or_default(),
+            from_library: provenance.from_library(id),
+            runs: h.refusal.is_none(),
         })
-        .cloned()
-        .collect()
+    };
+    for entry in library::updates_due(&index, have) {
+        if !QUIET.with(|q| q.borrow_mut().insert(entry.id.clone())) {
+            continue;
+        }
+        tracing::info!("plugins: updating {} to {}", entry.id, entry.version);
+        row_said(&entry.id, format!("Updating to {}...", entry.version));
+        fetch_and_install(entry);
+    }
 }
 
-/// Plugin `id` was removed, or added from a file over the library's: the
-/// library no longer looks after it.
-pub(super) fn forget_library(id: &str) {
-    let had = PROVENANCE.with(|p| p.borrow_mut().plugins.remove(id).is_some());
+/// Plugin `id` was added from a file over the library's (`removed`: or taken
+/// off this device, which also forgets that it was turned off): the library's
+/// record of it goes.
+pub(super) fn forget_library(id: &str, removed: bool) {
+    let had = PROVENANCE.with(|p| {
+        let mut p = p.borrow_mut();
+        let was_library = p.plugins.remove(id).is_some();
+        let was_off = removed && p.off.remove(id);
+        was_library || was_off
+    });
     if had {
         write_provenance();
     }
     ROW_LINES.with(|l| l.borrow_mut().remove(id));
-    refresh_library();
+    refresh_window();
 }
 
-fn write_provenance() {
+pub(super) fn write_provenance() {
     let json = PROVENANCE.with(|p| p.borrow().to_json());
     place::write_provenance(&json);
-}
-
-#[cfg(test)]
-mod update_tests {
-    use super::*;
-    use pimble_plugin_host::abi::{Permissions, ABI_VERSION};
-
-    fn entry(id: &str, version: &str, abi: u32) -> Entry {
-        Entry {
-            id: id.into(),
-            name: id.into(),
-            version: version.into(),
-            abi,
-            author: "Pimble".into(),
-            summary: String::new(),
-            asks: Permissions::default(),
-            wasm: format!("{id}-{version}.wasm"),
-            sig: format!("{id}-{version}.wasm.sig"),
-            shot: None,
-            bytes: 1,
-            sha256: String::new(),
-        }
-    }
-
-    #[test]
-    fn only_newer_library_plugins_this_pimble_runs_update_on_their_own() {
-        let index = Index {
-            v: 1,
-            plugins: vec![
-                entry("kanban-viewer", "0.2.0", ABI_VERSION),
-                entry("todo-viewer", "0.2.0", ABI_VERSION),
-                entry("timeline-viewer", "0.2.0", ABI_VERSION + 1),
-                entry("calendar-viewer", "0.2.0", ABI_VERSION),
-                entry("stuck-viewer", "0.1.0", ABI_VERSION),
-            ],
-        };
-        let installed = |id: &str| match id {
-            "kanban-viewer" | "todo-viewer" | "timeline-viewer" => Some("0.1.0".to_string()),
-            "stuck-viewer" => Some("0.1.0".to_string()),
-            _ => None,
-        };
-        // todo was added from a file; calendar is not installed; timeline's new
-        // version needs a newer Pimble; stuck is current.
-        let from_library = |id: &str| id != "todo-viewer";
-        let due: Vec<String> = updates_due(&index, installed, from_library).into_iter().map(|e| e.id).collect();
-        assert_eq!(due, vec!["kanban-viewer".to_string()]);
-    }
 }
