@@ -5,8 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered (2026-11-24): decisions 1 to 11. Decision 12 the
-same day. Open: 8b (how the fonts ship).
+has answered them. Answered (2026-11-24): decisions 1 to 12. Open: 8b (how
+the fonts ship).
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
