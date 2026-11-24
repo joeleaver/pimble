@@ -1819,9 +1819,22 @@ deleted yet (part 2).
 - `pimble-host` `http::socket` tests: a server that closes with 4404 answers `Some(4404)`, one that
   speaks first answers `None`, no listener answers `None`. The relay suite (`tests/relay.rs`)
   covers the owner-away path end to end on the desktop.
+- The server suites (`pimble-host`, `pimble-store`, `pimble-server`) pass on the real disk and with
+  `PIMBLE_TEST_DISK=memory`.
+- In a browser (headless Chromium through Playwright, on `scripts/local-stack` with made-up
+  accounts, the default worker path): a plain store created on the hosted server and held by
+  Alice showed in her page as `synced`; text she typed into a note reached her desktop replica
+  (added with `cloud-add-hosted`, `via_account` in its `sync.json`) and its search, and a note
+  made on the desktop appeared in the page live. A relayed store's folder shared with Bob showed
+  in his page as `shared by alice · encrypted · synced`; with the owner's desktop stopped, the
+  row read `owner offline` within a second.
 
 ### Not done
 
 - `handler.rs` (about 7,050 lines) and `vault_link.rs` (about 3,480) are still far over the
   700-line limit; this part moved code out of both (`grant.rs`, `hosted_plain.rs`) but did not
   split them.
+- This part's browser proof ran in Chromium only, not Firefox.
+- No test covers an expired sign-in on a plain link held through the account (the link waits
+  while the session is expired, as the vault link does; the vault link's tests cover that path).
+- The old browser path is still there (wave 5's later parts remove it).
