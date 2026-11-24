@@ -7,8 +7,11 @@
 //! write ([`Window::REPORT`]), so someone typing is a handful of reports and
 //! not hundreds; and the accounts service gathers what it is told per
 //! (watcher, document, writer) until five quiet minutes have passed
-//! ([`Window::NOTICE`]), and then queues one notice. Nothing here holds a
-//! clock: every call names the time, so a test moves it.
+//! ([`Window::NOTICE`]), and then queues one notice. The service counts
+//! what it gathers in spells of editing, not in appends
+//! ([`Gathered::add_spell`]): someone typing for ten minutes edited the note
+//! once, not 412 times. Nothing here holds a clock: every call names the
+//! time, so a test moves it.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -18,6 +21,10 @@ pub const QUIET_MS: i64 = 5 * 60 * 1000;
 /// Someone who never stops for five minutes is still told about, once an
 /// hour: a batch is due at the latest this long after its first write.
 pub const LONGEST_MS: i64 = 60 * 60 * 1000;
+
+/// Writes this far apart are two spells of editing; closer, one
+/// ([`Gathered::add_spell`]).
+pub const SPELL_GAP_MS: i64 = 30 * 1000;
 
 /// How long a batch waits: until it has been quiet for `quiet_ms`, or at
 /// the latest `longest_ms` after it began.
@@ -37,7 +44,8 @@ impl Window {
 /// What has been gathered under one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gathered {
-    /// How many writes.
+    /// How many writes ([`Gathered::add`]: a server's report) or spells of
+    /// editing ([`Gathered::add_spell`]: the service's batch).
     pub count: u32,
     pub first_ms: i64,
     pub last_ms: i64,
@@ -53,6 +61,17 @@ impl Gathered {
     pub fn add(&mut self, count: u32, now_ms: i64) {
         self.count = self.count.saturating_add(count.max(1));
         self.last_ms = self.last_ms.max(now_ms);
+    }
+
+    /// A write at `at_ms`, counted as a spell of editing: one more only when
+    /// it is [`SPELL_GAP_MS`] or more from every write gathered so far (a
+    /// report told late can land before the first). The batch spans it.
+    pub fn add_spell(&mut self, at_ms: i64) {
+        if at_ms - self.last_ms >= SPELL_GAP_MS || self.first_ms - at_ms >= SPELL_GAP_MS {
+            self.count = self.count.saturating_add(1);
+        }
+        self.first_ms = self.first_ms.min(at_ms);
+        self.last_ms = self.last_ms.max(at_ms);
     }
 
     /// Whether the batch is due at `now_ms` under `window`.
@@ -104,14 +123,14 @@ impl<K: Hash + Eq + Clone> Batcher<K> {
     }
 }
 
-/// The line a watch notice is told in where nothing of the note can be
-/// read (a push the service worker shows, an email, a notice whose note
-/// this device does not hold): "3 changes in a note you watch".
-pub fn changes_line(count: u32) -> String {
-    if count <= 1 {
-        "1 change in a note you watch".to_string()
-    } else {
-        format!("{count} changes in a note you watch")
+/// What a watch notice says where nothing of the note can be read (a push
+/// the service worker shows, a notice whose note this device does not
+/// hold), `spells` the spells of editing it stands for: "Joe edited a note
+/// you watch", "Joe edited a note you watch 3 times".
+pub fn watch_title(who: &str, spells: u32) -> String {
+    match spells {
+        0 | 1 => format!("{who} edited a note you watch"),
+        n => format!("{who} edited a note you watch {n} times"),
     }
 }
 
@@ -164,9 +183,24 @@ mod tests {
     }
 
     #[test]
-    fn the_line_says_how_many() {
-        assert_eq!(changes_line(3), "3 changes in a note you watch");
-        assert_eq!(changes_line(1), "1 change in a note you watch");
-        assert_eq!(changes_line(0), "1 change in a note you watch");
+    fn spells_of_editing_are_counted_not_writes() {
+        let mut g = Gathered::start(1, 0);
+        for t in (2_000..600_000).step_by(2_000) {
+            g.add_spell(t);
+        }
+        assert_eq!(g.count, 1, "ten minutes of typing without a pause is one spell");
+        g.add_spell(600_000 + SPELL_GAP_MS - 2_000);
+        assert_eq!(g.count, 2, "a half-minute pause starts another");
+        g.add_spell(-SPELL_GAP_MS);
+        assert_eq!((g.count, g.first_ms), (3, -SPELL_GAP_MS), "a write told late, well before the first");
+        g.add_spell(300_000);
+        assert_eq!(g.count, 3, "one inside the span is part of it");
+    }
+
+    #[test]
+    fn the_title_says_who_and_how_often() {
+        assert_eq!(watch_title("Joe", 3), "Joe edited a note you watch 3 times");
+        assert_eq!(watch_title("Joe", 1), "Joe edited a note you watch");
+        assert_eq!(watch_title("Joe", 0), "Joe edited a note you watch");
     }
 }

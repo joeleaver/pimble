@@ -2153,13 +2153,26 @@ impl RpcHandler {
     }
 
     /// A signed-in person wrote `node_id`'s document: gathered for whoever
-    /// evaluates watches, when anybody does. The operator's own writes
-    /// (`Principal::Service`) are nobody's to tell apart.
-    fn note_write(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) {
+    /// evaluates watches, when they want it told (`crate::writes`), with
+    /// the shared roots that reach it judged once per gathering. The
+    /// operator's own writes (`Principal::Service`) are nobody's to tell
+    /// apart. Call with the store manager unlocked.
+    async fn note_write(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) {
+        use crate::writes::Recorded;
         let Principal::User { sub, .. } = principal else { return };
-        if self.writes.record(store_id, node_id, sub, crate::writes::now_ms()) {
-            self.writes.keep_telling(&self.runtime);
+        let now = crate::writes::now_ms();
+        match self.writes.record(store_id, node_id, sub, now) {
+            Recorded::Unwanted => return,
+            Recorded::Added => {}
+            Recorded::Starts(candidates) => {
+                let roots = {
+                    let manager = self.store_manager.read().await;
+                    crate::writes::roots_reaching(&manager, store_id, node_id, &candidates)
+                };
+                self.writes.start(store_id, node_id, sub, now, roots);
+            }
         }
+        self.writes.keep_telling(&self.runtime);
     }
 
     /// The server stops: the gathered writes are told now.
@@ -3891,7 +3904,7 @@ impl PimbleApiServer for RpcHandler {
         }
         drop(manager);
         if let VaultDocId::Node(node_id) = request.doc_id {
-            self.note_write(&principal, request.store_id, node_id);
+            self.note_write(&principal, request.store_id, node_id).await;
         }
 
         // A picture is never announced: nobody holds one open, every reader
@@ -4372,6 +4385,12 @@ impl PimbleApiServer for RpcHandler {
             }
         });
         Ok(())
+    }
+
+    async fn set_write_interest(&self, ext: &Extensions, request: pimble_rpc::SetWriteInterestRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setWriteInterest")?;
+        self.writes.set_interest(request);
+        Ok(EmptyResponse {})
     }
 
     async fn register_push(&self, ext: &Extensions, request: pimble_rpc::RegisterPushRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
@@ -6390,7 +6409,7 @@ impl PimbleApiServer for RpcHandler {
             }
         }
         if effect.changed {
-            self.note_write(&principal, request.store_id, request.node_id);
+            self.note_write(&principal, request.store_id, request.node_id).await;
         }
 
         Ok(ApplyEditResponse {})

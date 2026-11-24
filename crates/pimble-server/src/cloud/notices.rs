@@ -168,12 +168,19 @@ pub async fn put_watched_docs(http: &dyn Http, base_url: &str, session: &str, st
     }
 }
 
-/// One gathered write, as the relay's owner reports it.
-#[derive(Debug, Clone, Serialize)]
+/// One gathered write, as the relay's owner reports it (and keeps it until
+/// the service has taken it, `crate::relay_writes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedWrite {
     pub doc: String,
     pub writer: String,
     pub count: u32,
+    /// The shared roots whose scope reaches the document.
+    #[serde(default)]
+    pub roots: Vec<String>,
+    /// When the last of these writes was made (Unix milliseconds).
+    #[serde(default)]
+    pub last_ms: i64,
 }
 
 /// `POST /api/v1/watches/writes`: what an owner's relay face saw others

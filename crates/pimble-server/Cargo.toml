@@ -92,6 +92,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# relay_writes.rs's tests stand in for the accounts service behind
+# `pimble_host::http::Http`, an `async_trait` trait.
+async-trait = { workspace = true }
 # notices.rs's tests build a discussion's document the way the app does.
 yrs = { workspace = true }
 # `PIMBLE_TEST_DISK=memory` runs the suite on the memory disk (pimble_host::disk::testfs).

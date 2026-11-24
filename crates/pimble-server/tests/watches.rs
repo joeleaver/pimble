@@ -2,9 +2,11 @@
 //! (docs/NOTIFICATIONS_CONTRACT.md section 3, wave 3), on the sharing
 //! harness: the owner watches a folder with its subtree; her device seals
 //! the choice to the stub accounts service and registers the documents it
-//! reaches, again as a node is made under it; a member's write reaches the
-//! hosted server's `subscribeWrites` naming the document and the writer and
-//! nothing else; Unwatch on a note under the folder takes the folder's
+//! reaches, again as a node is made under it; once its listener names the
+//! watched documents (`setWriteInterest`), a member's write to one of them
+//! reaches the hosted server's `subscribeWrites` naming the document, the
+//! writer and the shared roots that reach it, and a write to a document not
+//! named is never told; Unwatch on a note under the folder takes the folder's
 //! watch. A store on this computer alone cannot be watched.
 
 mod common;
@@ -16,7 +18,7 @@ use common::*;
 use pimble_client::PimbleClient;
 use pimble_core::{NodeId, StoreId};
 use pimble_crdt::NodeDoc;
-use pimble_rpc::{EditOperation, MemberRole};
+use pimble_rpc::{EditOperation, MemberRole, SetWriteInterestRequest, WriteInterest};
 
 fn registered(env: &Env, user: &str, store_id: StoreId) -> Vec<String> {
     let s = env.stub.inner.lock().unwrap();
@@ -61,22 +63,30 @@ async fn a_watched_folder_registers_what_is_under_it_and_a_members_write_is_repo
     let new = alice.create_node(fx.store_id, Some(fx.deeper), "document", "Ferry").await.unwrap();
     assert!(wait_until(Duration::from_secs(15), || async { registered(&env, &alice_id, fx.store_id).contains(&new.to_string()) }).await, "kept in step as nodes come");
 
-    // Bob writes in Packing: the hosted server tells who wrote which
-    // document, and how many times, to whoever follows its writes.
+    // The accounts service names what is watched: Packing, through Bob's
+    // share and a root that does not reach it. Bob writes in Packing and in
+    // a note nobody named: the hosted server tells only the first, who wrote
+    // it and through which share, to whoever follows its writes.
     let hosted = env.stub.inner.lock().unwrap().h_client.clone().expect("the hosted server's client");
     let mut writes = hosted.subscribe_writes().await.expect("following the hosted server's writes");
+    let interest = WriteInterest { store_id: fx.store_id, docs: vec![fx.inside], roots: vec![fx.shared, NodeId::new()] };
+    hosted.set_write_interest(SetWriteInterestRequest { stores: vec![interest], whole: true }).await.expect("naming the watched documents");
+    append(&bob, fx.store_id, fx.deeper, "and a map").await;
     append(&bob, fx.store_id, fx.inside, "and a towel").await;
-    let seen = tokio::time::timeout(Duration::from_secs(30), async {
+    let mut told = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let seen = writes.next().await.expect("a write").expect("it parses");
             if seen.writer == bob_id {
-                return seen;
+                told.push(seen);
             }
         }
     })
-    .await
-    .expect("Bob's write is reported");
+    .await;
+    assert_eq!(told.len(), 1, "Packing once, nothing of the note nobody named: {told:?}");
+    let seen = &told[0];
     assert_eq!((seen.store_id, seen.doc_id), (fx.store_id, fx.inside));
+    assert_eq!(seen.roots, vec![fx.shared], "the share that reaches it, not the other root");
     assert!(seen.count >= 1);
 
     // Unwatch on a note under the folder takes the folder's watch.

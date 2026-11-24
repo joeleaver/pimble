@@ -181,7 +181,10 @@ pub struct ListWatchesResponse {
 /// couple of seconds per (store, document, writer)
 /// (`pimble_core::watch::Window::REPORT`), so someone typing is a handful of
 /// these, not hundreds. Only a server that verifies tokens (the hosted
-/// server, an owner's relay face) has any to tell.
+/// server, an owner's relay face) has any to tell, and the hosted server
+/// tells only writes to documents the listener named
+/// ([`SetWriteInterestRequest`]): it never hands the accounts service a
+/// write to a note nobody watches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteSeen {
     pub store_id: StoreId,
@@ -190,4 +193,36 @@ pub struct WriteSeen {
     pub writer: String,
     /// How many appends or edits.
     pub count: u32,
+    /// The shared roots whose scope reaches the document: among the roots
+    /// the listener named, on the hosted server; every root the store
+    /// publishes, on a relay face. A watcher holding the store through a
+    /// share hears of the write only when its root is here.
+    #[serde(default)]
+    pub roots: Vec<NodeId>,
+    /// When the last of these writes was made (Unix milliseconds).
+    #[serde(default)]
+    pub last_ms: i64,
+}
+
+/// The writes one store's listener wants told (section 3): writes to these
+/// documents only, each with the roots among `roots` whose scope reaches
+/// it. The documents are opaque ids; the server learns nothing of who
+/// watches them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteInterest {
+    pub store_id: StoreId,
+    pub docs: Vec<NodeId>,
+    /// The roots of the shares watchers hold this store through.
+    #[serde(default)]
+    pub roots: Vec<NodeId>,
+}
+
+/// `setWriteInterest` (`Service`-only): which writes `subscribeWrites`
+/// tells. Each store named replaces what was wanted there (no documents:
+/// nothing); with `whole`, a store not named wants nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetWriteInterestRequest {
+    pub stores: Vec<WriteInterest>,
+    #[serde(default)]
+    pub whole: bool,
 }

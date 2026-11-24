@@ -423,6 +423,11 @@ pub trait PimbleApi {
     #[subscription(name = "subscribeWrites" => "writeSeen", unsubscribe = "unsubscribeWrites", item = WriteSeen, with_extensions)]
     async fn subscribe_writes(&self) -> SubscriptionResult;
 
+    /// Name the documents whose writes `subscribeWrites` tells (section 3):
+    /// the hosted server tells nothing else. `Service`-only.
+    #[method(name = "setWriteInterest", with_extensions)]
+    async fn set_write_interest(&self, request: SetWriteInterestRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// A Pimble window hears the links `openInApp` hands it, each with the
     /// activation token it came with, if any. `Service`-only.
     #[subscription(name = "subscribeAppLinks" => "appLink", unsubscribe = "unsubscribeAppLinks", item = HandedLink, with_extensions)]

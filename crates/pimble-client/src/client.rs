@@ -1219,6 +1219,13 @@ impl PimbleClient {
             .map_err(rpc_error)
     }
 
+    /// Name the documents whose writes [`Self::subscribe_writes`] tells
+    /// (`Service`-only).
+    pub async fn set_write_interest(&self, request: pimble_rpc::SetWriteInterestRequest) -> Result<()> {
+        self.client.set_write_interest(request).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
     /// Hear how this computer's connections to Pimble Cloud are doing, the
     /// first at once and then each change; `None` while signed out.
     pub async fn subscribe_cloud_connection(&self) -> Result<jsonrpsee::core::client::Subscription<Option<pimble_rpc::CloudConnection>>> {

@@ -5566,6 +5566,7 @@ name = "pimble-server"
 version = "0.30.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
  "bytes",

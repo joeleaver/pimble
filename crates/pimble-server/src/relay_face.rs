@@ -201,6 +201,9 @@ impl RelayHost {
         if inner.face.is_none() {
             let face = self.start_face(account, issuer).await?;
             *self.url.lock().unwrap() = Some(face.url.clone());
+            // The owner's own store: every write is told, with every root
+            // its twin publishes, and the owner's server reports them.
+            face.handler.writes().tell_everything();
             let writes = face.handler.writes().subscribe();
             inner.reporting = Some(self.runtime.spawn(crate::relay_writes::run(handler.clone(), writes, self.serve.subscribe())));
             inner.face = Some(face);
