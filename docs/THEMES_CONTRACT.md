@@ -5,7 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered so far (2026-11-24): decision 4 (shares) and decision 7 (palette, and themes
+has answered them. Answered so far (2026-11-24): decisions 2 (themes replace paragraph spacing), 3 (looked up
+from the nearest ancestor), 4 (shares) and 7 (palette, and themes
 that inherit and set only what they change).
 
 **Two kinds, kept apart:**
@@ -181,7 +182,8 @@ grows `theme`), so applying is shared: everyone sees the book layout.
 
 **The theme in force** for a node is the one named by the node itself or its nearest
 ancestor that names one; with none, Default. Looked up, not copied, which is the reverse
-of what paragraphs chose (section 4 says why and decision 3 asks): "this tree reads like a
+of what paragraphs chose (decided, Joe 2026-11-24, decision 3; any node with children is a
+"folder" here, nothing special marks one): "this tree reads like a
 book" means changing the theme on the tree's root changes the whole tree, including notes
 already in it.
 
@@ -266,7 +268,7 @@ Keeping both would be two settings for one margin, and the copy rule makes them 
 every node under a folder made spaced before themes carries a copied `"spaced"`, so a book
 theme applied to that folder would be overridden everywhere if the per-node key won.
 
-The recommendation (decision 2):
+Decided (Joe, 2026-11-24, decision 2: "it replaces compact/spaced"):
 - **No new writes of `custom["paragraphs"]`.** Edit > "Compact Paragraphs" and the
   Appearance picker's Paragraphs row are replaced by the Theme item (section 9), and
   `custom_keys::INHERITED` drops it.
@@ -484,16 +486,13 @@ cut or add.
 1. **Tokens, not CSS.** A theme is a fixed set of typed tokens (section 2); there is no way
    to write CSS. *Recommendation: yes.* Free CSS in shared stores is untrusted input to
    both renderers, and tokens survive rinch's markup changing.
-2. **Paragraph spacing.** Themes subsume `custom["paragraphs"]`: no new writes, a read-time
-   fallback so every existing note looks the same, importers name `builtin:document`, and
-   Edit > "Compact Paragraphs" is replaced by Format > Theme (section 4). *Recommendation:
-   yes.* Alternatives: keep `paragraphs` as a per-note override of the theme (two settings
-   for one margin, and the copied values would override every new theme), or keep both
-   unrelated (Compact Paragraphs and a theme's spacing fighting).
-3. **Looked up, not copied.** The theme in force is the nearest ancestor's (section 3.2),
-   so changing the theme on a tree's root changes the whole tree. *Recommendation: yes*:
-   that is what "this tree reads like a book" means. Paragraphs chose copying so a note
-   never needs its ancestors; decisions 4 and 5 handle the two places that matters.
+2. **Paragraph spacing. Decided (Joe, 2026-11-24):** themes replace Compact/Spaced: no new
+   writes of `custom["paragraphs"]`, a read-time fallback to `builtin:document` so every
+   existing note looks the same, importers name `builtin:document`, and Edit > "Compact
+   Paragraphs" becomes Format > Theme (section 4).
+3. **Looked up, not copied. Decided (Joe, 2026-11-24):** the theme in force is the one named
+   by the node or its nearest ancestor, so a theme on any node with children applies to its
+   whole subtree, notes already there included (section 3.2).
 4. **Shares. Decided (Joe, 2026-11-24):** a scope's reach includes the theme documents in
    force in it, at a theme access chosen when the share is made: read-only (the default),
    write, or a copy of the theme made for this share that members may edit (section 3.2).
