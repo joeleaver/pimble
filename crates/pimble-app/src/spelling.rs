@@ -38,7 +38,7 @@ use crate::rinch_editor::{EditorHandle, SpellcheckPlugin, SPELLCHECK_KEY};
 /// The language of the dictionary Pimble carries. The Windows and macOS
 /// desktops use the platform's spellchecker and have no use for it (nor for
 /// [`prefers_english`]).
-#[cfg(any(test, feature = "web", not(any(target_os = "windows", target_os = "macos"))))]
+#[cfg(any(test, feature = "web", all(feature = "native", not(any(target_os = "windows", target_os = "macos")))))]
 const BUNDLED_LANGUAGE: &str = "en_US";
 
 /// The person's own words, loaded once from where this device keeps them,
@@ -76,7 +76,7 @@ pub(crate) fn install(handle: &EditorHandle) {
 /// Whether the person's most preferred language, as a locale (`en_US`,
 /// `en-GB`, `en`), is English: the one the bundled dictionary checks. With no
 /// locale at all (`C`), English is what is left.
-#[cfg(any(test, feature = "web", not(any(target_os = "windows", target_os = "macos"))))]
+#[cfg(any(test, feature = "web", all(feature = "native", not(any(target_os = "windows", target_os = "macos")))))]
 fn prefers_english<S: AsRef<str>>(locales: &[S]) -> bool {
     locales.first().is_none_or(|first| {
         let first = first.as_ref();
