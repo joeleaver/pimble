@@ -253,6 +253,10 @@ pub struct StubInner {
     pub kinds: Vec<String>,
     /// Push subscriptions (user id, endpoint) (wave 2).
     pub push_subs: Vec<(String, String)>,
+    /// Wave 3: each account's sealed watch choices (version, sealed), and
+    /// the documents registered per (user id, store id).
+    pub watch_choices: HashMap<String, (u64, String)>,
+    pub watched: HashMap<(String, String), Vec<String>>,
 }
 
 pub struct Stub {
@@ -286,6 +290,9 @@ pub fn stub_router(state: StubState) -> Router {
         .route("/api/v1/me/notice-key", axum::routing::put(stub_put_notice_key))
         .route("/api/v1/me/notifications", axum::routing::put(stub_put_notifications))
         .route("/api/v1/me/push", post(stub_post_push).delete(stub_delete_push))
+        .route("/api/v1/me/watches", get(stub_get_watches))
+        .route("/api/v1/me/watches/choices", axum::routing::put(stub_put_watch_choices))
+        .route("/api/v1/me/watches/stores/{store_id}", axum::routing::put(stub_put_watched_docs))
         .route("/api/v1/inbox", get(stub_drain_inbox).delete(stub_clear_inbox))
         .route("/api/v1/inbox/ack", post(stub_ack_inbox))
         .route("/api/v1/inbox/{recipient}", post(stub_post_notice))
@@ -422,6 +429,45 @@ pub async fn stub_delete_push(State(state): State<StubState>, headers: HeaderMap
     let endpoint = req["endpoint"].as_str().unwrap_or_default().to_string();
     s.push_subs.retain(|(u, e)| !(*u == user_id && *e == endpoint));
     Json(json!({}))
+}
+
+/// `GET /api/v1/me/watches` (wave 3).
+pub async fn stub_get_watches(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let choices = match s.watch_choices.get(&user_id) {
+        Some((version, sealed)) => json!({ "version": version, "sealed": sealed }),
+        None => json!({ "version": 0 }),
+    };
+    let stores: Vec<serde_json::Value> = s.watched.iter().filter(|((u, _), _)| *u == user_id).map(|((_, store), docs)| json!({ "store_id": store, "docs": docs })).collect();
+    Json(json!({ "choices": choices, "stores": stores }))
+}
+
+/// `PUT /api/v1/me/watches/choices`: compare-and-swap on the version.
+pub async fn stub_put_watch_choices(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let held = s.watch_choices.get(&user_id).map(|(v, _)| *v).unwrap_or(0);
+    if req["version"].as_u64() != Some(held) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let sealed = req["sealed"].as_str().unwrap_or_default().to_string();
+    s.watch_choices.insert(user_id, (held + 1, sealed));
+    Ok(Json(json!({ "version": held + 1 })))
+}
+
+/// `PUT /api/v1/me/watches/stores/{store}`: the store's documents, whole,
+/// from the choices at `version`.
+pub async fn stub_put_watched_docs(State(state): State<StubState>, headers: HeaderMap, AxPath(store_id): AxPath<String>, Json(req): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let held = s.watch_choices.get(&user_id).map(|(v, _)| *v).unwrap_or(0);
+    if req["version"].as_u64() != Some(held) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let docs: Vec<String> = req["docs"].as_array().map(|d| d.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    s.watched.insert((user_id, store_id), docs);
+    Ok(Json(json!({})))
 }
 
 impl StubInner {
@@ -1048,6 +1094,8 @@ pub async fn spawn_env() -> Env {
             next_seq: 0,
             kinds: Vec::new(),
             push_subs: Vec::new(),
+            watch_choices: HashMap::new(),
+            watched: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
         refuse_sessions: AtomicBool::new(false),

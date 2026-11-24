@@ -1,8 +1,8 @@
 # Notifications contract: hearing that someone wrote to you
 
-Status: **design agreed 2026-11-23; wave 0 (mentions as text) and wave 1 (the inbox and
-the running app) built the same day**, see "Built in wave 0" and "Built in wave 1" at the
-end. Written from a conversation with Joe that
+Status: **design agreed 2026-11-23; waves 0 to 3 (mentions as text, the inbox and the
+running app, email and web push, watches) built the same day**, see "Built in wave 0" to
+"Built in wave 3" at the end. Written from a conversation with Joe that
 day; his decisions are listed at the end. The details not named there are design choices
 made here that he has not reviewed yet.
 
@@ -577,3 +577,133 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 - Safari's push service needs the page installed to the home screen on iOS; not tried.
 - The email has no unsubscribe link or `List-Unsubscribe` header; the switch is in
   Settings.
+
+## Built in wave 3 (2026-11-23, branch `notifications`)
+
+### Decided here (small; Joe has not reviewed them)
+
+- **Servers report writes, the accounts service decides who hears.** A server that
+  verifies tokens (the hosted server, an owner's relay face) records each write a
+  `Principal::User` makes to a node's document (`vaultAppend` of `VaultDocId::Node`,
+  `applyEdit` that changed something): store, document, writer, nothing of the content,
+  gathered 2 s quiet / 10 s longest per (store, document, writer) and told as
+  `WriteSeen`. The accounts service follows the hosted server's `subscribeWrites` over its
+  own connection; for a relayed store the owner's server hears its relay face's writes
+  in-process and posts them (`POST /api/v1/watches/writes`, the store's owner only,
+  relay-tier stores only). Section 3 said the owner's machine "posts the notices": it
+  cannot, as only the service knows who watches what, so it posts the writes and the
+  service evaluates them exactly as for a hosted store. The operator's own writes
+  (`Principal::Service`: a desktop's embedded server, the CLI) are never recorded.
+- **Two things kept per person, apart.** *The choices* (what the person chose: store,
+  node, with or without its subtree) are account data like the personal document: one
+  blob sealed with `personal_key` under the associated data `pimble-watches/{user}`
+  (`pimble_crypto::watches_aad`), versioned, written by compare-and-swap (409, then read,
+  change again and retry, four times at most). *The registered documents* are the opaque
+  ids the choices reach, per store, which the service matches writes against. Every put
+  of a store's documents names the choices' version it was computed from, and one from
+  older choices is refused (409), so two devices cannot leave a stale set behind.
+- **The registered set** of a store is the chosen nodes that are live, and with a subtree
+  everything live under them, less attachments and discussions (`docs_for`); recomputed
+  2 s after any structural change (created, deleted, moved, tree structure, shares ended,
+  sync state) and at every sign-in check, and put whole.
+- **Watching is refused on a store only on this computer** ("Only notes other people can
+  change are watched: this store is on this computer alone. Host it on Pimble Cloud or
+  share it first."): nobody else can write there, and the service could not hear it.
+- **"Unwatch" on a node** takes its own watch, or else the nearest watch with a subtree
+  above it (so Unwatch on a watch notice for a note under a watched folder stops the
+  folder's watch). The row menu offers Unwatch when a subtree watch in the store might
+  reach the node (the explorer does not hold every ancestor); the server says "This note
+  is not watched." when none does.
+- **The notice**: `NoticeKind::Watch`, sealed by the service to the watcher's notice key,
+  from the writer, the node changed, no snippet, `count` changes. The app says
+  "Joe: 3 changes in a note you watch" and shows the note's name, which only the
+  watcher's device knows; email and push say "Joe made 3 changes in a note you watch in
+  Garden" (several notes of one writer in one email: "made 7 changes in 2 notes you
+  watch"). Its item's root is the scope the watcher holds the store through, so the
+  share's name is the one the watcher knows.
+- **The watcher must still hold the store** when a write is gathered and when its notice
+  is queued; a member who left hears nothing more. The service checks the grant on the
+  store, not that a scoped root reaches the document (it cannot know the tree): a member
+  can register any document id of a store they are in, and hear only that someone wrote
+  to it, which their scope's own replica would show them anyway for documents it holds.
+- **The switch**: `watches` beside `on`, `email` and `push` in `PUT /me/notifications`
+  and `setNotifications`; on by default, nothing watched by default. Off (or everything
+  off) deletes the choices, the registered documents and what was gathered, refuses new
+  ones (403) and the device forgets its copy.
+
+### What was built, and where
+
+- `pimble-core/src/watch.rs`: `Window` (`REPORT`, `NOTICE`), `Gathered`, `Batcher`,
+  `changes_line`.
+- `pimble-rpc/src/notices.rs`: `NoticeKind::Watch`, `Notice.count`, `WatchEntry`,
+  `WatchNodeRequest`, `UnwatchNodeRequest`, `ListWatchesResponse`, `WriteSeen`,
+  `SetNotificationsRequest.watches`, `ListNoticesResponse.watches`; methods `watchNode`,
+  `unwatchNode`, `listWatches` (Service-only) and the subscription `subscribeWrites`
+  (Service-only); `pimble-client` wraps them.
+- `pimble-server/src/writes.rs` (`Writes`: record, gather, tell; nothing kept with nobody
+  listening), `relay_writes.rs` (the owner's report of its relay face's writes, for the
+  stores its tunnel serves), `handler.rs` `note_write` and the four RPCs.
+- `pimble-server/src/notices/` (split from the old `notices.rs`): `watches.rs` (choices
+  sealed and kept in step, `docs_for`, `register_all`, `follow_structure`, watch and
+  unwatch), `kept.rs` (the device's copy), `run.rs` (refreshed with the account,
+  registered after structural changes); `cloud/notices.rs` the service's endpoints.
+- `pimble-cloud`: `schema.rhype` (`User.notify_watches_off`, `InboxItem.count`,
+  `WatchChoices`, `WatchedDoc`, `WatchBatch`), `src/db/` (split from `db.rs`;
+  `watches.rs`), `src/routes/watches.rs` (`GET /me/watches`, `PUT /me/watches/choices`,
+  `PUT /me/watches/stores/{store}`, `POST /watches/writes`), `src/watches.rs`
+  (`record_writes`, `watch_pass(state, now_ms)` with the caller's clock, `spawn`: a pass
+  every 30 s and the hosted server's writes followed with backoff), `mail.rs` and
+  `notify.rs` (the watch line, changes summed per email line), `routes/inbox.rs` (the
+  switch).
+- `pimble-app`: `watches.rs` (state, the row menu's states, the switch, the Inbox's
+  "Watching" list with "Unwatch"), the row menu's "Watch" submenu (Watch, Watch with
+  Subtree, Unwatch) in `app.rs`, the switch in the Account modal and Settings, watch
+  notices in `inbox.rs` (title, the note's name as the system notification's body,
+  "Unwatch" on the row), `protocol.rs`/`commands.rs`/`events.rs`. One code base for the
+  desktop and the browser; `web/build/sw.template.js` titles a pushed watch notice.
+
+### Verified
+
+- `pimble-cloud` integration against a real `rhypedb-server`:
+  `writes_to_a_watched_note_become_one_notice_after_five_quiet_minutes` (choices and
+  documents round-trip, stale versions 409, bad ids 400; the writer's own writes and
+  unwatched documents gather nothing; nothing at four quiet minutes, one notice after
+  five, told once; it opens with the notice key to a `Watch` notice with count 3 and no
+  snippet; its email says "olga.watch made a change in a note you watch in Recipes" and
+  not the store's own name), `watches_need_a_grant` (registering in a store one is not in
+  is 403; a removed member hears nothing), `the_watches_switch_deletes_the_watches_and_stops_gathering`
+  (`/me` shows it; off empties choices, documents and batches and refuses new ones;
+  everything off does the same), `only_a_relayed_stores_owner_reports_its_writes`. Lib:
+  the watch lines' words. All of `notices`, `email` and `watch` filters pass (13 + 2).
+- `pimble-server/tests/watches.rs` (2), on the sharing harness with the stub service's
+  new watch endpoints: nothing watched by default; watching a folder with its subtree
+  writes sealed choices (version 1, no node id in the clear) and registers the folder
+  and what is under it but not the diary; a node made under it is registered a moment
+  later; a member's write reaches the hosted server's `subscribeWrites` naming the
+  document and the writer; Unwatch on a note under the folder takes the folder's watch
+  and empties the set; a store on this computer alone is refused. The whole
+  `pimble-server` suite passes (41 test binaries).
+- `pimble-server` lib: `Writes` gathering per document and writer and telling once
+  quiet, and at stop; `docs_for` (subtrees, discussions and deleted nodes left out);
+  unwatch taking the own watch or the nearest subtree watch above.
+- `pimble-app` lib (358 passed): the row menu's states (nothing watched by default),
+  a watch notice's title and where it opens. `pimble-crypto`: the chosen watches do not
+  open as the personal document.
+- Builds: `cargo check --workspace --tests`, `web/` for wasm32.
+- **Not seen running**: no desktop or browser walk-through; the hosted server's
+  `subscribeWrites` followed by the service's own loop and the relay face's report were
+  not run end to end (each half is under test up to its HTTP or RPC edge).
+
+### Not done in wave 3
+
+- Writes made while the service is not following the hosted server (a deploy, a dropped
+  connection) are not told; a relayed store's writes are told only while the owner's
+  machine is on; writes gathered in the last seconds before a server stops are told at
+  stop but may not reach anyone (the relay's report stops first); a report the service
+  does not take is dropped after three attempts.
+- Per-kind switches (mentions, replies, watched notes apart from the account switch);
+  watching from the MCP tools.
+- `pimble-server/src/handler.rs`, the app's `app.rs`, `events.rs`, `state.rs`,
+  `commands.rs` and `pimble-cloud/tests/integration.rs` were already far over 700 lines
+  and are not split here (other sessions work in them on `master`; a split is its own
+  change).
