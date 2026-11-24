@@ -132,6 +132,24 @@ pub(crate) fn received(store: AppStore, notice: Notice) {
     }
     if notifies_here() {
         show_system_notification(store, &notice);
+    } else {
+        #[cfg(feature = "native")]
+        crate::shown_notices::held_back(&notice.id);
+    }
+}
+
+/// This window process took the tray over from one that quit
+/// (`crate::tray::became_primary`): the notices that reached it while it
+/// was not yet the primary, which the old one never showed and the person
+/// has not opened, are shown now, each once (`crate::shown_notices`).
+#[cfg(feature = "native")]
+pub(crate) fn took_over(store: AppStore) {
+    let held = untracked(|| store.notices.get());
+    let unread = |id: &str| held.iter().find(|n| n.id == id).is_some_and(|n| !untracked(|| is_read(store, n)));
+    for id in crate::shown_notices::take_over(unread) {
+        if let Some(notice) = held.iter().find(|n| n.id == id) {
+            show_system_notification(store, notice);
+        }
     }
 }
 
@@ -208,6 +226,8 @@ pub(crate) fn open_inbox(store: AppStore) {
 
 #[cfg(feature = "native")]
 fn show_system_notification(store: AppStore, notice: &Notice) {
+    // Written down first: a window taking the tray over never shows it again.
+    crate::shown_notices::showing(&notice.id);
     let clicked = notice.clone();
     let shown = rinch::notification::Notification::new(title_of(notice))
         .body(body_of(store, notice))

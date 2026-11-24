@@ -212,13 +212,10 @@ fn render_general(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
 /// switch, and a sentence saying what closing does now.
 #[cfg(feature = "native")]
 fn render_tray(__scope: &mut RenderScope) -> NodeHandle {
-    let keep = Signal::new(crate::persistence::load_tray_settings().keep_running);
+    // The setting as stored, which follows another window's switch too.
+    let keep = crate::tray::keep_running();
     let status = crate::tray::status();
-    let flip = move || {
-        let on = !untracked(|| keep.get());
-        keep.set(on);
-        crate::tray::set_keep_running(on);
-    };
+    let flip = move || crate::tray::set_keep_running(!untracked(|| keep.get()));
     rsx! {
         div {
             class: "pimble-settings__section",

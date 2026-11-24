@@ -169,15 +169,12 @@ fn main() {
     // One window process owns the tray and the notifications
     // (docs/NOTIFICATIONS_CONTRACT.md "Built in wave 4"). A plain launch while
     // it runs brings it to the front, with this launch's activation token so
-    // that on Wayland it may raise itself (rinch #2880), and stops; if no
-    // window takes that, this one opens after all.
+    // that on Wayland it may raise itself (rinch #2880), and stops once that
+    // window says it came; if none says so, this one opens after all.
     let primary = pimble_app::instance::claim();
-    if pimble_app::instance::launch(options.new_window || untaken_link, primary) == pimble_app::instance::Launch::HandOver {
-        if hand_to_open_window(pimble_app::app_links::COME_TO_FRONT, activation_token.clone()) {
-            tracing::info!("Pimble is already running; it came to the front");
-            return;
-        }
-        tracing::info!("Pimble is running but no window took the launch; opening one here");
+    let hand_over = || hand_to_open_window(pimble_app::app_links::COME_TO_FRONT, activation_token.clone());
+    if pimble_app::instance::launch(options.new_window || untaken_link, primary, hand_over) == pimble_app::instance::Launch::HandedOver {
+        return;
     }
 
     pimble_app::startup::began();
@@ -189,16 +186,21 @@ fn main() {
 }
 
 /// Hand `link`, with the activation token this program was started with, to
-/// a Pimble window on this computer's server; whether one took it. No server,
-/// an older one, or no window listening: `false`.
+/// a Pimble window on this computer's server; whether one said it acted on
+/// it (`openInApp` with `confirm`: the window answers once it came to the
+/// front and opened the link, within `APP_LINK_CONFIRM_WAIT_MS`). No server,
+/// no window listening, or one that never answers (hung, or partway through
+/// quitting): `false`, and this program opens a window of its own.
 fn hand_to_open_window(link: &str, activation_token: Option<String>) -> bool {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return false };
     runtime.block_on(async {
         let asked = async {
             let client = pimble_client::PimbleClient::connect(pimble_server::local::server_url()).await.ok()?;
-            client.open_in_app(link, activation_token).await.ok()
+            client.open_in_app_confirmed(link, activation_token).await.ok()
         };
-        matches!(tokio::time::timeout(std::time::Duration::from_secs(3), asked).await, Ok(Some(true)))
+        // Connecting, plus the server's own wait for the window.
+        let limit = std::time::Duration::from_millis(pimble_rpc::APP_LINK_CONFIRM_WAIT_MS + 3000);
+        matches!(tokio::time::timeout(limit, asked).await, Ok(Some(true)))
     })
 }
 

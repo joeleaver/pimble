@@ -344,6 +344,10 @@ pub enum BackendCommand {
     /// The person opened these notices: acknowledged to the accounts
     /// service. Answers nothing.
     AcknowledgeNotices { ids: Vec<String> },
+    /// This window acted on the link the server handed it with `ack`
+    /// (`BackendEvent::AppLink`): it came to the front and opened it, and the
+    /// launch that handed it over may stop (`appLinkTaken`). Answers nothing.
+    AppLinkTaken { ack: u64 },
     /// Notifications on or off for the account (section 6). Answers
     /// `NoticesListed`, or `CloudError { op: Notifications }`.
     SetNotifications { on: bool },
@@ -788,8 +792,10 @@ pub enum BackendEvent {
     WatchesListed { watches: Vec<pimble_rpc::WatchEntry>, on: bool },
     /// A `pimble:` link this computer was asked to open, handed to this window
     /// by the server (`openInApp`; desktop only), with the activation token
-    /// the program that was asked came with, to come to the front with.
-    AppLink { url: String, activation_token: Option<String> },
+    /// the program that was asked came with, to come to the front with, and
+    /// the number to confirm it with once acted on (`AppLinkTaken`), when
+    /// the launch that handed it waits to hear.
+    AppLink { url: String, activation_token: Option<String>, ack: Option<u64> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.
     CloudError { op: CloudOp, message: String },

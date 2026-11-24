@@ -806,42 +806,79 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   server are the two-window setup, so a second icon and every notice twice had to be
   ruled out. The owner (the primary) holds an exclusive OS lock (`flock` on Linux,
   `LockFileEx` on Windows) on `<config dir>/pimble/app-<server address>.lock`; it goes
-  with the process, a crash included, so nothing goes stale. Any other window process
+  with the process, a crash included, so nothing goes stale. The address is normalized
+  first (resolved, every loopback or unspecified address as `127.0.0.1`), so
+  `localhost:7462` and `127.0.0.1:7462` are one lock. Any other window process
   shows no icon and no OS notification (its Inbox list and count still fill), waits on
-  the lock in a thread, and takes the tray when the owner quits.
+  the lock in a thread, and takes the tray when the owner quits. A primary that quits
+  (tray Quit, File > Quit, a close that quits) gives the lock up first, then writes what
+  it remembers.
+- **No notice is lost in a takeover, and none is shown twice.** The primary writes the id
+  of each notice it shows beside the lock (`app-<server address>.shown`, the last 200);
+  a window that is not the primary keeps the ids it did not show. The window taking
+  over shows the ones it kept that the old primary never wrote and the person has not
+  opened. The file is the record of one computer's windows between themselves; nothing
+  syncs it.
 - **A plain launch while Pimble runs brings it to the front** and stops: it hands
   `pimble:` (`app_links::COME_TO_FRONT`) through `openInApp` with its XDG activation
-  token (rinch #2880). A second window is asked for with `pimble --new-window`; a link
+  token (rinch #2880). The hand-over is acknowledged: `openInApp` with `confirm`
+  answers `delivered` only once the window says, from its own thread, that it came to
+  the front and opened the link (`appLinkTaken` with the link's `ack`), and `false`
+  after 2 s (`APP_LINK_CONFIRM_WAIT_MS`); the launch then opens a window of its own, so a
+  hung primary, or one partway through Quit, never swallows it. A link handed over
+  from `pimble <link>` is confirmed the same way. A second window is asked for with `pimble --new-window`; a link
   no running window took also opens its own window, as before. The updater's restart
   waits for the old process before it claims, so it becomes the primary.
 - **Closing the window with the icon up hides it**; closing with no icon up quits, so a
   window never vanishes with nothing to bring it back. No icon is: the setting off,
   another window owning the tray, or a desktop with no tray host (vanilla GNOME). The
-  last is judged once at start (rinch has no live "is the host there" query).
+  last is judged once at start (rinch has no live "is the host there" query). The icon
+  is made once the first window is up, on the next turn of the event loop: asking the
+  tray host can take up to 5 s when it hangs, and the window must not wait on that.
 - **File > Quit (Ctrl+Q) replaces File > Exit (Alt+F4)**: Alt+F4 is the system's close,
   which now hides. Tray "Quit" and File > Quit write what the device remembers of how
   things looked and exit, the window shown or hidden.
 - The setting, "Keep running in the tray when the window closes", is on by default and
   lives in Settings > General ("When the window closes"), in `state.json` as
-  `tray_keep_running`; turning it off takes the icon down at once. The one notice ("Pimble
+  `tray_keep_running`; turning it off takes the icon down at once, in whichever window it
+  is turned: every window process watches the state file, the owner puts its icon up or
+  takes it down when the stored value changes, and a window that does not own the tray
+  says what is true there ("Closing this window closes only this one. Another Pimble
+  window shows the notifications, and with this off, closing that one quits it."). The
+  one notice ("Pimble
   is still running") is sent the first time a close hides the window, and
   `tray_notice_shown` records it.
 
 ### What was built, and where
 
-- `crates/pimble-app/src/instance.rs`: `launch` (:44, Start or HandOver), `claim` (:98;
-  a lock file that cannot be opened makes this process the primary, with a warning),
-  `wait_to_become_primary` (:123), `is_primary`, `lock_name`.
+- `crates/pimble-app/src/instance.rs`: `WindowLock` with `claim` (:56; a lock file that
+  cannot be opened makes this process the primary, with a warning), `wait` (:80) and
+  `resign` (:110); `launch` (:135, the whole decision, the hand-over passed in);
+  `lock_key` (:177, the address normalized), `lock_name`, `lock_path`.
+- `crates/pimble-app/src/shown_notices.rs` (new): `held_back` (:34), `showing` (:39),
+  `take_over` (:48) and `to_show` (:55), the `.shown` record (`read`, `record`).
 - `crates/pimble-app/src/tray.rs`: `TraySettings` (`from_state`/`write_into`),
-  `on_close` (:75, the one decision), `TrayStatus` and `status_line` (Settings'
-  sentence), `start` (:134), `set_keep_running` (:187), `quit` (:206),
-  `close_requested` (:214), `tell_once` (:231).
-- `crates/pimble-app/src/desktop.rs` (new, moved out of `app.rs`): `bring_to_front`
-  (:17), `run` (:32: the tray, the wait for the lock, `on_close_requested`),
-  `remember_views`, `close_window` (:124, the titlebar's close asks the same question).
+  `on_close` (the one decision), `TrayStatus` and `status_line` (:100, Settings'
+  sentence), `start` (:152), `became_primary` (:205, the icon and the notices held
+  back), `set_keep_running` (:213), `setting_changed` and `after_setting` (:223, :243),
+  `follow_setting` (:271, the state file watched), `quit` (:312), `close_requested`
+  (:323), `tell_once` (:343).
+- `crates/pimble-app/src/desktop.rs`: `bring_to_front` (:17), `run` (:32: the tray
+  armed once the window is built (:62), the wait for the lock, the setting followed,
+  `on_close_requested`), `remember_views`, `close_window` (:136, the titlebar's close
+  asks the same question).
 - `crates/pimble-app/src/inbox.rs:133`: the OS notification is gated on
-  `notifies_here()` (:144 native `instance::is_primary()`, :149 the browser always).
-- `crates/pimble-app/src/main.rs:174`: claim, then hand over or start; `--new-window`.
+  `notifies_here()` (:162 native `instance::is_primary()`, :167 the browser always); a
+  notice not shown is held back (:137); `took_over` (:146).
+- `crates/pimble-app/src/events.rs:1520`: `BackendEvent::AppLink` comes to the front,
+  opens the link, then sends `BackendCommand::AppLinkTaken`.
+- `crates/pimble-rpc/src/app_links.rs` (new, out of `types.rs`): `OpenInAppRequest.confirm`,
+  `HandedLink.ack`, `AppLinkTakenRequest`, `APP_LINK_CONFIRM_WAIT_MS`;
+  `crates/pimble-server/src/app_links.rs` (new): `AppLinks::hand` (:39) and `taken`
+  (:63), behind `openInApp` and `appLinkTaken` in `handler.rs`;
+  `PimbleClient::open_in_app_confirmed`, `app_link_taken`.
+- `crates/pimble-app/src/main.rs:176`: claim, then `instance::launch`; `hand_to_open_window`
+  (:194) asks with `confirm`; `--new-window`.
 - `crates/pimble-app/src/app_links.rs`: `AppLink::Window` and `COME_TO_FRONT`;
   `menus.rs:203` Quit; `settings.rs:214` the switch; `persistence.rs:95`
   `load_tray_settings`/`save_tray_settings`.
@@ -850,12 +887,19 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
 
 ### Verified
 
-- Tests: `tray.rs` (6: on by default, the round trip keeping the rest of the state,
-  hide and tell only the first time, the setting off quits, no icon quits, every status
-  has a sentence), `instance.rs` (4: a plain launch hands over unless primary,
-  `--new-window` and an untaken link start, the lock's name per server, one holder at a
-  time and released when its holder goes), `main.rs` (`--new-window` beside the
-  renderer), `app_links.rs` (`pimble:` and `pimble://` are the window).
+- Tests: `tray.rs` (7: on by default, the round trip keeping the rest of the state,
+  hide and tell only the first time, the setting off quits, no icon quits, the owner
+  follows the setting and another window says so, every status has a sentence),
+  `instance.rs` (8: a plain launch stops when the primary came and opens its own when
+  none did, the primary and a new window ask nobody, one lock whatever the address's
+  spelling, the lock's name, one primary at a time, a waiting window takes over when the
+  primary goes and not before, a window that resigned while waiting lets the lock go),
+  `shown_notices.rs` (4: what nobody showed or opened is shown, once; the record keeps
+  the last 200; what the old primary wrote down is not shown again), `main.rs`
+  (`--new-window` beside the renderer), `app_links.rs` (`pimble:` and `pimble://` are
+  the window), `pimble-server/tests/app_links.rs` (3 more: the `ack` on the wire, a
+  confirmed link delivered when the window says so, one no window acts on answers
+  `false` after the wait and at once with nobody listening).
 - **Seen on screen** (KDE Plasma on Wayland, an app on its own port and scratch dirs):
   the StatusNotifierItem registered; the close button hid the window and the process
   stayed; "Pimble is still running" sent once and `tray_notice_shown` saved, a second
@@ -864,14 +908,39 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
   when the owner quit from the tray menu; Settings showed the switch, and turning it off
   took the icon down and saved it; with it off, closing the window exited the app and its
   embedded server.
+- **Seen again after the review fixes** (same setup): the icon came up 0.4 s after the
+  window was built; a plain second launch exited in 17 ms once the window said it came
+  to the front; with the owner stopped (`SIGSTOP`), a plain launch opened a window of its
+  own after 5 s instead of exiting; writing `tray_keep_running: false` into `state.json`
+  (what another window's switch does) took the owner's icon down within 2 s, and `true`
+  put it back; with the owner killed, the `--new-window` process took the tray and a
+  plain launch came to it. The takeover's notices were not staged on screen (it needs a
+  signed-in account and a notice timed into the gap); the tests cover it.
 
 ### Not done in wave 4
 
 - Not run on Windows (built for it through rinch's tray-icon backend; CI builds it).
 - No macOS tray (the app is not built for macOS).
 - A tray host that appears after Pimble starts (a panel restarted, an extension turned on)
-  is not noticed until the next start. The general mechanism for rinch would be
-  `TrayIcon::host_present()` or a signal for it (a rinch PR, not proposed yet).
+  is not noticed until the next start. It needs a general rinch mechanism, with no Pimble
+  concept in it (a rinch PR, not proposed yet): `rinch::tray::host_present(timeout) ->
+  Option<bool>`, callable from any thread (on Linux: is `org.kde.StatusNotifierWatcher`
+  owned and `IsStatusNotifierHostRegistered` true; `None` when the watcher does not
+  answer in time; elsewhere always `Some(true)`), and `rinch::tray::on_host_changed(f)`,
+  called on the main thread when a host appears or goes. The first would also take the
+  icon's build off the main thread's path entirely: it is made after the first window is
+  up now, but a hung host still holds the main thread for up to 5 s then (the window is
+  drawn, and stalls once).
+- A hung primary that recovers after the acknowledgement's wait also comes to the
+  front, so both windows show.
+- A hung primary's own server (the embedded one, in the same process) makes a launch
+  wait for its connection to time out (5 s) rather than the 2 s of the acknowledgement.
+- The notices held back while not the primary are the ones heard live; a notice drained
+  at a reconnect during a takeover (the old primary's embedded server gone) is listed in
+  the Inbox, as at any start, and not shown.
+- `handler.rs`, `pimble-rpc`'s `types.rs` and `pimble-client`'s `client.rs` are over 700
+  lines; only the app-link pieces moved out of them here (another session was editing the
+  server's watch and relay code).
 - A real crash of the owner was not staged; the lock's release is the OS's (covered by
   the test that drops the holder).
 - `app.rs`, `events.rs` and `state.rs` are still far over 700 lines (see wave 3).

@@ -87,8 +87,9 @@ pub enum TrayStatus {
     Up,
     /// The setting is off.
     Off,
-    /// Another Pimble window owns the tray.
-    OtherWindow,
+    /// Another Pimble window owns the tray; `keep_running` is the setting as
+    /// stored, which that window follows.
+    OtherWindow { keep_running: bool },
     /// This desktop shows no tray icons (Linux: no StatusNotifierWatcher).
     NoHost,
     /// The icon could not be made.
@@ -100,7 +101,8 @@ pub fn status_line(status: TrayStatus) -> &'static str {
     match status {
         TrayStatus::Up => "Closing the window keeps Pimble in the tray, where notifications still arrive. Quit from the tray icon or File > Quit.",
         TrayStatus::Off => "Closing the window quits Pimble; notifications arrive only while it is open.",
-        TrayStatus::OtherWindow => "Another Pimble window owns the tray icon; closing this window closes only this one.",
+        TrayStatus::OtherWindow { keep_running: true } => "Another Pimble window owns the tray icon; closing this window closes only this one.",
+        TrayStatus::OtherWindow { keep_running: false } => "Closing this window closes only this one. Another Pimble window shows the notifications, and with this off, closing that one quits it.",
         TrayStatus::NoHost => "This desktop shows no tray icons, so closing the window quits Pimble.",
         TrayStatus::Failed => "The tray icon could not be made, so closing the window quits Pimble.",
     }
@@ -111,6 +113,8 @@ thread_local! {
     static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
     /// Where it stands, for Settings to follow.
     static STATUS: Cell<Option<Signal<TrayStatus>>> = const { Cell::new(None) };
+    /// The setting as this process last read or wrote it.
+    static KEEP_RUNNING: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
 }
 
 /// The status signal, made once with app lifetime.
@@ -120,6 +124,20 @@ pub fn status() -> Signal<TrayStatus> {
         None => {
             let signal = rinch::core::reactive::unowned(|| Signal::new(TrayStatus::Off));
             s.set(Some(signal));
+            signal
+        }
+    })
+}
+
+/// The setting as stored (`state.json` `tray_keep_running`), followed when
+/// another window process changes it; made once with app lifetime.
+pub fn keep_running() -> Signal<bool> {
+    KEEP_RUNNING.with(|k| match k.get() {
+        Some(signal) => signal,
+        None => {
+            let on = crate::persistence::load_tray_settings().keep_running;
+            let signal = rinch::core::reactive::unowned(|| Signal::new(on));
+            k.set(Some(signal));
             signal
         }
     })
@@ -135,11 +153,13 @@ pub fn start() {
     if icon_up() {
         return;
     }
+    let keep = crate::persistence::load_tray_settings().keep_running;
+    set_if_changed(keep_running(), keep);
     if !crate::instance::is_primary() {
-        status().set(TrayStatus::OtherWindow);
+        status().set(TrayStatus::OtherWindow { keep_running: keep });
         return;
     }
-    if !crate::persistence::load_tray_settings().keep_running {
+    if !keep {
         status().set(TrayStatus::Off);
         return;
     }
@@ -155,6 +175,7 @@ pub fn start() {
         .map(|b| b.with_menu(menu).on_activate(open_window).wait_for_host(false).build());
     match built {
         Ok(Ok(tray)) => {
+            tracing::info!("The tray icon is up");
             TRAY.with(|t| *t.borrow_mut() = Some(tray));
             status().set(TrayStatus::Up);
         }
@@ -178,20 +199,105 @@ fn stop() {
 }
 
 /// The window process that owned the tray quit and this one is the primary
-/// now (`crate::instance::wait_to_become_primary`).
+/// now (`crate::instance::wait_to_become_primary`): the icon goes up, and
+/// the notices that reached this window in between and nobody showed are
+/// shown.
 pub fn became_primary() {
     start();
+    if let Some(store) = crate::links::with_app_store(|store| store) {
+        crate::inbox::took_over(store);
+    }
 }
 
-/// Settings turned the switch.
+/// Settings turned the switch in this window.
 pub fn set_keep_running(on: bool) {
     let mut settings = crate::persistence::load_tray_settings();
     settings.keep_running = on;
     crate::persistence::save_tray_settings(settings);
-    if on {
-        start();
-    } else {
-        stop();
+    setting_changed(on);
+}
+
+/// The stored setting is `on` now (this window's switch, or another window
+/// process's, heard through [`follow_setting`]). The owner of the tray
+/// puts the icon up or takes it down; any other window only says so.
+fn setting_changed(on: bool) {
+    set_if_changed(keep_running(), on);
+    match after_setting(crate::instance::is_primary(), on) {
+        AfterSetting::PutUp => start(),
+        AfterSetting::TakeDown => stop(),
+        AfterSetting::Say(said) => status().set(said),
+    }
+}
+
+/// What a change of the stored setting does in one window process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterSetting {
+    /// The owner of the tray puts its icon up.
+    PutUp,
+    /// The owner takes it down.
+    TakeDown,
+    /// A window that does not own the tray only says what closing does now.
+    Say(TrayStatus),
+}
+
+fn after_setting(primary: bool, on: bool) -> AfterSetting {
+    match (primary, on) {
+        (true, true) => AfterSetting::PutUp,
+        (true, false) => AfterSetting::TakeDown,
+        (false, keep_running) => AfterSetting::Say(TrayStatus::OtherWindow { keep_running }),
+    }
+}
+
+/// The setting as stored was read again (`state.json` changed): acted on
+/// only when it differs from what this process last knew, so every other
+/// write of the state file (views, zoom) never builds the icon again.
+fn stored_setting_read(on: bool) {
+    if untracked(|| keep_running().get()) != on {
+        setting_changed(on);
+    }
+}
+
+fn set_if_changed(signal: Signal<bool>, value: bool) {
+    if untracked(|| signal.get()) != value {
+        signal.set(value);
+    }
+}
+
+/// Follow the stored setting for as long as the app runs: another window
+/// process on this server can turn it off (or on) in its Settings, and the
+/// owner of the tray must take its icon down (or put it up). The folder
+/// holding `state.json` is watched, a burst of writes read once it has been
+/// quiet for a moment.
+pub fn follow_setting() {
+    let path = pimble_server::local::state_file_path();
+    let spawned = std::thread::Builder::new().name("pimble-tray-setting".into()).spawn(move || watch_state_file(path));
+    if let Err(e) = spawned {
+        tracing::warn!("The tray setting cannot be followed ({e}); a change in another window shows at the next start");
+    }
+}
+
+fn watch_state_file(path: std::path::PathBuf) {
+    use notify::Watcher;
+    use std::time::Duration;
+    let Some(dir) = path.parent().map(std::path::Path::to_path_buf) else { return };
+    let Some(name) = path.file_name().map(std::ffi::OsStr::to_os_string) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut watcher = match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok_and(|e| e.paths.iter().any(|p| p.file_name() == Some(name.as_os_str()))) {
+            let _ = tx.send(());
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => return tracing::warn!("The tray setting cannot be followed ({e}); a change in another window shows at the next start"),
+    };
+    if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+        return tracing::warn!("{} cannot be watched ({e}); a tray setting changed in another window shows at the next start", dir.display());
+    }
+    while rx.recv().is_ok() {
+        while rx.recv_timeout(Duration::from_millis(250)).is_ok() {}
+        let on = crate::persistence::load_tray_settings().keep_running;
+        rinch::core::reactive::run_on_main_thread(move || stored_setting_read(on));
     }
 }
 
@@ -204,6 +310,9 @@ fn open_window() {
 /// things looked is written, and the app exits, whether the window is shown
 /// or hidden.
 pub fn quit() {
+    // The tray goes to a window waiting for it at once, while this one
+    // writes what it remembers.
+    crate::instance::resign();
     crate::desktop::remember_views(None);
     rinch::prelude::exit();
 }
@@ -215,7 +324,10 @@ pub fn close_requested() -> bool {
     let settings = crate::persistence::load_tray_settings();
     crate::desktop::remember_views(None);
     match on_close(settings, icon_up()) {
-        OnClose::Quit => true,
+        OnClose::Quit => {
+            crate::instance::resign();
+            true
+        }
         OnClose::Hide { tell } => {
             hide_current_window();
             if tell {
@@ -283,9 +395,32 @@ mod tests {
         assert_eq!(on_close(TraySettings::default(), false), OnClose::Quit);
     }
 
+    /// The setting turned in any window: the owner of the tray follows it
+    /// with its icon, and a window that does not own it says what is true
+    /// there, the setting off included.
+    #[test]
+    fn the_owner_follows_the_setting_and_another_window_says_so() {
+        assert_eq!(after_setting(true, false), AfterSetting::TakeDown);
+        assert_eq!(after_setting(true, true), AfterSetting::PutUp);
+        assert_eq!(after_setting(false, false), AfterSetting::Say(TrayStatus::OtherWindow { keep_running: false }));
+        assert_eq!(after_setting(false, true), AfterSetting::Say(TrayStatus::OtherWindow { keep_running: true }));
+        assert_ne!(
+            status_line(TrayStatus::OtherWindow { keep_running: false }),
+            status_line(TrayStatus::OtherWindow { keep_running: true }),
+        );
+    }
+
     #[test]
     fn every_status_has_a_sentence() {
-        for s in [TrayStatus::Up, TrayStatus::Off, TrayStatus::OtherWindow, TrayStatus::NoHost, TrayStatus::Failed] {
+        let all = [
+            TrayStatus::Up,
+            TrayStatus::Off,
+            TrayStatus::OtherWindow { keep_running: true },
+            TrayStatus::OtherWindow { keep_running: false },
+            TrayStatus::NoHost,
+            TrayStatus::Failed,
+        ];
+        for s in all {
             assert!(status_line(s).ends_with('.'));
         }
     }

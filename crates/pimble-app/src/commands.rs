@@ -1073,6 +1073,14 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             None
         }
 
+        BackendCommand::AppLinkTaken { ack } => {
+            let c = ctx.host.as_ref()?;
+            if let Err(e) = c.app_link_taken(ack).await {
+                tracing::debug!("the link taken was not confirmed: {e}");
+            }
+            None
+        }
+
         BackendCommand::SetNotifications { on } => {
             let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Notifications, message: "Not connected".into() });

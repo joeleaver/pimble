@@ -83,6 +83,10 @@ pub mod desktop;
 /// Which window process owns the tray and the notifications.
 #[cfg(feature = "native")]
 pub mod instance;
+/// The notices the window owning the tray showed, so one taking over shows
+/// the rest once.
+#[cfg(feature = "native")]
+mod shown_notices;
 /// The tray icon and closing the window into it.
 #[cfg(feature = "native")]
 pub mod tray;
