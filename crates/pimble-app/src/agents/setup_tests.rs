@@ -254,3 +254,33 @@ fn removing_takes_an_agent_out_of_codex_too() {
     let text = std::fs::read_to_string(at.path(ConfigFile::Codex)).unwrap();
     assert!(!text.contains("pimble-chatgpt") && text.contains("# mine") && text.contains("[mcp_servers.other]"), "{text}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_claude_file_that_cannot_be_written_removes_nobody() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, at) = computer();
+    let old = Uuid::new_v4();
+    let pair = serde_json::json!({ "mcpServers": { "pimble-claude-desktop": pimble(&key(old)) } });
+    write(&at, ConfigFile::ClaudeApp, pair.clone());
+    write(&at, ConfigFile::ClaudeCli, pair);
+    // The home folder is readable but takes no new file: ~/.claude.json
+    // reads, and cannot be replaced.
+    std::fs::set_permissions(&at.home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    std::fs::set_permissions(&at.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(added.written, vec![ConfigFile::ClaudeApp]);
+    assert_eq!(added.failed.len(), 1);
+    assert_eq!(added.replaced(), [old].into_iter().collect(), "taken out of the Claude app's file");
+    let held = holders(&at);
+    assert!(!held.unreadable, "every file reads; only a write failed");
+    let settled = settle(ClientApp::Claude, &added, &held, &[(old, "Claude Desktop".into())]);
+    assert!(settled.remove.is_empty(), "its entry is still in the file that failed");
+    assert_eq!(settled.kept, vec!["Claude Desktop".to_string()]);
+    // Even were the files read as holding nothing, a failed write is reason
+    // enough to remove nobody.
+    let settled = settle(ClientApp::Claude, &added, &Holders::default(), &[(old, "Claude Desktop".into())]);
+    assert!(settled.remove.is_empty());
+}

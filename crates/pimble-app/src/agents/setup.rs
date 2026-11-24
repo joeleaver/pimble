@@ -302,7 +302,7 @@ pub fn added_sentence(app: ClientApp, added: &Added, settled: &Settled) -> Strin
         out.push(format!("It replaces {}, removed from Pimble.", quoted(&settled.removed)));
     }
     if !settled.kept.is_empty() {
-        out.push(format!("It replaces {} in {}; kept in Pimble, as another app may still use it.", quoted(&settled.kept), app.name()));
+        out.push(format!("{} kept in Pimble: another app, or a file Pimble could not change, may still use {}.", quoted(&settled.kept), if settled.kept.len() == 1 { "it" } else { "them" }));
     }
     if !settled.others.is_empty() {
         out.push(format!(

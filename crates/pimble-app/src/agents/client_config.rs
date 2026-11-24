@@ -138,17 +138,14 @@ pub fn apply(path: &Path, format: Format, change: &Change) -> Result<Changed, St
     if (dropped.is_empty() && change.add.is_none()) || text.as_deref() == Some(new_text.as_str()) {
         return Ok(Changed { dropped, written: false });
     }
-    // Agent keys sit in these files: the new file and the backup keep the
-    // old file's permissions (a 0600 file stays 0600).
+    // Agent keys sit in these files: the new file and the backup are made
+    // with the old file's permissions (a 0600 file stays 0600), and a new
+    // file is the person's alone.
     let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
     if let Some(old) = &text {
-        let backup = backup_path(path);
-        std::fs::write(&backup, old).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
-        if let Some(p) = &permissions {
-            std::fs::set_permissions(&backup, p.clone()).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
-        }
+        write_new(&backup_path(path), old, permissions.as_ref()).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
     }
-    write_replacing(path, &new_text, permissions)?;
+    write_replacing(path, &new_text, permissions.as_ref())?;
     Ok(Changed { dropped, written: true })
 }
 
@@ -243,15 +240,34 @@ fn parse_toml(path: &Path, text: &str) -> Result<toml_edit::Document, String> {
     text.parse().map_err(|_| format!("{} is not TOML Pimble can read, so it was left alone", path.display()))
 }
 
-fn write_replacing(path: &Path, text: &str, permissions: Option<std::fs::Permissions>) -> Result<(), String> {
+/// Write `text` to `path`, replacing it, the file made with `permissions`
+/// from the start (on Unix; 0600 when there are none to keep), so the key
+/// is never readable by others even for a moment.
+fn write_new(path: &Path, text: &str, permissions: Option<&std::fs::Permissions>) -> std::io::Result<()> {
+    use std::io::Write;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.map(|p| p.mode() & 0o777).unwrap_or(0o600));
+    }
+    let mut file = options.open(path)?;
+    file.write_all(text.as_bytes())?;
+    // The mode given at creation is narrowed by the umask; set it exactly.
+    if let Some(p) = permissions {
+        std::fs::set_permissions(path, p.clone())?;
+    }
+    Ok(())
+}
+
+fn write_replacing(path: &Path, text: &str, permissions: Option<&std::fs::Permissions>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("pimble-tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
-    if let Some(p) = permissions {
-        std::fs::set_permissions(&tmp, p).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
-    }
+    write_new(&tmp, text, permissions).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
@@ -346,6 +362,10 @@ mod tests {
         apply(&path, Format::Json, &Change { drop: &drop, add: Some(new("pimble-x", "k", false)) }).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(backup_path(&path)).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let fresh = dir.path().join("new").join("mcp.json");
+        apply(&fresh, Format::Json, &Change { drop: &drop, add: Some(new("pimble-x", "k", false)) }).unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600, "a new file holding a key is private");
     }
 
     #[test]
