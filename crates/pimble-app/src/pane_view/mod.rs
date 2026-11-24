@@ -19,7 +19,7 @@ mod document;
 mod pane;
 
 pub(crate) use actions::{close_focused, focus_pane, open_beside, split_focused, split_pane};
-pub(crate) use document::{pane_document, pane_icon, pane_spaced, pane_title};
+pub(crate) use document::{pane_document, pane_icon, pane_title};
 use document::{editor_read_only, pane_access};
 use divider::render_divider;
 use pane::render_pane;
@@ -57,49 +57,10 @@ pub(crate) fn press_in_view() {
     RELEASE_IN_VIEW.with(|p| p.set(true));
 }
 
-/// Edit > "Compact Paragraphs" and the focused pane's note, kept as one
-/// (docs/PARAGRAPHS_CONTRACT.md): the check follows the note (a focus change,
-/// another window's or person's change), and a choice of the item writes the
-/// note, or, with no note there or one this device may only read, the check
-/// goes back to what the note says. Both effects live as long as the app.
-fn follow_paragraphs(store: AppStore) {
-    let _ = rinch::Effect::new(move || {
-        let compact = !pane_spaced(store, store.focused_pane.get());
-        if untracked(|| store.compact_paragraphs.get()) != compact {
-            store.compact_paragraphs.set(compact);
-        }
-    });
-    let _ = rinch::Effect::new(move || {
-        let wanted = store.compact_paragraphs.get();
-        untracked(|| {
-            let pane = store.focused_pane.get();
-            let compact = !pane_spaced(store, pane);
-            if wanted == compact {
-                return;
-            }
-            match pane_document(store, pane) {
-                Some((store_id, node_id)) if store.pane(pane).show_editor.get() && !editor_read_only(store, pane) => {
-                    store.send(crate::protocol::BackendCommand::SetNodeAppearance {
-                        store_id,
-                        node_id,
-                        icon: None,
-                        color: None,
-                        background: None,
-                        tags: None,
-                        paragraphs: Some(!wanted),
-                    });
-                }
-                _ => store.compact_paragraphs.set(compact),
-            }
-        });
-    });
-}
-
 /// The area beside the explorer: the one toolbar, then every pane slot and
 /// every divider slot, once. `hints` are the lines under the empty state's
 /// sentence.
 pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[&'static str]) -> NodeHandle {
-    follow_paragraphs(store);
     // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
     // toolbar"), and has nothing to act on while that pane holds no document
     // or one this device may only read.

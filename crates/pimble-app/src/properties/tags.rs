@@ -61,7 +61,7 @@ fn edit_tag(store: AppStore, s: StoreId, n: NodeId, change: TagEdit) {
         }
         other => other,
     };
-    store.send(BackendCommand::SetNodeAppearance { store_id: s, node_id: n, icon: None, color: None, background: None, tags: Some(change), paragraphs: None });
+    store.send(BackendCommand::SetNodeAppearance { store_id: s, node_id: n, icon: None, color: None, background: None, tags: Some(change), theme: None });
 }
 
 /// One tag chip: the tag, and when it is a #hashtag in the node's text, how

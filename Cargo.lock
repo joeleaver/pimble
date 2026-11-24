@@ -5240,6 +5240,7 @@ dependencies = [
  "pimble-server",
  "pimble-sheet",
  "pimble-store",
+ "pimble-themes",
  "pimble-ui",
  "reqwest",
  "rinch",
@@ -5705,6 +5706,13 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pimble-themes"
+version = "0.31.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

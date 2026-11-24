@@ -134,6 +134,17 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::ThemeChainLoaded { store_id, nodes } => {
+                crate::themes::chain_answered(*store_id, nodes);
+                let mut changed = false;
+                for node in nodes {
+                    changed |= take_node(store, *store_id, node);
+                }
+                if changed {
+                    store.bump_tree_structure();
+                }
+            }
+
             BackendEvent::NodeNotLoaded { store_id, node_id, message } => {
                 crate::metanodes::parent_not_loaded(*store_id, *node_id);
                 connection::error(store, message);
