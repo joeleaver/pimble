@@ -93,7 +93,7 @@ client returns `GetStoreSyncResponse` fields, so the mode comes for free (add a
 `set_store_sync_with_mode` to `pimble-client` only if the existing wrapper drops it, and
 keep the old wrapper).
 
-## State (`crates/pimble-app/src/state.rs`)
+## State (`crates/pimble-app/src/state/mod.rs`)
 
 ```rust
 pub cloud_signed_in: Signal<bool>,

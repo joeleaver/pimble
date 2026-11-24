@@ -217,7 +217,7 @@ Not done, or done differently from sections 3 and 8:
 
 What is built, on `master`. The person sees one word for it: **Metanode** (decision 1).
 
-- **Explorer** (`crates/pimble-app/src/state.rs` `structural_node`, `metanodes.rs`): a query
+- **Explorer** (`crates/pimble-app/src/state/tree_rows.rs` `structural_node`, `metanodes.rs`): a query
   metanode's row has its own children, then its finds (`AppStore::finds`). A found row's tree
   value is a path address through the metanode, as a mount child's is
   (`node_{s}_{n}/{ms}_{mn}`); its own children carry the found row too

@@ -93,7 +93,7 @@ text toolbar's contents are unchanged.
 
 ## Built (2026-11-21, v2)
 
-`toolbar.rs` (`Item`, `Picked`, `which`, `item_changed`), `state.rs` (`PaneState::item`),
+`toolbar.rs` (`Item`, `Picked`, `which`, `item_changed`), `state/pane_state.rs` (`PaneState::item`),
 `editor.rs` (the selection callback), `text_boards.rs` (`selected_item`, `embed_raw`,
 `mark_up_at` for embeds), `pane_view.rs` (one rule; the release that ends a text table's
 cell), `boards/toolbar.rs` (Canvas group, contextual groups, embeds), `boards/rail.rs`
