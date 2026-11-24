@@ -6,7 +6,7 @@ stores, plugins themed, about a dozen built in, maybe replacing the paragraph se
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
 has answered them. Answered so far (2026-11-24): decisions 2 (themes replace paragraph spacing), 3 (looked up
-from the nearest ancestor), 4 (shares) and 7 (palette, and themes
+from the nearest ancestor), 4 (shares), 5 (mounts keep their native look) and 7 (palette, and themes
 that inherit and set only what they change).
 
 **Two kinds, kept apart:**
@@ -222,12 +222,15 @@ Lookup has two edges the copy rule never had:
   takes no edits with `StoreAccess::READ_ONLY_REFUSAL`'s sentence. The owner's devices hold
   the whole picture, so nothing here puts a theme on Pimble Cloud that was not already
   there: a hosted or relayed store's theme nodes are store documents like the rest.
-- **Mounts.** A node is addressed everywhere by its canonical `(StoreId, NodeId)`, so a node
-  should read the same wherever it is opened. The recommendation (decision 5): **the theme
-  in force is resolved in the source store's own tree**, and the mounting store's chain is
-  ignored. A mounted subtree of code notes stays code-like inside a book. The mount node
-  itself may name a theme (it is a node of the mounting store), and that applies to the
-  mount row only, not to what it shows.
+- **Mounts. Decided (Joe, 2026-11-24, decision 5: "mounting a node anywhere should
+  preserve its native look"):** the theme in force is resolved in the source store's own
+  tree, and the mounting store's chain is ignored. A node is addressed everywhere by its
+  canonical `(StoreId, NodeId)`, and it reads the same wherever it is opened: through a
+  mount, directly, or in two panes by both paths at once. A mounted subtree of code notes
+  stays code-like inside a book. A theme set on a mount node itself would apply to nothing
+  (a mount has no content of its own), so the Theme picker on a mount row acts on the
+  source node, as every other edit through a mount does, judged by the access to the source
+  store.
 
 Resolution is a pure function of the chain's documents (a pane's node and its ancestors,
 which the tree has loaded to show it; wave 1 checks that the API holds the chain for a node
@@ -499,11 +502,8 @@ cut or add.
    Open detail: *recommendation:* write is offered only to editor shares, and the copy
    lives in the store's Themes folder, outside the shared subtree, so it does not appear as
    a node in members' trees.
-5. **Mounts.** *Recommendation:* a node's theme is resolved in its own (source) store and
-   the mounting chain is ignored, so a node reads the same wherever it is opened.
-   Alternative: the source chain first, the mounting chain when the source names none (a
-   mounted plain subtree takes on the book it is mounted into, but reads differently
-   opened directly).
+5. **Mounts. Decided (Joe, 2026-11-24):** a mounted node keeps its native look: its theme
+   is resolved in its own store, and the picker on a mount row acts on the source node.
 6. **App themes are theme nodes of kind `app`, chosen per device** (section 3.3).
    *Recommendation: yes*: one model and one editor for making and copying themes, while
    choosing one stays personal and per device like dark mode and zoom. Alternatives: app
