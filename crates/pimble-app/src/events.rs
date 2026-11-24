@@ -707,6 +707,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::Disconnected => {
                 tracing::info!("Disconnected from backend");
+                crate::inbox::answers_lost();
                 store.connection.set(ConnectionState::Disconnected);
                 store.connection_status.set("Disconnected".to_string());
                 // The account is asked again on the next connection; until
@@ -763,6 +764,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::Error { message } => {
                 tracing::error!("Backend error: {}", message);
+                crate::inbox::answers_lost();
                 if untracked(|| store.deleted_modal_pending.get()) {
                     // "Put Back" on a node no list names is an ordinary
                     // `MoveNode`, so its failure is not told apart by the
@@ -1185,6 +1187,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Whoever made it, it may change what points at the node
                 // the Properties panel shows.
                 crate::properties::store_changed(store);
+                // A note a notice named may be named differently now.
+                if let pimble_rpc::StoreChangeKind::MetadataUpdated { node_id } | pimble_rpc::StoreChangeKind::ContentUpdated { node_id } = change_kind {
+                    crate::inbox::note_changed(store, *store_id, *node_id);
+                }
                 // Skip our own echoes
                 let my_id = untracked(|| store.client_id.get());
                 if let Some(source) = source_client_id {

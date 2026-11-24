@@ -52,8 +52,9 @@ pub(crate) fn where_of(store: AppStore, kind: NoticeKind, (store_id, node_id): (
 
 /// The name of a note a notice names, as the explorer shows it: from the
 /// note itself when a view holds it (so a rename shows), else as this
-/// device read it for the notice ([`named`]); tracked, so the Inbox's line
-/// fills in when it arrives.
+/// device read it for the notice ([`named`], read again when the note
+/// changes, [`note_changed`]); tracked, so the Inbox's line fills in when
+/// it arrives.
 pub(crate) fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Option<String> {
     if let Some(node) = store.node_data.with(|map| map.get(&(store_id, node_id)).copied()) {
         return Some(node.with(crate::state::display_label_from_node));
@@ -61,10 +62,21 @@ pub(crate) fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Op
     store.notice_names.with(|names| names.get(&(store_id, node_id)).cloned())
 }
 
+/// How long a name asked for is waited on before it counts as unanswered
+/// and the next notice or listing asks for it again (an answer can be lost
+/// with nothing said: a command dropped while the connection went down).
+const NAME_ANSWER_WAIT_MS: f64 = 30_000.0;
+
 thread_local! {
-    /// The notes whose names were asked for and not answered yet, so a
-    /// notice arriving meanwhile asks for none of them again.
-    static ASKING: std::cell::RefCell<std::collections::HashSet<(StoreId, NodeId)>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The notes whose names were asked for and not answered yet, each with
+    /// when it was asked, so a notice arriving meanwhile asks for none of
+    /// them again ([`NAME_ANSWER_WAIT_MS`]).
+    static ASKING: std::cell::RefCell<std::collections::HashMap<(StoreId, NodeId), f64>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether the name of `key` is asked for and still waited on at `now_ms`.
+fn is_asking(key: &(StoreId, NodeId), now_ms: f64) -> bool {
+    ASKING.with(|asking| asking.borrow().get(key).is_some_and(|asked| now_ms - asked < NAME_ANSWER_WAIT_MS))
 }
 
 /// The app holds only the notes some view showed. A notice can name any
@@ -75,12 +87,16 @@ thread_local! {
 /// path on the desktop and in the browser), answered as names alone
 /// (`NotesNamed`, [`named`]): nothing of the tree changes for them.
 fn ask_for_names(store: AppStore, notices: &[Notice]) {
-    let known = |key: &(StoreId, NodeId)| {
-        untracked(|| name_of(store, key.0, key.1)).is_some() || ASKING.with(|asking| asking.borrow().contains(key))
-    };
+    let now = crate::text_boards::now_ms();
+    let known = |key: &(StoreId, NodeId)| untracked(|| name_of(store, key.0, key.1)).is_some() || is_asking(key, now);
     let nodes = unnamed(notices.iter().map(|n| (n.store, n.node)), known);
+    ask(store, nodes, now);
+}
+
+/// Ask for the names of `nodes` at `now_ms`, unless there are none.
+fn ask(store: AppStore, nodes: Vec<(StoreId, NodeId)>, now_ms: f64) {
     if !nodes.is_empty() {
-        ASKING.with(|asking| asking.borrow_mut().extend(nodes.iter().copied()));
+        ASKING.with(|asking| asking.borrow_mut().extend(nodes.iter().map(|key| (*key, now_ms))));
         store.send(BackendCommand::NameNodes { nodes });
     }
 }
@@ -102,6 +118,27 @@ pub(crate) fn named(store: AppStore, names: Vec<((StoreId, NodeId), Option<Strin
         store.notice_names.update(|held| held.extend(read));
     }
     crate::notice_show::names_arrived(store, &notes);
+}
+
+/// The answers to the names asked for may never come: the backend said an
+/// error (which names no request) or the connection went down. Nothing is
+/// waited on any more, so the next notice or listing asks again; a name
+/// asked twice is answered twice, alike.
+pub(crate) fn answers_lost() {
+    ASKING.with(|asking| asking.borrow_mut().clear());
+}
+
+/// A note of `store_id` changed (a rename, or the text an untitled note is
+/// named by). The name read for a notice is not kept in step by any view,
+/// so when a notice named it, it is read again: [`name_of`] says it while
+/// no view holds the note, and a view that holds it now may let it go.
+pub(crate) fn note_changed(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    let key = (store_id, node_id);
+    let named_here = untracked(|| store.notice_names.with(|names| names.contains_key(&key)));
+    let now = crate::text_boards::now_ms();
+    if named_here && !is_asking(&key, now) {
+        ask(store, vec![key], now);
+    }
 }
 
 /// The notes in `named`, once each, that `known` says are not named yet.
@@ -162,7 +199,7 @@ pub(crate) fn rows(store: AppStore) -> Vec<(Notice, bool, String, (NoticeKind, (
 /// The server's list arrived (at connect, or after the switch). A name
 /// asked for on an earlier connection and never answered is asked again.
 pub(crate) fn listed(store: AppStore, notices: Vec<Notice>, on: bool) {
-    ASKING.with(|asking| asking.borrow_mut().clear());
+    answers_lost();
     ask_for_names(store, &notices);
     store.notices.set(notices);
     store.notifications_on.set(on);
@@ -602,6 +639,54 @@ mod tests {
 
         listed(store, vec![watched, unreadable], true);
         assert_eq!(asked(&commands), vec![vec![there]], "a reconnect asks only for what was not named");
+    }
+
+    /// A note a notice named, renamed elsewhere while no view holds it, is
+    /// named again, and the Inbox says its new name; a change to a note no
+    /// notice named asks for nothing.
+    #[test]
+    fn a_rename_elsewhere_names_the_note_again() {
+        let (store, commands) = store_and_commands();
+        let watched = notice(NoticeKind::Watch, None, "");
+        let here = (watched.store, watched.node);
+        listed(store, vec![watched.clone()], true);
+        named(store, vec![(here, Some("Garden plan".into()))]);
+        let _ = asked(&commands);
+
+        note_changed(store, here.0, here.1);
+        assert_eq!(asked(&commands), vec![vec![here]], "read again");
+        note_changed(store, here.0, here.1);
+        assert!(asked(&commands).is_empty(), "not again while it is asked");
+        named(store, vec![(here, Some("Vegetable plan".into()))]);
+        assert_eq!(untracked(|| where_of(store, NoticeKind::Watch, here)).as_deref(), Some("Vegetable plan"));
+        assert_eq!(body_of(store, &watched), "Vegetable plan");
+
+        note_changed(store, here.0, NodeId::new());
+        assert!(asked(&commands).is_empty(), "a note no notice named");
+    }
+
+    /// A name asked for whose answer never comes (an error, a lost
+    /// connection, or none for too long) is asked again by the next notice
+    /// naming it.
+    #[test]
+    fn a_name_whose_answer_is_lost_is_asked_again() {
+        let (store, commands) = store_and_commands();
+        let watched = notice(NoticeKind::Watch, None, "");
+        let here = (watched.store, watched.node);
+        ask_for_names(store, std::slice::from_ref(&watched));
+        assert_eq!(asked(&commands), vec![vec![here]]);
+        ask_for_names(store, std::slice::from_ref(&watched));
+        assert!(asked(&commands).is_empty(), "waited on");
+
+        answers_lost();
+        ask_for_names(store, std::slice::from_ref(&watched));
+        assert_eq!(asked(&commands), vec![vec![here]], "after an error or a disconnect");
+
+        answers_lost();
+        ask(store, vec![here], crate::text_boards::now_ms() - NAME_ANSWER_WAIT_MS - 1.0);
+        let _ = asked(&commands);
+        ask_for_names(store, std::slice::from_ref(&watched));
+        assert_eq!(asked(&commands), vec![vec![here]], "after waiting too long");
     }
 
     #[test]

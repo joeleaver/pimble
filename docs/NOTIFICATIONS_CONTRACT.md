@@ -670,9 +670,13 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   the connection broke after the post) is not told twice. Reports are taken one at a
   time (`relay_reports_lock`). The report is remembered after its writes are gathered,
   so a report whose remembering failed is gathered again when it is sent again; each
-  batch holds the ids of the reports gathered into it (`WatchBatch.reports`, written in
-  the same query as the write), so none of their writes is gathered twice, even one whose
-  notice was queued in between: a pass takes such a batch's spells and keeps the row,
+  batch holds the writes of reports gathered into it, each named by its report's id and
+  its place in the report (`WatchBatch.reports`, `<report>#<place>`, written in the same
+  query as the write), so none of their writes is gathered twice, even one whose notice
+  was queued in between, and one a failed sending did not reach is gathered when the
+  report is sent again. A write, not a report, is what a batch holds: one report can name
+  the same writer and document twice (two spells of editing, the second after a gap of
+  `SPELL_GAP_MS` or more, as after an outage), and both are counted: a pass takes such a batch's spells and keeps the row,
   with no spells, until its reports are forgotten (30 days, hourly, with the reports). A
   batch's `spells` are read as stored and never rebuilt from its first and last write
   (that would lose its count); no batch without them exists, as `WatchBatch` never
@@ -909,7 +913,13 @@ StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_reque
     answered with names alone (`BackendEvent::NotesNamed`, `None` for a note this
     device cannot read, kept in `AppStore::notice_names`; nothing of the tree moves),
     and asked for once: not again while asked, nor on a reconnect once named (a note
-    not read is asked again with the next listing). The Inbox's "where" line and the
+    not read is asked again with the next listing). An ask whose answer never comes
+    (a backend error, a lost connection, or 30 s with none: `answers_lost`,
+    `NAME_ANSWER_WAIT_MS`) is waited on no longer, so the next notice or listing asks
+    again. A name read for a notice is read again when the note changes
+    (`MetadataUpdated` or `ContentUpdated` on the store: `note_changed`), so a note
+    renamed elsewhere shows its new name; a note a view holds is named from the view.
+    The Inbox's "where" line and the
     system notification's body come from one place (`inbox.rs` `where_of`: the name,
     or "A note you watch" for a watch notice whose note cannot be read here). A watch
     notice's system notification waits up to 3 s for the name (`notice_show.rs`, out
