@@ -5,7 +5,7 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them.
+has answered them. Answered so far: decision 4 (shares), 2026-11-24.
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
@@ -154,16 +154,37 @@ Lookup has two edges the copy rule never had:
 
 - **Shares.** A member's partial replica holds the share's root and below, not its
   ancestors, and may not hold the theme node either (it may sit in a Themes folder outside
-  the share). Decision 4 picks how members see the theme. The recommendation: **a scope's
-  reach includes, read-only, the theme documents in force in it**: the theme named by the
-  share root's nearest themed ancestor, and every theme named inside the share, with their
-  bases. The owner's share upkeep already publishes scope sets as a union that only grows
-  (`share.rs`, `docs/MOVE_CONTRACT.md`); it would add these, and the reach rule (`Reach` in
-  `handler.rs`) would grant read on them. The share root's own effective theme is then
-  recorded on the share (the accounts service already stores a share's name) so a member
-  resolves "the theme in force above my root" without holding the ancestors. A member
-  who may edit the share cannot edit a theme outside it: they see it, read-only, and may
-  apply another (their own, or a built-in) inside the share.
+  the share). **Decided (Joe, 2026-11-24, decision 4): a scope's reach includes the
+  theme documents in force in it**: the theme named by the share root's nearest themed
+  ancestor, every theme named inside the share, and their bases. The owner's share upkeep
+  already publishes scope sets as a union that only grows (`share.rs`,
+  `docs/MOVE_CONTRACT.md`); it adds these, and the reach rule (`Reach` in `handler.rs`)
+  grants them at the share's **theme access**. The share root's inherited theme is recorded
+  on the share (the accounts service already stores a share's name), so a member resolves
+  "the theme in force above my root" without holding the ancestors.
+
+  **Theme access is chosen when the share is made** (Joe, 2026-11-24), in the Share dialog,
+  and can be changed later from Shares...:
+  1. **Read-only theme** (the default). Members see the theme and cannot change it; they may
+     still apply another one (a built-in, or a theme inside the share) to nodes they may edit.
+  2. **Write.** Members may edit the theme documents in force in the share, as the share's
+     own editors. Their edits are edits of the owner's theme, so every other tree using that
+     theme changes too; the dialog says so in a sentence naming how many other places use
+     it ("Book is also used by 3 other trees in this store; members' changes show there
+     too."). Offered only to a share whose role is editor; a reader share is always
+     read-only.
+  3. **Copy a theme for this share.** The theme in force is copied once (section 6's copy,
+     within the store) into a new theme node, "<Theme> for <share name>", in the store's
+     Themes folder; the share root names the copy; members get write on the copy only.
+     Members restyle their share freely and nothing else in the owner's store changes. The
+     owner sees the copy's look on that subtree too, because it is applied there.
+
+  The access is a property of the share's grant (`(user, store, root node, role)` gains
+  nothing: the share itself records `theme_access: read | write`, the same for every member
+  of the share), judged by `Reach` like any other document. A theme a member can only read
+  takes no edits with `StoreAccess::READ_ONLY_REFUSAL`'s sentence. The owner's devices hold
+  the whole picture, so nothing here puts a theme on Pimble Cloud that was not already
+  there: a hosted or relayed store's theme nodes are store documents like the rest.
 - **Mounts.** A node is addressed everywhere by its canonical `(StoreId, NodeId)`, so a node
   should read the same wherever it is opened. The recommendation (decision 5): **the theme
   in force is resolved in the source store's own tree**, and the mounting store's chain is
@@ -434,13 +455,12 @@ cut or add.
    so changing the theme on a tree's root changes the whole tree. *Recommendation: yes*:
    that is what "this tree reads like a book" means. Paragraphs chose copying so a note
    never needs its ancestors; decisions 4 and 5 handle the two places that matters.
-4. **Shares.** How a member sees a theme set above the share or kept outside it.
-   *Recommendation: (a)* a scope's reach includes, read-only, the theme documents in force
-   in it, and the share records its root's inherited theme; members see the book layout
-   the owner sees. (b) Members see Default unless the share's root or something inside it
-   names a theme they can read (simpler; the owner and members see different layouts).
-   (c) Copy at creation like paragraphs (no lookup at all; then changing a tree's theme
-   changes only new notes). (a) touches the reach rules, which are yours to decide.
+4. **Shares. Decided (Joe, 2026-11-24):** a scope's reach includes the theme documents in
+   force in it, at a theme access chosen when the share is made: read-only (the default),
+   write, or a copy of the theme made for this share that members may edit (section 3.2).
+   Open detail: *recommendation:* write is offered only to editor shares, and the copy
+   lives in the store's Themes folder, outside the shared subtree, so it does not appear as
+   a node in members' trees.
 5. **Mounts.** *Recommendation:* a node's theme is resolved in its own (source) store and
    the mounting chain is ignored, so a node reads the same wherever it is opened.
    Alternative: the source chain first, the mounting chain when the source names none (a
@@ -487,7 +507,8 @@ cut or add.
    the two stock themes as data, Paper and Midnight.
 4. **Shares and mounts** per decisions 4 and 5, with the sharing harness
    (`crates/pimble-server/tests/common`) covering a member who holds neither the
-   ancestors nor the theme node.
+   ancestors nor the theme node, at each of the three theme accesses; the Share dialog's
+   theme access choice.
 5. **MCP** tools, and "Update from original".
 
 ## 14. How it is checked
@@ -501,4 +522,5 @@ cut or add.
 - Screens: Default and Document identical to today; each built-in on desktop (GPU and
   `--cpu`) and in the browser side by side.
 - Sharing: a member sees the owner's book layout with neither the ancestors nor the Themes
-  folder in their replica (decision 4 (a)).
+  folder in their replica; a read-only member's theme edit refused; a write member's edit
+  reaching the owner; a copy-for-share member's edit changing only the copy.
