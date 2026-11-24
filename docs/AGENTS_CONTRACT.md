@@ -117,7 +117,9 @@ only remote ones and says why):
    Work/Drafts"), local or remote, last used. Rows open the editor; "Remove" revokes at
    once (its key stops working on the next call).
 2. **New agent**:
-   - **Which app**: Claude Desktop, Claude Code, Cursor, "Another MCP client (stdio)",
+   - **Which app**: Claude (the Claude app's Chat and Code tabs and `claude` in a
+     terminal, one choice since 2026-11-24, section 6), ChatGPT / Codex, Cursor,
+     "Another MCP client (stdio)",
      "A remote client (ChatGPT, claude.ai)". This only decides the setup step; the list
      of apps Pimble configures itself grows as their config formats are confirmed.
    - **What it can reach**: the explorer's own tree with a three-way control per row:
@@ -126,7 +128,7 @@ only remote ones and says why):
      union of its grants, judged as a share's member is, so "edit the project except
      Drafts" is made by granting the parts, not by subtracting one. Stores are rows too.
      Nothing is checked to start with.
-   - **Setup**: for an app Pimble knows, "Add to Claude Desktop" writes its config
+   - **Setup**: for an app Pimble knows, "Add to Claude" writes its config
      entry (section 6) and says to restart that app; for any other client, the JSON to
      paste and a Copy button; for remote, the address and "Connect" instructions.
 3. **In the explorer**: rows an agent can reach can carry a small marker (off by
@@ -138,8 +140,7 @@ Pimble adds one `mcpServers.pimble-<agent name>` entry and touches nothing else:
 
 | Client | File |
 | --- | --- |
-| Claude Desktop | Linux `~/.config/Claude/claude_desktop_config.json`, Windows `%APPDATA%\Claude\claude_desktop_config.json`, macOS `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| Claude Code | `claude mcp add` if `claude` is on the PATH, else `~/.claude.json` user scope |
+| Claude | both of: the Claude app's `claude_desktop_config.json` (Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`, macOS `~/Library/Application Support/Claude/`), and `~/.claude.json` user scope (with `"type": "stdio"`), each only when that Claude is installed (the `Claude` config folder; `~/.claude.json` or `~/.claude/`) |
 | ChatGPT desktop, Codex CLI and IDE extension | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`): a `[mcp_servers.pimble-<name>]` table with `command` and an `env` table, merged with `toml_edit` so the file's comments and layout stay |
 | Cursor | `~/.cursor/mcp.json` |
 
@@ -147,7 +148,30 @@ The entry names the installed `pimble-mcp` by absolute path (the self-updating i
 folder, so updates keep it working) and passes the key through `env`. The file is read,
 the entry merged in, a backup written beside it (`.pimble-backup`), and the result
 written atomically; a file that does not parse is left alone and the person gets the
-snippet instead. Removing an agent removes its entry the same way.
+snippet instead.
+
+**Claude is one choice, one agent, written to two files** (Joe, 2026-11-24, after Code-tab
+sessions carried every Pimble tool twice). The Claude app's Chat tab reads only
+`claude_desktop_config.json`; `claude` in a terminal reads only `~/.claude.json`; the
+app's Code tab reads both, and loads an entry once when both files name it alike (the
+`~/.claude.json` copy wins; tested 2026-11-24). So "Add to Claude" writes the same entry
+(name, command, key) to both files, and **takes every other Pimble entry out of both**
+(an entry whose `command` is a file named `pimble-mcp`/`pimble-mcp.exe`, whatever its
+name): the entries of the old "Claude Desktop" and "Claude Code" choices
+(`pimble-claude-desktop`, `pimble-claude-code`), a hand-made pair, a stale entry under the
+new name. Each Claude file ends with exactly one Pimble entry. The other apps replace only
+an entry of the same name.
+
+**Replaced agents are removed.** A key names its agent (`pmbl_agent_<id>_...`,
+`pimble_rpc::agent_id_of_key`), so Pimble knows whose entries an "Add" replaced. Each of
+this device's agents whose entry was replaced and that no file in this section still holds
+is removed from Pimble (its key revoked); one still set up in another app is kept. The
+page says so under "Add to Claude" before it is pressed, and names them after.
+
+**Removing an agent takes its entries out of every file in this section**, the same way
+(backup, rename), once the server's list says it is gone; the page says which apps' settings
+changed. The list shows under each agent the apps it is set up in, or that it is in no app
+Pimble knows here (an agent left over from by-hand setups, to remove).
 
 ## 7. Waves
 
@@ -156,8 +180,8 @@ snippet instead. Removing an agent removes its entry the same way.
    Tests: an agent reads and writes only inside its grants, through every tool and
    search; a reader is refused writes with the sentence; a removed agent's key fails.
 2. **pimble-mcp**: `--agent` / `PIMBLE_AGENT_KEY`; no key refuses with the sentence.
-3. **App**: the Agents window, the tree picker, config writing for Claude Desktop,
-   Claude Code and Cursor, the copy-paste fallback; desktop and web.
+3. **App**: the Agents window, the tree picker, config writing for Claude, ChatGPT /
+   Codex and Cursor, the copy-paste fallback; desktop and web.
 4. **Remote**: deferred (section 9). Every major desktop client reaches Pimble locally;
    a public endpoint would expose plaintext to jkbase's edge and Pimble Cloud.
 
@@ -170,7 +194,7 @@ snippet instead. Removing an agent removes its entry the same way.
 3. **Setups made by hand stop until scoped**: no unrestricted agent, no key no access.
 4. **Roles: reader and editor**, as share members have.
 5. Not asked, the proposal stands until Joe says otherwise: Pimble writes the config of
-   the apps it knows (Claude Desktop, Claude Code, Cursor) with a backup, and offers the
+   the apps it knows (Claude, ChatGPT / Codex, Cursor) with a backup, and offers the
    snippet for everything else.
 
 ## Built in wave 1 (server), 2026-10-20
@@ -224,18 +248,18 @@ snippet instead. Removing an agent removes its entry the same way.
 - The picker is the open stores' tree, loaded as rows open, with None / Read / Edit per
   row; a row nothing is chosen on says what it inherits ("reads, from above"). A store's
   root node stands for the whole store.
-- "Add to Claude Desktop / Claude Code / Cursor" merges one `mcpServers.pimble-<name>`
-  entry (`command` the `pimble-mcp` beside the app, `env.PIMBLE_AGENT_KEY`; Claude Code's
-  with `type: stdio`), keeps the old file as `.pimble-backup`, writes by rename, and
-  leaves a file it cannot parse alone (`write_entry`, tested).
+- "Add to <app>" merges one `mcpServers.pimble-<name>` entry (`command` the `pimble-mcp`
+  beside the app, `env.PIMBLE_AGENT_KEY`), keeps the old file as `.pimble-backup`, writes
+  by rename, and leaves a file it cannot parse alone. Since 2026-11-24 Claude is one
+  choice written to both of its files (section 6): `crates/pimble-app/src/agents/`
+  `client_config.rs` (the file formats) and `setup.rs` (which files, add, remove, who is
+  set up where), tested on a scratch home.
 - Walked through on an isolated app (port 7491, scratch config, fake `HOME`): an agent
   made with MEDICAL read and one folder inside it edited; the scratch Claude Desktop
   config got the entry; Edit loads the grants back; Remove takes it off the server.
 
 **Not built yet, or known gaps:**
 - View > "Show Agent Access" markers in the explorer.
-- Removing an agent does not take its entry out of the app's config (the key stops
-  working at once; the stale entry answers with the removed-agent sentence).
 - The browser shows no Agents window; it gets one with remote agents (wave 4).
 
 ## 9. Remote agents and Pimble Cloud's blindness (investigated 2026-10-21)
