@@ -44,9 +44,9 @@ use std::rc::Weak;
 use pimble_api::{Addr, Forest};
 use pimble_crdt::NodeDoc;
 use pimble_plugin_host::abi::api::{ApiReply, Reach};
-use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl, StoreAsk};
+use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl};
 use pimble_plugin_host::bridge::asking_sentence;
-use pimble_plugin_host::library::{self, Entry, Index, Offer, Provenance};
+use pimble_plugin_host::library::{self, Entry, Index, Provenance};
 #[cfg(not(feature = "native"))]
 use pimble_plugin_host::js_engine::{Plugin, Registry, ViewerLookup};
 #[cfg(feature = "native")]
@@ -61,6 +61,7 @@ use crate::state::AppStore;
 
 mod host;
 mod library_client;
+mod listing;
 mod mount;
 mod window;
 
@@ -68,7 +69,7 @@ pub(crate) use mount::{allow, decline, hide, render_slot, reply, show, Outcome};
 pub(crate) use window::{hidden, offer_install, open, render_page, shown};
 
 use host::watch_host_state;
-use library_client::{refresh_library, schedule_update_check, FIRST_UPDATE_CHECK_MS};
+use library_client::{schedule_update_check, write_provenance, FIRST_UPDATE_CHECK_MS};
 use window::{refresh_window, PluginsUi};
 
 /// A pane's plugin area: the element a plugin's view is applied under.
@@ -117,16 +118,17 @@ thread_local! {
     static WATCHING: Cell<bool> = const { Cell::new(false) };
     /// The plugin library's index, once it was read.
     static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
-    /// Which installed plugins came from the library: `library.json`.
+    /// Which installed plugins came from the library, and which are turned
+    /// off: `library.json`.
     static PROVENANCE: RefCell<Provenance> = RefCell::new(Provenance::default());
-    /// What a library row says about its plugin now (downloading, what came
-    /// of an install), by plugin id.
+    /// What a plugin's row says now instead of its state (downloading,
+    /// updating, what came of an install), by plugin id.
     static ROW_LINES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     /// Plugins being updated on their own (wave 3): a pane showing one keeps
     /// the version it runs when the new one is swapped in.
     static QUIET: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
     /// The plugin a `pimble:settings/plugins?install=<id>` link asked about:
-    /// its library row is marked and says what to press.
+    /// its row is marked and says what to press.
     static ASKED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The library is checked for updates on a timer, started once.
     static CHECKING: Cell<bool> = const { Cell::new(false) };
@@ -181,7 +183,6 @@ fn loaded(registry: Registry) {
         }
     }
     refresh_window();
-    refresh_library();
 }
 
 /// The plugins changed: one was added, replaced or removed (`changed` names
@@ -222,22 +223,56 @@ fn stop_everywhere(id: &str) {
     }
 }
 
-/// The recipes every loaded plugin registers ("New Kanban"), in the folder's
-/// order, each with the plugin that registered it.
+/// Plugin `id` is turned off here: installed and kept up to date, run nowhere.
+fn is_off(id: &str) -> bool {
+    PROVENANCE.with(|p| p.borrow().is_off(id))
+}
+
+/// What a pane showing a turned-off plugin's metanode says over the outline.
+fn turned_off_sentence(name: &str) -> String {
+    format!("Shown as an outline: the {name} plugin is turned off (Settings > Plugins).")
+}
+
+/// "Turn Off" / "Turn On": every pane showing it stops it (or looks again),
+/// and its recipes and child viewers leave (or come back), in place.
+fn set_off(id: &str, off: bool) {
+    let changed = PROVENANCE.with(|p| {
+        let mut p = p.borrow_mut();
+        if off { p.off.insert(id.to_string()) } else { p.off.remove(id) }
+    });
+    if !changed {
+        return;
+    }
+    write_provenance();
+    // The row says what it is now, not what came of its last update.
+    ROW_LINES.with(|l| l.borrow_mut().remove(id));
+    if off {
+        stop_everywhere(id);
+    }
+    if let Some(registry) = REGISTRY.with(|r| r.borrow().clone()) {
+        loaded(registry);
+    }
+}
+
+/// The recipes every loaded plugin that is on registers ("New Kanban"), in
+/// the folder's order, each with the plugin that registered it.
 fn recipes() -> Vec<crate::state::PluginRecipe> {
     with_registry(|registry| {
         registry
             .plugins
             .iter()
+            .filter(|p| !is_off(&p.manifest.id))
             .flat_map(|p| p.manifest.recipes().map(|r| crate::state::PluginRecipe { plugin: p.manifest.name.clone(), recipe: r.clone() }))
             .collect()
     })
     .unwrap_or_default()
 }
 
-/// The child viewers every loaded plugin provides, in the folder's order.
+/// The child viewers every loaded plugin that is on provides, in the
+/// folder's order.
 fn child_viewers() -> Vec<pimble_plugin_abi::ChildViewerDecl> {
-    with_registry(|registry| registry.plugins.iter().flat_map(|p| p.manifest.child_viewers().cloned()).collect()).unwrap_or_default()
+    with_registry(|registry| registry.plugins.iter().filter(|p| !is_off(&p.manifest.id)).flat_map(|p| p.manifest.child_viewers().cloned()).collect())
+        .unwrap_or_default()
 }
 
 /// A row's recipe item: make what `recipe` says under `parent`, through the

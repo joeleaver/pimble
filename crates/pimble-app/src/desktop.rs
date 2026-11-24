@@ -103,6 +103,8 @@ pub fn run(renderer: Renderer, activation_token: Option<String>) {
         .window_props(props)
         .theme(theme)
         .menu(menus)
+        // The families document themes name (docs/THEMES_CONTRACT.md section 5).
+        .fonts(crate::fonts::FACES)
         .renderer(renderer)
         .activation_token(activation_token)
         .run();

@@ -130,9 +130,10 @@ pub enum BackendCommand {
         /// docs/PROPERTIES_CONTRACT.md section 4), made on the node's tags as
         /// the edit finds them.
         tags: Option<TagEdit>,
-        /// `Some(true)` for a gap between paragraphs, `Some(false)` for none
-        /// (`custom_keys::PARAGRAPHS`, docs/PARAGRAPHS_CONTRACT.md).
-        paragraphs: Option<bool>,
+        /// The document theme the node names (`custom_keys::THEME`,
+        /// docs/THEMES_CONTRACT.md section 3.2), the same way: `Some(None)`
+        /// clears it, so the node reads in its parent's.
+        theme: Option<Option<String>>,
     },
     DeleteNode { store_id: StoreId, node_id: NodeId },
     /// Split a text node at `at`, a sticky index made at the editor's caret:
@@ -167,6 +168,11 @@ pub enum BackendCommand {
     /// The nodes above `node_id`, so the tree can open down to it (a followed
     /// link's target, docs/LINKS_CONTRACT.md). Answers `AncestorsLoaded`.
     GetAncestors { store_id: StoreId, node_id: NodeId },
+    /// `node_id` and the nodes above it, as far as this device may read, for
+    /// the theme in force on a node whose chain the app does not hold
+    /// (docs/THEMES_CONTRACT.md section 3.2). Answers `ThemeChainLoaded`,
+    /// quietly: a node it cannot read ends the chain and says nothing.
+    GetThemeChain { store_id: StoreId, node_id: NodeId },
     /// What the Properties panel shows of a node besides its own signal
     /// (docs/PROPERTIES_CONTRACT.md sections 4 and 5): where it lives and the
     /// tags its store uses. Answers `PropertiesLoaded`.

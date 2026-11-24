@@ -223,6 +223,10 @@ pub struct AppStore {
     // filters the icon grid over the whole Tabler set. Tags are the
     // Properties panel's (docs/PROPERTIES_CONTRACT.md).
     pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
+    /// The node the Theme picker is open for (Node > Theme..., a row's
+    /// "Theme...", the Properties panel, docs/THEMES_CONTRACT.md section 9);
+    /// `None` when closed.
+    pub theme_picker_node: Signal<Option<(StoreId, NodeId)>>,
     pub appearance_icon_query: Signal<String>,
 
     /// The Properties panel (docs/PROPERTIES_CONTRACT.md): whether it is
@@ -230,10 +234,6 @@ pub struct AppStore {
     /// on this device (`views.rs`); a new field's row is showing (Edit >
     /// "Add Field"); and what the backend last said of the node it shows.
     pub properties_open: Signal<bool>,
-    /// Edit > "Compact Paragraphs": checked while the focused pane's note is
-    /// compact (docs/PARAGRAPHS_CONTRACT.md); choosing it flips the note
-    /// (`pane_view::follow_paragraphs`).
-    pub compact_paragraphs: Signal<bool>,
     pub properties_width: Signal<f32>,
     pub properties_adding_field: Signal<bool>,
     pub properties_context: Signal<Option<crate::properties::Context>>,
@@ -539,6 +539,16 @@ impl AppStore {
         let selected_id = self.selected_id.get()?;
         let (store_id, node_id) = parse_tree_value(&selected_id)?;
         let node_id = node_id?;
+        Some((store_id, node_id))
+    }
+
+    /// The node the explorer's selected row stands for: a node row's node, a
+    /// store row's root node. What the menu bar's Node menu acts on, as a
+    /// row's own menu does (`app/explorer_menu.rs`).
+    pub fn selected_row_node(&self) -> Option<(StoreId, NodeId)> {
+        let selected_id = self.selected_id.get()?;
+        let (store_id, node_id) = parse_tree_value(&selected_id)?;
+        let node_id = node_id.or_else(|| self.root_node_id(store_id))?;
         Some((store_id, node_id))
     }
 

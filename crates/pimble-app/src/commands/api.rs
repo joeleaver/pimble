@@ -106,12 +106,12 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             renamed(ctx, store_id, node_id, edited).await
         }
 
-        C::SetNodeAppearance { store_id, node_id, icon, color, background, tags, paragraphs } => {
+        C::SetNodeAppearance { store_id, node_id, icon, color, background, tags, theme } => {
             let edited = api
                 .edit(Addr::new(store_id, node_id), move |doc, now| -> Result<(), ApiError> {
                     // `None` leaves a key alone; `Some(None)`, or an empty
                     // string, removes it, as `NodeMetadata::set_icon` does.
-                    for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background)] {
+                    for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background), (custom_keys::THEME, theme)] {
                         let Some(value) = value else { continue };
                         match value.filter(|s| !s.is_empty()) {
                             Some(value) => doc.set_custom(key, &serde_json::Value::String(value), now)?,
@@ -119,10 +119,6 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                                 doc.remove_custom(key, now)?;
                             }
                         }
-                    }
-                    if let Some(spaced) = paragraphs {
-                        let value = if spaced { pimble_core::SPACED_PARAGRAPHS } else { pimble_core::COMPACT_PARAGRAPHS };
-                        doc.set_custom(custom_keys::PARAGRAPHS, &serde_json::Value::String(value.to_string()), now)?;
                     }
                     // Made on the tags as the document has them now, so a
                     // tag someone else added meanwhile stays. They are the
@@ -179,6 +175,22 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             }
             ancestors.reverse();
             Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
+        }
+
+        C::GetThemeChain { store_id, node_id } => {
+            // Parent by parent, as `GetAncestors` reads them, but the nodes
+            // themselves: the app takes each as a `NodeLoaded`.
+            let mut nodes: Vec<pimble_core::Node> = Vec::new();
+            let mut at = Some(node_id);
+            while let Some(id) = at.take() {
+                if nodes.iter().any(|n| n.id == id) || nodes.len() >= 256 {
+                    break;
+                }
+                let Ok(node) = api.node(Addr::new(store_id, id)).await else { break };
+                at = node.parent_id;
+                nodes.push(node);
+            }
+            Some(BackendEvent::ThemeChainLoaded { store_id, nodes })
         }
 
         C::GetProperties { store_id, node_id } => {

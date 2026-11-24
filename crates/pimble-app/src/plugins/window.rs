@@ -1,64 +1,87 @@
-//! Account > Plugins...: Settings > Plugins, the plugins installed here and
-//! what each was allowed, and the library's rows.
+//! Settings > Plugins: one list of plugins, each once, from what is installed
+//! here and what the library offers (docs/PLUGINS_CONTRACT.md section 7;
+//! `listing` decides what each row says), with "Add from a File...".
 
-use super::library_client::{install_from_library, read_library, refresh_library};
-use super::mount::revoke;
+use std::collections::HashSet;
+
+use super::library_client::{install_from_library, read_library};
+use super::listing::{self, Action, Installed, Row};
+use super::mount::revoke as revoke_approval;
 use super::*;
 
-/// One installed plugin, as the Plugins window lists it.
+/// A row as the window draws it: the list's row, and what the plugin was
+/// allowed here (Details), which "Revoke" takes back.
 #[derive(Clone, PartialEq)]
-pub(super) struct PluginRow {
-    id: String,
-    name: String,
-    /// What it provides and asks for, or why it does not run.
-    line: String,
-    /// What it is allowed here, or that it needs nothing.
-    note: String,
-    /// It was allowed something here, which "Revoke" takes back.
+pub(super) struct ShownRow {
+    row: Row,
+    allowed: Option<String>,
     revocable: bool,
-    /// "Remove" takes it off this device (the browser's own store of
-    /// plugins; the desktop's folder is the person's to change).
-    removable: bool,
 }
 
-/// What a plugin asks for, as a row says it: "asks to read the stores you
-/// choose".
-pub(super) fn asks_sentence(asks: &pimble_plugin_host::abi::Permissions) -> &'static str {
-    match (asks.stores, asks.write) {
-        (StoreAsk::None, _) => "asks for nothing",
-        (StoreAsk::All, true) => "asks to read and change all your stores",
-        (StoreAsk::All, false) => "asks to read all your stores",
-        (StoreAsk::Chosen, true) => "asks to read and change the stores you choose",
-        (StoreAsk::Chosen, false) => "asks to read the stores you choose",
-    }
-}
-
-/// One plugin the library offers, as Settings > Plugins lists it.
+/// A row ready to draw: every field is used once by the markup (a rinch `for`
+/// body hands each to its own closure), and what shows or hides is a style,
+/// since the row is drawn again whenever anything in it changes (its key).
 #[derive(Clone, PartialEq)]
-pub(super) struct LibraryRow {
-    pub(super) id: String,
-    /// "Kanban 0.1.0".
-    pub(super) title: String,
-    pub(super) summary: String,
-    /// "Asks to read and change the stores you choose."
-    pub(super) asks: String,
-    pub(super) offer: Offer,
-    /// "Install" or "Update", when the row has a button.
-    pub(super) button: Option<&'static str>,
-    /// Downloading, or what came of the last install.
-    pub(super) line: String,
-    /// A link asked about this plugin.
-    pub(super) asked: bool,
+struct RowView {
+    key: String,
+    class: &'static str,
+    title: String,
+    summary: String,
+    summary_style: &'static str,
+    state: String,
+    button: Option<(String, Action)>,
+    button_style: &'static str,
+    button_label: &'static str,
+    toggle_id: String,
+    toggle_label: &'static str,
+    details_style: &'static str,
+    details: Vec<String>,
+    actions: Vec<(String, Action)>,
+    revoke: Option<String>,
+    revoke_style: &'static str,
+}
+
+const SHOW: &str = "";
+const HIDE: &str = "display: none;";
+
+impl RowView {
+    fn of(shown: ShownRow, open: bool) -> RowView {
+        let key = format!("{:?} {:?} {} {open}", shown.row, shown.allowed, shown.revocable);
+        let row = shown.row;
+        let mut details = row.details.clone();
+        details.extend(shown.allowed);
+        RowView {
+            key,
+            class: if row.asked { "pimble-plugins__row pimble-plugins__row--asked" } else { "pimble-plugins__row" },
+            summary_style: if row.summary.is_empty() { HIDE } else { SHOW },
+            title: row.title,
+            summary: row.summary,
+            state: row.state,
+            button_style: if row.button.is_some() { SHOW } else { HIDE },
+            button_label: row.button.map(Action::label).unwrap_or_default(),
+            button: row.button.map(|a| (row.id.clone(), a)),
+            toggle_id: row.id.clone(),
+            toggle_label: if open { "Hide Details" } else { "Details" },
+            details_style: if open { SHOW } else { HIDE },
+            details,
+            actions: row.more.iter().map(|a| (row.id.clone(), *a)).collect(),
+            revoke_style: if shown.revocable { SHOW } else { HIDE },
+            revoke: shown.revocable.then(|| row.id.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct PluginsUi {
-    pub(super) rows: Signal<Vec<PluginRow>>,
-    /// What came of the last "Add plugin..." or "Remove".
+    pub(super) rows: Signal<Vec<ShownRow>>,
+    /// What came of the last "Add from a File..." or "Remove".
     pub(super) status: Signal<String>,
-    pub(super) library: Signal<Vec<LibraryRow>>,
     /// Reading the library, or why it could not be read.
     pub(super) library_line: Signal<String>,
+    /// Only the installed plugins are listed.
+    installed_only: Signal<bool>,
+    /// The rows whose Details are open, by plugin id.
+    open: Signal<HashSet<String>>,
 }
 
 /// Account > "Plugins...": Settings at Plugins.
@@ -66,13 +89,13 @@ pub(crate) fn open(store: AppStore) {
     crate::settings::open_at(store, crate::settings::Section::Plugins);
 }
 
-/// Settings > Plugins is shown: the list as it is now, and no line left from
-/// last time.
-pub(crate) fn shown(store: AppStore) {
+/// Settings > Plugins is shown: the list as it is now, no line left from
+/// last time, and the library read again (which also updates what it can).
+pub(crate) fn shown(_store: AppStore) {
     if let Some(ui) = UI.with(Cell::get) {
         ui.status.set(String::new());
-        ui.rows.set(rows(store));
     }
+    refresh_window();
     read_library();
 }
 
@@ -81,176 +104,223 @@ pub(crate) fn shown(store: AppStore) {
 pub(crate) fn hidden() {
     ROW_LINES.with(|l| l.borrow_mut().clear());
     ASKED.with(|a| *a.borrow_mut() = None);
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.open.set(HashSet::new());
+    }
 }
 
 /// A link asked to install plugin `id` (the website's "Install in Pimble"):
-/// its row in the library is marked and says what to press. Nothing is
-/// installed until the person presses it.
+/// its row is marked and says what to press. Nothing is installed until the
+/// person presses it.
 pub(crate) fn offer_install(id: &str) {
     ASKED.with(|a| *a.borrow_mut() = Some(id.to_string()));
-    refresh_library();
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.installed_only.set(false);
+    }
+    refresh_window();
 }
 
+/// Draw the list again from what is installed, the library's index and what
+/// each row says now.
 pub(super) fn refresh_window() {
     if let (Some(ui), Some(store)) = (UI.with(Cell::get), STORE.with(Cell::get)) {
         ui.rows.set(rows(store));
     }
 }
 
-fn rows(store: AppStore) -> Vec<PluginRow> {
-    with_registry(|registry| rows_of(store, registry)).unwrap_or_default()
+/// What is installed here, as the list reads it.
+pub(super) fn installed() -> Vec<Installed> {
+    with_registry(|registry| {
+        let running = registry.plugins.iter().map(|p| Installed::running(&p.manifest, file_name(&p.path)));
+        running.chain(registry.refused.iter().map(Installed::refused)).collect()
+    })
+    .unwrap_or_default()
 }
 
-fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
-    let mut rows: Vec<PluginRow> = registry
-        .plugins
-        .iter()
-        .map(|p| {
-            let m = &p.manifest;
-            let viewers: Vec<String> = m.viewers().map(|v| v.name.clone()).collect();
-            let asks = asks_sentence(&m.asks);
-            let line = format!("{} {}: the {} viewer; {asks}.", m.name, m.version, viewers.join(", "));
-            let came = if PROVENANCE.with(|p| p.borrow().from_library(&m.id)) { "From the library." } else { "Added from a file." };
-            let approval = approval_of(&m.id);
-            let verb = if approval.write { "read and change" } else { "read" };
-            let (note, revocable) = match &approval.stores {
-                Approved::All => (format!("Allowed to {verb} all your stores on this device."), true),
-                Approved::Only(ids) => {
-                    let names = ids.iter().map(|id| store_name(store, *id)).collect::<Vec<_>>().join(", ");
-                    (format!("Allowed to {verb} {names} on this device."), true)
-                }
-                Approved::Nothing if m.asks.asks_anything() => ("Not allowed anything yet.".to_string(), false),
-                Approved::Nothing => ("It needs nothing allowed.".to_string(), false),
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn rows(store: AppStore) -> Vec<ShownRow> {
+    let installed = installed();
+    let index = INDEX.with(|i| i.borrow().clone());
+    let provenance = PROVENANCE.with(|p| p.borrow().clone());
+    let lines = ROW_LINES.with(|l| l.borrow().clone());
+    let asked = ASKED.with(|a| a.borrow().clone());
+    let inputs = listing::Inputs { installed: &installed, index: index.as_ref(), provenance: &provenance, lines: &lines, asked: asked.as_deref() };
+    listing::rows(&inputs)
+        .into_iter()
+        .map(|row| {
+            let (allowed, revocable) = match manifest_of(&row.id) {
+                Some(m) => allowed_sentence(store, &m),
+                None => (None, false),
             };
-            let note = format!("{came} {note}");
-            PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable, removable: place::REMOVABLE }
+            ShownRow { row, allowed, revocable }
         })
-        .collect();
-    for refused in &registry.refused {
-        rows.push(PluginRow { id: String::new(), name: refused.file(), line: refused.sentence.clone(), note: String::new(), revocable: false, removable: false });
-    }
-    rows
+        .collect()
 }
 
-/// Settings > Plugins: each plugin installed, what it asks for, what it was
-/// allowed here, "Revoke" and "Remove"; and "Add from a file...".
+/// What plugin `m` was allowed on this device, and whether "Revoke" has
+/// anything to take back.
+fn allowed_sentence(store: AppStore, m: &Manifest) -> (Option<String>, bool) {
+    let approval = approval_of(&m.id);
+    let verb = if approval.write { "read and change" } else { "read" };
+    match &approval.stores {
+        Approved::All => (Some(format!("Allowed to {verb} all your stores on this device.")), true),
+        Approved::Only(ids) => {
+            let names = ids.iter().map(|id| store_name(store, *id)).collect::<Vec<_>>().join(", ");
+            (Some(format!("Allowed to {verb} {names} on this device.")), true)
+        }
+        Approved::Nothing if m.asks.asks_anything() => (Some("Not allowed anything yet: it asks the first time it is shown.".to_string()), false),
+        Approved::Nothing => (Some("It needs nothing allowed.".to_string()), false),
+    }
+}
+
+/// A row's button was pressed.
+fn act(id: &str, action: Action) {
+    match action {
+        Action::Install | Action::Update | Action::UseLibrary => install_from_library(id),
+        Action::TurnOn => set_off(id, false),
+        Action::TurnOff => set_off(id, true),
+        Action::Remove => place::remove(id),
+    }
+}
+
+fn toggle_open(ui: PluginsUi, id: &str) {
+    ui.open.update(|open| {
+        if !open.remove(id) {
+            open.insert(id.to_string());
+        }
+    });
+}
+
+/// Settings > Plugins.
 pub(crate) fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let ui = PluginsUi {
         rows: Signal::new(Vec::new()),
         status: Signal::new(String::new()),
-        library: Signal::new(Vec::new()),
         library_line: Signal::new(String::new()),
+        installed_only: Signal::new(false),
+        open: Signal::new(HashSet::new()),
     };
     UI.with(|u| u.set(Some(ui)));
+    let shown_rows = move || {
+        let only = ui.installed_only.get();
+        let open = ui.open.get();
+        ui.rows.get().into_iter().filter(|r| !only || r.row.installed).map(|r| {
+            let is_open = open.contains(&r.row.id);
+            RowView::of(r, is_open)
+        }).collect::<Vec<_>>()
+    };
     rsx! {
+        div {
+            class: "pimble-plugins",
+            style: "display: flex; flex-direction: column; gap: 12px;",
             div {
-                class: "pimble-plugins",
-                style: "display: flex; flex-direction: column; gap: 12px;",
+                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                {place::WHERE.to_string()}
+                " Plugins from pimble.app are signed by Pimble, checked before they are installed, and kept up to date on their own."
+            }
+            div {
+                style: "display: flex; gap: 6px; align-items: center;",
+                Button {
+                    variant: {move || if ui.installed_only.get() { "default" } else { "filled" }},
+                    size: "xs",
+                    onclick: move || ui.installed_only.set(false),
+                    "All"
+                }
+                Button {
+                    variant: {move || if ui.installed_only.get() { "filled" } else { "default" }},
+                    size: "xs",
+                    onclick: move || ui.installed_only.set(true),
+                    "Installed"
+                }
+                div { style: "flex: 1;" }
+                if place::CAN_ADD {
+                    Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add from a File..." }
+                }
+            }
+            if !ui.library_line.get().is_empty() {
+                div { style: "font-size: 13px;", {move || ui.library_line.get()} }
+            }
+            if !ui.status.get().is_empty() {
+                div { style: "font-size: 12px;", {move || ui.status.get()} }
+            }
+            if shown_rows().is_empty() {
+                div { style: "font-size: 13px;", "No plugins are installed." }
+            }
+            for view in shown_rows() {
                 div {
-                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                    {place::WHERE.to_string()}
-                }
-                if ui.rows.with(|r| r.is_empty()) {
-                    div { style: "font-size: 13px;", "No plugins are installed." }
-                }
-                for row in ui.rows.get() {
+                    key: view.key.clone(),
+                    class: view.class,
+                    style: "display: flex; flex-direction: column; gap: 6px;",
                     div {
-                        key: format!("{} {} {} {}", row.id, row.name, row.note, row.revocable),
-                        class: "pimble-plugins__row",
                         style: "display: flex; gap: 12px; align-items: center;",
                         div {
                             style: "flex: 1; display: flex; flex-direction: column; gap: 2px;",
-                            div { style: "font-size: 13px;", {row.line.clone()} }
-                            div {
-                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                                {row.note.clone()}
-                            }
+                            div { style: "font-size: 13px; font-weight: 600;", {view.title.clone()} }
+                            div { style: format!("font-size: 13px; {}", view.summary_style), {view.summary.clone()} }
+                            div { style: "font-size: 12px; color: var(--rinch-color-dimmed);", {view.state.clone()} }
                         }
-                        if row.removable {
-                            Button {
-                                variant: "default",
-                                size: "xs",
-                                onclick: {
-                                    let id = row.id.clone();
-                                    move || place::remove(&id)
-                                },
-                                "Remove"
-                            }
-                        }
-                        if row.revocable {
-                            Button {
-                                variant: "default",
-                                size: "xs",
-                                onclick: {
-                                    let id = row.id.clone();
-                                    move || revoke(store, &id)
-                                },
-                                "Revoke"
-                            }
-                        }
-                    }
-                }
-                if !ui.status.get().is_empty() {
-                    div { style: "font-size: 12px;", {move || ui.status.get()} }
-                }
-                div {
-                    style: "display: flex; justify-content: flex-start; gap: 8px;",
-                    if place::CAN_ADD {
-                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add from a File..." }
-                    }
-                }
-                div { class: "pimble-settings__heading", style: "margin-top: 8px;", "Library" }
-                div {
-                    style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                    "Plugins from pimble.app, signed by Pimble and checked before they are installed."
-                }
-                if !ui.library_line.get().is_empty() {
-                    div { style: "font-size: 13px;", {move || ui.library_line.get()} }
-                }
-                for row in ui.library.get() {
-                    div {
-                        key: format!("{} {} {:?} {} {}", row.id, row.title, row.offer, row.line, row.asked),
-                        class: if row.asked { "pimble-plugins__row pimble-plugins__row--asked" } else { "pimble-plugins__row" },
-                        style: "display: flex; gap: 12px; align-items: center;",
                         div {
-                            style: "flex: 1; display: flex; flex-direction: column; gap: 2px;",
-                            div { style: "font-size: 13px; font-weight: 600;", {row.title.clone()} }
-                            div { style: "font-size: 13px;", {row.summary.clone()} }
-                            div { style: "font-size: 12px; color: var(--rinch-color-dimmed);", {row.asks.clone()} }
-                            if !row.line.is_empty() {
-                                div { style: "font-size: 12px;", {row.line.clone()} }
-                            }
-                        }
-                        if row.button.is_some() {
+                            style: view.button_style,
                             Button {
                                 variant: "filled",
                                 size: "xs",
                                 onclick: {
-                                    let id = row.id.clone();
-                                    move || install_from_library(&id)
+                                    let button = view.button.clone();
+                                    move || if let Some((id, action)) = &button { act(id, *action) }
                                 },
-                                {row.button.unwrap_or_default()}
+                                {view.button_label}
                             }
                         }
-                        if row.button.is_none() {
+                        Button {
+                            variant: "subtle",
+                            size: "xs",
+                            onclick: {
+                                let id = view.toggle_id.clone();
+                                move || toggle_open(ui, &id)
+                            },
+                            {view.toggle_label}
+                        }
+                    }
+                    div {
+                        class: "pimble-plugins__details",
+                        style: format!("display: flex; flex-direction: column; gap: 4px; padding-left: 12px; font-size: 12px; color: var(--rinch-color-dimmed); {}", view.details_style),
+                        for line in view.details.clone() {
+                            div { key: line.clone(), {line.clone()} }
+                        }
+                        div {
+                            style: "display: flex; gap: 6px; margin-top: 2px;",
+                            for (id, action) in view.actions.clone() {
+                                Button {
+                                    key: action.label().to_string(),
+                                    variant: "default",
+                                    size: "xs",
+                                    onclick: {
+                                        let id = id.clone();
+                                        move || act(&id, action)
+                                    },
+                                    {action.label()}
+                                }
+                            }
                             div {
-                                style: "font-size: 12px; color: var(--rinch-color-dimmed); white-space: nowrap;",
-                                {offer_label(&row.offer)}
+                                style: view.revoke_style,
+                                Button {
+                                    variant: "default",
+                                    size: "xs",
+                                    onclick: {
+                                        let revoke = view.revoke.clone();
+                                        move || if let Some(id) = &revoke { revoke_approval(store, id) }
+                                    },
+                                    "Revoke"
+                                }
                             }
                         }
                     }
                 }
             }
-    }
-}
-
-/// What a library row says instead of a button.
-fn offer_label(offer: &Offer) -> &'static str {
-    match offer {
-        Offer::Installed => "Installed",
-        Offer::FromFile => "Added from a file",
-        Offer::NeedsNewer => "Needs a newer Pimble",
-        Offer::Install | Offer::Update { .. } => "",
+        }
     }
 }
 

@@ -575,3 +575,98 @@ reads, and its settings with a schema. The plugin's crate holds it as `guide.jso
 is embedded with `plugin!(describe: ..., view: ..., guide: include_bytes!("../guide.json"))`
 as the module's `pimble-guide` custom section. The MCP reads it from the file; nothing
 runs. No ABI change. docs/AGENT_GUIDES_CONTRACT.md.
+
+## 7. Every plugin updates, and one list (2026-11-24)
+
+Joe, 2026-11-24: "We do need to get plugins auto-updating too. Also the plugins interface
+isn't great. There's two complete listings, one for the library, one for what's
+installed, that's not how most library systems work." This replaces what
+docs/SETTINGS_CONTRACT.md sections 4 and 5 said about a plugin added from a file ("never
+touched") and about the Library list beside the installed one.
+
+**Joe's answers (2026-11-24):** a plugin installed from a file follows the library; no
+pinning ("Keep This Version" was proposed and declined); a plugin can be turned off without
+being removed.
+
+**A plugin is its id.** The library, the plugins folder, the browser's store and
+`library.json` all name a plugin by its manifest id (`kanban-viewer`). A plugin installed
+from a file whose id the library lists is the library's plugin at whatever version the file
+holds; where it came from only says what its row says.
+
+**What updates on its own** (`pimble_plugin_host::library::offer` and `updates_due`). At
+start (20 s), every six hours, and whenever Settings > Plugins is shown, the index is read,
+and for every plugin installed here whose id the library lists with an entry this Pimble
+runs (the entry's ABI is the app's):
+
+- it is updated when the library's version is newer than the installed one, wherever the
+  installed one came from;
+- it is updated when the installed one was built for an earlier plugin ABI (refused after
+  the app updated), whatever its version, since a plugin that does not run has nothing to
+  keep (`Runs::BuiltFor`, judged from its manifest's head);
+- one refused for anything else is left alone and its row offers "Use Library Version"
+  (`Offer::Replace`): one built for a later ABI (a development build ahead of this Pimble),
+  and one refused for another reason (it faulted or ran past its time while it described
+  itself, its description could not be read), since the library's version may not settle
+  that, and replacing it on its own would repeat at every check;
+- a file at the library's version or later (a development build, or a version that is not
+  a version) is left alone; its row offers "Use Library Version".
+
+Installing bytes identical to the file already there writes nothing, and the folder's next
+scan judges that file again (a refusal cached from a bad moment does not outlive it).
+
+Nothing is asked: the person did nothing to get an update, and what each plugin was allowed
+carries over (a version that asks for more asks the way a first use does). A refused plugin
+is known by the head of its manifest (`ManifestHead`: id, name, version, ABI, the first four
+fields, which every ABI has encoded the same way and first), so one whose full manifest no
+longer decodes is still known by id; failing that, by its file name (`kanban_viewer.wasm`
+is `kanban-viewer`, `Refused::id`).
+
+**One file per plugin.** The folder holds a plugin as `<id>.wasm`. Installing (from the
+library or a file) writes that name and removes every other file holding the same id;
+`scripts/plugins/install.sh` writes that name too and removes its old `kanban_viewer.wasm`
+(it wrote that name before, so a library install beside it made two files of one plugin).
+A registry that still meets two files of one id runs the later version and logs it, and a
+refused file of a plugin that loaded from another file is set aside.
+
+**Turned off.** `library.json` (`localStorage` in the browser) keeps `off`, plugin ids,
+beside the library version of each plugin installed from it; an older Pimble ignores it.
+"Turn Off" keeps a plugin installed and updating but not running: its viewers' metanodes
+show the outline under "Shown as an outline: the Kanban plugin is turned off (Settings >
+Plugins).", its recipes leave the new-node menu, its child viewers stop applying, and panes
+showing it stop. "Turn On" brings it back in place. Remove forgets that it was off. The
+MCP reads the same `library.json`: `list_viewers` lists a turned-off plugin's file under
+"Turned off", `call_plugin_tool` refuses its tools with a sentence that says so, and
+`set_viewer_settings` and `set_fields` do not run its checks (the guide's schema still
+applies). It learns which file holds which id by compiling the files, only while any plugin
+is off.
+
+**One list** (`crates/pimble-app/src/plugins/listing.rs` decides, `window.rs` draws).
+Settings > Plugins is one list, each plugin once, from the union of what is installed here
+and what the library offers: installed first, then by name. "All" / "Installed" filter it;
+"Add from a File..." sits beside them. A row has the plugin's name and version (the
+installed one, else the library's), its summary (the library's, else the viewers it
+provides), one state, and at most one button:
+
+| State | Says | Button |
+| --- | --- | --- |
+| Not installed | "Asks to read and change the stores you choose." | Install |
+| Installed, current | "Installed" | |
+| Update available (an automatic update failed) | "Version 0.2.0 is in the library." | Update |
+| Updating, updated while open, downloading | "Updating to 0.2.0...", "Updated to 0.2.0." | |
+| From a file, not in the library | "From a file" | |
+| From a file at the library's version or later | "From a file" | Use Library Version |
+| Built for an earlier ABI | the refusal, then "The library's version replaces it." | Update |
+| Does not run here otherwise | the refusal | Use Library Version, when the library has it |
+| Library's needs a newer Pimble | "Needs a newer Pimble" | |
+| Turned off | "Turned off" | Turn On |
+
+"Details" opens the row under it: what it asks for, where it came from and its file, the
+library's version when it differs, what it was allowed here, and the actions that apply
+(Turn Off / Turn On, Remove, Revoke). Remove deletes every file of the plugin; a file that
+will not go is named, and the plugin keeps what it was allowed until Remove finishes. A `pimble:settings/plugins?install=<id>` link marks
+the plugin's row and shows All.
+
+**Known limit.** `library.json` names the plugins the app installed from the library; a
+file `install.sh` writes over one of them later is still recorded as the library's until it
+is replaced, so its row says "Installed" rather than "From a file". What updates is the
+same either way (only a newer library version replaces it).

@@ -13,6 +13,13 @@
 # shown it asks to be allowed what it needs (Settings > Plugins lists them and
 # takes approvals back).
 #
+# Each plugin is written as <id>.wasm (the crate's name is the plugin's id), the
+# name the library and "Add from a File..." use, so one plugin is one file. A
+# plugin installed here follows the library like any other
+# (docs/PLUGINS_CONTRACT.md section 7): when the library has a newer version
+# this Pimble runs, it replaces this build on its own. A build at the library's
+# version or later is left alone.
+#
 # The build runs under scripts/guarded.sh (a shared machine: memory-capped, low
 # priority, CARGO_BUILD_JOBS jobs, 4 by default here).
 set -euo pipefail
@@ -40,11 +47,16 @@ done
 
 mkdir -p "$dest"
 for p in "${plugins[@]}"; do
-  file="${p//-/_}.wasm"
+  built="${p//-/_}.wasm"
+  file="$p.wasm"
   # Copied beside it and renamed over it, so a running Pimble never reads
   # half a plugin.
-  cp "$here/plugins/target/wasm32-wasip1/release/$file" "$dest/$file.partial"
+  cp "$here/plugins/target/wasm32-wasip1/release/$built" "$dest/$file.partial"
   mv "$dest/$file.partial" "$dest/$file"
+  # The name this script used before: a second file of the same plugin.
+  if [ "$built" != "$file" ] && [ -e "$dest/$built" ]; then
+    rm -f -- "$dest/$built"
+  fi
   echo "installed $file into $dest"
 done
 echo "A running Pimble takes them at once."

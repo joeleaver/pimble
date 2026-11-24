@@ -1,0 +1,13 @@
+[package]
+name = "pimble-themes"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pimble's themes as data: typed tokens and their checks, the built-in themes, the fonts Pimble provides, resolution and the CSS custom properties a theme becomes (docs/THEMES_CONTRACT.md)."
+
+# Data and pure functions only, for the desktop and the browser alike: no rinch,
+# no I/O. The app draws what this crate answers; the font files themselves are
+# in assets/fonts and are bundled by the app's platform adapters.
+[dependencies]
+serde_json = { workspace = true }

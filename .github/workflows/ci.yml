@@ -40,6 +40,11 @@ jobs:
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets
 
+      # The library's index tool is behind a feature, so the workspace check
+      # misses it; the Release workflow runs it, and it broke there once.
+      - name: cargo check the plugin index tool
+        run: cargo check -p pimble-plugin-host --features index-tool --bins
+
   test:
     name: cargo test
     runs-on: ubuntu-24.04

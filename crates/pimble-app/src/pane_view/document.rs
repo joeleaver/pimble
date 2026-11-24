@@ -77,15 +77,6 @@ pub(crate) fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> 
     )]
 }
 
-/// Whether pane `pane`'s note draws a gap between its paragraphs
-/// (docs/PARAGRAPHS_CONTRACT.md), tracked; compact when it says nothing.
-pub(crate) fn pane_spaced(store: AppStore, pane: PaneId) -> bool {
-    let Some((store_id, node_id)) = pane_document(store, pane) else { return false };
-    // One signal read at a time (see `editor_read_only`).
-    let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
-    node.is_some_and(|sig| sig.with(|n| n.metadata.spaced_paragraphs()))
-}
-
 /// Whether the document in pane `pane` is one this device may only read
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): its store is held to
 /// read, or the server judged this node so (a reader's root in a store where

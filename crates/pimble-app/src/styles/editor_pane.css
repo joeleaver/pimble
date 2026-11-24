@@ -51,13 +51,6 @@
     border-radius: 0;
 }
 
-/* A gutter right of the text for the discussions' margin markers
-   (docs/DISCUSSIONS_CONTRACT.md section 6), inside the editor's padding box
-   so its own scroller never clips them. */
-.pimble-editor__content-wrap > [data-pm-editor] {
-    padding-right: 34px;
-}
-
 .pimble-margin-marker {
     position: absolute;
     min-width: 18px;
@@ -93,18 +86,6 @@
 .pimble-editor__content-wrap > [data-pm-editor] img {
     max-width: 100%;
     height: auto;
-}
-
-/* Paragraph spacing (docs/PARAGRAPHS_CONTRACT.md): a note is compact unless it
-   says spaced, so Enter starts the next line with no gap; a spaced note keeps
-   rinch's gap after each paragraph. Headings, quotes, code blocks and tables
-   keep their own margins either way. Only how it is drawn: the paragraphs are
-   the same paragraphs. */
-.pimble-editor__content-wrap > [data-pm-editor] p {
-    margin: 0;
-}
-.pimble-editor__content-wrap--spaced > [data-pm-editor] p {
-    margin: 0 0 0.75em;
 }
 
 .editor-toolbar {

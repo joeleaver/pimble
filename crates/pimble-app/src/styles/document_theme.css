@@ -1,0 +1,328 @@
+/* Document themes (docs/THEMES_CONTRACT.md sections 2 and 7).
+
+   A pane's note draws with the theme in force on it: `themes::pane_drawn` puts
+   the theme's tokens on `.pimble-editor__content-wrap` as inline `--pd-*`
+   custom properties, and its structural choices as the wrapper's modifier
+   classes (`pimble-editor__content-wrap--para-spaced`, ...). Every rule here
+   reads a token with `var(--pd-<token>, <the look before themes>)`, so Default,
+   which writes nothing, draws exactly what the app drew before themes, and
+   one token set changes one thing. Tokens that name no value of their own
+   (a heading's font, its tracking, its color) fall back to the token they
+   inherit from, and that one to today's value: never to a CSS-wide keyword,
+   which a `var()` fallback cannot carry everywhere.
+
+   Specificity: rinch's editor sheet is added to the page after the app's, so
+   a rule here outranks it by specificity rather than by order. Its rules are
+   `[data-pm-editor] x` (0,1,1), its dark scheme's `[data-pm-editor][data-pm-theme="dark"] x`
+   (0,2,1). Layout rules here are `WRAP > [data-pm-editor] x` (0,2,1) and
+   colors carry the scheme attribute as well (0,3,1). The theme picker's
+   preview (app/theme_preview.rs) is a wrap of its own and takes these same
+   rules. */
+
+/* ── Page and body ──────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] {
+    font-family: var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif);
+    font-size: var(--pd-body-size, 15px);
+    line-height: var(--pd-body-line-height, 1.7);
+    letter-spacing: var(--pd-body-letter-spacing, normal);
+    text-align: var(--pd-body-align, start);
+    padding-left: var(--pd-page-padding, 20px);
+    /* A gutter right of the text for the discussions' margin markers
+       (docs/DISCUSSIONS_CONTRACT.md section 6), inside the editor's padding
+       box so its own scroller never clips them: 14px beyond the page's
+       padding. */
+    padding-right: calc(var(--pd-page-padding, 20px) + 14px);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] {
+    background: var(--pd-page, var(--rinch-color-body));
+    color: var(--pd-text, var(--rinch-color-text));
+    border-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] {
+    background: var(--pd-page, var(--rinch-color-surface));
+    color: var(--pd-text, var(--rinch-color-text));
+    border-color: var(--rinch-color-border);
+}
+
+/* ── Paragraphs (section 4: themes replace compact and spaced) ───── */
+/* Compact: no gap, so Enter starts the next line. Headings, quotes, code blocks
+   and tables keep their own margins whatever the paragraphs do. */
+.pimble-editor__content-wrap > [data-pm-editor] p {
+    margin: 0;
+}
+.pimble-editor__content-wrap--para-spaced > [data-pm-editor] p {
+    margin: 0 0 var(--pd-paragraph-gap, 0.75em);
+}
+/* A book's paragraphs: no gap, the first line indented, except the first
+   paragraph after anything that is not a paragraph (a heading, a quote). */
+.pimble-editor__content-wrap--para-indented > [data-pm-editor] p + p {
+    text-indent: var(--pd-paragraph-indent, 1.5em);
+}
+
+/* ── Headings ───────────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] h1 {
+    font-family: var(--pd-h1-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h1-size, 2em);
+    font-weight: var(--pd-h1-weight, 700);
+    text-transform: var(--pd-h1-case, none);
+    letter-spacing: var(--pd-h1-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h1-align, start);
+    margin-top: var(--pd-h1-space-before, 0.5em);
+    margin-bottom: var(--pd-h1-space-after, 0.5em);
+    border-bottom: var(--pd-h1-rule-below, none);
+}
+.pimble-editor__content-wrap > [data-pm-editor] h2 {
+    font-family: var(--pd-h2-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h2-size, 1.5em);
+    font-weight: var(--pd-h2-weight, 700);
+    text-transform: var(--pd-h2-case, none);
+    letter-spacing: var(--pd-h2-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h2-align, start);
+    margin-top: var(--pd-h2-space-before, 0.7em);
+    margin-bottom: var(--pd-h2-space-after, 0.4em);
+    border-bottom: var(--pd-h2-rule-below, none);
+}
+.pimble-editor__content-wrap > [data-pm-editor] h3 {
+    font-family: var(--pd-h3-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h3-size, 1.25em);
+    font-weight: var(--pd-h3-weight, 600);
+    text-transform: var(--pd-h3-case, none);
+    letter-spacing: var(--pd-h3-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h3-align, start);
+    margin-top: var(--pd-h3-space-before, 0.7em);
+    margin-bottom: var(--pd-h3-space-after, 0.3em);
+    border-bottom: var(--pd-h3-rule-below, none);
+}
+.pimble-editor__content-wrap > [data-pm-editor] h4 {
+    font-family: var(--pd-h4-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h4-size, 1.05em);
+    font-weight: var(--pd-h4-weight, 600);
+    text-transform: var(--pd-h4-case, none);
+    letter-spacing: var(--pd-h4-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h4-align, start);
+    margin-top: var(--pd-h4-space-before, 0.7em);
+    margin-bottom: var(--pd-h4-space-after, 0.3em);
+    border-bottom: var(--pd-h4-rule-below, none);
+}
+.pimble-editor__content-wrap > [data-pm-editor] h5 {
+    font-family: var(--pd-h5-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h5-size, 0.95em);
+    font-weight: var(--pd-h5-weight, 600);
+    text-transform: var(--pd-h5-case, none);
+    letter-spacing: var(--pd-h5-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h5-align, start);
+    margin-top: var(--pd-h5-space-before, 0.7em);
+    margin-bottom: var(--pd-h5-space-after, 0.3em);
+    border-bottom: var(--pd-h5-rule-below, none);
+}
+.pimble-editor__content-wrap > [data-pm-editor] h6 {
+    font-family: var(--pd-h6-font, var(--pd-headings-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif)));
+    font-size: var(--pd-h6-size, 0.9em);
+    font-weight: var(--pd-h6-weight, 600);
+    text-transform: var(--pd-h6-case, none);
+    letter-spacing: var(--pd-h6-tracking, var(--pd-body-letter-spacing, normal));
+    text-align: var(--pd-h6-align, start);
+    margin-top: var(--pd-h6-space-before, 0.7em);
+    margin-bottom: var(--pd-h6-space-after, 0.3em);
+    border-bottom: var(--pd-h6-rule-below, none);
+}
+/* Heading colors: the text color for h1-h4 and the dimmed for h5 and h6, as
+   before themes, unless the theme names one. */
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h1,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h1 {
+    color: var(--pd-h1-color, var(--pd-text, var(--rinch-color-text)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h2,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h2 {
+    color: var(--pd-h2-color, var(--pd-text, var(--rinch-color-text)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h3,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h3 {
+    color: var(--pd-h3-color, var(--pd-text, var(--rinch-color-text)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h4,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h4 {
+    color: var(--pd-h4-color, var(--pd-text, var(--rinch-color-text)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h5,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h5 {
+    color: var(--pd-h5-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h6,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h6 {
+    color: var(--pd-h6-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
+}
+
+/* ── Quotes ─────────────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] blockquote {
+    font-family: var(--pd-quote-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] blockquote {
+    border-left-color: var(--pd-rule, var(--rinch-primary-color-7));
+    color: var(--pd-quote-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] blockquote {
+    border-left-color: var(--pd-rule, var(--rinch-primary-color-3));
+    color: var(--pd-quote-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
+}
+/* Indent: no bar, set in further. */
+.pimble-editor__content-wrap--quote-indent > [data-pm-editor] blockquote {
+    border-left-style: none;
+    padding-left: 2em;
+}
+/* Italic: no bar, the words in italic. */
+.pimble-editor__content-wrap--quote-italic > [data-pm-editor] blockquote {
+    border-left-style: none;
+    font-style: italic;
+}
+/* Boxed: a frame in the rule color around the quote. */
+.pimble-editor__content-wrap--quote-boxed > [data-pm-editor] blockquote {
+    border: 1px solid var(--pd-rule, var(--rinch-color-border));
+    border-radius: 6px;
+    padding: 0.5em 0.9em;
+}
+/* The bar's color per scheme above is more specific than the frame; the left
+   edge is the frame's too. */
+.pimble-editor__content-wrap--quote-boxed > [data-pm-editor][data-pm-theme] blockquote {
+    border-left-color: var(--pd-rule, var(--rinch-color-border));
+}
+
+/* ── Code ───────────────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] code,
+.pimble-editor__content-wrap > [data-pm-editor] pre {
+    font-family: var(--pd-code-font, ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace);
+    font-size: var(--pd-code-size, 0.9em);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] code {
+    background: var(--pd-code-background, var(--pd-code-bg, var(--rinch-color-option-hover)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] pre {
+    background: var(--pd-code-background, var(--pd-code-bg, var(--rinch-color-surface)));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] code {
+    background: var(--pd-code-background, var(--pd-code-bg, #eef1f4));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] pre {
+    background: var(--pd-code-background, var(--pd-code-bg, var(--rinch-color-body)));
+}
+/* Long lines scroll sideways instead of wrapping. */
+.pimble-editor__content-wrap--code-unwrapped > [data-pm-editor] pre {
+    white-space: pre;
+    overflow-x: auto;
+}
+
+/* ── Lists ──────────────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] li {
+    margin-top: var(--pd-lists-item-spacing, 0.15em);
+    margin-bottom: var(--pd-lists-item-spacing, 0.15em);
+}
+/* The marker's own color: the desktop draws a marker as an element of its own
+   (rinch-dom's `rinch-list-marker`), the browser as `::marker`. Two rules, so
+   an engine that does not know one selector still reads the other. */
+.pimble-editor__content-wrap--marker-color > [data-pm-editor] li > [rinch-list-marker] {
+    color: var(--pd-lists-marker-color, var(--pd-accent, var(--rinch-primary-color-6)));
+}
+.pimble-editor__content-wrap--marker-color > [data-pm-editor] li::marker {
+    color: var(--pd-lists-marker-color, var(--pd-accent, var(--rinch-primary-color-6)));
+}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor] table {
+    font-family: var(--pd-tables-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif));
+    font-size: var(--pd-tables-size, 1em);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
+    border-color: var(--pd-rule, var(--rinch-color-border));
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th {
+    background: var(--rinch-color-surface);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
+    background: var(--rinch-color-body);
+}
+/* Rows: lines between rows only. */
+.pimble-editor__content-wrap--table-rows > [data-pm-editor] table {
+    border-left-style: none;
+    border-right-style: none;
+    border-radius: 0;
+}
+.pimble-editor__content-wrap--table-rows > [data-pm-editor] td,
+.pimble-editor__content-wrap--table-rows > [data-pm-editor] th {
+    border-left-style: none;
+    border-right-style: none;
+}
+/* Minimal: one line under the header and none else. */
+.pimble-editor__content-wrap--table-minimal > [data-pm-editor] table,
+.pimble-editor__content-wrap--table-minimal > [data-pm-editor] td {
+    border-style: none;
+}
+.pimble-editor__content-wrap--table-minimal > [data-pm-editor] th {
+    border-style: none none solid none;
+}
+/* A header in bold type with no shading (the scheme attribute outranks the
+   shading above). */
+.pimble-editor__content-wrap--table-header-bold > [data-pm-editor][data-pm-theme] th {
+    background: transparent;
+    font-weight: 700;
+}
+
+/* ── Horizontal rules ───────────────────────────────────────────── */
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] hr,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] hr {
+    border-top-color: var(--pd-rule, var(--rinch-color-border));
+}
+/* Ornament: a short double line centered between the sections, as a book's
+   section break. Drawn by the rule's own border: generated content inside the
+   editor puts the caret beside the wrong character (joeleaver/rinch#891). */
+.pimble-editor__content-wrap--rule-ornament > [data-pm-editor] hr {
+    border-top-style: double;
+    border-top-width: 4px;
+    max-width: 4em;
+    margin-left: auto;
+    margin-right: auto;
+}
+/* Space: the break's gap with no line in it. */
+.pimble-editor__content-wrap--rule-space > [data-pm-editor][data-pm-theme] hr {
+    border-top-color: transparent;
+}
+
+/* ── Highlight ──────────────────────────────────────────────────── */
+/* A highlight in a chosen color is the mark's inline style, which wins. */
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] mark {
+    background: var(--pd-highlight, #bb8009);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] mark {
+    background: var(--pd-highlight, #fff3a3);
+}
+
+/* ── Measure ────────────────────────────────────────────────────── */
+/* A theme with a measure keeps the text a column that wide at most, centered
+   in the pane, and every block keeps its own indent inside it.
+   The column is the editor itself, not the blocks' margins: rinch writes each
+   text block's indent as an inline `margin-left`, which no rule outranks, and
+   a measure in a heading's own `em` would make it wider than the paragraphs.
+   The editor's `em` is the body size. It keeps the page's padding and the
+   discussions' gutter inside it, so a pane narrower than the measure reads as
+   a pane without one. No percentage is mixed into a calc() here: rinch
+   resolves one only against a width it can prove definite, and a pane's is
+   not, so it would drop the percentage. The wrap paints the page beside the
+   column in the editor's colors, and the pointer there reaches the wrap, not
+   the editor. */
+.pimble-editor__content-wrap--measured > [data-pm-editor] {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: calc(var(--pd-page-measure) + 2 * var(--pd-page-padding, 20px) + 14px);
+    margin-left: auto;
+    margin-right: auto;
+}
+.pimble-editor__content-wrap--measured.pimble-editor__content-wrap--dark {
+    background: var(--pd-page, var(--rinch-color-body));
+}
+.pimble-editor__content-wrap--measured.pimble-editor__content-wrap--light {
+    background: var(--pd-page, var(--rinch-color-surface));
+}

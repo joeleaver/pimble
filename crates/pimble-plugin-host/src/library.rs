@@ -3,7 +3,7 @@
 //! update, and the check every downloaded plugin passes before it is installed.
 //! Pure: the app fetches, this decides and verifies, on both targets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pimble_plugin_abi::{Manifest, Permissions, ABI_VERSION};
 use serde::{Deserialize, Serialize};
@@ -62,38 +62,93 @@ impl Index {
     }
 }
 
-/// What the library's row for a plugin offers on this device.
+/// A plugin installed on this device, as the library judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Have<'a> {
+    /// Its version, as its manifest says.
+    pub version: &'a str,
+    /// It was installed from the library (`library.json` names it).
+    pub from_library: bool,
+    /// Whether this Pimble runs it, and if not, what the library may do.
+    pub runs: Runs,
+}
+
+/// Whether this Pimble runs an installed plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runs {
+    Yes,
+    /// Refused because it was built for plugin ABI `.0`, another than this
+    /// Pimble runs (its manifest's head says so).
+    BuiltFor(u32),
+    /// Refused for another reason: it faulted or ran past its time while it
+    /// described itself, its description could not be read, or it asks for
+    /// something this Pimble refuses.
+    No,
+}
+
+impl Runs {
+    /// What loading a plugin came to: `refused` or not, and the ABI its
+    /// manifest named, when that much could be read.
+    pub fn judged(refused: bool, abi: Option<u32>) -> Runs {
+        match (refused, abi) {
+            (false, _) => Runs::Yes,
+            (true, Some(abi)) if abi != ABI_VERSION => Runs::BuiltFor(abi),
+            (true, _) => Runs::No,
+        }
+    }
+}
+
+/// What the library offers for one of its plugins on this device
+/// (docs/PLUGINS_CONTRACT.md section 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Offer {
     /// Not installed here.
     Install,
-    /// Installed from the library at this version or a later one.
+    /// Installed at the library's version or a later one, from the library.
     Installed,
-    /// Installed from the library at an earlier version.
+    /// Installed at an earlier version, or built for an earlier plugin ABI:
+    /// the library's replaces it on its own, wherever it came from.
     Update { from: String },
-    /// Installed here from a file: the library leaves it alone.
+    /// Installed, and this Pimble does not run it for a reason the library's
+    /// version does not settle on its own (built for a later ABI than this
+    /// Pimble runs, a development build ahead of it; or refused for something
+    /// else, such as a fault): left alone; the person may take the library's.
+    Replace { from: String },
+    /// Installed from a file at the library's version or a later one (a
+    /// development build): left alone; the person may take the library's.
     FromFile,
-    /// Built for another plugin ABI than this Pimble runs.
+    /// The library's version is built for another plugin ABI than this Pimble
+    /// runs, and nothing here runs in its place.
     NeedsNewer,
 }
 
-/// What `entry` offers, given the version installed here (if any) and whether
-/// that one came from the library.
-pub fn offer(entry: &Entry, installed: Option<&str>, from_library: bool) -> Offer {
+/// What `entry` offers, given what is installed here (if anything).
+pub fn offer(entry: &Entry, have: Option<Have<'_>>) -> Offer {
     if entry.abi != ABI_VERSION {
         // One installed and running stays; only the library's is out of reach.
-        return match installed {
-            Some(_) if from_library => Offer::Installed,
-            Some(_) => Offer::FromFile,
-            None => Offer::NeedsNewer,
+        return match have {
+            Some(h) if h.runs == Runs::Yes && h.from_library => Offer::Installed,
+            Some(h) if h.runs == Runs::Yes => Offer::FromFile,
+            _ => Offer::NeedsNewer,
         };
     }
-    match installed {
-        None => Offer::Install,
-        Some(_) if !from_library => Offer::FromFile,
-        Some(have) if newer(&entry.version, have) => Offer::Update { from: have.to_string() },
-        Some(_) => Offer::Installed,
+    let Some(h) = have else { return Offer::Install };
+    let from = h.version.to_string();
+    match h.runs {
+        Runs::BuiltFor(abi) if abi < ABI_VERSION => Offer::Update { from },
+        Runs::BuiltFor(_) | Runs::No => Offer::Replace { from },
+        Runs::Yes if newer(&entry.version, h.version) => Offer::Update { from },
+        Runs::Yes if !h.from_library => Offer::FromFile,
+        Runs::Yes => Offer::Installed,
     }
+}
+
+/// The entries of `index` to install on their own now: every plugin installed
+/// here (`installed` says how, by id) that the library has a newer version of
+/// this Pimble runs, or that was built for an earlier plugin ABI and the
+/// library has one this Pimble runs. Nothing else is touched.
+pub fn updates_due<'a>(index: &Index, installed: impl Fn(&str) -> Option<Have<'a>>) -> Vec<Entry> {
+    index.plugins.iter().filter(|entry| matches!(offer(entry, installed(&entry.id)), Offer::Update { .. })).cloned().collect()
 }
 
 /// Is `version` later than `than`? Anything that is not a version is never
@@ -174,15 +229,23 @@ pub fn entry_for(manifest: &Manifest, summary: &str, bytes: &[u8], shot: Option<
     }
 }
 
-/// Which installed plugins came from the library, and at which version
-/// (`<plugins dir>/library.json`, `localStorage` in the browser). A plugin not
-/// named here was added from a file.
+/// The name of `Provenance`'s file in the desktop's plugins folder.
+pub const PROVENANCE_FILE: &str = "library.json";
+
+/// What this device keeps about its plugins beside the plugins themselves
+/// (`<plugins dir>/library.json`, `localStorage` in the browser): which
+/// installed plugins came from the library, at which version (a plugin not
+/// named there was added from a file), and which the person turned off. An
+/// older Pimble reading it ignores `off`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Provenance {
     #[serde(default)]
     pub v: u32,
     #[serde(default)]
     pub plugins: BTreeMap<String, String>,
+    /// Plugins installed but turned off: they keep updating, and run nowhere.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub off: BTreeSet<String>,
 }
 
 impl Provenance {
@@ -198,6 +261,10 @@ impl Provenance {
 
     pub fn from_library(&self, id: &str) -> bool {
         self.plugins.contains_key(id)
+    }
+
+    pub fn is_off(&self, id: &str) -> bool {
+        self.off.contains(id)
     }
 }
 
@@ -246,18 +313,92 @@ mod tests {
         assert!(said.contains("newer format"), "{said}");
     }
 
+    fn have(version: &str, from_library: bool, runs: bool) -> Option<Have<'_>> {
+        Some(Have { version, from_library, runs: if runs { Runs::Yes } else { Runs::BuiltFor(ABI_VERSION - 1) } })
+    }
+
+    fn refused(version: &str, runs: Runs) -> Option<Have<'_>> {
+        Some(Have { version, from_library: false, runs })
+    }
+
     #[test]
-    fn what_a_row_offers() {
+    fn what_the_library_offers_for_each_plugin() {
         let entry = entry_for(&manifest("kanban-viewer", "0.2.0"), "", b"x", None);
-        assert_eq!(offer(&entry, None, false), Offer::Install);
-        assert_eq!(offer(&entry, Some("0.1.0"), true), Offer::Update { from: "0.1.0".into() });
-        assert_eq!(offer(&entry, Some("0.2.0"), true), Offer::Installed);
-        assert_eq!(offer(&entry, Some("0.3.0"), true), Offer::Installed);
-        assert_eq!(offer(&entry, Some("0.1.0"), false), Offer::FromFile);
+        assert_eq!(offer(&entry, None), Offer::Install);
+        assert_eq!(offer(&entry, have("0.1.0", true, true)), Offer::Update { from: "0.1.0".into() });
+        assert_eq!(offer(&entry, have("0.2.0", true, true)), Offer::Installed);
+        assert_eq!(offer(&entry, have("0.3.0", true, true)), Offer::Installed);
+        // A file install follows the library: an older one is updated...
+        assert_eq!(offer(&entry, have("0.1.0", false, true)), Offer::Update { from: "0.1.0".into() });
+        // ...a development build at its version or later is left alone.
+        assert_eq!(offer(&entry, have("0.2.0", false, true)), Offer::FromFile);
+        assert_eq!(offer(&entry, have("0.3.0-dev", false, true)), Offer::FromFile);
+        assert_eq!(offer(&entry, have("dev", false, true)), Offer::FromFile, "not a version: never older");
+        // One built for an older ABI is replaced, whatever its version.
+        assert_eq!(offer(&entry, have("0.2.0", false, false)), Offer::Update { from: "0.2.0".into() });
+        assert_eq!(offer(&entry, have("0.9.0", true, false)), Offer::Update { from: "0.9.0".into() });
+        // One built for a later ABI (a build ahead of this Pimble), or refused
+        // for another reason (it faulted once), is offered, never replaced on
+        // its own.
+        assert_eq!(offer(&entry, refused("0.3.0", Runs::BuiltFor(ABI_VERSION + 1))), Offer::Replace { from: "0.3.0".into() });
+        assert_eq!(offer(&entry, refused("0.1.0", Runs::No)), Offer::Replace { from: "0.1.0".into() });
+        assert_eq!(offer(&entry, refused("", Runs::No)), Offer::Replace { from: String::new() });
+
         let mut later = entry.clone();
         later.abi = ABI_VERSION + 1;
-        assert_eq!(offer(&later, None, false), Offer::NeedsNewer);
-        assert_eq!(offer(&later, Some("0.1.0"), true), Offer::Installed);
+        assert_eq!(offer(&later, None), Offer::NeedsNewer);
+        assert_eq!(offer(&later, have("0.1.0", true, true)), Offer::Installed);
+        assert_eq!(offer(&later, have("0.1.0", false, true)), Offer::FromFile);
+        assert_eq!(offer(&later, have("0.1.0", true, false)), Offer::NeedsNewer);
+    }
+
+    #[test]
+    fn a_refusal_is_judged_by_the_abi_its_head_names() {
+        assert_eq!(Runs::judged(false, Some(ABI_VERSION - 1)), Runs::Yes);
+        assert_eq!(Runs::judged(true, Some(ABI_VERSION - 1)), Runs::BuiltFor(ABI_VERSION - 1));
+        assert_eq!(Runs::judged(true, Some(ABI_VERSION + 1)), Runs::BuiltFor(ABI_VERSION + 1));
+        assert_eq!(Runs::judged(true, Some(ABI_VERSION)), Runs::No);
+        assert_eq!(Runs::judged(true, None), Runs::No);
+    }
+
+    #[test]
+    fn every_installed_plugin_the_library_can_replace_updates_on_its_own() {
+        let at = |id: &str, version: &str, abi: u32| {
+            let mut m = manifest(id, version);
+            m.abi = abi;
+            entry_for(&m, "", b"x", None)
+        };
+        let index = Index {
+            v: INDEX_FORMAT,
+            plugins: vec![
+                at("kanban-viewer", "0.2.0", ABI_VERSION),
+                at("todo-viewer", "0.1.2", ABI_VERSION),
+                at("timeline-viewer", "0.2.0", ABI_VERSION + 1),
+                at("calendar-viewer", "0.2.0", ABI_VERSION),
+                at("stuck-viewer", "0.1.0", ABI_VERSION),
+                at("dev-viewer", "0.1.0", ABI_VERSION),
+                at("ahead-viewer", "0.1.0", ABI_VERSION),
+                at("faulty-viewer", "0.1.0", ABI_VERSION),
+            ],
+        };
+        let installed = |id: &str| match id {
+            // From a file (install.sh), older: updated.
+            "kanban-viewer" => have("0.1.2", false, true),
+            // Built for the ABI before, same version: it does not run, so updated.
+            "todo-viewer" => have("0.1.2", false, false),
+            // The library's needs a newer Pimble.
+            "timeline-viewer" => have("0.1.0", true, true),
+            "stuck-viewer" => have("0.1.0", true, true),
+            // A development build ahead of the library.
+            "dev-viewer" => have("0.2.0", false, true),
+            // Built for the ABI after this Pimble's: left for the person.
+            "ahead-viewer" => refused("0.0.9", Runs::BuiltFor(ABI_VERSION + 1)),
+            // Refused for another reason (it timed out once): left too.
+            "faulty-viewer" => refused("0.0.9", Runs::No),
+            _ => None,
+        };
+        let due: Vec<String> = updates_due(&index, installed).into_iter().map(|e| e.id).collect();
+        assert_eq!(due, vec!["kanban-viewer".to_string(), "todo-viewer".to_string()]);
     }
 
     #[test]
@@ -302,5 +443,10 @@ mod tests {
         assert!(back.from_library("kanban-viewer"));
         assert!(!back.from_library("todo-viewer"));
         assert_eq!(Provenance::parse(b"not json"), Provenance::default());
+        // Turned off survives, and a record from before `off` reads as none off.
+        p.off.insert("todo-viewer".into());
+        assert!(Provenance::parse(&p.to_json()).is_off("todo-viewer"));
+        let old = Provenance::parse(br#"{"v": 1, "plugins": {"kanban-viewer": "0.2.0"}}"#);
+        assert!(old.from_library("kanban-viewer") && old.off.is_empty());
     }
 }
