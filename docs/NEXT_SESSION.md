@@ -23,6 +23,8 @@ Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all
   those three; one narrow review of that diff, then merge to master, release, set the VAPID key
   before deploy, and put Joe's notification decisions to him (list in the side notes'
   `notifications-ready.md`). Then the worker starts wave 5 from master.
+- Markdown typing shortcuts (rinch #2975, on rinch main): Joe said 2026-11-23 "Turn them on" for the
+  note editor. Do it with the pin move for #2997 (code-block Enter): one pin move, one release.
 - Possibly flaky on master under load (passed 3 of 3 reruns): pimble-server `--test search`
   `a_locked_index_is_waited_for_and_never_rebuilt`, `--test vault_link`
   `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`.
