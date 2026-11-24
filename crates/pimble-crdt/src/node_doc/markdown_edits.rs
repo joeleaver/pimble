@@ -7,7 +7,8 @@ use std::rc::Rc;
 use rinch_editor_core::Schema;
 use yrs::{Map, Transact};
 
-use super::{data_keys_named, NodeDoc};
+use super::split::data_keys_named;
+use super::NodeDoc;
 use crate::content_doc::{model_edit_delta, model_edit_steps, model_of};
 use crate::error::{CrdtError, Result};
 use crate::markdown::{self, BlockTarget, Echo, HeadingTarget, InsertAt, MarkdownEdit};
