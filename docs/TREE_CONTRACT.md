@@ -304,7 +304,7 @@ deletes, creates, renames from the tree), cleared on restart.
 
 **Pimble:**
 
-- P1 `Place` through `pimble-rpc`, `pimble-crdt` (`Tree`), `pimble-server`, `protocol.rs`,
+- P1 `Place` through `pimble-rpc`, `pimble-crdt` (`Tree`), `pimble-server`, `protocol/`,
   `commands.rs`, `web/src/vault.rs` and `pimble-cli`, plus `moveNodes`.
 - P2 `judge_drop` (from `decide_drop`): access, self-or-descendant, mounts, stores,
   leaving a share, with the sentences above; pure and unit-tested like `decide_drop`.

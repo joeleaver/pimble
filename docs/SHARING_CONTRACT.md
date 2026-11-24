@@ -216,7 +216,7 @@ CloudHostedStoreInfo { /* … */ pub share: bool, pub shared_by: Option<String> 
 GetStoreSyncResponse { /* … */ pub access: StoreAccess }                           // serde(default)
 ```
 
-`pimble-app` `protocol.rs`: `BackendCommand::{CloudShareNode, CloudShareInfo, CloudShareInvite,
+`pimble-app` `protocol/`: `BackendCommand::{CloudShareNode, CloudShareInfo, CloudShareInvite,
 CloudShareRemoveMember, CloudStopSharing}`, `BackendEvent::{CloudShareUpdated { store_id,
 node_id, share, members }, CloudSharingStopped { store_id, node_id }}`, `CloudOp::{Share,
 ShareInfo, ShareInvite, ShareRemoveMember, StopSharing}`, wired through `commands.rs` to

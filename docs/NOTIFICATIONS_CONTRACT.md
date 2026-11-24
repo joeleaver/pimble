@@ -734,7 +734,7 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   "Watching" list with "Unwatch"), the row menu's "Watch" submenu (Watch, Watch with
   Subtree, Unwatch) in `app/explorer_menu.rs`, the switch in the Account modal and Settings, watch
   notices in `inbox.rs` (title, the note's name as the system notification's body,
-  "Unwatch" on the row), `protocol.rs`/`commands.rs`/`events.rs`. One code base for the
+  "Unwatch" on the row), `protocol/`/`commands.rs`/`events.rs`. One code base for the
   desktop and the browser; `web/build/sw.template.js` titles a pushed watch notice.
 
 ### Verified

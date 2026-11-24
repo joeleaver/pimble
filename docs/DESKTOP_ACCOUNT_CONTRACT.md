@@ -64,7 +64,7 @@ app restart and `cloudStatus` reports it on the next start.
    (the wrappers compile for wasm); the menu entries, the row item, the modals and the
    status-bar text are `native` only. The browser signs in through its own pages.
 
-## Protocol (`crates/pimble-app/src/protocol.rs`)
+## Protocol (`crates/pimble-app/src/protocol/`)
 
 ```rust
 // BackendCommand

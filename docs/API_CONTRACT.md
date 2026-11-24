@@ -22,7 +22,7 @@ app does, the way the app does it. Today there is no such "way": there are three
    MCP, the CLI and the sync and vault links.
 2. **Document libraries** (`NodeDoc`, `Tree`, `markdown`, `pimble-board`, `pimble-sheet`,
    `pimble-discussion`). Pure and shared. In good shape.
-3. **The app's `BackendCommand`/`BackendEvent`** (66 commands, 52 events, `protocol.rs`)
+3. **The app's `BackendCommand`/`BackendEvent`** (66 commands, 52 events, `protocol/`)
    plus `AppStore` signals. This is what the UI talks to, on both targets: desktop and
    plain web stores go through `process_command` to RPC, encrypted web stores go to
    `web/src/vault.rs`, which answers the same commands itself. It is fire-and-forget with
