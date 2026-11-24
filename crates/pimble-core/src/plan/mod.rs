@@ -223,15 +223,26 @@ pub fn label_from_title_and_content(has_explicit_title: bool, title: &str, conte
 /// is called only when the label needs the text, since that decode walks the
 /// whole document (an explicitly titled node's label is its title).
 pub fn display_label(node: &Node, text_of: impl FnOnce(&[u8]) -> String) -> String {
-    let has_explicit_title =
-        node.metadata.custom.get(crate::custom_keys::EXPLICIT_TITLE).and_then(|v| v.as_bool()).unwrap_or(false);
-    if has_explicit_title && !node.metadata.title.is_empty() {
+    if !label_follows_text(node) {
+        // A discussion's title is its topic; it has no text to take one from
+        // (docs/DISCUSSIONS_CONTRACT.md section 2).
+        if node.node_type == crate::node_types::DISCUSSION && node.metadata.title.trim().is_empty() {
+            return "Discussion".to_string();
+        }
         return node.metadata.title.clone();
     }
-    // A discussion's title is its topic; it has no text to take one from
-    // (docs/DISCUSSIONS_CONTRACT.md section 2).
-    if node.node_type == crate::node_types::DISCUSSION {
-        return if node.metadata.title.trim().is_empty() { "Discussion".to_string() } else { node.metadata.title.clone() };
-    }
-    label_from_title_and_content(has_explicit_title, &node.metadata.title, &text_of(&node.content))
+    label_from_title_and_content(has_explicit_title(node), &node.metadata.title, &text_of(&node.content))
+}
+
+/// Whether the node is titled explicitly (`custom_keys::EXPLICIT_TITLE`).
+fn has_explicit_title(node: &Node) -> bool {
+    node.metadata.custom.get(crate::custom_keys::EXPLICIT_TITLE).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Whether [`display_label`] reads the node's text: false for an explicit,
+/// non-empty title and for a discussion (its topic), so an edit of the text
+/// alone cannot rename such a node.
+pub fn label_follows_text(node: &Node) -> bool {
+    let explicit = has_explicit_title(node) && !node.metadata.title.is_empty();
+    !explicit && node.node_type != crate::node_types::DISCUSSION
 }

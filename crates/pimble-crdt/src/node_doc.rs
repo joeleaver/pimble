@@ -34,7 +34,6 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use pimble_core::{Anchor, IndexUnit, Node, NodeId, NodeMetadata, PimbleUrl, Place, StoreAccess};
 use pimble_core::metanode::{Metanode, Source, SOURCE_KEY, VIEWER_KEY};
-use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, BranchID, Doc, GetString, In, Map, MapPrelim, MapRef, Out,
     ReadTxn, StateVector, TextPrelim, Transact, TransactionMut,

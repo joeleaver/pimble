@@ -509,6 +509,17 @@ pub enum CloudOp {
     Watches,
 }
 
+/// What a note a notice names is called (`NotesNamed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteName {
+    /// The label, as the explorer shows it.
+    pub label: String,
+    /// Whether the label is read from the note's text
+    /// (`pimble_core::plan::label_follows_text`), so an edit of the text
+    /// alone can change it.
+    pub follows_text: bool,
+}
+
 /// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
 /// type, a yrs update merged into its document, and `metadata.custom` keys,
 /// all in the one edit that creates it. A board node's board is written this
@@ -790,7 +801,7 @@ pub enum BackendEvent {
     NoticeReceived { notice: pimble_rpc::Notice },
     /// The names `NameNodes` asked for, as the explorer would show them;
     /// `None` for a note this device cannot read.
-    NotesNamed { names: Vec<((StoreId, NodeId), Option<String>)> },
+    NotesNamed { names: Vec<((StoreId, NodeId), Option<NoteName>)> },
     /// The notices this device keeps, newest first, and whether
     /// notifications are on (`ListNotices`, `SetNotifications`).
     NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String>, watches: bool },

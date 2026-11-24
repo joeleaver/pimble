@@ -247,7 +247,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             let mut names = Vec::with_capacity(nodes.len());
             for (store_id, node_id) in nodes {
                 let name = match api.node(Addr::new(store_id, node_id)).await {
-                    Ok(node) => Some(crate::state::display_label_from_node(&node)),
+                    Ok(node) => Some(crate::protocol::NoteName {
+                        label: crate::state::display_label_from_node(&node),
+                        follows_text: pimble_core::plan::label_follows_text(&node),
+                    }),
                     Err(e) => {
                         tracing::debug!("The note {node_id} a notice names is not read here: {}", error_message(&e));
                         None

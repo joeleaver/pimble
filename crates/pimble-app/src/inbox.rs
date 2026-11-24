@@ -14,7 +14,7 @@ use pimble_core::{NodeId, StoreId};
 use pimble_rpc::{Notice, NoticeKind};
 use rinch::prelude::*;
 
-use crate::protocol::BackendCommand;
+use crate::protocol::{BackendCommand, NoteName};
 use crate::state::{AppStore, LinkOpen};
 
 /// The line a notice is shown under: who, and what they did.
@@ -59,7 +59,7 @@ pub(crate) fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Op
     if let Some(node) = store.node_data.with(|map| map.get(&(store_id, node_id)).copied()) {
         return Some(node.with(crate::state::display_label_from_node));
     }
-    store.notice_names.with(|names| names.get(&(store_id, node_id)).cloned())
+    store.notice_names.with(|names| names.get(&(store_id, node_id)).map(|name| name.label.clone()))
 }
 
 /// How long a name asked for is waited on before it counts as unanswered
@@ -105,7 +105,7 @@ fn ask(store: AppStore, nodes: Vec<(StoreId, NodeId)>, now_ms: f64) {
 /// the Inbox's lines fill in, and the notices waiting to say them go
 /// (`crate::notice_show::names_arrived`). One not read is asked again with
 /// the next listing (its store may be open by then).
-pub(crate) fn named(store: AppStore, names: Vec<((StoreId, NodeId), Option<String>)>) {
+pub(crate) fn named(store: AppStore, names: Vec<((StoreId, NodeId), Option<NoteName>)>) {
     let notes: Vec<(StoreId, NodeId)> = names.iter().map(|(key, _)| *key).collect();
     ASKING.with(|asking| {
         let mut asking = asking.borrow_mut();
@@ -113,7 +113,7 @@ pub(crate) fn named(store: AppStore, names: Vec<((StoreId, NodeId), Option<Strin
             asking.remove(key);
         }
     });
-    let read: Vec<((StoreId, NodeId), String)> = names.into_iter().filter_map(|(key, name)| Some((key, name?))).collect();
+    let read: Vec<((StoreId, NodeId), NoteName)> = names.into_iter().filter_map(|(key, name)| Some((key, name?))).collect();
     if !read.is_empty() {
         store.notice_names.update(|held| held.extend(read));
     }
@@ -128,15 +128,32 @@ pub(crate) fn answers_lost() {
     ASKING.with(|asking| asking.borrow_mut().clear());
 }
 
-/// A note of `store_id` changed (a rename, or the text an untitled note is
-/// named by). The name read for a notice is not kept in step by any view,
-/// so when a notice named it, it is read again: [`name_of`] says it while
-/// no view holds the note, and a view that holds it now may let it go.
-pub(crate) fn note_changed(store: AppStore, store_id: StoreId, node_id: NodeId) {
+/// What changed in a note another client wrote to (`RemoteStoreChange`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteChange {
+    /// Its title or metadata: any name may have changed.
+    Metadata,
+    /// Its text alone: only a name read from the text may have changed.
+    Text,
+}
+
+/// A note of `store_id` changed elsewhere (this window's own edits never
+/// come here). The name read for a notice is not kept in step by any view,
+/// so it is read again when it may have changed: a notice named the note,
+/// no view holds it (then [`name_of`] reads the held node, which is in step
+/// already), and the change can rename it (a text edit renames only a note
+/// named by its text, `NoteName::follows_text`). A watched note someone is
+/// typing in is read again only if it is named by its text.
+pub(crate) fn note_changed(store: AppStore, store_id: StoreId, node_id: NodeId, change: NoteChange) {
     let key = (store_id, node_id);
-    let named_here = untracked(|| store.notice_names.with(|names| names.contains_key(&key)));
+    if untracked(|| store.node_data.with(|map| map.contains_key(&key))) {
+        return;
+    }
+    let renames = untracked(|| {
+        store.notice_names.with(|names| names.get(&key).is_some_and(|name| change == NoteChange::Metadata || name.follows_text))
+    });
     let now = crate::text_boards::now_ms();
-    if named_here && !is_asking(&key, now) {
+    if renames && !is_asking(&key, now) {
         ask(store, vec![key], now);
     }
 }
@@ -607,6 +624,11 @@ mod tests {
         (store, cmd_rx)
     }
 
+    /// A note named by an explicit title, which a text edit cannot change.
+    fn titled(label: &str) -> NoteName {
+        NoteName { label: label.to_string(), follows_text: false }
+    }
+
     fn asked(commands: &crossbeam_channel::Receiver<BackendCommand>) -> Vec<Vec<(StoreId, NodeId)>> {
         commands.try_iter().filter_map(|c| match c { BackendCommand::NameNodes { nodes } => Some(nodes), _ => None }).collect()
     }
@@ -628,7 +650,7 @@ mod tests {
         assert!(asked(&commands).is_empty(), "asked already");
 
         let tree = untracked(|| store.tree_structure_version.get());
-        named(store, vec![(here, Some("Garden plan".into())), (there, None)]);
+        named(store, vec![(here, Some(titled("Garden plan"))), (there, None)]);
         assert_eq!(untracked(|| store.tree_structure_version.get()), tree, "the tree is not touched");
         assert!(store.get_node_signal(here.0, here.1).is_none(), "no node is taken for it");
         assert_eq!(untracked(|| where_of(store, NoticeKind::Watch, here)).as_deref(), Some("Garden plan"));
@@ -650,19 +672,43 @@ mod tests {
         let watched = notice(NoticeKind::Watch, None, "");
         let here = (watched.store, watched.node);
         listed(store, vec![watched.clone()], true);
-        named(store, vec![(here, Some("Garden plan".into()))]);
+        named(store, vec![(here, Some(titled("Garden plan")))]);
         let _ = asked(&commands);
 
-        note_changed(store, here.0, here.1);
+        note_changed(store, here.0, here.1, NoteChange::Text);
+        assert!(asked(&commands).is_empty(), "its text cannot rename a titled note");
+        note_changed(store, here.0, here.1, NoteChange::Metadata);
         assert_eq!(asked(&commands), vec![vec![here]], "read again");
-        note_changed(store, here.0, here.1);
+        note_changed(store, here.0, here.1, NoteChange::Metadata);
         assert!(asked(&commands).is_empty(), "not again while it is asked");
-        named(store, vec![(here, Some("Vegetable plan".into()))]);
+        named(store, vec![(here, Some(titled("Vegetable plan")))]);
         assert_eq!(untracked(|| where_of(store, NoticeKind::Watch, here)).as_deref(), Some("Vegetable plan"));
         assert_eq!(body_of(store, &watched), "Vegetable plan");
 
-        note_changed(store, here.0, NodeId::new());
+        note_changed(store, here.0, NodeId::new(), NoteChange::Metadata);
         assert!(asked(&commands).is_empty(), "a note no notice named");
+    }
+
+    /// Someone typing in a watched note named by its text renames it, so it
+    /// is read again; once a view holds the note it is said from the held
+    /// node and never asked for.
+    #[test]
+    fn a_text_edit_renames_only_a_note_named_by_its_text() {
+        let (store, commands) = store_and_commands();
+        let watched = notice(NoticeKind::Watch, None, "");
+        let here = (watched.store, watched.node);
+        listed(store, vec![watched], true);
+        named(store, vec![(here, Some(NoteName { label: "Pack the tent".into(), follows_text: true }))]);
+        let _ = asked(&commands);
+
+        note_changed(store, here.0, here.1, NoteChange::Text);
+        assert_eq!(asked(&commands), vec![vec![here]], "its name is its text");
+        named(store, vec![(here, Some(NoteName { label: "Pack the tents".into(), follows_text: true }))]);
+
+        store.upsert_node(here.0, pimble_core::Node { id: here.1, ..pimble_core::Node::new("text") });
+        note_changed(store, here.0, here.1, NoteChange::Text);
+        note_changed(store, here.0, here.1, NoteChange::Metadata);
+        assert!(asked(&commands).is_empty(), "a held note is said from what is held");
     }
 
     /// A name asked for whose answer never comes (an error, a lost
