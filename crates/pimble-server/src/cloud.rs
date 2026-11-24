@@ -16,7 +16,7 @@
 //! cookie or that header; see its `src/session.rs`).
 
 use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams, KeyEnvelope};
-use pimble_host::http::{Http, HttpRequest, HttpResponse, Method};
+use pimble_host::http::{Body, Http, HttpRequest, HttpResponse, Method};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,7 +49,7 @@ impl CloudError {
 pub type Result<T> = std::result::Result<T, CloudError>;
 
 async fn send(http: &dyn Http, method: Method, url: &str, bearer: Option<&str>, json: Option<Vec<u8>>) -> Result<HttpResponse> {
-    http.send(HttpRequest { method, url: url.to_string(), bearer: bearer.map(str::to_string), json })
+    http.send(HttpRequest { method, url: url.to_string(), bearer: bearer.map(str::to_string), body: json.map(Body::json) })
         .await
         .map_err(|e| CloudError::Request { url: url.to_string(), source: e })
 }

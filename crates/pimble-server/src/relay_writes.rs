@@ -453,7 +453,7 @@ mod tests {
     impl Http for Service {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
             let status = { self.answers.lock().unwrap().pop().unwrap_or(200) };
-            let body: serde_json::Value = serde_json::from_slice(&request.json.unwrap()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body.unwrap().bytes).unwrap();
             let id = body["report"].as_str().expect("every report has an id").to_string();
             match status {
                 0 => return Err(HttpError("the service is not reachable".into())),

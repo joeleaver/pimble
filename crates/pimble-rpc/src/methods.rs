@@ -13,6 +13,7 @@ use pimble_rpc_macros::pimble_api;
 
 use crate::app_links::*;
 use crate::notices::*;
+use crate::diagnostics::*;
 use crate::types::*;
 
 /// Pimble RPC API
@@ -357,6 +358,17 @@ pub trait PimbleApi {
     /// `hands_over`. Answers before it stops.
     #[method(name = "handOver", with_extensions)]
     async fn hand_over(&self) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Whether diagnostics are on, and the install they are recorded under:
+    /// what the browser's page tells its server at every connect and when
+    /// the person changes it. `Service`-only.
+    #[method(name = "setDiagnostics", with_extensions)]
+    async fn set_diagnostics(&self, request: SetDiagnosticsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Help > "Send Diagnostics...": the client's logs, this server's own,
+    /// the note and the stores, sent as one report; its code. `Service`-only.
+    #[method(name = "sendDiagnostics", with_extensions)]
+    async fn send_diagnostics(&self, request: SendDiagnosticsRequest) -> Result<SendDiagnosticsResponse, ErrorObjectOwned>;
 
     /// Whether an account is currently signed in, and as whom. `Service`-only.
     #[method(name = "cloudStatus", with_extensions)]

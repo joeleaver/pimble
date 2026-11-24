@@ -34,7 +34,6 @@ pub mod keystore;
 pub mod local;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod logs;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod memory;
@@ -55,19 +54,9 @@ pub mod sync_link;
 pub mod vault_link;
 pub mod writes;
 
-/// What the core asks of the native-only modules, answered in a browser's
-/// worker: no diagnostics yet (section 6, item 10: the worker's own, on its
-/// disk, come with the old browser path's removal), and no host kind and no
-/// hand-over (a worker has no port to hand).
-#[cfg(target_arch = "wasm32")]
-pub mod diagnostics {
-    pub fn ids() -> Option<(String, String)> {
-        None
-    }
-    pub fn set_account(_account: Option<String>) {}
-    pub fn record(_kind: &str, _data: serde_json::Value) {}
-}
-
+/// What the core asks of the native-only `local` module, answered in a
+/// browser's worker: its host kind, and no hand-over (a worker has no port to
+/// hand).
 #[cfg(target_arch = "wasm32")]
 pub mod local {
     /// Which program this process is, as `serverInfo` reports it.

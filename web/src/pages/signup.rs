@@ -19,7 +19,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::accounts::{self, SignupRequest};
 use crate::pages::PAGE_CSS;
 use crate::route::{self, Route};
-use crate::session::derive_timed;
+use crate::kdf::derive_timed;
 use crate::util::yield_to_browser;
 
 /// Where the signup page is in its three-step flow.
@@ -244,7 +244,7 @@ pub fn signup_page() -> NodeHandle {
 /// code's), which is why the caller yields to the browser first.
 async fn build_and_send(email: &str, password: &str) -> Result<String, String> {
     let kdf = KdfParams::generate();
-    let derived = derive_timed(password, &kdf).map_err(|e| e.to_string())?;
+    let derived = derive_timed(password, &kdf)?;
 
     let account = AccountKeys::generate();
     let public_keys = account.public_keys();

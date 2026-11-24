@@ -6,6 +6,7 @@
 //! - Server and client traits
 
 pub mod app_links;
+pub mod diagnostics;
 pub mod dispatch;
 pub mod error;
 pub mod methods;
@@ -15,6 +16,7 @@ pub mod vault;
 pub mod vault_cursor;
 
 pub use app_links::*;
+pub use diagnostics::*;
 pub use error::*;
 pub use methods::*;
 pub use notices::*;

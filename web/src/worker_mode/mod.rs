@@ -125,7 +125,8 @@ const PERSIST_REFUSED: &str =
 /// Build the app into its host, once: connected to this browser's server and
 /// signed in, or to the sign-in page.
 pub fn start_app() {
-    crate::app_page::keep_open_link();
+    crate::open_link::keep_open_link();
+    crate::diagnostics::on_save(backend::diagnostics_saved);
     spawn_local(async move {
         let started = js_sys::Date::now();
         let local = backend::local();
@@ -168,7 +169,7 @@ pub fn start_app() {
 
         let (store, view) = pimble_app::app::build_view();
         store.backend.set(Some(backend::spawn()));
-        if let Some(link) = crate::app_page::take_open_link() {
+        if let Some(link) = crate::open_link::take_open_link() {
             pimble_app::app_links::set_launch_link(link);
         }
         // A notification or a notice email opened this page (wave 2).

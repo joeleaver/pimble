@@ -40,6 +40,7 @@
 //! several documents' updates, is applied whole before repair judges it
 //! (see [`Repair`]).
 
+mod diagnostics;
 mod hosted_plain;
 
 use std::collections::{HashMap, HashSet};
@@ -4273,6 +4274,17 @@ impl PimbleApiServer for RpcHandler {
             info!("Pimble server stopped for a newer one");
         });
         Ok(EmptyResponse {})
+    }
+
+    async fn set_diagnostics(&self, ext: &Extensions, request: pimble_rpc::SetDiagnosticsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setDiagnostics")?;
+        self.diagnostics_set(request).await?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn send_diagnostics(&self, ext: &Extensions, request: pimble_rpc::SendDiagnosticsRequest) -> Result<pimble_rpc::SendDiagnosticsResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "sendDiagnostics")?;
+        self.diagnostics_send(request).await
     }
 
     async fn cloud_status(&self, ext: &Extensions) -> Result<CloudStatusResponse, ErrorObjectOwned> {

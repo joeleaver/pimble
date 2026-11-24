@@ -54,6 +54,12 @@ impl Paths {
         self.data.join("relay")
     }
 
+    /// Where diagnostic records wait to be sent, and this install's number
+    /// (docs/DIAGNOSTICS_CONTRACT.md): the desktop's programs and a browser's
+    /// server alike.
+    pub fn diagnostics(&self) -> PathBuf {
+        self.data.join("diagnostics")
+    }
     pub fn keystore(&self) -> PathBuf {
         self.config.join("keys.json")
     }

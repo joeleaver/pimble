@@ -1,6 +1,7 @@
 //! Outbound HTTP to the Pimble Cloud accounts service
 //! (docs/ONE_CODEBASE_CONTRACT.md seam D): sign-in, tokens, stores, keys,
-//! members, the personal document. JSON in, JSON out, a session bearer.
+//! members, the personal document, diagnostics. JSON in (diagnostic records
+//! NDJSON), JSON out, a session bearer.
 //!
 //! - The desktop: [`ReqwestHttp`] (`reqwest` with rustls, a 15 s timeout), as
 //!   before this seam.
@@ -33,8 +34,27 @@ pub struct HttpRequest {
     pub url: String,
     /// `Authorization: Bearer <bearer>`.
     pub bearer: Option<String>,
-    /// A JSON body, sent with `Content-Type: application/json`.
-    pub json: Option<Vec<u8>>,
+    /// The body, sent with its `Content-Type`.
+    pub body: Option<Body>,
+}
+
+/// A request's body and its media type.
+#[derive(Debug, Clone)]
+pub struct Body {
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+impl Body {
+    /// JSON (`application/json`): what the accounts service takes.
+    pub fn json(bytes: Vec<u8>) -> Self {
+        Body { content_type: "application/json", bytes }
+    }
+
+    /// Newline-delimited JSON (`application/x-ndjson`): diagnostic records.
+    pub fn ndjson(bytes: Vec<u8>) -> Self {
+        Body { content_type: "application/x-ndjson", bytes }
+    }
 }
 
 /// What the service answered, whatever its status.
@@ -121,8 +141,8 @@ impl Http for ReqwestHttp {
         if let Some(bearer) = &request.bearer {
             builder = builder.bearer_auth(bearer);
         }
-        if let Some(json) = request.json {
-            builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json").body(json);
+        if let Some(body) = request.body {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, body.content_type).body(body.bytes);
         }
         let response = builder.send().await.map_err(|e| HttpError(e.to_string()))?;
         let status = response.status().as_u16();
@@ -182,9 +202,9 @@ impl Http for FetchHttp {
         if let Some(bearer) = &request.bearer {
             headers.set("Authorization", &format!("Bearer {bearer}")).map_err(|e| failed("headers", e))?;
         }
-        if let Some(json) = &request.json {
-            headers.set("Content-Type", "application/json").map_err(|e| failed("headers", e))?;
-            init.set_body(&js_sys::Uint8Array::from(json.as_slice()).into());
+        if let Some(body) = &request.body {
+            headers.set("Content-Type", body.content_type).map_err(|e| failed("headers", e))?;
+            init.set_body(&js_sys::Uint8Array::from(body.bytes.as_slice()).into());
         }
         init.set_headers(&headers.into());
         let req = web_sys::Request::new_with_str_and_init(&request.url, &init).map_err(|e| failed("request", e))?;

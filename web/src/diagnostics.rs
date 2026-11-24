@@ -8,10 +8,10 @@
 //! [`RECENT_LINES`] log lines for Help > "Send Diagnostics...".
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 
-use pimble_core::diagnostics::Scrubber;
+use pimble_core::diagnostics::{is_info_target, random_hex, report_code, timestamp, valid_install, Envelope, LogBudget, Scrubber, Severity};
 use serde_json::{json, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -25,22 +25,19 @@ const INSTALL_KEY: &str = "pimble.diagnostics.install";
 const QUEUE_KEY: &str = "pimble.diagnostics.queue";
 const MAX_QUEUED_BYTES: usize = 1 << 20;
 const RECENT_LINES: usize = 3000;
-const MAX_WARNINGS: u32 = 500;
-const MAX_INFO: u32 = 2000;
-const SAME_MESSAGE: u32 = 3;
 const EVERY_MS: i32 = 60_000;
-const INFO_TARGETS: &[&str] = &["pimble_web::vault", "pimble_web::backend", "pimble_web::endpoints", "pimble_app::events", "pimble_client"];
+/// The page's targets whose `info` lines are recorded: how its connections
+/// go, and what the app makes of them (the worker's server records its own,
+/// `pimble_core::diagnostics::INFO_TARGETS`).
+const INFO_TARGETS: &[&str] = &["pimble_web::vault", "pimble_web::backend", "pimble_web::endpoints", "pimble_web::worker_mode", "pimble_app::events", "pimble_client"];
 
 struct State {
-    install: String,
-    session: String,
+    envelope: Envelope,
     seq: u64,
     queue: Vec<String>,
     queued_bytes: usize,
     recent: VecDeque<String>,
-    seen: HashMap<String, u32>,
-    warnings: u32,
-    infos: u32,
+    budget: LogBudget,
     scrubber: Scrubber,
     account: Option<String>,
     enabled: bool,
@@ -48,6 +45,8 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// Told when the choice is saved (worker mode tells its server).
+    static ON_SAVE: RefCell<Option<fn()>> = const { RefCell::new(None) };
 }
 
 fn storage() -> Option<web_sys::Storage> {
@@ -76,19 +75,27 @@ pub fn save_settings(enabled: bool, noticed: bool) -> Result<(), String> {
                 st.queued_bytes = 0;
             }
         });
+    } else {
+        STATE.with(|st| {
+            if let Some(st) = st.borrow_mut().as_mut() {
+                st.enabled = true;
+            }
+        });
+    }
+    if let Some(told) = ON_SAVE.with(|f| *f.borrow()) {
+        told();
     }
     Ok(())
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    let _ = getrandom::getrandom(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+/// Call `told` whenever the choice is saved.
+pub fn on_save(told: fn()) {
+    ON_SAVE.with(|f| *f.borrow_mut() = Some(told));
 }
 
 fn install_id() -> String {
     let Some(s) = storage() else { return random_hex(16) };
-    if let Some(id) = s.get_item(INSTALL_KEY).ok().flatten().filter(|id| id.len() == 32) {
+    if let Some(id) = s.get_item(INSTALL_KEY).ok().flatten().filter(|id| valid_install(id)) {
         return id;
     }
     let id = random_hex(16);
@@ -98,7 +105,7 @@ fn install_id() -> String {
 
 /// This page's install number, while diagnostics record.
 pub fn install() -> Option<String> {
-    STATE.with(|st| st.borrow().as_ref().filter(|s| s.enabled).map(|s| s.install.clone()))
+    STATE.with(|st| st.borrow().as_ref().filter(|s| s.enabled).map(|s| s.envelope.install.clone()))
 }
 
 /// Start, once, before the subscriber with [`Layer`] is installed: what an
@@ -114,15 +121,12 @@ pub fn start() {
     let queued_bytes = queue.iter().map(String::len).sum();
     STATE.with(|st| {
         *st.borrow_mut() = Some(State {
-            install: install_id(),
-            session: random_hex(16),
+            envelope: Envelope { install: install_id(), session: random_hex(16), app: env!("CARGO_PKG_VERSION").to_string(), os: "web".to_string() },
             seq: 0,
             queue,
             queued_bytes,
             recent: VecDeque::new(),
-            seen: HashMap::new(),
-            warnings: 0,
-            infos: 0,
+            budget: LogBudget::default(),
             scrubber: Scrubber::new(None),
             account: None,
             enabled,
@@ -158,7 +162,7 @@ pub fn set_account(account: Option<String>) {
 }
 
 fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    timestamp(chrono::Utc::now())
 }
 
 /// Queue one record of `kind`, its strings scrubbed.
@@ -166,16 +170,8 @@ pub fn record(kind: &str, data: Value) {
     STATE.with(|st| {
         let mut st = st.borrow_mut();
         let Some(st) = st.as_mut().filter(|s| s.enabled) else { return };
-        let data = scrub_value(&st.scrubber, data);
-        let mut line = json!({
-            "v": 1, "install": st.install, "session": st.session, "seq": st.seq, "ts": now(),
-            "app": env!("CARGO_PKG_VERSION"), "os": "web", "kind": kind, "data": data,
-        });
+        let line = st.envelope.record(&st.scrubber, st.seq, &now(), kind, data, st.account.as_deref());
         st.seq += 1;
-        if let Some(account) = &st.account {
-            line["account"] = Value::String(account.clone());
-        }
-        let line = line.to_string();
         st.queued_bytes += line.len();
         st.queue.push(line);
         while st.queued_bytes > MAX_QUEUED_BYTES && !st.queue.is_empty() {
@@ -183,15 +179,6 @@ pub fn record(kind: &str, data: Value) {
             st.queued_bytes -= dropped.len();
         }
     });
-}
-
-fn scrub_value(s: &Scrubber, value: Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(s.scrub(&text)),
-        Value::Array(items) => Value::Array(items.into_iter().map(|v| scrub_value(s, v)).collect()),
-        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, scrub_value(s, v))).collect()),
-        other => other,
-    }
 }
 
 fn save_queue() {
@@ -245,37 +232,24 @@ async fn send_waiting() {
     save_queue();
 }
 
+/// This page's recent log lines, oldest first: what a report carries as
+/// `page.log` (worker mode hands it to its server, which adds its own).
+pub fn recent_log() -> String {
+    STATE.with(|st| st.borrow().as_ref().map(|s| s.recent.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default())
+}
+
 /// Help > "Send Diagnostics...": this page's recent log lines, the stores
 /// the window knows, and the note; the report's code.
 pub async fn send_report(note: String, stores: Value) -> Result<String, String> {
+    let log = recent_log();
     let body = STATE.with(|st| {
         let st = st.borrow();
         let st = st.as_ref()?;
-        let log: Vec<String> = st.recent.iter().cloned().collect();
-        let mut body = json!({
-            "v": 1, "install": st.install, "session": st.session, "app": env!("CARGO_PKG_VERSION"), "os": "web", "ts": now(),
-            "note": st.scrubber.scrub(&note),
-            "logs": [{ "name": "page.log", "text": log.join("\n") }],
-            "stores": scrub_value(&st.scrubber, stores),
-        });
-        if let Some(account) = &st.account {
-            body["account"] = Value::String(account.clone());
-        }
-        Some(body.to_string())
+        Some(st.envelope.report(&st.scrubber, &now(), &note, vec![("page.log".to_string(), log)], stores, st.account.as_deref()).to_string())
     });
     let body = body.ok_or_else(|| "Diagnostics did not start on this page.".to_string())?;
     let text = post("/api/v1/diagnostics/reports", "application/json", body).await.map_err(|e| format!("Pimble Cloud did not take the report ({e})."))?;
-    serde_json::from_str::<Value>(&text).ok().and_then(|v| v["report"].as_str().map(str::to_string)).ok_or_else(|| "Pimble Cloud answered without a report code.".to_string())
-}
-
-fn recorded(n: u32) -> bool {
-    n <= SAME_MESSAGE || (n >= 10 && {
-        let mut m = n;
-        while m >= 10 && m % 10 == 0 {
-            m /= 10;
-        }
-        m == 1
-    })
+    report_code(&text).ok_or_else(|| "Pimble Cloud answered without a report code.".to_string())
 }
 
 /// The `tracing` layer beside the console's.
@@ -288,8 +262,13 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
         if target.starts_with("pimble_web::diagnostics") || *meta.level() > Level::INFO {
             return;
         }
-        let mut message = Message(String::new());
+        let mut message = Message::default();
         event.record(&mut message);
+        let severity = if *meta.level() <= Level::WARN {
+            Some(Severity::Warning)
+        } else {
+            is_info_target(target, INFO_TARGETS).then_some(Severity::Info)
+        };
         let line = STATE.with(|st| {
             let mut st = st.borrow_mut();
             let st = st.as_mut()?;
@@ -298,29 +277,8 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
             if st.recent.len() > RECENT_LINES {
                 st.recent.pop_front();
             }
-            if !st.enabled {
-                return None;
-            }
-            let warning = *meta.level() <= Level::WARN;
-            if !warning && !INFO_TARGETS.iter().any(|t| target == *t || target.starts_with(&format!("{t}::"))) {
-                return None;
-            }
-            let key = format!("{target} {}", message.0.chars().filter(|c| !c.is_ascii_digit()).collect::<String>());
-            let n = st.seen.entry(key).or_insert(0);
-            *n += 1;
-            let n = *n;
-            if !recorded(n) {
-                return None;
-            }
-            let count = if warning { &mut st.warnings } else { &mut st.infos };
-            *count += 1;
-            if *count > if warning { MAX_WARNINGS } else { MAX_INFO } {
-                return None;
-            }
-            let mut text = message.0.clone();
-            if n > SAME_MESSAGE {
-                let _ = write!(text, " (seen {n} times)");
-            }
+            let severity = severity.filter(|_| st.enabled)?;
+            let text = st.budget.admit(severity, target, &message.0)?;
             Some(json!({ "level": meta.level().to_string(), "target": target, "message": text }))
         });
         if let Some(data) = line {
@@ -329,6 +287,8 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
     }
 }
 
+/// A `tracing` event's message and fields as one line of text.
+#[derive(Default)]
 struct Message(String);
 
 impl Visit for Message {

@@ -22,6 +22,10 @@ pimble-client = { workspace = true }
 # a direct path dependency, same as pimble-cloud's.
 pimble-crypto = { path = "../pimble-crypto" }
 chrono = { workspace = true }
+# The diagnostics recorders' `tracing` layers, native and in the worker: the
+# registry alone, as the worker has it (the native build adds the workspace's
+# features below).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # tokio's locks, channels and `select!` (`sync`, `macros`) build for wasm32; the
@@ -47,7 +51,7 @@ async-trait = { workspace = true }
 
 # The desktop's server: jsonrpsee's HTTP/WebSocket server and the HTTP edge in
 # front of it, tokio's whole runtime, the platform's directories, and the
-# native-only modules (local.rs, auth.rs, jwt.rs, logs.rs, diagnostics.rs,
+# native-only modules (local.rs, auth.rs, jwt.rs, logs.rs, diagnostics/native.rs,
 # memory.rs, relay_tunnel.rs). None of it builds for a browser's worker
 # (docs/ONE_CODEBASE_CONTRACT.md wave 3), which serves the same handler over a
 # `MessagePort` (crates/pimble-worker).
@@ -60,7 +64,7 @@ dirs = "6"
 # item 1): the JWT itself is parsed by hand (see src/jwt.rs) rather than
 # through a JWT crate, so this is only the signature primitive.
 ed25519-dalek = "2.2"
-# Diagnostics records go gzipped (src/diagnostics.rs).
+# Diagnostics records go gzipped (src/diagnostics/queue.rs).
 flate2 = "1"
 # HTTP-edge auth middleware (docs/history/HARDENING_CONTRACT.md decision 1), wired
 # onto jsonrpsee via `Server::builder().set_http_middleware(...)`. Pinned to

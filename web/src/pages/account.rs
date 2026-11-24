@@ -23,7 +23,8 @@ use crate::accounts::{
 use crate::keys;
 use crate::pages::PAGE_CSS;
 use crate::route::{self, Route};
-use crate::session::{self, derive_timed};
+use crate::kdf::derive_timed;
+use crate::session;
 use crate::util::yield_to_browser;
 
 /// The shortest password the accounts service accepts.
@@ -614,10 +615,10 @@ async fn change_password(current: &str, next: &str) -> Result<(), String> {
     // The current password's `auth_key` is derived under the *current*
     // parameters, which are the ones the service still has.
     let my_keys = accounts::my_keys().await.map_err(|e| e.message)?;
-    let current_derived = derive_timed(current, &my_keys.kdf).map_err(|e| e.to_string())?;
+    let current_derived = derive_timed(current, &my_keys.kdf)?;
 
     let kdf = KdfParams::generate();
-    let derived = derive_timed(next, &kdf).map_err(|e| e.to_string())?;
+    let derived = derive_timed(next, &kdf)?;
     let account_key_blob =
         wrap_account_keys(&keys, &derived.kek).map_err(|e| format!("Wrapping failed: {e}"))?;
 

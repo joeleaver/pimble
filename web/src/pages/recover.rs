@@ -23,7 +23,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::accounts::{self, RecoverCompleteRequest, RecoveryMaterial};
 use crate::pages::PAGE_CSS;
 use crate::route::{self, Route};
-use crate::session::derive_timed;
+use crate::kdf::derive_timed;
 use crate::util::{query_param, yield_to_browser};
 
 /// The shortest password the accounts service accepts.
@@ -343,7 +343,7 @@ async fn rewrap(
     }
 
     let kdf = KdfParams::generate();
-    let derived = derive_timed(new_password, &kdf).map_err(|e| e.to_string())?;
+    let derived = derive_timed(new_password, &kdf)?;
     let account_key_blob = wrap_account_keys(&keys, &derived.kek)
         .map_err(|e| format!("Wrapping your keys failed: {e}"))?;
 

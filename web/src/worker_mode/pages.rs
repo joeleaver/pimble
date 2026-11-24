@@ -251,6 +251,11 @@ pub fn account_page() -> NodeHandle {
                         "This browser keeps your stores in memory only: a reload asks for your password."
                     }}
                 }
+                // docs/DISCUSSIONS_CONTRACT.md section 8: one switch, in the
+                // app, which this browser's server answers (`cloudPersonalSync`).
+                p { class: "pimble-page__lede",
+                    "Whether what you've read and your place in each note follow you to your other devices is \"Keep what I've read in step\", in Pimble's Settings > Account."
+                }
                 if !error.get().is_empty() {
                     div { class: "pimble-page__error", {|| error.get()} }
                 }
