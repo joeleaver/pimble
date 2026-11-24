@@ -30,6 +30,9 @@ pub struct WatchBatchRow {
     pub store_uuid: String,
     pub doc_uuid: String,
     pub writer_uuid: String,
+    /// The share the watcher was told through: `""` for the whole store.
+    pub root: String,
+    /// Spells of editing (`pimble_core::watch::Gathered::add_spell`).
     pub count: u64,
     pub first_at_ms: i64,
     pub last_at_ms: i64,
@@ -55,6 +58,7 @@ fn watch_batch_from_object(o: &Object) -> CloudResult<WatchBatchRow> {
         store_uuid: get_string(o, "store_uuid")?.to_string(),
         doc_uuid: get_string(o, "doc_uuid")?.to_string(),
         writer_uuid: get_string(o, "writer_uuid")?.to_string(),
+        root: get_string(o, "root")?.to_string(),
         count: get_u64(o, "count")?,
         first_at_ms: get_datetime_ms(o, "first_at")?,
         last_at_ms: get_datetime_ms(o, "last_at")?,
@@ -90,6 +94,17 @@ impl RhypeDb {
         self.objects(&q).await?.iter().map(watched_doc_from_object).collect()
     }
 
+    /// Every document registered in `store_uuid`, everyone's.
+    pub async fn watched_docs_in(&self, store_uuid: &str) -> CloudResult<Vec<WatchedDocRow>> {
+        let q = format!("WatchedDoc.filter(.store_uuid == {})", ql_str(store_uuid));
+        self.objects(&q).await?.iter().map(watched_doc_from_object).collect()
+    }
+
+    /// Every document registered, everyone's in every store.
+    pub async fn all_watched_docs(&self) -> CloudResult<Vec<WatchedDocRow>> {
+        self.objects("WatchedDoc").await?.iter().map(watched_doc_from_object).collect()
+    }
+
     /// Everyone watching `doc_uuid` of `store_uuid`.
     pub async fn watchers_of(&self, store_uuid: &str, doc_uuid: &str) -> CloudResult<Vec<WatchedDocRow>> {
         let q = format!("WatchedDoc.filter(.doc_uuid == {})", ql_str(doc_uuid));
@@ -113,25 +128,34 @@ impl RhypeDb {
         self.one(&q).await?.as_ref().map(watch_batch_from_object).transpose()
     }
 
-    /// `count` writes by `writer` to `doc` at `at_ms`, gathered for
-    /// `watcher`: a new batch, or added to the one gathering.
-    pub async fn gather_watch_write(&self, watcher: &str, store: &str, doc: &str, writer: &str, count: u64, at_ms: i64) -> CloudResult<()> {
+    /// A write by `writer` to `doc` at `at_ms`, gathered for `watcher`
+    /// (told through `root`): a new batch, or another spell of editing in
+    /// the one gathering when it is half a minute or more from the rest.
+    /// A read and then a write: the caller holds `AppState::watches_lock`,
+    /// as `crate::watches::watch_pass` does to take batches out.
+    pub async fn gather_watch_write(&self, watcher: &str, store: &str, doc: &str, writer: &str, root: &str, at_ms: i64) -> CloudResult<()> {
         let key = WatchBatchRow::key(watcher, store, doc, writer);
         let q = match self.find_watch_batch(&key).await? {
-            Some(batch) => format!(
-                "WatchBatch.get({}).update({{ count: {}, last_at: {} }})",
-                batch.rid,
-                batch.count.saturating_add(count.max(1)),
-                datetime_literal(batch.last_at_ms.max(at_ms)),
-            ),
+            Some(batch) => {
+                let mut gathered = batch.gathered();
+                gathered.add_spell(at_ms);
+                format!(
+                    "WatchBatch.get({}).update({{ count: {}, first_at: {}, last_at: {}, root: {} }})",
+                    batch.rid,
+                    gathered.count,
+                    datetime_literal(gathered.first_ms),
+                    datetime_literal(gathered.last_ms),
+                    ql_str(root),
+                )
+            }
             None => format!(
-                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, count: {}, first_at: {at}, last_at: {at} }})",
+                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, root: {}, count: 1, first_at: {at}, last_at: {at} }})",
                 ql_str(&key),
                 ql_str(watcher),
                 ql_str(store),
                 ql_str(doc),
                 ql_str(writer),
-                count.max(1),
+                ql_str(root),
                 at = datetime_literal(at_ms),
             ),
         };
@@ -153,19 +177,27 @@ impl RhypeDb {
         delete_quietly(self, &format!("WatchBatch.get({rid}).delete()")).await
     }
 
-    /// Everything of `user_uuid`'s watches: the choices, the registered
-    /// documents and what was gathered for them (the switch, turned off).
-    pub async fn delete_watches_of(&self, user_uuid: &str) -> CloudResult<()> {
+    /// Everything of `user_uuid`'s watches: the registered documents, what
+    /// was gathered for them, and the choices, emptied with their version
+    /// moved on (never deleted: a version must never go back, or a device
+    /// holding older choices could write them again). The switch, turned
+    /// off; the caller holds `AppState::watches_lock`. Answers the stores
+    /// whose documents were registered.
+    pub async fn delete_watches_of(&self, user_uuid: &str) -> CloudResult<Vec<String>> {
+        let mut stores = std::collections::BTreeSet::new();
         for doc in self.watched_docs_of(user_uuid).await? {
             self.delete_watched_doc(doc.rid).await?;
+            stores.insert(doc.store_uuid);
         }
         for batch in self.watch_batches_of(user_uuid).await? {
             self.delete_watch_batch(batch.rid).await?;
         }
-        if let Some((rid, _, _)) = self.get_watch_choices(user_uuid).await? {
-            delete_quietly(self, &format!("WatchChoices.get({rid}).delete()")).await?;
+        if let Some((rid, version, sealed)) = self.get_watch_choices(user_uuid).await? {
+            if !sealed.is_empty() {
+                self.put_watch_choices(user_uuid, Some(rid), version + 1, "").await?;
+            }
         }
-        Ok(())
+        Ok(stores.into_iter().collect())
     }
 }
 

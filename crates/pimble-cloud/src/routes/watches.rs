@@ -10,13 +10,19 @@
 //!   choices if they are still at `version` (409 otherwise: fetch, change
 //!   again, retry). Answers `{ version }`, the new one. Refused while watched
 //!   notes are off.
+//!   The version never goes back: turning watched notes off empties the
+//!   choices and moves it on, so a device holding older ones gets 409.
 //! - `PUT /api/v1/me/watches/stores/{store} { docs, version }`: every
 //!   document watched in one store, computed from the choices at `version`
 //!   (409 when they moved on since). The caller must hold a grant there.
+//!   The hosted server is told again which documents are watched in it.
 //! - `POST /api/v1/watches/writes { store_id, writes: [{ doc, writer,
-//!   count }] }`: the writes an owner's relay face saw others make. Only the
-//!   owner of a relayed store may; a hosted store's writes come from the
-//!   hosted server itself (`crate::watches`).
+//!   count, roots, last_ms }] }`: the writes an owner's relay face saw others
+//!   make, each with the shared roots that reach its document and when it
+//!   was last written. Only the owner of a relayed store may; a hosted
+//!   store's writes come from the hosted server itself (`crate::watches`).
+//!   A write whose writer holds no grant on the store is refused and not
+//!   gathered (`refused` counts them).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -136,6 +142,7 @@ pub async fn put_store_docs(State(state): State<AppState>, authed: AuthedUser, P
             state.db.create_watched_doc(&user.user_uuid, &store_uuid, doc).await?;
         }
     }
+    state.watch_interest.changed([store_uuid]);
     Ok(Json(json!({ "docs": wanted.len() })))
 }
 
@@ -157,10 +164,35 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
         return Err(CloudError::Forbidden("only the store's owner reports its relay's writes".into()));
     }
     for write in &body.writes {
-        if uuid::Uuid::parse_str(&write.doc).is_err() || uuid::Uuid::parse_str(&write.writer).is_err() {
-            return Err(CloudError::BadRequest("a write names a document and a writer by id".into()));
+        let ids = std::iter::once(&write.doc).chain(std::iter::once(&write.writer)).chain(&write.roots);
+        if ids.map(|id| uuid::Uuid::parse_str(id)).any(|parsed| parsed.is_err()) {
+            return Err(CloudError::BadRequest("a write names a document, a writer and the roots reaching it by id".into()));
         }
     }
-    let gathered = crate::watches::record_writes(&state, &store.store_id, &body.writes, chrono::Utc::now().timestamp_millis()).await?;
-    Ok(Json(json!({ "gathered": gathered })))
+    // The owner names the writer, so the writer must be someone the store
+    // was shared with: nobody else's name goes on a notice.
+    let mut members: BTreeMap<String, bool> = BTreeMap::new();
+    let mut taken = Vec::with_capacity(body.writes.len());
+    let mut refused = 0usize;
+    for write in body.writes {
+        let writer = uuid::Uuid::parse_str(&write.writer).map(|u| u.to_string()).unwrap_or_default();
+        let member = match members.get(&writer) {
+            Some(member) => *member,
+            None => {
+                let member = match state.db.find_user_by_uuid(&writer).await? {
+                    Some(user) => !state.db.grants_for_user_and_store(user.rid, store.rid).await?.is_empty(),
+                    None => false,
+                };
+                members.insert(writer.clone(), member);
+                member
+            }
+        };
+        if member {
+            taken.push(crate::watches::Write { writer, ..write });
+        } else {
+            refused += 1;
+        }
+    }
+    let gathered = crate::watches::record_writes(&state, &store.store_id, &taken, chrono::Utc::now().timestamp_millis()).await?;
+    Ok(Json(json!({ "gathered": gathered, "refused": refused })))
 }

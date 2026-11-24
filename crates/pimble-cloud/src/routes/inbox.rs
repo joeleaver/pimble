@@ -113,7 +113,8 @@ pub async fn put_notifications(State(state): State<AppState>, authed: AuthedUser
                 state.db.delete_inbox_item(item.rid).await?;
             }
             let _one_at_a_time = state.watches_lock.lock().await;
-            state.db.delete_watches_of(&user.user_uuid).await?;
+            let stores = state.db.delete_watches_of(&user.user_uuid).await?;
+            state.watch_interest.changed(stores);
         }
     }
     if body.email.is_some() || body.push.is_some() {
@@ -123,7 +124,8 @@ pub async fn put_notifications(State(state): State<AppState>, authed: AuthedUser
         state.db.set_notify_watches_off(user.rid, !on).await?;
         if !on {
             let _one_at_a_time = state.watches_lock.lock().await;
-            state.db.delete_watches_of(&user.user_uuid).await?;
+            let stores = state.db.delete_watches_of(&user.user_uuid).await?;
+            state.watch_interest.changed(stores);
         }
     }
     Ok(Json(json!({

@@ -1,7 +1,8 @@
 //! Watched notes (docs/NOTIFICATIONS_CONTRACT.md section 3, wave 3): a node
 //! the person chose to hear about, alone or with everything under it. When
 //! someone else changes one, the accounts service tells them in the Inbox
-//! ("Joe: 3 changes in a note you watch") and nothing of what changed.
+//! ("Joe edited a note you watch 3 times": spells of editing, not
+//! keystrokes) and nothing of what changed.
 //!
 //! The watches are the account's: the server keeps them (sealed on the
 //! accounts service so every device of the person's holds the same list)

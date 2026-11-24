@@ -77,6 +77,9 @@ pub struct Inner {
     /// One write of watches at a time, so a version check and its write are
     /// one step (docs/NOTIFICATIONS_CONTRACT.md section 3).
     pub watches_lock: tokio::sync::Mutex<()>,
+    /// The hosted stores whose watched documents (or their watchers' shares)
+    /// changed, for the hosted server to be told (`crate::watches`).
+    pub watch_interest: crate::watches::InterestChanges,
     /// Notices one sender may queue (docs/NOTIFICATIONS_CONTRACT.md section 2).
     pub inbox_quota: QuotaLimiter,
     /// Wakes a recipient's waiting drain when a notice is queued for them.
@@ -169,6 +172,7 @@ impl AppState {
             relay,
             personal_lock: tokio::sync::Mutex::new(()),
             watches_lock: tokio::sync::Mutex::new(()),
+            watch_interest: crate::watches::InterestChanges::default(),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),
             vapid,

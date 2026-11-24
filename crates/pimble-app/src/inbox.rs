@@ -25,7 +25,7 @@ pub fn title_of(notice: &Notice) -> String {
         (NoticeKind::Mention, false) => format!("{who} mentioned you"),
         (NoticeKind::Mention, true) => format!("{who} mentioned you in a discussion"),
         (NoticeKind::Reply, _) => format!("{who} replied in a discussion"),
-        (NoticeKind::Watch, _) => format!("{who}: {}", pimble_core::watch::changes_line(notice.count)),
+        (NoticeKind::Watch, _) => pimble_core::watch::watch_title(who, notice.count),
     }
 }
 
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(title_of(&nameless), "Someone replied in a discussion");
         let mut watched = notice(NoticeKind::Watch, None, "");
         watched.count = 3;
-        assert_eq!(title_of(&watched), "Joe: 3 changes in a note you watch");
+        assert_eq!(title_of(&watched), "Joe edited a note you watch 3 times");
         let (_, node, anchor) = target_of(&watched);
         assert_eq!(node, watched.node, "a watch notice opens the note changed");
         assert!(anchor.is_none());

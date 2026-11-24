@@ -305,7 +305,9 @@ type PushSubscription {
 //
 // What a person chose to watch is their own account data: one blob sealed
 // with a key only their devices derive (as `PersonalDoc`), and a version a
-// write must name. Opaque here.
+// write must name. Opaque here. The row outlives the switch turned off
+// (`sealed` emptied, the version moved on), so a version never goes back
+// and a device holding older choices can never write them again.
 type WatchChoices {
     user_uuid: String @unique
     sealed: String
@@ -319,21 +321,25 @@ type WatchChoices {
 // device replaces a store's set whole as nodes come and go.
 type WatchedDoc {
     user_uuid: String @indexed
-    store_uuid: String
+    store_uuid: String @indexed
     doc_uuid: String @indexed
     created_at: DateTime
 }
 
 // Writes gathered for one watcher, per (document, writer): one notice is
 // queued once the writer has been quiet for five minutes (or an hour after
-// the first). `batch_key` is "watcher/store/doc/writer". Kept here, not in
-// memory, so a deploy loses none.
+// the first). `batch_key` is "watcher/store/doc/writer". `count` is spells
+// of editing (writes half a minute or more apart), not appends. `root` is
+// the share the watcher was told through ("" for the whole store), checked
+// again when the notice is queued. Kept here, not in memory, so a deploy
+// loses none.
 type WatchBatch {
     batch_key: String @unique
     watcher_uuid: String @indexed
     store_uuid: String
     doc_uuid: String
     writer_uuid: String
+    root: String
     count: u64
     first_at: DateTime
     last_at: DateTime

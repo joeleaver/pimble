@@ -590,7 +590,22 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   `WriteSeen`. The accounts service follows the hosted server's `subscribeWrites` over its
   own connection; for a relayed store the owner's server hears its relay face's writes
   in-process and posts them (`POST /api/v1/watches/writes`, the store's owner only,
-  relay-tier stores only). Section 3 said the owner's machine "posts the notices": it
+  relay-tier stores only).
+- **The hosted server tells only watched documents.** The service names them
+  (`setWriteInterest`, Service-only): per store the opaque document ids registered there
+  and the roots of the shares their watchers hold the store through, whole when it starts
+  following and per store as they change (documents registered, the watches switch, a
+  grant made). The server tells nothing else, so the service never hears of a write to a
+  note nobody watches; it learns which documents are watched, never by whom. A relay face
+  is the owner's own server and tells every write; the owner's posts are not filtered
+  (filtering them would tell the owner's machine which of its documents others watch).
+- **A write names the roots that reach it.** Each `WriteSeen` carries the shared roots
+  whose scope set contains its document (among the roots named, or every root a relay
+  face's store publishes), judged once per gathering by `scope_set_of`, the same judgement
+  every scoped read uses. The service gathers a write for a watcher only when they hold
+  the store whole or hold a share whose root is among them, keeps that root with the
+  batch, and judges again when the notice is queued (grants change in between: a share
+  moved or ended tells nothing). Section 3 said the owner's machine "posts the notices": it
   cannot, as only the service knows who watches what, so it posts the writes and the
   service evaluates them exactly as for a hosted store. The operator's own writes
   (`Principal::Service`: a desktop's embedded server, the CLI) are never recorded.
@@ -615,46 +630,63 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   reach the node (the explorer does not hold every ancestor); the server says "This note
   is not watched." when none does.
 - **The notice**: `NoticeKind::Watch`, sealed by the service to the watcher's notice key,
-  from the writer, the node changed, no snippet, `count` changes. The app says
-  "Joe: 3 changes in a note you watch" and shows the note's name, which only the
-  watcher's device knows; email and push say "Joe made 3 changes in a note you watch in
-  Garden" (several notes of one writer in one email: "made 7 changes in 2 notes you
-  watch"). Its item's root is the scope the watcher holds the store through, so the
+  from the writer, the node changed, no snippet, `count` spells of editing: writes 30 s
+  or more apart (`pimble_core::watch::SPELL_GAP_MS`, `Gathered::add_spell`) count once
+  each, so a minute's typing is one, not a hundred appends. The app says "Joe edited a
+  note you watch" ("... 3 times" for three spells) and shows the note's name, which only
+  the watcher's device knows; email and push say "Joe edited a note you watch in Garden"
+  ("... (3 times)"; several notes of one writer in one email: "Joe edited 2 notes you
+  watch in Garden"). Its item's root is the scope the watcher holds the store through, so the
   share's name is the one the watcher knows.
 - **The watcher must still hold the store** when a write is gathered and when its notice
-  is queued; a member who left hears nothing more. The service checks the grant on the
-  store, not that a scoped root reaches the document (it cannot know the tree): a member
-  can register any document id of a store they are in, and hear only that someone wrote
-  to it, which their scope's own replica would show them anyway for documents it holds.
+  is queued, through the whole store or a share whose root reaches the document (above);
+  a member who left, or whose share no longer reaches the note, hears nothing more.
+- **A relayed store's writer is a member.** The owner's report names writers; each must
+  hold a grant on the store, and a write naming anyone else is refused (counted in the
+  answer's `refused`) and gathers nothing.
+- **Unsent relay reports are kept.** What the owner's server could not post waits in the
+  store's `sync-state.json` (section `relay_writes`), writes of one spell merged, at most
+  20,000 kept (the oldest go first), and is sent 500 at a time when the service answers
+  again (backoff 2 s to 5 minutes, and at once when the relay serves again). A part the
+  service refuses as malformed or not the owner's (400, 403, 404) is dropped; an expired
+  session waits for the next.
+- **Gathering and taking batches are one lock** (`watches_lock`): a write gathered while a
+  pass takes the batches is never lost or told twice.
 - **The switch**: `watches` beside `on`, `email` and `push` in `PUT /me/notifications`
   and `setNotifications`; on by default, nothing watched by default. Off (or everything
-  off) deletes the choices, the registered documents and what was gathered, refuses new
+  off) deletes the registered documents and what was gathered, empties the choices and
+  moves their version on (the row is kept as a tombstone, so the version never goes back
+  and a device still holding older choices gets 409 and reads them again), refuses new
   ones (403) and the device forgets its copy.
 
 ### What was built, and where
 
-- `pimble-core/src/watch.rs`: `Window` (`REPORT`, `NOTICE`), `Gathered`, `Batcher`,
-  `changes_line`.
+- `pimble-core/src/watch.rs`: `Window` (`REPORT`, `NOTICE`), `Gathered` (`add_spell`),
+  `Batcher`, `SPELL_GAP_MS`, `watch_title`.
 - `pimble-rpc/src/notices.rs`: `NoticeKind::Watch`, `Notice.count`, `WatchEntry`,
-  `WatchNodeRequest`, `UnwatchNodeRequest`, `ListWatchesResponse`, `WriteSeen`,
+  `WatchNodeRequest`, `UnwatchNodeRequest`, `ListWatchesResponse`, `WriteSeen` (with
+  `roots`, `last_ms`), `WriteInterest`, `SetWriteInterestRequest`,
   `SetNotificationsRequest.watches`, `ListNoticesResponse.watches`; methods `watchNode`,
-  `unwatchNode`, `listWatches` (Service-only) and the subscription `subscribeWrites`
-  (Service-only); `pimble-client` wraps them.
-- `pimble-server/src/writes.rs` (`Writes`: record, gather, tell; nothing kept with nobody
-  listening), `relay_writes.rs` (the owner's report of its relay face's writes, for the
-  stores its tunnel serves), `handler.rs` `note_write` and the four RPCs.
+  `unwatchNode`, `listWatches`, `setWriteInterest` (Service-only) and the subscription
+  `subscribeWrites` (Service-only); `pimble-client` wraps them.
+- `pimble-server/src/writes.rs` (`Writes`: interest, record, gather, tell, `roots_reaching`;
+  nothing kept with nobody listening), `relay_writes.rs` (the owner's report of its relay
+  face's writes, for the stores its tunnel serves, its `Outbox` in `sync-state.json`),
+  `handler.rs` `note_write` and the five RPCs.
 - `pimble-server/src/notices/` (split from the old `notices.rs`): `watches.rs` (choices
   sealed and kept in step, `docs_for`, `register_all`, `follow_structure`, watch and
   unwatch), `kept.rs` (the device's copy), `run.rs` (refreshed with the account,
   registered after structural changes); `cloud/notices.rs` the service's endpoints.
 - `pimble-cloud`: `schema.rhype` (`User.notify_watches_off`, `InboxItem.count`,
-  `WatchChoices`, `WatchedDoc`, `WatchBatch`), `src/db/` (split from `db.rs`;
-  `watches.rs`), `src/routes/watches.rs` (`GET /me/watches`, `PUT /me/watches/choices`,
-  `PUT /me/watches/stores/{store}`, `POST /watches/writes`), `src/watches.rs`
-  (`record_writes`, `watch_pass(state, now_ms)` with the caller's clock, `spawn`: a pass
-  every 30 s and the hosted server's writes followed with backoff), `mail.rs` and
-  `notify.rs` (the watch line, changes summed per email line), `routes/inbox.rs` (the
-  switch).
+  `WatchChoices`, `WatchedDoc`, `WatchBatch` with its `root`), `src/db/` (split from
+  `db.rs`; `watches.rs`), `src/routes/watches.rs` (`GET /me/watches`, `PUT
+  /me/watches/choices`, `PUT /me/watches/stores/{store}`, `POST /watches/writes` with the
+  writer check), `src/watches.rs` (`record_writes`, `watch_pass(state, now_ms)` with the
+  caller's clock, `interest_of`/`all_interest`, `InterestChanges`, `spawn`: a pass every
+  30 s and the hosted server's writes followed with backoff, its interest sent whole on
+  every connect and per store as it changes), `mail.rs` and `notify.rs` (the watch line,
+  spells summed per email line), `routes/inbox.rs` (the switch), `routes/stores.rs` (a
+  grant made changes the store's interest).
 - `pimble-app`: `watches.rs` (state, the row menu's states, the switch, the Inbox's
   "Watching" list with "Unwatch"), the row menu's "Watch" submenu (Watch, Watch with
   Subtree, Unwatch) in `app.rs`, the switch in the Account modal and Settings, watch
@@ -664,27 +696,39 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 
 ### Verified
 
-- `pimble-cloud` integration against a real `rhypedb-server`:
+- `pimble-cloud` integration against a real `rhypedb-server` (`tests/integration/watches.rs`):
   `writes_to_a_watched_note_become_one_notice_after_five_quiet_minutes` (choices and
   documents round-trip, stale versions 409, bad ids 400; the writer's own writes and
   unwatched documents gather nothing; nothing at four quiet minutes, one notice after
-  five, told once; it opens with the notice key to a `Watch` notice with count 3 and no
-  snippet; its email says "olga.watch made a change in a note you watch in Recipes" and
-  not the store's own name), `watches_need_a_grant` (registering in a store one is not in
-  is 403; a removed member hears nothing), `the_watches_switch_deletes_the_watches_and_stops_gathering`
-  (`/me` shows it; off empties choices, documents and batches and refuses new ones;
-  everything off does the same), `only_a_relayed_stores_owner_reports_its_writes`. Lib:
-  the watch lines' words. All of `notices`, `email` and `watch` filters pass (13 + 2).
+  five, told once, its item's root the share; it opens with the notice key to a `Watch`
+  notice with count 2 for two spells of four writes and no snippet; its email says
+  "olga.watch edited a note you watch in Recipes" and not the store's own name),
+  `a_scoped_watcher_hears_only_of_what_their_share_reaches` (no roots or another share's
+  gather nothing; a batch gathered through a share that then moves is not told; through
+  the new share it is), `the_hosted_server_is_told_only_the_watched_documents_and_their_watchers_shares`
+  (documents once each, a scoped watcher's root, none for a whole-store watcher, nothing
+  for a relayed store, the switch taking a watcher's root away),
+  `writes_gathered_while_a_pass_takes_batches_are_all_told` (eight gathers at once make
+  one batch; 30 spells gathered while passes run are all told, once),
+  `watches_need_a_grant`, `the_watches_switch_deletes_the_watches_and_stops_gathering`
+  (off empties documents and batches, the choices' version moves to 2 and older versions
+  are 409 once back on), `only_a_relayed_stores_owner_reports_its_writes_and_only_its_members`
+  (a writer never shared the store is refused; bad ids and roots 400). Lib (18): the
+  watch lines' words. The `watch`, `notices` and `email` filters pass (16).
 - `pimble-server/tests/watches.rs` (2), on the sharing harness with the stub service's
   new watch endpoints: nothing watched by default; watching a folder with its subtree
   writes sealed choices (version 1, no node id in the clear) and registers the folder
   and what is under it but not the diary; a node made under it is registered a moment
-  later; a member's write reaches the hosted server's `subscribeWrites` naming the
-  document and the writer; Unwatch on a note under the folder takes the folder's watch
-  and empties the set; a store on this computer alone is refused. The whole
-  `pimble-server` suite passes (41 test binaries).
+  later; once the watched documents are named with `setWriteInterest`, a member's write
+  reaches the hosted server's `subscribeWrites` naming the document, the writer and only
+  the share's root that reaches it, and a write to a document not named is never told;
+  Unwatch on a note under the folder takes the folder's watch
+  and empties the set; a store on this computer alone is refused. `relay.rs` (9) and
+  `notices.rs` (2) pass beside it.
 - `pimble-server` lib: `Writes` gathering per document and writer and telling once
-  quiet, and at stop; `docs_for` (subtrees, discussions and deleted nodes left out);
+  quiet, and at stop, only named documents, everything on a relay face; the relay
+  `Outbox` keeping what the service did not take on disk and sending it later, merging a
+  spell into one entry, dropping a refused part, sending many writes a part at a time; `docs_for` (subtrees, discussions and deleted nodes left out);
   unwatch taking the own watch or the nearest subtree watch above.
 - `pimble-app` lib (358 passed): the row menu's states (nothing watched by default),
   a watch notice's title and where it opens. `pimble-crypto`: the chosen watches do not
@@ -698,9 +742,10 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 
 - Writes made while the service is not following the hosted server (a deploy, a dropped
   connection) are not told; a relayed store's writes are told only while the owner's
-  machine is on; writes gathered in the last seconds before a server stops are told at
-  stop but may not reach anyone (the relay's report stops first); a report the service
-  does not take is dropped after three attempts.
+  machine is on (kept on disk until the service takes them, above).
+- The service judges a share by the roots the server reports; it does not know the tree.
+  A relayed store's roots come from the owner's machine, which could name any root: the
+  owner already holds every note of the store, so a lie only misleads its own members.
 - Per-kind switches (mentions, replies, watched notes apart from the account switch);
   watching from the MCP tools.
 - `pimble-server/src/handler.rs`, the app's `app.rs`, `events.rs`, `state.rs`,

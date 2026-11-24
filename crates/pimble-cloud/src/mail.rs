@@ -376,27 +376,24 @@ pub struct NoticeLine {
     pub share: String,
     /// How many items this line stands for.
     pub count: usize,
-    /// For watch notices (wave 3): how many changes those items stand for
-    /// together; 0 for any other kind.
+    /// For watch notices (wave 3): how many spells of editing those items
+    /// stand for together; 0 for any other kind.
     pub changes: u64,
 }
 
 impl NoticeLine {
     /// "Joe mentioned you in Shared with Will", "(3 times)" when several;
-    /// "Joe made 3 changes in a note you watch in Garden".
+    /// "Joe edited a note you watch in Garden", "(3 times)" when in several
+    /// spells; "Joe edited 2 notes you watch in Garden".
     pub fn text(&self) -> String {
         let sender = display_name(&self.sender);
         let share = display_name(&self.share);
         if self.kind == "watch" {
-            let changes = match self.changes.max(1) {
-                1 => "a change".to_string(),
-                n => format!("{n} changes"),
+            return match (self.count, self.changes) {
+                (0 | 1, 0 | 1) => format!("{sender} edited a note you watch in {share}"),
+                (0 | 1, spells) => format!("{sender} edited a note you watch in {share} ({spells} times)"),
+                (notes, _) => format!("{sender} edited {notes} notes you watch in {share}"),
             };
-            let notes = match self.count {
-                0 | 1 => "a note".to_string(),
-                n => format!("{n} notes"),
-            };
-            return format!("{sender} made {changes} in {notes} you watch in {share}");
         }
         let verb = match self.kind.as_str() {
             "mention" => "mentioned you in",
@@ -555,15 +552,15 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_line_counts_changes_and_notes_and_names_no_note() {
+    fn a_watch_line_counts_spells_and_notes_and_names_no_note() {
         let one = NoticeLine { sender: "Joe".into(), kind: "watch".into(), share: "Garden".into(), count: 1, changes: 3 };
-        assert_eq!(one.text(), "Joe made 3 changes in a note you watch in Garden");
+        assert_eq!(one.text(), "Joe edited a note you watch in Garden (3 times)");
         let single = NoticeLine { changes: 1, ..one.clone() };
-        assert_eq!(single.text(), "Joe made a change in a note you watch in Garden");
+        assert_eq!(single.text(), "Joe edited a note you watch in Garden");
         let several = NoticeLine { count: 2, changes: 7, ..one.clone() };
-        assert_eq!(several.text(), "Joe made 7 changes in 2 notes you watch in Garden");
+        assert_eq!(several.text(), "Joe edited 2 notes you watch in Garden");
         let (subject, ..) = notices_email(&[one], 0, "x");
-        assert_eq!(subject, "Joe made 3 changes in a note you watch in Garden");
+        assert_eq!(subject, "Joe edited a note you watch in Garden (3 times)");
     }
 
     #[test]

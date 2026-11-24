@@ -829,6 +829,9 @@ async fn grant_member(
         None => {
             require_room_for_one_more(state, store).await?;
             state.db.create_grant(target.rid, store.rid, &store.store_id, role, root, share_name).await?;
+            // A watcher of the store holding it through one more share: the
+            // hosted server judges writes against that root too.
+            state.watch_interest.changed([store.store_id.clone()]);
         }
     }
     // The name the owner typed is this share's name, for everybody who holds
@@ -1003,6 +1006,7 @@ async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usiz
                         .db
                         .create_grant(user.rid, store.rid, &store.store_id, &invitation.role, &invitation.root, &invitation.share_name)
                         .await?;
+                    state.watch_interest.changed([store.store_id.clone()]);
                     claimed += 1;
                 }
             }
