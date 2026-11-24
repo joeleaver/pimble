@@ -53,8 +53,7 @@ use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobId, IndexState, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_rpc::{
-    HandedLink,
-    OpenInAppRequest, OpenInAppResponse,
+    AppLinkTakenRequest, OpenInAppRequest, OpenInAppResponse,
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
@@ -1297,7 +1296,7 @@ pub struct RpcHandler {
     /// watch (`RelayHost::watch_tunnel`). `subscribeCloudConnection` hears both.
     cloud_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The Pimble windows hearing `openInApp`, oldest first.
-    app_links: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<HandedLink>>>>,
+    app_links: Arc<crate::app_links::AppLinks>,
     /// Notices sent and received (docs/NOTIFICATIONS_CONTRACT.md, `crate::notices`).
     notices: Arc<crate::notices::Notices>,
     /// Writes signed-in people made here, for watches (`crate::writes`).
@@ -1439,7 +1438,7 @@ impl RpcHandler {
             version: Arc::from(env!("CARGO_PKG_VERSION")),
             presence: Arc::new(crate::presence::PresenceHub::new(runtime.clone())),
             cloud_changes: Arc::new(tokio::sync::watch::channel(0).0),
-            app_links: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_links: Arc::new(crate::app_links::AppLinks::default()),
             pictures: Arc::new(crate::pictures::PictureRefs::default()),
             folders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             computers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -4434,13 +4433,18 @@ impl PimbleApiServer for RpcHandler {
 
     async fn open_in_app(&self, ext: &Extensions, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "openInApp")?;
-        let mut windows = self.app_links.lock().unwrap_or_else(|e| e.into_inner());
-        // The oldest window still listening takes it; gone ones are dropped.
-        windows.retain(|w| !w.is_closed());
-        let link = HandedLink { url: request.url, activation_token: request.activation_token };
-        let delivered = windows.iter().any(|w| w.send(link.clone()).is_ok());
-        info!("openInApp: {}", if delivered { "handed to a window" } else { "no window is listening" });
+        let wait = Duration::from_millis(pimble_rpc::APP_LINK_CONFIRM_WAIT_MS);
+        let delivered = self.app_links.hand(&self.runtime, request.url, request.activation_token, request.confirm, wait).await;
+        info!("openInApp: {}", if delivered { "a window took it" } else if request.confirm { "no window took it" } else { "no window is listening" });
         Ok(OpenInAppResponse { delivered })
+    }
+
+    async fn app_link_taken(&self, ext: &Extensions, request: AppLinkTakenRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "appLinkTaken")?;
+        if !self.app_links.taken(request.ack) {
+            debug!("appLinkTaken: nobody waits for link {} any more", request.ack);
+        }
+        Ok(EmptyResponse {})
     }
 
     async fn subscribe_app_links(&self, pending: PendingSubscriptionSink, ext: &Extensions) -> SubscriptionResult {
@@ -4449,8 +4453,7 @@ impl PimbleApiServer for RpcHandler {
             return Ok(());
         }
         let sink = pending.accept().await?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HandedLink>();
-        self.app_links.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        let mut rx = self.app_links.listen();
         self.runtime.spawn(async move {
             loop {
                 tokio::select! {

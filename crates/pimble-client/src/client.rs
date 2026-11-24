@@ -1131,8 +1131,23 @@ impl PimbleClient {
     /// activation token this program was started with, if any; `false` when
     /// no window listens.
     pub async fn open_in_app(&self, url: &str, activation_token: Option<String>) -> Result<bool> {
-        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token }).await.map_err(rpc_error)?;
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token, confirm: false }).await.map_err(rpc_error)?;
         Ok(response.delivered)
+    }
+
+    /// [`open_in_app`](Self::open_in_app), answering `true` only once the
+    /// window says it acted on the link (`appLinkTaken`), and `false` when it
+    /// has not within `pimble_rpc::APP_LINK_CONFIRM_WAIT_MS`: a hung window,
+    /// or one partway through quitting, does not swallow the link.
+    pub async fn open_in_app_confirmed(&self, url: &str, activation_token: Option<String>) -> Result<bool> {
+        let response = self.client.open_in_app(pimble_rpc::OpenInAppRequest { url: url.to_string(), activation_token, confirm: true }).await.map_err(rpc_error)?;
+        Ok(response.delivered)
+    }
+
+    /// As a Pimble window: the link handed with `ack` was acted on.
+    pub async fn app_link_taken(&self, ack: u64) -> Result<()> {
+        self.client.app_link_taken(pimble_rpc::AppLinkTakenRequest { ack }).await.map_err(rpc_error)?;
+        Ok(())
     }
 
     /// As a Pimble window: hear the links `openInApp` hands this one.

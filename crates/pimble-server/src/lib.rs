@@ -13,6 +13,7 @@
 //! tunnel) are not built.
 
 pub mod agents;
+mod app_links;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod auth;
 pub mod cloud;

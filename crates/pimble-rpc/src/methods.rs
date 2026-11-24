@@ -11,6 +11,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc_macros::pimble_api;
 
+use crate::app_links::*;
 use crate::notices::*;
 use crate::types::*;
 
@@ -370,9 +371,17 @@ pub trait PimbleApi {
     /// or a mail app starts `pimble <link>`): handed to one Pimble window
     /// listening through `subscribeAppLinks`, the one open longest.
     /// `delivered` is false when none is, and the caller opens a window of its
-    /// own. `Service`-only.
+    /// own. With `confirm`, `delivered` waits for the window's
+    /// `appLinkTaken`, and is false if none comes within
+    /// `APP_LINK_CONFIRM_WAIT_MS`. `Service`-only.
     #[method(name = "openInApp", with_extensions)]
     async fn open_in_app(&self, request: OpenInAppRequest) -> Result<OpenInAppResponse, ErrorObjectOwned>;
+
+    /// A window acted on a link `subscribeAppLinks` handed it with an `ack`
+    /// (it came to the front and opened it): the `openInApp` waiting on it
+    /// answers `delivered`. `Service`-only.
+    #[method(name = "appLinkTaken", with_extensions)]
+    async fn app_link_taken(&self, request: AppLinkTakenRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
     /// The notices this device has received (docs/NOTIFICATIONS_CONTRACT.md
     /// section 5), and whether notifications are on. `Service`-only, as are
