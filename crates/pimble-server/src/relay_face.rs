@@ -514,6 +514,7 @@ impl RpcHandler {
                     last_sync: None,
                     mode: SyncMode::Relay,
                     via_relay: false,
+                    via_account: false,
                     last_seq: Default::default(),
                     vault_key_id: Some(key_id),
                     access: StoreAccess::Full,

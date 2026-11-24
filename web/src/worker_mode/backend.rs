@@ -373,8 +373,10 @@ async fn create_store(ctx: &Context<'_>, name: &str, kind: &str) -> BackendEvent
 }
 
 /// Every store the account is granted, a replica in this browser (section 5):
-/// each encrypted store not here yet (or a share of one whose root is not) is
-/// added as the desktop's "Add Hosted Store..." adds it. Answers the stores
+/// each hosted store not here yet (or a share of one whose root is not),
+/// encrypted or plain, is added as the desktop's "Add Hosted Store..." adds
+/// it (`cloudAddHostedStore`: a vault link for an encrypted store, a plain
+/// link held through the account for a plain one; wave 5, part 1). Answers the stores
 /// this server has open, for the tree; `None` when nobody is signed in.
 /// Taken one tab at a time (a Web Lock), so two tabs never add one store
 /// twice.
@@ -389,10 +391,6 @@ pub async fn keep_account_stores(client: &PimbleClient) -> Option<Vec<pimble_cor
             let open = client.list_stores().await.unwrap_or_default();
             let mut asked: HashSet<String> = HashSet::new();
             for row in &rows {
-                if row.kind != "vault" {
-                    tracing::info!("{} is a plain hosted store; the browser's own server keeps encrypted stores only for now", row.store_id);
-                    continue;
-                }
                 let Ok(store_id) = pimble_core::StoreId::parse(&row.store_id) else { continue };
                 let here = open.iter().find(|s| s.id == store_id);
                 let wanted = match here {

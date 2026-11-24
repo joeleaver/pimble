@@ -9,7 +9,11 @@
 //! - A phone app: its platform's client, or `reqwest` as on the desktop.
 //!
 //! Links to Pimble servers do not come through here: they connect with
-//! `PimbleClient`, which builds for every host already.
+//! `PimbleClient`, which builds for every host already. One WebSocket does:
+//! asking Pimble Cloud's relay how it answers a member's connection
+//! ([`Http::websocket_close_code`]), because the JSON-RPC client does not
+//! pass a close frame's code on (docs/RELAY_CONTRACT.md: `owner offline` is
+//! close code 4404).
 
 use std::fmt;
 
@@ -67,7 +71,25 @@ impl std::error::Error for HttpError {}
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait Http: Send + Sync + fmt::Debug {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError>;
+
+    /// Open a WebSocket to `url` (`ws://` or `wss://`) with `token` as its
+    /// credential, and answer the close code it is closed with as the first
+    /// thing it says, if it says that within [`FIRST_WORD_WAIT`] of opening.
+    /// `None` for anything else: it does not open within
+    /// [`SOCKET_CONNECT_TIMEOUT`] (refused before the upgrade, no network),
+    /// it says something else first, or it stays quiet. The socket is closed
+    /// before this answers.
+    ///
+    /// The desktop sends the token as `Authorization: Bearer`; a browser's
+    /// WebSocket cannot set a header, so there it is the `access_token`
+    /// query parameter, which every Pimble endpoint takes too.
+    async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16>;
 }
+
+/// How long [`Http::websocket_close_code`] waits for the socket to open.
+pub const SOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long, once open, it waits for the first thing the socket says.
+pub const FIRST_WORD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The desktop's: one `reqwest` client (rustls, a 15 s timeout per call).
 #[cfg(not(target_arch = "wasm32"))]
@@ -107,7 +129,19 @@ impl Http for ReqwestHttp {
         let body = response.bytes().await.map_err(|e| HttpError(e.to_string()))?.to_vec();
         Ok(HttpResponse { status, body })
     }
+
+    async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16> {
+        socket::close_code(url, token).await
+    }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "http/native_socket.rs"]
+mod socket;
+
+#[cfg(target_arch = "wasm32")]
+#[path = "http/browser_socket.rs"]
+mod socket;
 
 /// A browser's worker (and the page, and Node): the global `fetch`, with
 /// `credentials: "include"` so the accounts service's session cookie goes
@@ -160,5 +194,9 @@ impl Http for FetchHttp {
         let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(|e| failed("body", e))?).await.map_err(|e| failed("body", e))?;
         let body = js_sys::Uint8Array::new(&buffer).to_vec();
         Ok(HttpResponse { status, body })
+    }
+
+    async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16> {
+        socket::close_code(url, token).await
     }
 }

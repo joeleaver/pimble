@@ -5443,6 +5443,7 @@ dependencies = [
  "reqwest",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "wasm-bindgen",

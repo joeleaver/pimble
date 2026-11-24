@@ -221,7 +221,7 @@ Every store in the browser is a replica, as on a desktop that added hosted store
   to the twin, made as `cloudAddHostedStore` makes one; members' partial replicas, scope
   roots, ended shares and `owner offline` all as on the desktop.
 - **Plain stores hosted on Pimble Cloud**: a replica with a plain sync link to the hosted
-  server, as `addRemoteStore` makes one. Today the page reads them straight from the
+  server, made by `cloudAddHostedStore` and held through the account (built in wave 5, part 1). Today the page reads them straight from the
   hosted server; afterwards the page reads its own server, and the link keeps it level.
 - **Stores the account owns, shared from a computer** (relay tier): the browser is a
   member-side replica like any other. Sharing *from* a browser is not offered: a tab is not
@@ -1359,8 +1359,8 @@ this is the transport adapter of section 6), loaded before the page's wasm.
 - **The account's stores, kept here** (`keep_account_stores`, section 5): at connect and every
   two minutes, under the `pimble-account-stores` lock: `cloudListHostedStores`, and for each
   encrypted store not open here (or a share of one whose root is not), `cloudAddHostedStore`, the
-  desktop's "Add Hosted Store..." call; then `StoresListed`. A plain hosted store is logged and
-  skipped (below).
+  desktop's "Add Hosted Store..." call; then `StoresListed`. A plain hosted store was logged and
+  skipped (below; replicated since wave 5, part 1).
 - `pages.rs`: the sign-in page (email, password, "Don't remember this browser" with section 7's
   sentence beside it in its words) and the account page (who is signed in, how the stores are
   kept, "Sign Out", "Forget This Browser", "Sign in again"). Signing up, verifying and recovering
@@ -1519,8 +1519,8 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
   hosted twin as it is taken (so only offline is there a window), and the other tabs' editors
   reconcile on reconnect (the typing test above). Whether the browser (or both apps) adopts the
   log is still wave 0's question.
-- **Plain hosted stores** are not replicated in the browser yet (section 5's second bullet): they
-  are logged and skipped. The link would be `addRemoteStore` with `AuthMethod::CloudSession` to
+- **Plain hosted stores** are not replicated in the browser yet (section 5's second bullet; built
+  in wave 5, part 1, through `cloudAddHostedStore`): they are logged and skipped. The link would be `addRemoteStore` with `AuthMethod::CloudSession` to
   the session's `rpc_url`; not built or tried. The local stack makes only encrypted stores.
 - **No Settings switch**: `?server=worker` only. "Forget This Browser" is on the account page,
   not in Settings.
@@ -1528,7 +1528,7 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
   worker's files (no service worker; the edge says `no-store`). Offline use needs the page served
   (or a service worker, which is a decision of its own).
 - A relayed store whose owner is away reads as plainly offline in the worker
-  (`owner_is_offline` is `false` there, as wave 3 left it).
+  (`owner_is_offline` is `false` there, as wave 3 left it; shared since wave 5, part 1).
 - Diagnostics are not sent from the worker; the old path's are untouched.
 - Semantic search in the browser is wave 6.
 - **Firefox and Safari were not run**: there is no Firefox in this machine's Playwright cache
@@ -1750,3 +1750,78 @@ before.
   a page offline on the older build until then; this one never runs two builds' files in one
   page.
 - Safari is still not run.
+
+## Built: wave 5, part 1 (2026-11-23, not merged or released): plain hosted stores, and an owner away
+
+The two things the worker's server still could not do that the old browser path could, built in
+the shared server so the desktop and the browser do them by one code path. The old path is not
+deleted yet (part 2).
+
+### Plain hosted stores as replicas
+
+- **The call is `cloudAddHostedStore`**, not `addRemoteStore` as section 5 and wave 4's notes
+  guessed: the row's `kind` (`"plain"`) says which link the store gets, so the worker's
+  `keep_account_stores` and the desktop's "Add Hosted Store..." make one call for every hosted
+  store. The request and answer are unchanged; what the call accepts widened (a plain store was
+  refused before, for want of key envelopes). Built in `pimble-server/src/handler/hosted_plain.rs`
+  (`add_hosted_plain_store`): a whole replica for a whole-store grant (an empty replica with a
+  placeholder root, corrected by `adopt_document_root` once the pull lands, as for a vault twin),
+  a partial one rooted at the shared nodes for a share, another root added to the open partial
+  replica for a share given since; `sync.json` is `mode: "sync"` with the new
+  `via_account: true` (`pimble-store` `SyncConfig`), the hosted server's address and no
+  credential, and how the account holds the store (`access`, `shared_by`, the roots read only or
+  commented).
+- **The link is the plain `SyncLink`**, with the vault link's way of reaching its remote
+  (`pimble-server/src/sync_link/account.rs`): before every connect the grant is read again and a
+  token minted from the account's session, sent as `Bearer` (`credentials.json` is neither read
+  nor written); while connected the grant is asked about every `grant_check_interval` and a
+  change connects again at once. A refused session waits for a sign-in, as the vault link does.
+- **What the account's grant decides, now shared** (`pimble-server/src/grant.rs`, moved out of
+  `vault_link.rs` and used by both links): `refresh` (rows read at connect: role, shares added,
+  shares ended, `sync.json` kept in line), `grant_shape` and `GRANT_CHECK_EVERY`, `mint` with
+  `SessionExpired`, `record_ended_roots`, and `may_push` (an editor or owner pushes, a commenter
+  only discussions, a reader nothing).
+- **The plain link pushes only what the account may write** (`sync_link/reconcile.rs`
+  `send_edit`, every push of the reconcile and of the live loop): nothing for a reader's replica,
+  and a document the hosted server refuses (`is_refusal`: out of scope now, or under a root only
+  read) is left for a later connect rather than taking the link down. For a link with a saved
+  credential nothing changes: its access is always full. `sync_link.rs` became
+  `sync_link/{mod,reconcile,account}.rs` (594, 192, 54 lines).
+- **The browser**: `keep_account_stores` no longer skips plain rows. **The desktop**: "Add Hosted
+  Store..." lists plain hosted stores too (`pimble-app/src/events.rs`), the same call.
+- "New Store..." in the browser still makes an encrypted store only, as the button always has.
+
+### A relayed store whose owner is away
+
+- The relay accepts a member's upgrade and closes it with 4404 when the owner's computer is not
+  connected; the desktop asked with a raw tokio-tungstenite socket. That question is now a seam
+  method, `Http::websocket_close_code(url, token)` (`pimble-host/src/http.rs`): natively
+  tokio-tungstenite with `Authorization: Bearer` (`http/native_socket.rs`), in the browser a
+  `web_sys::WebSocket` with the token as `access_token` (`http/browser_socket.rs`; a code is read
+  only after the socket opened, so a refused handshake's 1006 is never taken for an answer). Both
+  answer a code only when the first thing after opening is a close, within
+  `FIRST_WORD_WAIT` (2 s) after a `SOCKET_CONNECT_TIMEOUT` (15 s) connect.
+- `owner_is_offline` is shared (`pimble-server/src/relay_probe.rs`); the wasm32 stub that
+  answered `false` is gone, and the vault link asks through `handler.http()` on both targets.
+- So the worker shows `owner offline` exactly as the desktop does, and, as on the desktop, the
+  store stays editable from its replica (edits go when the owner is back; docs/RELAY_CONTRACT.md).
+  The old browser path made such a store read-only because it held no copy of its own; the worker
+  holds one, so it does not.
+
+### Proof
+
+- `crates/pimble-server/tests/hosted_plain.rs` (new, the sharing harness's stub accounts service
+  and JWT-mode hosted server): a plain hosted store replicated through the account both ways,
+  `sync.json` with `via_account` and no token, the placeholder root corrected, a restart catching
+  up; a reader whose replica refuses edits and pushes nothing, made an editor while connected and
+  then writing to `H`; a share as a partial replica that never receives what is outside it, writes
+  inside it, and records its removal as an ended share.
+- `pimble-host` `http::socket` tests: a server that closes with 4404 answers `Some(4404)`, one that
+  speaks first answers `None`, no listener answers `None`. The relay suite (`tests/relay.rs`)
+  covers the owner-away path end to end on the desktop.
+
+### Not done
+
+- `handler.rs` (about 7,050 lines) and `vault_link.rs` (about 3,480) are still far over the
+  700-line limit; this part moved code out of both (`grant.rs`, `hosted_plain.rs`) but did not
+  split them.

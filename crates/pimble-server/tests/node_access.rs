@@ -66,6 +66,7 @@ fn held_as(access: StoreAccess, read_only_roots: Vec<NodeId>) -> SyncConfig {
         last_sync: None,
         mode: SyncMode::Vault,
         via_relay: false,
+        via_account: false,
         last_seq: Default::default(),
         vault_key_id: None,
         access,

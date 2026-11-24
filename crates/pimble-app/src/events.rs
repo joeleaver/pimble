@@ -1670,9 +1670,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::CloudSharesListed { shares } => crate::shares::listed(store, shares),
             BackendEvent::PeopleLoaded { store_id, people } => crate::shares::people_loaded(store, *store_id, people),
             BackendEvent::CloudHostedStoresListed { stores, relayed } => {
-                // Only an encrypted store not already open here can be added
-                // as a replica (the server refuses an open one anyway), so
-                // the modal lists just those (decision 6). A share is the
+                // Only a hosted store not already open here can be added as
+                // a replica (the server refuses an open one anyway), so the
+                // modal lists just those (decision 6): an encrypted one, or a
+                // plain one, which `cloudAddHostedStore` links through the
+                // account since docs/ONE_CODEBASE_CONTRACT.md wave 5. A share is the
                 // exception: a second share of a store already open here as a
                 // partial replica extends that replica with another root, so
                 // it is listed as long as this device does not hold that root
@@ -1681,7 +1683,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let mut listed: Vec<String> = Vec::new();
                 let candidates: Vec<pimble_rpc::CloudHostedStoreInfo> = stores
                     .iter()
-                    .filter(|s| s.kind == "vault")
+                    .filter(|s| s.kind == "vault" || s.kind == "plain")
                     .filter(|s| {
                         let Ok(id) = s.store_id.parse::<uuid::Uuid>() else { return false };
                         let store_id = StoreId(id);

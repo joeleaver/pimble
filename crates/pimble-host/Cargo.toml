@@ -23,6 +23,12 @@ tokio = { version = "1", features = ["fs", "io-util", "rt", "time"] }
 dirs = "6"
 # The accounts service's calls (src/http.rs): rustls, no openssl, as pimble-server had it.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Asking Pimble Cloud's relay how it answers a member's WebSocket
+# (src/http/native_socket.rs): close codes, which jsonrpsee's client does not
+# pass on. The version pimble-server's relay tunnel uses, so the lock gains
+# nothing.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures = { workspace = true }
 
 # uuid v4 needs a randomness backend in the browser; the native build has one.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -44,6 +50,8 @@ web-sys = { version = "0.3", features = [
     "FileSystemHandle", "FileSystemHandleKind", "FileSystemDirectoryHandle", "FileSystemFileHandle",
     "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemRemoveOptions",
     "FileSystemWritableFileStream", "FileSystemSyncAccessHandle", "FileSystemReadWriteOptions",
+    # Asking the relay how it answers a member (src/http/browser_socket.rs).
+    "WebSocket", "CloseEvent", "Event", "MessageEvent", "Url", "UrlSearchParams",
 ] }
 
 [dev-dependencies]

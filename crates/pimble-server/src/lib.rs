@@ -25,6 +25,7 @@ pub mod faults;
 mod folder_watch;
 #[cfg(not(target_arch = "wasm32"))]
 mod fs_util;
+mod grant;
 pub mod handler;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jwt;
@@ -44,6 +45,7 @@ mod presence;
 mod presence_link;
 pub mod principal;
 pub mod relay_face;
+mod relay_probe;
 mod relay_writes;
 #[cfg(not(target_arch = "wasm32"))]
 mod relay_tunnel;
@@ -55,9 +57,8 @@ pub mod writes;
 
 /// What the core asks of the native-only modules, answered in a browser's
 /// worker: no diagnostics yet (section 6, item 10: the worker's own, on its
-/// disk, come with the old browser path's removal), no host kind and no
-/// hand-over (a worker has no port to hand), and no relay tunnel to ask
-/// whether a relayed store's owner is there.
+/// disk, come with the old browser path's removal), and no host kind and no
+/// hand-over (a worker has no port to hand).
 #[cfg(target_arch = "wasm32")]
 pub mod diagnostics {
     pub fn ids() -> Option<(String, String)> {
@@ -74,18 +75,6 @@ pub mod local {
         "worker"
     }
     pub fn handed_over() {}
-}
-
-#[cfg(target_arch = "wasm32")]
-mod relay_tunnel {
-    /// A member's side: whether the relay says the store's owner is not
-    /// there. The desktop reads the relay's close code with its own
-    /// WebSocket (`relay_tunnel.rs`); a browser's worker cannot set the
-    /// bearer header that needs, so it cannot tell, and a relayed store
-    /// whose owner is off reads as plainly offline (wave 4).
-    pub(crate) async fn owner_is_offline(_url: &url::Url, _token: &str) -> bool {
-        false
-    }
 }
 
 pub use error::*;

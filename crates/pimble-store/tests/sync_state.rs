@@ -44,6 +44,7 @@ fn write_folder_link(l: &Layout, mode: SyncMode) {
         last_sync: None,
         mode,
         via_relay: false,
+        via_account: false,
         last_seq: Default::default(),
         vault_key_id: mode.is_vault_link().then(uuid::Uuid::new_v4),
         access: StoreAccess::Full,

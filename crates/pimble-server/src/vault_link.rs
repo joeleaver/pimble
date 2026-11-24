@@ -100,12 +100,12 @@
 //! a root this account only reads) leaves that document marked and the link
 //! up. How the account holds the store is read again from the accounts
 //! service at every connect (`refresh_grant`), and asked about every two
-//! minutes while connected (`grant_shape`): a role the owner changed,
+//! minutes while connected (`crate::grant::grant_shape`): a role the owner changed,
 //! another share of the store or a removal ends the connection, and the
 //! next one is made with a token minted from the grant as it is now. A
 //! scope root the account's rows no longer name (a removal, a share its
 //! owner stopped) is recorded as ended in the manifest and announced once
-//! (`record_ended_roots`, `StoreChangeKind::SharesEnded`): it stays on this
+//! (`crate::grant::record_ended_roots`, `StoreChangeKind::SharesEnded`): it stays on this
 //! device, read only, until the replica is removed, and the app stops
 //! showing it. The scope roots themselves are never shrunk.
 //!
@@ -205,11 +205,6 @@ const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
 /// disk first): past the content flush's debounce, so usually there is
 /// nothing left to write but the cursor.
 const CURSOR_SAVE_AFTER: Duration = Duration::from_secs(1);
-/// How often a connected link asks the accounts service whether the
-/// account's grant on the store is still what this connection was made
-/// with (see [`grant_shape`]), unless `ServerConfig::grant_check_interval`
-/// says otherwise.
-pub(crate) const GRANT_CHECK_EVERY: Duration = Duration::from_secs(120);
 /// How long a share's recipient waits before asking the remote again for a
 /// document a held list names and the scope did not hold yet, doubling up
 /// to [`MAX_AWAITED_POLL`] while nothing new arrives.
@@ -435,7 +430,7 @@ async fn run_loop(handler: RpcHandler, endpoint: LinkEndpoint, key_id: Uuid, lin
             // again, which is what makes the app ask again.
             owner_offline = e.is::<OwnerOffline>()
                 || match &reached {
-                    Some(reached) if reached.via_relay => crate::relay_tunnel::owner_is_offline(&reached.url, &reached.token).await,
+                    Some(reached) if reached.via_relay => crate::relay_probe::owner_is_offline(handler.http(), &reached.url, &reached.token).await,
                     _ => false,
                 };
             let reason_changed = link.owner_offline.swap(owner_offline, std::sync::atomic::Ordering::Relaxed) != owner_offline;
@@ -447,7 +442,7 @@ async fn run_loop(handler: RpcHandler, endpoint: LinkEndpoint, key_id: Uuid, lin
             shares.upkeep.link_down(&handler, store_id).await;
             progress.parts.clear();
             flush_waiting(&handler, &link, &progress).await;
-            if e.is::<SessionExpired>() {
+            if e.is::<crate::grant::SessionExpired>() {
                 // Said once, by `connect`; until someone signs in, the link
                 // only gathers what changes here, checking every few seconds
                 // whether a sign-in came.
@@ -588,20 +583,6 @@ impl std::fmt::Display for OwnerOffline {
 
 impl std::error::Error for OwnerOffline {}
 
-/// Pimble Cloud refused the account's session: the link waits for a sign-in
-/// rather than asking again every 30 seconds (2026-11-19: 58 refusals in a
-/// quarter of an hour, and the status bar still said "Signed in").
-#[derive(Debug)]
-pub(crate) struct SessionExpired;
-
-impl std::fmt::Display for SessionExpired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the Pimble Cloud sign-in expired; nothing is tried again until someone signs in")
-    }
-}
-
-impl std::error::Error for SessionExpired {}
-
 /// Wait out a backoff, recording which documents change locally meanwhile.
 async fn note_local_changes_for(
     local_rx: &mut broadcast::Receiver<LocalChange>,
@@ -641,7 +622,7 @@ async fn note_local_changes_for(
 
 /// Where a connect attempt went, and with what: kept by the retry loop so
 /// that a failure at a relayed endpoint can be asked about
-/// (`crate::relay_tunnel::owner_is_offline`).
+/// (`crate::relay_probe::owner_is_offline`).
 struct Reached {
     url: Url,
     token: String,
@@ -675,26 +656,7 @@ async fn connect(
     if handler.link_faults().is_some_and(|faults| faults.is_offline()) {
         return Err(anyhow::anyhow!("this device has no network (a fault the test injected)"));
     }
-    let account = handler
-        .keystore()
-        .account()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no Pimble Cloud account is signed in"))?;
-    if handler.keystore().session_expired() {
-        return Err(anyhow::Error::new(SessionExpired));
-    }
-    let minted = match crate::cloud::mint_token(handler.http(), &account.url, &account.session).await {
-        Ok(minted) => minted,
-        Err(e) if e.status() == Some(401) => {
-            if !handler.keystore().session_expired() {
-                handler.keystore().mark_session_expired();
-                warn!("Pimble Cloud at {} refused this computer's sign-in (it expired, or was signed out elsewhere): sign in again to sync", account.url);
-                handler.cloud_changed();
-            }
-            return Err(anyhow::Error::new(SessionExpired));
-        }
-        Err(e) => return Err(anyhow::anyhow!("minting a cloud token from {} failed: {}", account.url, e)),
-    };
+    let (account, minted) = crate::grant::mint(handler).await?;
     let (url, token, via_relay) = match endpoint {
         LinkEndpoint::RelayFace => {
             let url = handler
@@ -720,7 +682,7 @@ async fn connect(
         }
     };
     if ask_first {
-        if via_relay && crate::relay_tunnel::owner_is_offline(&url, &token).await {
+        if via_relay && crate::relay_probe::owner_is_offline(handler.http(), &url, &token).await {
             return Err(anyhow::Error::new(OwnerOffline));
         }
         on_the_way.await;
@@ -773,7 +735,7 @@ async fn connect_and_sync(
     }
 
     let owner = refresh_grant(handler, store_id).await;
-    let connected_as = grant_shape(handler, store_id).await;
+    let connected_as = crate::grant::grant_shape(handler, store_id).await;
     // Who is who in the store's shares, beside the connection rather than
     // in its way (docs/PRESENCE_CONTRACT.md section 3).
     spawn_people_refresh(handler, store_id);
@@ -951,7 +913,7 @@ async fn connect_and_sync(
             // reads the grant and mints a token from it.
             _ = grant_tick.tick() => {
                 spawn_people_refresh(handler, store_id);
-                let now = grant_shape(handler, store_id).await;
+                let now = crate::grant::grant_shape(handler, store_id).await;
                 if now.is_some() && now != connected_as {
                     info!("Vault link for store {}: the account's grant on it has changed; connecting again", store_id);
                     progress.save_if_unsaved().await;
@@ -1018,7 +980,7 @@ async fn connect_and_sync(
 
 /// Ask the accounts service again who is who in the store's shares
 /// (`crate::people`); a name someone chose reaches this device within one
-/// [`GRANT_CHECK_EVERY`].
+/// [`crate::grant::GRANT_CHECK_EVERY`].
 fn spawn_people_refresh(handler: &RpcHandler, store_id: StoreId) {
     let handler = handler.clone();
     let runtime = handler.runtime().clone();
@@ -1027,126 +989,20 @@ fn spawn_people_refresh(handler: &RpcHandler, store_id: StoreId) {
     });
 }
 
-/// How the account holds the store, as far as the accounts service's rows
-/// say: what a token minted now would carry. Compared between a connect and
-/// now ([`GRANT_CHECK_EVERY`]); never stored.
-#[derive(Debug, PartialEq, Eq)]
-struct GrantShape {
-    /// `None`: no row names the store.
-    held: Option<(pimble_core::StoreAccess, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)>,
-}
-
-/// `None` when it cannot be read (no account, no network): nothing is
-/// concluded from that, and the connection stands.
-async fn grant_shape(handler: &RpcHandler, store_id: StoreId) -> Option<GrantShape> {
-    let account = handler.keystore().account().await?;
-    let rows = crate::cloud::list_stores(handler.http(), &account.url, &account.session).await.ok()?;
-    let ids = |roots: &[NodeId]| roots.iter().map(|id| id.to_string()).collect::<std::collections::BTreeSet<_>>();
-    Some(GrantShape {
-        held: crate::cloud::HeldAs::from_rows(&rows, store_id).map(|held_as| (held_as.access, ids(&held_as.roots), ids(&held_as.read_only_roots))),
-    })
-}
-
 /// Read again, from the accounts service, how the signed-in account holds
-/// this store, and bring `sync.json` (`access`, `shared_by`, the roots only
-/// read), a partial replica's scope roots, the roots among them that have
-/// ended, and the keystore in line with it: a role changed by the owner,
-/// another share of the same store, a removal from one, a share's key
-/// handed over since the replica was added. Best effort: the token the
-/// connect mints next is what the hosted server judges, and a link with no
-/// account or no network fails there, with its backoff.
+/// this store (`crate::grant::refresh`: `sync.json`, a partial replica's
+/// scope roots, the roots among them that have ended), and bring the
+/// keystore in line with it: a share's key handed over since the replica was
+/// added. Best effort: the token the connect mints next is what the hosted
+/// server judges, and a link with no account or no network fails there,
+/// with its backoff.
 ///
 /// Answers whether the account is an owner of the store, as far as the
 /// rows say (`None`: they could not be read), which is what decides whether
 /// this device keeps the store's shares up (`crate::share`).
 async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> {
-    let account = handler.keystore().account().await?;
-    let rows = match crate::cloud::list_stores(handler.http(), &account.url, &account.session).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            debug!("Vault link for store {}: could not list the account's stores: {}", store_id, e);
-            return None;
-        }
-    };
-    let owner = crate::cloud::is_owner_of(&rows, store_id);
+    let crate::grant::Held { owner, account } = crate::grant::refresh(handler, store_id, "Vault link").await?;
     let manager = handler.store_manager_handle();
-    let local_roots = manager.read().await.scope_roots(store_id);
-    let Some(mut held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
-        // No row at all. For a share's replica that is a removal from every
-        // share of the store: the hosted server takes nothing from this
-        // account any more, so nothing is taken here either (an edit
-        // accepted here would sit on this device for good, looking saved).
-        if !local_roots.is_empty() {
-            let manager = manager.read().await;
-            if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
-                if config.access != StoreAccess::Read {
-                    info!("Vault link for store {}: the account holds no share of it any more; read only here now", store_id);
-                    config.access = StoreAccess::Read;
-                    if let Err(e) = manager.write_sync_config(store_id, &config).await {
-                        warn!("Vault link for store {}: could not record how the store is held: {}", store_id, e);
-                    }
-                }
-            }
-            drop(manager);
-            // Every share of it has ended. The documents stay where they
-            // are until the replica is removed; the app stops showing them.
-            record_ended_roots(handler, store_id, local_roots.clone()).await;
-        }
-        return Some(owner);
-    };
-    // A root this replica holds and the account does not any more (removed
-    // from that share, or its owner stopped sharing it) stays here as it
-    // last was and takes no edits, for the same reason.
-    for root in local_roots.iter().filter(|root| !held_as.roots.contains(root)) {
-        if !held_as.read_only_roots.contains(root) {
-            held_as.read_only_roots.push(*root);
-        }
-    }
-    // Only a partial replica takes roots: a whole replica holds every
-    // document already, whatever the account's grant has become since.
-    if !local_roots.is_empty() {
-        let mut added = false;
-        for root in held_as.roots.iter().filter(|root| !local_roots.contains(root)) {
-            match manager.write().await.add_scope_root(store_id, *root).await {
-                Ok(()) => added = true,
-                Err(e) => warn!("Vault link for store {}: could not add scope root {}: {}", store_id, root, e),
-            }
-        }
-        // One share's replica carries that share's name; with another it is
-        // "Shared by ...", as a replica added with both would be.
-        if let (true, Some(name)) = (added, &held_as.name) {
-            if let Err(e) = manager.write().await.set_partial_replica_name(store_id, name).await {
-                warn!("Vault link for store {}: could not rename the replica: {}", store_id, e);
-            }
-        }
-    }
-    {
-        let manager = manager.read().await;
-        if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
-            let read_only_roots = if local_roots.is_empty() { Vec::new() } else { held_as.read_only_roots.clone() };
-            let comment_roots = if local_roots.is_empty() { Vec::new() } else { held_as.comment_roots.clone() };
-            if config.access != held_as.access || config.shared_by != held_as.shared_by || config.read_only_roots != read_only_roots || config.comment_roots != comment_roots {
-                info!("Vault link for store {}: held as {:?} now (shared by {:?})", store_id, held_as.access, held_as.shared_by);
-                config.access = held_as.access;
-                config.shared_by = held_as.shared_by.clone();
-                config.read_only_roots = read_only_roots;
-                config.comment_roots = comment_roots;
-                if let Err(e) = manager.write_sync_config(store_id, &config).await {
-                    warn!("Vault link for store {}: could not record how the store is held: {}", store_id, e);
-                }
-            }
-        }
-    }
-    // The shares that ended: exactly the roots held here that the account's
-    // rows no longer name, so one granted again is un-ended by the same
-    // comparison. After `sync.json`, so that whoever hears of it and asks
-    // how the store is held reads the ended root as read only already. A
-    // whole-store grant names no root and leaves none out: nothing of the
-    // store has stopped being this account's.
-    if !local_roots.is_empty() {
-        let ended = if held_as.roots.is_empty() { Vec::new() } else { local_roots.iter().filter(|root| !held_as.roots.contains(root)).copied().collect() };
-        record_ended_roots(handler, store_id, ended).await;
-    }
 
     // The scope keys: a share's recipient's shares', or the store key and,
     // on a device that holds the whole store, the key of every share in it
@@ -1177,31 +1033,6 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
         }
     }
     Some(owner)
-}
-
-/// Record in a partial replica's manifest which of its scope roots the
-/// account no longer holds (`StoreManifest::ended_roots`; the scope roots
-/// themselves are never shrunk, and nothing else on disk is touched), and
-/// when that changed anything, tell the store's subscribers which roots
-/// ended just now (`StoreChangeKind::SharesEnded`): the app stops showing
-/// them and says so. A set that did not change, which is every connect
-/// after the one that learned of it, says nothing.
-async fn record_ended_roots(handler: &RpcHandler, store_id: StoreId, ended: Vec<NodeId>) {
-    let manager = handler.store_manager_handle();
-    let (before, changed) = {
-        let mut manager = manager.write().await;
-        let before = manager.ended_roots(store_id);
-        (before, manager.set_ended_roots(store_id, ended.clone()).await)
-    };
-    match changed {
-        Ok(false) => {}
-        Ok(true) => {
-            let just_now: Vec<NodeId> = ended.iter().filter(|root| !before.contains(root)).copied().collect();
-            info!("Vault link for store {}: {} share(s) of it ended just now; {} of the shares held here have ended in all", store_id, just_now.len(), ended.len());
-            handler.notify_shares_ended(store_id, just_now).await;
-        }
-        Err(e) => warn!("Vault link for store {}: could not record which shares have ended: {}", store_id, e),
-    }
 }
 
 /// Fetch and unwrap the scope keys the signed-in account has been handed
@@ -2429,10 +2260,10 @@ async fn forward_local_change(
 /// appends (the local server refuses a reader's writes; what changes here is
 /// its own upkeep).
 async fn may_push(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId) -> bool {
-    let manager = handler.store_manager_handle();
-    let manager = manager.read().await;
-    let access = manager.store_access(store_id);
-    access.allows_write() || (access.allows_comment() && matches!(doc_id, VaultDocId::Node(id) if manager.is_discussion(store_id, *id)))
+    match doc_id {
+        VaultDocId::Node(node_id) => crate::grant::may_push(handler, store_id, *node_id).await,
+        _ => handler.store_manager_handle().read().await.store_access(store_id).allows_write(),
+    }
 }
 
 /// Whether an append went out.

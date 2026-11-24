@@ -84,6 +84,16 @@ pub struct SyncConfig {
     /// older `sync.json`: hosted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub via_relay: bool,
+    /// A `Sync`-mode link to a plain store hosted on Pimble Cloud
+    /// (docs/ONE_CODEBASE_CONTRACT.md, "Built: wave 5, part 1"): its
+    /// credential is the signed-in account's, a token minted from the
+    /// account's session before every connect, and how the account holds
+    /// the store (`access`, the roots only read) is read again from the
+    /// accounts service at every connect. Never a credential itself: the
+    /// session lives in the keystore. Missing in an older `sync.json`: the
+    /// link's credential is the one saved for the remote's origin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_account: bool,
     /// Per-document last-applied vault sequence number
     /// (`pimble_rpc::VaultDocId::as_str()` -> seq), meaningful only when
     /// `mode` is `Vault`: lets a restarted `VaultLink` resume `vaultFetch`
@@ -2519,6 +2529,7 @@ mod tests {
             last_sync: None,
             mode: SyncMode::Vault,
             via_relay: false,
+            via_account: false,
             last_seq: Default::default(),
             vault_key_id: None,
             access,

@@ -470,6 +470,12 @@ mod tests {
             }
             Ok(HttpResponse { status, body: b"{}".to_vec() })
         }
+
+        /// Reports go to the accounts service over plain calls only; a test of
+        /// them never asks a relay how it answers a socket.
+        async fn websocket_close_code(&self, _url: &str, _token: &str) -> Option<u16> {
+            None
+        }
     }
 
     fn write(doc: &str, writer: &str, last_ms: i64) -> ReportedWrite {

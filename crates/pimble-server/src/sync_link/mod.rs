@@ -30,7 +30,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
-use pimble_rpc::{EditOperation, StoreChangeKind, StoreChangedNotification, MAX_SYNC_NODE_CONTENTS};
+use pimble_rpc::{StoreChangeKind, StoreChangedNotification};
 use pimble_store::SyncConfig;
 use tokio::sync::{broadcast, mpsc, watch};
 use pimble_host::{Runtime, Task};
@@ -38,6 +38,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::handler::{LocalChange, Repair, RpcHandler};
+
+mod account;
+mod reconcile;
 
 /// Initial retry backoff on a dropped or failed connection; doubles up to
 /// [`MAX_BACKOFF`] (decision 6).
@@ -47,6 +50,19 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// notification about it that carried no bytes (an older peer's), so a burst
 /// of them yields one round trip.
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// How often a link held through the account checks whether someone has
+/// signed in again after its session expired.
+const SIGN_IN_CHECK: Duration = Duration::from_secs(5);
+
+/// The next tick of a link's grant check, or never for a link that has none.
+async fn next_grant_check(tick: &mut Option<pimble_host::Interval>) {
+    match tick {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 
 /// A running sync link for one store. Always call [`SyncLinkHandle::stop`]
 /// when the link should end (`closeStore`, `setStoreSync(None)`, or
@@ -198,6 +214,7 @@ async fn persist_last_sync(handler: &RpcHandler, store_id: StoreId, last_sync: O
         last_sync,
         mode: existing.mode,
         via_relay: existing.via_relay,
+        via_account: existing.via_account,
         last_seq: existing.last_seq,
         vault_key_id: existing.vault_key_id,
         access: existing.access,
@@ -216,9 +233,18 @@ async fn run_loop(handler: RpcHandler, remote: RemoteEndpoint, link_id: String, 
     loop {
         match connect_and_sync(&handler, &remote, &link_id, &link).await {
             Ok(()) => {
-                // `connect_and_sync` only returns once its select loop hits
-                // an error; a clean `Ok` should not happen, but treat it the
-                // same as a dropped connection defensively rather than spin.
+                // The account's grant changed (`account`): connect again at
+                // once, which reads it and mints a token from it.
+                backoff = INITIAL_BACKOFF;
+            }
+            Err(e) if e.is::<crate::grant::SessionExpired>() => {
+                // Said once, by `crate::grant::mint`; until someone signs in
+                // nothing is tried, and the reconcile at the next connect
+                // brings over what changed meanwhile.
+                set_state(&handler, &link, SyncState::Offline).await;
+                while handler.keystore().session_expired() {
+                    handler.runtime().sleep(SIGN_IN_CHECK).await;
+                }
                 backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
@@ -245,17 +271,38 @@ async fn connect_and_sync(
     let store_id = link.store_id;
     set_state(handler, link, SyncState::Syncing).await;
 
-    // `remote.auth` is `AuthMethod::None` whenever this link was restarted
-    // from `sync.json` (which never stores a real credential — docs/
-    // HARDENING_CONTRACT.md decision 4); `resolve` finds the credential
-    // saved for this origin, if any, the same way `addRemoteStore`/
-    // `setStoreSync`/`listRemoteStores` do.
-    let auth = handler.credentials().resolve(&remote.url, &remote.auth).await;
-    let client = Arc::new(
-        PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
+    // A plain store hosted on Pimble Cloud is reached with a token minted
+    // from the signed-in account (see `account`); any other remote with the
+    // credential saved for its origin. `remote.auth` is `AuthMethod::None`
+    // whenever this link was restarted from `sync.json` (which never stores
+    // a real credential — docs/HARDENING_CONTRACT.md decision 4); `resolve`
+    // finds the credential saved for this origin, if any, the same way
+    // `addRemoteStore`/`setStoreSync`/`listRemoteStores` do.
+    let via_account = handler
+        .store_manager_handle()
+        .read()
+        .await
+        .read_sync_config(store_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|config| config.via_account);
+    let (client, connected_as) = if via_account {
+        let connection = account::connect(handler, store_id, &remote.url).await?;
+        (connection.client, Some(connection.connected_as))
+    } else {
+        let auth = handler.credentials().resolve(&remote.url, &remote.auth).await;
+        let client = PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?,
-    );
+            .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?;
+        (client, None)
+    };
+    let client = Arc::new(client);
+    // How often the grant is asked about: only for a link held through the
+    // account (a link with a saved credential has no grant to change).
+    let grant_check_every = handler.grant_check_every();
+    let runtime = handler.runtime().clone();
+    let mut grant_tick = connected_as.as_ref().map(|_| runtime.interval_at(runtime.now() + grant_check_every, grant_check_every));
 
     // Both channels are open before the reconcile, not after it: what
     // happens during it (the remote repairing its tree after this side's
@@ -271,7 +318,7 @@ async fn connect_and_sync(
     let (reconcile_tx, mut reconcile_rx) = mpsc::unbounded_channel::<NodeId>();
     let mut channels = Channels { remote_sub, local_rx, debouncer: Arc::new(ReconcileDebouncer::new(handler.runtime().clone())), reconcile_tx };
 
-    full_reconcile(handler, &client, store_id, link_id, &mut channels).await?;
+    reconcile::full_reconcile(handler, &client, store_id, link_id, &mut channels).await?;
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     info!("Sync link for store {} connected to {}", store_id, remote.url);
@@ -299,7 +346,7 @@ async fn connect_and_sync(
             change = channels.local_rx.recv() => {
                 match change {
                     Ok(local_change) => {
-                        forward_local_change(&client, store_id, link_id, local_change, &channels.debouncer, &channels.reconcile_tx).await?;
+                        forward_local_change(handler, &client, store_id, link_id, local_change, &channels.debouncer, &channels.reconcile_tx).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -317,10 +364,22 @@ async fn connect_and_sync(
                     }
                 }
             }
+            // A role the owner changed, another share of the store, a
+            // removal: what this connection may do was settled by the token
+            // it was made with, so the answer is to connect again, which
+            // reads the grant and mints a token from it.
+            _ = next_grant_check(&mut grant_tick) => {
+                if let Some(connected_as) = &connected_as {
+                    if account::grant_changed(handler, store_id, connected_as).await {
+                        info!("Sync link for store {}: the account's grant on it has changed; connecting again", store_id);
+                        return Ok(());
+                    }
+                }
+            }
             trigger = reconcile_rx.recv() => {
                 match trigger {
                     Some(node_id) => {
-                        reconcile_node(handler, &client, store_id, node_id, link_id).await?;
+                        reconcile::reconcile_node(handler, &client, store_id, node_id, link_id).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     None => return Err(anyhow::anyhow!("internal reconcile channel closed")),
@@ -339,7 +398,7 @@ async fn connect_and_sync(
 /// echo. Left alone, a store of a few thousand documents would lag the
 /// broadcast (1024 slots) or overflow the subscription (which jsonrpsee then
 /// closes), and cost a second connection cycle to finish.
-struct Channels {
+pub(super) struct Channels {
     remote_sub: jsonrpsee::core::client::Subscription<StoreChangedNotification>,
     local_rx: broadcast::Receiver<LocalChange>,
     debouncer: Arc<ReconcileDebouncer>,
@@ -351,10 +410,10 @@ impl Channels {
     /// more: a local change is forwarded, a remote one merged (with no
     /// repair, the reconcile's own at the end covers it). The same errors
     /// as the live loop's, for the same reasons.
-    async fn drain(&mut self, handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
+    pub(super) async fn drain(&mut self, handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
         loop {
             match self.local_rx.try_recv() {
-                Ok(change) => forward_local_change(client, store_id, link_id, change, &self.debouncer, &self.reconcile_tx).await?,
+                Ok(change) => forward_local_change(handler, client, store_id, link_id, change, &self.debouncer, &self.reconcile_tx).await?,
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     return Err(anyhow::anyhow!("missed {} local notifications (broadcast lag); reconnecting to reconcile", n));
@@ -444,6 +503,7 @@ async fn handle_remote_notification(
 /// same bytes ride the store notification), so only `LocalChange::Store` is
 /// acted on here.
 async fn forward_local_change(
+    handler: &RpcHandler,
     client: &PimbleClient,
     store_id: StoreId,
     link_id: &str,
@@ -473,11 +533,9 @@ async fn forward_local_change(
     };
     match notif.update {
         Some(changes) => {
-            client
-                .apply_edit(store_id, node_id, link_id, EditOperation::IncrementalChanges { changes })
-                .await
-                .map_err(|e| anyhow::anyhow!("remote applyEdit for node {} failed: {}", node_id, e))?;
-            debug!("Sync link for store {} forwarded a local update to node {}", store_id, node_id);
+            if reconcile::send_edit(handler, client, store_id, node_id, link_id, changes).await? {
+                debug!("Sync link for store {} forwarded a local update to node {}", store_id, node_id);
+            }
         }
         None => schedule_node_reconcile(debouncer, reconcile_tx, node_id),
     }
@@ -490,157 +548,11 @@ async fn forward_local_change(
 /// it fetched with its own credential has no per-request `Principal` to
 /// forward; the handler's internal entry point authorises nothing
 /// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 4).
-async fn apply_update_locally(handler: &RpcHandler, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8], repair: Repair) -> anyhow::Result<()> {
+pub(super) async fn apply_update_locally(handler: &RpcHandler, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8], repair: Repair) -> anyhow::Result<()> {
     handler
         .apply_node_update_from(store_id, node_id, update, Some(link_id), repair)
         .await
         .map_err(|e| anyhow::anyhow!("local applyEdit for node {} failed: {}", node_id, e.message()))?;
-    Ok(())
-}
-
-// ── Reconcile ────────────────────────────────────────────────────────
-
-/// A full reconcile over documents (decision 5): every held document's
-/// state vector goes to the remote in one `syncNodes` (batched by the
-/// client) that also asks what it did not name; what comes back is merged,
-/// the named unknowns are fetched in batches of [`MAX_SYNC_NODE_CONTENTS`]
-/// and merged, every held document is pushed back to the extent the remote
-/// lacks it (whole when the remote never heard of it), and the tree is
-/// repaired once at the end (see `Repair::Later`: a repair between two
-/// batches would judge a half-arrived tree). The live channels are drained
-/// every batch (see [`Channels`]).
-async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str, channels: &mut Channels) -> anyhow::Result<()> {
-    let manager = handler.store_manager_handle();
-
-    let local_svs: Vec<(NodeId, Vec<u8>)> = {
-        let manager = manager.read().await;
-        let ids = manager.doc_ids(store_id)?;
-        let mut svs = Vec::with_capacity(ids.len());
-        for node_id in ids {
-            svs.push((node_id, manager.node_state_vector(store_id, node_id)?));
-        }
-        svs
-    };
-
-    let (answers, unknown) = client
-        .sync_nodes(store_id, &local_svs, true)
-        .await
-        .map_err(|e| anyhow::anyhow!("remote syncNodes failed: {}", e))?;
-
-    // The pull always applies (decision 7's finding: a yrs v1 diff is never
-    // actually empty — `[0, 0]` at minimum plus the sender's whole delete
-    // set — so an `is_empty()` gate here would always be true); the handler
-    // does its own no-op check (decision 8), so applying a diff that turns
-    // out to carry nothing new is cheap. Then the push back, only where the
-    // remote lacks something.
-    let mut answered = std::collections::HashSet::with_capacity(answers.len());
-    for chunk in answers.chunks(MAX_SYNC_NODE_CONTENTS) {
-        for (node_id, diff, remote_sv) in chunk {
-            answered.insert(*node_id);
-            apply_update_locally(handler, store_id, *node_id, link_id, diff, Repair::Later).await?;
-            push_node_diff(handler, client, store_id, *node_id, link_id, remote_sv, diff).await?;
-        }
-        channels.drain(handler, client, store_id, link_id).await?;
-    }
-
-    // Documents the remote holds and this store does not: asked for whole
-    // (an empty state vector), and nothing to push back for them.
-    let empty_sv = pimble_crdt::empty_state_vector();
-    for chunk in unknown.chunks(MAX_SYNC_NODE_CONTENTS) {
-        let wanted: Vec<(NodeId, Vec<u8>)> = chunk.iter().map(|id| (*id, empty_sv.clone())).collect();
-        let (fetched, _) = client
-            .sync_nodes(store_id, &wanted, false)
-            .await
-            .map_err(|e| anyhow::anyhow!("remote syncNodes for unknown documents failed: {}", e))?;
-        for (node_id, diff, _) in fetched {
-            apply_update_locally(handler, store_id, node_id, link_id, &diff, Repair::Later).await?;
-        }
-        channels.drain(handler, client, store_id, link_id).await?;
-    }
-
-    // Documents this store holds and the remote does not: its `applyEdit`
-    // makes a document for an id it has never seen, so the whole state goes
-    // (`save`, which unlike a diff from an empty vector carries what is
-    // still pending here too).
-    let unanswered: Vec<NodeId> = local_svs.iter().map(|(id, _)| *id).filter(|id| !answered.contains(id)).collect();
-    for chunk in unanswered.chunks(MAX_SYNC_NODE_CONTENTS) {
-        for node_id in chunk {
-            let whole = {
-                let manager = manager.read().await;
-                match manager.tree(store_id)?.doc(*node_id) {
-                    Some(doc) => doc.save(),
-                    None => continue,
-                }
-            };
-            push_update_remotely(client, store_id, *node_id, link_id, &whole).await?;
-            debug!("Sync link for store {} pushed the whole document of node {} to the remote", store_id, node_id);
-        }
-        channels.drain(handler, client, store_id, link_id).await?;
-    }
-
-    handler.repair_store_tree(store_id).await;
-    Ok(())
-}
-
-/// Reconcile one document with the remote (decision 5), the fallback for a
-/// notification about it that carried no bytes.
-async fn reconcile_node(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, node_id: NodeId, link_id: &str) -> anyhow::Result<()> {
-    let manager = handler.store_manager_handle();
-
-    let local_sv = {
-        let manager = manager.read().await;
-        // Not held here yet: everything the remote has of it is wanted.
-        manager.node_state_vector(store_id, node_id).unwrap_or_else(|_| pimble_crdt::empty_state_vector())
-    };
-
-    let (diff, remote_sv) = client
-        .sync_node_content(store_id, node_id, &local_sv)
-        .await
-        .map_err(|e| anyhow::anyhow!("remote syncNodes for node {} failed: {}", node_id, e))?;
-
-    apply_update_locally(handler, store_id, node_id, link_id, &diff, Repair::Debounced).await?;
-
-    push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv, &diff).await
-}
-
-/// Send the remote everything this node's local document has beyond
-/// `remote_sv`, if anything — `remote_diff` (the diff the remote just sent
-/// us, en route to `remote_sv`) is what `diff_if_peer_lacks_it` needs to
-/// tell "nothing new" apart from "carries the remote's whole delete set, as
-/// every yrs diff does" (decision 7).
-async fn push_node_diff(
-    handler: &RpcHandler,
-    client: &PimbleClient,
-    store_id: StoreId,
-    node_id: NodeId,
-    link_id: &str,
-    remote_sv: &[u8],
-    remote_diff: &[u8],
-) -> anyhow::Result<()> {
-    let local_push = {
-        let manager = handler.store_manager_handle();
-        let manager = manager.read().await;
-        let tree = manager.tree(store_id)?;
-        match tree.doc(node_id) {
-            Some(doc) => doc.diff_if_peer_lacks_it(remote_sv, remote_diff)?,
-            None => None,
-        }
-    };
-
-    if let Some(local_diff) = local_push {
-        push_update_remotely(client, store_id, node_id, link_id, &local_diff).await?;
-        debug!("Sync link for store {} pushed a diff for node {} to the remote", store_id, node_id);
-    }
-
-    Ok(())
-}
-
-async fn push_update_remotely(client: &PimbleClient, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8]) -> anyhow::Result<()> {
-    let changes = base64::engine::general_purpose::STANDARD.encode(update);
-    client
-        .apply_edit(store_id, node_id, link_id, EditOperation::IncrementalChanges { changes })
-        .await
-        .map_err(|e| anyhow::anyhow!("remote applyEdit for node {} failed during reconcile: {}", node_id, e))?;
     Ok(())
 }
 

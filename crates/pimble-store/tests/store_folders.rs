@@ -52,6 +52,7 @@ fn link(last_seq: &[(&str, u64)]) -> SyncConfig {
         last_sync: None,
         mode: SyncMode::Vault,
         via_relay: false,
+        via_account: false,
         last_seq: last_seq.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         vault_key_id: None,
         access: StoreAccess::Full,

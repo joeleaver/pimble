@@ -40,6 +40,8 @@
 //! several documents' updates, is applied whole before repair judges it
 //! (see [`Repair`]).
 
+mod hosted_plain;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1257,7 +1259,7 @@ pub struct RpcHandler {
     /// (`crate::relay_face`). Nothing of it runs until a store is relayed.
     relay: Arc<crate::relay_face::RelayHost>,
     /// How often a connected vault link asks whether the account's grant on
-    /// its store has changed (`crate::vault_link::GRANT_CHECK_EVERY` unless
+    /// its store has changed (`crate::grant::GRANT_CHECK_EVERY` unless
     /// `ServerConfig::grant_check_interval` says otherwise).
     grant_check_every: Duration,
     /// Whether this server's vault links report what they hold and compare
@@ -1422,7 +1424,7 @@ impl RpcHandler {
             vault_links: Arc::new(RwLock::new(HashMap::new())),
             keystore: Arc::new(Keystore::on_disk(&disk, keystore_path)),
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
-            grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
+            grant_check_every: crate::grant::GRANT_CHECK_EVERY,
             vault_reports: true,
             out_of_step_after: crate::vault_link::OUT_OF_STEP_AFTER,
             set_aside_after: Duration::from_secs(pimble_rpc::vault::SET_ASIDE_AFTER_SECS as u64),
@@ -2350,6 +2352,7 @@ impl RpcHandler {
                     last_sync: None,
                     mode: SyncMode::Vault,
                     via_relay: reach.via_relay,
+                    via_account: false,
                     last_seq: Default::default(),
                     vault_key_id: Some(key_id),
                     access: held_as.access,
@@ -2692,7 +2695,7 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, via_account: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
@@ -4663,6 +4666,14 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
+        // A plain store: its hosted server holds its documents in the clear,
+        // so there are no keys to fetch, and a plain link held through the
+        // account keeps the replica in step (`hosted_plain`).
+        let is_plain = rows.iter().any(|row| row.store_id.eq_ignore_ascii_case(&store_id.to_string()) && row.kind == hosted_plain::PLAIN_KIND);
+        if is_plain {
+            return self.add_hosted_plain_store(store_id, &held_as, &name, open_roots.is_some()).await;
+        }
+
         // The scope keys this account has been handed: the store key, or
         // each share's. An envelope is believed when the account itself or
         // one of the store's owners signed it.
@@ -6037,7 +6048,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, via_account: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);
