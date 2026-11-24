@@ -176,7 +176,7 @@ ever leaves the app without the modifier.
 ## What a link looks like
 
 The link colour (`--rinch-primary-color-4` dark, `-6` light), no underline until hover
-(built 2026-09-23, `styles.rs`; the hover underline does not show on the desktop yet).
+(built 2026-09-23, `styles/editor_content.css`; the hover underline does not show on the desktop yet).
 Hover and Ctrl/Cmd+click are built on rinch PR joeleaver/rinch#892 (`on_link_hover`,
 `on_link_click`, wired in `editor::start_editing`): the tooltip (`links::hover_link`,
 `tooltip_target`: the note's title and store as the app knows them, or a web link's URL,

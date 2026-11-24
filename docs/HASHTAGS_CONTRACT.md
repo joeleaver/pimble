@@ -143,7 +143,7 @@ caret, selection, typing and deleting are unchanged. Ctrl+click on a hashtag sea
   at its strings. Code blocks are skipped, text under the `code` mark is masked, an image or hard
   break is one masked place. `decorations` hands out one `Inline` decoration with class
   `pimble-hashtag` per range.
-- **Style** (`styles.rs` `EDITOR_CSS`): `color` only, the link colors (`--rinch-primary-color-6`
+- **Style** (`styles/editor_content.css`, `EDITOR_CSS`): `color` only, the link colors (`--rinch-primary-color-6`
   light, `-4` dark). Checked on screen: the words of a line start at the same pixel columns with
   the coloring as without it (the previous binary on the same note), and the caret, typing inside
   a hashtag, Backspace and a selection across one behave as in plain text.

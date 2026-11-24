@@ -1,0 +1,188 @@
+/* A small pane (a quarter of a split view): a tighter rail, and no color
+   well squares (the context bar's swatches open its picker). */
+.pimble-board--small .pimble-board__rail .pimble-board-tool {
+    width: 24px;
+    height: 24px;
+}
+
+.pimble-board--small .pimble-board__rail-gap {
+    margin: 2px 0;
+}
+
+.pimble-board--small .pimble-board__well {
+    display: none;
+}
+
+.pimble-board--small .pimble-board__map {
+    width: 140px;
+    height: 88px;
+}
+
+.pimble-board__panels {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    pointer-events: auto;
+}
+
+.pimble-board__panel-box {
+    flex-shrink: 0;
+}
+
+/* A folded panel is its icon alone, at the right edge of the column. */
+.pimble-board__panel-box--icon {
+    align-self: flex-end;
+}
+
+.pimble-board__panel-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    cursor: pointer;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__panel-icon:hover {
+    color: var(--rinch-color-text);
+}
+
+.pimble-board__panel-body {
+    padding: 0 8px 8px 8px;
+}
+
+.pimble-board__corner {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    pointer-events: auto;
+}
+
+.pimble-board__map {
+    position: relative;
+    width: 200px;
+    height: 128px;
+    display: flex;
+    overflow: hidden;
+}
+
+.pimble-board__bottom-center {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 10px;
+    z-index: 5;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+}
+
+.pimble-board__layers-body {
+    display: flex;
+    flex-direction: column;
+}
+
+.pimble-board__layer-fold {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__layer-kind {
+    width: 14px;
+    height: 14px;
+}
+
+/* A layer's thumbnail (docs/DRAWING_CONTRACT.md section 4): drawn at twice
+   its size, on a faint panel so a white mark shows. */
+.pimble-board__layer-thumb {
+    width: 24px;
+    height: 18px;
+    flex-shrink: 0;
+    margin: 0 4px 0 2px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 2px;
+    background: var(--rinch-color-default);
+}
+
+/* The Stamp's symbol picker and settings (docs/DRAWING_WAVE6_CONTRACT.md
+   section 2): thumbnails on a faint panel, a column of rows. */
+.pimble-board__symbol-thumb {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 2px;
+    background: var(--rinch-color-default);
+}
+
+.pimble-board__symbol-face {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pimble-board__symbol {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-board__stack {
+    flex-direction: column;
+    align-items: stretch;
+    max-width: 360px;
+}
+
+.pimble-board__symbols {
+    flex-wrap: wrap;
+    max-width: 480px;
+}
+
+/* An eye or lock that a group's own flag decides. */
+.pimble-board__layer-icon--inherited {
+    opacity: 0.4;
+}
+
+.pimble-board__layer--drop-above {
+    border-top-color: var(--rinch-primary-color-5);
+}
+
+.pimble-board__layer--drop-below {
+    border-bottom-color: var(--rinch-primary-color-5);
+}
+
+.pimble-board__layer--drop-into {
+    border-color: var(--rinch-primary-color-5);
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-board__layer-props {
+    margin-top: 6px;
+    padding-right: 8px;
+}
+
+.pimble-board__blend {
+    white-space: nowrap;
+}
+
+.pimble-board__blends {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin: 4px 0;
+}
+
+.pimble-board-chip--hidden {
+    display: none;
+}
+

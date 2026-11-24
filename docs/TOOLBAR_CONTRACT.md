@@ -100,7 +100,7 @@ cell), `boards/toolbar.rs` (Canvas group, contextual groups, embeds), `boards/ra
 (`render_context_bar` answers the controls and their pickers; `context_label`, `context_shown`,
 `status_hint`), `boards/ui.rs` (no bar), `boards/tools.rs` (Escape), `boards/export.rs`
 (embeds, names), `sheets.rs` (`pressed_outside`), `sheets/toolbar.rs` (in-text sheets, the
-selected table), `sheets/in_text.rs`, `app/shell.rs` (the status bar hint), `styles.rs`.
+selected table), `sheets/in_text.rs`, `app/shell.rs` (the status bar hint), `styles/toolbar.css` and `styles/status_bar.css`.
 
 Tests: the rule over every pane kind and item; a selection of exactly a picture or an embedded
 canvas node (not a caret beside it); export names all different; the opening zoom; the groups.
