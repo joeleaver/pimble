@@ -1,0 +1,17 @@
+# The worker's build crate: crates/pimble-worker as the browser app's workspace
+# builds it (web/index.html). It lives in this workspace so that web/Cargo.lock
+# names every dependency the worker has, which the deploy's trunk buildpack
+# fetches before it builds with the network off (it fetches this workspace
+# only; built from the main workspace, the worker's rhypedb was never fetched
+# and the deploy failed, 2026-11-23).
+[package]
+name = "pimble-web-worker"
+version = "0.0.0"  # never read: the workspace version is web/Cargo.toml's
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pimble-worker = { path = "../../crates/pimble-worker", features = ["entry"] }

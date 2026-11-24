@@ -3,8 +3,8 @@
 # parent with TRUNK_STAGING_DIR set, before the build replaces dist/.
 #
 # 1. The browser's own server (docs/ONE_CODEBASE_CONTRACT.md wave 4) is built
-#    by trunk under fixed names (pimble-worker_loader.js, pimble-worker.js,
-#    pimble-worker_bg.wasm): trunk hashes no worker. They are renamed by a
+#    by trunk under fixed names (pimble-web-worker_loader.js, pimble-web-worker.js,
+#    pimble-web-worker_bg.wasm): trunk hashes no worker. They are renamed by a
 #    hash of their contents, the loader rewritten to load its own pair, and
 #    the page told the loader's name (the `pimble-worker-loader` meta tag in
 #    index.html, which hub.js reads), so a page always starts the worker of
@@ -22,14 +22,14 @@ base="${TRUNK_PUBLIC_URL:-/app/}"
 
 hash_of() { cat "$@" | sha256sum | cut -c1-16; }
 
-if [ -f "$dir/pimble-worker_bg.wasm" ]; then
-  h=$(hash_of "$dir/pimble-worker.js" "$dir/pimble-worker_bg.wasm")
-  mv "$dir/pimble-worker.js" "$dir/pimble-worker-$h.js"
-  mv "$dir/pimble-worker_bg.wasm" "$dir/pimble-worker-${h}_bg.wasm"
-  rm -f "$dir/pimble-worker_loader.js"
-  printf 'importScripts("./pimble-worker-%s.js");wasm_bindgen("./pimble-worker-%s_bg.wasm");' "$h" "$h" > "$dir/pimble-worker-${h}_loader.js"
-  sed -i "s|content=\"pimble-worker_loader.js\"|content=\"pimble-worker-${h}_loader.js\"|" "$dir/index.html"
-  grep -q "pimble-worker-${h}_loader.js" "$dir/index.html" || { echo "post_build: index.html names no worker loader" >&2; exit 1; }
+if [ -f "$dir/pimble-web-worker_bg.wasm" ]; then
+  h=$(hash_of "$dir/pimble-web-worker.js" "$dir/pimble-web-worker_bg.wasm")
+  mv "$dir/pimble-web-worker.js" "$dir/pimble-web-worker-$h.js"
+  mv "$dir/pimble-web-worker_bg.wasm" "$dir/pimble-web-worker-${h}_bg.wasm"
+  rm -f "$dir/pimble-web-worker_loader.js"
+  printf 'importScripts("./pimble-web-worker-%s.js");wasm_bindgen("./pimble-web-worker-%s_bg.wasm");' "$h" "$h" > "$dir/pimble-web-worker-${h}_loader.js"
+  sed -i "s|content=\"pimble-web-worker_loader.js\"|content=\"pimble-web-worker-${h}_loader.js\"|" "$dir/index.html"
+  grep -q "pimble-web-worker-${h}_loader.js" "$dir/index.html" || { echo "post_build: index.html names no worker loader" >&2; exit 1; }
 fi
 
 # Every file of this build, as the page asks for it, and the build's id: a

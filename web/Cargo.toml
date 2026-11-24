@@ -4,12 +4,12 @@
 # otherwise try to build this for the host, where `rinch-web` has no document to
 # render into.
 [workspace]
-members = ["."]
+members = [".", "worker"]
 resolver = "2"
 
 [package]
 name = "pimble-web"
-version = "0.30.1"
+version = "0.30.2"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -109,6 +109,15 @@ opt-level = 2
 # The wasm binary is shipped over the wire, so size is the thing to optimise;
 # trunk's `data-wasm-opt="z"` runs wasm-opt over the result as well.
 opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# The browser's worker (worker/, built by index.html through trunk), for size
+# as the page is, with the main workspace's settings for it.
+[profile.worker]
+inherits = "release"
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"

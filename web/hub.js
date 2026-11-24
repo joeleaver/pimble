@@ -5,7 +5,7 @@
 //
 // Every tab asks for one Web Lock, `pimble-server`. The tab that holds it is
 // the leader: it runs the server in a dedicated worker (the page's build
-// writes it, `pimble-worker_loader.js`, from crates/pimble-worker with its
+// writes it, `pimble-web-worker_loader.js`, from crates/pimble-worker with its
 // `entry` feature) and relays the other tabs' connections to it. The others
 // talk to it through a BroadcastChannel, JSON-RPC text addressed by a
 // connection id. When the leader tab closes, the lock passes to the next tab,
@@ -116,7 +116,7 @@
     // worker's contents (build/post_build.sh), in a meta tag of index.html.
     function workerUrl() {
         const meta = document.querySelector('meta[name="pimble-worker-loader"]');
-        const name = (meta && meta.content) || "pimble-worker_loader.js";
+        const name = (meta && meta.content) || "pimble-web-worker_loader.js";
         // The page is served under /app/ (Trunk.toml public_url).
         return new URL("/app/" + name, location.origin).href;
     }

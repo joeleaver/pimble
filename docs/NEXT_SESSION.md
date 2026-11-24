@@ -1,5 +1,96 @@
 # Next session: start here
 
+**2026-11-23 (master session local_198b8f9e, transcript 3e8511e5): wave 5 started.**
+Cleanup of session 78e7f30f done: its scratch (1.8 GB) deleted. It is the app session
+`local_0e9ad72e` ("Pimble"); archiving it was refused while a Remote Control client is
+attached, so Joe archives it from the sidebar. The three other worktrees are untouched.
+Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all three:
+- Master: local_198b8f9e. It keeps this file, reviews, merges, releases and deploys.
+- Open work: local_29e8b449 ("Pimble master: finish notifications"). It works on notifications
+  waves 3-4 and the walk-through in `/home/joe/dev/pimble-notifications`, then wave 5. It reports
+  its branch tip and Joe's open decisions to the master and does not merge or release itself.
+- Bear liaison: local_9f92929f (`bear-liaison`). It handles Shared Pimble Notes and the Pimble To
+  Do board, and posts release summaries only once a release is published.
+- Waiting on rinch: a code block can't grow past one line (Enter has no `newlineInCode`;
+  Shift+Enter's hard break isn't allowed in code). Sent to the Rinch master 2026-11-23; move
+  the pin when it merges.
+- Kanban drop and column-height fixes merged (0ed2349, reviewed twice). Release 0.30.2 (kanban
+  0.1.2) is committed and pushed; tag `v0.30.2` waits for CI run 45304589117 to pass. Then come the
+  Release run, install-release.sh, `git push jkbase`, sw.js 200, and the Bear liaison's summary.
+- Kanban worker local_97f04d79 (`kanban-fixes`): `claude/kanban-column-view` (07cb523) holds stage 1. Next is Joe's
+  column view (a column node opens as one kanban column, with a column icon; ABI 7
+  `Provision::ChildViewer`). Its ABI, SDK and plugin parts can be built now. Its app edits, with the splits
+  of app.rs, state.rs, events.rs and plugins.rs, wait until notifications merges.
+- The old-path inventory for wave 5 is in the side-session notes folder (`wave5-inventory.md`).
+
+**2026-11-23 handover (master session badfd859-f16b-4ea1-9262-11df8582780f, stopped at
+the weekly limit; every agent of it is dead).** Released today: 0.30.0 and 0.30.1 (Bear
+cards: copy a picture, Save Picture As, hourly update check; summaries posted in Shared
+Pimble Notes). Building: **notifications**, docs/NOTIFICATIONS_CONTRACT.md (design agreed
+with Joe; he said "build the whole thing, all waves").
+
+- Branch `notifications`, worktree `/home/joe/dev/pimble-notifications`, target dir
+  `/home/joe/dev/pimble-notif-target`. Not pushed, not merged. Must survive.
+- Done and committed: wave 0 (mentions, d55c115), wave 1 (notice key, inbox, sending,
+  Inbox view, switch; 11a2b8e, 4fb67a1), wave 2 (email fallback, web push, seen/read,
+  channel switches; 6d96320, 5a9faea). Each has a "Built in wave N" section in the contract.
+- Wave 3 (watches): only a checkpoint, ba4a2de, **which does not build**: `pimble-core`
+  `watch.rs`, RPC types and the declarations `watchNode`, `unwatchNode`, `listWatches`,
+  `subscribeWrites`. Still to write: the handler, the accounts service's
+  `PUT/GET /api/v1/me/watches` and 5-quiet-minute batching per (watcher, doc, writer)
+  (injectable clock, as `notify.rs`), Watch/Unwatch UI with subtrees, the relay face,
+  the switch deleting watches, tests, the contract's "Built in wave 3".
+- Then wave 4 (the tray, on by default), then the end-to-end walk-through on
+  `scripts/local-stack` (OS notification, Inbox, a real browser push).
+- Decisions to put to Joe at the end: mention names in note text do not follow renames
+  (needs a rinch mechanism); the `list_people` MCP tool; one account-wide switch; notices
+  open at the mention, a discussion as a whole; the service now learns mention vs reply
+  (for the email wording; else "wrote to you"); seen-but-unread is not emailed; push
+  switched per account, not per browser. Before deploying: `pimble-cloud
+  --generate-vapid-key` into `PIMBLE_VAPID_PRIVATE_KEY` (docs/DEPLOY.md).
+- Offer as its own task: in the sharing test harness, a discussion the owner starts on a
+  shared note did not reach the member within 30 s (member to owner works).
+- Bear board: the welcome-note card is still in To Do; the notifications card points at
+  the contract. Post Bear summaries only once a release is published.
+- Not this session's, leave alone: worktrees `pimble-tree-drops` and
+  `.claude/worktrees/jolly-lovelace-c07780`.
+
+**2026-11-23 handover (master session 78e7f30f-9d69-4df3-984a-dee51fb8f54e, ended after
+a compaction and a session-limit stop; no background jobs or agents survive).**
+
+State: v0.30.1 released and installed here; the web app is deployed as jkbase v64
+(8c150b9) with the browser's own server (worker) as its default, `/app/sw.js` 200.
+docs/ONE_CODEBASE_CONTRACT.md waves 0-4 and the wave 4 follow-ups are done.
+
+Fixed in passing: every web deploy since 0.30.0 failed silently ("[static] app failed"),
+because jkbase's trunk buildpack fetches only web/'s workspace and the worker was built
+from the main one. The worker now builds through `web/worker` (a member of web's
+workspace; files `pimble-web-worker-<hash>`). A failed build's reason is not in
+`jkbase logs`: read it from `GET https://api.jkbase.app/projects/pimble/builds`
+(targets[].detail) with the CLI's token from `~/.jkbase/credentials` (never print it).
+Local check of a deploy build: an empty `CARGO_HOME`, `cargo fetch --locked` in web/,
+then `trunk build --release --offline` with wasm-bindgen 0.2.128 on PATH.
+
+Open, in order:
+
+1. **Wave 5** (docs/ONE_CODEBASE_CONTRACT.md): delete the browser's old path
+   (`?server=old`, web's vault.rs, vault_backend.rs, routed.rs, endpoints.rs and what
+   only they use) and turn on the no-second-path check. Not briefed yet.
+2. The plain hosted stores in the browser; a Settings switch and "Forget This Browser";
+   worker diagnostics; Safari untested.
+3. Joe may want to rotate the jkbase CLI token (it was printed into session 78e7f30f's
+   transcript by mistake on 2026-11-23; it went nowhere else).
+
+Cleanup for the next master (docs: ~/.claude/rules/master-session-handover.md):
+- Archive session 78e7f30f-9d69-4df3-984a-dee51fb8f54e. It started no side sessions that
+  are still open, and its agents ran in this checkout (no agent worktrees of its own).
+- Not this session's, leave them: worktrees `/home/joe/dev/pimble-notifications`
+  (`notifications`), `/home/joe/dev/pimble-tree-drops` (`tree-drops-stores`),
+  `.claude/worktrees/jolly-lovelace-c07780` (detached), and the uncommitted work of the
+  notifications session, if any.
+- Scratch to delete: `/tmp/claude-1000/-home-joe-dev-pimble/78e7f30f-9d69-4df3-984a-dee51fb8f54e/`
+  (a fresh cargo home, dist checks, a deploy export, wasm-bindgen 0.2.128).
+
 **2026-11-22: v0.29.0 released and installed. Everything below this line up to 0.28.9 is
 committed and released** (0.28.10 to 0.29.0): text color (docs/TEXT_COLOR_CONTRACT.md),
 whole-window zoom (docs/ZOOM_CONTRACT.md), the toolbar that follows the selection, one-row
