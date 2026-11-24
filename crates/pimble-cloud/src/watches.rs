@@ -169,24 +169,28 @@ pub async fn all_interest(state: &AppState) -> CloudResult<Vec<WriteInterest>> {
 /// Gather `writes` to `store_uuid` at `now_ms` for everyone watching them.
 /// Answers how many (watcher, write) pairs were gathered.
 pub async fn record_writes(state: &AppState, store_uuid: &str, writes: &[Write], now_ms: i64) -> CloudResult<usize> {
-    gather(state, store_uuid, writes, now_ms, None).await
+    gather(state, store_uuid, writes.iter().map(|write| (None, write)), now_ms).await
 }
 
-/// [`record_writes`] for the relay report `report`: a write of it that a
-/// batch gathered already (an earlier sending that failed before the report
-/// was remembered) is not gathered again, even once its notice was queued
-/// (`WatchBatchRow::reports`).
-pub async fn record_relay_writes(state: &AppState, store_uuid: &str, report: &str, writes: &[Write], now_ms: i64) -> CloudResult<usize> {
-    gather(state, store_uuid, writes, now_ms, Some(report)).await
+/// [`record_writes`] for the relay report `report`, each write with its
+/// place in the report as it was sent: a write of it that a batch gathered
+/// already (an earlier sending that failed before the report was
+/// remembered) is not gathered again, even once its notice was queued
+/// (`WatchBatchRow::reports`), and one the earlier sending did not reach
+/// is. Each write is judged by its place, not the report by its id, as one
+/// report can name the same writer and document twice (two spells of
+/// editing, the second after a gap).
+pub async fn record_relay_writes(state: &AppState, store_uuid: &str, report: &str, writes: &[(usize, Write)], now_ms: i64) -> CloudResult<usize> {
+    gather(state, store_uuid, writes.iter().map(|(place, write)| (Some(WatchBatchRow::report_write(report, *place)), write)), now_ms).await
 }
 
-async fn gather(state: &AppState, store_uuid: &str, writes: &[Write], now_ms: i64, report: Option<&str>) -> CloudResult<usize> {
+async fn gather<'w>(state: &AppState, store_uuid: &str, writes: impl Iterator<Item = (Option<String>, &'w Write)>, now_ms: i64) -> CloudResult<usize> {
     let Some(store) = state.db.find_hosted_store(store_uuid).await? else { return Ok(0) };
     if store.deleted {
         return Ok(0);
     }
     let mut gathered = 0;
-    for write in writes {
+    for (named, write) in writes {
         let reached: BTreeSet<String> = write.roots.iter().map(|r| canonical(r)).collect();
         let at = if write.last_ms > 0 { write.last_ms.clamp(now_ms - LATEST_TOLD_LATE_MS, now_ms) } else { now_ms };
         for watched in state.db.watchers_of(store_uuid, &write.doc).await? {
@@ -200,7 +204,7 @@ async fn gather(state: &AppState, store_uuid: &str, writes: &[Write], now_ms: i6
             let grants = state.db.grants_for_user_and_store(watcher.rid, store.rid).await?;
             let Some(root) = told_through(&grants, &reached) else { continue };
             let _one_at_a_time = state.watches_lock.lock().await;
-            if state.db.gather_watch_write(&watcher.user_uuid, store_uuid, &write.doc, &write.writer, &root, at, report.map(|r| (r, now_ms))).await? {
+            if state.db.gather_watch_write(&watcher.user_uuid, store_uuid, &write.doc, &write.writer, &root, at, named.as_deref().map(|n| (n, now_ms))).await? {
                 gathered += 1;
             }
         }

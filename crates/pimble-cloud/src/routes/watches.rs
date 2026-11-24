@@ -190,7 +190,9 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
     let mut grants_of: BTreeMap<String, Vec<GrantRow>> = BTreeMap::new();
     let mut taken = Vec::with_capacity(body.writes.len());
     let mut refused = 0usize;
-    for write in body.writes {
+    // Each write keeps its place in the report as sent (the same every time
+    // it is sent), by which a batch knows it gathered it already.
+    for (place, write) in body.writes.into_iter().enumerate() {
         let writer = uuid::Uuid::parse_str(&write.writer).map(|u| u.to_string()).unwrap_or_default();
         if !grants_of.contains_key(&writer) {
             let grants = match state.db.find_user_by_uuid(&writer).await? {
@@ -201,7 +203,7 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
         }
         let reached: BTreeSet<String> = write.roots.iter().map(|r| crate::watches::canonical(r)).collect();
         if crate::watches::told_through(&grants_of[&writer], &reached).is_some() {
-            taken.push(crate::watches::Write { writer, ..write });
+            taken.push((place, crate::watches::Write { writer, ..write }));
         } else {
             refused += 1;
         }
@@ -210,8 +212,8 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
     let gathered = crate::watches::record_relay_writes(&state, &store.store_id, &report, &taken, now).await?;
     // Remembered once gathered: a report that failed half way, or whose
     // remembering failed, is gathered again when it is sent again, and each
-    // batch it reached already holds its id, so none of its writes is
-    // gathered twice, even one whose notice was queued meanwhile.
+    // batch it reached already holds each of its writes it gathered, so none
+    // of them is gathered twice, even one whose notice was queued meanwhile.
     state.db.remember_relay_report(&report, &store.store_id, now).await?;
     Ok(Json(json!({ "gathered": gathered, "refused": refused })))
 }

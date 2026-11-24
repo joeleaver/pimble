@@ -396,13 +396,13 @@ async fn a_relay_report_gathered_but_not_remembered_tells_its_writes_once() {
     let olgas = pimble_cloud::watches::Write { last_ms: now_ms() - 20 * MIN, ..write(&doc, &olga_id, &[&garden]) };
 
     // The first sending gathered it, and then remembering the report failed.
-    assert_eq!(record_relay_writes(state, &relayed_id, &report, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 1);
+    assert_eq!(record_relay_writes(state, &relayed_id, &report, &[(0, olgas.clone())], now_ms()).await.unwrap(), 1);
     assert!(!state.db.relay_report_taken(&report).await.unwrap());
     watch_pass(state, now_ms()).await.unwrap();
     assert_eq!(watch_notices(&stack, &will_cookie, &notice, &will_id).await.len(), 1, "told");
 
     // Sent again, directly and through the route: nothing more is gathered.
-    assert_eq!(record_relay_writes(state, &relayed_id, &report, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 0);
+    assert_eq!(record_relay_writes(state, &relayed_id, &report, &[(0, olgas.clone())], now_ms()).await.unwrap(), 0);
     let body = json!({ "store_id": relayed_id, "report": report, "writes": [{ "doc": doc, "writer": olga_id, "roots": [garden], "last_ms": olgas.last_ms }] });
     let resp = stack.http.post(format!("{}/watches/writes", stack.base_url)).header("Cookie", &olga_cookie).json(&body).send().await.unwrap();
     assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 0 }));
@@ -413,13 +413,56 @@ async fn a_relay_report_gathered_but_not_remembered_tells_its_writes_once() {
     // The taken batch stays, with no spells, for as long as its report is
     // remembered; another report's write is gathered into it as usual.
     let batches = state.db.watch_batches_of(&will_id).await.unwrap();
-    assert_eq!((batches.len(), batches[0].count, batches[0].reports.contains_key(&report)), (1, 0, true));
+    assert_eq!((batches.len(), batches[0].count, batches[0].holds_report(&report)), (1, 0, true));
     let another = node_id();
-    assert_eq!(record_relay_writes(state, &relayed_id, &another, std::slice::from_ref(&olgas), now_ms()).await.unwrap(), 1);
+    assert_eq!(record_relay_writes(state, &relayed_id, &another, &[(0, olgas.clone())], now_ms()).await.unwrap(), 1);
     assert_eq!(state.db.watch_batches_of(&will_id).await.unwrap()[0].count, 1);
     state.db.forget_batch_reports_before(now_ms() + 1).await.unwrap();
     let batch = &state.db.watch_batches_of(&will_id).await.unwrap()[0];
     assert!(batch.reports.is_empty() && batch.count == 1, "the reports forgotten, the spell gathering kept");
+}
+
+/// One relay report naming the same writer and document twice (two spells
+/// of editing, the second after a gap, as after an outage) counts both, and
+/// a sending that gathered only the first and failed gathers the second
+/// when the report is sent again, and the first not twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_report_with_two_spells_of_one_writer_counts_both() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, will_cookie, will_id, _hosted_id, _root, _notice) = a_share_with_notice_keys(&stack, "watchtwospells").await;
+    let olga_id = uuid_of(&stack, "olga.watchtwospells@example.com").await;
+    let relayed = create_store_with_body(&stack, &olga_cookie, json!({ "name": "", "kind": "vault", "store_id": node_id(), "tier": "relay" })).await;
+    let relayed_id = relayed["store_id"].as_str().unwrap().to_string();
+    let garden = node_id();
+    let resp = put_member_with(&stack, &olga_cookie, &relayed_id, json!({ "email": "will.watchtwospells@example.com", "role": "editor", "root": garden, "name": "Garden" })).await;
+    assert_eq!(resp.status(), 200);
+    let (doc, other) = (node_id(), node_id());
+    assert_eq!(put_json(&stack, &will_cookie, &format!("/me/watches/stores/{relayed_id}"), json!({ "docs": [doc, other], "version": 0 })).await.status(), 200);
+    let state = &stack.app_state;
+    let (first_ms, second_ms) = (now_ms() - 20 * MIN, now_ms() - 5 * MIN);
+    let post = |report: &str, doc: &str| {
+        let body = json!({ "store_id": relayed_id, "report": report, "writes": [
+            { "doc": doc, "writer": olga_id, "roots": [garden], "last_ms": first_ms },
+            { "doc": doc, "writer": olga_id, "roots": [garden], "last_ms": second_ms },
+        ] });
+        stack.http.post(format!("{}/watches/writes", stack.base_url)).header("Cookie", &olga_cookie).json(&body).send()
+    };
+
+    let report = node_id();
+    assert_eq!(post(&report, &doc).await.unwrap().json::<Value>().await.unwrap(), json!({ "gathered": 2, "refused": 0 }));
+    let batches = state.db.watch_batches_of(&will_id).await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!((batches[0].count, batches[0].first_at_ms, batches[0].last_at_ms), (2, first_ms, second_ms), "both spells, the second the last");
+
+    // A sending that gathered the first write and failed: sent again, the
+    // second is gathered and the first is not gathered twice.
+    let resent = node_id();
+    let first = pimble_cloud::watches::Write { last_ms: first_ms, ..write(&other, &olga_id, &[&garden]) };
+    assert_eq!(record_relay_writes(state, &relayed_id, &resent, &[(0, first)], now_ms()).await.unwrap(), 1);
+    assert_eq!(post(&resent, &other).await.unwrap().json::<Value>().await.unwrap(), json!({ "gathered": 1, "refused": 0 }));
+    let batches = state.db.watch_batches_of(&will_id).await.unwrap();
+    let batch = batches.iter().find(|b| b.doc_uuid == other).expect("the other document's batch");
+    assert_eq!((batch.count, batch.last_at_ms), (2, second_ms));
 }
 
 /// A write told late, between two spells of editing gathered already and

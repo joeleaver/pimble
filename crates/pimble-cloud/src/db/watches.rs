@@ -39,9 +39,14 @@ pub struct WatchBatchRow {
     pub spells: pimble_core::watch::Spells,
     pub first_at_ms: i64,
     pub last_at_ms: i64,
-    /// The relay reports gathered into this batch, each with when it was
-    /// gathered: a report sent again finds its writes here, told or not,
-    /// and gathers none of them twice. Forgotten with the reports
+    /// The writes of relay reports gathered into this batch, each named
+    /// [`WatchBatchRow::report_write`] (the report's id and the write's
+    /// place in it) with when it was gathered: a report sent again finds
+    /// here each of its writes gathered already, told or not, and gathers
+    /// none of them twice, and gathers those it did not reach before. A
+    /// report may name the same writer and document more than once (two
+    /// spells of editing apart), so a write and not the report is what was
+    /// gathered. Forgotten with the reports
     /// (`crate::watches::RELAY_REPORT_REMEMBERED_MS`).
     pub reports: std::collections::BTreeMap<String, i64>,
 }
@@ -50,6 +55,19 @@ impl WatchBatchRow {
     /// "watcher/store/doc/writer": one batch per such key.
     pub fn key(watcher: &str, store: &str, doc: &str, writer: &str) -> String {
         format!("{watcher}/{store}/{doc}/{writer}")
+    }
+
+    /// How [`WatchBatchRow::reports`] names the write at `place` in the
+    /// relay report `report` (its place as the report was sent, the same
+    /// each time it is sent).
+    pub fn report_write(report: &str, place: usize) -> String {
+        format!("{report}#{place}")
+    }
+
+    /// Whether any write of the relay report `report` was gathered here.
+    pub fn holds_report(&self, report: &str) -> bool {
+        let prefix = format!("{report}#");
+        self.reports.keys().any(|key| key.starts_with(&prefix))
     }
 
     /// What `pimble_core::watch` judges a batch by; `None` once its spells
@@ -162,9 +180,10 @@ impl RhypeDb {
     /// A write by `writer` to `doc` at `at_ms`, gathered for `watcher`
     /// (told through `root`): a new batch, or added to the spells of
     /// editing of the one gathering, wherever among them it falls. A write
-    /// of a relay report (`report`: its id and when it is taken) that this
+    /// of a relay report (`report`: the write's name,
+    /// [`WatchBatchRow::report_write`], and when it is taken) that this
     /// batch gathered already, told since or not, is not gathered again;
-    /// the batch and the report it names are written in one query, so a
+    /// the batch and the write it names are written in one query, so a
     /// report sent again after a failure gathers each write once. Answers
     /// whether it was gathered. A read and then a write: the caller holds
     /// `AppState::watches_lock`, as `crate::watches::watch_pass` does to
