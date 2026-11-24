@@ -96,7 +96,8 @@ Read-only sections under the fields, each collapsed to one line when empty:
 
 **What and where.**
 
-- `crates/pimble-app/src/properties.rs`: the panel, rendered once by `pane_view::render_panes`
+- `crates/pimble-app/src/properties/` (`mod.rs` the panel; `tags.rs`, `fields.rs`,
+  `place.rs`, `references.rs` its sections): the panel, rendered once by `pane_view::render_panes`
   in a `pimble-panes-row` beside `.pimble-panes` (under the toolbar; the panes keep their
   percent layout inside what is left). It shows `pane_view::pane_document` of the focused
   pane, with the pane strip's own icon and title (`pane_icon`, `pane_title`, now
