@@ -741,8 +741,15 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   `watches_need_a_grant`, `the_watches_switch_deletes_the_watches_and_stops_gathering`
   (off empties documents and batches, the choices' version moves to 2 and older versions
   are 409 once back on), `only_a_relayed_stores_owner_reports_its_writes_and_only_its_members`
-  (a writer never shared the store is refused; bad ids and roots 400). Lib (18): the
-  watch lines' words. The `watch`, `notices` and `email` filters pass (16).
+  (a writer never shared the store is refused; bad ids, roots and report ids 400),
+  `a_relay_report_is_taken_once_and_names_a_member_only_inside_their_share` (a member
+  named for a document outside his share, or through a root he does not hold, is
+  refused; the same report sent again is `again: true` and gathers nothing; every
+  report is remembered and forgotten when old), `a_late_write_between_two_spells_is_counted_where_it_falls`,
+  `every_grant_change_tells_the_hosted_server_again` (a role changed, a whole-store
+  grant, a share removed, a member removed, a store deleted). Lib (19): the watch
+  lines' words, and an unreadable store waiting longer each time up to a minute. All
+  of `pimble-cloud` passes (19 lib, 98 integration) after `routes/stores.rs` was split.
 - `pimble-server/tests/watches.rs` (2), on the sharing harness with the stub service's
   new watch endpoints: nothing watched by default; watching a folder with its subtree
   writes sealed choices (version 1, no node id in the clear) and registers the folder
@@ -756,11 +763,16 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 - `pimble-server` lib: `Writes` gathering per document and writer and telling once
   quiet, and at stop, only named documents, everything on a relay face; the relay
   `Outbox` keeping what the service did not take on disk and sending it later, merging a
-  spell into one entry, dropping a refused part, sending many writes a part at a time; `docs_for` (subtrees, discussions and deleted nodes left out);
+  spell into one entry, dropping a refused part, sending many writes a part at a time,
+  a report whose answer was lost sent again with its id and taken once, a post under way
+  let go at stop with its writes kept, and what the face told as it stopped kept
+  (`run` over a fake owner and service); `docs_for` (subtrees, discussions and deleted nodes left out);
   unwatch taking the own watch or the nearest subtree watch above.
 - `pimble-app` lib (358 passed): the row menu's states (nothing watched by default),
   a watch notice's title and where it opens. `pimble-crypto`: the chosen watches do not
   open as the personal document.
+- `pimble-core`: `Spells` (a late write inside a span judged by the writes around it,
+  one closing a gap joining two spells, the same write twice counted once).
 - Builds: `cargo check --workspace --tests`, `web/` for wasm32.
 - **Not seen running**: no desktop or browser walk-through; the hosted server's
   `subscribeWrites` followed by the service's own loop and the relay face's report were

@@ -321,7 +321,7 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
     // been invited to shares before it had an account. Best effort — a share
     // that cannot be handed over right now must not make verification itself
     // fail; the next login claims it.
-    super::stores::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user).await;
     Ok(redirect_to("/app/login?verified=1"))
 }
 
@@ -364,7 +364,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     // (claiming runs at every login). Verification
     // usually does this first; login covers an invitation sent afterwards,
     // and any claim that failed then.
-    super::stores::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user).await;
     issue_session(&state, &user).await
 }
 
@@ -644,6 +644,9 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
             }
         }
         state.db.delete_grant(grant.rid).await?;
+        // The account held the store through this grant: what its watchers
+        // hold changed.
+        state.watch_interest.changed([grant.store_uuid.clone()]);
     }
     for key_grant in state.db.key_grants_for_user(user.rid).await? {
         state.db.delete_key_grant(key_grant.rid).await?;

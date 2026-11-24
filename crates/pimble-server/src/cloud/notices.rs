@@ -185,8 +185,10 @@ pub struct ReportedWrite {
 
 /// `POST /api/v1/watches/writes`: what an owner's relay face saw others
 /// write to the store it relays (only the owner of a relayed store may).
-pub async fn post_relay_writes(http: &dyn Http, base_url: &str, session: &str, store_id: &str, writes: &[ReportedWrite]) -> Result<()> {
-    let body = serde_json::json!({ "store_id": store_id, "writes": writes });
+/// `report` names the batch, the same each time it is sent, so the service
+/// takes it once however often its answer is lost.
+pub async fn post_relay_writes(http: &dyn Http, base_url: &str, session: &str, store_id: &str, report: &str, writes: &[ReportedWrite]) -> Result<()> {
+    let body = serde_json::json!({ "store_id": store_id, "report": report, "writes": writes });
     let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/watches/writes"), Some(session), &body).await?;
     Ok(())
 }

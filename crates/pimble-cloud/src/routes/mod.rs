@@ -1,8 +1,10 @@
 mod accounts;
 mod diagnostics;
 pub mod inbox;
+mod members;
 mod misc;
 mod people;
+mod store_keys;
 mod stores;
 mod watches;
 
@@ -51,10 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/token", post(accounts::mint_token))
         .route("/api/v1/stores", get(stores::list_stores).post(stores::create_store))
         .route("/api/v1/stores/:id", delete(stores::delete_store))
-        .route("/api/v1/stores/:id/members", get(stores::list_members).put(stores::put_member))
-        .route("/api/v1/stores/:id/members/:user_id", delete(stores::delete_member))
-        .route("/api/v1/stores/:id/invitations/:email", delete(stores::delete_invitation))
-        .route("/api/v1/stores/:id/keys", get(stores::get_store_keys).put(stores::put_store_keys))
+        .route("/api/v1/stores/:id/members", get(members::list_members).put(members::put_member))
+        .route("/api/v1/stores/:id/members/:user_id", delete(members::delete_member))
+        .route("/api/v1/stores/:id/invitations/:email", delete(members::delete_invitation))
+        .route("/api/v1/stores/:id/keys", get(store_keys::get_store_keys).put(store_keys::put_store_keys))
         // The relay (docs/RELAY_CONTRACT.md), both WebSockets: the owner's
         // tunnel, and a member's connection to the store behind one.
         .route("/api/v1/relay", get(crate::relay::owner_tunnel))

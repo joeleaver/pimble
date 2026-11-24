@@ -32,8 +32,10 @@ pub struct WatchBatchRow {
     pub writer_uuid: String,
     /// The share the watcher was told through: `""` for the whole store.
     pub root: String,
-    /// Spells of editing (`pimble_core::watch::Gathered::add_spell`).
+    /// Spells of editing: `spells.count()`.
     pub count: u64,
+    /// Their spans (`pimble_core::watch::Spells`).
+    pub spells: pimble_core::watch::Spells,
     pub first_at_ms: i64,
     pub last_at_ms: i64,
 }
@@ -60,8 +62,24 @@ fn watch_batch_from_object(o: &Object) -> CloudResult<WatchBatchRow> {
         writer_uuid: get_string(o, "writer_uuid")?.to_string(),
         root: get_string(o, "root")?.to_string(),
         count: get_u64(o, "count")?,
+        spells: spells_of(o)?,
         first_at_ms: get_datetime_ms(o, "first_at")?,
         last_at_ms: get_datetime_ms(o, "last_at")?,
+    })
+}
+
+/// A batch's spans; a row that has none (or none that parse) is one span
+/// from its first write to its last.
+fn spells_of(o: &Object) -> CloudResult<pimble_core::watch::Spells> {
+    let parsed = get_string_opt(o, "spells")?.and_then(|text| serde_json::from_str::<pimble_core::watch::Spells>(text).ok()).filter(|s| s.count() > 0);
+    Ok(match parsed {
+        Some(spells) => spells,
+        None => {
+            let mut spells = pimble_core::watch::Spells::default();
+            spells.add(get_datetime_ms(o, "first_at")?);
+            spells.add(get_datetime_ms(o, "last_at")?);
+            spells
+        }
     })
 }
 
@@ -129,34 +147,39 @@ impl RhypeDb {
     }
 
     /// A write by `writer` to `doc` at `at_ms`, gathered for `watcher`
-    /// (told through `root`): a new batch, or another spell of editing in
-    /// the one gathering when it is half a minute or more from the rest.
+    /// (told through `root`): a new batch, or added to the spells of
+    /// editing of the one gathering, wherever among them it falls.
     /// A read and then a write: the caller holds `AppState::watches_lock`,
     /// as `crate::watches::watch_pass` does to take batches out.
     pub async fn gather_watch_write(&self, watcher: &str, store: &str, doc: &str, writer: &str, root: &str, at_ms: i64) -> CloudResult<()> {
         let key = WatchBatchRow::key(watcher, store, doc, writer);
-        let q = match self.find_watch_batch(&key).await? {
-            Some(batch) => {
-                let mut gathered = batch.gathered();
-                gathered.add_spell(at_ms);
-                format!(
-                    "WatchBatch.get({}).update({{ count: {}, first_at: {}, last_at: {}, root: {} }})",
-                    batch.rid,
-                    gathered.count,
-                    datetime_literal(gathered.first_ms),
-                    datetime_literal(gathered.last_ms),
-                    ql_str(root),
-                )
-            }
+        let held = self.find_watch_batch(&key).await?;
+        let mut spells = held.as_ref().map(|batch| batch.spells.clone()).unwrap_or_default();
+        spells.add(at_ms);
+        let (first_ms, last_ms) = spells.span().unwrap_or((at_ms, at_ms));
+        let spans = serde_json::to_string(&spells).map_err(|e| CloudError::Internal(e.to_string()))?;
+        let q = match held {
+            Some(batch) => format!(
+                "WatchBatch.get({}).update({{ count: {}, spells: {}, first_at: {}, last_at: {}, root: {} }})",
+                batch.rid,
+                spells.count(),
+                ql_str(&spans),
+                datetime_literal(first_ms),
+                datetime_literal(last_ms),
+                ql_str(root),
+            ),
             None => format!(
-                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, root: {}, count: 1, first_at: {at}, last_at: {at} }})",
+                "WatchBatch.create({{ batch_key: {}, watcher_uuid: {}, store_uuid: {}, doc_uuid: {}, writer_uuid: {}, root: {}, count: {}, spells: {}, first_at: {}, last_at: {} }})",
                 ql_str(&key),
                 ql_str(watcher),
                 ql_str(store),
                 ql_str(doc),
                 ql_str(writer),
                 ql_str(root),
-                at = datetime_literal(at_ms),
+                spells.count(),
+                ql_str(&spans),
+                datetime_literal(first_ms),
+                datetime_literal(last_ms),
             ),
         };
         self.objects(&q).await?;
@@ -202,6 +225,41 @@ impl RhypeDb {
 }
 
 /// A delete of a row another request deleted first is done all the same.
+impl RhypeDb {
+    // ── Relay reports taken ───────────────────────────────────────────
+
+    /// Whether the relay report `report_uuid` was taken already.
+    pub async fn relay_report_taken(&self, report_uuid: &str) -> CloudResult<bool> {
+        let q = format!("RelayReport.filter(.report_uuid == {})", ql_str(report_uuid));
+        Ok(self.one(&q).await?.is_some())
+    }
+
+    /// Remember that the relay report `report_uuid` of `store_uuid` was
+    /// taken at `at_ms`.
+    pub async fn remember_relay_report(&self, report_uuid: &str, store_uuid: &str, at_ms: i64) -> CloudResult<()> {
+        let q = format!(
+            "RelayReport.create({{ report_uuid: {}, store_uuid: {}, taken_at: {} }})",
+            ql_str(report_uuid),
+            ql_str(store_uuid),
+            datetime_literal(at_ms),
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// Forget the relay reports taken before `before_ms`. Answers how many.
+    pub async fn forget_relay_reports_before(&self, before_ms: i64) -> CloudResult<usize> {
+        let mut forgotten = 0;
+        for o in self.objects("RelayReport").await? {
+            if get_datetime_ms(&o, "taken_at")? < before_ms {
+                delete_quietly(self, &format!("RelayReport.get({}).delete()", o.id)).await?;
+                forgotten += 1;
+            }
+        }
+        Ok(forgotten)
+    }
+}
+
 async fn delete_quietly(db: &RhypeDb, q: &str) -> CloudResult<()> {
     match db.client.query(q).await {
         Ok(_) => Ok(()),

@@ -120,13 +120,21 @@ pub(crate) enum TunnelState {
     Replaced,
 }
 
+/// The task reporting the face's writes, and how it is asked to stop: it
+/// keeps on disk what it heard and ends, and is waited for, never aborted
+/// (`crate::relay_writes`, "Stopping loses nothing").
+struct Reporting {
+    task: pimble_host::Task,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
 #[derive(Default)]
 struct Inner {
     face: Option<Face>,
     tunnel: Option<pimble_host::Task>,
     /// What reports the face's writes for watches (`crate::relay_writes`),
     /// while the face runs.
-    reporting: Option<pimble_host::Task>,
+    reporting: Option<Reporting>,
     /// The relayed stores open here: `true` once the tunnel announces them.
     stores: HashMap<StoreId, bool>,
 }
@@ -205,7 +213,9 @@ impl RelayHost {
             // its twin publishes, and the owner's server reports them.
             face.handler.writes().tell_everything();
             let writes = face.handler.writes().subscribe();
-            inner.reporting = Some(self.runtime.spawn(crate::relay_writes::run(handler.clone(), writes, self.serve.subscribe())));
+            let (stop, stopped) = tokio::sync::watch::channel(false);
+            let task = self.runtime.spawn(crate::relay_writes::run(handler.clone(), writes, self.serve.subscribe(), stopped));
+            inner.reporting = Some(Reporting { task, stop });
             inner.face = Some(face);
         }
         let face = inner.face.as_ref().expect("started above");
@@ -395,7 +405,7 @@ impl RelayHost {
         }
     }
 
-    /// With the server: the tunnel, then the face.
+    /// With the server: the tunnel, then the face, then its reports.
     pub(crate) async fn stop(&self) {
         let mut inner = self.inner.lock().await;
         self.stop_locked(&mut inner).await;
@@ -406,20 +416,26 @@ impl RelayHost {
             task.abort();
         }
         self.set_tunnel_state(TunnelState::Idle);
-        if let Some(task) = inner.reporting.take() {
-            task.abort();
-        }
-        inner.stores.clear();
-        self.publish(inner);
         *self.url.lock().unwrap() = None;
         if let Some(mut face) = inner.face.take() {
             // Boxed: a server's `stop` stops its relay host, which stops a
-            // server, and a future cannot contain itself.
+            // server, and a future cannot contain itself. It tells the
+            // writes it gathered and had not told yet as it stops.
             if let Err(e) = Box::pin(face.server.stop()).await {
                 warn!("Relay face: did not stop cleanly: {}", e);
             }
             debug!("Relay face stopped");
         }
+        // Then the reports, which keep on disk what the face told (the
+        // stores it served still named, so none of it is passed over) and
+        // end; waited for, so nothing heard is lost.
+        if let Some(reporting) = inner.reporting.take() {
+            let _ = reporting.stop.send(true);
+            reporting.task.await;
+            debug!("Relay writes: kept what was left and stopped");
+        }
+        inner.stores.clear();
+        self.publish(inner);
     }
 
     fn publish(&self, inner: &Inner) {

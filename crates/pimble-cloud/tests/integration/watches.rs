@@ -302,21 +302,129 @@ async fn only_a_relayed_stores_owner_reports_its_writes_and_only_its_members() {
     let olga_id = uuid_of(&stack, "olga.watchrelay@example.com").await;
     let doc = node_id();
     let post = |cookie: &str, body: Value| stack.http.post(format!("{}/watches/writes", stack.base_url)).header("Cookie", cookie).json(&body).send();
-    let report = json!({ "store_id": store_id, "writes": [{ "doc": doc, "writer": will_id, "count": 1 }] });
+    let report = json!({ "store_id": store_id, "report": node_id(), "writes": [{ "doc": doc, "writer": will_id, "count": 1 }] });
     assert_eq!(post(&olga_cookie, report.clone()).await.unwrap().status(), 400, "a hosted store");
 
     let relayed = create_store_with_body(&stack, &olga_cookie, json!({ "name": "", "kind": "vault", "store_id": node_id(), "tier": "relay" })).await;
     let relayed_id = relayed["store_id"].as_str().unwrap().to_string();
-    let report = json!({ "store_id": relayed_id, "writes": [{ "doc": doc, "writer": will_id, "count": 1 }] });
+    let report = json!({ "store_id": relayed_id, "report": node_id(), "writes": [{ "doc": doc, "writer": will_id, "count": 1 }] });
     assert_eq!(post(&will_cookie, report.clone()).await.unwrap().status(), 403, "not its owner");
     let resp = post(&olga_cookie, report).await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 1 }), "Will was never shared this store");
-    let hers = json!({ "store_id": relayed_id, "writes": [{ "doc": doc, "writer": olga_id, "count": 3, "roots": [], "last_ms": now_ms() }] });
+    let hers = json!({ "store_id": relayed_id, "report": node_id(), "writes": [{ "doc": doc, "writer": olga_id, "count": 3, "roots": [], "last_ms": now_ms() }] });
     let resp = post(&olga_cookie, hers).await.unwrap();
     assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 0 }), "hers, and nobody watches it");
-    let bad = json!({ "store_id": relayed_id, "writes": [{ "doc": "x", "writer": will_id }] });
+    let bad = json!({ "store_id": relayed_id, "report": node_id(), "writes": [{ "doc": "x", "writer": will_id }] });
     assert_eq!(post(&olga_cookie, bad).await.unwrap().status(), 400);
-    let bad_root = json!({ "store_id": relayed_id, "writes": [{ "doc": doc, "writer": olga_id, "roots": ["not a root"] }] });
+    let bad_root = json!({ "store_id": relayed_id, "report": node_id(), "writes": [{ "doc": doc, "writer": olga_id, "roots": ["not a root"] }] });
     assert_eq!(post(&olga_cookie, bad_root).await.unwrap().status(), 400);
+    let no_id = json!({ "store_id": relayed_id, "report": "not an id", "writes": [] });
+    assert_eq!(post(&olga_cookie, no_id).await.unwrap().status(), 400, "a report is named by an id");
+}
+
+/// A relay report sent again (its answer lost) is taken once; a member is
+/// named as a write's writer only for a document their share reaches.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_report_is_taken_once_and_names_a_member_only_inside_their_share() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, _will_cookie, will_id, _hosted_id, _root, _notice) = a_share_with_notice_keys(&stack, "watchreport").await;
+    let olga_id = uuid_of(&stack, "olga.watchreport@example.com").await;
+    let relayed = create_store_with_body(&stack, &olga_cookie, json!({ "name": "", "kind": "vault", "store_id": node_id(), "tier": "relay" })).await;
+    let relayed_id = relayed["store_id"].as_str().unwrap().to_string();
+    let garden = node_id();
+    let resp = put_member_with(&stack, &olga_cookie, &relayed_id, json!({ "email": "will.watchreport@example.com", "role": "editor", "root": garden, "name": "Garden" })).await;
+    assert_eq!(resp.status(), 200);
+    let doc = node_id();
+    assert_eq!(put_json(&stack, &olga_cookie, &format!("/me/watches/stores/{relayed_id}"), json!({ "docs": [doc], "version": 0 })).await.status(), 200);
+    let post = |body: Value| stack.http.post(format!("{}/watches/writes", stack.base_url)).header("Cookie", &olga_cookie).json(&body).send();
+
+    // Will holds the Garden share; the document is outside it.
+    let mut sent = Vec::new();
+    let mut named = || { let id = node_id(); sent.push(id.clone()); id };
+    let outside = json!({ "store_id": relayed_id, "report": named(), "writes": [{ "doc": doc, "writer": will_id, "roots": [], "last_ms": now_ms() }] });
+    let resp = post(outside).await.unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 1 }), "not named for a write his share does not reach");
+    let other_root = json!({ "store_id": relayed_id, "report": named(), "writes": [{ "doc": doc, "writer": will_id, "roots": [node_id()], "last_ms": now_ms() }] });
+    assert_eq!(post(other_root).await.unwrap().json::<Value>().await.unwrap()["refused"], 1, "nor through a share he does not hold");
+
+    // Inside it: gathered for Olga, once however often the report is sent.
+    let report = named();
+    let inside = json!({ "store_id": relayed_id, "report": report, "writes": [{ "doc": doc, "writer": will_id, "roots": [garden], "last_ms": now_ms() - 10 * 60 * 1000 }] });
+    assert_eq!(post(inside.clone()).await.unwrap().json::<Value>().await.unwrap(), json!({ "gathered": 1, "refused": 0 }));
+    assert_eq!(post(inside).await.unwrap().json::<Value>().await.unwrap(), json!({ "gathered": 0, "refused": 0, "again": true }), "the same report again");
+    let later = json!({ "store_id": relayed_id, "report": named(), "writes": [{ "doc": doc, "writer": will_id, "roots": [garden], "last_ms": now_ms() }] });
+    assert_eq!(post(later).await.unwrap().json::<Value>().await.unwrap()["gathered"], 1);
+    let batches = stack.app_state.db.watch_batches_of(&olga_id).await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].count, 2, "two spells of editing, ten minutes apart, the first counted once");
+
+    // Every report taken is remembered, refused writes and all, until it
+    // is older than the forgetting; the database is shared with the other
+    // tests, so the reports are judged by their ids, not by counts.
+    let db = &stack.app_state.db;
+    for id in &sent {
+        assert!(db.relay_report_taken(id).await.unwrap(), "{id} remembered");
+    }
+    db.forget_relay_reports_before(now_ms() - 60 * MIN).await.unwrap();
+    for id in &sent {
+        assert!(db.relay_report_taken(id).await.unwrap(), "{id} is newer than the forgetting");
+    }
+    assert!(db.forget_relay_reports_before(now_ms() + 1).await.unwrap() >= sent.len());
+    for id in &sent {
+        assert!(!db.relay_report_taken(id).await.unwrap(), "{id} forgotten");
+    }
+}
+
+/// A write told late, between two spells of editing gathered already and
+/// half a minute or more from both, is a spell of its own; one that closes
+/// the gap between two makes them one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_write_between_two_spells_is_counted_where_it_falls() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, _will_cookie, will_id, store_id, _root, _notice) = a_share_with_notice_keys(&stack, "watchlate").await;
+    let olga_id = uuid_of(&stack, "olga.watchlate@example.com").await;
+    let doc = node_id();
+    assert_eq!(put_json(&stack, &olga_cookie, &format!("/me/watches/stores/{store_id}"), json!({ "docs": [doc], "version": 0 })).await.status(), 200);
+    let state = &stack.app_state;
+    let now = now_ms();
+    let at = |ms: i64| pimble_cloud::watches::Write { last_ms: ms, ..write(&doc, &will_id, &[]) };
+    for ms in [now - 20 * MIN, now - 10 * MIN] {
+        record_writes(state, &store_id, &[at(ms)], now).await.unwrap();
+    }
+    let count = || async { state.db.watch_batches_of(&olga_id).await.unwrap()[0].count };
+    assert_eq!(count().await, 2);
+    record_writes(state, &store_id, &[at(now - 15 * MIN)], now).await.unwrap();
+    assert_eq!(count().await, 3, "five minutes from each: a spell of its own");
+    record_writes(state, &store_id, &[at(now - 15 * MIN + 20_000), at(now - 15 * MIN - 20_000)], now).await.unwrap();
+    assert_eq!(count().await, 3, "close to it: part of it");
+    let batch = &state.db.watch_batches_of(&olga_id).await.unwrap()[0];
+    assert_eq!(batch.spells.spans().len(), 3);
+    assert_eq!((batch.first_at_ms, batch.last_at_ms), (now - 20 * MIN, now - 10 * MIN));
+}
+
+/// Every change to a grant, and its removal, has the hosted server told
+/// again what the store's watchers hold: a role or scope changed, a member
+/// removed, the store deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_grant_change_tells_the_hosted_server_again() {
+    let stack = skip_without_rhypedb!();
+    let (olga_cookie, _will_cookie, will_id, store_id, root, _notice) = a_share_with_notice_keys(&stack, "watchgrants").await;
+    let changes = &stack.app_state.watch_interest;
+    assert!(changes.take().contains(&store_id), "a new share");
+    let resp = put_member_with(&stack, &olga_cookie, &store_id, json!({ "email": "will.watchgrants@example.com", "role": "reader", "root": root, "name": "Recipes" })).await;
+    assert_eq!(resp.status(), 200);
+    assert!(changes.take().contains(&store_id), "a role changed");
+    let resp = put_member_with(&stack, &olga_cookie, &store_id, json!({ "email": "will.watchgrants@example.com", "role": "editor" })).await;
+    assert_eq!(resp.status(), 200);
+    assert!(changes.take().contains(&store_id), "the whole store granted");
+    let resp = stack.http.delete(format!("{}/stores/{store_id}/members/{will_id}?root={root}", stack.base_url)).header("Cookie", &olga_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(changes.take().contains(&store_id), "a share removed: he holds the whole store now");
+    let resp = stack.http.delete(format!("{}/stores/{store_id}/members/{will_id}", stack.base_url)).header("Cookie", &olga_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(changes.take().contains(&store_id), "removed altogether");
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &olga_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(changes.take().contains(&store_id), "the store deleted");
 }

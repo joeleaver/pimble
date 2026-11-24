@@ -16,13 +16,18 @@
 //!   document watched in one store, computed from the choices at `version`
 //!   (409 when they moved on since). The caller must hold a grant there.
 //!   The hosted server is told again which documents are watched in it.
-//! - `POST /api/v1/watches/writes { store_id, writes: [{ doc, writer,
-//!   count, roots, last_ms }] }`: the writes an owner's relay face saw others
-//!   make, each with the shared roots that reach its document and when it
-//!   was last written. Only the owner of a relayed store may; a hosted
-//!   store's writes come from the hosted server itself (`crate::watches`).
-//!   A write whose writer holds no grant on the store is refused and not
-//!   gathered (`refused` counts them).
+//! - `POST /api/v1/watches/writes { store_id, report, writes: [{ doc,
+//!   writer, count, roots, last_ms }] }`: the writes an owner's relay face
+//!   saw others make, each with the shared roots that reach its document and
+//!   when it was last written. Only the owner of a relayed store may; a
+//!   hosted store's writes come from the hosted server itself
+//!   (`crate::watches`). A write whose writer holds no grant reaching its
+//!   document (the whole store, or a share whose root is among the roots
+//!   reaching it) is refused and not gathered (`refused` counts them).
+//!   `report` is the batch's id, the same each time the owner's device
+//!   sends it: a report taken already is answered `{ again: true }` and
+//!   gathers nothing, so a report sent again because its answer was lost is
+//!   not told twice.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +36,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::db::GrantRow;
 use crate::error::{CloudError, CloudResult};
 use crate::session::AuthedUser;
 use crate::state::AppState;
@@ -149,6 +155,8 @@ pub async fn put_store_docs(State(state): State<AppState>, authed: AuthedUser, P
 #[derive(Deserialize)]
 pub struct PostWrites {
     pub store_id: String,
+    /// The batch's id, the same each time it is sent.
+    pub report: String,
     pub writes: Vec<Write>,
 }
 
@@ -156,6 +164,7 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
     if body.writes.len() > MAX_WRITES_PER_REPORT {
         return Err(CloudError::BadRequest("too many writes in one report".into()));
     }
+    let report = uuid::Uuid::parse_str(&body.report).map_err(|_| CloudError::BadRequest("a report is named by an id".into()))?.to_string();
     let store = super::stores::require_live_store(&state, &body.store_id).await?;
     if !store.is_relayed() {
         return Err(CloudError::BadRequest("a hosted store's writes are told by the hosted server".into()));
@@ -169,30 +178,39 @@ pub async fn post_relay_writes(State(state): State<AppState>, authed: AuthedUser
             return Err(CloudError::BadRequest("a write names a document, a writer and the roots reaching it by id".into()));
         }
     }
+    // One report at a time, so the same one sent twice at once is taken once.
+    let _one_at_a_time = state.relay_reports_lock.lock().await;
+    if state.db.relay_report_taken(&report).await? {
+        return Ok(Json(json!({ "gathered": 0, "refused": 0, "again": true })));
+    }
     // The owner names the writer, so the writer must be someone the store
-    // was shared with: nobody else's name goes on a notice.
-    let mut members: BTreeMap<String, bool> = BTreeMap::new();
+    // was shared with, through a grant that reaches the document written:
+    // nobody else's name goes on a notice, and a member is never named for a
+    // write outside what they hold.
+    let mut grants_of: BTreeMap<String, Vec<GrantRow>> = BTreeMap::new();
     let mut taken = Vec::with_capacity(body.writes.len());
     let mut refused = 0usize;
     for write in body.writes {
         let writer = uuid::Uuid::parse_str(&write.writer).map(|u| u.to_string()).unwrap_or_default();
-        let member = match members.get(&writer) {
-            Some(member) => *member,
-            None => {
-                let member = match state.db.find_user_by_uuid(&writer).await? {
-                    Some(user) => !state.db.grants_for_user_and_store(user.rid, store.rid).await?.is_empty(),
-                    None => false,
-                };
-                members.insert(writer.clone(), member);
-                member
-            }
-        };
-        if member {
+        if !grants_of.contains_key(&writer) {
+            let grants = match state.db.find_user_by_uuid(&writer).await? {
+                Some(user) => state.db.grants_for_user_and_store(user.rid, store.rid).await?,
+                None => Vec::new(),
+            };
+            grants_of.insert(writer.clone(), grants);
+        }
+        let reached: BTreeSet<String> = write.roots.iter().map(|r| crate::watches::canonical(r)).collect();
+        if crate::watches::told_through(&grants_of[&writer], &reached).is_some() {
             taken.push(crate::watches::Write { writer, ..write });
         } else {
             refused += 1;
         }
     }
-    let gathered = crate::watches::record_writes(&state, &store.store_id, &taken, chrono::Utc::now().timestamp_millis()).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let gathered = crate::watches::record_writes(&state, &store.store_id, &taken, now).await?;
+    // Remembered once gathered: a report that failed half way is gathered
+    // again when it is sent again, and a write gathered twice at the same
+    // moment adds no spell of editing.
+    state.db.remember_relay_report(&report, &store.store_id, now).await?;
     Ok(Json(json!({ "gathered": gathered, "refused": refused })))
 }

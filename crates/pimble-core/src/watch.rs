@@ -8,9 +8,8 @@
 //! not hundreds; and the accounts service gathers what it is told per
 //! (watcher, document, writer) until five quiet minutes have passed
 //! ([`Window::NOTICE`]), and then queues one notice. The service counts
-//! what it gathers in spells of editing, not in appends
-//! ([`Gathered::add_spell`]): someone typing for ten minutes edited the note
-//! once, not 412 times. Nothing here holds a clock: every call names the
+//! what it gathers in spells of editing, not in appends ([`Spells`]):
+//! someone typing for ten minutes edited the note once, not 412 times. Nothing here holds a clock: every call names the
 //! time, so a test moves it.
 
 use std::collections::HashMap;
@@ -23,7 +22,7 @@ pub const QUIET_MS: i64 = 5 * 60 * 1000;
 pub const LONGEST_MS: i64 = 60 * 60 * 1000;
 
 /// Writes this far apart are two spells of editing; closer, one
-/// ([`Gathered::add_spell`]).
+/// ([`Spells`]).
 pub const SPELL_GAP_MS: i64 = 30 * 1000;
 
 /// How long a batch waits: until it has been quiet for `quiet_ms`, or at
@@ -45,7 +44,7 @@ impl Window {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gathered {
     /// How many writes ([`Gathered::add`]: a server's report) or spells of
-    /// editing ([`Gathered::add_spell`]: the service's batch).
+    /// editing ([`Spells::count`]: the service's batch).
     pub count: u32,
     pub first_ms: i64,
     pub last_ms: i64,
@@ -63,20 +62,62 @@ impl Gathered {
         self.last_ms = self.last_ms.max(now_ms);
     }
 
-    /// A write at `at_ms`, counted as a spell of editing: one more only when
-    /// it is [`SPELL_GAP_MS`] or more from every write gathered so far (a
-    /// report told late can land before the first). The batch spans it.
-    pub fn add_spell(&mut self, at_ms: i64) {
-        if at_ms - self.last_ms >= SPELL_GAP_MS || self.first_ms - at_ms >= SPELL_GAP_MS {
-            self.count = self.count.saturating_add(1);
-        }
-        self.first_ms = self.first_ms.min(at_ms);
-        self.last_ms = self.last_ms.max(at_ms);
-    }
-
     /// Whether the batch is due at `now_ms` under `window`.
     pub fn is_due(&self, window: Window, now_ms: i64) -> bool {
         now_ms - self.last_ms >= window.quiet_ms || now_ms - self.first_ms >= window.longest_ms
+    }
+}
+
+/// The spells of editing a batch gathered: each a span of writes, no two
+/// writes next to each other in time [`SPELL_GAP_MS`] or more apart, and
+/// every span that far or more from the next. Writes are told in any order
+/// (a relay's report can arrive late, its writes before or among those
+/// gathered already), so the spans are kept, not only the first and last
+/// write: a write is judged against the writes it falls between, wherever
+/// it lands, and one that closes the gap between two spans makes them one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Spells(Vec<(i64, i64)>);
+
+impl Spells {
+    /// A write at `at_ms`.
+    pub fn add(&mut self, at_ms: i64) {
+        let (mut first, mut last) = (at_ms, at_ms);
+        // Every span within the gap of the write is one spell with it: one
+        // it falls inside, one it follows or precedes closely, or two it
+        // falls between.
+        self.0.retain(|&(start, end)| {
+            let joins = at_ms - end < SPELL_GAP_MS && start - at_ms < SPELL_GAP_MS;
+            if joins {
+                first = first.min(start);
+                last = last.max(end);
+            }
+            !joins
+        });
+        let at = self.0.partition_point(|&(start, _)| start < first);
+        self.0.insert(at, (first, last));
+    }
+
+    /// How many spells of editing (at least one once anything is added).
+    pub fn count(&self) -> u32 {
+        u32::try_from(self.0.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The first write and the last, once anything is added.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        Some((self.0.first()?.0, self.0.last()?.1))
+    }
+
+    /// The spans, in time order: `(first write, last write)` each.
+    pub fn spans(&self) -> &[(i64, i64)] {
+        &self.0
+    }
+
+    /// These spans as a batch is judged by ([`Gathered::is_due`]), `None`
+    /// while nothing is added.
+    pub fn gathered(&self) -> Option<Gathered> {
+        let (first_ms, last_ms) = self.span()?;
+        Some(Gathered { count: self.count(), first_ms, last_ms })
     }
 }
 
@@ -182,19 +223,55 @@ mod tests {
         assert_eq!(Gathered::start(0, 5).count, 1, "a write is at least one");
     }
 
+    fn spells(at: &[i64]) -> Spells {
+        let mut spells = Spells::default();
+        for t in at {
+            spells.add(*t);
+        }
+        spells
+    }
+
     #[test]
     fn spells_of_editing_are_counted_not_writes() {
-        let mut g = Gathered::start(1, 0);
+        let mut g = spells(&[0]);
         for t in (2_000..600_000).step_by(2_000) {
-            g.add_spell(t);
+            g.add(t);
         }
-        assert_eq!(g.count, 1, "ten minutes of typing without a pause is one spell");
-        g.add_spell(600_000 + SPELL_GAP_MS - 2_000);
-        assert_eq!(g.count, 2, "a half-minute pause starts another");
-        g.add_spell(-SPELL_GAP_MS);
-        assert_eq!((g.count, g.first_ms), (3, -SPELL_GAP_MS), "a write told late, well before the first");
-        g.add_spell(300_000);
-        assert_eq!(g.count, 3, "one inside the span is part of it");
+        assert_eq!(g.count(), 1, "ten minutes of typing without a pause is one spell");
+        g.add(600_000 + SPELL_GAP_MS - 2_000);
+        assert_eq!(g.count(), 2, "a half-minute pause starts another");
+        g.add(-SPELL_GAP_MS);
+        assert_eq!((g.count(), g.span()), (3, Some((-SPELL_GAP_MS, 600_000 + SPELL_GAP_MS - 2_000))), "a write told late, well before the first");
+        g.add(300_000);
+        assert_eq!(g.count(), 3, "one inside a spell is part of it");
+        assert_eq!(g.gathered(), Some(Gathered { count: 3, first_ms: -SPELL_GAP_MS, last_ms: 600_000 + SPELL_GAP_MS - 2_000 }));
+        assert_eq!(Spells::default().gathered(), None);
+    }
+
+    #[test]
+    fn a_late_report_inside_the_span_is_judged_by_the_writes_around_it() {
+        // Two spells ten minutes apart; a late write lands between them, at
+        // least half a minute from both: a third spell.
+        let mut g = spells(&[0, 600_000]);
+        g.add(300_000);
+        assert_eq!((g.count(), g.spans()), (3, &[(0, 0), (300_000, 300_000), (600_000, 600_000)][..]));
+        // Late writes that close a gap join the spells on both sides.
+        g.add(300_000 - SPELL_GAP_MS + 1);
+        assert_eq!(g.count(), 3, "close to the middle one: part of it");
+        let mut g = spells(&[0, 40_000]);
+        assert_eq!(g.count(), 2);
+        g.add(20_000);
+        assert_eq!((g.count(), g.spans()), (1, &[(0, 40_000)][..]), "twenty seconds from each: one spell after all");
+        // Order does not matter.
+        let at = [5_000, 220_000, 80_000, 0, 100_000, 200_000, 60_000];
+        let mut sorted = at;
+        sorted.sort();
+        assert_eq!(spells(&at), spells(&sorted));
+        assert_eq!(spells(&at).count(), 3, "0..5s, 60..100s, 200..220s");
+        // The same write told twice changes nothing.
+        let mut again = spells(&at);
+        again.add(80_000);
+        assert_eq!(again, spells(&at));
     }
 
     #[test]

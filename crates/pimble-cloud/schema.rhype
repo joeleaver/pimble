@@ -329,7 +329,10 @@ type WatchedDoc {
 // Writes gathered for one watcher, per (document, writer): one notice is
 // queued once the writer has been quiet for five minutes (or an hour after
 // the first). `batch_key` is "watcher/store/doc/writer". `count` is spells
-// of editing (writes half a minute or more apart), not appends. `root` is
+// of editing (writes half a minute or more apart), not appends; `spells`
+// is their spans, JSON `[[first_ms, last_ms], ...]`, so a write told late
+// is judged by the writes it falls between (`pimble_core::watch::Spells`);
+// `first_at` and `last_at` are the first and last of them. `root` is
 // the share the watcher was told through ("" for the whole store), checked
 // again when the notice is queued. Kept here, not in memory, so a deploy
 // loses none.
@@ -341,6 +344,17 @@ type WatchBatch {
     writer_uuid: String
     root: String
     count: u64
+    spells: String
     first_at: DateTime
     last_at: DateTime
+}
+
+// A relay report already taken (`POST /api/v1/watches/writes`'s `report`,
+// a UUID the owner's device gives each batch it keeps and sends until it is
+// taken). Remembered for 30 days, so a report sent again because its answer
+// was lost (the app quit, the connection broke) is not gathered twice.
+type RelayReport {
+    report_uuid: String @unique
+    store_uuid: String
+    taken_at: DateTime
 }

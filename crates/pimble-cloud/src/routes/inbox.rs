@@ -224,7 +224,7 @@ pub async fn names_for(state: &AppState, item: &InboxItemRow) -> CloudResult<(St
     let sender = state.db.find_user_by_uuid(&item.sender_uuid).await?;
     let recipient = state.db.find_user_by_uuid(&item.recipient_uuid).await?;
     let Some(store) = store else { return Ok((sender.map(|u| u.default_name()).unwrap_or_else(|| "Someone".into()), "a shared store".into())) };
-    let names = super::stores::Names::of_store(state, store.rid).await?;
+    let names = super::members::Names::of_store(state, store.rid).await?;
     let sender_name = match &sender {
         Some(user) => names.name_of(user, &item.root),
         None => "Someone".into(),
