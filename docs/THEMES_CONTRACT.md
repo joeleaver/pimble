@@ -5,11 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered so far (2026-11-24): decisions 1, (themes replace paragraph spacing), 3 (looked up
-from the nearest ancestor), 4 (shares), 5 (mounts keep their native look), 6 (app themes
-follow the account; every theme has its own light and dark), 7, 8 (a longer bundled-or-fetched
-font list; how it ships is 8b), 9, 10 and 11. Open: 8b and 12 (palette, and themes
-that inherit and set only what they change).
+has answered them. Answered (2026-11-24): decisions 1 to 11. Open: 8b (how the fonts
+ship) and 12 (where theme nodes live, and hiding them).
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
