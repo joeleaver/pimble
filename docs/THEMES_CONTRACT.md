@@ -5,9 +5,10 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered so far (2026-11-24): decisions 2 (themes replace paragraph spacing), 3 (looked up
+has answered them. Answered so far (2026-11-24): decisions 1, (themes replace paragraph spacing), 3 (looked up
 from the nearest ancestor), 4 (shares), 5 (mounts keep their native look), 6 (app themes
-follow the account; every theme has its own light and dark) and 7 (palette, and themes
+follow the account; every theme has its own light and dark), 7, 8 (a longer bundled-or-fetched
+font list; how it ships is 8b), 9, 10 and 11. Open: 8b and 12 (palette, and themes
 that inherit and set only what they change).
 
 **Two kinds, kept apart:**
@@ -321,26 +322,41 @@ Decided (Joe, 2026-11-24, decision 2: "it replaces compact/spaced"):
 
 ## 5. Fonts
 
-A theme names fonts by **stack**, never by file or URL. The stacks are a fixed list that
-the app guarantees on both targets by bundling the faces under open licenses (Pimble ships
-no font today: rinch ships none, and the wordmark's Manrope is drawn as outlines in
-`brand.rs`):
+A theme names fonts by **family**, never by file or URL, from a fixed list Pimble provides on
+both targets, all under the SIL Open Font License (Pimble ships no font today: rinch ships
+none, and the wordmark's Manrope is drawn as outlines in `brand.rs`). Decided (Joe,
+2026-11-24, decision 8): only these, no installed system fonts, and **more of them** than
+the first proposal's six. The list (a proposal; add or cut freely):
 
-| Stack | Bundled face (proposal) | Fallbacks |
-| --- | --- | --- |
-| `sans` | Inter | system-ui, sans-serif |
-| `serif` | Source Serif 4 | Georgia, serif |
-| `book` | EB Garamond | serif |
-| `slab` | Roboto Slab | serif |
-| `mono` | JetBrains Mono | ui-monospace, monospace |
-| `humanist` | Manrope | sans-serif |
-| `system` | none | the platform's UI font |
+| Kind | Families |
+| --- | --- |
+| Sans | Inter, Source Sans 3, IBM Plex Sans, Manrope, Work Sans |
+| Readable | Atkinson Hyperlegible (low vision), Lexend, OpenDyslexic |
+| Serif | Source Serif 4, Literata (made for long reading on screens), Merriweather, Lora, Crimson Pro, Libre Baskerville |
+| Book | EB Garamond, Cormorant Garamond |
+| Slab | Roboto Slab, Zilla Slab |
+| Mono | JetBrains Mono, IBM Plex Mono, Fira Code, Courier Prime (manuscripts) |
+| Writer | iA Writer Quattro / Duo (duospaced; OFL, from IBM Plex) |
+| Hand | Caveat, Patrick Hand |
+| System | none bundled: the platform's UI font, for a theme that wants to look native |
 
-Bundling is what makes "everyone sees the book layout" true: a font named by the person's
-own system would draw differently on every device. Each face adds roughly 200–700 KB per
-weight to the desktop binary and the web bundle (the web can load faces lazily, on first
-use). Decision 8 asks whether a person may also name an installed system font for a theme
-only they use.
+Each family names its own fallbacks by kind (serif, sans-serif, monospace), so text draws
+while a face is not yet loaded.
+
+How they ship (decision 8b, open): about thirty families at a few weights each is 20–40 MB,
+too much to put in every desktop binary and web bundle. *Recommendation:* a **core set is
+bundled** (Inter, Source Serif 4, EB Garamond, JetBrains Mono, Atkinson Hyperlegible:
+enough for every built-in theme), and the rest form a **font library** on pimble.app,
+signed like the plugin library (`docs/SETTINGS_CONTRACT.md` decision 2) and fetched on
+first use: by the theme editor when someone picks one, and by any device that opens a tree
+whose theme names one it lacks. Fetched faces are kept in the user's data dir
+(`pimble/fonts/`, the browser's cache) and work offline from then on. Until a face arrives,
+its fallback draws; a device that is offline draws the fallback and fetches later. A
+download is not hosting: nothing of the person's goes anywhere (CLAUDE.md "Nothing is
+hosted unless asked"), and the font's name is all the request carries.
+
+Bundling or fetching from one list is what makes "everyone sees the book layout" true: a
+font named by the person's own system would draw differently on every device.
 
 ## 6. Copying themes between stores
 
@@ -525,9 +541,8 @@ cut or add.
 
 ## 12. Decisions for Joe
 
-1. **Tokens, not CSS.** A theme is a fixed set of typed tokens (section 2); there is no way
-   to write CSS. *Recommendation: yes.* Free CSS in shared stores is untrusted input to
-   both renderers, and tokens survive rinch's markup changing.
+1. **Tokens, not CSS. Decided (Joe, 2026-11-24):** a theme is a fixed set of typed tokens
+   (section 2); there is no way to write CSS.
 2. **Paragraph spacing. Decided (Joe, 2026-11-24):** themes replace Compact/Spaced: no new
    writes of `custom["paragraphs"]`, a read-time fallback to `builtin:document` so every
    existing note looks the same, importers name `builtin:document`, and Edit > "Compact
@@ -551,18 +566,16 @@ cut or add.
    named slots, each a light and dark pair, the values drawn as chosen (section 2.1).
    Themes inherit from a base and set only what they change; "Customize..." is how one is
    made (section 3.1).
-8. **Fonts.** *Recommendation:* the fixed stacks of section 5, faces bundled on both
-   targets (a few MB in all, lazy in the browser). Also allow an installed system font by
-   name for a theme only its author uses? *Recommendation: no*, since a shared theme would
-   draw differently on every device.
-9. **"Update from original"** on a copied theme (section 6): an explicit, one-time re-copy.
-   *Recommendation: yes*, as a later wave. Never automatic.
-10. **Plugins.** *Recommendation:* no ABI change: app themes reach plugins through new
-    semantic surface variables in `pimble_ui::viewer`, and document-theme properties are
-    set on a plugin mount's root for plugins that use them (section 8). ABI 7's
-    `HostState.document_theme` only when a plugin needs the values in code.
-11. **The starting set** (section 11): nine document themes, four app themes. Cut, add or
-    rename?
+8. **Fonts. Decided (Joe, 2026-11-24):** only Pimble's own list, no installed system fonts,
+   and a longer list than first proposed (section 5). **8b, open:** how they ship.
+   *Recommendation:* a core set bundled, the rest a signed font library on pimble.app,
+   fetched on first use and kept offline.
+9. **"Update from original". Decided (Joe, 2026-11-24):** yes, an explicit one-time re-copy,
+   never automatic, in a later wave (section 6).
+10. **Plugins. Decided (Joe, 2026-11-24, "for now"):** no ABI change (section 8); revisit
+    when a plugin needs theme values in code.
+11. **The starting set. Decided (Joe, 2026-11-24):** section 11's nine document themes and
+    five app themes, Grove (green) added at his request.
 12. **Where theme nodes go.** *Recommendation:* anywhere; "New Theme" makes a Themes folder
     at the store root on first use. Alternative: themes kept out of the explorer, listed
     only in the picker (would need a place in the store that is not the tree, which node
