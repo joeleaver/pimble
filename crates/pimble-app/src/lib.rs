@@ -45,6 +45,7 @@ pub mod link_picker;
 pub mod links;
 pub mod app_links;
 pub mod web_links;
+pub mod markdown_shortcuts;
 pub mod mentions;
 pub mod menus;
 pub mod metanodes;

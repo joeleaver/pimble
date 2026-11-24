@@ -51,6 +51,10 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
             .get_or_insert_with(|| {
                 let handle = create_editor();
                 // Before any content: adding a plugin resets history.
+                // Markdown shortcuts before Pimble's other plugins, as rinch
+                // places its own: their input rules are tried first
+                // (crate::markdown_shortcuts).
+                handle.add_plugin(std::rc::Rc::new(crate::markdown_shortcuts::MarkdownShortcutsPlugin));
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
                 // After the links plugin: a pasted link is claimed there.
                 handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));

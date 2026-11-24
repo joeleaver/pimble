@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "ab_glyph"
-version = "0.2.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
-dependencies = [
- "ab_glyph_rasterizer",
- "owned_ttf_parser",
-]
-
-[[package]]
-name = "ab_glyph_rasterizer"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
-
-[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4922,15 +4906,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "owned_ttf_parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
-dependencies = [
- "ttf-parser",
-]
-
-[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6829,7 +6804,7 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
@@ -6889,7 +6864,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -6902,7 +6877,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "arboard",
  "js-sys",
@@ -6915,7 +6890,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -6927,7 +6902,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -6937,7 +6912,7 @@ dependencies = [
 [[package]]
 name = "rinch-debug"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -6949,7 +6924,7 @@ dependencies = [
 [[package]]
 name = "rinch-dom"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -6994,7 +6969,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "rinch-words",
 ]
@@ -7002,7 +6977,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -7012,7 +6987,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -7024,7 +6999,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -7035,7 +7010,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7045,7 +7020,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "peniko",
  "vello",
@@ -7055,7 +7030,7 @@ dependencies = [
 [[package]]
 name = "rinch-renderer"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "rinch-core",
  "thiserror 1.0.69",
@@ -7067,18 +7042,23 @@ dependencies = [
 [[package]]
 name = "rinch-spell"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
+ "dispatch2",
  "icu_normalizer",
  "icu_properties",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "spellbook",
  "unicode-segmentation",
+ "windows",
 ]
 
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "heck 0.5.0",
  "rinch-core",
@@ -7090,12 +7070,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "js-sys",
  "rinch",
@@ -7111,7 +7091,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#50b818cf141e92948f6b01a4013751fbf2ae0eed"
 dependencies = [
  "icu_segmenter",
  "regex",
@@ -7415,9 +7395,9 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f8ea028b7cb32e2f577b0a55a7b54cb206376bdb1221bd5c81dcf20b68db1fb"
 dependencies = [
- "ab_glyph",
  "log",
  "memmap2",
+ "skrifa 0.44.0",
  "smithay-client-toolkit",
  "tiny-skia 0.12.0",
 ]
