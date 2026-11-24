@@ -60,6 +60,7 @@ pub mod rinch_editor;
 pub mod state;
 pub mod styles;
 pub mod text_color;
+pub mod themes;
 pub mod sheets;
 pub mod settings;
 pub mod shortcuts;
@@ -82,6 +83,9 @@ pub mod update;
 /// the tray or out of the app.
 #[cfg(feature = "native")]
 pub mod desktop;
+/// The font files document themes draw with, carried by the desktop.
+#[cfg(feature = "native")]
+pub mod fonts;
 /// Which window process owns the tray and the notifications.
 #[cfg(feature = "native")]
 pub mod instance;

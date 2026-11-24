@@ -9,6 +9,7 @@ use crate::state::{parse_tree_value, AppStore};
 #[cfg(feature = "native")]
 use crate::state::PendingMount;
 use super::appearance_modal::open_appearance_modal;
+use super::theme_picker::open_theme_picker;
 use super::deleted_modal::open_deleted_modal;
 use super::explorer::start_rename;
 use super::hosting::{open_host_modal, open_stop_relay_modal};
@@ -151,6 +152,22 @@ pub(super) fn explorer_menu(
     let on_appearance = move || {
         if let Some((s_id, n_id)) = node_of() {
             open_appearance_modal(store, s_id, n_id);
+        }
+    };
+    // "Theme...": the document theme picker (docs/THEMES_CONTRACT.md section
+    // 9) for this node, a store row's root. A mount row's acts on the mount's
+    // source node: a mounted subtree reads as it does in its own store
+    // (decision 5), and a mount node has no content to draw.
+    let on_theme = move || {
+        let Some((s_id, n_id)) = node_of() else { return };
+        let target = if store.is_mount(s_id, n_id) {
+            use pimble_core::plan::TreeView;
+            store.view().mount_source(s_id, n_id)
+        } else {
+            Some((s_id, n_id))
+        };
+        if let Some((s_id, n_id)) = target {
+            open_theme_picker(store, s_id, n_id);
         }
     };
     let on_rename = move || {
@@ -315,6 +332,11 @@ pub(super) fn explorer_menu(
                         "Appearance..."
                     }
                     DropdownMenuItem {
+                        left_section: TablerIcon::Typography,
+                        onclick: on_theme,
+                        "Theme..."
+                    }
+                    DropdownMenuItem {
                         left_section: TablerIcon::History,
                         disabled: {move || menu.store_off(|s| s.recently_deleted)},
                         onclick: on_recently_deleted,
@@ -351,6 +373,11 @@ pub(super) fn explorer_menu(
                         disabled: {move || !menu.can_write_tree.get()},
                         onclick: on_appearance,
                         "Appearance..."
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Typography,
+                        onclick: on_theme,
+                        "Theme..."
                     }
                     DropdownMenuDivider {}
                     DropdownMenuItem {
@@ -422,6 +449,12 @@ pub(super) fn explorer_menu(
                         disabled: {move || !menu.can_write_tree.get()},
                         onclick: on_appearance,
                         "Appearance..."
+                    }
+                    DropdownMenuItem {
+                        left_section: TablerIcon::Typography,
+                        disabled: {move || several()},
+                        onclick: on_theme,
+                        "Theme..."
                     }
                     DropdownMenuDivider {}
                     DropdownMenuItem {

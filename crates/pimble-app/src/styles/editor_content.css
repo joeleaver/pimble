@@ -1,32 +1,19 @@
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] {
-    background: var(--rinch-color-body);
-    color: var(--rinch-color-text);
-    border-color: var(--rinch-color-border);
-    font-size: 15px;
-    line-height: 1.7;
-}
-
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h1,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h2,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h3,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h4 {
-    color: var(--rinch-color-text);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h5,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] h6 {
-    color: var(--rinch-color-dimmed);
-}
+/* The editor's colors over rinch's scheme. What a document theme can change
+   (the page, the text, headings, quotes, code backgrounds, rules, tables, the
+   highlight) is in `document_theme.css`; links, hashtags and mentions take
+   the theme's accent here, where their order against the text colors below
+   is kept. */
 
 /* Links, Pimble and web alike (docs/LINKS_CONTRACT.md "What a link looks like"):
-   the link color, underlined only under the pointer. The contract's arrow after a
+   the link color (the theme's accent), underlined only under the pointer. The contract's arrow after a
    web link waits for rinch: generated content (`::after`) inside the editor puts the
    caret beside the wrong character (joeleaver/rinch#891). */
 .pimble-editor__content-wrap > [data-pm-editor] a {
-    color: var(--rinch-primary-color-6);
+    color: var(--pd-accent, var(--rinch-primary-color-6));
     text-decoration: none;
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] a {
-    color: var(--rinch-primary-color-4);
+    color: var(--pd-accent, var(--rinch-primary-color-4));
 }
 .pimble-editor__content-wrap > [data-pm-editor] a:hover {
     text-decoration: underline;
@@ -36,10 +23,10 @@
    else: no padding, border, weight or size, so the text lays out as before and
    the caret, selection and typing are untouched. Ctrl/Cmd+click searches. */
 .pimble-editor__content-wrap > [data-pm-editor] .pimble-hashtag {
-    color: var(--rinch-primary-color-6);
+    color: var(--pd-accent, var(--rinch-primary-color-6));
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] .pimble-hashtag {
-    color: var(--rinch-primary-color-4);
+    color: var(--pd-accent, var(--rinch-primary-color-4));
 }
 
 /* Mentions (docs/NOTIFICATIONS_CONTRACT.md section 1, mentions.rs): the accent on a
@@ -131,84 +118,25 @@
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] code {
-    background: var(--rinch-color-option-hover);
     color: #e06c75;
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] pre {
-    background: var(--rinch-color-surface);
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] pre code {
     background: none;
     color: #abb2bf;
 }
 
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] blockquote {
-    border-left-color: var(--rinch-primary-color-7);
-    color: var(--rinch-color-dimmed);
-}
-
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] hr {
-    border-top-color: var(--rinch-color-border);
-}
-
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] table,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] td,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th {
-    border-color: var(--rinch-color-border);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] th {
-    background: var(--rinch-color-surface);
-}
-
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] [data-pm-placeholder] {
     color: var(--rinch-color-dimmed);
 }
 
-/* The light scheme, the same rules over rinch's GitHub-light palette: the app's
-   tokens, the dark scheme's size and leading, and code in a muted red as dark's
-   is in a bright one. */
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] {
-    background: var(--rinch-color-surface);
-    color: var(--rinch-color-text);
-    border-color: var(--rinch-color-border);
-    font-size: 15px;
-    line-height: 1.7;
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h1,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h2,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h3,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h4 {
-    color: var(--rinch-color-text);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h5,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] h6 {
-    color: var(--rinch-color-dimmed);
-}
+/* The light scheme, the same rules over rinch's GitHub-light palette: code in a
+   muted red as dark's is in a bright one. */
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] code {
-    background: #eef1f4;
     color: #a3404c;
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] pre {
-    background: var(--rinch-color-body);
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] pre code {
     background: none;
     color: #383a42;
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] blockquote {
-    border-left-color: var(--rinch-primary-color-3);
-    color: var(--rinch-color-dimmed);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] hr {
-    border-top-color: var(--rinch-color-border);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] table,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] td,
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
-    border-color: var(--rinch-color-border);
-}
-.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] th {
-    background: var(--rinch-color-body);
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] [data-pm-placeholder] {
     color: var(--rinch-color-dimmed);

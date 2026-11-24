@@ -223,6 +223,9 @@ pub struct AppStore {
     // filters the icon grid over the whole Tabler set. Tags are the
     // Properties panel's (docs/PROPERTIES_CONTRACT.md).
     pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
+    /// The node the Theme picker is open for (Format > Theme..., a row's
+    /// "Theme...", docs/THEMES_CONTRACT.md section 9); `None` when closed.
+    pub theme_picker_node: Signal<Option<(StoreId, NodeId)>>,
     pub appearance_icon_query: Signal<String>,
 
     /// The Properties panel (docs/PROPERTIES_CONTRACT.md): whether it is
@@ -230,10 +233,6 @@ pub struct AppStore {
     /// on this device (`views.rs`); a new field's row is showing (Edit >
     /// "Add Field"); and what the backend last said of the node it shows.
     pub properties_open: Signal<bool>,
-    /// Edit > "Compact Paragraphs": checked while the focused pane's note is
-    /// compact (docs/PARAGRAPHS_CONTRACT.md); choosing it flips the note
-    /// (`pane_view::follow_paragraphs`).
-    pub compact_paragraphs: Signal<bool>,
     pub properties_width: Signal<f32>,
     pub properties_adding_field: Signal<bool>,
     pub properties_context: Signal<Option<crate::properties::Context>>,

@@ -35,6 +35,7 @@ mod shell;
 mod status;
 mod store_modals;
 mod theme;
+mod theme_picker;
 mod tree_row;
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,7 @@ pub use share_modal::open_share_modal;
 pub use store_modals::{pick_and_create_store, pick_and_open_store};
 pub use store_modals::{open_connect_modal, open_mount_picker, open_new_store_modal};
 pub use theme::{apply_theme, theme_css, theme_props, toggle_dark_mode};
+pub(crate) use theme_picker::open_theme_picker_for_focused;
 
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
@@ -73,6 +75,11 @@ const TREE_INDENT: f32 = 12.0;
 /// create and share stores instead. Offering a menu item that can only fail is
 /// worse than not offering it, so the browser build hides them.
 const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
+
+/// Where the browser build serves `assets/fonts/`: web/index.html copies the
+/// folder beside the app, under trunk's `public_url` (web/Trunk.toml).
+#[cfg(not(feature = "native"))]
+const WEB_FONTS_URL: &str = "/app/fonts/";
 
 /// Whether this build can make a store on the signed-in account.
 ///
@@ -293,6 +300,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let connect_modal = store_modals::render_connect_modal(__scope, store);
         let link_modal = store_modals::render_link_modal(__scope, store);
         let appearance_modal = appearance_modal::render(__scope, store);
+        // Format > Theme... (docs/THEMES_CONTRACT.md section 9).
+        let theme_picker = theme_picker::render(__scope, store);
         // Paste with several things it could do (`crate::pasting`).
         let paste_chooser = crate::pasting::render_chooser(__scope, store);
         let new_store_modal = store_modals::render_new_store_modal(__scope, store);
@@ -373,6 +382,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
+                {theme_picker}
                 {settings_modal}
                 {about_modal}
                 {send_diagnostics}
@@ -398,6 +408,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 style { {APP_CSS} }
                 style { {pimble_ui::STYLES} }
                 style { {EDITOR_CSS} }
+                // The families document themes name, fetched the first time
+                // text uses one (docs/THEMES_CONTRACT.md section 5); the
+                // desktop carries the same files (`crate::fonts`).
+                style { {pimble_themes::fonts::font_face_css(WEB_FONTS_URL)} }
 
                 {connect_modal}
                 {link_modal}
@@ -408,6 +422,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
+                {theme_picker}
                 {settings_modal}
                 {about_modal}
                 {send_diagnostics}

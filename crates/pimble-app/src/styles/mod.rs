@@ -46,7 +46,7 @@ app_css!(
     "canvas_bar.css",
     // The canvas's panels: a small pane's rail, layers, the Stamp's symbols.
     "canvas_panels.css",
-    // The editor's content area, margin markers, pictures, paragraph spacing.
+    // The editor's content area, margin markers and pictures.
     "editor_pane.css",
     // A metanode's outline and a query metanode's setup.
     "metanodes.css",
@@ -66,8 +66,15 @@ app_css!(
 /// dark scheme keyed on `data-pm-theme="dark"` (set from `editor::start_editing`).
 /// These rules ride on top of that scheme with higher specificity and swap its
 /// GitHub-dark palette for the app's own theme tokens, so the pane matches the
-/// tree and toolbar around it. The rules are in `editor_content.css`.
-pub(crate) const EDITOR_CSS: &str = concat!("\n", include_str!("editor_content.css"));
+/// tree and toolbar around it. `document_theme.css` comes first: the look a
+/// document theme changes, read from the `--pd-*` properties a pane's theme
+/// writes (docs/THEMES_CONTRACT.md section 7), with today's look as every
+/// fallback; `editor_content.css` then holds the colors no theme changes.
+pub(crate) const EDITOR_CSS: &str = concat!("\n", include_str!("document_theme.css"), include_str!("editor_content.css"));
+
+/// The document theme rules alone, for their tests.
+#[cfg(test)]
+const DOCUMENT_THEME_CSS: &str = include_str!("document_theme.css");
 
 
 /// Pimble's variables for the dark scheme, added to rinch's theme sheet
@@ -179,3 +186,6 @@ mod tests {
         assert!(EDITOR_CSS.starts_with('\n') && EDITOR_CSS.contains("[data-pm-editor]"));
     }
 }
+
+#[cfg(test)]
+mod document_theme_tests;

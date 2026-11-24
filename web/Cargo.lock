@@ -2215,6 +2215,7 @@ dependencies = [
  "pimble-plugin-host",
  "pimble-rpc",
  "pimble-sheet",
+ "pimble-themes",
  "pimble-ui",
  "rinch",
  "rinch-editor-collab",
@@ -2549,6 +2550,13 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pimble-themes"
+version = "0.31.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

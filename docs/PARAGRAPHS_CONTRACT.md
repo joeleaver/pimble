@@ -2,6 +2,12 @@
 
 Status: built 2026-11-13 (Joe agreed the design the same day).
 
+**Replaced by document themes (2026-11-24, docs/THEMES_CONTRACT.md wave 1).** Nothing
+writes `custom["paragraphs"]` any more and the Compact Paragraphs check is gone. The key
+is still read, once, as a fallback: a note whose chain names no theme reads in Document
+when its own paragraphs say `"spaced"`, otherwise in Default (compact). An import names
+the Document theme on its top node instead. What follows is the record of the setting.
+
 Some notes are documents (a novel, a report), where a gap between paragraphs reads
 well. Most are quick notes, where Enter should just start the next line. So each note
 says which it is.

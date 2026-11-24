@@ -64,6 +64,7 @@ pub fn menu_spec(store: AppStore) -> Vec<MenuSection> {
     #[cfg(feature = "native")]
     sections.push(MenuSection { title: "Account", entries: account_entries(store) });
     sections.push(MenuSection { title: "Edit", entries: edit_entries(store) });
+    sections.push(MenuSection { title: "Format", entries: format_entries(store) });
     sections.push(MenuSection { title: "View", entries: view_entries(store) });
     sections.push(MenuSection {
         title: "Help",
@@ -249,9 +250,6 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::Sub { label: "Text Color", entries: text_color_entries(store) },
         // Nodes, where the explorer's "+" makes them: File > New's list.
         MenuEntry::Sub { label: "New", entries: new_entries(store) },
-        // The focused pane's note drawn with no gap between paragraphs, or
-        // with one (docs/PARAGRAPHS_CONTRACT.md): checked while compact.
-        MenuEntry::Check { label: "Compact Paragraphs", shortcut: "", checked: store.compact_paragraphs },
         // docs/SPLIT_CONTRACT.md: Scrivener's keys (Ctrl+K, Ctrl+M).
         MenuEntry::item("Split Note at Caret", crate::shortcuts::chord(crate::shortcuts::SPLIT), move || crate::splitting::split_here(store)),
         MenuEntry::item("Join Note Below", crate::shortcuts::chord(crate::shortcuts::JOIN), move || crate::splitting::join_below(store)),
@@ -275,6 +273,12 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         }
         }),
     ]
+}
+
+/// How the focused pane's note reads (docs/THEMES_CONTRACT.md section 9):
+/// its document theme, which replaces Edit > "Compact Paragraphs".
+fn format_entries(store: AppStore) -> Vec<MenuEntry> {
+    vec![MenuEntry::item("Theme...", "", move || crate::app::open_theme_picker_for_focused(store))]
 }
 
 fn view_entries(store: AppStore) -> Vec<MenuEntry> {

@@ -1,4 +1,5 @@
-//! The "Appearance..." modal: a node's icon, colors and paragraphs.
+//! The "Appearance..." modal: a node's icon and colors, and the way to its
+//! document theme.
 
 use rinch::prelude::*;
 
@@ -31,20 +32,22 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
         let (s_id, n_id) = store.appearance_modal_node.get()?;
         store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.background().map(String::from))
     };
-    // How the node's paragraphs are drawn (docs/PARAGRAPHS_CONTRACT.md); a
-    // store row's picker sets its root's, which every new node copies down.
-    let appearance_node_spaced = move || -> bool {
-        let Some((s_id, n_id)) = store.appearance_modal_node.get() else { return false };
-        store.get_node_signal(s_id, n_id).is_some_and(|sig| sig.with(|n| n.metadata.spaced_paragraphs()))
+    // The document theme in force on the node and where it comes from
+    // (docs/THEMES_CONTRACT.md section 9); "Theme..." opens its picker.
+    let theme_line = move || -> String {
+        let Some((s_id, n_id)) = store.appearance_modal_node.get() else { return String::new() };
+        let (in_force, walk) = crate::themes::resolve(store, s_id, n_id);
+        crate::themes::in_force_sentence(&in_force, &walk)
     };
-    let send_paragraphs = move |spaced: bool| {
+    let open_theme = move || {
         if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-            store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, background: None, tags: None, paragraphs: Some(spaced) });
+            store.appearance_modal_node.set(None);
+            super::theme_picker::open_theme_picker(store, store_id, node_id);
         }
     };
     let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>, background: Option<Option<String>>| {
         if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-            store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None, paragraphs: None });
+            store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None, theme: None });
         }
     };
     let swatches: Vec<NodeHandle> = COLOR_CHOICES
@@ -111,20 +114,15 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                     }
                     {row_swatches}
                 }
-                div { class: "pimble-appearance__label", "Paragraphs" }
+                div { class: "pimble-appearance__label", "Theme" }
                 div {
                     class: "pimble-appearance__row",
-                    div {
-                        class: {move || if appearance_node_spaced() { "pimble-swatch pimble-swatch--none pimble-swatch--choice" } else { "pimble-swatch pimble-swatch--none pimble-swatch--choice pimble-swatch--active" }},
-                        title: "No gap between paragraphs: Enter starts the next line",
-                        onclick: move || send_paragraphs(false),
-                        "Compact"
-                    }
-                    div {
-                        class: {move || if appearance_node_spaced() { "pimble-swatch pimble-swatch--none pimble-swatch--choice pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none pimble-swatch--choice" }},
-                        title: "A gap after each paragraph, for writing a document",
-                        onclick: move || send_paragraphs(true),
-                        "Spaced"
+                    div { class: "pimble-appearance__theme", {move || theme_line()} }
+                    Button {
+                        variant: "default",
+                        size: "xs",
+                        onclick: open_theme,
+                        "Theme..."
                     }
                 }
                 div { class: "pimble-appearance__label", "Icon" }

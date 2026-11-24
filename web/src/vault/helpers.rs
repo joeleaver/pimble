@@ -44,6 +44,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | UndeleteNode { store_id, .. }
         | ListDeleted { store_id }
         | GetAncestors { store_id, .. }
+        | GetThemeChain { store_id, .. }
         | GetProperties { store_id, .. }
         | GetReferences { store_id, .. }
         | CreateMount { store_id, .. }

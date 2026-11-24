@@ -340,7 +340,7 @@ pub async fn write<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
             format!("The import stopped after {made} of {total} notes: {message}")
         },
     };
-    let top = match write_one(runner, store_id, parent_id, tree).await {
+    let top = match write_one(runner, store_id, parent_id, tree, true).await {
         Ok(id) => id,
         Err(message) => return failed(0, message),
     };
@@ -348,7 +348,7 @@ pub async fn write<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
     let mut pending: Vec<(NodeId, &Imported)> = vec![(top, tree)];
     while let Some((id, node)) = pending.pop() {
         for child in &node.children {
-            match write_one(runner, store_id, Some(id), child).await {
+            match write_one(runner, store_id, Some(id), child, false).await {
                 Ok(child_id) => {
                     made += 1;
                     pending.push((child_id, child));
@@ -361,8 +361,8 @@ pub async fn write<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
 }
 
 /// One node: create it, then write its fields and content as one update of
-/// the document the server made.
-async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Option<NodeId>, item: &Imported) -> Result<NodeId, String> {
+/// the document the server made. `top` is the import's top node.
+async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Option<NodeId>, item: &Imported, top: bool) -> Result<NodeId, String> {
     let node_id = match runner.run(BackendCommand::CreateNode { store_id, parent_id, title: item.title.clone(), init: None, place: Default::default() }).await {
         Some(BackendEvent::NodeCreated { node_id, .. }) => node_id,
         other => return Err(unexpected(other)),
@@ -383,7 +383,7 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
         Some(BackendEvent::NodeLoaded { node, .. }) => node.content,
         other => return Err(unexpected(other)),
     };
-    let delta = fill(&content, item, &stored).map_err(|e| format!("\"{}\" could not be written: {e}", item.title))?;
+    let delta = fill(&content, item, &stored, top).map_err(|e| format!("\"{}\" could not be written: {e}", item.title))?;
     match runner.run(BackendCommand::ApplyUpdate { store_id, node_id, update: delta }).await {
         Some(BackendEvent::NodeContentUpdated { .. }) => Ok(node_id),
         other => Err(unexpected(other)),
@@ -392,8 +392,9 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
 
 /// The update that gives a freshly created node's document `item`'s type,
 /// appearance, tags and blocks. Its title came with `CreateNode`, and is
-/// marked as chosen so the tree never retitles it from its first words.
-fn fill(document: &[u8], item: &Imported, stored: &[Option<crate::protocol::StoredBlob>]) -> pimble_crdt::Result<Vec<u8>> {
+/// marked as chosen so the tree never retitles it from its first words. The
+/// import's `top` node also names the Document theme.
+fn fill(document: &[u8], item: &Imported, stored: &[Option<crate::protocol::StoredBlob>], top: bool) -> pimble_crdt::Result<Vec<u8>> {
     let mut doc = NodeDoc::load(document)?;
     let before = doc.state_vector();
     let now = chrono::Utc::now().to_rfc3339();
@@ -401,9 +402,13 @@ fn fill(document: &[u8], item: &Imported, stored: &[Option<crate::protocol::Stor
         doc.set_node_type(item.node_type, &now)?;
     }
     doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::json!(true), &now)?;
-    // What is imported is writing (a Scrivener project, a Word or RTF document):
-    // its paragraphs keep a gap between them (docs/PARAGRAPHS_CONTRACT.md).
-    doc.set_custom(custom_keys::PARAGRAPHS, &serde_json::json!(pimble_core::SPACED_PARAGRAPHS), &now)?;
+    // What is imported is writing (a Scrivener project, a Word or RTF
+    // document): the whole import reads as Document, paragraphs with a gap
+    // between them, from its top node, which everything under it looks up
+    // (docs/THEMES_CONTRACT.md section 4).
+    if top {
+        doc.set_custom(custom_keys::THEME, &serde_json::json!(pimble_themes::DOCUMENT), &now)?;
+    }
     if let Some(icon) = &item.icon {
         doc.set_custom(custom_keys::ICON, &serde_json::json!(icon), &now)?;
     }
@@ -505,7 +510,7 @@ mod tests {
         item.icon = Some("star".into());
         item.tags = vec!["Draft".into()];
 
-        let delta = fill(&created.save(), &item, &[]).unwrap();
+        let delta = fill(&created.save(), &item, &[], true).unwrap();
         created.apply_update(&delta).unwrap();
 
         let fields = created.fields().unwrap();
@@ -515,7 +520,21 @@ mod tests {
         assert_eq!(fields.custom.get(custom_keys::ICON), Some(&serde_json::json!("star")));
         assert_eq!(fields.custom.get(custom_keys::BACKGROUND), Some(&serde_json::json!("#b0d7ff")));
         assert_eq!(fields.custom.get(custom_keys::EXPLICIT_TITLE), Some(&serde_json::json!(true)));
-        assert_eq!(fields.custom.get(custom_keys::PARAGRAPHS), Some(&serde_json::json!(pimble_core::SPACED_PARAGRAPHS)));
+        assert_eq!(fields.custom.get(custom_keys::THEME), Some(&serde_json::json!(pimble_themes::DOCUMENT)));
+        assert_eq!(fields.custom.get(custom_keys::PARAGRAPHS), None, "no new writes of paragraphs");
         assert_eq!(created.text().trim(), "It was a dark night.");
+    }
+
+    /// Only the top node names the theme: the notes under it look it up.
+    #[test]
+    fn only_the_imports_top_node_names_a_theme() {
+        let mut created = NodeDoc::new();
+        created.init(node_types::DOCUMENT, "Scene", None, "2026-10-09T00:00:00Z").unwrap();
+        let item = Imported::document("Scene", vec![Block::plain("Rain.")]);
+        let delta = fill(&created.save(), &item, &[], false).unwrap();
+        created.apply_update(&delta).unwrap();
+        let fields = created.fields().unwrap();
+        assert_eq!(fields.custom.get(custom_keys::THEME), None);
+        assert_eq!(fields.custom.get(custom_keys::PARAGRAPHS), None);
     }
 }

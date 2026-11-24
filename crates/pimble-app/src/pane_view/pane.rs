@@ -11,7 +11,7 @@ use crate::rinch_editor::Editor;
 use crate::state::AppStore;
 
 use super::actions::{close_pane, focus_pane, split_pane};
-use super::document::{editor_read_only, pane_access, pane_icon, pane_out_of_step, pane_people, pane_spaced, pane_title};
+use super::document::{editor_read_only, pane_access, pane_icon, pane_out_of_step, pane_people, pane_title};
 use super::{press_in_view, EDITOR_KEEPS_ITS_PRESSES, PRESS_HEARD, PRESS_IN_VIEW, RELEASE_IN_VIEW};
 
 /// One pane slot: its title strip, the read-only sentence when it applies,
@@ -78,13 +78,18 @@ pub(super) fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: Pane
     // The note's tables no atom shows any more (docs/SHEETS_CONTRACT.md
     // section 1), under its text.
     let lost_tables = crate::sheets::in_text::render_lost(__scope, store, pane);
+    // The note's document theme (docs/THEMES_CONTRACT.md section 7): its
+    // custom properties on the wrapper and its modifiers as the wrapper's
+    // classes; `document_theme.css` does the rest. Default draws nothing.
+    let drawn = rinch::core::reactive::Memo::new(move || crate::themes::pane_drawn(store, pane));
     let content_wrap = rsx! {
         div {
-            // Its paragraphs spaced or compact, as the note says
-            // (docs/PARAGRAPHS_CONTRACT.md); the stylesheet does the rest.
-            class: {move || if pane_spaced(store, pane) { "pimble-editor__content-wrap pimble-editor__content-wrap--spaced" } else { "pimble-editor__content-wrap" }},
+            class: {move || crate::themes::classes(crate::themes::WRAP_CLASS, &drawn.get())},
             // Hidden under a picture's board view while it is marked up.
-            style: {move || if state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() { "" } else { "display: none;" }},
+            style: {move || {
+                let shown = state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get();
+                if shown { drawn.get().style } else { "display: none;".to_string() }
+            }},
             onscroll: move |_| {
                 crate::text_boards::scrolled(store, pane);
                 crate::presence::text::redraw_later(store, pane);

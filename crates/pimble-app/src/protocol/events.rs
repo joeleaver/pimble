@@ -112,6 +112,10 @@ pub enum BackendEvent {
     /// Answer to `GetAncestors`: the store's root first, down to `node_id`'s
     /// parent. Empty for the root, or when the chain could not be read.
     AncestorsLoaded { store_id: StoreId, node_id: NodeId, ancestors: Vec<NodeId> },
+    /// Answer to `GetThemeChain`: the node asked for, then its parent, and
+    /// so on up, each taken as `NodeLoaded` takes one. Empty when the node
+    /// itself could not be read.
+    ThemeChainLoaded { store_id: StoreId, nodes: Vec<Node> },
     /// Answer to `GetProperties`: the nodes above `node_id`, the store's top
     /// first, each with the label its row shows (empty for a store's root,
     /// or when the chain could not be read), and the tags used in the store.

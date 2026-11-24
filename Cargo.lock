@@ -5240,6 +5240,7 @@ dependencies = [
  "pimble-server",
  "pimble-sheet",
  "pimble-store",
+ "pimble-themes",
  "pimble-ui",
  "reqwest",
  "rinch",
