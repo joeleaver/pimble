@@ -594,8 +594,10 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 - **The hosted server tells only watched documents.** The service names them
   (`setWriteInterest`, Service-only): per store the opaque document ids registered there
   and the roots of the shares their watchers hold the store through, whole when it starts
-  following and per store as they change (documents registered, the watches switch, a
-  grant made). The server tells nothing else, so the service never hears of a write to a
+  following and per store as they change (documents registered, the watches switch, and
+  every grant change: one made, a role or scope changed, one removed, a store deleted or
+  revived, an account deleted). A store whose watched notes cannot be read is read again
+  with backoff (1 s doubling to a minute), not at once. The server tells nothing else, so the service never hears of a write to a
   note nobody watches; it learns which documents are watched, never by whom. A relay face
   is the owner's own server and tells every write; the owner's posts are not filtered
   (filtering them would tell the owner's machine which of its documents others watch).
@@ -631,8 +633,12 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   is not watched." when none does.
 - **The notice**: `NoticeKind::Watch`, sealed by the service to the watcher's notice key,
   from the writer, the node changed, no snippet, `count` spells of editing: writes 30 s
-  or more apart (`pimble_core::watch::SPELL_GAP_MS`, `Gathered::add_spell`) count once
-  each, so a minute's typing is one, not a hundred appends. The app says "Joe edited a
+  or more apart (`pimble_core::watch::SPELL_GAP_MS`) count once each, so a minute's
+  typing is one, not a hundred appends. Writes are told in any order (a relay's report
+  can arrive late), so a batch keeps its spells' spans (`pimble_core::watch::Spells`,
+  `WatchBatch.spells`), not only its first and last write: a write is judged against the
+  writes it falls between, and one that closes the gap between two spells makes them
+  one; the same write told twice adds nothing. The app says "Joe edited a
   note you watch" ("... 3 times" for three spells) and shows the note's name, which only
   the watcher's device knows; email and push say "Joe edited a note you watch in Garden"
   ("... (3 times)"; several notes of one writer in one email: "Joe edited 2 notes you
@@ -641,15 +647,30 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 - **The watcher must still hold the store** when a write is gathered and when its notice
   is queued, through the whole store or a share whose root reaches the document (above);
   a member who left, or whose share no longer reaches the note, hears nothing more.
-- **A relayed store's writer is a member.** The owner's report names writers; each must
-  hold a grant on the store, and a write naming anyone else is refused (counted in the
-  answer's `refused`) and gathers nothing.
+- **A relayed store's writer is a member, inside their share.** The owner's report names
+  writers; each must hold the store whole or a share whose root is among the roots the
+  write names as reaching its document, and a write naming anyone else, or a member for
+  a document outside what they hold, is refused (counted in the answer's `refused`) and
+  gathers nothing.
 - **Unsent relay reports are kept.** What the owner's server could not post waits in the
-  store's `sync-state.json` (section `relay_writes`), writes of one spell merged, at most
-  20,000 kept (the oldest go first), and is sent 500 at a time when the service answers
-  again (backoff 2 s to 5 minutes, and at once when the relay serves again). A part the
-  service refuses as malformed or not the owner's (400, 403, 404) is dropped; an expired
-  session waits for the next.
+  store's `sync-state.json` (section `relay_writes`, written whole to a temporary and
+  renamed into place), writes of one spell merged, at most 20,000 kept (the oldest go
+  first), and is sent 500 at a time when the service answers again (backoff 2 s to 5
+  minutes, and at once when the relay serves again). A part the service refuses as
+  malformed or not the owner's (400, 403, 404) is dropped; an expired session waits for
+  the next.
+- **Each relay report is taken once.** A part is sealed as a report with an id of its own
+  (`report`, a UUID) and kept so before it is posted; nothing is added to it after, and
+  it is sent with that id until the service takes it. The service remembers the ids it
+  took for 30 days (`RelayReport`, forgotten hourly) and answers one sent again
+  `{ again: true }`, gathering nothing, so a report whose answer was lost (the app quit,
+  the connection broke after the post) is not told twice. Reports are taken one at a
+  time (`relay_reports_lock`).
+- **Quitting loses no relay write.** At stop the relay face stops first, telling what it
+  gathered and had not told yet, and then its reports are asked to stop: they keep all of
+  it on disk and end, and are waited for, never aborted. A post under way is let go;
+  every write is on disk before a post carries it, and the report is sent again with its
+  id the next time.
 - **Gathering and taking batches are one lock** (`watches_lock`): a write gathered while a
   pass takes the batches is never lost or told twice.
 - **The switch**: `watches` beside `on`, `email` and `push` in `PUT /me/notifications`
@@ -661,7 +682,7 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
 
 ### What was built, and where
 
-- `pimble-core/src/watch.rs`: `Window` (`REPORT`, `NOTICE`), `Gathered` (`add_spell`),
+- `pimble-core/src/watch.rs`: `Window` (`REPORT`, `NOTICE`), `Gathered`, `Spells`,
   `Batcher`, `SPELL_GAP_MS`, `watch_title`.
 - `pimble-rpc/src/notices.rs`: `NoticeKind::Watch`, `Notice.count`, `WatchEntry`,
   `WatchNodeRequest`, `UnwatchNodeRequest`, `ListWatchesResponse`, `WriteSeen` (with
@@ -671,22 +692,29 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   `subscribeWrites` (Service-only); `pimble-client` wraps them.
 - `pimble-server/src/writes.rs` (`Writes`: interest, record, gather, tell, `roots_reaching`;
   nothing kept with nobody listening), `relay_writes.rs` (the owner's report of its relay
-  face's writes, for the stores its tunnel serves, its `Outbox` in `sync-state.json`),
+  face's writes, for the stores its tunnel serves, its `Outbox` in `sync-state.json` with
+  sealed reports, `Owner` what it needs of the owner's server, `run` with its stop;
+  `relay_face.rs` stops the face before its reports and waits for them),
   `handler.rs` `note_write` and the five RPCs.
 - `pimble-server/src/notices/` (split from the old `notices.rs`): `watches.rs` (choices
   sealed and kept in step, `docs_for`, `register_all`, `follow_structure`, watch and
   unwatch), `kept.rs` (the device's copy), `run.rs` (refreshed with the account,
   registered after structural changes); `cloud/notices.rs` the service's endpoints.
 - `pimble-cloud`: `schema.rhype` (`User.notify_watches_off`, `InboxItem.count`,
-  `WatchChoices`, `WatchedDoc`, `WatchBatch` with its `root`), `src/db/` (split from
+  `WatchChoices`, `WatchedDoc`, `WatchBatch` with its `root` and `spells`,
+  `RelayReport`), `src/db/` (split from
   `db.rs`; `watches.rs`), `src/routes/watches.rs` (`GET /me/watches`, `PUT
   /me/watches/choices`, `PUT /me/watches/stores/{store}`, `POST /watches/writes` with the
-  writer check), `src/watches.rs` (`record_writes`, `watch_pass(state, now_ms)` with the
-  caller's clock, `interest_of`/`all_interest`, `InterestChanges`, `spawn`: a pass every
-  30 s and the hosted server's writes followed with backoff, its interest sent whole on
-  every connect and per store as it changes), `mail.rs` and `notify.rs` (the watch line,
-  spells summed per email line), `routes/inbox.rs` (the switch), `routes/stores.rs` (a
-  grant made changes the store's interest).
+  report id and the writer's grant judged against the write's roots), `src/watches.rs`
+  (`record_writes`, `watch_pass(state, now_ms)` with the caller's clock,
+  `interest_of`/`all_interest`, `InterestChanges`, `spawn`: a pass every 30 s, relay
+  reports forgotten after 30 days, and the hosted server's writes followed with backoff,
+  its interest sent whole on every connect and per store as it changes, an unreadable
+  store read again with backoff), `mail.rs` and `notify.rs` (the watch line, spells
+  summed per email line), `routes/inbox.rs` (the switch), `routes/stores.rs`,
+  `routes/members.rs`, `routes/accounts.rs` (every grant change changes the store's
+  interest; `routes/stores.rs` was split into `stores.rs`, `members.rs` and
+  `store_keys.rs`, each under 700 lines).
 - `pimble-app`: `watches.rs` (state, the row menu's states, the switch, the Inbox's
   "Watching" list with "Unwatch"), the row menu's "Watch" submenu (Watch, Watch with
   Subtree, Unwatch) in `app.rs`, the switch in the Account modal and Settings, watch
@@ -752,3 +780,86 @@ app inline atom (above) or a decoration that draws a widget in place of a range.
   `commands.rs` and `pimble-cloud/tests/integration.rs` were already far over 700 lines
   and are not split here (other sessions work in them on `master`; a split is its own
   change).
+
+## Built in wave 4 (2026-11-23, branch `notifications`)
+
+The tray, desktop only (`native`); the browser is unchanged. Everything comes from rinch
+`main` as it is: `rinch::tray` (its `system-tray` feature, now on in `native`: a
+StatusNotifierItem through ksni on Linux, tray-icon on Windows), `on_close_requested`,
+`hide_current_window`/`show_current_window`, `exit()` and `rinch::notification`.
+
+### Decided here
+
+- **One window process owns the tray and the notifications.** Two app processes on one
+  server are the two-window setup, so a second icon and every notice twice had to be
+  ruled out. The owner (the primary) holds an exclusive OS lock (`flock` on Linux,
+  `LockFileEx` on Windows) on `<config dir>/pimble/app-<server address>.lock`; it goes
+  with the process, a crash included, so nothing goes stale. Any other window process
+  shows no icon and no OS notification (its Inbox list and count still fill), waits on
+  the lock in a thread, and takes the tray when the owner quits.
+- **A plain launch while Pimble runs brings it to the front** and stops: it hands
+  `pimble:` (`app_links::COME_TO_FRONT`) through `openInApp` with its XDG activation
+  token (rinch #2880). A second window is asked for with `pimble --new-window`; a link
+  no running window took also opens its own window, as before. The updater's restart
+  waits for the old process before it claims, so it becomes the primary.
+- **Closing the window with the icon up hides it**; closing with no icon up quits, so a
+  window never vanishes with nothing to bring it back. No icon is: the setting off,
+  another window owning the tray, or a desktop with no tray host (vanilla GNOME). The
+  last is judged once at start (rinch has no live "is the host there" query).
+- **File > Quit (Ctrl+Q) replaces File > Exit (Alt+F4)**: Alt+F4 is the system's close,
+  which now hides. Tray "Quit" and File > Quit write what the device remembers of how
+  things looked and exit, the window shown or hidden.
+- The setting, "Keep running in the tray when the window closes", is on by default and
+  lives in Settings > General ("When the window closes"), in `state.json` as
+  `tray_keep_running`; turning it off takes the icon down at once. The one notice ("Pimble
+  is still running") is sent the first time a close hides the window, and
+  `tray_notice_shown` records it.
+
+### What was built, and where
+
+- `crates/pimble-app/src/instance.rs`: `launch` (:44, Start or HandOver), `claim` (:98;
+  a lock file that cannot be opened makes this process the primary, with a warning),
+  `wait_to_become_primary` (:123), `is_primary`, `lock_name`.
+- `crates/pimble-app/src/tray.rs`: `TraySettings` (`from_state`/`write_into`),
+  `on_close` (:75, the one decision), `TrayStatus` and `status_line` (Settings'
+  sentence), `start` (:134), `set_keep_running` (:187), `quit` (:206),
+  `close_requested` (:214), `tell_once` (:231).
+- `crates/pimble-app/src/desktop.rs` (new, moved out of `app.rs`): `bring_to_front`
+  (:17), `run` (:32: the tray, the wait for the lock, `on_close_requested`),
+  `remember_views`, `close_window` (:124, the titlebar's close asks the same question).
+- `crates/pimble-app/src/inbox.rs:133`: the OS notification is gated on
+  `notifies_here()` (:144 native `instance::is_primary()`, :149 the browser always).
+- `crates/pimble-app/src/main.rs:174`: claim, then hand over or start; `--new-window`.
+- `crates/pimble-app/src/app_links.rs`: `AppLink::Window` and `COME_TO_FRONT`;
+  `menus.rs:203` Quit; `settings.rs:214` the switch; `persistence.rs:95`
+  `load_tray_settings`/`save_tray_settings`.
+- `links.rs` was 899 lines once touched and is split by responsibility: `app_links.rs`
+  (links from outside the app) and `web_links.rs` (web URLs and autolinking).
+
+### Verified
+
+- Tests: `tray.rs` (6: on by default, the round trip keeping the rest of the state,
+  hide and tell only the first time, the setting off quits, no icon quits, every status
+  has a sentence), `instance.rs` (4: a plain launch hands over unless primary,
+  `--new-window` and an untaken link start, the lock's name per server, one holder at a
+  time and released when its holder goes), `main.rs` (`--new-window` beside the
+  renderer), `app_links.rs` (`pimble:` and `pimble://` are the window).
+- **Seen on screen** (KDE Plasma on Wayland, an app on its own port and scratch dirs):
+  the StatusNotifierItem registered; the close button hid the window and the process
+  stayed; "Pimble is still running" sent once and `tray_notice_shown` saved, a second
+  close sent nothing; the icon brought the window back; a plain second launch brought it
+  to the front and exited; a `--new-window` process showed no icon, and took the tray
+  when the owner quit from the tray menu; Settings showed the switch, and turning it off
+  took the icon down and saved it; with it off, closing the window exited the app and its
+  embedded server.
+
+### Not done in wave 4
+
+- Not run on Windows (built for it through rinch's tray-icon backend; CI builds it).
+- No macOS tray (the app is not built for macOS).
+- A tray host that appears after Pimble starts (a panel restarted, an extension turned on)
+  is not noticed until the next start. The general mechanism for rinch would be
+  `TrayIcon::host_present()` or a signal for it (a rinch PR, not proposed yet).
+- A real crash of the owner was not staged; the lock's release is the OS's (covered by
+  the test that drops the holder).
+- `app.rs`, `events.rs` and `state.rs` are still far over 700 lines (see wave 3).
