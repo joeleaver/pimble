@@ -1838,3 +1838,109 @@ deleted yet (part 2).
 - No test covers an expired sign-in on a plain link held through the account (the link waits
   while the session is expired, as the vault link does; the vault link's tests cover that path).
 - The old browser path is still there (wave 5's later parts remove it).
+
+## Built: wave 5, part 2 (2026-11-23, not merged or released): diagnostics, the account page, shared helpers
+
+What the worker's browser path still lacked next to the old one, so that the old path can go in
+its own step. The old path is not deleted yet.
+
+### Diagnostics are the server's (section 6, item 10)
+
+- **One core, three recorders.** `pimble_core::diagnostics` (`records.rs`) holds what every
+  recorder shares, with no I/O: the envelope (`Envelope::record`, `Envelope::report`), the log
+  budget (`LogBudget`: repeats at 1, 2, 3, then tens; 500 warnings, 2,000 info lines), the info
+  targets, scrubbing a record's values, ids and the report code. The desktop's recorder
+  (`pimble-server/src/diagnostics/native.rs`, `queue.rs`, `system.rs`, `report.rs`: the old
+  799-line `diagnostics.rs` split by job), the worker's, and the page's (`web/src/diagnostics.rs`)
+  are each built on it.
+- **The worker's server records** (`diagnostics/worker.rs` over `diagnostics/on_disk.rs`, both
+  targets, tested natively): a `tracing` layer installed beside the console's
+  (`pimble-worker/src/entry.rs`) keeps the recent log and admits lines through the budget; the
+  records wait in memory (at most 1 MiB) until the page has said its choice, then go every
+  minute onto the server's own disk (`Paths::diagnostics()`, `records-<millis>-<session>.ndjson`,
+  at most 4 MiB, the oldest dropped), and are sent through the host's `Http` to the accounts
+  service's `/api/v1/diagnostics/records` with the keystore's session as the bearer. The
+  accounts service adds the send key as before; no browser carries it. Signed out, they wait.
+  Records say `os: "web"`, and a `system` record says `program: "worker"`.
+- **The choice stays the page's** (Settings > Diagnostics, `localStorage`): the page tells the
+  server `setDiagnostics { enabled, install }` at every connection and whenever it saves. The
+  install number is the page's, so the page's records and the worker's share one
+  (`Queue::install`: an offered valid id wins and is kept). Off clears the worker's queue.
+- **Send Diagnostics** in worker mode is `sendDiagnostics { note, stores, logs }`: the page hands
+  over its recent log as `page.log`, the server adds `worker.log` and posts the report to
+  `/api/v1/diagnostics/reports` as the signed-in account. It answers the code, or a sentence
+  (signed out: "Sign in to send diagnostics from this browser."). On the desktop the same two
+  RPCs save `diagnostics.json` and run `send_report` (the app still calls its server's
+  `send_report` in process, as before). Both RPCs are Service-only.
+- `HttpRequest` carries a `Body { content_type, bytes }` (`Body::json`, `Body::ndjson`) in
+  place of `json`, so the NDJSON batches go through the same seam.
+- The page's recorder keeps its own records (`program: "web"`, queued in `localStorage`, sent
+  with the cookie) in both modes, and in worker mode takes the account's id from
+  `CloudStatusChanged`.
+
+### The account page
+
+- **Keep what I've read in step** is already the server's in worker mode: Settings > Account's
+  switch sends `cloudPersonalSync`, which the worker's server answers as the desktop's does. The
+  worker's account page now says where the switch is; it has no second switch.
+- **Change password, a new recovery code, members per store: not built. They need Joe's call**
+  (the brief's stop rule: new security-sensitive RPCs, where keys live, roles). What the old
+  page does in the page (derive, rewrap the account keys, `PUT` them) has to happen where the
+  keys are, which in worker mode is the server's keystore. The proposal:
+  - `cloudChangePassword { current_password, new_password }` → empty: in the keystore, derive
+    the old and new password keys (`pimble_crypto`), unwrap and rewrap the account keys, and send
+    the accounts service the new `auth_key` and wrapped blob, as `cloudSignIn` does in reverse.
+    Service-only. The session stays.
+  - `cloudNewRecoveryCode {}` → `{ code }`: the code is made in the server and wraps the account
+    keys under its KEK; the answer is the one place it is shown. This is the first RPC that would
+    answer a secret to the page. It is the person's own, shown once, as on the old page.
+  - Members of a whole store: either the share RPCs (`cloudShareInfo`, `cloudInvite`,
+    `cloudRemoveMember`) take `node_id: Option<NodeId>` (`None` meaning the whole store), or
+    three new ones (`cloudStoreMembers`, `cloudStoreAddMember`, `cloudStoreRemoveMember`). Adding
+    a member of a vault store seals the current store key for them. The old page could also
+    make someone an owner; the share RPCs refuse Owner. Which roles a whole-store invite may
+    give is the roles model, so it is Joe's.
+
+### Shared helpers out of old-only files
+
+- `web/src/open_link.rs`: `keep_open_link` and `take_open_link`, out of `app_page.rs`; both
+  modes call them.
+- `web/src/kdf.rs`: `derive_timed`, out of `session.rs`; the signup, recover and account pages
+  and the old session call it.
+
+### Proof
+
+Chromium (Playwright), the local stack, a made-up account, in worker mode. The accounts service
+was pointed at a stub diagnostics server on loopback that kept what it was sent and answered a
+report code; nothing left the machine.
+
+- Help > "Send Diagnostics..." with a note answered "Sent. Its code is STUB4242". The report
+  reached the stub through `/api/v1/diagnostics/reports`, with the accounts service's key and
+  the account's id. It carried the note, `page.log` (16 lines) and `worker.log` (4 lines), and
+  its install number was the page's.
+- The worker's own records arrived through `/api/v1/diagnostics/records` about ten seconds after
+  it started (its `system` record says `program: "worker"`), with the same install number and
+  account as the page's records. No address reached the stub.
+- Settings > Account, "Keep what I've read in step": off sent `DELETE /api/v1/me/personal`
+  from the worker, and on sent `GET` then `PUT`.
+- `cargo test` passes for pimble-core, pimble-host, pimble-rpc, pimble-client and pimble-server
+  (the new `diagnostics::on_disk` tests among them), with one exception:
+  `tests/in_process.rs` `a_reader_is_refused_in_process` fails. It fails the same way at
+  eed398e without this part's changes: the first notification has no source where the test
+  expects `"service"`. `cargo check --workspace --tests` and both browser crates' checks for
+  wasm32 are clean.
+
+### Not done
+
+- Change password, a new recovery code and members per store in worker mode wait for the
+  decisions above.
+- A panic in the worker is not recorded: a panic traps the wasm instance before any write to
+  its disk can finish. The page's panic hook still records the page's own.
+- A report's `page.log` can name the account's email local part: `pimble_app::boards` logs the
+  author stamp at info ("board edits are stamped as ..."), and the scrubber takes out whole
+  addresses only. The old path sends the same line.
+- `a_reader_is_refused_in_process` fails at eed398e and here (above); not looked into.
+- `handler.rs` (about 7,060 lines), `pimble-rpc/src/types.rs` (2,163) and
+  `pimble-client/src/client.rs` (1,815) are still over the 700-line limit. This part put its
+  code in new modules (`handler/diagnostics.rs`, `pimble-rpc/src/diagnostics.rs`) but split none
+  of them.
