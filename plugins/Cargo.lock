@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "kanban-viewer"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "pimble-plugin-sdk",
  "serde_json",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "timeline-viewer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pimble-plugin-sdk",
  "serde",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "todo-viewer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "pimble-plugin-sdk",
