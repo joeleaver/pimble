@@ -5,7 +5,8 @@ Status: proposed 2026-11-24, nothing built. Asked for by Seth; sketched by Joe t
 stores, plugins themed, about a dozen built in, maybe replacing the paragraph setting).
 Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions Joe must
 take are numbered in section 12, each with a recommendation; nothing is built until he
-has answered them. Answered so far: decision 4 (shares), 2026-11-24.
+has answered them. Answered so far (2026-11-24): decision 4 (shares) and decision 7 (palette, and themes
+that inherit and set only what they change).
 
 **Two kinds, kept apart:**
 - **App themes** dress the chrome: the explorer, the panes' frames, menus, dialogs, the
@@ -90,7 +91,7 @@ so nothing a theme holds can end a declaration or open a rule. One stylesheet
 
 | Group | Tokens |
 | --- | --- |
-| Page | `measure` (max line length: `none` or 40–100 `em`, centered when set), `page_padding` (length), `background` (color, optional), `text` (color, optional), `dimmed` (color, optional), `accent` (color for links, hashtags, mentions; optional) |
+| Page | `measure` (max line length: `none` or 40–100 `em`, centered when set), `page_padding` (length); the colors are the palette below |
 | Body | `font_body`, `size` (12–24 px), `line_height` (1.0–2.2), `letter_spacing` (optional), `align` (`start`, `justify`) |
 | Paragraph | `spacing` (`compact`, `spaced`, `indented`: a book's first-line indent and no gap, the first paragraph after a heading not indented), `indent` (length, for `indented`), `gap` (length, for `spaced`) |
 | Headings 1–6 | per level: `font` (default: `font_heading`), `size` (ratio of body), `weight` (`normal`, `medium`, `bold`), `case` (`none`, `upper`), `tracking` (letter spacing), `align` (`start`, `center`), `space_before`, `space_after`, `color` (optional), `rule_below` (bool) |
@@ -100,9 +101,29 @@ so nothing a theme holds can end a declaration or open a rule. One stylesheet
 | Tables | `style` (`grid`, `rows`, `minimal`), `header` (`bold`, `shaded`), `font` (optional), `size` (ratio) |
 | Rule | `style` (`line`, `ornament`: a centered short rule, `space`) |
 
-Colors are optional on purpose: a theme that sets none draws in the app theme's colors,
-so it reads in dark and light alike. A theme that sets colors must set them for both
-schemes (decision 7).
+**The palette** (decided, Joe 2026-11-24, decision 7): a fixed set of named color slots,
+each a **pair**, one value for the light scheme and one for the dark:
+
+| Slot | Used for |
+| --- | --- |
+| `page` | the page behind the text |
+| `text` | body text and headings without their own color |
+| `dimmed` | h5/h6, captions, a quote's text when its style dims it |
+| `accent` | links, hashtags, mentions, list markers without their own color |
+| `rule` | horizontal rules, table lines, a quote's bar |
+| `code_bg` | code blocks and inline code |
+| `highlight` | the highlight mark's default |
+
+Per-block `color` tokens in the groups above name a slot (`accent`, `dimmed`, ...) or give
+their own pair. Every slot is optional: unset, it comes from the base (section 3.1), and
+where no theme in the chain sets it, from the app theme, so a theme that sets no color
+reads in dark and light alike. A pair is set as a pair: the editor shows both values side by
+side, and setting one offers the other filled in ("Suggest the dark one": the light value
+through the same lift `display_color` applies to row colors), which the person may keep or
+change. The values drawn are the ones chosen; `display_color` is not applied to them.
+Built-ins come with their palettes filled in, so picking Paper or Book gives both schemes
+without anyone choosing a color. Members who view a shared tree in the other scheme see
+the theme's values for that scheme, not their own app theme's.
 
 ### 2.2 App theme tokens
 
@@ -129,10 +150,24 @@ Deleted, and has a link (CLAUDE.md "Everything is co-editable": no copy kept in 
 projection). Its title is the theme's name; its content is free text, and the theme pane
 shows a live sample under the token editor (section 9).
 
-A theme node may name a **base**: `data.theme.base` = a built-in's id (`builtin:book`) or
-another theme node of the same store. Tokens it does not set come from the base, then from
-the built-in Default. A base in another store is not allowed (it would make one store's
-look depend on another being open).
+**Every theme inherits** (Joe, 2026-11-24: people should not have to build a whole theme
+at once; they tweak a few things). A theme node names a **base**: `data.theme.base` = a
+built-in's id (`builtin:book`) or another theme node of the same store, and **sets only the
+tokens it changes**; every other token, palette slot and half of a pair comes from the
+base, its base, and so on, then the built-in Default. Bases chain to any depth (a cycle is
+refused when it is made and, if concurrent edits make one, broken at the theme with the
+smallest id, which then reads its base as Default). A change to a base shows in every theme
+built on it, because nothing is copied: "Book, but 17 px and a wider measure" is two
+tokens, and it follows Book as Book is tuned.
+
+The usual way to make a theme is therefore **"Customize..."** in the Theme picker, on
+whatever theme is in force: it makes a new theme node whose base is that theme and which
+sets nothing, applies it where the old one was applied (on the node the picker is for, or,
+asked, in the old theme's place on the node that named it), and opens it in the editor.
+Customizing a built-in leaves the built-in as it is. Customizing a theme from another open
+store first copies that theme into this store (section 6), then bases the new one on the
+copy. A base in another store is not allowed (it would make one store's look depend on
+another being open).
 
 Where theme nodes sit in the tree is the person's business; "New Theme" offers a
 **Themes** folder at the store root, made on first use, so they do not clutter writing.
@@ -384,7 +419,10 @@ text good at any width. Until either lands, no token depends on it.
   force and where it comes from ("Book, from 'Novel'", "Book, set here"), and "Use the
   parent's" clears the key. The store row's menu and "Appearance..." get the same item.
 - **A theme node opens as the theme editor**: the tokens in groups (section 2.1), each with
-  a control fitting its type, "inherits from <base>" shown greyed until set, a sample text
+  a control fitting its type; a token it does not set shows the inherited value greyed with
+  where it comes from ("17 px, from Book"), a token it sets has a reset that clears it back
+  to inherited, and a "Show only what this theme changes" switch lists the tweaks alone; a
+  sample text
   under it drawn live, and a scheme switch to preview dark and light. Edits are `applyEdit`s
   of `data.theme`, so two people editing a theme see each other's changes as they land.
 - **Settings > General > Theme**: the app theme, from built-ins and the app themes in open
@@ -472,12 +510,10 @@ cut or add.
    choosing one stays personal and per device like dark mode and zoom. Alternatives: app
    themes kept as device files only (no co-editing, no copying through stores), or the
    choice following the account through the personal document.
-7. **Colors in document themes.** *Recommendation:* optional; a theme that sets any color
-   sets a light and a dark value for each, and `display_color` is not applied to them (the
-   author chose both). Alternative: one set of colors, with the app's lift-and-cap applied in
-   the other scheme (less to author, less control: a sepia page would be adjusted on dark).
-   Or: no colors in document themes at all (the app theme owns color; document themes own
-   type and space only). That last is the simplest and the safest for legibility.
+7. **Colors in document themes. Decided (Joe, 2026-11-24):** optional, as a palette of
+   named slots, each a light and dark pair, the values drawn as chosen (section 2.1).
+   Themes inherit from a base and set only what they change; "Customize..." is how one is
+   made (section 3.1).
 8. **Fonts.** *Recommendation:* the fixed stacks of section 5, faces bundled on both
    targets (a few MB in all, lazy in the browser). Also allow an installed system font by
    name for a theme only its author uses? *Recommendation: no*, since a shared theme would
