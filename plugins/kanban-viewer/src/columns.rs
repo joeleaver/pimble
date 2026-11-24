@@ -4,13 +4,12 @@
 use super::*;
 
 /// A lane's columns as the board has them now, tracked, each with whether it
-/// is the last (where done things pile up) and folded.
-pub(crate) fn lane_columns(k: &Kanban, lane: Addr) -> Vec<(board::Column, bool, bool)> {
+/// is folded.
+pub(crate) fn lane_columns(k: &Kanban, lane: Addr) -> Vec<(board::Column, bool)> {
     let columns = k.board.with(|b| b.lanes.iter().find(|l| l.metanode == lane).map(|l| l.columns.clone()).unwrap_or_default());
-    let n = columns.len();
-    columns.into_iter().enumerate().map(|(i, c)| {
+    columns.into_iter().map(|c| {
         let folded = k.folded(&c.label);
-        (c, n > 1 && i + 1 == n, folded)
+        (c, folded)
     }).collect()
 }
 
@@ -188,8 +187,9 @@ pub(crate) fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board
     if board_writable && writable { rsx! { SortableHandle { {header} } } } else { header }
 }
 
-/// A lane's cells, one per column, stretched to the tallest so the last
-/// (Done, where finished cards pile up) is never taller than the others.
+/// A lane's cells, one per column, stretched to the tallest: each grows with
+/// its cards (the board scrolls), and a shorter one's empty foot is still its
+/// list, a place to drop.
 pub(crate) fn cells_row(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown, judge: SortJudge) -> NodeHandle {
     let kc = k.clone();
     let lane = shown.lane.metanode;
@@ -198,11 +198,11 @@ pub(crate) fn cells_row(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown
         div {
             class: "kanban__cells",
             style: ROW_STYLE,
-            for (column, last, folded) in lane_columns(&kc, lane) {
+            for (column, folded) in lane_columns(&kc, lane) {
                 div {
-                    key: format!("{column:?} {last} {folded}"),
+                    key: format!("{column:?} {folded}"),
                     style: "display: flex; flex-shrink: 0;",
-                    {cell(__scope, &kc, column.clone(), last, folded, size, writable, judge.clone())}
+                    {cell(__scope, &kc, column.clone(), folded, size, writable, judge.clone())}
                 }
             }
         }
@@ -210,11 +210,14 @@ pub(crate) fn cells_row(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown
 }
 
 /// One column of one lane: its cards (a sortable list of their own), and on
-/// hover, "Add card". The last column's list fills the cell the row's tallest
-/// sets and scrolls inside it; a minimized lane's lists show about three
-/// cards. A folded column is a narrow strip with its name and count.
+/// hover, "Add card". The list is the whole cell, padding and foot included,
+/// so a drag anywhere over a column (between cards, below the last, in the
+/// empty foot of a shorter column) is over its list; a drag over anything
+/// else in the cell would find no list and offer no place. It grows with its
+/// cards; only a minimized lane caps it, at about three cards, and scrolls.
+/// A folded column is a narrow strip with its name and count.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column, last: bool, folded: bool, size: Size, lane_writable: bool, judge: SortJudge) -> NodeHandle {
+pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column, folded: bool, size: Size, lane_writable: bool, judge: SortJudge) -> NodeHandle {
     let addr = column.addr;
     let name = column.label.clone();
     if folded {
@@ -237,50 +240,42 @@ pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column,
     let can_add = column.writable;
     let (kd, ka, kenter, kleave) = (k.clone(), k.clone(), k.clone(), k.clone());
     let hovered = k.hovered;
-    let list_style = if last {
-        "position: absolute; top: 8px; left: 8px; right: 8px; bottom: 34px; overflow-y: auto;".to_string()
-    } else if size == Size::Minimized {
-        format!("max-height: {MINIMIZED_MAX}px; overflow-y: auto;")
-    } else {
-        String::new()
-    };
     rsx! {
         div {
             class: "kanban__cell",
             data-kanban-column: key_of(addr),
-            style: format!("width: {COLUMN_W}px; min-height: {}px; position: relative; display: flex; flex-direction: column; padding: 8px 8px 34px 8px; box-sizing: border-box; {CELL_BG}", if last { 110 } else { 72 }),
+            style: cell_style(size),
             onmouseenter: move || kenter.hovered.set(Some(addr)),
             onmouseleave: move || {
                 if untracked(|| kleave.hovered.get()) == Some(addr) {
                     kleave.hovered.set(None);
                 }
             },
-            div {
-                style: list_style,
-                SortableList {
-                    group: CARDS,
-                    id: key_of(addr),
-                    label: column.label.clone(),
-                    class: "kanban__cards",
-                    style: format!("{CARD_LIST_STYLE}{SORT_THEME}"),
-                    // A read-only board takes no drags; a read-only column on a
-                    // writable board still judges a drop into it, so the caret says
-                    // why not ("You can read this, not change it.").
-                    disabled: !lane_writable,
-                    lift_keys: lift_keys(),
-                    // Trello's feel (Joe, 2026-11-04): the card follows the
-                    // pointer, and the list opens a gap where it lands.
-                    indicator: SortIndicator::Gap,
-                    source: SortSource::Collapse,
-                    // The app's own picture of the item under the pointer: a copy of
-                    // a plugin's elements does not keep its look across the host.
-                    preview: SortPreview::Snapshot,
-                    judge: Some(judge),
-                    ondrop: move |m: SortMove| kd.drop_move(m),
-                    {cards}
-                }
+            SortableList {
+                group: CARDS,
+                id: key_of(addr),
+                label: column.label.clone(),
+                class: "kanban__cards",
+                style: format!("{}{SORT_THEME}", card_list_style(size)),
+                // A read-only board takes no drags; a read-only column on a
+                // writable board still judges a drop into it, so the caret says
+                // why not ("You can read this, not change it.").
+                disabled: !lane_writable,
+                lift_keys: lift_keys(),
+                // Trello's feel (Joe, 2026-11-04): the card follows the
+                // pointer, and the list opens a gap where it lands.
+                indicator: SortIndicator::Gap,
+                source: SortSource::Collapse,
+                // The app's own picture of the item under the pointer: a copy of
+                // a plugin's elements does not keep its look across the host.
+                preview: SortPreview::Snapshot,
+                judge: Some(judge),
+                ondrop: move |m: SortMove| kd.drop_move(m),
+                {cards}
             }
-            if can_add && hovered.get() == Some(addr) {
+            // Not while a card is carried: the button is the cell's, not the
+            // list's, and a drag over it would find no place to drop.
+            if can_add && hovered.get() == Some(addr) && sortable_drag().is_none() {
                 div {
                     class: "kanban__add-card",
                     style: "position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; padding: 3px 10px; font-size: 12px; border-radius: 4px; cursor: pointer; white-space: nowrap; color: var(--rinch-color-body); background: var(--rinch-color-text); box-shadow: 0 1px 3px rgba(0,0,0,0.25);",

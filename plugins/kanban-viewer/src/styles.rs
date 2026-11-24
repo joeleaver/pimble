@@ -10,17 +10,68 @@ pub(crate) const GRID_STYLE: &str = "display: flex; flex-direction: column; gap:
 pub(crate) const COLUMN_W: u32 = 280;
 pub(crate) const FOLDED_W: u32 = 44;
 pub(crate) const LABEL_W: u32 = 168;
-/// A minimized lane shows about three cards a column (kobayban's cap).
+/// A minimized lane shows about three cards a column (kobayban's cap): the
+/// height its cards scroll in, inside the list's padding.
 pub(crate) const MINIMIZED_MAX: u32 = 220;
+/// A column cell's padding around its cards; the foot leaves room for "Add
+/// card" below the last.
+const LIST_PAD: u32 = 8;
+const LIST_FOOT: u32 = 34;
+/// The least a column is drawn, empty: room to drop a first card.
+const CELL_MIN: u32 = 72;
 pub(crate) const ROW_STYLE: &str = "display: flex; gap: 12px; align-items: stretch; flex-shrink: 0;";
 pub(crate) const HEADER_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-end; flex-shrink: 0;";
 // The sortable lists' layout is written here as well as in rinch's stylesheet,
 // which is the app's: an app on a rinch from before sortable lists still lays
 // the board out (only the caret and the refusal box need its stylesheet).
 pub(crate) const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-end; flex-shrink: 0; position: relative;";
-pub(crate) const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; min-height: 28px; position: relative;";
+pub(crate) const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; position: relative;";
 pub(crate) const CELL_BG: &str = viewer_look::PANEL;
 pub(crate) const LANE_LABEL_STYLE: &str = "display: flex; flex-direction: column; gap: 4px; padding: 6px 4px; flex-shrink: 0; box-sizing: border-box; min-width: 0;";
 
 pub(crate) const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
 pub(crate) const DEFAULT_CARD_ICON: &str = viewer_look::PLAIN_ICON;
+
+/// A column cell's style: a panel its card list fills ([`card_list_style`]),
+/// as tall as its cards or the row's tallest, capped only in a minimized lane.
+pub(crate) fn cell_style(size: Size) -> String {
+    let cap = match size {
+        Size::Minimized => format!(" max-height: {}px;", MINIMIZED_MAX + LIST_PAD + LIST_FOOT),
+        Size::Expanded | Size::Collapsed => String::new(),
+    };
+    format!("width: {COLUMN_W}px; min-height: {CELL_MIN}px;{cap} position: relative; display: flex; flex-direction: column; box-sizing: border-box; {CELL_BG}")
+}
+
+/// A column's card list: the whole of its cell (it grows to fill a cell the
+/// row stretched), the cell's padding its own, so every point of the column
+/// is over the list. In a minimized lane it scrolls inside the cell's cap.
+pub(crate) fn card_list_style(size: Size) -> String {
+    let scroll = match size {
+        Size::Minimized => " min-height: 0; overflow-y: auto;",
+        Size::Expanded | Size::Collapsed => "",
+    };
+    format!("{CARD_LIST_STYLE} flex: 1;{scroll} padding: {LIST_PAD}px {LIST_PAD}px {LIST_FOOT}px {LIST_PAD}px; box-sizing: border-box;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Joe's "Done" column (2026-11-23): eight cards in a window one card tall.
+    /// Nothing but a minimized lane caps a column, and no column's list is
+    /// taken out of the flow, where it would add no height to its cell.
+    #[test]
+    fn a_column_grows_with_its_cards_unless_its_lane_is_minimized() {
+        for size in [Size::Expanded, Size::Collapsed] {
+            assert!(!cell_style(size).contains("max-height"), "{size:?}");
+            assert!(!card_list_style(size).contains("overflow"), "{size:?}");
+        }
+        assert!(cell_style(Size::Minimized).contains("max-height"));
+        assert!(card_list_style(Size::Minimized).contains("overflow-y: auto"));
+        for size in [Size::Expanded, Size::Minimized, Size::Collapsed] {
+            assert!(!card_list_style(size).contains("absolute"));
+            assert!(!cell_style(size).contains("padding"), "the cell's padding is the list's, so the list is every point of it");
+            assert!(card_list_style(size).contains("flex: 1;"));
+        }
+    }
+}
