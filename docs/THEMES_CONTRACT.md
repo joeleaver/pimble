@@ -7,7 +7,7 @@ Written against the code at `ed48772` and rinch `main` `e8e04ccc`. The decisions
 take are numbered in section 12, each with a recommendation; nothing is built until he
 has answered them. Answered so far (2026-11-24): decisions 2 (themes replace paragraph spacing), 3 (looked up
 from the nearest ancestor), 4 (shares), 5 (mounts keep their native look), 6 (app themes
-follow the account) and 7 (palette, and themes
+follow the account; every theme has its own light and dark) and 7 (palette, and themes
 that inherit and set only what they change).
 
 **Two kinds, kept apart:**
@@ -136,9 +136,15 @@ rinch's semantic colors (`body`, `surface`, `text`, `dimmed`, `border`, `default
 the light scheme's ramp around `#3f6491` was derived), the title bar's two, Pimble's own
 (`--pimble-toolbar-*`, `--pimble-sheet-ghost`, the viewer surfaces of section 8), the
 radius (`xs`..`xl`), the UI font (a stack from section 5) and the UI size (13–16 px).
-Each app theme names its **scheme** (dark or light): that still drives the editor's
-`set_dark_mode`, `display_color` and every color Pimble derives, so the existing dark/light
-logic stays the one place that judges legibility.
+**Every theme has its own light and dark** (Joe, 2026-11-24). An app theme is never "a dark
+theme" or "a light theme": every color token above is a pair, one value for each scheme,
+like a document theme's palette (section 2.1), and the primary ramp is derived per scheme
+from that scheme's primary. Radius, UI font and UI size are shared by both. Which scheme
+shows is a separate preference (section 3.3), so switching dark and light keeps the theme
+and shows its other half. The scheme still drives the editor's `set_dark_mode`,
+`display_color` and every color Pimble derives, so the existing dark/light logic stays the
+one place that judges legibility. A theme with a base inherits each half of each pair it
+does not set, so a tweak to only the dark side of Paper is one token.
 
 ## 3. Where themes live
 
@@ -249,7 +255,7 @@ theme kept in a store would leave the chrome depending on that store being open.
   `crates/pimble-app/src/personal.rs`), the one yrs document per account edited only by
   that person's devices, gains two entries:
   ```
-  app_themes: Map<theme id, Map>   a person's own app themes: name, base, scheme, tokens
+  app_themes: Map<theme id, Map>   a person's own app themes: name, base, tokens (color pairs)
   app_theme:  String               the one in use: a built-in id or an app_themes id
   ```
   Signed out, it stays on the device (`personal.yrs`, IndexedDB in the browser), as read
@@ -267,11 +273,11 @@ theme kept in a store would leave the chrome depending on that store being open.
   runs Pimble, so the theme in use is always there. The only fallback left is a built-in
   that a newer release removed, or a base deleted on another device: the chain then reads
   Default for what is missing.
-- **Dark and light.** The `dark_mode` preference becomes the app theme's scheme. View >
-  "Toggle Dark Mode" switches to the last-used app theme of the other scheme
-  (`app_theme_last_dark`, `app_theme_last_light` beside `app_theme`). The first start after
-  this ships seeds `app_theme` from `state.json` `dark_mode` (`builtin:pimble-dark` or
-  `-light`), so nothing changes on screen.
+- **Dark and light** stay a preference of their own, beside the theme: `dark_mode` as today
+  (`state.json`, `localStorage` in the browser), Settings > General and View > "Toggle Dark
+  Mode". Toggling keeps the theme and shows its other half, for the chrome and for every
+  document theme on screen at once. The first start after this ships sets `app_theme` to
+  `builtin:pimble`, today's look in both schemes, so nothing changes on screen.
 - **Giving an app theme to someone else** is not in the first waves: there is no store to
   carry it. Later: "Copy as text" and "Paste theme" (the tokens as JSON, checked by type on
   the way in), which needs no new sync path.
@@ -503,10 +509,14 @@ Document themes (all set no colors unless said, so they read in both schemes):
 9. **Compact**: `sans` 13 px, line height 1.4, tight lists: dense reference notes.
 
 App themes:
-10. **Pimble Dark**: today's dark scheme.
-11. **Pimble Light**: today's light scheme (the brand slate).
-12. **Paper**: light, warm off-white surfaces, sepia text, `serif` UI font: pairs with Book.
-13. **Midnight**: dark, near-black surfaces, high contrast, cyan accent: late-night writing.
+Each app theme has a light and a dark half:
+10. **Pimble**: today's light scheme (the brand slate) and today's dark scheme.
+11. **Paper**: warm off-white surfaces and sepia text in light, warm brown-black and parchment
+    text in dark, `serif` UI font: pairs with Book.
+12. **Contrast**: pure white or near-black surfaces, strong borders, saturated accent: for
+    bright rooms, projectors and low vision.
+13. **Dusk**: muted, low-contrast, cool grays in both halves: long sessions, late at night.
+
 That is nine document themes and four app themes (thirteen); decision 11 asks which to
 cut or add.
 
@@ -532,7 +542,8 @@ cut or add.
    is resolved in its own store, and the picker on a mount row acts on the source node.
 6. **App themes. Decided (Joe, 2026-11-24):** they follow the account: a person's app themes
    and the one in use live in the personal document, synced to their own devices when
-   signed in, never in a store (section 3.3).
+   signed in, never in a store (section 3.3). Every theme, app or document, has its own
+   light and dark; the scheme stays a preference of its own (section 2.2).
 7. **Colors in document themes. Decided (Joe, 2026-11-24):** optional, as a palette of
    named slots, each a light and dark pair, the values drawn as chosen (section 2.1).
    Themes inherit from a base and set only what they change; "Customize..." is how one is
@@ -564,8 +575,8 @@ cut or add.
 2. **Theme nodes.** `node_type = "theme"`, the theme editor pane, New Theme, bases, the
    picker's store group, copying from other open stores.
 3. **App themes.** The app token set, the personal document's `app_themes` and
-   `app_theme`, Settings > General, the viewer surface variables, the two stock themes as
-   data, Paper and Midnight.
+   `app_theme`, Settings > General, the viewer surface variables, Pimble (today's two
+   schemes as one theme), Paper, Contrast and Dusk.
 4. **Shares and mounts** per decisions 4 and 5, with the sharing harness
    (`crates/pimble-server/tests/common`) covering a member who holds neither the
    ancestors nor the theme node, at each of the three theme accesses; the Share dialog's
