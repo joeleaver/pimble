@@ -2066,12 +2066,11 @@ asking again with the old password says "That is not your current password." Bot
 through a proxy that refuses or drops the answer
 (`crates/pimble-cloud/tests/integration/account_worker.rs`).
 
-**Other devices' sessions stay signed in.** That is what `POST /me/password` already does
-(docs/CRYPTO_CONTRACT.md, Phase 2a-2: "keeps other sessions (Joe may change that later)") and
-what the old page did. The account keys do not change with the password, so ending sessions
-would not take keys back from a device that holds them; the keystore of this device needs no
-change either. **For Joe**: whether a password change should also end every other session
-(a "sign out everywhere") is still his call; nothing here prevents adding it.
+**A password change signs out the account's other sessions; the session that made it stays
+signed in** (Joe, 2026-11-25: "Sign out the others"). Built in part 4 below, which replaces
+what this part first built (other sessions stayed signed in, as the old page had them). The
+account keys do not change with the password, so ending sessions does not take keys back
+from a device that holds them; the keystore of this device needs no change.
 
 ### A new recovery code
 
@@ -2164,17 +2163,104 @@ logs, the desks' answers) is under the session's scratchpad, `wave5efg/`.
 
 ### Not done, and open
 
-- **For Joe**: whether a password change should also sign out every other session (above).
 - `tests/in_process.rs` `a_reader_is_refused_in_process` fails as at this part's base (part 2
   above). `tests/vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`
   failed in every run here (four of four) at line 1408, the known race between the test's look
   at H and the owner's upkeep (part 1's notes); the test does not touch what this part changed.
-- A sign-in refused for a wrong password shows the service's raw answer ("cloud service at ...
-  answered 401: ...") on the worker's sign-in page. It predates this part (`cloudSignIn`); it
-  should be a sentence.
+- A sign-in refused for a wrong password showed the service's raw answer ("cloud service at
+  ... answered 401: ...") on the worker's sign-in page. Part 4 makes it a sentence.
 - `handler.rs`, `pimble-rpc/src/types.rs`, `pimble-client/src/client.rs` and
   `crates/pimble-cloud/tests/integration.rs` are still over the 700-line limit; this part's code
   is in new modules (`handler/account.rs`, `cloud/account.rs`, `pimble-rpc/src/account.rs`,
   `client/account.rs`, `web/src/worker_mode/account_sections.rs`,
   `tests/integration/account_worker.rs`).
 - The old browser path is still there.
+
+## Built: wave 5, part 4 (2026-11-25, not merged or released): a refused sign-in in a sentence, and a password change signs out the others
+
+### Joe's decision (2026-11-25)
+
+- **A password change signs out the account's other sessions** ("Sign out the others"). The
+  session that made the change stays signed in. This replaces part 3's "Other devices'
+  sessions stay signed in".
+
+### A refused sign-in is a sentence (`crates/pimble-server/src/cloud/refusal.rs`)
+
+The shared server turns the accounts service's refusals into `CloudError::Refused { status,
+refusal }`, whose Display is a whole sentence (`Refusal`), and whose `status()` is still the
+service's, so code that reads a 401 reads it as before. The browser's worker-mode sign-in page,
+the account page and the desktop's Account modal show the server's answer as it is, so all of
+them say:
+
+- `POST /login` 401: "That email and password do not match." An address with no account
+  reads exactly the same: `GET /kdf` answers it with a decoy and `/login` with the same 401, so
+  the sentence cannot say whether an account exists, and does not try.
+- `POST /login` 403 `email_unverified`: "Check your inbox: this address has not been verified
+  yet." The service says it only once the password matched.
+- A call made with the session (`GET /me/keys`, `POST /me/password`, `POST /me/recovery-code`)
+  answered 401: "Your Pimble Cloud sign-in has ended. Sign in again.", and the keystore marks
+  the session ended (as minting a token does), so the account's status asks to sign in again.
+  `POST /me/password` with a wrong current password now answers 401 `wrong_current_password`
+  (it was `unauthorized`, like an ended session), which reads "That is not your current
+  password."
+- 429 anywhere in these: "Pimble Cloud asks to slow down. Wait a moment and try again."; a 5xx:
+  "Pimble Cloud could not answer just now. Try again in a moment."
+- The members RPCs (part 3) say an ended session and a 5xx the same way.
+
+The old browser path's wording (`web/src/session.rs`) was the model. `cloud.rs` (724 lines) is
+split by responsibility into `cloud/` (`sessions`, `stores`, `keys`, `people`, `members`,
+`account`, `notices`, `refusal`), with no change of behavior; the accounts service's recovery
+and password routes moved from `routes/accounts.rs` (865 lines) to `routes/password.rs`.
+
+### A password change ends every other session (`crates/pimble-cloud/src/routes/password.rs`)
+
+`User.session_epoch` and `Session.epoch` (u64, absent on old rows: 0): a session is valid
+while its epoch is not below its account's (`SessionRow::ended_for`, checked by
+`AuthedUser`, so the cookie, a session bearer, `/me`, `/token` and the relay's owner tunnel
+all refuse an ended session as "invalid session"). A session is made with the account's epoch
+as read when its password was checked.
+
+`POST /me/password`, after the current password is checked: the new epoch is the clock in
+milliseconds (above the stored epoch should the clock be behind); the changing session's epoch
+is raised to it first, which ends nothing; then the one `User.update` that writes the new
+hash, the KDF parameters and the wrapped keys raises the account's epoch to it, which ends
+every other session at that moment. So the change and the sign-out are one write: a change that
+never reached that update leaves the old password and every session; one that did leaves the
+new password and only the changing session. A sign-in that checked the old password and is
+written after the change carries the old epoch and is ended too. The ended sessions' rows are
+then deleted, as housekeeping (they are refused already; a failure there is logged).
+
+**Recovery** (`POST /recover/{token}/complete`) already ended every session (docs/CRYPTO_CONTRACT.md
+"Phase 2a-2", "deletes every session"), so it is the same decision and nothing about what it
+does changed: it now raises the epoch in its own one update, so no session survives even a
+racing sign-in, and deletes the rows after, as the password change does.
+
+### Known limits
+
+- **JWTs are not revoked.** Pimble servers keep no session state and verify hour-long JWTs
+  against the JWKS, so a JWT minted before the change stays valid until it expires (at most an
+  hour). A device whose session ended keeps a live connection until its token expires or it
+  reconnects; it then fails to mint a new one and asks to sign in again. JWT revocation is not
+  built.
+- The relay's owner tunnel is authorized with the session when it opens; a tunnel opened before
+  the change stays up until it drops, and is refused when it reconnects.
+- Two password changes from two sessions at the same moment: the later write's password holds;
+  the session whose epoch is the higher stays signed in, and if the earlier write's epoch was the
+  higher both changing sessions stay. Every other session ends either way.
+
+### Proof
+
+- `crates/pimble-cloud/tests/integration/sessions.rs`, against a real `rhypedb-server`
+  (`RHYPEDB_SERVER_BIN=~/dev/rhypedb/target/debug/rhypedb-server`, not skipped): after a change,
+  another session is refused as a cookie and as a bearer (`/me`, `/me/keys`, `/token` all 401);
+  the changing session's `/me` and `/token` answer 200; only its row is left; a later sign-in
+  works and ends nothing; a change from that session ends the first changer's. A refused change
+  ends nothing and answers `wrong_current_password`. A session written for the old password
+  after the change is refused. A recovery ends every session.
+- `tests/integration/account_worker.rs`: the device that changes the password stays signed in
+  (`cloudStatus`, `cloudListHostedStores`, `cloudNewRecoveryCode` work); another device signed
+  in before is told "Your Pimble Cloud sign-in has ended. Sign in again.", changes nothing, and
+  signs in again with the new password. A device's sign-in refused for a wrong password, for an
+  unknown address, and for an unverified one reads as the sentences above, the first two
+  identical.
+- Unit tests: `cloud::refusal` (every mapping, the status kept) and `handler::account`.
