@@ -133,11 +133,21 @@ impl Recorder {
         }
     }
 
-    /// Everything recorded since the last take, as record lines of `install`.
-    pub fn take(&mut self, install: &str) -> Vec<String> {
+    /// Everything recorded since the last take, as record lines of
+    /// `install`, one batch per account that was signed in when its records
+    /// were made (`None`: no one was), in the order each first appears.
+    pub fn take(&mut self, install: &str) -> Vec<(Option<String>, Vec<String>)> {
         let envelope = self.envelope(install);
         self.pending_bytes = 0;
-        self.pending.drain(..).map(|p| envelope.record(&self.scrubber, p.seq, &p.ts, &p.kind, p.data, p.account.as_deref())).collect()
+        let mut batches: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for p in self.pending.drain(..) {
+            let line = envelope.record(&self.scrubber, p.seq, &p.ts, &p.kind, p.data, p.account.as_deref());
+            match batches.iter_mut().find(|(account, _)| *account == p.account) {
+                Some((_, lines)) => lines.push(line),
+                None => batches.push((p.account, vec![line])),
+            }
+        }
+        batches
     }
 
     /// The recent log, oldest line first.
@@ -169,11 +179,50 @@ pub enum Sent {
 }
 
 /// Records waiting on the server's disk: one NDJSON file per batch, named by
-/// when it was written, so the oldest go first. One server holds a browser's
-/// disk at a time (section 4), so no file is ever claimed by two senders.
+/// when it was written, so the oldest go first, and by the account whose
+/// records it holds, so that it is only ever sent as that account. One server
+/// holds a browser's disk at a time (section 4), so no file is ever claimed by
+/// two senders.
 pub struct Queue {
     disk: Disk,
     dir: PathBuf,
+}
+
+/// Whose records a batch holds, from its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// Recorded while no one was signed in: sent as whoever signs in next.
+    NoOne,
+    /// Recorded while this account was signed in: sent only as it.
+    Account(String),
+    /// A name that says neither (no batch this version writes).
+    Unknown,
+}
+
+/// A batch's name: `records-<millis>-<session>-<owner>.ndjson`, the owner
+/// `none` or `u` and the account id in hex (any id, and no `-` in it).
+fn batch_name(millis: u128, session: &str, account: Option<&str>) -> String {
+    let owner = match account {
+        None => "none".to_string(),
+        Some(id) => format!("u{}", id.bytes().map(|b| format!("{b:02x}")).collect::<String>()),
+    };
+    format!("records-{millis:013}-{session}-{owner}.ndjson")
+}
+
+fn owner_of(path: &std::path::Path) -> Owner {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Owner::Unknown };
+    let Some(stem) = name.strip_prefix("records-").and_then(|n| n.strip_suffix(".ndjson")) else { return Owner::Unknown };
+    let parts: Vec<&str> = stem.split('-').collect();
+    let [_millis, _session, owner] = parts.as_slice() else { return Owner::Unknown };
+    if *owner == "none" {
+        return Owner::NoOne;
+    }
+    let Some(hex) = owner.strip_prefix('u').filter(|h| !h.is_empty() && h.len() % 2 == 0) else { return Owner::Unknown };
+    let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect();
+    match bytes.and_then(|b| String::from_utf8(b).ok()) {
+        Some(id) => Owner::Account(id),
+        None => Owner::Unknown,
+    }
 }
 
 impl Queue {
@@ -199,18 +248,19 @@ impl Queue {
         id
     }
 
-    /// Write `lines` as one batch, taken at `millis` by `session`.
-    pub async fn append(&self, lines: &[String], millis: u128, session: &str) -> io::Result<()> {
+    /// Write `lines` as one batch of `account`'s records (`None`: recorded
+    /// while no one was signed in), taken at `millis` by `session`.
+    pub async fn append(&self, lines: &[String], millis: u128, session: &str, account: Option<&str>) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
         self.disk.create_dir_all(&self.dir).await?;
         let mut text = lines.join("\n");
         text.push('\n');
-        self.disk.write(self.dir.join(format!("records-{millis:013}-{session}.ndjson")), text).await
+        self.disk.write(self.dir.join(batch_name(millis, session, account)), text).await
     }
 
-    /// The waiting batches, oldest first.
+    /// The waiting batches, whoever's, oldest first.
     pub async fn waiting(&self) -> Vec<PathBuf> {
         let Ok(entries) = self.disk.list(&self.dir).await else { return Vec::new() };
         let mut files: Vec<PathBuf> =
@@ -237,13 +287,32 @@ impl Queue {
         }
     }
 
-    /// Send every waiting batch to `url`, oldest first, with `bearer` (the
-    /// account's session). A batch taken, or refused as unreadable or too
-    /// big (400, 413), is deleted; anything else stops the send.
-    pub async fn send(&self, http: &dyn Http, url: &str, bearer: Option<&str>) -> Sent {
+    /// Send, oldest first, every waiting batch that is `account`'s or no
+    /// one's to `url` with `bearer` (that account's session), asking
+    /// `go_on` before each: once it says no (diagnostics were turned off),
+    /// nothing more is read or sent. Another account's batches wait for it;
+    /// a batch whose name says no owner is deleted unsent. A batch taken, or
+    /// refused as unreadable or too big (400, 413), is deleted; anything else
+    /// stops the send.
+    pub async fn send(&self, http: &dyn Http, url: &str, bearer: &str, account: &str, go_on: &dyn Fn() -> bool) -> Sent {
         for path in self.waiting().await {
+            match owner_of(&path) {
+                Owner::NoOne => {}
+                Owner::Account(owner) if owner == account => {}
+                Owner::Account(_) => continue,
+                Owner::Unknown => {
+                    let _ = self.disk.remove_file(&path).await;
+                    continue;
+                }
+            }
+            if !go_on() {
+                return Sent::Stopped;
+            }
             let Ok(bytes) = self.disk.read(&path).await else { continue };
-            let request = HttpRequest { method: Method::Post, url: url.to_string(), bearer: bearer.map(str::to_string), body: Some(Body::ndjson(bytes)) };
+            if !go_on() {
+                return Sent::Stopped;
+            }
+            let request = HttpRequest { method: Method::Post, url: url.to_string(), bearer: Some(bearer.to_string()), body: Some(Body::ndjson(bytes)) };
             match http.send(request).await {
                 Ok(answer) if answer.is_success() || matches!(answer.status, 400 | 413) => {
                     let _ = self.disk.remove_file(&path).await;
@@ -261,7 +330,8 @@ impl Queue {
         Sent::All
     }
 
-    /// Turned off: everything waiting goes (the install number stays).
+    /// Turned off: everything waiting goes, whoever's (the install number
+    /// stays).
     pub async fn clear(&self) {
         for path in self.waiting().await {
             let _ = self.disk.remove_file(&path).await;

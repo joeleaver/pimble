@@ -46,6 +46,8 @@ pub use report::send_report;
 
 #[cfg(target_arch = "wasm32")]
 mod worker;
+#[cfg(any(target_arch = "wasm32", test))]
+mod worker_core;
 #[cfg(target_arch = "wasm32")]
 pub use worker::*;
 

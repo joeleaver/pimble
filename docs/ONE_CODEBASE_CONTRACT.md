@@ -1900,15 +1900,32 @@ its own step. The old path is not deleted yet.
   (`pimble-server/src/diagnostics/native.rs`, `queue.rs`, `system.rs`, `report.rs`: the old
   799-line `diagnostics.rs` split by job), the worker's, and the page's (`web/src/diagnostics.rs`)
   are each built on it.
-- **The worker's server records** (`diagnostics/worker.rs` over `diagnostics/on_disk.rs`, both
-  targets, tested natively): a `tracing` layer installed beside the console's
+- **The worker's server records** (`diagnostics/worker.rs` over `diagnostics/worker_core.rs` and
+  `diagnostics/on_disk.rs`, the latter two built for both targets and tested natively): a `tracing` layer installed beside the console's
   (`pimble-worker/src/entry.rs`) keeps the recent log and admits lines through the budget; the
   records wait in memory (at most 1 MiB) until the page has said its choice, then go every
-  minute onto the server's own disk (`Paths::diagnostics()`, `records-<millis>-<session>.ndjson`,
+  minute onto the server's own disk (`Paths::diagnostics()`,
+  `records-<millis>-<session>-<owner>.ndjson`,
   at most 4 MiB, the oldest dropped), and are sent through the host's `Http` to the accounts
   service's `/api/v1/diagnostics/records` with the keystore's session as the bearer. The
   accounts service adds the send key as before; no browser carries it. Signed out, they wait.
-  Records say `os: "web"`, and a `system` record says `program: "worker"`.
+  Records say `os: "web"`, and a `system` record says `program: "worker"` (once per session, the
+  first time diagnostics are on, even after an off).
+- **A batch is sent only as the account that recorded it** (review of e31e31e, 2026-11-25). A
+  pump writes one batch per account that was signed in when its records were made; the batch's
+  name carries the owner (`none`, or `u` and the account id in hex). A send takes the signed-in
+  account's own batches and the ones recorded while no one was signed in (those carry no
+  `account`, and wait for the next sign-in as before); another account's batches wait on the
+  disk for that account (or the 4 MiB cap, or an off). A batch whose name names no owner is
+  deleted unsent.
+- **An off is never overtaken by a pump** (same review). `WorkerDiagnostics` holds the
+  recorder, the choice, the install number and the queue's folder, and its two steps that touch
+  the queue (applying a choice, a pump) take turns behind one async lock. `setDiagnostics`
+  turns the switch at once; a pump already sending asks the switch before reading and before
+  sending each batch, so after the off nothing more leaves (a request already on the wire when
+  the person saved finishes); the off's clearing runs once that pump has ended, so nothing it
+  wrote stays on the disk. A choice that comes before the server has given the queue's folder
+  is kept and applied when the folder comes (`attach`, from `run`).
 - **The choice stays the page's** (Settings > Diagnostics, `localStorage`): the page tells the
   server `setDiagnostics { enabled, install }` at every connection and whenever it saves. The
   install number is the page's, so the page's records and the worker's share one
