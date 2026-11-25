@@ -19,7 +19,9 @@
 //! session's token and the personal document), [`stores`] (hosted and
 //! relayed stores, and how the account holds one), [`keys`] (a store's key
 //! envelopes), [`people`] (names and shares), [`members`], [`account`] (the
-//! password, the recovery code, lookups) and [`notices`].
+//! password, the recovery code, lookups), [`notices`], and [`refusal`]: the
+//! refusals a person meets while signing in or changing the password, said
+//! as sentences.
 
 use pimble_host::http::{Body, Http, HttpRequest, HttpResponse, Method};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,7 @@ mod keys;
 mod members;
 mod notices;
 mod people;
+mod refusal;
 mod sessions;
 mod stores;
 
@@ -37,6 +40,8 @@ pub use keys::*;
 pub use members::*;
 pub use notices::*;
 pub use people::*;
+pub(crate) use refusal::{signing_in, with_session};
+pub use refusal::Refusal;
 pub use sessions::*;
 pub use stores::*;
 
@@ -48,13 +53,17 @@ pub enum CloudError {
     Status { url: String, status: u16, body: String },
     #[error("cloud service response from {url} could not be parsed: {source}")]
     Decode { url: String, source: serde_json::Error },
+    /// A refusal a person meets, said as a whole sentence ([`Refusal`]);
+    /// `status` is what the service answered.
+    #[error("{refusal}")]
+    Refused { status: u16, refusal: Refusal },
 }
 
 impl CloudError {
     /// The HTTP status the service answered with, when it answered at all.
     pub fn status(&self) -> Option<u16> {
         match self {
-            CloudError::Status { status, .. } => Some(*status),
+            CloudError::Status { status, .. } | CloudError::Refused { status, .. } => Some(*status),
             _ => None,
         }
     }

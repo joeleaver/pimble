@@ -54,7 +54,7 @@ pub async fn delete_personal(http: &dyn Http, base_url: &str, session: &str) -> 
 
 pub async fn kdf(http: &dyn Http, base_url: &str, email: &str) -> Result<KdfParams> {
     let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
-    get(http, &endpoint(base_url, &format!("/api/v1/kdf?email={encoded_email}")), None).await
+    get(http, &endpoint(base_url, &format!("/api/v1/kdf?email={encoded_email}")), None).await.map_err(super::signing_in)
 }
 
 // ── POST /login ───────────────────────────────────────────────────────────
@@ -77,8 +77,11 @@ pub struct LoginResponse {
     pub session: String,
 }
 
+/// Refused as [`super::Refusal::WrongPassword`] for a wrong password and for
+/// an address with no account alike, and as [`super::Refusal::Unverified`]
+/// once the password matched an address not verified yet.
 pub async fn login(http: &dyn Http, base_url: &str, email: &str, auth_key: &str) -> Result<LoginResponse> {
-    post(http, &endpoint(base_url, "/api/v1/login"), None, &LoginRequest { email, auth_key }).await
+    post(http, &endpoint(base_url, "/api/v1/login"), None, &LoginRequest { email, auth_key }).await.map_err(super::signing_in)
 }
 
 // ── GET /me/keys ──────────────────────────────────────────────────────────
@@ -102,7 +105,7 @@ pub struct NoticeKeyView {
 /// The account's public keys, the password's KDF parameters and the account
 /// keys wrapped under it.
 pub async fn me_keys(http: &dyn Http, base_url: &str, session: &str) -> Result<MeKeysResponse> {
-    get(http, &endpoint(base_url, "/api/v1/me/keys"), Some(session)).await
+    get(http, &endpoint(base_url, "/api/v1/me/keys"), Some(session)).await.map_err(super::with_session)
 }
 
 // ── POST /token ───────────────────────────────────────────────────────────

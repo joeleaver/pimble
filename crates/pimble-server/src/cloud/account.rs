@@ -17,8 +17,9 @@ struct ChangePasswordBody<'a> {
 }
 
 /// Replace the password's material: the service checks `current_auth_key`
-/// as login does (401 when it is wrong), then stores the new hash, the
-/// parameters and the wrapped keys in one update.
+/// as login does ([`super::Refusal::WrongCurrentPassword`] when it is
+/// wrong), then stores the new hash, the parameters and the wrapped keys,
+/// and ends every other session of the account, in one update.
 pub async fn change_password(
     http: &dyn Http,
     base_url: &str,
@@ -29,7 +30,7 @@ pub async fn change_password(
     account_key_blob: &AccountKeyBlob,
 ) -> Result<()> {
     let body = ChangePasswordBody { current_auth_key, auth_key, kdf, account_key_blob };
-    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/password"), Some(session), &body).await?;
+    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/password"), Some(session), &body).await.map_err(super::with_session)?;
     Ok(())
 }
 
@@ -42,7 +43,7 @@ struct ChangeRecoveryCodeBody<'a> {
 /// Replace the recovery code's material in one update.
 pub async fn change_recovery_code(http: &dyn Http, base_url: &str, session: &str, recovery_salt: &str, recovery_key_blob: &AccountKeyBlob) -> Result<()> {
     let body = ChangeRecoveryCodeBody { recovery_salt, recovery_key_blob };
-    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/recovery-code"), Some(session), &body).await?;
+    let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/recovery-code"), Some(session), &body).await.map_err(super::with_session)?;
     Ok(())
 }
 

@@ -9,8 +9,9 @@
 //! stores the new hash, parameters and wrapped keys in one update, so at every
 //! moment the account opens with exactly one password (and one code). Nothing
 //! on this server depends on the password: the keystore holds the keys
-//! unwrapped and the session, and both stay. Other devices' sessions stay too
-//! (they hold the same keys; docs/CRYPTO_CONTRACT.md "Phase 2a-2").
+//! unwrapped and the session, and both stay. Every other session of the
+//! account ends with a password change, in the service's same update (Joe,
+//! 2026-11-25; docs/ONE_CODEBASE_CONTRACT.md "Built: wave 5, part 4").
 //!
 //! No password, auth key or code is logged or kept; the new recovery code
 //! leaves this server once, in the answer.
@@ -21,25 +22,36 @@ use pimble_rpc::{to_rpc_error, CloudStoreMembersResponse, MemberRole, ShareMembe
 use tracing::{info, warn};
 
 use super::{hosted_plain, RpcHandler};
-use crate::cloud::{CloudError, MemberView};
+use crate::cloud::{CloudError, MemberView, Refusal};
 use crate::keystore::SignedInAccount;
 
 /// The shortest password the account pages accept (`web/src/pages`).
 pub(crate) const MIN_PASSWORD: usize = 8;
 
 const NOT_SIGNED_IN: &str = "Sign in to Pimble Cloud first.";
-const WRONG_PASSWORD: &str = "That is not your current password.";
 const LAST_OWNER: &str = "A store always keeps at least one owner. Make someone else an owner first.";
 const OWNERS_ONLY: &str = "Only an owner of this store can see and change who holds it.";
-const TOO_FAST: &str = "Pimble Cloud asks to slow down. Wait a moment and try again.";
 
-/// A refusal of the accounts service's, said as a sentence: the ones this
-/// page meets in its own words, any other in the service's.
+/// A refusal of the accounts service's on a store's members, said as a
+/// sentence: the ones this page meets in its own words, any other in the
+/// service's.
 fn refusal(e: CloudError) -> ErrorObjectOwned {
     match &e {
         CloudError::Status { status: 409, .. } => to_rpc_error(LAST_OWNER),
         CloudError::Status { status: 403, .. } => to_rpc_error(OWNERS_ONLY),
-        CloudError::Status { status: 429, .. } => to_rpc_error(TOO_FAST),
+        CloudError::Status { status: 401, .. } => to_rpc_error(Refusal::SignedOut),
+        CloudError::Status { status: 429, .. } => to_rpc_error(Refusal::TooFast),
+        CloudError::Status { status, .. } if (500..600).contains(status) => to_rpc_error(Refusal::Unavailable),
+        _ => account_refusal(e),
+    }
+}
+
+/// A refusal of a call on the account's own material (`GET /me/keys`,
+/// `POST /me/password`, `POST /me/recovery-code`), which
+/// `crate::cloud::with_session` has already said as a sentence where it
+/// knows one; a 400 is said in the service's words.
+fn account_refusal(e: CloudError) -> ErrorObjectOwned {
+    match &e {
         CloudError::Status { status: 400, body, .. } => to_rpc_error(crate::cloud::service_message(body).unwrap_or_else(|| e.to_string())),
         _ => to_rpc_error(e),
     }
@@ -64,6 +76,19 @@ impl RpcHandler {
         self.keystore.account().await.ok_or_else(|| to_rpc_error(NOT_SIGNED_IN))
     }
 
+    /// [`account_refusal`], and a session the service no longer takes (a
+    /// password changed on another device ends this one) marked as ended, as
+    /// minting a token does (`crate::grant::mint`), so the account's status
+    /// says to sign in again.
+    fn refused(&self, e: CloudError) -> ErrorObjectOwned {
+        if matches!(e, CloudError::Refused { refusal: Refusal::SignedOut, .. }) && !self.keystore.session_expired() {
+            self.keystore.mark_session_expired();
+            warn!("Pimble Cloud refused this computer's sign-in (it expired, or was signed out elsewhere): sign in again");
+            self.cloud_changed();
+        }
+        account_refusal(e)
+    }
+
     /// `cloudChangePassword`. The current password is checked here first
     /// (it must open the wrapped keys the service holds), so a typo costs no
     /// request; the service checks it again, as login does.
@@ -72,7 +97,7 @@ impl RpcHandler {
             return Err(to_rpc_error(format!("A password needs at least {MIN_PASSWORD} characters.")));
         }
         let account = self.account_signed_in().await?;
-        let held = crate::cloud::me_keys(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
+        let held = crate::cloud::me_keys(self.http(), &account.url, &account.session).await.map_err(|e| self.refused(e))?;
         if held.public_keys != account.keys.public_keys() {
             // The service's keys are not the ones this server holds: a
             // rewrap of these would lock the account out of its own.
@@ -96,16 +121,13 @@ impl RpcHandler {
             .map_err(to_rpc_error)?
             .map_err(to_rpc_error)?;
         let Some((current_auth_key, material)) = derived else {
-            return Err(to_rpc_error(WRONG_PASSWORD));
+            return Err(to_rpc_error(Refusal::WrongCurrentPassword));
         };
 
         crate::cloud::change_password(self.http(), &account.url, &account.session, &current_auth_key, &material.auth_key, &material.kdf, &material.account_key_blob)
             .await
-            .map_err(|e| match e.status() {
-                Some(401) => to_rpc_error(WRONG_PASSWORD),
-                _ => refusal(e),
-            })?;
-        info!("The Pimble Cloud password was changed");
+            .map_err(|e| self.refused(e))?;
+        info!("The Pimble Cloud password was changed; the account's other sessions ended with it");
         Ok(())
     }
 
@@ -123,7 +145,7 @@ impl RpcHandler {
             .map_err(to_rpc_error)?;
         crate::cloud::change_recovery_code(self.http(), &account.url, &account.session, &material.recovery_salt, &material.recovery_key_blob)
             .await
-            .map_err(refusal)?;
+            .map_err(|e| self.refused(e))?;
         info!("The Pimble Cloud recovery code was replaced");
         Ok(std::mem::take(&mut material.code))
     }
@@ -249,6 +271,22 @@ mod tests {
         let bad = CloudError::Status { url: "u".into(), status: 400, body: r#"{"error":"bad_request","message":"an owner must already have a verified Pimble account; invite them as an editor, commenter or reader"}"#.into() };
         assert!(refusal(bad).message().starts_with("An owner must already have"));
         let fast = CloudError::Status { url: "u".into(), status: 429, body: r#"{"error":"rate_limited","message":"too many lookups; slow down"}"#.into() };
-        assert_eq!(refusal(fast).message(), TOO_FAST);
+        assert_eq!(refusal(fast).message(), Refusal::TooFast.to_string());
+        let ended = CloudError::Status { url: "u".into(), status: 401, body: r#"{"error":"unauthorized","message":"invalid session"}"#.into() };
+        assert_eq!(refusal(ended).message(), Refusal::SignedOut.to_string());
+        let failed = CloudError::Status { url: "u".into(), status: 502, body: "Bad Gateway".into() };
+        assert_eq!(refusal(failed).message(), Refusal::Unavailable.to_string());
+    }
+
+    #[test]
+    fn a_refusal_on_the_accounts_own_material_is_a_sentence() {
+        let wrong = crate::cloud::with_session(CloudError::Status {
+            url: "u".into(),
+            status: 401,
+            body: r#"{"error":"wrong_current_password","message":"current password is incorrect"}"#.into(),
+        });
+        assert_eq!(account_refusal(wrong).message(), "That is not your current password.");
+        let bad = CloudError::Status { url: "u".into(), status: 400, body: r#"{"error":"bad_request","message":"auth_key must not be empty"}"#.into() };
+        assert_eq!(account_refusal(bad).message(), "Auth_key must not be empty.");
     }
 }
