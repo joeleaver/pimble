@@ -15,8 +15,9 @@ impl RpcHandler {
     /// was shown): off deletes what waits at once, on starts recording the
     /// next time a program starts. In a worker, from now on, after any clear
     /// the page says is owed. Whether every owed clear has run: on the
-    /// desktop, where an off deletes at once and no client keeps a note, it
-    /// always has.
+    /// desktop an off deletes at once and no client keeps a note, so it has
+    /// whenever this answers at all (an off that could not delete what
+    /// waits, or an on that could not delete what an off left, is an error).
     pub(super) async fn diagnostics_set(&self, request: SetDiagnosticsRequest) -> Result<bool, ErrorObjectOwned> {
         #[cfg(not(target_arch = "wasm32"))]
         {

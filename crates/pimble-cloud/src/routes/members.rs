@@ -306,6 +306,23 @@ pub async fn put_member(
     Json(req): Json<PutMemberRequest>,
 ) -> CloudResult<Json<MemberView>> {
     let store = require_live_store(&state, &store_id).await?;
+    // "A verified account" for this purpose means one a key can actually be
+    // wrapped to: verified, with key material. An unverified or legacy row is
+    // invited instead, and the invitation becomes a grant the moment that
+    // address really has an account (see `claim_invitations`).
+    let email = req.email.trim();
+    let found = match valid_email(email) {
+        true => state.db.find_user_by_email(email).await?.filter(|u| u.verified && u.has_key_material()),
+        false => None,
+    };
+    // A grant is written for that account under its lock, taken before the
+    // store's (the lock order: account, then store): an account being
+    // deleted holds it from listing its grants until it is gone, so this
+    // waits, and finds the account deleted.
+    let account = match &found {
+        Some(found) => Some(state.lock_live_account(found.rid).await?),
+        None => None,
+    };
     // Who is an owner, and how many there are, is read and written under the
     // store's lock (see `AppState::store_owner_locks`): the caller's own
     // ownership too, which another owner may be taking away at this moment.
@@ -331,21 +348,24 @@ pub async fn put_member(
     } else {
         stored_name(req.name.as_deref().unwrap_or_default(), "a share's name")?
     };
-    let email = req.email.trim();
-    if email.is_empty() || !email.contains('@') {
+    if !valid_email(email) {
         return Err(CloudError::BadRequest("email is not valid".to_string()));
     }
 
-    // "A verified account" for this purpose means one a key can actually be
-    // wrapped to: verified, with key material. An unverified or legacy row is
-    // invited instead, and the invitation becomes a grant the moment that
-    // address really has an account (see `claim_invitations`).
-    let target = state.db.find_user_by_email(email).await?.filter(|u| u.verified && u.has_key_material());
-
-    match target {
-        Some(target) => grant_member(&state, &store, owners, &authed.user, target, &req.role, &root, &share_name).await,
+    match account {
+        Some((held, Some(target))) => grant_member(&state, &store, (held, owners), &authed.user, target, &req.role, &root, &share_name).await,
+        Some((_, None)) => Err(CloudError::Conflict(ACCOUNT_DELETED_REFUSAL.to_string())),
         None => invite_member(&state, &store, owners, &authed.user, email, &req.role, &root, &share_name).await,
     }
+}
+
+/// The refusal of a grant for an account that was deleted before it could
+/// be written.
+pub const ACCOUNT_DELETED_REFUSAL: &str = "That account was deleted while this change waited, so nothing was shared with it.";
+
+/// Whether `email` (trimmed) can name an account at all.
+fn valid_email(email: &str) -> bool {
+    !email.is_empty() && email.contains('@')
 }
 
 /// Gives every grant and every invitation of `(store, root)` the name the
@@ -372,13 +392,15 @@ async fn rename_share(state: &AppState, store: &HostedStoreRow, root: &str, shar
 
 /// `PUT members` for an address that has a usable account: a grant on this
 /// scope, plus the "shared with you" mail and the public keys the caller
-/// needs to wrap the scope's key straight away. `owners` is the store's
-/// owner lock, held until the grant is written and let go before the mail.
+/// needs to wrap the scope's key straight away. `locks` are `target`'s
+/// account lock and the store's owner lock, taken in that order, held until
+/// the grant is written and let go before the mail; `target` was read under
+/// the first.
 #[allow(clippy::too_many_arguments)]
 async fn grant_member(
     state: &AppState,
     store: &HostedStoreRow,
-    owners: OwnedMutexGuard<()>,
+    locks: (OwnedMutexGuard<()>, OwnedMutexGuard<()>),
     caller: &UserRow,
     target: UserRow,
     role: &str,
@@ -421,7 +443,10 @@ async fn grant_member(
     if let Some(invitation) = state.db.find_invitation(store.rid, &target.email, root).await? {
         state.db.delete_invitation(invitation.rid).await?;
     }
+    // The store's lock first, then the account's: the reverse of taking them.
+    let (account, owners) = locks;
     drop(owners);
+    drop(account);
 
     send_share_mail(state, store, share_name, &caller.email, &target.email, false).await;
     let has_key = has_key(state, target.rid, store.rid, root).await?;
@@ -586,7 +611,15 @@ pub async fn delete_invitation(
 /// An existing grant on that same scope wins — an owner who invited an
 /// address and then added the account directly (or changed its role
 /// afterwards) must not have that role overwritten by the older invitation.
+///
+/// The grants are written under the account's lock, as every grant is
+/// (`AppState::lock_live_account`): an account being deleted claims nothing,
+/// and its invitations are left for the address's next account.
 async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usize> {
+    let (_account, live) = state.lock_live_account(user.rid).await?;
+    if live.is_none() {
+        return Ok(0);
+    }
     let mut claimed = 0usize;
     for invitation in state.db.invitations_for_email(&user.email).await? {
         let store = state.db.get_hosted_store(invitation.store_rid).await?;

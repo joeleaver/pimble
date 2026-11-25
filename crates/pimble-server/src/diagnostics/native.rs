@@ -47,9 +47,20 @@ pub fn settings() -> Settings {
 }
 
 /// Save the choice; turning it off deletes what waits and stops recording at
-/// once, turning it on starts the next time a program starts.
+/// once, turning it on starts the next time a program starts. An off that
+/// could not delete everything waiting is saved and answers an error (each
+/// start while off tries again); an on after an off first deletes whatever
+/// that off left, and stays off with an error when it cannot, so nothing
+/// recorded before an off is ever sent.
 pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     let path = settings_path().ok_or_else(|| std::io::Error::other("no config folder"))?;
+    if settings.enabled && !self::settings().enabled {
+        if let Some(dir) = queue_dir() {
+            clear_queue(&dir).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("Diagnostics stay off: what they kept before they were turned off could not be deleted ({e})."))
+            })?;
+        }
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -57,10 +68,21 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     if !settings.enabled {
         ENABLED.store(false, Ordering::SeqCst);
         if let Some(dir) = queue_dir() {
-            let _ = fs::remove_dir_all(dir);
+            clear_queue(&dir).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("Diagnostics are off, but what they kept could not all be deleted ({e}); it is never sent, and is deleted next time."))
+            })?;
         }
     }
     Ok(())
+}
+
+/// Delete the queue in `dir`, everything in it: a folder that is not there
+/// holds nothing.
+fn clear_queue(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Where records wait.
@@ -107,7 +129,11 @@ pub fn start(program: &'static str) {
     let Some(key) = send_key() else { return };
     if !settings().enabled {
         if let Some(dir) = queue_dir() {
-            let _ = fs::remove_dir_all(dir);
+            // What an off could not delete; nothing is sent while off, and
+            // an on deletes it first.
+            if let Err(e) = clear_queue(&dir) {
+                tracing::debug!("diagnostics are off and what they kept is not deleted yet: {e}");
+            }
         }
         return;
     }
@@ -212,4 +238,30 @@ pub(super) fn install_id(path: &Path) -> String {
     let id = random_hex(16);
     let _ = fs::write(path, &id);
     id
+}
+
+/// Permissions are how a test makes a removal fail, so these run on Unix.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::clear_queue;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_queue_that_cannot_be_deleted_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("diagnostics");
+        clear_queue(&dir).expect("a queue that is not there is cleared");
+        let inner = dir.join("held");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("records-1.ndjson"), "{}").unwrap();
+        // A folder whose entries cannot be removed.
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = clear_queue(&dir);
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err(), "the failure is answered, not dropped");
+        assert!(inner.join("records-1.ndjson").exists());
+        clear_queue(&dir).expect("once it can, the queue goes");
+        assert!(!dir.exists());
+    }
 }

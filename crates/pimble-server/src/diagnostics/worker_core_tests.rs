@@ -513,3 +513,63 @@ async fn the_restart_case_is_only_caught_by_the_page_s_note() {
     let (sent, _) = a_restart_after_an_off_said_before_the_folder(false).await;
     assert_eq!(sent, [1, 2]);
 }
+
+/// The page's say as the worker hears it (`worker::configure`): the clear the
+/// page notes as owed when `note`, then the choice; whether the worker
+/// answers that every clear has run, for the page to drop its note.
+async fn say(d: &WorkerDiagnostics, disk: &Disk, enabled: bool, note: bool) -> bool {
+    let cleared = !note || tokio::time::timeout(DEADLINE, d.clear_owed_by_the_page(disk)).await.expect("the page's clear runs");
+    tokio::time::timeout(DEADLINE, d.configure(disk, enabled, None)).await.expect("the say is applied");
+    cleared && !d.clears_owed()
+}
+
+/// An off whose clear cannot remove a batch is not done: the clear stays
+/// owed, nothing is sent (even with diagnostics on again, and even with the
+/// off's mark gone from the disk), and the page is not told "cleared". Once
+/// the batch can be removed, the next say clears it and only then says so.
+#[tokio::test]
+async fn a_clear_that_cannot_remove_a_batch_stays_owed() {
+    let held: &'static HeldDisk = Box::leak(Box::new(HeldDisk::new()));
+    let disk = Disk::new(held);
+    let service = Service::default();
+    let d = WorkerDiagnostics::new("1.0.0", "web");
+    d.attach(&disk, dir()).await;
+    d.configure(&disk, true, None).await;
+    d.record("stores", json!({ "at": 1 }), "t".into());
+    d.pump(&disk, &service, &rt(), None).await;
+    assert_eq!(waiting(&disk).await, 1, "a batch from before the off waits (signed out)");
+
+    // The person turns diagnostics off; the batch cannot be removed.
+    held.fail_removals(true);
+    let mut page = SavedChoice::default().saved(false, true, || "off-1".into());
+    assert!(!say(&d, &disk, false, page.clear_owed.is_some()).await, "the page is not told the clear ran");
+    assert!(d.clears_owed());
+    assert_eq!(waiting(&disk).await, 1);
+    assert_eq!(clear_marks(&disk).await, 1, "the off's mark stays");
+
+    // On again, and the removal still fails: nothing is sent or written.
+    page = page.saved(true, true, || unreachable!("an on owes nothing"));
+    assert!(page.clear_owed.is_some(), "the page keeps its note");
+    assert!(!say(&d, &disk, true, true).await, "the retry did not clear either");
+    d.record("stores", json!({ "at": 2 }), "t".into());
+    d.pump(&disk, &service, &rt(), Some(alice())).await;
+    assert!(service.sent().is_empty(), "nothing is sent while the clear is owed");
+    // Even were the off's mark gone (as when it could not be written), the
+    // clear owed in memory keeps every pump out.
+    for (mark, _) in Queue::new(disk.clone(), dir()).clear_marks().await {
+        disk.remove_file(&mark).await.unwrap();
+    }
+    d.pump(&disk, &service, &rt(), Some(alice())).await;
+    assert!(service.sent().is_empty(), "nothing is sent while the clear is owed in memory");
+    assert_eq!(waiting(&disk).await, 1, "and nothing more is written");
+
+    // The batch can be removed now: the next say clears it, then says so.
+    held.fail_removals(false);
+    assert!(say(&d, &disk, true, true).await, "the worker confirms the clear once it ran");
+    page = page.confirmed("off-1");
+    assert_eq!(page.clear_owed, None, "the page drops its note");
+    assert!(!d.clears_owed());
+    assert_eq!(waiting(&disk).await, 0, "the batch from before the off is gone");
+    d.pump(&disk, &service, &rt(), Some(alice())).await;
+    assert_eq!(service.ats(), [2], "only what was recorded after the on is sent");
+}

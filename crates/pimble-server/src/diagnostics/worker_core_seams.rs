@@ -79,23 +79,30 @@ impl Http for Service {
 }
 
 /// A memory disk whose next write of a record batch, once armed, waits
-/// (with nothing written yet) until [`HeldDisk::release`] is notified.
+/// (with nothing written yet) until [`HeldDisk::release`] is notified, and
+/// which refuses to remove a batch while [`HeldDisk::fail_removals`] says so.
 #[derive(Debug)]
 pub struct HeldDisk {
     below: Disk,
     armed: AtomicBool,
+    failing_removals: AtomicBool,
     pub arrived: Notify,
     pub release: Notify,
 }
 
 impl HeldDisk {
     pub fn new() -> Self {
-        HeldDisk { below: Disk::memory(), armed: AtomicBool::new(false), arrived: Notify::new(), release: Notify::new() }
+        HeldDisk { below: Disk::memory(), armed: AtomicBool::new(false), failing_removals: AtomicBool::new(false), arrived: Notify::new(), release: Notify::new() }
     }
 
     /// Hold the next batch written.
     pub fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, every removal of a batch fails (`on`) or works again.
+    pub fn fail_removals(&self, on: bool) {
+        self.failing_removals.store(on, Ordering::SeqCst);
     }
 }
 
@@ -156,6 +163,9 @@ impl DiskBackend for &'static HeldDisk {
         self.below.copy(f, t).await
     }
     async fn remove_file(&self, p: &Path) -> io::Result<()> {
+        if is_batch(p) && self.failing_removals.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "this batch cannot be removed"));
+        }
         self.below.remove_file(p).await
     }
     async fn remove_dir_all(&self, p: &Path) -> io::Result<()> {

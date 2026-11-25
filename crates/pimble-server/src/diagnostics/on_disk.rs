@@ -307,13 +307,24 @@ impl Queue {
         self.disk.write(self.dir.join(batch_name(seq, session, account)), text).await
     }
 
-    /// The waiting batches, whoever's, oldest first.
+    /// The waiting batches, whoever's, oldest first (none when the folder
+    /// cannot be listed).
     pub async fn waiting(&self) -> Vec<PathBuf> {
-        let Ok(entries) = self.disk.list(&self.dir).await else { return Vec::new() };
+        self.listed().await.unwrap_or_default()
+    }
+
+    /// The waiting batches, oldest first, or why the folder could not be
+    /// listed: a folder that is not there holds none.
+    async fn listed(&self) -> io::Result<Vec<PathBuf>> {
+        let entries = match self.disk.list(&self.dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let mut files: Vec<PathBuf> =
             entries.into_iter().filter(|e| !e.is_dir && e.name().is_some_and(|n| n.starts_with("records-") && n.ends_with(".ndjson"))).map(|e| e.path).collect();
         files.sort();
-        files
+        Ok(files)
     }
 
     /// The oldest batches go once more than `max` bytes wait.
@@ -378,11 +389,11 @@ impl Queue {
     }
 
     /// Turned off: everything waiting goes, whoever's (the install number
-    /// stays).
-    pub async fn clear(&self) {
-        for path in self.waiting().await {
-            let _ = self.disk.remove_file(&path).await;
-        }
+    /// stays). Every batch is tried; the first that could not be removed is
+    /// the error, and then the clear has not happened: the caller keeps it
+    /// owed and tries again.
+    pub async fn clear(&self) -> io::Result<()> {
+        self.remove_batches(|_| true).await
     }
 
     /// An off said once the sequence had given `through`, written down
@@ -416,20 +427,30 @@ impl Queue {
     }
 
     /// Every batch numbered `through` or lower goes, and every batch named
-    /// before sequence numbers or by nothing readable; whether all of them
-    /// did.
-    pub async fn clear_through(&self, through: u64) -> bool {
-        let mut all = true;
-        for path in self.waiting().await {
-            let before = match written(&path) {
-                Written::At(seq) => seq <= through,
-                Written::BeforeAnyMark => true,
-            };
-            if before && self.disk.remove_file(&path).await.is_err() {
-                all = false;
+    /// before sequence numbers or by nothing readable; as [`Self::clear`],
+    /// the first that could not be removed is the error.
+    pub async fn clear_through(&self, through: u64) -> io::Result<()> {
+        self.remove_batches(|path| match written(path) {
+            Written::At(seq) => seq <= through,
+            Written::BeforeAnyMark => true,
+        })
+        .await
+    }
+
+    /// Remove every waiting batch `which` names, trying each one; the first
+    /// error, if any was not removed (or the folder could not be listed).
+    async fn remove_batches(&self, which: impl Fn(&std::path::Path) -> bool) -> io::Result<()> {
+        let mut first_error = None;
+        for path in self.listed().await?.into_iter().filter(|p| which(p)) {
+            match self.disk.remove_file(&path).await {
+                // Gone already: what a clear asks.
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    first_error.get_or_insert(e);
+                }
+                _ => {}
             }
         }
-        all
+        first_error.map_or(Ok(()), Err)
     }
 }
 

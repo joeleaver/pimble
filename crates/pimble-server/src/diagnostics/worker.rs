@@ -83,14 +83,15 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
 /// whether it holds a clear no worker has confirmed (`clear_owed`). Off drops
 /// what waits, in memory at once and on the disk once no pump is running; a
 /// say that comes before the server has started is applied when it starts.
-/// Whether every clear the page said was owed has run (always, when it said
-/// none), for the page to drop its note.
+/// Whether every clear the page said was owed has run, and the say's own
+/// off's too (always, when it said none and turned nothing off), for the page
+/// to drop its note: a batch that could not be removed keeps it.
 pub async fn configure(handler: &RpcHandler, enabled: bool, install: Option<String>, clear_owed: bool) -> bool {
     // The owed clear first: it is counted before the say is applied, so no
     // pump can send between them.
     let cleared = !clear_owed || diagnostics().clear_owed_by_the_page(handler.disk()).await;
     said(diagnostics().configure(handler.disk(), enabled, install).await);
-    cleared
+    cleared && !diagnostics().clears_owed()
 }
 
 fn said(applied: Applied) {

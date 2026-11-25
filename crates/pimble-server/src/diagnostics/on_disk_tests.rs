@@ -195,7 +195,7 @@ async fn the_queue_drops_the_oldest_past_its_cap_and_clears() {
     let left: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(left, ["records-s00000000000000000003-s-none.ndjson", "records-s00000000000000000004-s-none.ndjson"]);
     let install = queue.install(None).await;
-    queue.clear().await;
+    queue.clear().await.unwrap();
     assert!(queue.waiting().await.is_empty());
     assert_eq!(queue.install(None).await, install, "clearing keeps the install number");
 }
@@ -215,7 +215,7 @@ async fn the_sequence_only_grows_and_an_off_clears_through_its_number() {
     assert_eq!(queue.last_seq().await, 9, "and so does an off written down");
     queue.append(&["{}".into()], 10, "s", None).await.unwrap();
     assert_eq!(queue.clear_marks().await.iter().map(|(_, through)| *through).collect::<Vec<_>>(), [9]);
-    assert!(queue.clear_through(9).await);
+    queue.clear_through(9).await.unwrap();
     let left: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(left, ["records-s00000000000000000010-s-none.ndjson"], "only the batch numbered after the off");
 }
@@ -235,7 +235,7 @@ async fn batches_and_offs_named_by_wall_time_are_before_any_mark() {
     let names: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(names[0], "records-9999999999999-old-none.ndjson", "the old batch is the oldest");
     assert_eq!(queue.last_seq().await, 1, "an old name gives no number");
-    assert!(queue.clear_through(0).await);
+    queue.clear_through(0).await.unwrap();
     assert_eq!(queue.waiting().await.len(), 1, "an off before every new batch still clears the old one");
 
     disk.write(dir.join("clear-before-0000000000001-old-1"), "").await.unwrap();

@@ -71,11 +71,14 @@ pub const PASSWORD_CHANGED_REFUSAL: &str =
 /// One account's lock (`AppState::account_locks`): a password change, a
 /// recovery, an account deleted by recovery and a new recovery code each
 /// take it and read the account again inside it, so none of them writes
-/// over another's result or lowers `session_epoch`.
+/// over another's result or lowers `session_epoch`. The deletion holds it
+/// until the account is gone, and every grant made or changed for an
+/// account waits for it (`AppState::lock_live_account`), so no grant is
+/// written after the deletion listed the account's grants.
 type AccountLock = tokio::sync::OwnedMutexGuard<()>;
 
 async fn lock_account(state: &AppState, user_rid: u64) -> AccountLock {
-    state.account_locks.lock(&user_rid.to_string()).await
+    state.lock_account(user_rid).await
 }
 
 /// `authed`'s account as stored now, read under its lock: refused when the
@@ -289,10 +292,11 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
         // than ownerless (`AppState::store_owner_locks`).
         let _owners = state.store_owner_locks.lock(&listed.store_uuid).await;
         // The listing was taken before this lock: another owner may have
-        // demoted or removed this account since. Only the grant as it is
-        // now says whether this account is one of the store's owners; the
-        // stale role would count a demoted account as the last owner and
-        // delete the store out from under the owner who demoted it.
+        // removed this account's grant since (a removal takes no account
+        // lock). A grant made or changed for this account cannot have
+        // happened since: that waits for this account's lock, held here,
+        // and is refused once the account is gone. Only the grant as it is
+        // now says whether this account is one of the store's owners.
         let Some(grant) = state.db.find_grant(user.rid, listed.store_rid, &listed.root).await? else {
             continue;
         };

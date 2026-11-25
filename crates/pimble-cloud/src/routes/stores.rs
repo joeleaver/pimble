@@ -365,6 +365,13 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
         .transpose()
         .map_err(|e| CloudError::BadRequest(format!("store_id is not a valid id: {e}")))?;
     let kind_str = store_kind_str(req.kind);
+    // The owner's grant is written under the creator's account lock, as every
+    // grant is (`AppState::lock_live_account`), taken before anything is
+    // made: an account being deleted makes no store it would own once gone.
+    let (_account, live) = state.lock_live_account(authed.user.rid).await?;
+    if live.is_none() {
+        return Err(CloudError::Conflict("This account was deleted while the store waited to be made, so nothing was made.".to_string()));
+    }
 
     // A chosen id may already have a row. A live one is somebody's store and
     // is refused. A deleted one is what "stop hosting" and "stop sharing from

@@ -87,7 +87,11 @@ pub struct Inner {
     pub store_owner_locks: crate::locks::KeyedLocks,
     /// Per account: a password change, a recovery and a new recovery code
     /// read the account again and write under its lock, so neither writes
-    /// over the other (`crate::routes::password`).
+    /// over the other (`crate::routes::password`). An account deleted
+    /// through recovery holds it from listing its grants until it is gone,
+    /// and every grant made or changed for an account takes it first
+    /// ([`Inner::lock_live_account`]), so none survives the deletion. Where
+    /// a store's owner lock is held too, this one comes first.
     pub account_locks: crate::locks::KeyedLocks,
     /// Where a test may hold a request to make a race overlap; nothing can
     /// be held outside builds with the `test-hooks` feature
@@ -108,6 +112,24 @@ pub struct Inner {
 }
 
 impl Inner {
+    /// Waits for `user_rid`'s account lock (`account_locks`) and holds it
+    /// until the guard drops.
+    pub async fn lock_account(&self, user_rid: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        self.account_locks.lock(&user_rid.to_string()).await
+    }
+
+    /// `user_rid`'s account lock, held, and the account as stored once it is:
+    /// `None` when it was deleted meanwhile. Every request that makes or
+    /// changes a grant for an account takes this first (then the store's
+    /// owner lock, if it needs one), so a grant is never written for an
+    /// account whose deletion has already listed its grants: the deletion
+    /// holds this lock from its listing until the account is gone.
+    pub async fn lock_live_account(&self, user_rid: u64) -> crate::error::CloudResult<(tokio::sync::OwnedMutexGuard<()>, Option<crate::db::UserRow>)> {
+        let held = self.lock_account(user_rid).await;
+        let user = self.db.get_user(user_rid).await?;
+        Ok((held, user))
+    }
+
     /// The waker of `recipient`'s drains.
     pub fn inbox_waker(&self, recipient: &str) -> Arc<tokio::sync::Notify> {
         let mut wakers = self.inbox_wakers.lock().expect("inbox wakers poisoned");

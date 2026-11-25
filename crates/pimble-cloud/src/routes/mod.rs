@@ -15,6 +15,7 @@ use axum::Router;
 use crate::state::AppState;
 
 pub use inbox::InboxWakers;
+pub use members::ACCOUNT_DELETED_REFUSAL;
 
 /// Everything under `/api/v1` (docs/CLOUD_CONTRACT.md: "serving under
 /// `/api/v1`", including `/health` and `/.well-known/jwks.json` — see

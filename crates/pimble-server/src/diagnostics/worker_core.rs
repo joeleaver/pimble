@@ -15,8 +15,11 @@
 //! "on" follows before the clear could run: a pump goes on only while no off
 //! has come since it took its records, and no pump starts while a clear is
 //! owed. So nothing recorded before the latest off is ever sent, and none of
-//! it stays on the disk. A request is never waited for longer than
-//! [`SEND_TIMEOUT`] (the host's [`Bounded`]), so neither is an off.
+//! it stays on the disk. A clear that cannot remove a batch is not done: it
+//! stays owed (its mark stays, and the page is not told), so nothing is sent
+//! until a later attach, say or page's note runs it to the end. A request is
+//! never waited for longer than [`SEND_TIMEOUT`] (the host's [`Bounded`]),
+//! so neither is an off.
 //!
 //! The count lives in memory, so the clear an off owes is also written down
 //! on the disk, before the off waits for its turn: a mark outside the
@@ -243,7 +246,8 @@ impl WorkerDiagnostics {
     /// as one more off at once, so nothing is written or sent until it has
     /// run; run once the folder is known (the server's diagnostics task gives
     /// it as it starts, so it comes); whether the queue has been cleared for
-    /// it, for the page to drop its note.
+    /// it, for the page to drop its note (not when a batch could not be
+    /// removed: the clear stays owed, and the page's note with it).
     pub async fn clear_owed_by_the_page(&self, disk: &Disk) -> bool {
         let owed = {
             let mut s = self.state.borrow_mut();
@@ -255,6 +259,13 @@ impl WorkerDiagnostics {
         let Some(dir) = self.dir() else { return false };
         self.run_clears(disk, &Queue::new(disk.clone(), dir)).await;
         self.state.borrow().cleared >= owed
+    }
+
+    /// Whether an off said in this session is still owed its clear: one
+    /// whose batches could not all be removed yet (or one not yet run).
+    pub fn clears_owed(&self) -> bool {
+        let s = self.state.borrow();
+        s.offs > s.cleared
     }
 
     /// The choice waiting and the clears owed, applied to the queue. Called
@@ -279,28 +290,38 @@ impl WorkerDiagnostics {
         }
     }
 
-    /// The clears owed, run on `queue`. Called with the step held.
+    /// The clears owed, run on `queue`. Called with the step held. A clear
+    /// is done only once every batch it names is gone: until then its marks
+    /// stay on the disk and the offs it was owed for stay uncleared, so no
+    /// pump runs and the page is not told it is done, and the next attach,
+    /// say or note from the page tries it again.
     async fn run_clears(&self, disk: &Disk, queue: &Queue) {
-        // The offs written down, by this session or one before it: every
-        // batch from before the latest goes, then the marks this read (an
-        // off said meanwhile wrote its own, which its own step clears for).
+        // The offs written down, by this session or one before it, and the
+        // offs said in this one: an off said during this clear owes one
+        // more, which its own step runs (and writes its own mark for).
         let marks = queue.clear_marks().await;
-        if let Some(latest) = marks.iter().map(|(_, through)| *through).max() {
-            if queue.clear_through(latest).await {
-                for (mark, _) in &marks {
-                    if let Err(e) = disk.remove_file(mark).await {
-                        tracing::debug!("a diagnostics clear mark was not removed: {e}");
-                    }
-                }
-            }
-        }
-        // Owed for every off said so far, even one an "on" has followed: what
-        // was written before it must go. An off said during this clear owes
-        // one more, which its own step runs.
         let offs = self.state.borrow().offs;
-        if offs > self.state.borrow().cleared {
-            queue.clear().await;
+        let owed_here = offs > self.state.borrow().cleared;
+        let latest = marks.iter().map(|(_, through)| *through).max();
+        // Owed for an off said here, even one an "on" has followed: every
+        // batch waiting goes, which is every one the marks name too.
+        // Otherwise every batch from before the latest mark.
+        let emptied = match (owed_here, latest) {
+            (true, _) => queue.clear().await,
+            (false, Some(latest)) => queue.clear_through(latest).await,
+            (false, None) => return,
+        };
+        if let Err(e) = emptied {
+            tracing::debug!("a diagnostics clear did not finish (a batch was not removed); it stays owed: {e}");
+            return;
+        }
+        if owed_here {
             self.state.borrow_mut().cleared = offs;
+        }
+        for (mark, _) in &marks {
+            if let Err(e) = disk.remove_file(mark).await {
+                tracing::debug!("a diagnostics clear mark was not removed: {e}");
+            }
         }
     }
 
