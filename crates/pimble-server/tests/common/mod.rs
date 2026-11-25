@@ -257,6 +257,10 @@ pub struct StubInner {
     /// the documents registered per (user id, store id).
     pub watch_choices: HashMap<String, (u64, String)>,
     pub watched: HashMap<(String, String), Vec<String>>,
+    /// A role a minted token carries for (user id, store id) in place of the
+    /// one the rows list: a hosted server that would take a write the
+    /// device believes it may not send, so a test can prove it sent none.
+    pub token_role: HashMap<(String, String), String>,
 }
 
 pub struct Stub {
@@ -559,7 +563,8 @@ pub async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap)
         let account = s.account_of(&headers);
         let mut stores_claim = serde_json::Map::new();
         for row in s.stores.iter().filter(|row| row.user_id == account.user_id && row.root.is_none()) {
-            stores_claim.insert(row.store_id.clone(), json!(row.role));
+            let role = s.token_role.get(&(row.user_id.clone(), row.store_id.clone())).unwrap_or(&row.role);
+            stores_claim.insert(row.store_id.clone(), json!(role));
         }
         for row in s.stores.iter().filter(|row| row.user_id == account.user_id) {
             let Some(root) = &row.root else { continue };
@@ -1016,6 +1021,17 @@ impl Env {
         self.stub.inner.lock().unwrap().account_by_email(Some(email)).user_id.clone()
     }
 
+    /// Make the tokens minted for `email` say `role` for the whole of
+    /// `store_id` whatever the grant rows say (`StubInner::token_role`), so
+    /// a test can have the hosted server take writes the rows refuse. One
+    /// lock for the lookup and the insert: `user_id` takes the same std
+    /// mutex, and calling it while holding the lock deadlocks the test.
+    pub fn set_token_role(&self, email: &str, store_id: StoreId, role: &str) {
+        let mut inner = self.stub.inner.lock().unwrap();
+        let user_id = inner.account_by_email(Some(email)).user_id.clone();
+        inner.token_role.insert((user_id, store_id.to_string()), role.to_string());
+    }
+
     pub fn has_share_key(&self, store_id: StoreId, root: NodeId, email: &str) -> bool {
         let s = self.stub.inner.lock().unwrap();
         let Some(user_id) = s.accounts.iter().find(|a| a.email == email).map(|a| a.user_id.clone()) else { return false };
@@ -1096,6 +1112,7 @@ pub async fn spawn_env() -> Env {
             push_subs: Vec::new(),
             watch_choices: HashMap::new(),
             watched: HashMap::new(),
+            token_role: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
         refuse_sessions: AtomicBool::new(false),

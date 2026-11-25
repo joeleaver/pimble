@@ -1436,11 +1436,14 @@ impl AppStore {
     /// when something did.
     pub fn set_store_roots(&self, store_id: StoreId, roots: Option<&[NodeId]>, ended_roots: &[NodeId]) -> RootsChange {
         let Some(sig) = self.get_store_signal(store_id) else { return RootsChange::default() };
-        let (was_roots, was_ended, was_shown) = untracked(|| sig.with(|s| (s.roots.clone(), s.ended_roots.clone(), s.shown_roots())));
+        let (was_roots, was_ended, was_shown, own_root) =
+            untracked(|| sig.with(|s| (s.roots.clone(), s.ended_roots.clone(), s.shown_roots(), s.root_node_id)));
         let same = |a: &[NodeId], b: &[NodeId]| a.len() == b.len() && a.iter().all(|id| b.contains(id));
         let roots = roots.unwrap_or(&was_roots);
-        // Only a root of the store can have ended.
-        let ended_roots: Vec<NodeId> = ended_roots.iter().copied().filter(|root| roots.contains(root)).collect();
+        // Only a root of the store can have ended: one it lists, or a whole
+        // store's own (`Store::held_roots`).
+        let ended_roots: Vec<NodeId> =
+            ended_roots.iter().copied().filter(|root| if roots.is_empty() { *root == own_root } else { roots.contains(root) }).collect();
         if roots == was_roots.as_slice() && same(&ended_roots, &was_ended) {
             return RootsChange::default();
         }
@@ -2531,9 +2534,15 @@ impl AppStore {
             // so opening, renaming and the context menu need no special case.
             // A share that has ended is not shown: its root is still one of
             // the replica's, and is no row (`Store::shown_roots`). When every
-            // share has ended the row has nothing under it.
+            // share has ended the row has nothing under it, and so has a
+            // whole replica whose own root has (the account holds the store
+            // no more).
             let children = if roots.is_empty() {
-                self.build_children_structural(sid, root_id, paste, &[], 0)
+                if ended_roots.contains(&root_id) {
+                    Vec::new()
+                } else {
+                    self.build_children_structural(sid, root_id, paste, &[], 0)
+                }
             } else {
                 roots
                     .iter()
@@ -3568,6 +3577,34 @@ mod tests {
         // which holds no replica): it left, and nothing says it ended.
         let change = app.set_store_roots(store_id, Some(&[trips]), &[]);
         assert_eq!(change, RootsChange { gone: vec![recipes], arrived: vec![trips], ..Default::default() });
+    }
+
+    /// A whole replica the account holds no more ends at its own root, as a
+    /// share's replica does at its last share: no child under its row, the
+    /// row's data changes, and holding it again brings the root back.
+    #[test]
+    fn a_whole_replica_whose_root_ended_shows_no_children() {
+        let app = AppStore::new();
+        let mut store = Store::new_local("Notes", "/tmp/notes.pimble".into());
+        store.is_replica = true;
+        let (store_id, root) = (store.id, store.root_node_id);
+        app.upsert_store(store);
+        let mut note = Node::document("Kept");
+        note.parent_id = Some(root);
+        app.set_children(store_id, root, vec![(store_id, note.id)]);
+        app.upsert_node(store_id, note);
+        let before = untracked(|| app.build_tree_data_structural());
+        assert_eq!(before[0].children.len(), 1);
+
+        let change = app.set_store_roots(store_id, None, &[root, NodeId::new()]);
+        assert_eq!(change, RootsChange { ended: vec![root], ..Default::default() }, "only its own root can end");
+        assert!(app.every_share_ended(store_id) && app.shown_roots(store_id).is_empty());
+        let after = untracked(|| app.build_tree_data_structural());
+        assert!(after[0].children.is_empty(), "the row stays, with nothing under it");
+        assert_ne!(before[0].label, after[0].label, "the row re-renders with its ended menu");
+
+        let change = app.set_store_roots(store_id, None, &[]);
+        assert_eq!(change, RootsChange { arrived: vec![root], ..Default::default() });
     }
 
     /// The words on the row of a replica whose every share has ended, in

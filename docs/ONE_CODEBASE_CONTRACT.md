@@ -1787,6 +1787,35 @@ deleted yet (part 2).
   read) is left for a later connect rather than taking the link down. For a link with a saved
   credential nothing changes: its access is always full. `sync_link.rs` became
   `sync_link/{mod,reconcile,account}.rs` (594, 192, 54 lines).
+- **A whole replica whose grant is gone ends like a share** (review fix, 2026-11-24). Before it,
+  `grant::refresh` handled a store no row names only for a partial replica: a member removed
+  from a whole store, or another account signed in on the device, kept `access: Full`, every
+  connect was denied, and local edits looked saved and never left the device. The gap was older
+  than this part: the code came from `vault_link.rs`, so encrypted whole replicas had it too, and
+  the one fix covers both links. Now a whole *replica* (under the replicas directory; a person's
+  own store is never ended by whoever is signed in) is made read only and its own root is
+  recorded in `StoreManifest::ended_roots`, announced once with `SharesEnded`: the decided
+  ended-share behavior (CLAUDE.md, "A member's desktop"), no new state or wording.
+  `Store::held_roots` (the listed roots, or a whole store's own) is what `ended_roots` is a subset
+  of, so `shown_roots` is empty and `every_share_ended` is true: the row says `no longer shared`,
+  shows nothing under it, and its menu leaves "Remove Replica..." alone on. `LocalStore`
+  keeps a whole replica's ended set to its root (`set_ended_roots`), follows the root the first
+  pull adopts (`set_root_node_id`), and judges everything in it ended (`under_ended_root`: no
+  link followed into it, no search hit). Rows naming the store again un-end it at the next
+  connect, which also restores the access.
+- **A mount's source, when the mounting store is held through the account** (a plain replica with
+  `via_account`, or a vault link's), is added through the account the way `cloudAddHostedStore`
+  adds a store (`handler/mount_sources.rs` `SourceRoute::Account`, then
+  `handler/hosted.rs` `add_hosted_store` with `Unlisted::Refuse`: a source the account holds
+  nothing of is refused, never made a whole replica held as owner). Before it the source was
+  tried at the mounting store's address with whatever `credentials.json` held for it, which for
+  an account replica is nothing: the mount went `Unavailable`. A mount ref's own
+  `source_remote` is still tried after the account when it names another server.
+  `cloudAddHostedStore`'s body moved to `handler/hosted.rs`, and the mount-source resolution to
+  `handler/mount_sources.rs`; `handler.rs` shrank by both.
+- **Adding another share to an open replica keeps its `last_sync`** (and `last_seq`): the
+  rewrite of `sync.json` in `hosted_plain.rs` reads what was there first. Before it a mount of the
+  replica read `Connecting` rather than `Cached` until the next sync.
 - **The browser**: `keep_account_stores` no longer skips plain rows. **The desktop**: "Add Hosted
   Store..." lists plain hosted stores too (`pimble-app/src/events.rs`), the same call.
 - "New Store..." in the browser still makes an encrypted store only, as the button always has.
@@ -1812,10 +1841,18 @@ deleted yet (part 2).
 
 - `crates/pimble-server/tests/hosted_plain.rs` (new, the sharing harness's stub accounts service
   and JWT-mode hosted server): a plain hosted store replicated through the account both ways,
-  `sync.json` with `via_account` and no token, the placeholder root corrected, a restart catching
-  up; a reader whose replica refuses edits and pushes nothing, made an editor while connected and
-  then writing to `H`; a share as a partial replica that never receives what is outside it, writes
-  inside it, and records its removal as an ended share.
+  `sync.json` with `via_account` and no token, the placeholder root corrected, a restart whose
+  link comes back from `sync.json` alone (a server opens no store by itself; its client opens
+  the replica by path, as the app's open-store list and the worker's replicas folder do); a reader
+  whose replica refuses edits and sends nothing (H is made to take Bob's writes through a stub
+  knob, `token_role`, and a change slipped onto the replica's disk while it was off never reaches
+  H until Bob is made an editor, when it goes), made an editor while connected and then writing
+  to `H`; a share as a partial replica that never receives what is outside it, writes inside it,
+  and records its removal as an ended share; a whole replica removed, granted again, then ended
+  by another account signing in and held again by its own; another share joining the open
+  replica with `last_sync` kept (the link held offline by `LinkFaults`); a mount in an account
+  replica whose source resolves through the account. `pimble-store`
+  `tests/ended_whole_replica.rs`, the core's and the app's tests of a whole store's ended root.
 - `pimble-host` `http::socket` tests: a server that closes with 4404 answers `Some(4404)`, one that
   speaks first answers `None`, no listener answers `None`. The relay suite (`tests/relay.rs`)
   covers the owner-away path end to end on the desktop.
@@ -1837,6 +1874,16 @@ deleted yet (part 2).
 - This part's browser proof ran in Chromium only, not Firefox.
 - No test covers an expired sign-in on a plain link held through the account (the link waits
   while the session is expired, as the vault link does; the vault link's tests cover that path).
+- `tests/in_process.rs` `a_reader_is_refused_in_process` fails on `master` (2ff7163) as on this
+  branch, and was not caused by it: the store's index turns ready after the reader subscribes,
+  and the first notification it hears is `IndexStateChanged { Ready }` (source `None`, since
+  eb60d11's startup work), not the service's edit the test waits for.
+- An ended whole replica is un-ended only by its link's next connect (the plain link backs off
+  to 30 s); "Add Hosted Store..." does not list it, since it is open here.
+- `tests/vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`
+  fails about one run in two at this part's base as with it (line 1408: the member's new
+  document is found wrapped under a second scope key as well as the share's), a race between the
+  test's look at H and the owner's upkeep; not caused by this part and not fixed here.
 - The old browser path is still there (wave 5's later parts remove it).
 
 ## Built: wave 5, part 2 (2026-11-23, not merged or released): diagnostics, the account page, shared helpers

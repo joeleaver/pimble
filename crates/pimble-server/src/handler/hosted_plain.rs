@@ -108,21 +108,26 @@ impl RpcHandler {
 
     /// `sync.json` for a plain link held through the account: the hosted
     /// server's address with no credential (the link mints one before every
-    /// connect), and how the account holds the store.
+    /// connect), and how the account holds the store. A replica already
+    /// here keeps when it last synced (what a mount of it reports as
+    /// `Cached { last_sync }` while the link is down) and what it had kept
+    /// per document.
     async fn write_account_sync_config(&self, store_id: StoreId, rpc_url: &url::Url, held_as: &HeldAs) -> Result<(), ErrorObjectOwned> {
+        let manager = self.store_manager.read().await;
+        let before = manager.read_sync_config(store_id).await.map_err(to_rpc_error)?;
         let config = SyncConfig {
             remote: RemoteEndpoint { url: rpc_url.clone(), auth: AuthMethod::None },
-            last_sync: None,
+            last_sync: before.as_ref().and_then(|before| before.last_sync),
             mode: SyncMode::Sync,
             via_relay: false,
             via_account: true,
-            last_seq: Default::default(),
+            last_seq: before.map(|before| before.last_seq).unwrap_or_default(),
             vault_key_id: None,
             access: held_as.access,
             shared_by: held_as.shared_by.clone(),
             read_only_roots: held_as.read_only_roots.clone(),
             comment_roots: held_as.comment_roots.clone(),
         };
-        self.store_manager.read().await.write_sync_config(store_id, &config).await.map_err(to_rpc_error)
+        manager.write_sync_config(store_id, &config).await.map_err(to_rpc_error)
     }
 }

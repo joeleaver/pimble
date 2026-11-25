@@ -10,7 +10,8 @@
 //! the connection, and the next one is made with a token minted from the
 //! grant as it is now ([`mint`]). A scope root the account's rows no longer
 //! name is recorded as ended in the manifest and announced once
-//! ([`record_ended_roots`]). What a link pushes follows what the account may
+//! ([`record_ended_roots`]), and so is a whole replica's own root when no
+//! row names the store at all. What a link pushes follows what the account may
 //! write ([`may_push`]).
 
 use std::time::Duration;
@@ -124,26 +125,34 @@ pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId, who: &str) 
     let manager = handler.store_manager_handle();
     let local_roots = manager.read().await.scope_roots(store_id);
     let Some(mut held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
-        // No row at all. For a share's replica that is a removal from every
-        // share of the store: the hosted server takes nothing from this
-        // account any more, so nothing is taken here either (an edit
-        // accepted here would sit on this device for good, looking saved).
-        if !local_roots.is_empty() {
+        // No row at all: a removal from every share of the store, from a
+        // whole-store grant, or another account signed in here. The hosted
+        // server takes nothing from this account any more, so nothing is
+        // taken here either (an edit accepted here would sit on this device
+        // for good, looking saved). A share's replica ends every root it
+        // holds; a whole replica ends at its own root, the same state and
+        // the same "Remove Replica..." (Store::every_share_ended). A store
+        // that is no replica is the person's own, and nothing of it ends
+        // because of whoever is signed in.
+        let ended = match ended_whole(handler, store_id, &local_roots).await {
+            Some(ended) => ended,
+            None => return Some(Held { owner, account }),
+        };
+        {
             let manager = manager.read().await;
             if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
                 if config.access != StoreAccess::Read {
-                    info!("{} for store {}: the account holds no share of it any more; read only here now", who, store_id);
+                    info!("{} for store {}: the account holds nothing of it any more; read only here now", who, store_id);
                     config.access = StoreAccess::Read;
                     if let Err(e) = manager.write_sync_config(store_id, &config).await {
                         warn!("{} for store {}: could not record how the store is held: {}", who, store_id, e);
                     }
                 }
             }
-            drop(manager);
-            // Every share of it has ended. The documents stay where they
-            // are until the replica is removed; the app stops showing them.
-            record_ended_roots(handler, store_id, local_roots.clone(), who).await;
         }
+        // The documents stay where they are until the replica is removed;
+        // the app stops showing them.
+        record_ended_roots(handler, store_id, ended, who).await;
         return Some(Held { owner, account });
     };
     // A root this replica holds and the account does not any more (removed
@@ -194,16 +203,30 @@ pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId, who: &str) 
     // comparison. After `sync.json`, so that whoever hears of it and asks
     // how the store is held reads the ended root as read only already. A
     // whole-store grant names no root and leaves none out: nothing of the
-    // store has stopped being this account's.
-    if !local_roots.is_empty() {
-        let ended = if held_as.roots.is_empty() { Vec::new() } else { local_roots.iter().filter(|root| !held_as.roots.contains(root)).copied().collect() };
-        record_ended_roots(handler, store_id, ended, who).await;
-    }
+    // store has stopped being this account's, and a whole replica that had
+    // ended (its account removed, or another one signed in) is held again.
+    let ended = if held_as.roots.is_empty() { Vec::new() } else { local_roots.iter().filter(|root| !held_as.roots.contains(root)).copied().collect() };
+    record_ended_roots(handler, store_id, ended, who).await;
     Some(Held { owner, account })
 }
 
-/// Record in a partial replica's manifest which of its scope roots the
-/// account no longer holds (`StoreManifest::ended_roots`; the scope roots
+/// What ends when the account's rows name the store no more: every scope
+/// root of a share's replica, or a whole replica's own root. `None` for a
+/// store that is no replica (the person's own store, hosted or relayed:
+/// nothing of it ends because of whoever is signed in) or one that cannot be
+/// read.
+async fn ended_whole(handler: &RpcHandler, store_id: StoreId, local_roots: &[NodeId]) -> Option<Vec<NodeId>> {
+    if !local_roots.is_empty() {
+        return Some(local_roots.to_vec());
+    }
+    let mut store = handler.store_manager_handle().read().await.get_store_info(store_id).ok()?;
+    handler.mark_replica(&mut store);
+    store.is_replica.then(|| vec![store.root_node_id])
+}
+
+/// Record in a replica's manifest which of its roots the account no longer
+/// holds: a partial replica's scope roots, or a whole replica's own root
+/// (`StoreManifest::ended_roots`; the scope roots
 /// themselves are never shrunk, and nothing else on disk is touched), and
 /// when that changed anything, tell the store's subscribers which roots
 /// ended just now (`StoreChangeKind::SharesEnded`): the app stops showing

@@ -733,8 +733,9 @@ impl LocalStore {
 
     /// The scope roots this account no longer holds (removed from that
     /// share, or the share was stopped). A subset of
-    /// [`LocalStore::scope_roots`]; their documents stay on disk, read only
-    /// and unshown, until the replica is removed.
+    /// [`LocalStore::scope_roots`], or for a whole replica the store's own
+    /// root once the account holds the store no more; their documents stay
+    /// on disk, read only and unshown, until the replica is removed.
     pub fn ended_roots(&self) -> &[NodeId] {
         &self.manifest.ended_roots
     }
@@ -747,18 +748,24 @@ impl LocalStore {
         if ended.is_empty() {
             return false;
         }
+        // A whole replica that has ended has ended everywhere.
+        if !self.is_partial() {
+            return true;
+        }
         let reached = self.scope_roots_above(id);
         !reached.is_empty() && reached.iter().all(|root| ended.contains(root))
     }
 
     /// Record which scope roots have ended, replacing what was recorded: a
-    /// root granted again is un-ended by leaving it out. Only scope roots
-    /// count (anything else in `ended` is dropped), `scope_roots` itself is
+    /// root granted again is un-ended by leaving it out. Only the roots the
+    /// store holds count (its scope roots; a whole store's own root), and
+    /// anything else in `ended` is dropped; `scope_roots` itself is
     /// untouched, and nothing on disk but the manifest is. Answers whether
     /// anything changed; an unchanged set writes nothing.
     pub async fn set_ended_roots(&mut self, ended: Vec<NodeId>) -> Result<bool> {
         // In scope-root order, so the same set is always the same list.
-        let ended: Vec<NodeId> = self.manifest.scope_roots.iter().filter(|root| ended.contains(root)).copied().collect();
+        let held = if self.is_partial() { self.manifest.scope_roots.clone() } else { vec![self.manifest.root_node_id] };
+        let ended: Vec<NodeId> = held.into_iter().filter(|root| ended.contains(root)).collect();
         if ended == self.manifest.ended_roots {
             return Ok(false);
         }
@@ -1095,6 +1102,11 @@ impl LocalStore {
     pub async fn set_root_node_id(&mut self, root_node_id: NodeId) -> Result<()> {
         if self.manifest.root_node_id == root_node_id {
             return Ok(());
+        }
+        // A whole replica that has ended names its root as ended: the root
+        // it has now.
+        if !self.is_partial() && !self.manifest.ended_roots.is_empty() {
+            self.manifest.ended_roots = vec![root_node_id];
         }
         self.manifest.root_node_id = root_node_id;
         self.manifest.modified_at = Utc::now();
