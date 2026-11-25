@@ -1345,6 +1345,10 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
     seed_content(&alice, store_id, private, "seed", "PRIVATE-DIARY-TEXT").await;
     alice.cloud_host_store(store_id).await.unwrap();
     wait_all_seeded(&env, store_id, &[root_id, shared, inside, deeper, leaf, private]).await;
+    // Hosting made one key, the store's; every later key is a share's.
+    let hosted_keys = scope_keys_in(a_dir.path(), store_id);
+    assert_eq!(hosted_keys.len(), 1, "hosting made exactly the store key");
+    let store_key_id = hosted_keys[0].0;
 
     let (share_key_id, _) = share_by_hand(&env, &alice, a_dir.path(), store_id, shared, &[inside, deeper, leaf], "editor", "Holiday Plans").await;
     // The owner's device picks the share key up at its next connect.
@@ -1414,11 +1418,7 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
         keys.wraps.iter().map(|w| w.scope_key_id).collect::<std::collections::BTreeSet<Uuid>>()
     };
     assert!(wraps_of_from_bob().await.contains(&share_key_id), "wrapped under the scope key its maker holds");
-    let mut owner_keys: std::collections::BTreeSet<Uuid> = scope_keys_in(a_dir.path(), store_id).into_iter().map(|(id, _)| id).collect();
-    assert!(owner_keys.len() >= 2, "the owner's device holds the store key and the share's key");
-    owner_keys.retain(|id| *id != share_key_id);
-    let mut both = owner_keys.clone();
-    both.insert(share_key_id);
+    let both: std::collections::BTreeSet<Uuid> = [store_key_id, share_key_id].into_iter().collect();
     let owner_wrapped = wait_until(Duration::from_secs(10), || async { wraps_of_from_bob().await == both }).await;
     assert!(owner_wrapped, "the owner's device adds the store key's wrap to a member's document: {:?}, wanted {both:?}", wraps_of_from_bob().await);
     let scope: Vec<NodeId> = env.h_admin.get_scopes(store_id).await.unwrap().into_iter().find(|s| s.root == shared).unwrap().doc_ids;
