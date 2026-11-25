@@ -17,7 +17,11 @@
    (0,2,1). Layout rules here are `WRAP > [data-pm-editor] x` (0,2,1) and
    colors carry the scheme attribute as well (0,3,1). The theme picker's
    preview (app/theme_preview.rs) is a wrap of its own and takes these same
-   rules. */
+   rules.
+
+   Alignment: rinch writes an inline `text-align` only on a block whose
+   alignment someone chose (joeleaver/rinch#2210), so the body's and the
+   headings' alignment below reach every other block, and a chosen one wins. */
 
 /* ── Page and body ──────────────────────────────────────────────── */
 .pimble-editor__content-wrap > [data-pm-editor] {
@@ -54,7 +58,10 @@
     margin: 0 0 var(--pd-paragraph-gap, 0.75em);
 }
 /* A book's paragraphs: no gap, the first line indented, except the first
-   paragraph after anything that is not a paragraph (a heading, a quote). */
+   paragraph after anything that is not a paragraph (a heading, a quote).
+   `p + p` reads the blocks alone: rinch keeps the caret and selection
+   overlays it puts in the editor after every block, never between two
+   (joeleaver/rinch, the root's blocks come first). */
 .pimble-editor__content-wrap--para-indented > [data-pm-editor] p + p {
     text-indent: var(--pd-paragraph-indent, 1.5em);
 }

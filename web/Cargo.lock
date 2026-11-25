@@ -3186,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "js-sys",
  "log",
@@ -3206,7 +3206,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -3219,7 +3219,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "arboard",
  "js-sys",
@@ -3232,7 +3232,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -3244,7 +3244,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -3254,7 +3254,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-words",
 ]
@@ -3262,7 +3262,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -3272,7 +3272,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -3284,7 +3284,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -3295,7 +3295,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3305,7 +3305,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "web-time",
 ]
@@ -3313,7 +3313,7 @@ dependencies = [
 [[package]]
 name = "rinch-spell"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "dispatch2",
  "icu_normalizer",
@@ -3329,7 +3329,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "heck",
  "rinch-core",
@@ -3341,12 +3341,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "js-sys",
  "rinch",
@@ -3362,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "regex",
  "unicode-segmentation",

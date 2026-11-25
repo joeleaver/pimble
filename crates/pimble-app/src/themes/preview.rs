@@ -155,9 +155,13 @@ fn items_of(list: &EditorNode, depth: usize) -> Vec<Vec<Block>> {
     children(list).map(|item| blocks_of(children(item), depth + 1)).collect()
 }
 
-/// A textblock's own alignment, when it has one other than the start.
+/// A textblock's own alignment, when someone set one. An unset alignment is
+/// `None`, so the theme decides it; a chosen one, `left` included, wins over
+/// the theme, as rinch's editor writes it (an inline `text-align` only for a
+/// block that holds one, joeleaver/rinch#2210).
 fn align_of(node: &EditorNode) -> Option<&'static str> {
     match node.attrs().get_str("text_align") {
+        Some("left") => Some("left"),
         Some("center") => Some("center"),
         Some("right") => Some("right"),
         Some("justify") => Some("justify"),
@@ -249,6 +253,24 @@ mod tests {
         assert_eq!(inlines[1], Inline::Break);
         assert!(matches!(&inlines[2], Inline::Text(run) if run.color.as_deref() == Some("#ff0000")));
         assert_eq!(blocks[2], Block::Rule);
+    }
+
+    #[test]
+    fn a_chosen_alignment_is_kept_and_an_unset_one_left_to_the_theme() {
+        let s = schema();
+        let aligned = |align: &str| {
+            s.create_node("paragraph", Attrs::new().with("text_align", align.to_string()), Fragment::from_node(s.text("x").unwrap())).unwrap()
+        };
+        let plain = para(&s, vec![s.text("x").unwrap()]);
+        let blocks = of_doc(&doc(&s, vec![plain, aligned("left"), aligned("center"), aligned("justify")]));
+        let aligns: Vec<_> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph { align, .. } => *align,
+                _ => panic!("a paragraph"),
+            })
+            .collect();
+        assert_eq!(aligns, [None, Some("left"), Some("center"), Some("justify")]);
     }
 
     #[test]
