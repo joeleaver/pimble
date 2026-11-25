@@ -6,7 +6,7 @@ use pimble_crypto::KeyEnvelope;
 use pimble_host::http::{Http, Method};
 use serde::{Deserialize, Serialize};
 
-use super::{endpoint, finish, get, json_of, post, put, send, MeKeysResponse, Result};
+use super::{endpoint, finish, get, json_of, post, put, send, Result};
 
 /// `PUT /api/v1/me/notice-key`: `Ok(false)` when the account already has a
 /// different one (another device made it first).
@@ -101,10 +101,6 @@ pub async fn drain_inbox(http: &dyn Http, base_url: &str, session: &str, after: 
 pub async fn ack_inbox(http: &dyn Http, base_url: &str, session: &str, ids: &[String]) -> Result<()> {
     let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/inbox/ack"), Some(session), &serde_json::json!({ "ids": ids })).await?;
     Ok(())
-}
-
-pub async fn me_keys(http: &dyn Http, base_url: &str, session: &str) -> Result<MeKeysResponse> {
-    get(http, &endpoint(base_url, "/api/v1/me/keys"), Some(session)).await
 }
 
 

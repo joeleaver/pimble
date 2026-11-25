@@ -3,6 +3,8 @@
 use pimble_crypto::AccountPublicKeys;
 use serde::{Deserialize, Serialize};
 
+use super::{delete, endpoint, get, put, root_query, Http, Result};
+
 // ── GET/PUT/DELETE /stores/{id}/members, DELETE /stores/{id}/invitations ──
 //
 // A share is a scoped grant (docs/NODE_DOCUMENT_CONTRACT.md section 5;
@@ -66,3 +68,45 @@ pub struct PersonView {
     pub notice_key: Option<String>,
 }
 
+
+
+pub async fn list_members(http: &dyn Http, base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<MembersResponse> {
+    get(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members{}", root_query(root))), Some(session)).await
+}
+
+#[derive(Serialize)]
+struct PutMemberRequest<'a> {
+    email: &'a str,
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    /// The share's name, required with a `root`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+/// Give `email` a role on a scope: a grant when the address has an account
+/// (the answer then carries its `public_keys`), an invitation when not.
+pub async fn put_member(
+    http: &dyn Http,
+    base_url: &str,
+    session: &str,
+    store_id: &str,
+    email: &str,
+    role: &str,
+    root: Option<&pimble_core::NodeId>,
+    name: Option<&str>,
+) -> Result<MemberView> {
+    let body = PutMemberRequest { email, role, root: root.map(|r| r.to_string()), name };
+    put(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members")), session, &body).await
+}
+
+pub async fn delete_member(http: &dyn Http, base_url: &str, session: &str, store_id: &str, user_id: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+    delete(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/members/{user_id}{}", root_query(root))), session).await
+}
+
+/// Withdraw an invitation; `200` whether or not there was one.
+pub async fn delete_invitation(http: &dyn Http, base_url: &str, session: &str, store_id: &str, email: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+    let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
+    delete(http, &endpoint(base_url, &format!("/api/v1/stores/{store_id}/invitations/{encoded_email}{}", root_query(root))), session).await
+}
