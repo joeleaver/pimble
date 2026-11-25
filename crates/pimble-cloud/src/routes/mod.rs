@@ -3,6 +3,7 @@ mod diagnostics;
 pub mod inbox;
 mod members;
 mod misc;
+mod password;
 mod people;
 mod store_keys;
 mod stores;
@@ -43,13 +44,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/inbox/seen/:item", post(inbox::seen))
         .route("/api/v1/me/push", post(inbox::post_push).delete(inbox::delete_push))
         .route("/api/v1/inbox/:recipient", post(inbox::post_notice))
-        .route("/api/v1/me/password", post(accounts::change_password))
-        .route("/api/v1/me/recovery-code", post(accounts::change_recovery_code))
+        .route("/api/v1/me/password", post(password::change_password))
+        .route("/api/v1/me/recovery-code", post(password::change_recovery_code))
         .route("/api/v1/users/lookup", get(accounts::users_lookup))
-        .route("/api/v1/recover/start", post(accounts::recover_start))
-        .route("/api/v1/recover/:token", get(accounts::recover_get))
-        .route("/api/v1/recover/:token/complete", post(accounts::recover_complete))
-        .route("/api/v1/recover/:token/delete-account", post(accounts::recover_delete_account))
+        .route("/api/v1/recover/start", post(password::recover_start))
+        .route("/api/v1/recover/:token", get(password::recover_get))
+        .route("/api/v1/recover/:token/complete", post(password::recover_complete))
+        .route("/api/v1/recover/:token/delete-account", post(password::recover_delete_account))
         .route("/api/v1/token", post(accounts::mint_token))
         .route("/api/v1/stores", get(stores::list_stores).post(stores::create_store))
         .route("/api/v1/stores/:id", delete(stores::delete_store))
