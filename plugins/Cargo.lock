@@ -1565,7 +1565,7 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "pimble-api"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-board"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-discussion"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugin-abi"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "base64 0.22.1",
  "pimble-api",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc-macros"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-sheet"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-ui"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "pimble-core",
  "rinch",
@@ -1974,7 +1974,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "js-sys",
  "log",
@@ -1994,7 +1994,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -2016,7 +2016,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -2026,7 +2026,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -2038,7 +2038,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2048,7 +2048,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "web-time",
 ]
@@ -2056,7 +2056,7 @@ dependencies = [
 [[package]]
 name = "rinch-spell"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "dispatch2",
  "icu_normalizer",
@@ -2072,7 +2072,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "heck",
  "rinch-core",
@@ -2084,12 +2084,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#f9d15abf77d275a784ed402ba595c7e25d71309f"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Feditor-blocks-before-overlays#a7e5b4a0975d383bbf2c7e7d4aa79d0c808e5c80"
 dependencies = [
  "regex",
  "unicode-segmentation",
