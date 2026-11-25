@@ -1806,8 +1806,9 @@ deleted yet (part 2).
 - **A mount's source, when the mounting store is held through the account** (a plain replica with
   `via_account`, or a vault link's), is added through the account the way `cloudAddHostedStore`
   adds a store (`handler/mount_sources.rs` `SourceRoute::Account`, then
-  `handler/hosted.rs` `add_hosted_store` with `Unlisted::Refuse`: a source the account holds
-  nothing of is refused, never made a whole replica held as owner). Before it the source was
+  `handler/hosted.rs` `add_hosted_store`: a source the account holds nothing of is refused,
+  never made a whole replica held as owner; since wave 5, part 3 `cloudAddHostedStore` refuses
+  the same way, and the `Unlisted` choice is gone). Before it the source was
   tried at the mounting store's address with whatever `credentials.json` held for it, which for
   an account replica is nothing: the mount went `Unavailable`. A mount ref's own
   `source_remote` is still tried after the account when it names another server.
@@ -2008,3 +2009,155 @@ report code; nothing left the machine.
   `pimble-client/src/client.rs` (1,815) are still over the 700-line limit. This part put its
   code in new modules (`handler/diagnostics.rs`, `pimble-rpc/src/diagnostics.rs`) but split none
   of them.
+
+## Built: wave 5, part 3 (2026-11-25, not merged or released): the account page's own sections, and adding only what the account holds
+
+### Joe's decisions (2026-11-25)
+
+- **(e) Change password happens in the worker**, through a Service-only `cloudChangePassword`:
+  the server that holds the account keys derives the new password's keys, rewraps the account
+  keys and updates the accounts service. The page sends what was typed and nothing else.
+- **(f) A new recovery code: allowed, shown once.** `cloudNewRecoveryCode` answers the code once;
+  it is never stored or logged. It is the only RPC that answers the page a secret.
+- **(g) Whole-store members: an owner may make another owner** from the browser. A store always
+  keeps at least one owner, which the accounts service enforces (409, said as a sentence). An
+  owner lists a whole store's members and changes or removes them, as the old page did.
+- **(h) `cloudAddHostedStore` refuses a store the account holds no row for**, with a whole
+  sentence, in place of adding it whole and writable as an owner (`Unlisted::AsOwner`, which the
+  link's first grant refresh then ended as "no longer shared").
+
+### Changing the password (`crates/pimble-server/src/handler/account.rs`)
+
+`cloudChangePassword { current_password, new_password }`, Service-only, signed in:
+
+1. A new password under 8 characters is refused in a sentence before anything is derived.
+2. The account's keys as the accounts service holds them (`GET /me/keys`) must be the keystore's
+   (same public keys), or the change is refused: it would wrap keys this device does not hold.
+3. Off the async thread (`runtime().run_heavy`), the current password's keys are derived and the
+   served blob unwrapped with them. A wrong current password fails here, as "That is not your
+   current password.", and nothing is sent. Then `pimble_crypto::new_password_material`
+   (`crates/pimble-crypto/src/rotate.rs`) makes a fresh salt, the new `auth_key` and the account
+   keys wrapped under the new KEK.
+4. One `POST /api/v1/me/password { current_auth_key, auth_key, kdf, account_key_blob }`. The
+   service checks the current auth key as login does and writes the hash, the kdf and the blob
+   in one update.
+
+**Atomic from the person's view**: the only write is that one update, so the account always
+opens with exactly one password, old or new, whose blob holds the same keys. A change that never
+reached the service leaves the old password; one whose answer was lost leaves the new one, and
+asking again with the old password says "That is not your current password." Both are tested
+through a proxy that refuses or drops the answer
+(`crates/pimble-cloud/tests/integration/account_worker.rs`).
+
+**Other devices' sessions stay signed in.** That is what `POST /me/password` already does
+(docs/CRYPTO_CONTRACT.md, Phase 2a-2: "keeps other sessions (Joe may change that later)") and
+what the old page did. The account keys do not change with the password, so ending sessions
+would not take keys back from a device that holds them; the keystore of this device needs no
+change either. **For Joe**: whether a password change should also end every other session
+(a "sign out everywhere") is still his call; nothing here prevents adding it.
+
+### A new recovery code
+
+`cloudNewRecoveryCode {}` → `{ code }`, Service-only: `pimble_crypto::new_recovery_material`
+makes the code, a salt and the account keys wrapped under the code's KEK (run off the async
+thread), the server sends `POST /me/recovery-code { recovery_salt, recovery_key_blob }`, and only
+then answers the code. Neither the request nor the response type prints it (`Debug` is
+redacted, `NewRecoveryMaterial` zeroes it on drop), and it is never written to the keystore.
+The page shows it with "Shown once. The old code no longer works.", a checkbox "I have written
+this down somewhere safe" and "Done", which drops it.
+
+### Whole-store members
+
+Three new Service-only RPCs (the contract's second proposal; the share RPCs are left alone,
+since a share's members are never owners): `cloudStoreMembers { store_id }`,
+`cloudStoreSetMember { store_id, email, role }` (adds, or changes a role) and
+`cloudStoreRemoveMember { store_id, email }` (a member, or an invitation withdrawn). Each answers
+the store's members after it, so the page needs no second call.
+
+- Only an owner of the store, by the account's rows, is answered; anyone else is told "Only an
+  owner of this store can see and change who holds it."
+- **Encrypted stores**: an address that holds nothing of the store yet must belong to a verified
+  account (`GET /users/lookup`; a role change of a member asks no lookup, since lookups are
+  limited to one per 200 ms per caller and a 429 is said as "Pimble Cloud asks to slow down."), or
+  the answer is "No verified Pimble account has that address. An
+  encrypted store is shared only with an account, whose key can be sealed to it." Once the
+  member is put, the current store key (`fetch_scope_keys`) is sealed to their public key with
+  the context `store:{id}` and `PUT` to the store's keys. If that hand-over fails, the person
+  holds the store but not the key yet, and the sentence says to add them again.
+- **Plain stores** take an invitation for an address with no account, as before.
+- An owner needs a verified account (the service's own 400, as a sentence). The last owner is
+  neither demoted nor removed (the service's 409: "A store always keeps at least one owner. Make
+  someone else an owner first.").
+
+The page (`web/src/worker_mode/account_sections.rs`) lists the stores this account owns whole
+(`cloudListHostedStores`, `root` none and role `owner`), each with "Members": a row per member
+with a role select (owner, editor, commenter, reader) and "Remove", and "Add by email" with a
+role.
+
+### (h) Adding only what the account holds
+
+`handler/hosted.rs` `add_hosted_store` takes the account's rows for the store
+(`HeldAs::from_rows`) or refuses with "The signed-in Pimble Cloud account does not hold store
+<id>, so it cannot be added here." Nothing is created. The mount-source route
+(`handler/mount_sources.rs`) uses the same call. Tests: `crates/pimble-server/tests/hosted_add.rs`
+(a store with no row, and an unknown id, are refused and nothing is open; a store the account
+owns, added on a second device, is still whole and writable after its first grant refreshes).
+
+### Known limits
+
+- Removing a member of an encrypted store does not rotate the store key, as on the old page
+  (docs/NODE_DOCUMENT_CONTRACT.md's known limits).
+- The service counts owners and then writes, outside a transaction: two owners demoting each
+  other at the same moment could both pass the check. The old page had the same window.
+
+### Proof
+
+Chromium (Playwright), the local stack, made-up accounts (`erin.w5c@example.com`,
+`frank.w5c@example.com`) with fixture passwords, in worker mode. Evidence (screenshots, step
+logs, the desks' answers) is under the session's scratchpad, `wave5efg/`.
+
+- **Members.** Erin's encrypted store "Garden" was hosted from a headless desk. On the account
+  page "Your stores" listed it; "Members" showed Erin as owner. Adding Frank as **owner** showed
+  him as owner, and Frank's own desk then listed the store as `role=owner`, added it and read
+  the note's title "Tomato beds" from the encrypted replica: the key was sealed to him. His role
+  changed to editor; demoting Erin, then the last owner, answered "A store always keeps at
+  least one owner." and her row still read owner; removing Frank took his row away; removing
+  Erin was refused with the same sentence.
+- **Password.** A wrong current password answered "That is not your current password."; the
+  change answered "Your password is changed.". After "Sign Out", the old password was refused
+  at sign-in and the new one signed in. Erin's desk, signed in before the change, still listed
+  her stores.
+- **Recovery code.** "New Recovery Code" showed the code with "Shown once. The old code no
+  longer works.", "Done" stayed disabled until the checkbox was ticked, and the code left the
+  page at "Done" (screenshots mask it). Then Forgot -> the mailed link (logged by the stack) ->
+  that code and a new password: the account was recovered, and the new password signed in.
+- No password appears in the stack's logs or the pages' consoles.
+- `cargo test`: pimble-crypto, pimble-rpc, pimble-client and pimble-server pass except the two
+  tests below; pimble-cloud's integration suite runs against `rhypedb-server` and passes
+  (104 tests, the four in `account_worker.rs` among them). `cargo check --workspace --tests` and
+  `web/`'s `cargo check --workspace --target wasm32-unknown-unknown` are clean.
+
+### Found while building
+
+- The accounts service takes one `/users/lookup` per 200 ms per caller. The first cut looked up
+  every address it was given, so changing a member's role right after adding them answered 429.
+  Only an address that holds nothing of the store is looked up now, and a 429 is a sentence.
+- After a refused role change the row's select kept showing the role just picked. Each row's
+  select now reads the member's role from the last answer, and a refusal makes it read again.
+
+### Not done, and open
+
+- **For Joe**: whether a password change should also sign out every other session (above).
+- `tests/in_process.rs` `a_reader_is_refused_in_process` fails as at this part's base (part 2
+  above). `tests/vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`
+  failed in every run here (four of four) at line 1408, the known race between the test's look
+  at H and the owner's upkeep (part 1's notes); the test does not touch what this part changed.
+- A sign-in refused for a wrong password shows the service's raw answer ("cloud service at ...
+  answered 401: ...") on the worker's sign-in page. It predates this part (`cloudSignIn`); it
+  should be a sentence.
+- `handler.rs`, `pimble-rpc/src/types.rs`, `pimble-client/src/client.rs` and
+  `crates/pimble-cloud/tests/integration.rs` are still over the 700-line limit; this part's code
+  is in new modules (`handler/account.rs`, `cloud/account.rs`, `pimble-rpc/src/account.rs`,
+  `client/account.rs`, `web/src/worker_mode/account_sections.rs`,
+  `tests/integration/account_worker.rs`).
+- The old browser path is still there.
