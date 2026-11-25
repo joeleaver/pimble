@@ -303,9 +303,10 @@ replaced the first cut (places in the personal document, following the account).
                                                 included, in the order they opened (5,000 kept)
   stores_seen: [store id]                       a store seen before opens as it was left; a
                                                 new one opens expanded
-  places:      { "<store id>/<node id>": { anchor, head, top?, at } }
+  places:      { "<store id>/<node id>": { anchor, head, top?, at_start?, at } }
                                                 the selection and the first line in view,
-                                                rinch's sticky bytes in base64
+                                                rinch's sticky bytes in base64; at_start
+                                                when the view showed the note from its start
   boards:      { "<store id>/<node id>": { x, y, zoom, at } }
                                                 the board point at the middle of the view and
                                                 board units per CSS pixel
@@ -316,6 +317,10 @@ replaced the first cut (places in the personal document, following the account).
   there is no `top`), unless the opening already names a place (a link to a heading, a
   search hit, a discussion, a back/forward step that carries its own). Because the
   positions are sticky, the place survives other people's edits while you were away. A
+  note left scrolled to its start opens at its start (`at_start`), so what someone added
+  above its first line while you were away is in view: `top` alone sticks to that line,
+  and a section put at the top of a note read newest first opened just out of view
+  (2026-11-25, an agent's new section in Shared Pimble Notes). A
   board opens at its camera instead of fitting its contents; "Fit" fits. The explorer's
   rows open as they were left, each row's children fetched as it arrives.
 - **Written sparingly**: a text place when a pane leaves the node, when the window closes,

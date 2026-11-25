@@ -122,6 +122,40 @@ pub(crate) fn viewport_top(pane: PaneId, handle: &crate::rinch_editor::EditorHan
     first_in_view(&blocks, top, |pos| handle.caret_rect(Pos(pos)).map(|r| (r.y, r.height)))
 }
 
+/// The start of the first textblock of the note `handle` holds (inside a table's
+/// first cell when the note starts with a table); `None` for a note with none.
+pub(crate) fn first_textblock(handle: &crate::rinch_editor::EditorHandle) -> Option<usize> {
+    let doc = handle.doc();
+    let mut first = None;
+    doc.nodes_between(0, doc.content_size(), &mut |node, pos, _| {
+        if first.is_some() {
+            return false;
+        }
+        if node.is_textblock() {
+            first = Some(pos + 1);
+            return false;
+        }
+        true
+    });
+    first
+}
+
+/// Whether pane `pane` shows its note from the start: the first textblock's
+/// first line is not above the top of the text's box (scrolled to the top,
+/// give or take the box's own padding). `None` when the text is not laid out.
+pub(crate) fn shows_start(pane: PaneId, handle: &crate::rinch_editor::EditorHandle) -> Option<bool> {
+    let (_, top, _, _) = text_rect(pane)?;
+    let first = first_textblock(handle)?;
+    let (y, _) = handle.caret_rect(Pos(first)).map(|r| (r.y, r.height))?;
+    Some(starts_in_view(y, top))
+}
+
+/// Whether a first line drawn at `y` is in view below a box whose top is
+/// `top`. Half a pixel of rounding is not scrolling.
+pub(crate) fn starts_in_view(y: f32, top: f32) -> bool {
+    y >= top - 0.5
+}
+
 /// The first position on a line reaching below `top`, of the textblocks
 /// `blocks` (each its content's `(start, end)`, in document order), where
 /// `rect` says the top and height of the line a position is drawn on, or
@@ -446,6 +480,13 @@ fn text_rect(pane: PaneId) -> Option<(f32, f32, f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_line_below_the_top_of_the_box_is_the_start_in_view() {
+        assert!(starts_in_view(124.0, 100.0), "the box's padding above it");
+        assert!(starts_in_view(99.8, 100.0), "rounding");
+        assert!(!starts_in_view(60.0, 100.0), "scrolled past it");
+    }
 
     #[test]
     fn a_caret_that_resolves_is_drawn_there_with_its_selection() {
