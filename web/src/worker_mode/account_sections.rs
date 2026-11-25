@@ -73,7 +73,7 @@ pub fn change_password_section(__scope: &mut RenderScope) -> NodeHandle {
                     for field in [current, next, again] {
                         field.set(String::new());
                     }
-                    note.set("Your password is changed. Use it the next time you sign in; devices signed in now stay signed in.".to_string());
+                    note.set("Your password is changed. Every other device and browser signed in to this account is signed out and signs in again with the new password; this one stays signed in.".to_string());
                 }
                 Err(e) => error.set(e),
             }
@@ -125,6 +125,9 @@ pub fn change_password_section(__scope: &mut RenderScope) -> NodeHandle {
 }
 
 pub fn recovery_code_section(__scope: &mut RenderScope) -> NodeHandle {
+    // A new code needs the current password (Joe, 2026-11-25), proved by the
+    // server worker and checked again by Pimble Cloud.
+    let password = Signal::new(String::new());
     let code = Signal::new(String::new());
     let saved = Signal::new(false);
     let error = Signal::new(String::new());
@@ -134,16 +137,18 @@ pub fn recovery_code_section(__scope: &mut RenderScope) -> NodeHandle {
         if untracked(|| busy.get()) {
             return;
         }
+        let current = untracked(|| password.get());
         busy.set(true);
         error.set(String::new());
         spawn_local(async move {
             yield_to_browser().await;
             let made = match client().await {
-                Ok(client) => client.cloud_new_recovery_code().await.map_err(|e| e.to_string()),
+                Ok(client) => client.cloud_new_recovery_code(current).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e),
             };
             match made {
                 Ok(fresh) => {
+                    password.set(String::new());
                     saved.set(false);
                     code.set(fresh);
                 }
@@ -159,7 +164,14 @@ pub fn recovery_code_section(__scope: &mut RenderScope) -> NodeHandle {
             h2 { style: "margin: 0; font-size: 16px;", "Recovery code" }
             if code.get().is_empty() {
                 p { class: "pimble-page__lede",
-                    "A new code replaces the old one, which stops working. Your password is unchanged."
+                    "A new code replaces the old one, which stops working. Your password is unchanged, and the account is mailed that its code changed."
+                }
+                PasswordInput {
+                    label: "Current password",
+                    size: "sm",
+                    toggle_visibility: false,
+                    value_fn: move || password.get(),
+                    oninput: move |value: String| password.set(value),
                 }
                 Button {
                     variant: "light",

@@ -7,8 +7,9 @@
 //! `Service`-only.
 //!
 //! Secrets cross this seam in two places only: the passwords of a change
-//! (to the server, as `cloudSignIn`'s does) and the new recovery code (from
-//! the server, once). Their `Debug` prints neither.
+//! and the current password that proves a new recovery code (to the server,
+//! as `cloudSignIn`'s does), and the new recovery code (from the server,
+//! once). Their `Debug` prints neither.
 
 use pimble_core::StoreId;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,19 @@ pub struct CloudChangePasswordRequest {
 impl std::fmt::Debug for CloudChangePasswordRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudChangePasswordRequest").finish_non_exhaustive()
+    }
+}
+
+/// `cloudNewRecoveryCode`: the current password proves it, as it proves a
+/// password change (Joe, 2026-11-25).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CloudNewRecoveryCodeRequest {
+    pub current_password: String,
+}
+
+impl std::fmt::Debug for CloudNewRecoveryCodeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudNewRecoveryCodeRequest").finish_non_exhaustive()
     }
 }
 

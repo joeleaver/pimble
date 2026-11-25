@@ -80,6 +80,15 @@ pub struct Inner {
     /// One relay report taken at a time, so a report sent twice at once is
     /// gathered once (`POST /api/v1/watches/writes`).
     pub relay_reports_lock: tokio::sync::Mutex<()>,
+    /// Per store: every change that could leave it with no owner (a demotion,
+    /// a removal, an account deleted) counts the owners and writes under its
+    /// store's lock, so two owners dropping each other at once cannot both
+    /// count two (`crate::routes::members`).
+    pub store_owner_locks: crate::locks::KeyedLocks,
+    /// Per account: a password change, a recovery and a new recovery code
+    /// read the account again and write under its lock, so neither writes
+    /// over the other (`crate::routes::password`).
+    pub account_locks: crate::locks::KeyedLocks,
     /// The hosted stores whose watched documents (or their watchers' shares)
     /// changed, for the hosted server to be told (`crate::watches`).
     pub watch_interest: crate::watches::InterestChanges,
@@ -176,6 +185,8 @@ impl AppState {
             personal_lock: tokio::sync::Mutex::new(()),
             watches_lock: tokio::sync::Mutex::new(()),
             relay_reports_lock: tokio::sync::Mutex::new(()),
+            store_owner_locks: Default::default(),
+            account_locks: Default::default(),
             watch_interest: crate::watches::InterestChanges::default(),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),

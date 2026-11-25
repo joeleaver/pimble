@@ -490,6 +490,12 @@ async fn fetch_kdf(stack: &Stack, email: &str) -> KdfParams {
     resp.json().await.unwrap()
 }
 
+/// The `auth_key` `password` gives for `email` under the parameters held now.
+async fn auth_key_of(stack: &Stack, email: &str, password: &str) -> String {
+    let kdf = fetch_kdf(stack, email).await;
+    pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(password, &kdf).unwrap().auth_key)
+}
+
 /// `POST /signup` (Phase 1b: 202, no session — see docs/CLOUD_CONTRACT.md
 /// "Phase 1b: email verification"), with real key material
 /// ([`build_signup_body`]). Returns the signup response body and the
@@ -2023,44 +2029,6 @@ async fn change_password_refuses_wrong_current_key_and_accepts_right_one() {
         stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": current_auth_key })).send().await.unwrap();
     assert_eq!(resp.status(), 401);
     login(&stack, email, new_password).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn change_recovery_code_replaces_material_for_future_recovery() {
-    let stack = skip_without_rhypedb!();
-    let email = "change-recovery@example.com";
-    let password = "recovery code owner password!!";
-    let (_body, account_keys) = signup_with_material(&stack, email, password).await;
-    let (_login_body, cookie) = verify_then_login(&stack, email, password).await;
-
-    let new_recovery_salt = KdfParams::generate().salt;
-    let new_recovery_code = pimble_crypto::generate_recovery_code();
-    let new_recovery_params = KdfParams {
-        salt: new_recovery_salt.clone(),
-        m_cost: pimble_crypto::KDF_M_COST_KIB,
-        t_cost: pimble_crypto::KDF_T_COST,
-        p_cost: pimble_crypto::KDF_P_COST,
-    };
-    let new_recovery_kek = pimble_crypto::derive_recovery_kek(&new_recovery_code, &new_recovery_params).unwrap();
-    let new_recovery_key_blob = pimble_crypto::wrap_account_keys(&account_keys, &new_recovery_kek).unwrap();
-
-    let resp = stack
-        .http
-        .post(format!("{}/me/recovery-code", stack.base_url))
-        .header("Cookie", &cookie)
-        .json(&json!({ "recovery_salt": new_recovery_salt, "recovery_key_blob": new_recovery_key_blob }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    // The new code really recovers the account now.
-    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
-    assert_eq!(resp.status(), 202);
-    let token = extract_recovery_token(&stack, email);
-    let (_recover_body, unwrapped_keys) = fetch_and_unwrap_recovery_material(&stack, &token, &new_recovery_code).await;
-    assert_eq!(unwrapped_keys.encryption_secret, account_keys.encryption_secret);
-    assert_eq!(unwrapped_keys.signing_secret, account_keys.signing_secret);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4839,3 +4807,9 @@ mod account_worker;
 
 #[path = "integration/sessions.rs"]
 mod sessions;
+
+#[path = "integration/owners.rs"]
+mod owners;
+
+#[path = "integration/recovery_code.rs"]
+mod recovery_code;

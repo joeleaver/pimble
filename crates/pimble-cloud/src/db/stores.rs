@@ -36,6 +36,16 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| session_from_object(&o)).transpose()
     }
 
+    /// The session row `session_rid`, or `None` once it is deleted.
+    /// (`Session.get` on a deleted id is an error, not an empty answer.)
+    pub async fn get_session(&self, session_rid: u64) -> CloudResult<Option<SessionRow>> {
+        match self.client.query(&format!("Session.get({session_rid})")).await {
+            Ok(result) => result.into_objects().first().map(session_from_object).transpose(),
+            Err(e) if super::is_not_found(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Move a session's expiry (renewal while it is used).
     pub async fn renew_session(&self, session_rid: u64, expires_at_ms: i64) -> CloudResult<()> {
         self.objects(&format!("Session.get({session_rid}).update({{ expires_at: {} }})", datetime_literal(expires_at_ms))).await?;

@@ -150,3 +150,150 @@ async fn a_recovery_ends_every_session() {
     let (_, fresh) = login(&stack, email, "a password after recovery").await;
     assert_eq!(me_status(&stack, &Credential::Cookie(&fresh)).await, 200);
 }
+
+// ── Races: every change reads the account again under its lock ───────────
+
+/// A `/recover/{token}/complete` body with fresh material: the password
+/// `new_password` and a new recovery code. Its `kdf.salt` and
+/// `recovery_salt` tell afterwards whose material the account holds.
+fn recovery_body(keys: &AccountKeys, new_password: &str) -> Value {
+    let kdf = KdfParams::generate();
+    let derived = pimble_crypto::derive_password_keys(new_password, &kdf).unwrap();
+    let recovery_params = KdfParams::generate();
+    let recovery_kek = pimble_crypto::derive_recovery_kek(&pimble_crypto::generate_recovery_code(), &recovery_params).unwrap();
+    json!({
+        "auth_key": pimble_crypto::encode_auth_key(&derived.auth_key),
+        "kdf": kdf,
+        "account_key_blob": pimble_crypto::wrap_account_keys(keys, &derived.kek).unwrap(),
+        "recovery_salt": recovery_params.salt,
+        "recovery_key_blob": pimble_crypto::wrap_account_keys(keys, &recovery_kek).unwrap(),
+    })
+}
+
+/// A `/me/recovery-code` body with a new code.
+fn recovery_code_body(keys: &AccountKeys, current_auth_key: &str) -> Value {
+    let params = KdfParams::generate();
+    let kek = pimble_crypto::derive_recovery_kek(&pimble_crypto::generate_recovery_code(), &params).unwrap();
+    json!({ "current_auth_key": current_auth_key, "recovery_salt": params.salt, "recovery_key_blob": pimble_crypto::wrap_account_keys(keys, &kek).unwrap() })
+}
+
+/// A recovery token for `email` (one per address per minute).
+async fn recovery_token(stack: &Stack, email: &str) -> String {
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    extract_recovery_token(stack, email)
+}
+
+/// The loser of a race is refused in a sentence: by the session check at
+/// the door (401) or by the account read again under the lock (409).
+async fn refused_in_a_sentence(resp: reqwest::Response, what: &str) {
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    assert!(status == 401 || status == 409, "{what}: refused, got {status} {body}");
+    if status == 409 {
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("nothing was changed"), "{what}: the refusal says so: {body}");
+    }
+}
+
+const RACE_ROUNDS: usize = 3;
+
+/// A password change racing a recovery never undoes the recovery: the
+/// account ends with the recovery's password, the changing session is
+/// signed out, and the epoch never goes down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_racing_a_recovery_never_undoes_it() {
+    let stack = skip_without_rhypedb!();
+    let password = "the first password";
+    for round in 0..RACE_ROUNDS {
+        // An account per round: a recovery mail goes once a minute.
+        let email = &format!("change-vs-recovery-{round}@example.com");
+        let (_, keys) = signup_with_material(&stack, email, password).await;
+        let (_, cookie) = verify_then_login(&stack, email, password).await;
+        let token = recovery_token(&stack, email).await;
+        let before = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap().session_epoch;
+        let current_key = auth_key_of(&stack, email, password).await;
+        let recovered = format!("recovered in round {round}");
+        let body = recovery_body(&keys, &recovered);
+        let recover = stack.http.post(format!("{}/recover/{token}/complete", stack.base_url)).json(&body).send();
+        let changing = Credential::Cookie(&cookie);
+        let (change, recover) = tokio::join!(change_password(&stack, &changing, &keys, &current_key, "the change's password"), recover);
+        assert_eq!(recover.unwrap().status(), 200, "round {round}: the recovery always completes");
+        if change.status() != 200 {
+            refused_in_a_sentence(change, "the change").await;
+        }
+        let user = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap();
+        assert_eq!(user.kdf_salt.as_deref(), body["kdf"]["salt"].as_str(), "round {round}: the recovery's password is the account's");
+        assert_eq!(user.recovery_salt.as_deref(), body["recovery_salt"].as_str(), "round {round}: and its recovery code");
+        assert!(user.session_epoch > before, "round {round}: the epoch only grows");
+        assert_eq!(me_status(&stack, &changing).await, 401, "round {round}: the changing session is signed out");
+    }
+}
+
+/// Two password changes at once, from two sessions that both checked the
+/// old password: one wins, the other writes nothing, and only the winner's
+/// session stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_password_changes_at_once_leave_one_password() {
+    let stack = skip_without_rhypedb!();
+    let (email, password) = ("two-changes@example.com", "the first password");
+    let (_, keys) = signup_with_material(&stack, email, password).await;
+    let (_, _) = verify_then_login(&stack, email, password).await;
+    let mut current = password.to_string();
+    for round in 0..RACE_ROUNDS {
+        let (_, first_cookie) = login(&stack, email, &current).await;
+        let (_, second_cookie) = login(&stack, email, &current).await;
+        let key = auth_key_of(&stack, email, &current).await;
+        let (first, second) = (Credential::Cookie(&first_cookie), Credential::Cookie(&second_cookie));
+        let (first_new, second_new) = (format!("first, round {round}"), format!("second, round {round}"));
+        let (a, b) = tokio::join!(change_password(&stack, &first, &keys, &key, &first_new), change_password(&stack, &second, &keys, &key, &second_new));
+        let statuses = [a.status().as_u16(), b.status().as_u16()];
+        assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 1, "round {round}: exactly one wins, got {statuses:?}");
+        let (winner, loser, winning, losing) =
+            if a.status() == 200 { (&first, &second, first_new, second_new) } else { (&second, &first, second_new, first_new) };
+        refused_in_a_sentence(if a.status() == 200 { b } else { a }, "the second change").await;
+        assert_eq!(me_status(&stack, winner).await, 200, "round {round}: the winner stays signed in");
+        assert_eq!(me_status(&stack, loser).await, 401, "round {round}: the loser is one of the others");
+        let login_status = |password: String| {
+            let stack = &stack;
+            async move {
+                let kdf = fetch_kdf(stack, email).await;
+                let auth_key = pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(&password, &kdf).unwrap().auth_key);
+                stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": auth_key })).send().await.unwrap().status()
+            }
+        };
+        assert_eq!(login_status(losing).await, 401, "round {round}: the loser's password was never written");
+        assert_eq!(login_status(winning.clone()).await, 200, "round {round}: the winner's is the account's");
+        current = winning;
+    }
+}
+
+/// A new recovery code made from a session a recovery is ending at that
+/// moment never replaces the code the recovery set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_recovery_code_racing_a_recovery_never_replaces_its_code() {
+    let stack = skip_without_rhypedb!();
+    let password = "the first password";
+    for round in 0..RACE_ROUNDS {
+        // An account per round: a recovery mail goes once a minute.
+        let email = &format!("code-vs-recovery-{round}@example.com");
+        let (_, keys) = signup_with_material(&stack, email, password).await;
+        let (_, cookie) = verify_then_login(&stack, email, password).await;
+        let current = auth_key_of(&stack, email, password).await;
+        let token = recovery_token(&stack, email).await;
+        let recovered = format!("recovered in round {round}");
+        let body = recovery_body(&keys, &recovered);
+        let recover = stack.http.post(format!("{}/recover/{token}/complete", stack.base_url)).json(&body).send();
+        let new_code = stack.http.post(format!("{}/me/recovery-code", stack.base_url)).header("Cookie", &cookie).json(&recovery_code_body(&keys, &current)).send();
+        let (recover, new_code) = tokio::join!(recover, new_code);
+        assert_eq!(recover.unwrap().status(), 200, "round {round}: the recovery always completes");
+        let new_code = new_code.unwrap();
+        if new_code.status() != 200 {
+            refused_in_a_sentence(new_code, "the new code").await;
+        }
+        let user = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap();
+        // A code made before the recovery is replaced by it; one made after
+        // is refused. Either way the recovery's code is the account's.
+        assert_eq!(user.recovery_salt.as_deref(), body["recovery_salt"].as_str(), "round {round}: the recovery's code is the account's");
+    }
+}

@@ -196,9 +196,14 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
+    /// `None` once the account is deleted (`User.get` on a deleted id is an
+    /// error, not an empty answer).
     pub async fn get_user(&self, user_rid: u64) -> CloudResult<Option<UserRow>> {
-        let q = format!("User.get({user_rid})");
-        self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
+        match self.client.query(&format!("User.get({user_rid})")).await {
+            Ok(result) => result.into_objects().first().map(user_from_object).transpose(),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn delete_user(&self, user_rid: u64) -> CloudResult<()> {

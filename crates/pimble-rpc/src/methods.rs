@@ -545,14 +545,19 @@ pub trait PimbleApi {
     // ── The account page (crate::account) ──
 
     /// Wrap the account keys under a new password, proved by the current
-    /// one, and tell the accounts service. Sessions stay. `Service`-only.
+    /// one, and tell the accounts service. Every other session of the account
+    /// is signed out; the one that asked stays signed in (Joe, 2026-11-25).
+    /// Refused in a sentence, with nothing changed, when a password change or
+    /// a recovery elsewhere got there first. `Service`-only.
     #[method(name = "cloudChangePassword", with_extensions)]
     async fn cloud_change_password(&self, request: CloudChangePasswordRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
-    /// Make a new recovery code, wrap the account keys under it, replace the
-    /// old one; the code is answered once. `Service`-only.
+    /// Make a new recovery code, proved by the current password (checked
+    /// here and again by the accounts service), wrap the account keys under
+    /// it, replace the old one; the account is mailed that its code changed
+    /// (Joe, 2026-11-25). The code is answered once. `Service`-only.
     #[method(name = "cloudNewRecoveryCode", with_extensions)]
-    async fn cloud_new_recovery_code(&self) -> Result<CloudNewRecoveryCodeResponse, ErrorObjectOwned>;
+    async fn cloud_new_recovery_code(&self, request: CloudNewRecoveryCodeRequest) -> Result<CloudNewRecoveryCodeResponse, ErrorObjectOwned>;
 
     /// A whole store's members and invitations. `Service`-only.
     #[method(name = "cloudStoreMembers", with_extensions)]

@@ -232,8 +232,28 @@ get their data back. The flows must say that plainly.
 | `GET /api/v1/recover/{token}` | the token | `{ email, recovery_salt, recovery_kdf: { m_cost, t_cost, p_cost }, recovery_key_blob, public_keys }`. This is the only place the recovery blob is ever served, and only to the holder of an emailed token. Unknown or expired: 404 `{ error: "recovery_invalid" }`. |
 | `POST /api/v1/recover/{token}/complete { auth_key, kdf, account_key_blob, recovery_salt, recovery_key_blob }` | the token | Replaces the password hash (of `auth_key`), kdf, account key blob and the recovery material (the client rotated the code); consumes the token; ends every session (in the same update, then deletes their rows); answers `{ user }` and starts no session. The public keys are unchanged, so every store envelope stays valid. |
 | `POST /api/v1/me/password { current_auth_key, auth_key, kdf, account_key_blob }` | session | Verifies `current_auth_key` like login (a wrong one is 401 `wrong_current_password`); replaces the password material and signs out every other session of the account in the same update; the session that asked stays signed in (Joe, 2026-11-25: "Sign out the others"; docs/ONE_CODEBASE_CONTRACT.md "Built: wave 5, part 4"). A JWT minted before the change stays valid until it expires (Pimble servers keep no session state; no JWT revocation). |
-| `POST /api/v1/me/recovery-code { recovery_salt, recovery_key_blob }` | session | Replaces the recovery material (a new code the client generated while holding the keys). |
+| `POST /api/v1/me/recovery-code { current_auth_key, recovery_salt, recovery_key_blob }` | session | Verifies `current_auth_key` as `/me/password` does (a wrong or missing one is 401 `wrong_current_password` and changes nothing), then replaces the recovery material (a new code the client generated while holding the keys) and mails the account that its code changed (Joe, 2026-11-25: "Password and an email"). |
 | `POST /api/v1/recover/{token}/delete-account` | the token | For people without the code: deletes the user, sessions, grants, key grants; hosted stores the user solely owned are marked `deleted` (the vault data is wiped in a later phase, noted). 200 `{}`. |
+
+**Every change of an account's recovery code is mailed** (Joe, 2026-11-25), through the same
+mailer: a new code and a completed recovery, which sets one. Subject "Your Pimble recovery code
+was changed"; it says the old code no longer recovers the account, that there is nothing to do
+for whoever made the change, and what to do otherwise (sign in, change the password, which
+signs out the others, make a new code; or, signed out for good, delete the account from the
+forgotten-password link). It carries no secret: no code, no token, only the account page's
+address. A failed send is logged and the change stands.
+
+**One write per account at a time** (2026-11-25, `AppState::account_locks`,
+`crates/pimble-cloud/src/locks.rs`). The managed RhypeDB has no transaction across a read and
+a write, so `/me/password`, `/me/recovery-code`, `/recover/{token}/complete` and
+`/recover/{token}/delete-account` take the account's lock and read the user (and, for the
+session routes, the session) again inside it. A session route whose session ended while it
+waited, or whose account's password hash changed since its request was judged, writes nothing
+and answers 409 in a sentence ("... so nothing was changed. Sign in again and try again.", or
+"... Sign in with the new password and try again."). The new session epoch is
+`max(stored + 1, now in ms)` from the user read under the lock, so it never goes back. A
+recovery's token is looked up again under the lock, so a token a racing recovery used is
+refused. The service is one process (docs/DEPLOY.md), so the lock in its memory is enough.
 
 `POST /recover` (501) is removed. Rate limits and no-enumeration as elsewhere. Tests: the
 full flow with `LogMailer` (start, GET, complete with keys rotated by real `pimble-crypto`,

@@ -102,7 +102,7 @@ async fn the_device_changes_the_password_and_the_new_one_opens_the_same_keys() {
     assert!(status.signed_in);
     assert_eq!(status.email.as_deref(), Some(email));
     device.client.cloud_list_hosted_stores().await.expect("this device's session still works");
-    device.client.cloud_new_recovery_code().await.expect("and still changes the account");
+    device.client.cloud_new_recovery_code(new).await.expect("and still changes the account");
 
     // Every other session is signed out: one made over HTTP, and another
     // device's, which says so in a sentence and asks to sign in again.
@@ -119,24 +119,25 @@ async fn the_device_changes_the_password_and_the_new_one_opens_the_same_keys() {
     device.stop().await;
 }
 
-/// What the proxy does with `POST /api/v1/me/password`.
+/// What the proxy does with the `POST` it was made for.
 const PASS: u8 = 0;
 /// Answer 502 without sending it on: the change never reached the service.
 const REFUSE: u8 = 1;
 /// Send it on, then answer 502: the change was made and its answer lost.
 const LOSE_REPLY: u8 = 2;
 
-/// A proxy in front of the accounts service that passes everything but the
-/// password change, which goes as `mode` says.
-async fn spawn_proxy(target: String, mode: Arc<AtomicU8>) -> (String, tokio::task::JoinHandle<()>) {
+/// A proxy in front of the accounts service that passes everything but a
+/// `POST` to `held` (a password change, a new recovery code), which goes as
+/// `mode` says.
+async fn spawn_proxy(target: String, held: &'static str, mode: Arc<AtomicU8>) -> (String, tokio::task::JoinHandle<()>) {
     use axum::body::Bytes;
     use axum::extract::State as AxState;
     use axum::http::{HeaderMap, Method, StatusCode, Uri};
     use axum::response::IntoResponse;
 
-    async fn forward(AxState((target, mode)): AxState<(String, Arc<AtomicU8>)>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> axum::response::Response {
+    async fn forward(AxState((target, held, mode)): AxState<(String, &'static str, Arc<AtomicU8>)>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> axum::response::Response {
         let path = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
-        let is_change = method == Method::POST && uri.path() == "/api/v1/me/password";
+        let is_change = method == Method::POST && uri.path() == held;
         let how = if is_change { mode.load(Ordering::SeqCst) } else { PASS };
         if how == REFUSE {
             return StatusCode::BAD_GATEWAY.into_response();
@@ -163,7 +164,7 @@ async fn spawn_proxy(target: String, mode: Arc<AtomicU8>) -> (String, tokio::tas
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = axum::Router::new().fallback(forward).with_state((target, mode));
+    let router = axum::Router::new().fallback(forward).with_state((target, held, mode));
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (format!("http://{addr}"), task)
 }
@@ -179,7 +180,7 @@ async fn a_password_change_that_fails_part_way_leaves_one_password_that_opens_th
     let (_, keys) = signup_with_material(&stack, email, old).await;
     verify_then_login(&stack, email, old).await;
     let mode = Arc::new(AtomicU8::new(PASS));
-    let (proxy_url, proxy) = spawn_proxy(service_url(&stack), Arc::clone(&mode)).await;
+    let (proxy_url, proxy) = spawn_proxy(service_url(&stack), "/api/v1/me/password", Arc::clone(&mode)).await;
     let device = Device::signed_in(&proxy_url, email, old).await;
 
     mode.store(REFUSE, Ordering::SeqCst);
@@ -213,8 +214,19 @@ async fn a_new_recovery_code_recovers_the_account_and_the_old_one_does_not() {
     verify_then_login(&stack, email, password).await;
     let device = Device::signed_in(&service_url(&stack), email, password).await;
 
-    let code = device.client.cloud_new_recovery_code().await.expect("a new code");
+    // Without the current password, or with a wrong one, nothing is asked of
+    // the service and the old code stands (Joe, 2026-11-25).
+    let mails = mail_count(&stack, email);
+    let empty = device.client.cloud_new_recovery_code("").await.expect_err("no password");
+    assert!(empty.to_string().contains("Enter your current password to make a new recovery code."), "{empty}");
+    let wrong = device.client.cloud_new_recovery_code("not the password").await.expect_err("a wrong password");
+    assert!(wrong.to_string().contains("That is not your current password."), "{wrong}");
+    assert!(code_opens(&stack, email, &old_code).await, "a refused code changes nothing");
+    assert_eq!(mail_count(&stack, email), mails, "and mails nothing");
+
+    let code = device.client.cloud_new_recovery_code(password).await.expect("a new code");
     assert_ne!(code, old_code);
+    assert_eq!(mail_count(&stack, email), mails + 1, "a change mails the account once");
     assert!(!contains_bytes(device.dir.path(), code.as_bytes()), "the code is not kept on the device's disk");
 
     let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
@@ -238,6 +250,58 @@ async fn a_new_recovery_code_recovers_the_account_and_the_old_one_does_not() {
     complete_recovery_with_new_material(&stack, &token, &opened, "a password after recovery").await;
     assert!(password_opens(&stack, email, "a password after recovery", &keys).await);
     device.stop().await;
+}
+
+/// The recovery material the service serves for `email` now, opened with
+/// `code`: whether that code recovers the account.
+async fn code_opens(stack: &Stack, email: &str, code: &str) -> bool {
+    let user = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap();
+    let params = KdfParams {
+        salt: user.recovery_salt.clone().unwrap(),
+        m_cost: pimble_crypto::KDF_M_COST_KIB,
+        t_cost: pimble_crypto::KDF_T_COST,
+        p_cost: pimble_crypto::KDF_P_COST,
+    };
+    let blob: AccountKeyBlob = serde_json::from_str(user.recovery_key_blob.as_deref().unwrap()).unwrap();
+    let kek = pimble_crypto::derive_recovery_kek(code, &params).unwrap();
+    pimble_crypto::unwrap_account_keys(&blob, &kek).is_ok()
+}
+
+/// A new recovery code whose answer was lost may have been taken, and the
+/// old code then opens nothing: the device says so, in a sentence that asks
+/// for a new one. A refusal the service answered keeps its own sentence and
+/// leaves the code as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_recovery_code_whose_answer_is_lost_says_to_make_another() {
+    let stack = skip_without_rhypedb!();
+    let (email, password) = ("lost-code@example.com", "a password to keep");
+    let (_, _, old_code) = signup_with_material_and_recovery_code(&stack, email, password).await;
+    verify_then_login(&stack, email, password).await;
+    let mode = Arc::new(AtomicU8::new(LOSE_REPLY));
+    let (proxy_url, proxy) = spawn_proxy(service_url(&stack), "/api/v1/me/recovery-code", Arc::clone(&mode)).await;
+    let device = Device::signed_in(&proxy_url, email, password).await;
+
+    let lost = device.client.cloud_new_recovery_code(password).await.expect_err("the answer was lost");
+    assert!(lost.to_string().contains("Your old recovery code may have stopped working, so make a new one now."), "{lost}");
+    assert!(!code_opens(&stack, email, &old_code).await, "the service took the code nobody saw: the old one opens nothing");
+
+    // Made again, as the sentence asks: a code that recovers the account.
+    mode.store(PASS, Ordering::SeqCst);
+    let code = device.client.cloud_new_recovery_code(password).await.expect("a new code");
+    assert!(code_opens(&stack, email, &code).await);
+
+    // Refused by the service itself (the device's session was ended by a
+    // password change elsewhere): its own sentence, and the code stands.
+    let other = Device::signed_in(&service_url(&stack), email, password).await;
+    other.client.cloud_change_password(password, "a password from elsewhere").await.expect("changed elsewhere");
+    let refused = device.client.cloud_new_recovery_code(password).await.expect_err("this sign-in has ended");
+    assert!(refused.to_string().contains("Your Pimble Cloud sign-in has ended. Sign in again."), "{refused}");
+    assert!(!refused.to_string().contains("may have stopped working"), "{refused}");
+    assert!(code_opens(&stack, email, &code).await, "nothing was written");
+
+    other.stop().await;
+    device.stop().await;
+    proxy.abort();
 }
 
 fn role_of(members: &[pimble_rpc::ShareMember], email: &str) -> Option<(MemberRole, ShareMemberStatus)> {

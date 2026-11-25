@@ -77,6 +77,19 @@ pub(crate) fn with_session(e: CloudError) -> CloudError {
     }
 }
 
+/// Whether a call's outcome is unknown: the request went out and no answer
+/// from the service came back (no connection or a broken one, a body that
+/// could not be read, or a 5xx from the service or a gateway in front of
+/// it, which may have passed the request on). A refusal the service itself
+/// answered with (a 4xx) is known: nothing was written.
+pub(crate) fn outcome_unknown(e: &CloudError) -> bool {
+    match e {
+        CloudError::Request { .. } | CloudError::Decode { .. } => true,
+        CloudError::Refused { refusal: Refusal::Unavailable, .. } => true,
+        CloudError::Status { status, .. } | CloudError::Refused { status, .. } => (500..600).contains(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +131,19 @@ mod tests {
         assert_eq!(ended.to_string(), "Your Pimble Cloud sign-in has ended. Sign in again.");
         assert_eq!(ended.status(), Some(401));
         assert_eq!(with_session(answered(503, "")).to_string(), "Pimble Cloud could not answer just now. Try again in a moment.");
+    }
+
+    /// A request that went out and got no answer from the service is of
+    /// unknown outcome; an answer the service gave is not.
+    #[test]
+    fn only_a_lost_answer_is_of_unknown_outcome() {
+        let lost = CloudError::Request { url: "https://pimble.app/api/v1/me/recovery-code".into(), source: pimble_host::http::HttpError("connection reset".into()) };
+        assert!(outcome_unknown(&lost));
+        assert!(outcome_unknown(&with_session(answered(502, "Bad Gateway"))), "a gateway may have passed it on");
+        assert!(outcome_unknown(&answered(500, "")));
+        for known in [with_session(answered(401, NO_SESSION)), with_session(answered(409, "{}")), answered(400, "{}"), with_session(answered(429, ""))] {
+            assert!(!outcome_unknown(&known), "the service answered: {known}");
+        }
     }
 
     /// Anything else stays as it was, for the caller to say in its own words

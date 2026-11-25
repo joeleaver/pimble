@@ -185,6 +185,15 @@ sensible statuses):
 | `GET /stores/{id}/members` | any grant | `[ { user_id, email, role } ]` |
 | `PUT /stores/{id}/members` `{email, role}` | owner | adds or changes a grant; unknown email is 404 (no invitations in phase 1) |
 | `DELETE /stores/{id}/members/{user_id}` | owner | removes; refuses to remove the last owner |
+
+**A store always keeps an owner, even under races** (2026-11-25). Every change that can take an
+owner away (a demotion or any grant change through `PUT .../members`, a removal or leaving
+through `DELETE .../members/{user_id}`, `DELETE /stores/{id}`, and deleting an account through
+recovery, for each store it holds a grant on) takes the store's owner lock
+(`AppState::store_owner_locks`, before the account lock where both are held) and counts the
+owners from grants read inside it, so two owners dropping each other at once leave one: the
+second is refused as the last owner (409), or as no longer an owner (403). Mail is sent after
+the lock is let go.
 | `GET /releases` | none | latest GitHub release: `{ version, published_at, assets: [ { name, os, url, size } ] }`, cached 10 min; `os` inferred from the asset name (`linux`, `windows`) |
 | `GET /.well-known/jwks.json` | none | production: jkbase's JWKS fetched and cached 10 min; development: the local key |
 | `GET /health` | none | `ok` |

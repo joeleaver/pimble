@@ -40,7 +40,7 @@ pub use keys::*;
 pub use members::*;
 pub use notices::*;
 pub use people::*;
-pub(crate) use refusal::{signing_in, with_session};
+pub(crate) use refusal::{outcome_unknown, signing_in, with_session};
 pub use refusal::Refusal;
 pub use sessions::*;
 pub use stores::*;

@@ -23,7 +23,7 @@ use super::accounts::{to_json, validate_blob, validate_kdf, UserView};
 use crate::auth::{hash_password, hash_recovery_token, new_recovery_token, verify_password_constant_time};
 use crate::db::UserRow;
 use crate::error::{CloudError, CloudResult};
-use crate::mail::recovery_email;
+use crate::mail::{recovery_code_changed_email, recovery_email};
 use crate::session::AuthedUser;
 use crate::state::AppState;
 
@@ -31,8 +31,10 @@ use crate::state::AppState;
 const RECOVERY_TTL_MS: i64 = 60 * 60 * 1000;
 
 /// The `session_epoch` a password change or a recovery raises `user`'s to:
-/// above every session made so far. The clock, so two changes at once pick
-/// different epochs; one above the stored epoch should the clock be behind.
+/// above every session made so far, so it only ever grows. The clock, so two
+/// changes pick different epochs; one above the stored epoch should the clock
+/// be behind. `user` is the account as read under its lock
+/// ([`AccountLock`]), never as read at the start of the request.
 fn next_session_epoch(user: &UserRow) -> u64 {
     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     now.max(user.session_epoch.saturating_add(1))
@@ -53,6 +55,52 @@ async fn delete_ended_sessions(state: &AppState, user_rid: u64, epoch: u64, keep
         if let Err(e) = state.db.delete_session(session.rid).await {
             tracing::warn!(error = %e, "deleting a session a password change ended failed; it is refused, and stays as a row");
         }
+    }
+}
+
+/// The refusal of a change made from a session that a password change or a
+/// recovery elsewhere ended while this request waited.
+pub const SESSION_ENDED_REFUSAL: &str =
+    "This session was signed out by a password change or a recovery made elsewhere while this change waited, so nothing was changed. Sign in again and try again.";
+/// The refusal of a change whose account's password changed after the
+/// request read it.
+pub const PASSWORD_CHANGED_REFUSAL: &str =
+    "The password was changed elsewhere while this change waited, so nothing was changed. Sign in with the new password and try again.";
+
+/// One account's lock (`AppState::account_locks`): a password change, a
+/// recovery, an account deleted by recovery and a new recovery code each
+/// take it and read the account again inside it, so none of them writes
+/// over another's result or lowers `session_epoch`.
+type AccountLock = tokio::sync::OwnedMutexGuard<()>;
+
+async fn lock_account(state: &AppState, user_rid: u64) -> AccountLock {
+    state.account_locks.lock(&user_rid.to_string()).await
+}
+
+/// `authed`'s account as stored now, read under its lock: refused when the
+/// session that asked has ended since it was checked, or the password it was
+/// checked against is no longer the account's.
+async fn account_still_as_read(state: &AppState, authed: &AuthedUser, _held: &AccountLock) -> CloudResult<UserRow> {
+    let user = state.db.get_user(authed.user.rid).await?.ok_or_else(|| CloudError::Conflict(SESSION_ENDED_REFUSAL.to_string()))?;
+    let session = state.db.get_session(authed.session_rid).await?;
+    if session.is_none_or(|session| session.ended_for(&user)) {
+        return Err(CloudError::Conflict(SESSION_ENDED_REFUSAL.to_string()));
+    }
+    if user.password_hash != authed.user.password_hash {
+        return Err(CloudError::Conflict(PASSWORD_CHANGED_REFUSAL.to_string()));
+    }
+    Ok(user)
+}
+
+/// Mail `user` that the account's recovery code changed (Joe, 2026-11-25:
+/// every change sends one). The change is made already, so a failed send is
+/// logged, not answered.
+async fn mail_recovery_code_changed(state: &AppState, user: &UserRow) {
+    let link = format!("{}/app/account", state.config.public_url.trim_end_matches('/'));
+    let (subject, text, html) = recovery_code_changed_email(&link);
+    match state.mailer.send(&user.email, subject, &text, &html).await {
+        Ok(()) => tracing::info!(email = %user.email, "mailed the account that its recovery code changed"),
+        Err(e) => tracing::warn!(email = %user.email, error = %e, "mailing that the recovery code changed failed; the change stands"),
     }
 }
 
@@ -191,8 +239,13 @@ pub async fn recover_complete(
     }
     validate_blob("recovery_key_blob", &req.recovery_key_blob)?;
 
-    let user = user_for_recovery_token(&state, &token).await?;
     let password_hash = hash_password(&req.auth_key)?;
+    let named = user_for_recovery_token(&state, &token).await?;
+    // Read again under the account's lock: a recovery that finished while
+    // this one waited consumed the token, and a password change that did
+    // raised the epoch this one must stay above.
+    let _held = lock_account(&state, named.rid).await;
+    let user = user_for_recovery_token(&state, &token).await?;
     let epoch = next_session_epoch(&user);
     state
         .db
@@ -210,6 +263,8 @@ pub async fn recover_complete(
         )
         .await?;
     delete_ended_sessions(&state, user.rid, epoch, None).await;
+    // A recovery sets a new recovery code too.
+    mail_recovery_code_changed(&state, &user).await;
 
     Ok(Json(RecoverCompleteResponse { user: UserView::from(&user) }))
 }
@@ -221,9 +276,15 @@ pub async fn recover_complete(
 /// it once this account is gone; wiping the underlying vault data is a
 /// later phase).
 pub async fn recover_delete_account(State(state): State<AppState>, Path(token): Path<String>) -> CloudResult<Json<Value>> {
+    let named = user_for_recovery_token(&state, &token).await?;
+    let _held = lock_account(&state, named.rid).await;
     let user = user_for_recovery_token(&state, &token).await?;
 
     for grant in state.db.grants_for_user(user.rid).await? {
+        // Counted and written under the store's owner lock, so two co-owners
+        // deleting their accounts at once leave the store deleted rather
+        // than ownerless (`AppState::store_owner_locks`).
+        let _owners = state.store_owner_locks.lock(&grant.store_uuid).await;
         // Only a whole-store owner is an owner: a scoped grant is a share of
         // somebody else's store, and losing it leaves that store alone.
         if grant.role == "owner" && grant.is_whole_store() {
@@ -283,6 +344,13 @@ pub struct ChangePasswordRequest {
 /// by a login that checked the old password carries the old epoch and is
 /// ended too. JWTs minted before the change are not revoked: a Pimble server
 /// keeps no session state and takes one until it expires, within the hour.
+///
+/// Under the account's lock, against the account read again inside it: a
+/// change whose session a recovery or another change ended while it waited,
+/// or whose password changed since it was checked, is refused with a
+/// sentence ([`SESSION_ENDED_REFUSAL`], [`PASSWORD_CHANGED_REFUSAL`]) and
+/// writes nothing, so it never puts back a password a recovery replaced nor
+/// lowers the epoch that ended a leaked session.
 pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<ChangePasswordRequest>) -> CloudResult<Json<Value>> {
     if !verify_password_constant_time(&req.current_auth_key, Some(authed.user.password_hash.as_str())) {
         return Err(CloudError::WrongCurrentPassword);
@@ -295,7 +363,9 @@ pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, 
 
     let password_hash = hash_password(&req.auth_key)?;
     let account_key_blob = to_json("account_key_blob", &req.account_key_blob)?;
-    let epoch = next_session_epoch(&authed.user);
+    let held = lock_account(&state, authed.user.rid).await;
+    let user = account_still_as_read(&state, &authed, &held).await?;
+    let epoch = next_session_epoch(&user);
     state.db.set_session_epoch(authed.session_rid, epoch).await?;
     state
         .db
@@ -307,21 +377,33 @@ pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, 
 
 #[derive(Deserialize)]
 pub struct ChangeRecoveryCodeRequest {
+    /// The current password's `auth_key`, checked the way login checks one
+    /// (Joe, 2026-11-25).
+    pub current_auth_key: String,
     pub recovery_salt: String,
     pub recovery_key_blob: AccountKeyBlob,
 }
 
 /// `POST /api/v1/me/recovery-code` — replaces the recovery material with a
 /// new code the client generated while already holding the account keys.
+/// Proved by the current password as [`change_password`] is (Joe,
+/// 2026-11-25), and the account is mailed that its code changed. Under the
+/// account's lock and refused as [`change_password`] is, so a code made from
+/// a session a recovery just ended never replaces the code that recovery
+/// set.
 pub async fn change_recovery_code(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<ChangeRecoveryCodeRequest>) -> CloudResult<Json<Value>> {
+    if !verify_password_constant_time(&req.current_auth_key, Some(authed.user.password_hash.as_str())) {
+        return Err(CloudError::WrongCurrentPassword);
+    }
     if req.recovery_salt.trim().is_empty() {
         return Err(CloudError::BadRequest("recovery_salt must not be empty".to_string()));
     }
     validate_blob("recovery_key_blob", &req.recovery_key_blob)?;
-    state
-        .db
-        .update_recovery_material(authed.user.rid, &req.recovery_salt, &to_json("recovery_key_blob", &req.recovery_key_blob)?)
-        .await?;
+    let held = lock_account(&state, authed.user.rid).await;
+    let user = account_still_as_read(&state, &authed, &held).await?;
+    state.db.update_recovery_material(user.rid, &req.recovery_salt, &to_json("recovery_key_blob", &req.recovery_key_blob)?).await?;
+    drop(held);
+    mail_recovery_code_changed(&state, &user).await;
     Ok(Json(json!({})))
 }
 

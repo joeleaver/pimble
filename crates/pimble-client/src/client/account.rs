@@ -3,7 +3,7 @@
 
 use pimble_core::StoreId;
 use pimble_rpc::{
-    CloudChangePasswordRequest, CloudStoreMembersResponse, CloudStoreRef, CloudStoreRemoveMemberRequest, CloudStoreSetMemberRequest, MemberRole, PimbleApiClient,
+    CloudChangePasswordRequest, CloudNewRecoveryCodeRequest, CloudStoreMembersResponse, CloudStoreRef, CloudStoreRemoveMemberRequest, CloudStoreSetMemberRequest, MemberRole, PimbleApiClient,
 };
 
 use super::{rpc_error, PimbleClient};
@@ -19,9 +19,11 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// A new recovery code, which replaces the old one; answered once.
-    pub async fn cloud_new_recovery_code(&self) -> Result<String> {
-        Ok(self.client.cloud_new_recovery_code().await.map_err(rpc_error)?.code)
+    /// A new recovery code, proved by `current_password`, which replaces the
+    /// old one; answered once.
+    pub async fn cloud_new_recovery_code(&self, current_password: impl Into<String>) -> Result<String> {
+        let request = CloudNewRecoveryCodeRequest { current_password: current_password.into() };
+        Ok(self.client.cloud_new_recovery_code(request).await.map_err(rpc_error)?.code)
     }
 
     /// A whole store's members and invitations.

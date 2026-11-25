@@ -430,6 +430,9 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
 
 pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Path(store_id): Path<String>) -> CloudResult<Json<Value>> {
     let store = require_live_store(&state, &store_id).await?;
+    // Under the owner lock: an owner being demoted or removed right now is
+    // judged after that, not before (`AppState::store_owner_locks`).
+    let _owners = state.store_owner_locks.lock(&store.store_id).await;
     require_owner(&state, &store, authed.user.rid).await?;
     // Everything that names the store goes with it: nobody keeps a grant, an
     // envelope, or a standing invitation to a store that no longer exists

@@ -89,6 +89,7 @@ pub fn account_page() -> NodeHandle {
     let fresh_code = Signal::new(String::new());
     let code_saved = Signal::new(false);
     let code_busy = Signal::new(false);
+    let code_password = Signal::new(String::new());
     let code_error = Signal::new(String::new());
 
     let do_change_password = move || {
@@ -132,12 +133,14 @@ pub fn account_page() -> NodeHandle {
         if untracked(|| code_busy.get()) {
             return;
         }
+        let current = untracked(|| code_password.get());
         code_error.set(String::new());
         code_busy.set(true);
         spawn_local(async move {
             yield_to_browser().await;
-            match new_recovery_code().await {
+            match new_recovery_code(&current).await {
                 Ok(code) => {
+                    code_password.set(String::new());
                     code_saved.set(false);
                     fresh_code.set(code);
                 }
@@ -523,7 +526,15 @@ pub fn account_page() -> NodeHandle {
                         style: "display: flex; flex-direction: column; gap: 10px;",
                         p { class: "pimble-page__lede",
                             "A new code replaces the old one, which stops working. Your \
-                             password is unchanged."
+                             password is unchanged, and the account is mailed that its code \
+                             changed."
+                        }
+                        PasswordInput {
+                            label: "Current password",
+                            size: "sm",
+                            toggle_visibility: false,
+                            value_fn: move || code_password.get(),
+                            oninput: move |value: String| code_password.set(value),
                         }
                         Button {
                             variant: "light",
@@ -636,9 +647,15 @@ async fn change_password(current: &str, next: &str) -> Result<(), String> {
 }
 
 /// Mint a recovery code, wrap the account keys under it, and replace the old
-/// one. Returns the code, to show once.
-async fn new_recovery_code() -> Result<String, String> {
+/// one, proved by the current password as [`change_password`] proves it.
+/// Returns the code, to show once.
+async fn new_recovery_code(current: &str) -> Result<String, String> {
     let keys = session::keys().ok_or("Unlock your account first.")?;
+    if current.is_empty() {
+        return Err("Enter your current password to make a new recovery code.".to_string());
+    }
+    let my_keys = accounts::my_keys().await.map_err(|e| e.message)?;
+    let current_derived = derive_timed(current, &my_keys.kdf)?;
 
     let code = generate_recovery_code();
     let params = KdfParams::generate();
@@ -648,11 +665,20 @@ async fn new_recovery_code() -> Result<String, String> {
         wrap_account_keys(&keys, &kek).map_err(|e| format!("Wrapping failed: {e}"))?;
 
     accounts::replace_recovery_code(&NewRecoveryCodeRequest {
+        current_auth_key: encode_auth_key(&current_derived.auth_key),
         recovery_salt: params.salt.clone(),
         recovery_key_blob,
     })
     .await
-    .map_err(|e| e.message)?;
+    .map_err(|e| match e.status {
+        401 => "That is not your current password.".to_string(),
+        // No answer, or the service failed: the code may have been saved.
+        0 | 500..=599 => "Pimble Cloud did not answer, so this browser cannot tell whether the new \
+                          recovery code was saved. Your old recovery code may have stopped working, \
+                          so make a new one now."
+            .to_string(),
+        _ => e.message,
+    })?;
 
     Ok(code)
 }

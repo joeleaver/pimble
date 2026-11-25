@@ -36,13 +36,15 @@ pub async fn change_password(
 
 #[derive(Serialize)]
 struct ChangeRecoveryCodeBody<'a> {
+    current_auth_key: &'a str,
     recovery_salt: &'a str,
     recovery_key_blob: &'a AccountKeyBlob,
 }
 
-/// Replace the recovery code's material in one update.
-pub async fn change_recovery_code(http: &dyn Http, base_url: &str, session: &str, recovery_salt: &str, recovery_key_blob: &AccountKeyBlob) -> Result<()> {
-    let body = ChangeRecoveryCodeBody { recovery_salt, recovery_key_blob };
+/// Replace the recovery code's material in one update, proved by the
+/// current password's `auth_key`.
+pub async fn change_recovery_code(http: &dyn Http, base_url: &str, session: &str, current_auth_key: &str, recovery_salt: &str, recovery_key_blob: &AccountKeyBlob) -> Result<()> {
+    let body = ChangeRecoveryCodeBody { current_auth_key, recovery_salt, recovery_key_blob };
     let _: serde_json::Value = post(http, &endpoint(base_url, "/api/v1/me/recovery-code"), Some(session), &body).await.map_err(super::with_session)?;
     Ok(())
 }

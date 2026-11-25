@@ -26,6 +26,7 @@ use crate::error::{CloudError, CloudResult};
 use crate::mail::{invitation_email, shared_with_you_email};
 use crate::session::AuthedUser;
 use crate::state::AppState;
+use tokio::sync::OwnedMutexGuard;
 
 /// One row of `GET /stores/{id}/members`: either a member (a `Grant`,
 /// `status: "active"`) or an address that has been invited and has no account
@@ -304,6 +305,10 @@ pub async fn put_member(
     Json(req): Json<PutMemberRequest>,
 ) -> CloudResult<Json<MemberView>> {
     let store = require_live_store(&state, &store_id).await?;
+    // Who is an owner, and how many there are, is read and written under the
+    // store's lock (see `AppState::store_owner_locks`): the caller's own
+    // ownership too, which another owner may be taking away at this moment.
+    let owners = state.store_owner_locks.lock(&store.store_id).await;
     require_owner(&state, &store, authed.user.rid).await?;
 
     if !ROLES.contains(&req.role.as_str()) {
@@ -337,8 +342,8 @@ pub async fn put_member(
     let target = state.db.find_user_by_email(email).await?.filter(|u| u.verified && u.has_key_material());
 
     match target {
-        Some(target) => grant_member(&state, &store, &authed.user, target, &req.role, &root, &share_name).await,
-        None => invite_member(&state, &store, &authed.user, email, &req.role, &root, &share_name).await,
+        Some(target) => grant_member(&state, &store, owners, &authed.user, target, &req.role, &root, &share_name).await,
+        None => invite_member(&state, &store, owners, &authed.user, email, &req.role, &root, &share_name).await,
     }
 }
 
@@ -366,10 +371,13 @@ async fn rename_share(state: &AppState, store: &HostedStoreRow, root: &str, shar
 
 /// `PUT members` for an address that has a usable account: a grant on this
 /// scope, plus the "shared with you" mail and the public keys the caller
-/// needs to wrap the scope's key straight away.
+/// needs to wrap the scope's key straight away. `owners` is the store's
+/// owner lock, held until the grant is written and let go before the mail.
+#[allow(clippy::too_many_arguments)]
 async fn grant_member(
     state: &AppState,
     store: &HostedStoreRow,
+    owners: OwnedMutexGuard<()>,
     caller: &UserRow,
     target: UserRow,
     role: &str,
@@ -381,7 +389,9 @@ async fn grant_member(
             // Demoting the store's last owner to editor/reader is exactly as
             // forbidden as removing them outright (`delete_member` below) —
             // both leave the store with zero owners. Only a whole-store grant
-            // can be that owner.
+            // can be that owner. The count is read under the store's lock,
+            // after `existing`, so two owners demoting each other at once
+            // cannot both count two.
             if existing.role == "owner" && role != "owner" && owner_count(state, store.rid).await? <= 1 {
                 return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
             }
@@ -406,6 +416,7 @@ async fn grant_member(
     if let Some(invitation) = state.db.find_invitation(store.rid, &target.email, root).await? {
         state.db.delete_invitation(invitation.rid).await?;
     }
+    drop(owners);
 
     send_share_mail(state, store, share_name, &caller.email, &target.email, false).await;
     let has_key = has_key(state, target.rid, store.rid, root).await?;
@@ -428,9 +439,12 @@ async fn grant_member(
 
 /// `PUT members` for an address with no usable account yet: an invitation,
 /// upserted so the same address is never invited twice to the same scope.
+/// `owners` as in [`grant_member`].
+#[allow(clippy::too_many_arguments)]
 async fn invite_member(
     state: &AppState,
     store: &HostedStoreRow,
+    owners: OwnedMutexGuard<()>,
     caller: &UserRow,
     email: &str,
     role: &str,
@@ -462,6 +476,7 @@ async fn invite_member(
     }
     // As in `grant_member`: one name for the share, on every row of it.
     rename_share(state, store, root, share_name).await?;
+    drop(owners);
 
     send_share_mail(state, store, share_name, &caller.email, email, true).await;
     Ok(Json(MemberView {
@@ -489,6 +504,11 @@ pub async fn delete_member(
 ) -> CloudResult<Json<Value>> {
     let store = require_live_store(&state, &store_id).await?;
     let root = normalize_root(&scope.root)?;
+    // Everything below is read and written under the store's owner lock, so
+    // the grant and the owner count are what is stored when it is deleted:
+    // two owners removing each other (or one leaving while the other is
+    // demoted) cannot both count two.
+    let _owners = state.store_owner_locks.lock(&store.store_id).await;
     // Authorization before the lookup, so who exists is never leaked by which
     // error comes back: a caller with no grant is 403 whatever `user_id` they
     // name.

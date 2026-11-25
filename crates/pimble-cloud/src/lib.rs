@@ -15,6 +15,7 @@ pub mod db;
 pub mod error;
 pub mod jwt;
 pub mod kdf_decoy;
+pub mod locks;
 pub mod mail;
 pub mod pimble;
 pub mod ratelimit;

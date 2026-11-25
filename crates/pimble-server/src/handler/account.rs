@@ -31,6 +31,10 @@ pub(crate) const MIN_PASSWORD: usize = 8;
 const NOT_SIGNED_IN: &str = "Sign in to Pimble Cloud first.";
 const LAST_OWNER: &str = "A store always keeps at least one owner. Make someone else an owner first.";
 const OWNERS_ONLY: &str = "Only an owner of this store can see and change who holds it.";
+/// `cloudNewRecoveryCode` when its request went out and no answer came back:
+/// the service may hold the new code, which this computer never showed.
+pub(crate) const RECOVERY_CODE_OUTCOME_UNKNOWN: &str =
+    "Pimble Cloud did not answer, so this computer cannot tell whether the new recovery code was saved. Your old recovery code may have stopped working, so make a new one now.";
 
 /// A refusal of the accounts service's on a store's members, said as a
 /// sentence: the ones this page meets in its own words, any other in the
@@ -52,7 +56,9 @@ fn refusal(e: CloudError) -> ErrorObjectOwned {
 /// knows one; a 400 is said in the service's words.
 fn account_refusal(e: CloudError) -> ErrorObjectOwned {
     match &e {
-        CloudError::Status { status: 400, body, .. } => to_rpc_error(crate::cloud::service_message(body).unwrap_or_else(|| e.to_string())),
+        // The service's refusals in its own sentence: a bad request, and a
+        // change refused because the account changed while it waited.
+        CloudError::Status { status: 400 | 409, body, .. } => to_rpc_error(crate::cloud::service_message(body).unwrap_or_else(|| e.to_string())),
         _ => to_rpc_error(e),
     }
 }
@@ -89,40 +95,50 @@ impl RpcHandler {
         account_refusal(e)
     }
 
-    /// `cloudChangePassword`. The current password is checked here first
-    /// (it must open the wrapped keys the service holds), so a typo costs no
-    /// request; the service checks it again, as login does.
-    pub(super) async fn change_password(&self, current_password: String, new_password: String) -> Result<(), ErrorObjectOwned> {
-        if new_password.chars().count() < MIN_PASSWORD {
-            return Err(to_rpc_error(format!("A password needs at least {MIN_PASSWORD} characters.")));
-        }
-        let account = self.account_signed_in().await?;
+    /// The current password proved here: it must open the wrapped keys the
+    /// service holds (so a typo costs no request), and its `auth_key` is what
+    /// the service checks again, as login does. Refused as
+    /// [`Refusal::WrongCurrentPassword`].
+    async fn prove_current_password(&self, account: &SignedInAccount, current_password: String) -> Result<String, ErrorObjectOwned> {
         let held = crate::cloud::me_keys(self.http(), &account.url, &account.session).await.map_err(|e| self.refused(e))?;
         if held.public_keys != account.keys.public_keys() {
             // The service's keys are not the ones this server holds: a
             // rewrap of these would lock the account out of its own.
-            return Err(to_rpc_error("This browser holds other keys than your account's. Sign out and sign in again, then change the password."));
+            return Err(to_rpc_error("This browser holds other keys than your account's. Sign out and sign in again, then try again."));
         }
-        info!("Changing the Pimble Cloud password");
-
-        let keys = pimble_crypto::AccountKeys { encryption_secret: account.keys.encryption_secret, signing_secret: account.keys.signing_secret };
         let (current_kdf, current_blob) = (held.kdf, held.account_key_blob);
-        let derived = self
+        let proved = self
             .runtime()
             .run_heavy(move || -> Result<_, String> {
                 let current = pimble_crypto::derive_password_keys(&current_password, &current_kdf).map_err(|e| e.to_string())?;
                 if pimble_crypto::unwrap_account_keys(&current_blob, &current.kek).is_err() {
                     return Ok(None);
                 }
-                let material = pimble_crypto::new_password_material(&keys, &new_password).map_err(|e| e.to_string())?;
-                Ok(Some((pimble_crypto::encode_auth_key(&current.auth_key), material)))
+                Ok(Some(pimble_crypto::encode_auth_key(&current.auth_key)))
             })
             .await
             .map_err(to_rpc_error)?
             .map_err(to_rpc_error)?;
-        let Some((current_auth_key, material)) = derived else {
-            return Err(to_rpc_error(Refusal::WrongCurrentPassword));
-        };
+        proved.ok_or_else(|| to_rpc_error(Refusal::WrongCurrentPassword))
+    }
+
+    /// `cloudChangePassword`, proved by the current password
+    /// ([`Self::prove_current_password`]).
+    pub(super) async fn change_password(&self, current_password: String, new_password: String) -> Result<(), ErrorObjectOwned> {
+        if new_password.chars().count() < MIN_PASSWORD {
+            return Err(to_rpc_error(format!("A password needs at least {MIN_PASSWORD} characters.")));
+        }
+        let account = self.account_signed_in().await?;
+        let current_auth_key = self.prove_current_password(&account, current_password).await?;
+        info!("Changing the Pimble Cloud password");
+
+        let keys = pimble_crypto::AccountKeys { encryption_secret: account.keys.encryption_secret, signing_secret: account.keys.signing_secret };
+        let material = self
+            .runtime()
+            .run_heavy(move || pimble_crypto::new_password_material(&keys, &new_password).map_err(|e| e.to_string()))
+            .await
+            .map_err(to_rpc_error)?
+            .map_err(to_rpc_error)?;
 
         crate::cloud::change_password(self.http(), &account.url, &account.session, &current_auth_key, &material.auth_key, &material.kdf, &material.account_key_blob)
             .await
@@ -132,9 +148,21 @@ impl RpcHandler {
     }
 
     /// `cloudNewRecoveryCode`: the code made here, the keys wrapped under it,
-    /// the old code's material replaced; the code answered once.
-    pub(super) async fn new_recovery_code(&self) -> Result<String, ErrorObjectOwned> {
+    /// the old code's material replaced; the code answered once. Proved by
+    /// the current password, here and again by the service, which mails the
+    /// account that its code changed (Joe, 2026-11-25).
+    ///
+    /// When the request went out and no answer came back, the service may
+    /// have taken the new code, which was never shown, and the old one then
+    /// opens nothing: the answer says so ([`RECOVERY_CODE_OUTCOME_UNKNOWN`]).
+    /// A refusal the service answered with wrote nothing and keeps its own
+    /// sentence.
+    pub(super) async fn new_recovery_code(&self, current_password: String) -> Result<String, ErrorObjectOwned> {
+        if current_password.is_empty() {
+            return Err(to_rpc_error("Enter your current password to make a new recovery code."));
+        }
         let account = self.account_signed_in().await?;
+        let current_auth_key = self.prove_current_password(&account, current_password).await?;
         info!("Making a new Pimble Cloud recovery code");
         let keys = pimble_crypto::AccountKeys { encryption_secret: account.keys.encryption_secret, signing_secret: account.keys.signing_secret };
         let mut material = self
@@ -143,9 +171,16 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?
             .map_err(to_rpc_error)?;
-        crate::cloud::change_recovery_code(self.http(), &account.url, &account.session, &material.recovery_salt, &material.recovery_key_blob)
+        crate::cloud::change_recovery_code(self.http(), &account.url, &account.session, &current_auth_key, &material.recovery_salt, &material.recovery_key_blob)
             .await
-            .map_err(|e| self.refused(e))?;
+            .map_err(|e| {
+                if crate::cloud::outcome_unknown(&e) {
+                    warn!(error = %e, "The new recovery code's request got no answer; the old code may have stopped working");
+                    to_rpc_error(RECOVERY_CODE_OUTCOME_UNKNOWN)
+                } else {
+                    self.refused(e)
+                }
+            })?;
         info!("The Pimble Cloud recovery code was replaced");
         Ok(std::mem::take(&mut material.code))
     }

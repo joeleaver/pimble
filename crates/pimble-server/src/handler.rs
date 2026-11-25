@@ -4727,9 +4727,9 @@ impl PimbleApiServer for RpcHandler {
         self.change_password(request.current_password, request.new_password).await.map(|()| EmptyResponse {})
     }
 
-    async fn cloud_new_recovery_code(&self, ext: &Extensions) -> Result<pimble_rpc::CloudNewRecoveryCodeResponse, ErrorObjectOwned> {
+    async fn cloud_new_recovery_code(&self, ext: &Extensions, request: pimble_rpc::CloudNewRecoveryCodeRequest) -> Result<pimble_rpc::CloudNewRecoveryCodeResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudNewRecoveryCode")?;
-        self.new_recovery_code().await.map(|code| pimble_rpc::CloudNewRecoveryCodeResponse { code })
+        self.new_recovery_code(request.current_password).await.map(|code| pimble_rpc::CloudNewRecoveryCodeResponse { code })
     }
 
     async fn cloud_store_members(&self, ext: &Extensions, request: pimble_rpc::CloudStoreRef) -> Result<pimble_rpc::CloudStoreMembersResponse, ErrorObjectOwned> {
