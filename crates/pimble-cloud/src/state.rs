@@ -89,6 +89,10 @@ pub struct Inner {
     /// read the account again and write under its lock, so neither writes
     /// over the other (`crate::routes::password`).
     pub account_locks: crate::locks::KeyedLocks,
+    /// Where a test may hold a request to make a race overlap; nothing can
+    /// be held outside builds with the `test-hooks` feature
+    /// (`crate::checkpoints`).
+    pub checkpoints: crate::checkpoints::Checkpoints,
     /// The hosted stores whose watched documents (or their watchers' shares)
     /// changed, for the hosted server to be told (`crate::watches`).
     pub watch_interest: crate::watches::InterestChanges,
@@ -187,6 +191,7 @@ impl AppState {
             relay_reports_lock: tokio::sync::Mutex::new(()),
             store_owner_locks: Default::default(),
             account_locks: Default::default(),
+            checkpoints: Default::default(),
             watch_interest: crate::watches::InterestChanges::default(),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),

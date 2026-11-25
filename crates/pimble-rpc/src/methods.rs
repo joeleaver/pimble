@@ -362,9 +362,10 @@ pub trait PimbleApi {
 
     /// Whether diagnostics are on, and the install they are recorded under:
     /// what the browser's page tells its server at every connect and when
-    /// the person changes it. `Service`-only.
+    /// the person changes it, with a clear it noted as owed; whether that
+    /// clear has run. `Service`-only.
     #[method(name = "setDiagnostics", with_extensions)]
-    async fn set_diagnostics(&self, request: SetDiagnosticsRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn set_diagnostics(&self, request: SetDiagnosticsRequest) -> Result<SetDiagnosticsResponse, ErrorObjectOwned>;
 
     /// Help > "Send Diagnostics...": the client's logs, this server's own,
     /// the note and the stores, sent as one report; its code. `Service`-only.

@@ -9,6 +9,7 @@
 //! server — see `tests/common/mod.rs`.
 
 pub mod auth;
+pub mod checkpoints;
 pub mod claims;
 pub mod config;
 pub mod db;

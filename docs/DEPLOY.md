@@ -190,6 +190,16 @@ This builds `site/` (committed, served as-is), `web/` (trunk, server-side), and 
 `crates/pimble-cloud/schema.rhype`. The whole project is one microVM at
 `https://pimble.jkbase.app`.
 
+**The accounts service runs as exactly one instance.** Never scale `cloud` beyond one
+process. The managed RhypeDB has no transaction that spans a read and a write, so the rules
+that need one (a store always keeps an owner; a password change, a recovery and a new
+recovery code never write over each other) are kept by locks in the service's memory
+(`crates/pimble-cloud/src/locks.rs`, docs/CLOUD_CONTRACT.md), and a second instance would
+hold locks of its own that the first never sees: two owners demoting each other through two
+instances could leave a store with no owner. The relay's registry of tunnels lives in the
+same memory (docs/RELAY_CONTRACT.md). Running more than one needs those rules moved into the
+database first.
+
 ```bash
 jkbase logs -f --service cloud     # tail the accounts service
 jkbase logs -f --service pimble    # tail the hosted Pimble server

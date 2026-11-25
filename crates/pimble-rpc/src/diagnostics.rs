@@ -8,12 +8,25 @@ use serde::{Deserialize, Serialize};
 
 /// `setDiagnostics`: whether the person has diagnostics on, and the install
 /// number the client keeps (the browser page's, which outlives a browser that
-/// is not remembered); the server records under it.
+/// is not remembered); the server records under it. `clear_owed`: the client
+/// noted an off that no server has confirmed clearing for (the browser's
+/// worker can end before it could write the off down), so what waits from
+/// before it must go before anything is sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetDiagnosticsRequest {
     pub enabled: bool,
     #[serde(default)]
     pub install: Option<String>,
+    #[serde(default)]
+    pub clear_owed: bool,
+}
+
+/// `setDiagnostics`' answer: whether every clear the request said was owed
+/// has run (always, when it said none), so the client may drop its note.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetDiagnosticsResponse {
+    #[serde(default)]
+    pub cleared: bool,
 }
 
 /// One log a client hands over for a report, as `(name, text)`.

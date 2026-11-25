@@ -190,10 +190,16 @@ sensible statuses):
 owner away (a demotion or any grant change through `PUT .../members`, a removal or leaving
 through `DELETE .../members/{user_id}`, `DELETE /stores/{id}`, and deleting an account through
 recovery, for each store it holds a grant on) takes the store's owner lock
-(`AppState::store_owner_locks`, before the account lock where both are held) and counts the
-owners from grants read inside it, so two owners dropping each other at once leave one: the
-second is refused as the last owner (409), or as no longer an owner (403). Mail is sent after
-the lock is let go.
+(`AppState::store_owner_locks`; where both are held, the account lock comes first and the store
+locks are then taken one at a time, each let go before the next) and reads inside it both the
+grant it is about to change and the owners it counts, so two owners dropping each other at once
+leave one: the second is refused as the last owner (409), or as no longer an owner (403). An
+account deletion lists the account's grants before any store lock, so inside each store's lock
+it reads that account's grant again and judges by the role it has then: a co-owner who demoted
+it in the meantime keeps their store (2026-11-25). Mail is sent after the lock is let go. The
+locks live in the service's memory, so this holds only while the accounts service runs as one
+instance (docs/DEPLOY.md). Tests make each race overlap at a checkpoint inside the service
+(`pimble_cloud::checkpoints`, built only with the `test-hooks` feature its own tests turn on).
 | `GET /releases` | none | latest GitHub release: `{ version, published_at, assets: [ { name, os, url, size } ] }`, cached 10 min; `os` inferred from the asset name (`linux`, `windows`) |
 | `GET /.well-known/jwks.json` | none | production: jkbase's JWKS fetched and cached 10 min; development: the local key |
 | `GET /health` | none | `ok` |

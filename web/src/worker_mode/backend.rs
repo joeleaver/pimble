@@ -362,13 +362,21 @@ fn heard(event: &BackendEvent) {
     }
 }
 
-/// Tell this browser's server the diagnostics choice and the page's install
-/// number (`setDiagnostics`): at every connection, since a new worker knows
-/// neither, and whenever Settings > Diagnostics saves it.
+/// Tell this browser's server the diagnostics choice, the page's install
+/// number and a clear the page owes it (`setDiagnostics`): at every
+/// connection, since a new worker knows none of them, and whenever Settings
+/// > Diagnostics saves it. The note of the clear goes once the server says
+/// it has run.
 async fn tell_diagnostics(client: Arc<PimbleClient>) {
     let (enabled, _) = crate::diagnostics::settings();
-    if let Err(e) = client.set_diagnostics(enabled, crate::diagnostics::install()).await {
-        tracing::debug!("This browser's server was not told the diagnostics choice: {e}");
+    let owed = crate::diagnostics::clear_owed();
+    match client.set_diagnostics(enabled, crate::diagnostics::install(), owed.is_some()).await {
+        Ok(cleared) => {
+            if let (true, Some(tag)) = (cleared, owed) {
+                crate::diagnostics::clear_confirmed(&tag);
+            }
+        }
+        Err(e) => tracing::debug!("This browser's server was not told the diagnostics choice: {e}"),
     }
 }
 

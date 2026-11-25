@@ -21,6 +21,7 @@ use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams};
 
 use super::accounts::{to_json, validate_blob, validate_kdf, UserView};
 use crate::auth::{hash_password, hash_recovery_token, new_recovery_token, verify_password_constant_time};
+use crate::checkpoints::Checkpoint;
 use crate::db::UserRow;
 use crate::error::{CloudError, CloudResult};
 use crate::mail::{recovery_code_changed_email, recovery_email};
@@ -280,16 +281,27 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
     let _held = lock_account(&state, named.rid).await;
     let user = user_for_recovery_token(&state, &token).await?;
 
-    for grant in state.db.grants_for_user(user.rid).await? {
+    let listed = state.db.grants_for_user(user.rid).await?;
+    state.checkpoints.reach(Checkpoint::AccountGrantsListed).await;
+    for listed in listed {
         // Counted and written under the store's owner lock, so two co-owners
         // deleting their accounts at once leave the store deleted rather
         // than ownerless (`AppState::store_owner_locks`).
-        let _owners = state.store_owner_locks.lock(&grant.store_uuid).await;
+        let _owners = state.store_owner_locks.lock(&listed.store_uuid).await;
+        // The listing was taken before this lock: another owner may have
+        // demoted or removed this account since. Only the grant as it is
+        // now says whether this account is one of the store's owners; the
+        // stale role would count a demoted account as the last owner and
+        // delete the store out from under the owner who demoted it.
+        let Some(grant) = state.db.find_grant(user.rid, listed.store_rid, &listed.root).await? else {
+            continue;
+        };
         // Only a whole-store owner is an owner: a scoped grant is a share of
         // somebody else's store, and losing it leaves that store alone.
         if grant.role == "owner" && grant.is_whole_store() {
             let owner_count =
                 state.db.grants_for_store(grant.store_rid).await?.into_iter().filter(|g| g.role == "owner" && g.is_whole_store()).count();
+            state.checkpoints.reach(Checkpoint::OwnersCounted).await;
             if owner_count <= 1 {
                 state.db.mark_store_deleted(grant.store_rid).await?;
                 // If it was a relayed store with a tunnel up, nobody is piped

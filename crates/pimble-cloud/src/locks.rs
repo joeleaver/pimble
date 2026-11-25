@@ -35,6 +35,20 @@ impl KeyedLocks {
     pub fn in_use(&self) -> usize {
         self.locks.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|lock| Arc::strong_count(lock) > 1).count()
     }
+
+    /// How many requests wait for `key`'s lock while another holds it; for
+    /// tests that must know a second request is queued behind the first.
+    /// The map holds one reference, the holder's guard one, and each waiter
+    /// one from the moment it is committed to waiting (`lock` takes its
+    /// reference and goes straight to waiting, with nothing in between).
+    #[cfg(feature = "test-hooks")]
+    pub fn waiting(&self, key: &str) -> usize {
+        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        match locks.get(key) {
+            Some(lock) if lock.try_lock().is_err() => Arc::strong_count(lock).saturating_sub(2),
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]

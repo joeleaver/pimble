@@ -179,10 +179,12 @@ pub enum Sent {
 }
 
 /// Records waiting on the server's disk: one NDJSON file per batch, named by
-/// when it was written, so the oldest go first, and by the account whose
-/// records it holds, so that it is only ever sent as that account. One server
-/// holds a browser's disk at a time (section 4), so no file is ever claimed by
-/// two senders.
+/// its place in the queue's own sequence (a number kept beside the batches
+/// that only ever grows, never the wall clock, which can step back), so the
+/// oldest go first and an off can name the batches from before it; and by
+/// the account whose records it holds, so that it is only ever sent as that
+/// account. One server holds a browser's disk at a time (section 4), so no
+/// file is ever claimed by two senders.
 pub struct Queue {
     disk: Disk,
     dir: PathBuf,
@@ -199,21 +201,43 @@ enum Owner {
     Unknown,
 }
 
-/// A batch's name: `records-<millis>-<session>-<owner>.ndjson`, the owner
-/// `none` or `u` and the account id in hex (any id, and no `-` in it).
-fn batch_name(millis: u128, session: &str, account: Option<&str>) -> String {
+/// A batch's name: `records-s<seq>-<session>-<owner>.ndjson`, `seq` its
+/// number in the queue's sequence (20 digits, so names sort as numbers), the
+/// owner `none` or `u` and the account id in hex (any id, and no `-` in it).
+/// Versions before 2026-11-25 wrote `records-<wall millis>-...` (13 digits,
+/// no `s`): those sort first, and every off clears them (see [`Written`]).
+fn batch_name(seq: u64, session: &str, account: Option<&str>) -> String {
     let owner = match account {
         None => "none".to_string(),
         Some(id) => format!("u{}", id.bytes().map(|b| format!("{b:02x}")).collect::<String>()),
     };
-    format!("records-{millis:013}-{session}-{owner}.ndjson")
+    format!("records-s{seq:020}-{session}-{owner}.ndjson")
 }
+
+/// Where a batch stands in the queue's sequence, from its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// At this number.
+    At(u64),
+    /// Named by the wall time of a version before sequence numbers, or by
+    /// nothing that can be read: before any off written down now, so every
+    /// off clears it.
+    BeforeAnyMark,
+}
+
+fn written(path: &std::path::Path) -> Written {
+    let seq = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("records-s")?.split('-').next()?.parse::<u64>().ok());
+    seq.map_or(Written::BeforeAnyMark, Written::At)
+}
+
+/// The file beside the batches holding the last number the sequence gave.
+const SEQ_FILE: &str = "batch-seq";
 
 fn owner_of(path: &std::path::Path) -> Owner {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Owner::Unknown };
     let Some(stem) = name.strip_prefix("records-").and_then(|n| n.strip_suffix(".ndjson")) else { return Owner::Unknown };
     let parts: Vec<&str> = stem.split('-').collect();
-    let [_millis, _session, owner] = parts.as_slice() else { return Owner::Unknown };
+    let [_seq, _session, owner] = parts.as_slice() else { return Owner::Unknown };
     if *owner == "none" {
         return Owner::NoOne;
     }
@@ -248,16 +272,39 @@ impl Queue {
         id
     }
 
-    /// Write `lines` as one batch of `account`'s records (`None`: recorded
-    /// while no one was signed in), taken at `millis` by `session`.
-    pub async fn append(&self, lines: &[String], millis: u128, session: &str, account: Option<&str>) -> io::Result<()> {
+    /// The last number the queue's sequence gave, in this session or any
+    /// before it: the one kept, or the highest a batch or an off written
+    /// down names, whichever is greater (a number given and not yet kept, by
+    /// a session that ended, is still never given twice while its batch is
+    /// there); 0 for a queue that has never had one.
+    pub async fn last_seq(&self) -> u64 {
+        let kept = self.disk.read_to_string(self.dir.join(SEQ_FILE)).await.ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        let waiting = self.waiting().await;
+        let batches = waiting.iter().filter_map(|p| match written(p) {
+            Written::At(seq) => Some(seq),
+            Written::BeforeAnyMark => None,
+        });
+        let marks = self.clear_marks().await.into_iter().map(|(_, through)| through).filter(|through| *through != u64::MAX);
+        batches.chain(marks).fold(kept, u64::max)
+    }
+
+    /// Keep `seq` as the last number the sequence gave, before any batch is
+    /// named by it.
+    pub async fn keep_seq(&self, seq: u64) -> io::Result<()> {
+        self.disk.create_dir_all(&self.dir).await?;
+        self.disk.write(self.dir.join(SEQ_FILE), seq.to_string().as_bytes()).await
+    }
+
+    /// Write `lines` as batch `seq` of `account`'s records (`None`: recorded
+    /// while no one was signed in), taken by `session`.
+    pub async fn append(&self, lines: &[String], seq: u64, session: &str, account: Option<&str>) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
         self.disk.create_dir_all(&self.dir).await?;
         let mut text = lines.join("\n");
         text.push('\n');
-        self.disk.write(self.dir.join(batch_name(millis, session, account)), text).await
+        self.disk.write(self.dir.join(batch_name(seq, session, account)), text).await
     }
 
     /// The waiting batches, whoever's, oldest first.
@@ -338,36 +385,47 @@ impl Queue {
         }
     }
 
-    /// An off said at `millis`, written down before its clear has run, so
-    /// that the clear is owed by whichever session opens this queue next
-    /// (`tag` makes the name this off's own). Outside the `records-*` names.
-    pub async fn mark_cleared_before(&self, millis: u128, tag: &str) -> io::Result<()> {
+    /// An off said once the sequence had given `through`, written down
+    /// before its clear has run, so that the clear is owed by whichever
+    /// session opens this queue next (`tag` makes the name this off's own).
+    /// Outside the `records-*` names.
+    pub async fn mark_cleared_through(&self, through: u64, tag: &str) -> io::Result<()> {
         self.disk.create_dir_all(&self.dir).await?;
-        self.disk.write(self.dir.join(format!("{CLEAR_MARK}{millis:013}-{tag}")), b"").await
+        self.disk.write(self.dir.join(format!("{CLEAR_MARK}{through:020}-{tag}")), b"").await
     }
 
     /// The offs written down and not yet cleared for: each mark's path and
-    /// its time.
-    pub async fn clear_marks(&self) -> Vec<(PathBuf, u128)> {
+    /// the last batch number it clears. A mark whose number cannot be read,
+    /// and one a version before sequence numbers wrote (`clear-before-<wall
+    /// millis>`), ask for everything ([`u64::MAX`]).
+    pub async fn clear_marks(&self) -> Vec<(PathBuf, u64)> {
         let Ok(entries) = self.disk.list(&self.dir).await else { return Vec::new() };
         entries
             .into_iter()
             .filter(|e| !e.is_dir)
             .filter_map(|e| {
-                let millis = e.name()?.strip_prefix(CLEAR_MARK)?.split('-').next()?.parse::<u128>().ok();
-                // A mark whose time cannot be read asks for everything.
-                Some((e.path.clone(), millis.unwrap_or(u128::MAX)))
+                let name = e.name()?;
+                let through = match name.strip_prefix(CLEAR_MARK) {
+                    Some(rest) => rest.split('-').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX),
+                    None if name.starts_with(LEGACY_CLEAR_MARK) => u64::MAX,
+                    None => return None,
+                };
+                Some((e.path.clone(), through))
             })
             .collect()
     }
 
-    /// Every batch written at or before `millis` goes (one whose name gives
-    /// no time goes too); whether all of them did.
-    pub async fn clear_through(&self, millis: u128) -> bool {
+    /// Every batch numbered `through` or lower goes, and every batch named
+    /// before sequence numbers or by nothing readable; whether all of them
+    /// did.
+    pub async fn clear_through(&self, through: u64) -> bool {
         let mut all = true;
         for path in self.waiting().await {
-            let written = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("records-")?.split('-').next()?.parse::<u128>().ok());
-            if written.is_none_or(|written| written <= millis) && self.disk.remove_file(&path).await.is_err() {
+            let before = match written(&path) {
+                Written::At(seq) => seq <= through,
+                Written::BeforeAnyMark => true,
+            };
+            if before && self.disk.remove_file(&path).await.is_err() {
                 all = false;
             }
         }
@@ -375,8 +433,10 @@ impl Queue {
     }
 }
 
-/// The name an off written down starts with: `clear-before-<millis>-<tag>`.
-const CLEAR_MARK: &str = "clear-before-";
+/// The name an off written down starts with: `clear-through-<seq>-<tag>`.
+const CLEAR_MARK: &str = "clear-through-";
+/// What versions before 2026-11-25 named one: `clear-before-<wall millis>-<tag>`.
+const LEGACY_CLEAR_MARK: &str = "clear-before-";
 
 /// Send one report's `body` to the accounts service at `service` as the
 /// account `bearer` holds: the report's code, or a sentence.

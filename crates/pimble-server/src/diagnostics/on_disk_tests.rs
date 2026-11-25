@@ -193,11 +193,54 @@ async fn the_queue_drops_the_oldest_past_its_cap_and_clears() {
     }
     queue.cap(250).await;
     let left: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
-    assert_eq!(left, ["records-0000000000003-s-none.ndjson", "records-0000000000004-s-none.ndjson"]);
+    assert_eq!(left, ["records-s00000000000000000003-s-none.ndjson", "records-s00000000000000000004-s-none.ndjson"]);
     let install = queue.install(None).await;
     queue.clear().await;
     assert!(queue.waiting().await.is_empty());
     assert_eq!(queue.install(None).await, install, "clearing keeps the install number");
+}
+
+#[tokio::test]
+async fn the_sequence_only_grows_and_an_off_clears_through_its_number() {
+    let disk = Disk::memory();
+    let queue = Queue::new(disk.clone(), PathBuf::from("/d/diagnostics"));
+    assert_eq!(queue.last_seq().await, 0, "a new queue");
+    queue.keep_seq(4).await.unwrap();
+    assert_eq!(queue.last_seq().await, 4, "kept");
+    // A batch numbered past what was kept (its session ended between giving
+    // the number and keeping it, or keeping it failed) still counts.
+    queue.append(&["{}".into()], 7, "s", None).await.unwrap();
+    assert_eq!(queue.last_seq().await, 7);
+    queue.mark_cleared_through(9, "t-1").await.unwrap();
+    assert_eq!(queue.last_seq().await, 9, "and so does an off written down");
+    queue.append(&["{}".into()], 10, "s", None).await.unwrap();
+    assert_eq!(queue.clear_marks().await.iter().map(|(_, through)| *through).collect::<Vec<_>>(), [9]);
+    assert!(queue.clear_through(9).await);
+    let left: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, ["records-s00000000000000000010-s-none.ndjson"], "only the batch numbered after the off");
+}
+
+/// Batches and offs written by a version that named them by wall time are
+/// before any off written now: every off clears them, and an old off clears
+/// everything.
+#[tokio::test]
+async fn batches_and_offs_named_by_wall_time_are_before_any_mark() {
+    let disk = Disk::memory();
+    let dir = PathBuf::from("/d/diagnostics");
+    let queue = Queue::new(disk.clone(), dir.clone());
+    // A wall time far past any sequence number this queue will reach.
+    disk.create_dir_all(&dir).await.unwrap();
+    disk.write(dir.join("records-9999999999999-old-none.ndjson"), "{\"old\":1}\n").await.unwrap();
+    queue.append(&["{}".into()], 1, "s", None).await.unwrap();
+    let names: Vec<String> = queue.waiting().await.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert_eq!(names[0], "records-9999999999999-old-none.ndjson", "the old batch is the oldest");
+    assert_eq!(queue.last_seq().await, 1, "an old name gives no number");
+    assert!(queue.clear_through(0).await);
+    assert_eq!(queue.waiting().await.len(), 1, "an off before every new batch still clears the old one");
+
+    disk.write(dir.join("clear-before-0000000000001-old-1"), "").await.unwrap();
+    assert_eq!(queue.clear_marks().await.iter().map(|(_, through)| *through).collect::<Vec<_>>(), [u64::MAX], "an old off asks for everything");
+    assert_eq!(queue.last_seq().await, 1, "and gives no number");
 }
 
 #[tokio::test]

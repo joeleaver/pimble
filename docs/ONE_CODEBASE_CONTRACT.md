@@ -1945,10 +1945,33 @@ its own step. The old path is not deleted yet.
   `attach` and `apply` delete every batch older than the newest mark (`clear_through`) and,
   once every one went, remove the marks they read; `pump` takes nothing while any mark exists.
   The in-memory counts keep their guarantees beside it. Tested by a worker ended between an
-  off and its clear: the next worker clears the batch before it sends anything. Residual: an
-  off said before the server has given the queue's folder (before `attach`) has nowhere to be
-  written; it is kept in memory (`unmarked_off`) and written down by `attach`, so a run closed
-  before `attach` loses it, but a run that never attached has sent nothing either.
+  off and its clear: the next worker clears the batch before it sends anything.
+- **Batches and offs are numbered, never timed** (2026-11-25, review of part 5). Naming both by
+  wall time let a clock that stepped back between a pump and an off name the off earlier than
+  a batch from before it, and a worker that ended before the clear left that batch to be sent.
+  Batches are now `records-s<seq>-<session>-<owner>.ndjson`, `seq` from the queue's own
+  sequence: kept in `batch-seq` beside them (`Queue::keep_seq`, written before any batch is
+  named by it) and read at `attach` as the greater of that and every number a batch or a mark
+  on the disk names (`Queue::last_seq`). A pump takes its numbers when it takes its records, so
+  an off's mark, `clear-through-<seq>-<session>-<offs>` naming the last number given
+  (`Queue::mark_cleared_through`), covers every batch from before it; `clear_through` deletes
+  the batches numbered at or below it. Nothing in the worker's queue reads the wall clock. A
+  batch named by a version before this (`records-<wall ms>-...`) sorts first and is before any
+  mark: every off clears it, and an old `clear-before-...` mark asks for everything. Tested
+  with the runtime's wall clock stepped back between two pumps and the off, and the worker ended
+  before the clear: the next worker deletes both batches, and the clock was never read.
+- **The page notes a clear it owes** (2026-11-25, review of part 5). An off said before the
+  server has given the queue's folder has nowhere to be written, so a worker that heard "off"
+  and "on" and ended before `attach` lost the off, and the next one sent what came before it.
+  Now saving "off" stores a tag beside the choice (`localStorage` `pimble.diagnostics`
+  `clear_owed`, through `pimble_core::diagnostics::SavedChoice`, which keeps the rules: an off
+  gives a new tag, an on keeps one owed, a confirmation drops only its own tag). The page sends
+  `setDiagnostics { clear_owed: true }` while one is noted; the worker counts it as an off at
+  once, waits for the folder, clears (`WorkerDiagnostics::clear_owed_by_the_page`) and answers
+  `{ cleared: true }`, and only then does the page drop its note. The desktop's server answers
+  `cleared: true` always (its off deletes at once). Tested by a restart after an off said
+  before the folder: with the note nothing from before the off is sent; the control without
+  it sends the earlier batch.
 - **A send is never waited for longer than 15 s** (`SEND_TIMEOUT`). The step is held across a
   request, and a browser's `fetch` has no timeout, so a stalled request delayed an off's clear
   for as long as it stalled. The pump's requests go through `pimble_host::http::Bounded`, which
@@ -1957,7 +1980,8 @@ its own step. The old path is not deleted yet.
   next send or the clear). Tested with a request that never answers and an off: the clear runs
   within the timeout and nothing more is sent.
 - **The choice stays the page's** (Settings > Diagnostics, `localStorage`): the page tells the
-  server `setDiagnostics { enabled, install }` at every connection and whenever it saves. The
+  server `setDiagnostics { enabled, install, clear_owed }` at every connection and whenever it
+  saves. The
   install number is the page's, so the page's records and the worker's share one
   (`Queue::install`: an offered valid id wins and is kept). Off clears the worker's queue.
 - **Send Diagnostics** in worker mode is `sendDiagnostics { note, stores, logs }`: the page hands

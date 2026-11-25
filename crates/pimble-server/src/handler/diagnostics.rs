@@ -13,18 +13,21 @@ use super::RpcHandler;
 impl RpcHandler {
     /// On or off. On the desktop the saved choice (keeping whether the notice
     /// was shown): off deletes what waits at once, on starts recording the
-    /// next time a program starts. In a worker, from now on.
-    pub(super) async fn diagnostics_set(&self, request: SetDiagnosticsRequest) -> Result<(), ErrorObjectOwned> {
+    /// next time a program starts. In a worker, from now on, after any clear
+    /// the page says is owed. Whether every owed clear has run: on the
+    /// desktop, where an off deletes at once and no client keeps a note, it
+    /// always has.
+    pub(super) async fn diagnostics_set(&self, request: SetDiagnosticsRequest) -> Result<bool, ErrorObjectOwned> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = request.install;
+            let _ = (request.install, request.clear_owed);
             let settings = crate::diagnostics::Settings { enabled: request.enabled, ..crate::diagnostics::settings() };
-            self.runtime().run_heavy(move || crate::diagnostics::save_settings(&settings)).await.map_err(to_rpc_error)?.map_err(to_rpc_error)
+            self.runtime().run_heavy(move || crate::diagnostics::save_settings(&settings)).await.map_err(to_rpc_error)?.map_err(to_rpc_error)?;
+            Ok(true)
         }
         #[cfg(target_arch = "wasm32")]
         {
-            crate::diagnostics::configure(self, request.enabled, request.install).await;
-            Ok(())
+            Ok(crate::diagnostics::configure(self, request.enabled, request.install, request.clear_owed).await)
         }
     }
 

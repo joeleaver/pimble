@@ -1,14 +1,19 @@
 //! The seams the worker core's tests drive it through: Pimble Cloud's records
-//! endpoint, which can hold a request, and a disk that can hold a batch's
-//! write, so that a test can say "off" (and "on") at exactly those moments.
+//! endpoint, which can hold a request, a disk that can hold a batch's write,
+//! so that a test can say "off" (and "on") at exactly those moments, and a
+//! runtime whose wall clock the test sets (and steps back).
 
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use std::sync::atomic::AtomicUsize;
+use std::time::{Duration, SystemTime};
+
 use pimble_host::http::{Http, HttpError, HttpRequest, HttpResponse};
-use pimble_host::{Disk, DiskBackend, DiskKind, Entry, Metadata};
+use pimble_host::runtime::{BoxFuture, HeavyJob, SleepFuture, TokioRuntime};
+use pimble_host::{Disk, DiskBackend, DiskKind, Entry, Instant, Metadata, RuntimeBackend, Task};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -155,5 +160,45 @@ impl DiskBackend for &'static HeldDisk {
     }
     async fn remove_dir_all(&self, p: &Path) -> io::Result<()> {
         self.below.remove_dir_all(p).await
+    }
+}
+
+/// The host's runtime with a wall clock the test sets: it reads what
+/// [`SetClock::set`] last said, and counts how often it was read.
+#[derive(Debug, Default)]
+pub struct SetClock {
+    millis: AtomicUsize,
+    reads: AtomicUsize,
+}
+
+impl SetClock {
+    /// The wall clock reads `millis` after the epoch from now on.
+    pub fn set(&self, millis: usize) {
+        self.millis.store(millis, Ordering::SeqCst);
+    }
+
+    /// How often the wall clock was read.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+/// A `&'static SetClock` is the backend, so the test keeps its handle.
+impl RuntimeBackend for &'static SetClock {
+    fn spawn(&self, task: BoxFuture<()>) -> Task {
+        TokioRuntime.spawn(task)
+    }
+    fn spawn_heavy(&self, job: HeavyJob) {
+        TokioRuntime.spawn_heavy(job)
+    }
+    fn sleep_until(&self, deadline: Instant) -> SleepFuture {
+        TokioRuntime.sleep_until(deadline)
+    }
+    fn now(&self) -> Instant {
+        TokioRuntime.now()
+    }
+    fn wall(&self) -> SystemTime {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        SystemTime::UNIX_EPOCH + Duration::from_millis(self.millis.load(Ordering::SeqCst) as u64)
     }
 }

@@ -79,13 +79,18 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
     }
 }
 
-/// What the page says (`setDiagnostics`): on or off, and its install number.
-/// Off drops what waits, in memory at once and on the disk once no pump is
-/// running; a say that comes before the server has started is applied when
-/// it starts.
-pub async fn configure(handler: &RpcHandler, enabled: bool, install: Option<String>) {
-    let applied = diagnostics().configure(handler.disk(), enabled, install, wall_millis(handler)).await;
-    said(applied);
+/// What the page says (`setDiagnostics`): on or off, its install number, and
+/// whether it holds a clear no worker has confirmed (`clear_owed`). Off drops
+/// what waits, in memory at once and on the disk once no pump is running; a
+/// say that comes before the server has started is applied when it starts.
+/// Whether every clear the page said was owed has run (always, when it said
+/// none), for the page to drop its note.
+pub async fn configure(handler: &RpcHandler, enabled: bool, install: Option<String>, clear_owed: bool) -> bool {
+    // The owed clear first: it is counted before the say is applied, so no
+    // pump can send between them.
+    let cleared = !clear_owed || diagnostics().clear_owed_by_the_page(handler.disk()).await;
+    said(diagnostics().configure(handler.disk(), enabled, install).await);
+    cleared
 }
 
 fn said(applied: Applied) {
@@ -107,17 +112,11 @@ pub async fn run(handler: RpcHandler, dir: PathBuf) {
     }
 }
 
-/// The wall time now, in the milliseconds batches and offs are named by.
-fn wall_millis(handler: &RpcHandler) -> u128 {
-    handler.runtime().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
-}
-
 /// One pump as the signed-in account, if one is and its session holds.
 async fn pump(handler: &RpcHandler) {
-    let millis = wall_millis(handler);
     let account = handler.keystore().account().await.filter(|_| !handler.keystore().session_expired());
     let send_as = account.as_ref().map(|a| SendAs { url: &a.url, session: &a.session, user_id: &a.user_id });
-    diagnostics().pump(handler.disk(), handler.http(), handler.runtime(), send_as, millis).await;
+    diagnostics().pump(handler.disk(), handler.http(), handler.runtime(), send_as).await;
 }
 
 /// Help > "Send Diagnostics...": the page's `logs`, this worker's recent log,

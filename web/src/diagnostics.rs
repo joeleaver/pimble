@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 
-use pimble_core::diagnostics::{is_info_target, random_hex, report_code, timestamp, valid_install, Envelope, LogBudget, Scrubber, Severity};
+use pimble_core::diagnostics::{is_info_target, random_hex, report_code, timestamp, valid_install, Envelope, LogBudget, SavedChoice, Scrubber, Severity};
 use serde_json::{json, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -53,19 +53,36 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
+/// The saved choice, with the clear it owes (`SavedChoice`).
+fn saved_choice() -> SavedChoice {
+    SavedChoice::parse(storage().and_then(|s| s.get_item(SETTINGS_KEY).ok().flatten()).as_deref())
+}
+
 /// The saved choice: on, never told, when nothing is saved.
 pub fn settings() -> (bool, bool) {
-    let saved: Option<Value> = storage().and_then(|s| s.get_item(SETTINGS_KEY).ok().flatten()).and_then(|t| serde_json::from_str(&t).ok());
-    match saved {
-        Some(v) => (v["enabled"].as_bool().unwrap_or(true), v["noticed"].as_bool().unwrap_or(false)),
-        None => (true, false),
+    let choice = saved_choice();
+    (choice.enabled, choice.noticed)
+}
+
+/// The tag of an off whose clear no server has confirmed yet, which every
+/// worker this page connects to hears (`setDiagnostics` `clear_owed`).
+pub fn clear_owed() -> Option<String> {
+    saved_choice().clear_owed
+}
+
+/// The server confirmed the clear owed under `tag`; a later off's stays.
+pub fn clear_confirmed(tag: &str) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(SETTINGS_KEY, &saved_choice().confirmed(tag).to_json());
     }
 }
 
-/// Save the choice; off deletes what waits and stops recording.
+/// Save the choice; off deletes what waits and stops recording, and notes
+/// the clear it owes the server's queue beside the choice.
 pub fn save_settings(enabled: bool, noticed: bool) -> Result<(), String> {
     let s = storage().ok_or_else(|| "this browser keeps no settings for the page".to_string())?;
-    s.set_item(SETTINGS_KEY, &json!({ "enabled": enabled, "noticed": noticed }).to_string()).map_err(|_| "the setting could not be saved".to_string())?;
+    let choice = saved_choice().saved(enabled, noticed, || random_hex(8));
+    s.set_item(SETTINGS_KEY, &choice.to_json()).map_err(|_| "the setting could not be saved".to_string())?;
     if !enabled {
         let _ = s.remove_item(QUEUE_KEY);
         STATE.with(|st| {

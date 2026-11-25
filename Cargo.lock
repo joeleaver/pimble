@@ -5343,6 +5343,7 @@ dependencies = [
  "hmac",
  "p256",
  "pimble-client",
+ "pimble-cloud",
  "pimble-core",
  "pimble-crypto",
  "pimble-rpc",

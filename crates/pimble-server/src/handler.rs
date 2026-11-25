@@ -4207,10 +4207,10 @@ impl PimbleApiServer for RpcHandler {
         Ok(EmptyResponse {})
     }
 
-    async fn set_diagnostics(&self, ext: &Extensions, request: pimble_rpc::SetDiagnosticsRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+    async fn set_diagnostics(&self, ext: &Extensions, request: pimble_rpc::SetDiagnosticsRequest) -> Result<pimble_rpc::SetDiagnosticsResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "setDiagnostics")?;
-        self.diagnostics_set(request).await?;
-        Ok(EmptyResponse {})
+        let cleared = self.diagnostics_set(request).await?;
+        Ok(pimble_rpc::SetDiagnosticsResponse { cleared })
     }
 
     async fn send_diagnostics(&self, ext: &Extensions, request: pimble_rpc::SendDiagnosticsRequest) -> Result<pimble_rpc::SendDiagnosticsResponse, ErrorObjectOwned> {

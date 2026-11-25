@@ -21,6 +21,7 @@ use super::stores::{
     is_store_owner, normalize_root, owner_count, require_live_store, require_owner, require_role_for_scope, root_view, stored_name, ScopeQuery, LAST_OWNER_ERROR,
     NO_SHARE_NAME, ROLES, UNNAMED_SHARE, WHOLE_STORE,
 };
+use crate::checkpoints::Checkpoint;
 use crate::db::{GrantRow, HostedStoreRow, UserRow};
 use crate::error::{CloudError, CloudResult};
 use crate::mail::{invitation_email, shared_with_you_email};
@@ -392,8 +393,12 @@ async fn grant_member(
             // can be that owner. The count is read under the store's lock,
             // after `existing`, so two owners demoting each other at once
             // cannot both count two.
-            if existing.role == "owner" && role != "owner" && owner_count(state, store.rid).await? <= 1 {
-                return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+            if existing.role == "owner" && role != "owner" {
+                let owners = owner_count(state, store.rid).await?;
+                state.checkpoints.reach(Checkpoint::OwnersCounted).await;
+                if owners <= 1 {
+                    return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+                }
             }
             state.db.update_grant_role(existing.rid, role).await?;
         }
@@ -531,8 +536,12 @@ pub async fn delete_member(
         .await?
         .ok_or_else(|| CloudError::NotFound("no such member".to_string()))?;
 
-    if grant.role == "owner" && grant.is_whole_store() && owner_count(&state, store.rid).await? <= 1 {
-        return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+    if grant.role == "owner" && grant.is_whole_store() {
+        let owners = owner_count(&state, store.rid).await?;
+        state.checkpoints.reach(Checkpoint::OwnersCounted).await;
+        if owners <= 1 {
+            return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+        }
     }
     // The envelopes for this scope go with the grant: the service stops
     // handing this account that key. What they already decrypted is theirs —

@@ -86,7 +86,15 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 bytes = "1"
 
+[features]
+# `checkpoints::Checkpoints::hold` and `KeyedLocks::waiting`: places a test
+# can hold a request so two requests' race overlaps by construction. Only this
+# crate's own tests turn it on (the dev-dependency on itself below); no build
+# that ships has it.
+test-hooks = []
+
 [dev-dependencies]
+pimble-cloud = { path = ".", features = ["test-hooks"] }
 pimble-server = { workspace = true }
 # Paused time, for the loop that follows the hosted server's writes
 # (`watches::tests`).
