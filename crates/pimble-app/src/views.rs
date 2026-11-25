@@ -24,7 +24,8 @@ const MAX_EXPANDED: usize = 5000;
 const SAVE_AFTER_MS: u32 = 1000;
 
 /// A text node's place: sticky positions (rinch's opaque bytes) for the
-/// selection and the first line in view.
+/// selection and the first line in view, and whether the view showed the
+/// note from its very start.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TextPlace {
     #[serde(with = "b64")]
@@ -33,6 +34,13 @@ pub(crate) struct TextPlace {
     pub head: Vec<u8>,
     #[serde(default, with = "b64_opt", skip_serializing_if = "Option::is_none")]
     pub top: Option<Vec<u8>>,
+    /// The view showed the note from its start (scrolled to the top): it
+    /// opens at the start again, showing whatever was added above the line
+    /// that was first then (another device's or an agent's new section at
+    /// the top of a note read newest first). `top` alone sticks to that
+    /// line, and a section put above it would open just out of view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_start: bool,
     /// When it was written, in this device's own count.
     #[serde(default)]
     at: u64,
@@ -40,7 +48,12 @@ pub(crate) struct TextPlace {
 
 impl TextPlace {
     pub(crate) fn new(anchor: Vec<u8>, head: Vec<u8>, top: Option<Vec<u8>>) -> Self {
-        Self { anchor, head, top, at: 0 }
+        Self { anchor, head, top, at_start: false, at: 0 }
+    }
+
+    /// The same place, its view at the note's start or not.
+    pub(crate) fn at_start(self, at_start: bool) -> Self {
+        Self { at_start, ..self }
     }
 }
 
@@ -150,10 +163,13 @@ impl Views {
 
     fn set_place(&mut self, key: String, mut place: TextPlace) -> bool {
         if let Some(old) = self.places.get(&key) {
+            // A place written with the text off screen says nothing of the
+            // view: the one kept stands.
             if place.top.is_none() {
                 place.top = old.top.clone();
+                place.at_start = old.at_start;
             }
-            if (&old.anchor, &old.head, &old.top) == (&place.anchor, &place.head, &place.top) {
+            if (&old.anchor, &old.head, &old.top, old.at_start) == (&place.anchor, &place.head, &place.top, place.at_start) {
                 return false;
             }
         }
@@ -386,6 +402,22 @@ mod tests {
         assert!(!v.set_place("s/n".into(), TextPlace::new(vec![1], vec![1], None)), "the same place is no change");
         assert!(v.set_place("s/n".into(), TextPlace::new(vec![2], vec![2], None)));
         assert_eq!(v.places["s/n"].top, Some(vec![9]));
+    }
+
+    /// A note left at its top opens at its top; a place written while the
+    /// text was off screen keeps that, and leaving it scrolled down ends it.
+    #[test]
+    fn a_place_at_the_start_of_the_note_is_kept_with_its_first_line() {
+        let mut v = Views::default();
+        assert!(v.set_place("s/n".into(), TextPlace::new(vec![1], vec![1], Some(vec![9])).at_start(true)));
+        assert!(!v.set_place("s/n".into(), TextPlace::new(vec![1], vec![1], None)), "the same place is no change");
+        assert!(v.places["s/n"].at_start);
+        assert!(v.set_place("s/n".into(), TextPlace::new(vec![1], vec![1], Some(vec![9]))), "scrolled down from the start is a change");
+        assert!(!v.places["s/n"].at_start);
+        let json = serde_json::to_string(&v.places["s/n"]).unwrap();
+        assert!(!json.contains("at_start"), "false is not written: {json}");
+        let read: TextPlace = serde_json::from_str(&serde_json::to_string(&TextPlace::new(vec![1], vec![1], None).at_start(true)).unwrap()).unwrap();
+        assert!(read.at_start);
     }
 
     #[test]

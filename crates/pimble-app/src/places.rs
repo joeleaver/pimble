@@ -1,5 +1,6 @@
 //! Your place in every text node (docs/DISCUSSIONS_CONTRACT.md section 8b):
-//! the selection and the first line in view as sticky positions, kept on
+//! the selection and the first line in view as sticky positions (or "the
+//! start", for a note left scrolled to its top), kept on
 //! this device (`views.rs`), written when a pane leaves a note, when the
 //! window closes and after about five seconds without a caret move or a
 //! scroll; put back when the note opens again and nothing else (a deep link,
@@ -42,7 +43,9 @@ pub(crate) fn remember(store: AppStore, pane: PaneId, store_id: StoreId, node_id
         .then(|| crate::presence::text::viewport_top(pane, &handle))
         .flatten()
         .and_then(|pos| handle.collab_sticky_index_with(Pos(pos), StickyAssoc::After));
-    crate::views::set_place(store_id, node_id, crate::views::TextPlace::new(anchor, head, top));
+    // Left at its top, it opens at its top, whatever was added above.
+    let at_start = top.is_some() && crate::presence::text::shows_start(pane, &handle) == Some(true);
+    crate::views::set_place(store_id, node_id, crate::views::TextPlace::new(anchor, head, top).at_start(at_start));
 }
 
 /// Remember the place of every pane holding a note (the window is closing).
@@ -90,10 +93,84 @@ pub(crate) fn restore(pane: PaneId, store_id: StoreId, node_id: NodeId) {
                 rinch_editor_core::selection::Selection::text(anchor.pos, head.pos)
             };
             handle.set_selection(selection);
-            match place.top.as_deref().and_then(|top| handle.collab_locate_sticky(top)) {
-                Some(top) => handle.scroll_into_view_aligned(top.pos, top.pos, crate::rinch_editor::ScrollAlign::Fraction(0.0)),
+            match view_top(&handle, &place) {
+                Some(top) => handle.scroll_into_view_aligned(Pos(top), Pos(top), crate::rinch_editor::ScrollAlign::Fraction(0.0)),
                 None => handle.scroll_into_view_aligned(head.pos, head.pos, crate::rinch_editor::ScrollAlign::Fraction(1.0 / 3.0)),
             }
         })
     });
+}
+
+/// The position a restored view puts at its top: the note's start when it
+/// was left at its start (so what was added above the line first in view
+/// then shows), else that line where it is now; `None` when neither can be
+/// found (the caret is shown instead).
+fn view_top(handle: &crate::rinch_editor::EditorHandle, place: &crate::views::TextPlace) -> Option<usize> {
+    if place.at_start {
+        if let Some(first) = crate::presence::text::first_textblock(handle) {
+            return Some(first);
+        }
+    }
+    place.top.as_deref().and_then(|top| handle.collab_locate_sticky(top)).map(|top| top.pos.0)
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::views::TextPlace;
+    use pimble_crdt::NodeDoc;
+
+    /// A note read newest first, left at its top: an agent puts a new
+    /// section above the first heading while the note is closed, and the
+    /// note opens on that section, not on the heading that was first.
+    #[test]
+    fn a_note_left_at_its_start_opens_at_its_start_after_a_section_is_put_above() {
+        let pane = PaneId::ALL[3];
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        let mut agent = NodeDoc::new();
+        agent.append_markdown("### Tuesday\n\nWhat happened on Tuesday.\n\n### Monday\n\nWhat happened on Monday.").unwrap();
+        let store = AppStore::new();
+        let (cmd_tx, _commands) = crossbeam_channel::bounded::<crate::protocol::BackendCommand>(256);
+        let (_events, event_rx) = crossbeam_channel::bounded::<crate::protocol::BackendEvent>(1);
+        store.backend.set(Some(crate::protocol::BackendHandle { cmd_tx, event_rx }));
+        crate::editor::start_editing(store, pane, store_id, node_id, &agent.save());
+        let handle = crate::editor::editor(pane);
+        let first = crate::presence::text::first_textblock(&handle).unwrap();
+        let top = handle.collab_sticky_index_with(Pos(first), StickyAssoc::After).unwrap();
+        let left_at_start = TextPlace::new(top.clone(), top.clone(), Some(top.clone())).at_start(true);
+        let left_scrolled = TextPlace::new(top.clone(), top.clone(), Some(top));
+
+        let added = agent
+            .edit_markdown(pimble_crdt::markdown::MarkdownEdit::ReplaceBlock {
+                block: pimble_crdt::markdown::BlockTarget::Index { index: 0, expect: None },
+                markdown: "### Wednesday\n\nWhat happened on Wednesday.\n\n### Tuesday",
+            })
+            .unwrap()
+            .0;
+        assert!(handle.collab_receive(&added));
+        // The text of the textblock that starts at `at`.
+        let text_at = |at: usize| {
+            fn collect(n: &rinch_editor_core::Node, out: &mut String) {
+                match n.text() {
+                    Some(t) => out.push_str(t),
+                    None => (0..n.child_count()).for_each(|i| collect(n.child(i), out)),
+                }
+            }
+            let doc = handle.doc();
+            let mut found = String::new();
+            doc.nodes_between(0, doc.content_size(), &mut |node, pos, _| {
+                if node.is_textblock() {
+                    if pos + 1 == at {
+                        collect(node, &mut found);
+                    }
+                    return false;
+                }
+                true
+            });
+            found
+        };
+        assert_eq!(text_at(view_top(&handle, &left_at_start).unwrap()), "Wednesday", "the new section is in view");
+        assert_eq!(text_at(view_top(&handle, &left_scrolled).unwrap()), "Tuesday", "a line further down stays the line it was");
+        crate::editor::stop_editing(store, pane);
+    }
 }
