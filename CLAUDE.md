@@ -273,6 +273,14 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   the scope as data, less rules, hard breaks and images (nothing builds those from outside
   yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
   tables arrive as tables). The toolbar has a quote button and table buttons.
+- Markdown input shortcuts (`# `, `- `, `1. `, `> `, a code fence, `**bold**`, ...) are
+  rinch's input rules less the task list (`markdown_shortcuts.rs`), and Ctrl+Shift+7 makes no
+  task list (`task_lists.rs` overrides the base keymap's `toggleTaskList` command).
+- Spellcheck (`spelling.rs`): rinch's, leaving code out; the system checker on the desktop
+  (Windows and macOS platform checkers, Linux Hunspell with the bundled `en_US` from
+  `assets/dictionaries/` as the fallback), the same `en_US` fetched in the browser. Added
+  words stay on the device (`<data dir>/pimble/dictionary.txt`, `localStorage`
+  `pimble.dictionary`) and never sync. rinch does not check a read-only editor.
 - Pictures (`crates/pimble-app/src/pictures.rs`, both targets): a paste, a drop and Edit >
   "Insert Image..." all end in `add_picture`, which sends `BackendCommand::PutBlob`
   (`pimble_image::fit`, then `putBlob`, beside the command loop) and inserts the image at
