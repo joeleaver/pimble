@@ -18,10 +18,15 @@ use crate::themes::preview::{Block, Cell, Inline, Run, Script, MAX_PLACED_COLUMN
 
 /// The page: the editor's element, in the app's scheme, holding `blocks`.
 pub(super) fn page(__scope: &mut RenderScope, store: AppStore, blocks: &[Block]) -> NodeHandle {
+    page_in(__scope, store.dark_mode, blocks)
+}
+
+/// The page in the scheme `dark` says (the theme editor's switch).
+pub(super) fn page_in(__scope: &mut RenderScope, dark: Signal<bool>, blocks: &[Block]) -> NodeHandle {
     let page = rsx! {
         div {
             "data-pm-editor": "",
-            "data-pm-theme": {move || if store.dark_mode.get() { "dark" } else { "light" }},
+            "data-pm-theme": {move || if dark.get() { "dark" } else { "light" }},
         }
     };
     for b in blocks {

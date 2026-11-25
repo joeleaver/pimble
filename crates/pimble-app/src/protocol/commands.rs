@@ -173,6 +173,8 @@ pub enum BackendCommand {
     /// (docs/THEMES_CONTRACT.md section 3.2). Answers `ThemeChainLoaded`,
     /// quietly: a node it cannot read ends the chain and says nothing.
     GetThemeChain { store_id: StoreId, node_id: NodeId },
+    /// A store's themes: listed, made, edited, copied in.
+    Themes(super::ThemeCommand),
     /// What the Properties panel shows of a node besides its own signal
     /// (docs/PROPERTIES_CONTRACT.md sections 4 and 5): where it lives and the
     /// tags its store uses. Answers `PropertiesLoaded`.
@@ -250,7 +252,9 @@ pub enum BackendCommand {
     // Search
     /// `purpose` says whose results these are, and comes back on
     /// `SearchResults`: the search box's or the link picker's.
-    Search { query: String, stores: Vec<StoreId>, limit: usize, purpose: SearchPurpose },
+    /// Hits of the internal kinds not `shown` are left out before `limit`
+    /// (docs/THEMES_CONTRACT.md section 3.1a).
+    Search { query: String, stores: Vec<StoreId>, limit: usize, shown: Vec<pimble_core::internal::InternalKind>, purpose: SearchPurpose },
     RebuildIndex { store_id: StoreId },
 
     // Replica sync (docs/history/HARDENING_CONTRACT.md "B: app") — routed through

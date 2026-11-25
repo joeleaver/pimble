@@ -48,6 +48,10 @@ fn push_children(store: AppStore, expanded: &HashSet<(StoreId, NodeId)>, store_i
     // Tracked, so children that arrive after the row opened are drawn.
     let Some(children) = store.children_of.with(|m| m.get(&(store_id, parent)).copied()) else { return };
     for (child_store, child) in children.get() {
+        // The explorer's own tree, so its hidden internal nodes stay hidden.
+        if store.hides_row(child_store, child) {
+            continue;
+        }
         let open = expanded.contains(&(child_store, child));
         out.push(Row { store: child_store, node: Some(child), depth, expanded: open });
         if open {

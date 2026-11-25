@@ -24,6 +24,7 @@ pub mod presence;
 pub mod recipes;
 pub mod router;
 pub mod split;
+pub mod themes;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod metanode;
@@ -44,6 +45,7 @@ pub use metanode::{Forest, ForestEntry, Judged, MetanodeEdit};
 pub use references::{LinksHere, RowsHere, ShownIn};
 pub use identity::Me;
 pub use names::label;
+pub use themes::StoreTheme;
 pub use pimble_core::plan;
 
 use pimble_core::{NodeId, PimbleUrl, StoreId};

@@ -169,8 +169,13 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
             })
         })
         .unwrap_or((None, None, None));
+    // An internal node shown (View > "Show Internal", docs/THEMES_CONTRACT.md
+    // section 3.1a) is dimmed and marked with its kind's icon.
+    let internal = if is_store_root { None } else { node_sig.and_then(|sig| sig.with(|n| pimble_core::internal::internal_kind(&n.node_type))) };
     let icon = if let Some(custom) = custom_icon {
         custom
+    } else if let Some(kind) = internal {
+        icon_by_name(kind.icon()).unwrap_or(TablerIcon::File)
     } else if is_store_root {
         TablerIcon::Database
     } else if is_mount {
@@ -453,6 +458,8 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
                         };
                         if dimmed {
                             format!("width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;{color}")
+                        } else if internal.is_some() {
+                            format!("opacity: 0.55;{color}")
                         } else {
                             color
                         }
@@ -480,11 +487,18 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
                         let color = color_css(&label_color);
                         if dimmed {
                             format!("cursor: default; opacity: 0.4;{color}")
+                        } else if internal.is_some() {
+                            format!("{base_label_style} opacity: 0.55;{color}")
                         } else {
                             format!("{base_label_style}{color}")
                         }
                     }
                 },
+                // A store row says how many internal nodes it hides.
+                title: {move || match parsed {
+                    Some((s_id, None)) => crate::state::hidden_count_text(store, s_id),
+                    _ => String::new(),
+                }},
 
                 // Reactive label text — subscribes to per-node/per-store signal
                 // (and, for a node under active local edit, `live_label`).

@@ -22,6 +22,8 @@ pub async fn change_events(api: &Pimble, change: Change, client_id: &str, last: 
             *last = None;
             let mut events = vec![BackendEvent::Resynced { store_id: store }];
             events.extend(shown(api, store, &pimble_api::Affected::documents(changed)).await);
+            // The app lists the themes again if it listed them
+            // (`events::themes_resynced`): what is held may not be whole now.
             events
         }
         Change::Rejudged { store, nodes } => shown(api, store, &pimble_api::Affected::rows(nodes)).await.into_iter().collect(),
@@ -36,8 +38,17 @@ pub async fn change_events(api: &Pimble, change: Change, client_id: &str, last: 
                 }
             }
             let affected = pimble_api::Affected::of(&c.kind);
+            let document = pimble_api::backend::document_of(&c.kind);
             events.push(BackendEvent::RemoteStoreChange { store_id: c.store, change_kind: c.kind, source_client_id: c.source });
             events.extend(shown(api, c.store, &affected).await);
+            // A theme node changed (its tokens, its name, made, deleted):
+            // the store's list of themes, read again from what is held, when
+            // they were listed (and so the store is held whole).
+            if let (Some(node), true) = (document, api.themes_at_hand(c.store)) {
+                if api.is_theme(pimble_api::Addr::new(c.store, node)).await {
+                    events.extend(super::themes::listed(api, c.store).await);
+                }
+            }
             events
         }
     }

@@ -93,7 +93,7 @@ fn schedule_search(store: AppStore, query: String) {
     let timeout = set_timeout(250, move || {
         SEARCH_DEBOUNCE.with(|slot| { slot.borrow_mut().take(); });
         let stores = untracked(|| store.store_ids.get());
-        store.send(BackendCommand::Search { query, stores, limit: 50, purpose: crate::protocol::SearchPurpose::Panel });
+        store.send(BackendCommand::Search { query, stores, limit: 50, shown: untracked(|| store.internal_kinds_shown()), purpose: crate::protocol::SearchPurpose::Panel });
     });
     SEARCH_DEBOUNCE.with(|slot| { *slot.borrow_mut() = Some(timeout); });
 }

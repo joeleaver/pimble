@@ -10,7 +10,7 @@ use crate::state::{display_label_from_node, parse_tree_value, AppStore};
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 pub(crate) fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() && !state.show_metanode.get() {
+    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() && !state.show_metanode.get() && !state.show_theme.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -66,6 +66,8 @@ pub(crate) fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> 
         TablerIcon::Messages
     } else if store.pane(pane).show_sheet.get() {
         TablerIcon::Table
+    } else if store.pane(pane).show_theme.get() {
+        TablerIcon::Palette
     } else if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() {
         TablerIcon::Chalkboard
     } else {

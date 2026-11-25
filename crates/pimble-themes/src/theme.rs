@@ -21,6 +21,14 @@ pub const DEFAULT: &str = "builtin:default";
 /// spaced before themes reads as (section 4).
 pub const DOCUMENT: &str = "builtin:document";
 
+/// The key a stored theme names its base under.
+pub const BASE: &str = "base";
+
+/// The key a copied theme records its original under
+/// (docs/THEMES_CONTRACT.md section 6): `{ "store", "node", "at" }`. It is
+/// provenance, not a token, and reading a theme passes over it.
+pub const COPIED_FROM: &str = "copied_from";
+
 /// The tokens a theme sets, by key, each checked.
 pub type Tokens = BTreeMap<&'static str, Value>;
 
@@ -45,7 +53,10 @@ impl Theme {
         let mut tokens = Tokens::new();
         let mut base = None;
         for (key, stored) in json {
-            if key == "base" {
+            if key == COPIED_FROM {
+                continue;
+            }
+            if key == BASE {
                 match stored.as_str() {
                     Some(text) if !text.is_empty() => base = Some(text.to_string()),
                     _ => refusals.push(Refusal {
@@ -84,7 +95,7 @@ impl Theme {
     pub fn to_json(&self) -> Map<String, Json> {
         let mut map = Map::new();
         if let Some(base) = &self.base {
-            map.insert("base".into(), Json::from(base.as_str()));
+            map.insert(BASE.into(), Json::from(base.as_str()));
         }
         for (key, value) in &self.tokens {
             let token: &Token = tokens::token_of(key).expect("a theme holds only checked tokens");
@@ -288,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_bad_value_is_left_out_and_said() {
-        let json = json!({ "base": "builtin:book", "body.size": "40px", "body.line_height": 1.5, "font.weird": 1 });
+        let json = json!({ "base": "builtin:book", "body.size": "40px", "body.line_height": 1.5, "font.weird": 1, "copied_from": { "store": "s", "node": "n", "at": "t" } });
         let (theme, refusals) = Theme::from_json("t1", "Mine", json.as_object().unwrap());
         assert_eq!(theme.base.as_deref(), Some("builtin:book"));
         assert_eq!(theme.tokens.len(), 1);

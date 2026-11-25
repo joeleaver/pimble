@@ -41,6 +41,11 @@ impl TreeView for AppView {
         Some(untracked(|| sig.with(|c| c.iter().map(|(_, n)| *n).collect())))
     }
 
+    fn internal_kind(&self, store_id: StoreId, node_id: NodeId) -> Option<pimble_core::internal::InternalKind> {
+        let sig = self.0.get_node_signal(store_id, node_id)?;
+        untracked(|| sig.with(|n| pimble_core::internal::internal_kind(&n.node_type)))
+    }
+
     fn is_mount(&self, store_id: StoreId, node_id: NodeId) -> bool {
         self.0.is_mount(store_id, node_id)
     }

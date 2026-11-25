@@ -206,3 +206,27 @@
     font-size: 12px;
     color: var(--rinch-color-dimmed);
 }
+/* A row with an "Edit" beside the name: the name takes the click that
+   applies, "Edit" opens the theme in the editor. */
+.pimble-theme-choice--row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: default;
+}
+.pimble-theme-choice__name {
+    flex: 1 1 auto;
+    min-width: 0;
+    cursor: pointer;
+}
+.pimble-theme-choice__edit {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.pimble-theme-choice__edit:hover {
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-option-hover);
+}

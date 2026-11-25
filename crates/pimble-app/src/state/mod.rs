@@ -32,6 +32,7 @@ use crate::protocol::BackendHandle;
 mod access;
 mod deleted;
 mod found;
+mod internal;
 mod mounts;
 mod nodes;
 mod pane_state;
@@ -48,6 +49,7 @@ mod test_fixtures;
 pub use access::RootsChange;
 pub use deleted::{deleted_row, deleted_row_meta, deleted_row_read_only, DeletedRow, readable_instant};
 pub use found::{first_found, Found, found_row, FoundRow};
+pub use internal::hidden_count_text;
 pub use mounts::{mount_is_dimmed, mount_label_suffix, mount_state_kind, MountInfo, MountStateKind, PendingMount};
 pub use nodes::SLOW_CHILDREN_MS;
 pub use pane_state::{ActiveEdit, PaneState};
@@ -227,6 +229,14 @@ pub struct AppStore {
     /// "Theme...", the Properties panel, docs/THEMES_CONTRACT.md section 9);
     /// `None` when closed.
     pub theme_picker_node: Signal<Option<(StoreId, NodeId)>>,
+    /// Every open store's theme nodes as last listed
+    /// (`BackendEvent::ThemesListed`): what a store's chains resolve through,
+    /// and the picker's "This store's themes" and "From other open stores".
+    pub store_themes: Signal<HashMap<StoreId, Vec<pimble_api::StoreTheme>>>,
+    /// Whether the explorer shows each internal kind, by
+    /// `InternalKind::index` (View > "Show Internal", each a check item),
+    /// remembered on this device (`views.rs`).
+    pub internal_shown: [Signal<bool>; pimble_core::internal::InternalKind::ALL.len()],
     pub appearance_icon_query: Signal<String>,
 
     /// The Properties panel (docs/PROPERTIES_CONTRACT.md): whether it is

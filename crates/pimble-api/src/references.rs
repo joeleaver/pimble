@@ -279,8 +279,11 @@ impl Pimble {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let addr = Addr::new(target.store, id);
-            if let Ok(node) = self.held_node(addr).await {
-                out.push(LinksHere { addr, node });
+            // An internal node (a theme's free text) is not listed among
+            // what links here (docs/THEMES_CONTRACT.md section 3.1a).
+            match self.held_node(addr).await {
+                Ok(node) if pimble_core::internal::internal_kind(&node.node_type).is_none() => out.push(LinksHere { addr, node }),
+                _ => {}
             }
         }
         out.sort_by_key(|l| label(&l.node).to_lowercase());

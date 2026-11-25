@@ -84,6 +84,7 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     let mut is_sheet = false;
     let mut is_discussion = false;
     let mut is_metanode = false;
+    let mut is_theme = false;
     let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
             let result = store.get_node_signal(s_id, n_id).map(|sig| {
@@ -101,17 +102,24 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                     // parent's child viewer (a kanban's column).
                     crate::metanodes::ask_for_parent(store, s_id, node);
                     let metanode = crate::metanodes::shows_as_metanode(store, s_id, node);
-                    (label, node.content.clone(), is_doc, board, sheet, discussion, metanode)
+                    let theme = node.node_type == pimble_core::node_types::THEME;
+                    (label, node.content.clone(), is_doc, board, sheet, discussion, metanode, theme)
                 })
             });
             match result {
                 // A metanode shows its outline whatever its type
                 // (docs/METANODES_CONTRACT.md section 1.4).
-                Some((label, _, _, _, _, _, true)) => {
+                Some((label, _, _, _, _, _, true, _)) => {
                     is_metanode = true;
                     (Some(label), None, false, Some((s_id, n_id)))
                 }
-                Some((label, content, is_doc, board, sheet, discussion, false)) => {
+                // A theme node opens in the theme editor
+                // (docs/THEMES_CONTRACT.md section 9).
+                Some((label, _, _, _, _, _, false, true)) => {
+                    is_theme = true;
+                    (Some(label), None, false, Some((s_id, n_id)))
+                }
+                Some((label, content, is_doc, board, sheet, discussion, false, false)) => {
                     is_board = board;
                     is_sheet = sheet;
                     is_discussion = discussion;
@@ -142,6 +150,16 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
     }
+
+    if is_theme {
+        if let Some((s_id, n_id)) = sel_ids {
+            super::start_theme_editor(store, pane, s_id, n_id);
+        }
+        store.editor_dirty.set(false);
+        return;
+    }
+    // Whatever theme the pane showed, it shows this instead.
+    super::stop_theme_editor(store, pane);
 
     if is_metanode {
         if let Some((s_id, n_id)) = sel_ids {

@@ -12,10 +12,7 @@ use crate::state::AppStore;
 /// The panel's "Theme" section.
 pub(super) fn render_theme(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let in_force = move || match shown(store) {
-        Some((s, n)) => {
-            let (in_force, walk) = crate::themes::resolve(store, s, n);
-            crate::themes::in_force_sentence(&in_force, &walk)
-        }
+        Some((s, n)) => crate::themes::sentence(store, s, n),
         None => String::new(),
     };
     rsx! {

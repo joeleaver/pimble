@@ -5,6 +5,8 @@
 //! chain (the node, then its ancestors, nearest first) and a [`ThemeSource`]
 //! that answers a theme by id.
 
+use std::collections::BTreeMap;
+
 use crate::theme::{self, Theme, Tokens};
 
 /// Answers a theme by id: the built-ins ([`Builtins`]), and from wave 2 a
@@ -23,6 +25,21 @@ impl ThemeSource for Builtins {
     }
 }
 
+/// One store's theme nodes in front of the built-ins (section 3.1): a theme
+/// node's id is its node id, and a base names a built-in or another theme
+/// node of the same store, never one elsewhere.
+#[derive(Debug, Clone, Copy)]
+pub struct WithStore<'a>(pub &'a [Theme]);
+
+impl ThemeSource for WithStore<'_> {
+    fn theme(&self, id: &str) -> Option<Theme> {
+        if id.starts_with(theme::BUILTIN_PREFIX) {
+            return theme::builtin(id);
+        }
+        self.0.iter().find(|theme| theme.id == id).cloned()
+    }
+}
+
 /// A theme with its bases folded in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Folded {
@@ -34,6 +51,10 @@ pub struct Folded {
     /// A base no source answers, where the chain stopped (it reads as
     /// Default from there).
     pub missing_base: Option<String>,
+    /// For each token in `tokens`, the theme of the chain that sets it: what
+    /// the theme editor says an inherited value comes from ("17px, from
+    /// Book").
+    pub from: BTreeMap<&'static str, String>,
 }
 
 /// Folds theme `id` and its bases. Bases chain to any depth; a cycle (only
@@ -69,15 +90,20 @@ pub fn fold(id: &str, source: &impl ThemeSource) -> Folded {
         }
     }
     let mut tokens = Tokens::new();
+    let mut from = BTreeMap::new();
     for theme in &walked {
         for (key, value) in &theme.tokens {
-            tokens.entry(key).or_insert(*value);
+            if !tokens.contains_key(key) {
+                tokens.insert(*key, *value);
+                from.insert(*key, theme.id.clone());
+            }
         }
     }
     Folded {
         tokens,
         chain: walked.into_iter().map(|theme| theme.id).collect(),
         missing_base,
+        from,
     }
 }
 
@@ -261,6 +287,9 @@ mod tests {
             "from Book"
         );
         assert_eq!(folded.missing_base, None);
+        assert_eq!(folded.from["body.size"], "mine");
+        assert_eq!(folded.from["page.measure"], "tweak");
+        assert_eq!(folded.from["paragraph.spacing"], "builtin:book");
     }
 
     #[test]

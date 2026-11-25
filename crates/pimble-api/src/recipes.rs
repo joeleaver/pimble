@@ -103,6 +103,16 @@ pub fn query_metanode(title: &str) -> NodeInit {
     }
 }
 
+/// A theme node named `name` (docs/THEMES_CONTRACT.md section 3.1), its
+/// `data.theme` holding `stored` (its base, the tokens it sets and, for a
+/// copy, where it came from) from the create on. Its icon is drawn at
+/// render time, like every internal kind's; nothing is stored for it.
+pub fn theme(name: &str, stored: &serde_json::Map<String, serde_json::Value>) -> Result<NodeInit, ApiError> {
+    let mut doc = NodeDoc::new();
+    doc.set_data(crate::themes::DATA_KEY, &serde_json::Value::Object(stored.clone()))?;
+    Ok(NodeInit { node_type: node_types::THEME.to_string(), title: name.to_string(), content: Some(doc.save()), custom: vec![explicit()] })
+}
+
 /// The first message of a discussion: who wrote it, when, and its body.
 pub struct FirstMessage<'a> {
     pub author: Option<&'a Author>,
@@ -165,6 +175,17 @@ mod tests {
         assert_eq!(spec.viewer, "kanban");
         assert_eq!(spec.source.depth(), 2);
         assert_eq!(doc.fields().unwrap().title, "Kanban");
+    }
+
+    #[test]
+    fn a_theme_holds_its_tokens_from_the_create() {
+        let stored = serde_json::json!({ "base": "builtin:book", "body.size": "17px" });
+        let init = theme("Mine", stored.as_object().unwrap()).unwrap();
+        assert_eq!(init.node_type, node_types::THEME);
+        let mut doc = NodeDoc::new();
+        doc.init(node_types::THEME, "Mine", None, "2026-11-25T00:00:00.000Z").unwrap();
+        doc.apply_update(init.content.as_deref().unwrap()).unwrap();
+        assert_eq!(crate::themes::stored_theme(&doc), *stored.as_object().unwrap());
     }
 
     #[test]

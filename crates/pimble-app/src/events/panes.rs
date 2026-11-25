@@ -68,6 +68,13 @@ pub(crate) fn open_in_panes(store: AppStore, store_id: StoreId, node: &Node) {
             state.show_board.set(true);
             crate::boards::start(store, pane, store_id, node_id, content_bytes);
         }
+        let already_theming = untracked(|| state.theme.get())
+            .is_some_and(|t| t.store_id == store_id && t.node_id == node_id);
+        if node.node_type == pimble_core::node_types::THEME && !already_theming {
+            // A theme node opens in the theme editor (docs/THEMES_CONTRACT.md
+            // section 9): a link to one, or a pane's theme at start.
+            crate::app::start_theme_editor(store, pane, store_id, node_id);
+        }
         if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
             // `open_node` could not tell this was a document (a search hit
             // the tree had not loaded), so the pane is still hidden: show

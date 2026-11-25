@@ -15,6 +15,7 @@ struct Mem {
     mounts: HashMap<(StoreId, NodeId), Option<(StoreId, NodeId)>>,
     shared: HashSet<(StoreId, NodeId)>,
     access: HashMap<(StoreId, NodeId), StoreAccess>,
+    internal: HashMap<(StoreId, NodeId), crate::internal::InternalKind>,
 }
 
 impl TreeView for Mem {
@@ -26,6 +27,9 @@ impl TreeView for Mem {
     }
     fn children(&self, store: StoreId, node: NodeId) -> Option<Vec<NodeId>> {
         self.children.get(&(store, node)).cloned()
+    }
+    fn internal_kind(&self, store: StoreId, node: NodeId) -> Option<crate::internal::InternalKind> {
+        self.internal.get(&(store, node)).copied()
     }
     fn is_mount(&self, store: StoreId, node: NodeId) -> bool {
         self.mounts.contains_key(&(store, node))
@@ -199,6 +203,20 @@ fn a_mount_is_its_source_and_refused_when_that_is_not_here() {
     // A mount whose target is not known yet is as far out of reach.
     f.view.mounts.insert((f.s, mount), None);
     assert_eq!(create_parent(&f.view, f.s, Some(mount)), Err(Refusal::MountNotHere));
+}
+
+/// An internal node holds nothing: nothing is made in it or moved into it,
+/// so a hidden theme never hides anything but itself.
+#[test]
+fn nothing_goes_inside_an_internal_node() {
+    use crate::internal::InternalKind;
+    let mut f = family();
+    f.view.internal.insert((f.s, f.vet), InternalKind::Theme);
+    let refusal = Refusal::IntoInternal(InternalKind::Theme);
+    assert_eq!(plan_move(&f.view, &[(f.s, f.boo)], (f.s, Some(f.vet)), Place::Last), Err(refusal));
+    assert_eq!(create_parent(&f.view, f.s, Some(f.vet)), Err(refusal));
+    assert_eq!(refusal.sentence(), "Nothing goes inside a theme.");
+    assert!(plan_move(&f.view, &[(f.s, f.vet)], (f.s, Some(f.boo)), Place::Last).is_ok(), "the theme itself moves");
 }
 
 #[test]

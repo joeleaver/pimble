@@ -22,10 +22,12 @@
 //! reads them, with today's values as every fallback.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+
+use rinch::prelude::untracked;
+use std::collections::{HashMap, HashSet};
 
 use pimble_core::{Node, NodeId, StoreId};
-use pimble_themes::{Builtins, Drawn, InForce, Link, Origin, ThemeSource};
+use pimble_themes::{Drawn, InForce, Link, Origin, Theme, ThemeSource, WithStore};
 
 use crate::panes::PaneId;
 use crate::protocol::BackendCommand;
@@ -44,6 +46,11 @@ thread_local! {
     /// them: each is asked once, so a node this device may not read (the
     /// parent of a share's root) is not asked for again on every redraw.
     static ASKED: RefCell<HashSet<(StoreId, NodeId)>> = RefCell::new(HashSet::new());
+
+    /// The stores whose themes are needed and not listed yet, each with
+    /// whether a `ThemeCommand::List` is on its way: each is asked once at
+    /// a time, and again after a failed one once the store is caught up.
+    static LISTING: RefCell<HashMap<StoreId, bool>> = RefCell::new(HashMap::new());
 }
 
 /// One node of a chain, as the picker names it.
@@ -122,6 +129,12 @@ pub(crate) fn in_force_of(walk: &Walk, source: &impl ThemeSource) -> InForce {
     pimble_themes::in_force(walk.steps.iter().map(|s| Link { theme: s.theme.as_deref() }), walk.spaced, source)
 }
 
+/// The themes `store_id`'s chains resolve through besides the built-ins: its
+/// own theme nodes, as last listed. Tracked.
+pub(crate) fn of_store(store: AppStore, store_id: StoreId) -> Vec<Theme> {
+    store.store_themes.with(|all| all.get(&store_id).map(|listed| crate::commands::as_themes(listed)).unwrap_or_default())
+}
+
 /// The theme in force for `(store_id, node_id)` and the chain it was found
 /// on, tracked. Asks for the rest of the chain when the app does not hold
 /// it (once, a turn later: never from inside the reactive read).
@@ -132,11 +145,18 @@ pub(crate) fn resolve(store: AppStore, store_id: StoreId, node_id: NodeId) -> (I
         let node = store.node_data.with(|map| map.get(&(store_id, id)).copied())?;
         Some(node.with(Held::of))
     };
-    let walk = walk(node_id, held, &Builtins);
+    let themes = of_store(store, store_id);
+    let source = WithStore(&themes);
+    let walk = walk(node_id, held, &source);
     if let Some(missing) = walk.missing {
         ask(store_id, missing);
     }
-    (in_force_of(&walk, &Builtins), walk)
+    // A chain naming a theme that is not a built-in needs the store's
+    // themes, listed the first time one does.
+    if walk.steps.iter().any(|s| s.theme.as_deref().is_some_and(|t| pimble_themes::builtin(t).is_none())) {
+        want_listed(store, store_id);
+    }
+    (in_force_of(&walk, &source), walk)
 }
 
 /// The theme `(store_id, node_id)` would read in without a theme of its own
@@ -147,7 +167,7 @@ pub(crate) fn in_force_without_own(store: AppStore, store_id: StoreId, node_id: 
     let (parent_id, spaced) = node.map(|n| n.with(|n| (n.parent_id, n.metadata.spaced_paragraphs()))).unwrap_or((None, false));
     let above = parent_id.map(|parent| resolve(store, store_id, parent).1).unwrap_or_default();
     let chain = std::iter::once(Link { theme: None }).chain(above.steps.iter().map(|s| Link { theme: s.theme.as_deref() }));
-    pimble_themes::in_force(chain, spaced, &Builtins)
+    pimble_themes::in_force(chain, spaced, &WithStore(&of_store(store, store_id)))
 }
 
 /// What the picker previews for `(store_id, node_id)`: the note's own blocks
@@ -158,6 +178,76 @@ pub(crate) fn preview_blocks(store: AppStore, store_id: StoreId, node_id: NodeId
         Some(pane) => (preview::of_doc(&crate::editor::editor(*pane).doc()), true),
         None => (preview::sample(), false),
     }
+}
+
+/// Open theme node `(store_id, node_id)` in the focused pane, as a followed
+/// link opens a node: "Edit Theme..." and a theme just made. It opens
+/// whether or not Themes are shown in the explorer (section 3.1a).
+pub(crate) fn open_theme_node(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    let value = format!("node_{store_id}_{node_id}");
+    store.link_open.set(Some(crate::state::LinkOpen { value, store_id, node_id, anchor: None, pane: None }));
+}
+
+/// Node > "New Theme": a theme of the selected row's store (a mount row's
+/// source store) based on Default and setting nothing, named so no theme
+/// of the store has its name, opened in the theme editor.
+pub(crate) fn new_theme_for_selected(store: AppStore) {
+    let target = untracked(|| store.selected_row_node()).and_then(|(s, n)| crate::app::theme_target(store, s, n));
+    let Some((store_id, _)) = target else {
+        crate::events::show_notice(store, "Select a node of the store the theme is for.".to_string());
+        return;
+    };
+    // Numbered past the store's themes by the backend, which reads them.
+    let name = "New theme".to_string();
+    store.send(BackendCommand::Themes(crate::protocol::ThemeCommand::New { store_id, name, base: None, apply_to: None }));
+}
+
+/// `store_id`'s themes are needed (a chain names one, the picker or the
+/// theme editor opened): listed now unless they are or are being. A store's
+/// themes are listed only once something needs them, as listing holds the
+/// whole store (docs/THEMES_CONTRACT.md "Built: wave 2"); once listed they
+/// are listed again whenever one changes. Asked a turn later, never from
+/// inside a reactive read.
+pub(crate) fn want_listed(store: AppStore, store_id: StoreId) {
+    if untracked(|| store.store_themes.with(|all| all.contains_key(&store_id))) {
+        return;
+    }
+    let on_its_way = LISTING.with(|asked| asked.borrow_mut().insert(store_id, true)) == Some(true);
+    if !on_its_way {
+        crate::links::later(move |store| store.send(BackendCommand::Themes(crate::protocol::ThemeCommand::List { store_id })));
+    }
+}
+
+/// `store_id`'s themes were listed, or the store closed: it may be asked
+/// for again.
+pub(crate) fn listing_ended(store_id: StoreId) {
+    LISTING.with(|asked| asked.borrow_mut().remove(&store_id));
+}
+
+/// `store_id`'s themes could not be listed: still needed, asked again by
+/// `relist` or the next `want_listed`.
+pub(crate) fn listing_failed(store_id: StoreId) {
+    LISTING.with(|asked| asked.borrow_mut().insert(store_id, false));
+}
+
+/// `store_id` was caught up (`Resynced`): its themes are listed again if
+/// they were listed or are needed, as anything may have changed while it
+/// was away or a listing may have failed with the connection.
+pub(crate) fn relist(store: AppStore, store_id: StoreId) {
+    let listed = untracked(|| store.store_themes.with(|all| all.contains_key(&store_id)));
+    let needed = LISTING.with(|asked| asked.borrow_mut().get_mut(&store_id).map(|on_its_way| std::mem::replace(on_its_way, true)));
+    if listed || needed == Some(false) {
+        store.send(BackendCommand::Themes(crate::protocol::ThemeCommand::List { store_id }));
+    }
+}
+
+/// `wanted`, or `wanted 2`, `wanted 3`, ...: the first no name in `taken`
+/// (lowercase) is.
+pub(crate) fn free_name(wanted: &str, taken: &[String]) -> String {
+    (1..)
+        .map(|n| if n == 1 { wanted.to_string() } else { format!("{wanted} {n}") })
+        .find(|name| !taken.contains(&name.to_lowercase()))
+        .unwrap_or_else(|| wanted.to_string())
 }
 
 /// Asks for `node_id` and the nodes above it, unless that is already asked.
@@ -176,15 +266,16 @@ pub(crate) fn chain_answered(store_id: StoreId, nodes: &[Node]) {
     }
 }
 
-/// The theme's name, as the picker shows it.
-pub(crate) fn theme_name(id: &str) -> String {
-    Builtins.theme(id).map(|t| t.name).unwrap_or_else(|| id.to_string())
+/// Theme `id`'s name among `themes` and the built-ins, as the picker shows
+/// it.
+pub(crate) fn theme_name(themes: &[Theme], id: &str) -> String {
+    WithStore(themes).theme(id).map(|t| t.name).unwrap_or_else(|| id.to_string())
 }
 
 /// The sentence saying which theme is in force and where it comes from
 /// (section 9: "Book, set here", "Book, from 'Novel'").
-pub(crate) fn in_force_sentence(in_force: &InForce, walk: &Walk) -> String {
-    let name = theme_name(&in_force.id);
+pub(crate) fn in_force_sentence(themes: &[Theme], in_force: &InForce, walk: &Walk) -> String {
+    let name = theme_name(themes, &in_force.id);
     match in_force.origin {
         Origin::Named { depth: 0 } => format!("{name}, set here"),
         Origin::Named { depth } => match walk.steps.get(depth) {
@@ -194,6 +285,13 @@ pub(crate) fn in_force_sentence(in_force: &InForce, walk: &Walk) -> String {
         Origin::SpacedParagraphs => format!("{name}: this note's paragraphs were spaced before themes"),
         Origin::Default => format!("{name}: nothing above this note names a theme"),
     }
+}
+
+/// [`in_force_sentence`] for `(store_id, node_id)` as it resolves now,
+/// tracked.
+pub(crate) fn sentence(store: AppStore, store_id: StoreId, node_id: NodeId) -> String {
+    let (in_force, walk) = resolve(store, store_id, node_id);
+    in_force_sentence(&of_store(store, store_id), &in_force, &walk)
 }
 
 /// One sentence per name on the chain that no theme answers (a theme that
@@ -216,12 +314,13 @@ pub(crate) fn pane_drawn(store: AppStore, pane: PaneId) -> Drawn {
     let Some((store_id, node_id)) = crate::pane_view::pane_document(store, pane) else { return Drawn::default() };
     let (in_force, _) = resolve(store, store_id, node_id);
     let dark = store.dark_mode.get();
-    drawn_for(&in_force.id, dark)
+    drawn_for(&of_store(store, store_id), &in_force.id, dark)
 }
 
-/// Theme `id` folded with its bases and drawn in one scheme.
-pub(crate) fn drawn_for(id: &str, dark: bool) -> Drawn {
-    let folded = pimble_themes::fold(id, &Builtins);
+/// Theme `id` (among `themes` and the built-ins) folded with its bases and
+/// drawn in one scheme.
+pub(crate) fn drawn_for(themes: &[Theme], id: &str, dark: bool) -> Drawn {
+    let folded = pimble_themes::fold(id, &WithStore(themes));
     pimble_themes::draw(&folded.tokens, dark)
 }
 

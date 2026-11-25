@@ -103,6 +103,11 @@ pub(crate) struct Views {
     /// whether it is open and its width.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     properties: Option<PanelView>,
+    /// The internal kinds the explorer shows (View > "Show Internal",
+    /// docs/THEMES_CONTRACT.md section 3.1a), by `InternalKind::id`; none
+    /// by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    internal_shown: Vec<String>,
     /// The last `at` handed out.
     #[serde(default)]
     clock: u64,
@@ -307,6 +312,28 @@ pub(crate) fn set_properties(panel: PanelView) {
     }
 }
 
+// ── Internal nodes ──────────────────────────────────────────────────────────
+
+/// The internal kinds this device shows.
+pub(crate) fn internal_shown() -> Vec<pimble_core::internal::InternalKind> {
+    with(|v| v.internal_shown.iter().filter_map(|id| pimble_core::internal::InternalKind::from_id(id)).collect())
+}
+
+/// This device now shows the internal kinds `shown`.
+pub(crate) fn set_internal_shown(shown: &[pimble_core::internal::InternalKind]) {
+    let ids: Vec<String> = shown.iter().map(|kind| kind.id().to_string()).collect();
+    let changed_now = with(|v| {
+        if v.internal_shown == ids {
+            return false;
+        }
+        v.internal_shown = ids;
+        true
+    });
+    if changed_now {
+        changed();
+    }
+}
+
 // ── Text ────────────────────────────────────────────────────────────────────
 
 pub(crate) fn place(store_id: StoreId, node_id: NodeId) -> Option<TextPlace> {
@@ -442,6 +469,7 @@ mod tests {
         v.set_place("s/m".into(), TextPlace::new(vec![5], vec![5], None));
         v.set_camera("s/b".into(), Camera::new(1.5, -2.0, 0.5));
         v.properties = Some(PanelView { open: true, width: 320.0 });
+        v.internal_shown = vec!["themes".into()];
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<Views>(&json).unwrap(), v);
         assert_eq!(serde_json::from_str::<Views>("{}").unwrap(), Views::default());

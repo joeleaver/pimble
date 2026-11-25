@@ -84,6 +84,15 @@ pub struct PaneState {
     pub metanode: Signal<Option<ActiveEdit>>,
     /// What the metanode's outline shows (`crate::metanodes`).
     pub metanode_ui: crate::metanodes::MetanodeUi,
+    /// Whether the pane shows a theme node in the theme editor
+    /// (docs/THEMES_CONTRACT.md section 9) instead of its editor, which
+    /// stays mounted, hidden.
+    pub show_theme: Signal<bool>,
+    /// The theme node the pane holds, like `sheet` for a sheet node.
+    pub theme: Signal<Option<ActiveEdit>>,
+    /// What the theme editor shows beyond the theme: the switch to show only
+    /// what it changes, and the scheme its sample is drawn in.
+    pub theme_ui: crate::app::ThemeUi,
     /// The pane this one opens things beside (`pane_view::open_beside`: a
     /// kanban's card clicked), kept so that opening one after another shows
     /// each in the same place instead of splitting again. Forgotten when
@@ -116,6 +125,9 @@ impl PaneState {
             show_metanode: Signal::new(false),
             metanode: Signal::new(None),
             metanode_ui: crate::metanodes::MetanodeUi::new(),
+            show_theme: Signal::new(false),
+            theme: Signal::new(None),
+            theme_ui: crate::app::ThemeUi::new(),
             beside: Signal::new(None),
         }
     }
@@ -233,6 +245,7 @@ impl AppStore {
         self.pane(pane).show_sheet.set(false);
         self.pane(pane).show_discussion.set(false);
         crate::metanodes::stop(*self, pane);
+        crate::app::stop_theme_editor(*self, pane);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());
@@ -257,6 +270,7 @@ impl AppStore {
                 .or_else(|| state.sheet.get())
                 .or_else(|| state.discussion.get())
                 .or_else(|| state.metanode.get())
+                .or_else(|| state.theme.get())
                 .map(|edit| (edit.store_id, edit.node_id))
                 .or_else(|| state.restore.get());
             if let Some((store_id, node_id)) = held {

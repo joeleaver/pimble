@@ -284,6 +284,6 @@ fn node_init(title: String, init: Option<crate::protocol::NodeInit>) -> pimble_a
 
 /// What a new node does to the tree: a row under `parent`, whose list
 /// changed.
-fn created(node_id: NodeId, parent_id: NodeId) -> pimble_api::Affected {
+pub(super) fn created(node_id: NodeId, parent_id: NodeId) -> pimble_api::Affected {
     pimble_api::Affected::of(&pimble_rpc::StoreChangeKind::NodeCreated { node_id, parent_id })
 }
