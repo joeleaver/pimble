@@ -6,11 +6,14 @@
 //! The sign-in page offers "Don't remember this browser" and says, beside it,
 //! what remembering protects and what it does not (section 7, in its words).
 //! The account page signs out or forgets this browser; each deletes the
-//! device key first, then everything this browser kept.
+//! device key first, then everything this browser kept. Its other sections
+//! (the members of the stores this account owns, the password, the recovery
+//! code) are `account_sections`.
 
 use rinch::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use super::account_sections::{change_password_section, recovery_code_section, store_members_section};
 use super::{backend, hub};
 use crate::pages::PAGE_CSS;
 use crate::route::{self, Route};
@@ -238,10 +241,10 @@ pub fn account_page() -> NodeHandle {
 
     rsx! {
         div {
-            class: "pimble-page",
+            class: "pimble-page pimble-page--wide",
             style { {PAGE_CSS} }
             div {
-                class: "pimble-page__card",
+                class: "pimble-page__card pimble-page__card--wide",
                 h1 { class: "pimble-page__brand", "Account" }
                 p { class: "pimble-page__lede", "Signed in as " {|| email.get()} }
                 p { class: "pimble-page__lede",
@@ -256,6 +259,13 @@ pub fn account_page() -> NodeHandle {
                 p { class: "pimble-page__lede",
                     "Whether what you've read and your place in each note follow you to your other devices is \"Keep what I've read in step\", in Pimble's Settings > Account."
                 }
+                Divider { size: "sm" }
+                {store_members_section(__scope)}
+                Divider { size: "sm" }
+                {change_password_section(__scope)}
+                Divider { size: "sm" }
+                {recovery_code_section(__scope)}
+                Divider { size: "sm" }
                 if !error.get().is_empty() {
                     div { class: "pimble-page__error", {|| error.get()} }
                 }

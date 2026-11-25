@@ -14,6 +14,7 @@
 
 pub mod backend;
 pub mod hub;
+mod account_sections;
 pub mod pages;
 
 use wasm_bindgen::JsCast;
