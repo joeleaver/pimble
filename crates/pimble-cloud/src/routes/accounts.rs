@@ -162,7 +162,7 @@ struct AuthResponse {
 async fn issue_session(state: &AppState, user: &UserRow) -> CloudResult<Response> {
     let (session_token, token_hash) = new_session_token();
     let expires_at_ms = chrono::Utc::now().timestamp_millis() + SESSION_TTL_MS;
-    state.db.create_session(user.rid, &token_hash, expires_at_ms).await?;
+    state.db.create_session(user.rid, &token_hash, expires_at_ms, user.session_epoch).await?;
 
     let claims = claims_for_user(state, user).await?;
     let minted = state.signer.mint(&user.user_uuid, claims).await?;

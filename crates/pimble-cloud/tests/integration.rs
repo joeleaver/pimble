@@ -1415,7 +1415,7 @@ async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_start
 
     let (_token, token_hash) = pimble_cloud::auth::new_session_token();
     let expires_at_ms = chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000;
-    stack.app_state.db.create_session(legacy.rid, &token_hash, expires_at_ms).await.unwrap();
+    stack.app_state.db.create_session(legacy.rid, &token_hash, expires_at_ms, legacy.session_epoch).await.unwrap();
 
     let hosted =
         stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain", "hosted").await.unwrap();
@@ -2013,8 +2013,8 @@ async fn change_password_refuses_wrong_current_key_and_accepts_right_one() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The session used to change it is kept (docs/CRYPTO_CONTRACT.md:
-    // "keeps other sessions").
+    // The session used to change it is kept; the others end
+    // (`integration/sessions.rs`).
     let resp = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
@@ -4836,3 +4836,6 @@ mod watches;
 
 #[path = "integration/account_worker.rs"]
 mod account_worker;
+
+#[path = "integration/sessions.rs"]
+mod sessions;

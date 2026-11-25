@@ -30,6 +30,32 @@ use crate::state::AppState;
 /// "1 hour" (docs/CRYPTO_CONTRACT.md, "Phase 2a-2").
 const RECOVERY_TTL_MS: i64 = 60 * 60 * 1000;
 
+/// The `session_epoch` a password change or a recovery raises `user`'s to:
+/// above every session made so far. The clock, so two changes at once pick
+/// different epochs; one above the stored epoch should the clock be behind.
+fn next_session_epoch(user: &UserRow) -> u64 {
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    now.max(user.session_epoch.saturating_add(1))
+}
+
+/// Delete the rows of `user_rid`'s sessions ended by raising its epoch to
+/// `epoch`, all but `keep`. Housekeeping only: they are refused already, so
+/// a failure here is logged and the change still answers that it was made.
+async fn delete_ended_sessions(state: &AppState, user_rid: u64, epoch: u64, keep: Option<u64>) {
+    let sessions = match state.db.sessions_for_user(user_rid).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!(error = %e, "listing the sessions a password change ended failed; they are refused, and stay as rows");
+            return;
+        }
+    };
+    for session in sessions.into_iter().filter(|s| Some(s.rid) != keep && s.epoch < epoch) {
+        if let Err(e) = state.db.delete_session(session.rid).await {
+            tracing::warn!(error = %e, "deleting a session a password change ended failed; it is refused, and stays as a row");
+        }
+    }
+}
+
 // ── Recovery (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ─────────────────────
 
 #[derive(Deserialize)]
@@ -146,8 +172,9 @@ pub struct RecoverCompleteResponse {
 }
 
 /// `POST /api/v1/recover/{token}/complete` — replaces password material and
-/// recovery material (the client rotates the code), consumes the token,
-/// deletes every session, and starts no new one. Public keys are unchanged,
+/// recovery material (the client rotates the code), consumes the token, and
+/// ends every session of the account in the same update (by raising its
+/// `session_epoch`; the rows are deleted after), and starts no new one. Public keys are unchanged,
 /// so every store envelope already wrapped to this account stays valid.
 pub async fn recover_complete(
     State(state): State<AppState>,
@@ -166,6 +193,7 @@ pub async fn recover_complete(
 
     let user = user_for_recovery_token(&state, &token).await?;
     let password_hash = hash_password(&req.auth_key)?;
+    let epoch = next_session_epoch(&user);
     state
         .db
         .complete_recovery(
@@ -178,12 +206,10 @@ pub async fn recover_complete(
             &to_json("account_key_blob", &req.account_key_blob)?,
             &req.recovery_salt,
             &to_json("recovery_key_blob", &req.recovery_key_blob)?,
+            epoch,
         )
         .await?;
-
-    for session in state.db.sessions_for_user(user.rid).await? {
-        state.db.delete_session(session.rid).await?;
-    }
+    delete_ended_sessions(&state, user.rid, epoch, None).await;
 
     Ok(Json(RecoverCompleteResponse { user: UserView::from(&user) }))
 }
@@ -244,11 +270,22 @@ pub struct ChangePasswordRequest {
 }
 
 /// `POST /api/v1/me/password` — verifies `current_auth_key` like login,
-/// then replaces the password material. Other sessions are kept (Joe may
-/// change that later — docs/CRYPTO_CONTRACT.md).
+/// then replaces the password material and signs out every other session of
+/// the account; the session that asked stays signed in (Joe, 2026-11-25:
+/// "Sign out the others"; docs/ONE_CODEBASE_CONTRACT.md "Built: wave 5,
+/// part 4").
+///
+/// Atomic: this session's epoch is raised first, which ends nothing (a
+/// session is valid while its epoch is not below the account's), and then
+/// the one `.update()` that writes the new password raises the account's
+/// epoch to the same value, which ends every other session at that moment.
+/// A change that fails before that update changes neither; a session made
+/// by a login that checked the old password carries the old epoch and is
+/// ended too. JWTs minted before the change are not revoked: a Pimble server
+/// keeps no session state and takes one until it expires, within the hour.
 pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<ChangePasswordRequest>) -> CloudResult<Json<Value>> {
     if !verify_password_constant_time(&req.current_auth_key, Some(authed.user.password_hash.as_str())) {
-        return Err(CloudError::Unauthorized("current password is incorrect".to_string()));
+        return Err(CloudError::WrongCurrentPassword);
     }
     if req.auth_key.trim().is_empty() {
         return Err(CloudError::BadRequest("auth_key must not be empty".to_string()));
@@ -257,18 +294,14 @@ pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, 
     validate_blob("account_key_blob", &req.account_key_blob)?;
 
     let password_hash = hash_password(&req.auth_key)?;
+    let account_key_blob = to_json("account_key_blob", &req.account_key_blob)?;
+    let epoch = next_session_epoch(&authed.user);
+    state.db.set_session_epoch(authed.session_rid, epoch).await?;
     state
         .db
-        .update_password_material(
-            authed.user.rid,
-            &password_hash,
-            &req.kdf.salt,
-            req.kdf.m_cost,
-            req.kdf.t_cost,
-            req.kdf.p_cost,
-            &to_json("account_key_blob", &req.account_key_blob)?,
-        )
+        .update_password_material(authed.user.rid, &password_hash, &req.kdf.salt, req.kdf.m_cost, req.kdf.t_cost, req.kdf.p_cost, &account_key_blob, epoch)
         .await?;
+    delete_ended_sessions(&state, authed.user.rid, epoch, Some(authed.session_rid)).await;
     Ok(Json(json!({})))
 }
 

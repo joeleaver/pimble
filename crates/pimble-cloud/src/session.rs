@@ -96,6 +96,11 @@ impl FromRequestParts<AppState> for AuthedUser {
             .get_user(session.user_rid)
             .await?
             .ok_or_else(|| CloudError::Internal("session references a user that no longer exists".to_string()))?;
+        if session.ended_for(&user) {
+            // Ended by a password change on another session, or a recovery:
+            // refused like one that never existed.
+            return Err(CloudError::Unauthorized("invalid session".to_string()));
+        }
 
         // In use: pushed back to 30 days from now (at most once a day). A
         // failed write leaves the session as it was; the request goes on.

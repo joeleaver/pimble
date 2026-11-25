@@ -10,9 +10,11 @@ impl RhypeDb {
         self.objects(&q).await?.iter().map(session_from_object).collect()
     }
 
-    pub async fn create_session(&self, user_rid: u64, token_hash: &str, expires_at_ms: i64) -> CloudResult<SessionRow> {
+    /// `epoch` is the user's `session_epoch` as read when the session's
+    /// password was checked: a password change since then ends it.
+    pub async fn create_session(&self, user_rid: u64, token_hash: &str, expires_at_ms: i64, epoch: u64) -> CloudResult<SessionRow> {
         let q = format!(
-            "Session.create({{ token_hash: {hash}, user_rid: {uid}, expires_at: {exp}, created_at: {now} }})",
+            "Session.create({{ token_hash: {hash}, user_rid: {uid}, expires_at: {exp}, created_at: {now}, epoch: {epoch} }})",
             hash = ql_str(token_hash),
             uid = user_rid,
             exp = datetime_literal(expires_at_ms),
@@ -37,6 +39,13 @@ impl RhypeDb {
     /// Move a session's expiry (renewal while it is used).
     pub async fn renew_session(&self, session_rid: u64, expires_at_ms: i64) -> CloudResult<()> {
         self.objects(&format!("Session.get({session_rid}).update({{ expires_at: {} }})", datetime_literal(expires_at_ms))).await?;
+        Ok(())
+    }
+
+    /// Raise a session's epoch: the session changing the password, before
+    /// the change raises the user's.
+    pub async fn set_session_epoch(&self, session_rid: u64, epoch: u64) -> CloudResult<()> {
+        self.objects(&format!("Session.get({session_rid}).update({{ epoch: {epoch} }})")).await?;
         Ok(())
     }
 

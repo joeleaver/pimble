@@ -51,6 +51,9 @@ pub struct UserRow {
     pub notify_watches_off: bool,
     /// When the last notice email went to them; `0` for never.
     pub notice_emailed_at_ms: i64,
+    /// Sessions whose epoch is below this are ended (a password change, a
+    /// recovery). 0 on every row from before the field.
+    pub session_epoch: u64,
 }
 
 impl UserRow {
@@ -136,6 +139,16 @@ pub struct SessionRow {
     pub rid: u64,
     pub user_rid: u64,
     pub expires_at_ms: i64,
+    /// The owner's `session_epoch` when it was made; the session is ended
+    /// once the owner's is above it. 0 on every row from before the field.
+    pub epoch: u64,
+}
+
+impl SessionRow {
+    /// Whether a password change or a recovery since it was made ended it.
+    pub fn ended_for(&self, user: &UserRow) -> bool {
+        self.epoch < user.session_epoch
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +307,7 @@ pub(super) fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         notify_push_off: get_bool_opt(o, "notify_push_off")?.unwrap_or(false),
         notify_watches_off: get_bool_opt(o, "notify_watches_off")?.unwrap_or(false),
         notice_emailed_at_ms: get_datetime_ms_opt(o, "notice_emailed_at")?.unwrap_or(0),
+        session_epoch: get_u64_opt(o, "session_epoch")?.unwrap_or(0),
     })
 }
 
@@ -357,7 +371,12 @@ pub(super) fn inbox_item_from_object(o: &Object) -> CloudResult<InboxItemRow> {
 }
 
 pub(super) fn session_from_object(o: &Object) -> CloudResult<SessionRow> {
-    Ok(SessionRow { rid: o.id, user_rid: get_u64(o, "user_rid")?, expires_at_ms: get_datetime_ms(o, "expires_at")? })
+    Ok(SessionRow {
+        rid: o.id,
+        user_rid: get_u64(o, "user_rid")?,
+        expires_at_ms: get_datetime_ms(o, "expires_at")?,
+        epoch: get_u64_opt(o, "epoch")?.unwrap_or(0),
+    })
 }
 
 /// The store kind a row with no `kind` field is treated as — the only kind

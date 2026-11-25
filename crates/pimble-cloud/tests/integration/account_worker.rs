@@ -84,6 +84,7 @@ async fn the_device_changes_the_password_and_the_new_one_opens_the_same_keys() {
     let (_, keys) = signup_with_material(&stack, email, old).await;
     let (_, other_session) = verify_then_login(&stack, email, old).await;
     let device = Device::signed_in(&service_url(&stack), email, old).await;
+    let other_device = Device::signed_in(&service_url(&stack), email, old).await;
 
     let wrong = device.client.cloud_change_password("not the password", new).await.expect_err("a wrong current password is refused");
     assert!(wrong.to_string().contains("That is not your current password."), "{wrong}");
@@ -95,12 +96,24 @@ async fn the_device_changes_the_password_and_the_new_one_opens_the_same_keys() {
     assert_eq!(login_status(&stack, email, old).await, 401, "the old password no longer logs in");
     assert!(password_opens(&stack, email, new, &keys).await, "the new password logs in and opens the same account keys");
 
-    // Sessions stay (docs/CRYPTO_CONTRACT.md "Phase 2a-2"): this device's,
-    // and one made elsewhere before the change.
-    assert_eq!(device.client.cloud_status().await.unwrap().email.as_deref(), Some(email));
+    // This device made the change and stays signed in (Joe, 2026-11-25:
+    // "Sign out the others"); its session still answers.
+    let status = device.client.cloud_status().await.unwrap();
+    assert!(status.signed_in);
+    assert_eq!(status.email.as_deref(), Some(email));
     device.client.cloud_list_hosted_stores().await.expect("this device's session still works");
+    device.client.cloud_new_recovery_code().await.expect("and still changes the account");
+
+    // Every other session is signed out: one made over HTTP, and another
+    // device's, which says so in a sentence and asks to sign in again.
     let me = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &other_session).send().await.unwrap();
-    assert_eq!(me.status(), 200, "another device's session still works");
+    assert_eq!(me.status(), 401, "another session is signed out");
+    let ended = other_device.client.cloud_change_password(new, "a third password").await.expect_err("another device's session has ended");
+    assert_eq!(ended.to_string(), "Your Pimble Cloud sign-in has ended. Sign in again.");
+    assert!(password_opens(&stack, email, new, &keys).await, "and its attempt changed nothing");
+    other_device.client.cloud_sign_in(&service_url(&stack), email, new).await.expect("it signs in again with the new password");
+    other_device.client.cloud_list_hosted_stores().await.expect("and works again");
+    other_device.stop().await;
 
     assert!(!contains_bytes(device.dir.path(), old.as_bytes()) && !contains_bytes(device.dir.path(), new.as_bytes()), "no password reaches the device's disk");
     device.stop().await;
@@ -298,4 +311,34 @@ async fn an_owner_makes_another_owner_and_a_store_always_keeps_one() {
 
     bobs_device.stop().await;
     device.stop().await;
+}
+
+/// A refused sign-in is a whole sentence on the device's server, the one the
+/// browser's sign-in page and the desktop's Account modal both show; an
+/// address with no account reads exactly as a wrong password.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_sign_in_is_a_sentence_that_does_not_say_whether_the_account_exists() {
+    let stack = skip_without_rhypedb!();
+    let (email, password) = ("refused@example.com", "the right password");
+    signup_with_material(&stack, email, password).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig::in_dir(dir.path()));
+    server.start().await.expect("the device's server starts");
+    let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("a client connects");
+    let url = service_url(&stack);
+
+    let unverified = client.cloud_sign_in(&url, email, password).await.expect_err("not verified yet");
+    assert_eq!(unverified.to_string(), "Check your inbox: this address has not been verified yet.");
+    let wrong_unverified = client.cloud_sign_in(&url, email, "not the password").await.expect_err("a wrong password");
+    assert_eq!(wrong_unverified.to_string(), "That email and password do not match.", "unverified is said only once the password matched");
+
+    verify_then_login(&stack, email, password).await;
+    let wrong = client.cloud_sign_in(&url, email, "not the password").await.expect_err("a wrong password");
+    assert_eq!(wrong.to_string(), "That email and password do not match.");
+    let unknown = client.cloud_sign_in(&url, "nobody-here@example.com", "any password").await.expect_err("no such account");
+    assert_eq!(unknown.to_string(), wrong.to_string(), "an unknown address reads as a wrong password");
+    assert!(!client.cloud_status().await.unwrap().signed_in, "nothing was signed in");
+
+    client.cloud_sign_in(&url, email, password).await.expect("the right password signs in");
+    server.stop().await.unwrap();
 }
