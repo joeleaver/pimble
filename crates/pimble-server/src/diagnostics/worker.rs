@@ -112,7 +112,7 @@ async fn pump(handler: &RpcHandler) {
     let millis = handler.runtime().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let account = handler.keystore().account().await.filter(|_| !handler.keystore().session_expired());
     let send_as = account.as_ref().map(|a| SendAs { url: &a.url, session: &a.session, user_id: &a.user_id });
-    diagnostics().pump(handler.disk(), handler.http(), send_as, millis).await;
+    diagnostics().pump(handler.disk(), handler.http(), handler.runtime(), send_as, millis).await;
 }
 
 /// Help > "Send Diagnostics...": the page's `logs`, this worker's recent log,

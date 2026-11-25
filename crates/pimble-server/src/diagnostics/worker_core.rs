@@ -10,16 +10,29 @@
 //! switch is turned the moment the page says so, a pump already sending
 //! stops before its next batch, and the off's clearing of the queue runs
 //! once that pump has ended, so nothing written by it survives on the disk.
+//!
+//! Every off advances a count, and a clear is owed for each one even when an
+//! "on" follows before the clear could run: a pump goes on only while no off
+//! has come since it took its records, and no pump starts while a clear is
+//! owed. So nothing recorded before the latest off is ever sent, and none of
+//! it stays on the disk. A request is never waited for longer than
+//! [`SEND_TIMEOUT`] (the host's [`Bounded`]), so neither is an off.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use pimble_host::http::Http;
-use pimble_host::Disk;
+use pimble_host::http::{Bounded, Http};
+use pimble_host::{Disk, Runtime};
 use serde_json::Value;
 
 use super::on_disk::{records_url, Queue, Recorder, MAX_QUEUED_BYTES};
 use pimble_core::diagnostics::Severity;
+
+/// How long one request of a pump is waited for: what the desktop's own
+/// client allows a call to the accounts service. An off waits for a pump in
+/// flight, so this is also the longest an off's clear can wait.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The page's say (`setDiagnostics`), kept until the queue's folder is known;
 /// on or off is the recorder's switch, turned at once.
@@ -39,6 +52,10 @@ struct State {
     unapplied: Option<Choice>,
     /// Whether this session has said which program it is.
     said_system: bool,
+    /// How many offs the page has said: each one owes the queue a clear.
+    offs: u64,
+    /// How many of them the queue has been cleared for.
+    cleared: u64,
 }
 
 /// The signed-in account a pump sends as.
@@ -67,13 +84,23 @@ pub struct WorkerDiagnostics {
     state: RefCell<State>,
     /// Held for the whole of a step that touches the queue.
     step: tokio::sync::Mutex<()>,
+    /// How long one request is waited for ([`SEND_TIMEOUT`]).
+    send_timeout: Duration,
 }
 
 impl WorkerDiagnostics {
     /// A new session recording as `app` on `os`, waiting for the page's say.
     pub fn new(app: &str, os: &str) -> Self {
-        let state = State { recorder: Recorder::new(app, os), install: None, dir: None, unapplied: None, said_system: false };
-        WorkerDiagnostics { state: RefCell::new(state), step: tokio::sync::Mutex::new(()) }
+        let state = State { recorder: Recorder::new(app, os), install: None, dir: None, unapplied: None, said_system: false, offs: 0, cleared: 0 };
+        WorkerDiagnostics { state: RefCell::new(state), step: tokio::sync::Mutex::new(()), send_timeout: SEND_TIMEOUT }
+    }
+
+    /// The same, waiting at most `limit` for each request: a test's, which
+    /// cannot wait [`SEND_TIMEOUT`] of real time.
+    #[cfg(test)]
+    pub fn with_send_timeout(mut self, limit: Duration) -> Self {
+        self.send_timeout = limit;
+        self
     }
 
     /// Whether records are kept (until the page says, they wait in memory).
@@ -124,13 +151,17 @@ impl WorkerDiagnostics {
     }
 
     /// The page's say: on or off, and its install number. The switch turns
-    /// at once (off drops what waits in memory); the queue follows once no
-    /// pump is running, off emptying it. Before the server has given the
-    /// queue's folder, the choice is kept for [`Self::attach`].
+    /// at once (off drops what waits in memory, and stops a pump in flight
+    /// before its next batch); the queue follows once no pump is running,
+    /// emptied for every off said, whatever came after it. Before the server
+    /// has given the queue's folder, the choice is kept for [`Self::attach`].
     pub async fn configure(&self, disk: &Disk, enabled: bool, install: Option<String>) -> Applied {
         {
             let mut s = self.state.borrow_mut();
             s.recorder.set_enabled(enabled);
+            if !enabled {
+                s.offs += 1;
+            }
             s.unapplied = Some(Choice { install });
         }
         let _step = self.step.lock().await;
@@ -145,21 +176,32 @@ impl WorkerDiagnostics {
         self.apply(disk).await
     }
 
-    /// The choice waiting, applied to the queue. Called with the step held.
+    /// The choice waiting and the clear owed, applied to the queue. Called
+    /// with the step held.
     async fn apply(&self, disk: &Disk) -> Applied {
-        let (choice, dir) = {
+        let (choice, dir, offs) = {
             let mut s = self.state.borrow_mut();
             let Some(dir) = s.dir.clone() else { return Applied::Done };
-            let Some(choice) = s.unapplied.take() else { return Applied::Done };
-            (choice, dir)
+            if s.unapplied.is_none() && s.offs == s.cleared {
+                return Applied::Done;
+            }
+            (s.unapplied.take(), dir, s.offs)
         };
         let queue = Queue::new(disk.clone(), dir);
-        let install = queue.install(choice.install.as_deref()).await;
-        self.state.borrow_mut().install = Some(install);
+        if let Some(choice) = choice {
+            let install = queue.install(choice.install.as_deref()).await;
+            self.state.borrow_mut().install = Some(install);
+        }
+        // Owed for every off said so far, even one an "on" has followed: what
+        // was written before it must go. An off said during this clear owes
+        // one more, which its own step runs.
+        if offs > self.state.borrow().cleared {
+            queue.clear().await;
+            self.state.borrow_mut().cleared = offs;
+        }
         // The switch as it is now: a later say has turned it already, and is
         // waiting for this step to end to apply itself.
         if !self.enabled() {
-            queue.clear().await;
             return Applied::Done;
         }
         let mut s = self.state.borrow_mut();
@@ -172,20 +214,32 @@ impl WorkerDiagnostics {
 
     /// Write what was recorded as batches on the disk, one per account, then
     /// send what waits as `account` (its own batches and no one's), taken at
-    /// `millis`. Nothing happens while off or before the page has said.
-    pub async fn pump(&self, disk: &Disk, http: &dyn Http, account: Option<SendAs<'_>>, millis: u128) {
+    /// `millis`, waiting for each request at most the send timeout on
+    /// `runtime`. Nothing happens while off, before the page has said, or
+    /// while a say or an off's clear waits to be applied; once an off is said,
+    /// nothing more is written or sent, even if an "on" follows it.
+    pub async fn pump(&self, disk: &Disk, http: &dyn Http, runtime: &Runtime, account: Option<SendAs<'_>>, millis: u128) {
         let _step = self.step.lock().await;
         let taken = {
             let mut s = self.state.borrow_mut();
-            let install = s.install.clone().filter(|_| s.recorder.enabled() && s.unapplied.is_none());
-            match (install, s.dir.clone()) {
-                (Some(install), Some(dir)) => Some((s.recorder.take(&install), s.recorder.session().to_string(), dir)),
+            let settled = s.recorder.enabled() && s.unapplied.is_none() && s.offs == s.cleared;
+            match (s.install.clone().filter(|_| settled), s.dir.clone()) {
+                (Some(install), Some(dir)) => Some((s.recorder.take(&install), s.recorder.session().to_string(), dir, s.offs)),
                 _ => None,
             }
         };
-        let Some((batches, session, dir)) = taken else { return };
+        let Some((batches, session, dir, offs)) = taken else { return };
+        // Asked before each write and each read and send: no off since the
+        // records were taken.
+        let go_on = || {
+            let s = self.state.borrow();
+            s.recorder.enabled() && s.offs == offs
+        };
         let queue = Queue::new(disk.clone(), dir);
         for (owner, lines) in batches {
+            if !go_on() {
+                return;
+            }
             if let Err(e) = queue.append(&lines, millis, &session, owner.as_deref()).await {
                 tracing::debug!("diagnostic records not written: {e}");
             }
@@ -193,8 +247,8 @@ impl WorkerDiagnostics {
         queue.cap(MAX_QUEUED_BYTES).await;
         // Signed out (or the session ran out): they wait for the next sign-in.
         let Some(account) = account else { return };
-        let go_on = || self.enabled();
-        queue.send(http, &records_url(account.url), account.session, account.user_id, &go_on).await;
+        let http = Bounded::new(http, runtime, self.send_timeout);
+        queue.send(&http, &records_url(account.url), account.session, account.user_id, &go_on).await;
     }
 }
 

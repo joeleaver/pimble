@@ -1927,6 +1927,23 @@ its own step. The old path is not deleted yet.
   the person saved finishes); the off's clearing runs once that pump has ended, so nothing it
   wrote stays on the disk. A choice that comes before the server has given the queue's folder
   is kept and applied when the folder comes (`attach`, from `run`).
+- **Every off owes a clear, even when an on follows it** (2026-11-25). Saving "off" and then
+  "on" while a send was in flight kept only the later choice: the pump, asking only the switch,
+  went on sending batches recorded before the off, and the step saw "on" and never cleared.
+  Now every off advances a count (`State::offs`) and the queue records how many it has been
+  cleared for (`State::cleared`). A pump notes the count when it takes its records and goes on
+  (before each write, each read and each send) only while the switch is on and no off has come
+  since; no pump starts while a clear is owed; and applying a choice clears the queue whenever
+  `offs > cleared`, whatever the switch says by then. So nothing recorded before the latest off
+  is sent, and none of it stays on the disk. Tested with an off then an on during a send (the
+  service holding the request) and during a pump's write (a disk holding the batch).
+- **A send is never waited for longer than 15 s** (`SEND_TIMEOUT`). The step is held across a
+  request, and a browser's `fetch` has no timeout, so a stalled request delayed an off's clear
+  for as long as it stalled. The pump's requests go through `pimble_host::http::Bounded`, which
+  ends a call on the server's `Runtime` clock alike on the desktop and in the worker (a request
+  already on the wire is not taken back; only the waiting ends, and the batch waits for the
+  next send or the clear). Tested with a request that never answers and an off: the clear runs
+  within the timeout and nothing more is sent.
 - **The choice stays the page's** (Settings > Diagnostics, `localStorage`): the page tells the
   server `setDiagnostics { enabled, install }` at every connection and whenever it saves. The
   install number is the page's, so the page's records and the worker's share one

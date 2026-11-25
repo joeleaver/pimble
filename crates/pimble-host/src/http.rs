@@ -9,6 +9,10 @@
 //!   session cookie the page already has, so the bearer may be left out.
 //! - A phone app: its platform's client, or `reqwest` as on the desktop.
 //!
+//! A caller that must not wait longer than it says wraps any of them in
+//! [`Bounded`], which ends a call on the server's runtime clock alike on
+//! every host (diagnostics' sends, which an off waits for).
+//!
 //! Links to Pimble servers do not come through here: they connect with
 //! `PimbleClient`, which builds for every host already. One WebSocket does:
 //! asking Pimble Cloud's relay how it answers a member's connection
@@ -17,6 +21,9 @@
 //! close code 4404).
 
 use std::fmt;
+use std::time::Duration;
+
+use crate::runtime::{Elapsed, Runtime};
 
 /// The methods the accounts service is called with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +113,47 @@ pub trait Http: Send + Sync + fmt::Debug {
     async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16>;
 }
 
+/// Another [`Http`] whose every call ends within `limit` on `runtime`'s clock:
+/// a call that has had no answer by then answers [`HttpError`] (`timed
+/// out`), and the caller stops waiting for it. The same on every host, where
+/// the hosts' own clients are not: the desktop's has a 15 s timeout, a
+/// browser's `fetch` none at all. A request already on the wire is not taken
+/// back; only the waiting for its answer ends.
+#[derive(Debug, Clone, Copy)]
+pub struct Bounded<'a> {
+    inner: &'a dyn Http,
+    runtime: &'a Runtime,
+    limit: Duration,
+}
+
+impl<'a> Bounded<'a> {
+    pub fn new(inner: &'a dyn Http, runtime: &'a Runtime, limit: Duration) -> Self {
+        Bounded { inner, runtime, limit }
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl Http for Bounded<'_> {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = request.url.clone();
+        match self.runtime.timeout(self.limit, self.inner.send(request)).await {
+            Ok(answer) => answer,
+            Err(Elapsed) => Err(HttpError(format!("{url} timed out after {} ms", self.limit.as_millis()))),
+        }
+    }
+
+    /// The inner client's own: it is bounded already
+    /// ([`SOCKET_CONNECT_TIMEOUT`], [`FIRST_WORD_WAIT`]).
+    async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16> {
+        self.inner.websocket_close_code(url, token).await
+    }
+}
+
 /// How long [`Http::websocket_close_code`] waits for the socket to open.
-pub const SOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long, once open, it waits for the first thing the socket says.
-pub const FIRST_WORD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const FIRST_WORD_WAIT: Duration = Duration::from_secs(2);
 
 /// The desktop's: one `reqwest` client (rustls, a 15 s timeout per call).
 #[cfg(not(target_arch = "wasm32"))]
@@ -165,7 +209,8 @@ mod socket;
 
 /// A browser's worker (and the page, and Node): the global `fetch`, with
 /// `credentials: "include"` so the accounts service's session cookie goes
-/// along whether or not a bearer does. No timeout of its own: the browser's.
+/// along whether or not a bearer does. No timeout of its own: the browser's
+/// (a caller that needs one wraps it in [`Bounded`]).
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FetchHttp;
@@ -218,5 +263,47 @@ impl Http for FetchHttp {
 
     async fn websocket_close_code(&self, url: &str, token: &str) -> Option<u16> {
         socket::close_code(url, token).await
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// An endpoint that answers 200 after `delay`.
+    #[derive(Debug)]
+    struct After(Duration);
+
+    #[async_trait::async_trait]
+    impl Http for After {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            tokio::time::sleep(self.0).await;
+            Ok(HttpResponse { status: 200, body: Vec::new() })
+        }
+
+        async fn websocket_close_code(&self, _url: &str, _token: &str) -> Option<u16> {
+            Some(4404)
+        }
+    }
+
+    fn post() -> HttpRequest {
+        HttpRequest { method: Method::Post, url: "https://cloud.test/x".into(), bearer: None, body: None }
+    }
+
+    #[tokio::test]
+    async fn a_call_with_no_answer_by_its_limit_ends_with_an_error() {
+        let runtime = Runtime::default();
+        let stalled = After(Duration::from_secs(3600));
+        let bounded = Bounded::new(&stalled, &runtime, Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(10), bounded.send(post())).await.expect("the bound ends the call");
+        let error = answer.expect_err("no answer in time");
+        assert!(error.0.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let quick = After(Duration::ZERO);
+        let answer = Bounded::new(&quick, &runtime, Duration::from_millis(50)).send(post()).await.expect("answered in time");
+        assert_eq!(answer.status, 200);
+        assert_eq!(Bounded::new(&quick, &runtime, Duration::ZERO).websocket_close_code("wss://x", "t").await, Some(4404));
     }
 }
