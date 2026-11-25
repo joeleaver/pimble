@@ -44,14 +44,14 @@ async fn nothing_is_sent_before_the_page_says_or_while_off() {
     assert_eq!(waiting(&disk).await, 0, "nor is anything written");
     assert!(d.ids().is_none());
 
-    assert_eq!(d.configure(&disk, false, None).await, Applied::Done);
+    assert_eq!(d.configure(&disk, false, None, 2).await, Applied::Done);
     d.record("stores", json!({ "stores": 2 }), "t1".into());
     d.pump(&disk, &service, &rt(), Some(alice()), 2).await;
     assert!(service.sent().is_empty(), "off");
     assert_eq!(waiting(&disk).await, 0);
     assert!(d.ids().is_none());
 
-    assert_eq!(d.configure(&disk, true, None).await, Applied::FirstOn, "on for the first time, even after an off");
+    assert_eq!(d.configure(&disk, true, None, 3).await, Applied::FirstOn, "on for the first time, even after an off");
     d.record("stores", json!({ "stores": 3 }), "t2".into());
     d.pump(&disk, &service, &rt(), Some(alice()), 3).await;
     let sent = service.sent();
@@ -59,7 +59,7 @@ async fn nothing_is_sent_before_the_page_says_or_while_off() {
     let records: Vec<i64> = sent[0].1.iter().map(|r| r["data"]["stores"].as_i64().unwrap()).collect();
     assert_eq!(records, [3], "what was recorded before the off went with it");
     assert!(d.ids().is_some());
-    assert_eq!(d.configure(&disk, true, None).await, Applied::Done, "the program is said once");
+    assert_eq!(d.configure(&disk, true, None, 3).await, Applied::Done, "the program is said once");
 }
 
 #[tokio::test]
@@ -68,7 +68,7 @@ async fn an_off_during_a_pump_sends_nothing_after_it_and_leaves_nothing() {
     let service = Service::holding_first();
     let d = WorkerDiagnostics::new("1.0.0", "web");
     d.attach(&disk, dir()).await;
-    d.configure(&disk, true, None).await;
+    d.configure(&disk, true, None, 1).await;
     // Three batches wait: two left by earlier pumps (signed out), one taken
     // by the pump the off interrupts.
     for millis in [1, 2] {
@@ -84,7 +84,7 @@ async fn an_off_during_a_pump_sends_nothing_after_it_and_leaves_nothing() {
         // The pump is suspended in its first request when the person saves
         // "off".
         tokio::time::timeout(DEADLINE, service.arrived.notified()).await.expect("the pump's first request");
-        let configured = d.configure(&disk, false, None);
+        let configured = d.configure(&disk, false, None, 3);
         tokio::pin!(configured);
         // The off waits for the pump: poll it once, then let the request go.
         assert!(futures::poll!(configured.as_mut()).is_pending(), "the off waits for the pump in flight");
@@ -108,7 +108,7 @@ async fn batches_never_cross_accounts() {
     let service = Service::default();
     let d = WorkerDiagnostics::new("1.0.0", "web");
     d.attach(&disk, dir()).await;
-    d.configure(&disk, true, None).await;
+    d.configure(&disk, true, None, 1).await;
     d.set_account(Some("alice-id".into()));
     d.record("stores", json!({ "by": "alice" }), "t".into());
     // Alice is signed out before a pump sends her records.
@@ -148,7 +148,7 @@ async fn a_choice_before_the_queue_s_folder_is_applied_with_it() {
     let earlier = Queue::new(disk.clone(), dir());
     earlier.append(&["{\"kind\":\"left\"}".into()], 1, "old", None).await.unwrap();
     let d = WorkerDiagnostics::new("1.0.0", "web");
-    assert_eq!(d.configure(&disk, false, Some(page_install.clone())).await, Applied::Done);
+    assert_eq!(d.configure(&disk, false, Some(page_install.clone()), 1).await, Applied::Done);
     assert!(!d.enabled());
     assert_eq!(waiting(&disk).await, 1, "nothing is touched without the folder");
     assert_eq!(d.attach(&disk, dir()).await, Applied::Done);
@@ -158,7 +158,7 @@ async fn a_choice_before_the_queue_s_folder_is_applied_with_it() {
 
     // On before the folder: the page's install number is used once it is.
     let d = WorkerDiagnostics::new("1.0.0", "web");
-    assert_eq!(d.configure(&disk, true, Some(page_install.clone())).await, Applied::Done, "nothing to apply to yet");
+    assert_eq!(d.configure(&disk, true, Some(page_install.clone()), 2).await, Applied::Done, "nothing to apply to yet");
     assert!(d.ids().is_none());
     assert_eq!(d.attach(&disk, dir()).await, Applied::FirstOn);
     assert_eq!(d.ids().map(|(install, _)| install), Some(page_install.clone()));
@@ -180,7 +180,7 @@ async fn a_report_carries_the_install_in_use_and_the_worker_s_log() {
     d.attach(&disk, dir()).await;
     assert_eq!(d.dir(), Some(dir()));
     let page_install = "d".repeat(32);
-    d.configure(&disk, true, Some(page_install.clone())).await;
+    d.configure(&disk, true, Some(page_install.clone()), 1).await;
     let report = d.report("a".repeat(32), "t", "note", vec![("page.log".into(), "from the page".into())], json!([]));
     assert_eq!(report["install"], page_install.as_str(), "the install in use");
     assert_eq!(report["logs"][1]["name"], "worker.log");
@@ -192,7 +192,7 @@ async fn a_report_carries_the_install_in_use_and_the_worker_s_log() {
 /// signed out, with diagnostics on.
 async fn three_batches_waiting(disk: &Disk, service: &Service, d: &WorkerDiagnostics) {
     d.attach(disk, dir()).await;
-    d.configure(disk, true, None).await;
+    d.configure(disk, true, None, 1).await;
     for at in [1, 2, 3] {
         d.record("stores", json!({ "at": at }), "t".into());
         d.pump(disk, service, &rt(), None, at as u128).await;
@@ -213,8 +213,8 @@ async fn an_off_then_an_on_during_a_send_send_nothing_from_before_the_off_and_cl
         // The first batch is on the wire when the person saves "off", then
         // "on", before it is answered.
         tokio::time::timeout(DEADLINE, service.arrived.notified()).await.expect("the pump's first request");
-        let off = d.configure(&disk, false, None);
-        let on = d.configure(&disk, true, None);
+        let off = d.configure(&disk, false, None, 4);
+        let on = d.configure(&disk, true, None, 4);
         tokio::pin!(off, on);
         assert!(futures::poll!(off.as_mut()).is_pending(), "the off waits for the pump in flight");
         assert!(futures::poll!(on.as_mut()).is_pending(), "and so does the on");
@@ -241,7 +241,7 @@ async fn an_off_during_a_pump_s_write(then_on: bool) {
     let service = Service::default();
     let d = WorkerDiagnostics::new("1.0.0", "web");
     d.attach(&disk, dir()).await;
-    d.configure(&disk, true, None).await;
+    d.configure(&disk, true, None, 1).await;
     // A batch left by an earlier pump, and no one's and Alice's records in
     // memory, so the pump writes two batches.
     d.record("stores", json!({ "at": 1 }), "t".into());
@@ -255,10 +255,10 @@ async fn an_off_during_a_pump_s_write(then_on: bool) {
     let pump = d.pump(&disk, &service, &runtime, Some(alice()), 2);
     let say = async {
         tokio::time::timeout(DEADLINE, held.arrived.notified()).await.expect("the pump's first write");
-        let off = d.configure(&disk, false, None);
+        let off = d.configure(&disk, false, None, 2);
         let on = async {
             if then_on {
-                d.configure(&disk, true, None).await;
+                d.configure(&disk, true, None, 2).await;
             }
         };
         tokio::pin!(off, on);
@@ -274,7 +274,7 @@ async fn an_off_during_a_pump_s_write(then_on: bool) {
     assert_eq!(waiting(&disk).await, 0, "and none of it stays on the disk");
 
     if !then_on {
-        d.configure(&disk, true, None).await;
+        d.configure(&disk, true, None, 2).await;
     }
     d.record("stores", json!({ "at": 10 }), "t".into());
     d.pump(&disk, &service, &rt(), Some(alice()), 3).await;
@@ -306,7 +306,7 @@ async fn an_off_during_a_stalled_send_clears_within_the_timeout_and_sends_nothin
     let off = async {
         tokio::time::timeout(DEADLINE, service.arrived.notified()).await.expect("the pump's first request");
         let saved = std::time::Instant::now();
-        tokio::time::timeout(LIMIT + Duration::from_secs(2), d.configure(&disk, false, None)).await.expect("the off is applied within the send timeout");
+        tokio::time::timeout(LIMIT + Duration::from_secs(2), d.configure(&disk, false, None, 4)).await.expect("the off is applied within the send timeout");
         let took = saved.elapsed();
         assert_eq!(waiting(&disk).await, 0, "the queue is cleared");
         took
@@ -319,4 +319,78 @@ async fn an_off_during_a_stalled_send_clears_within_the_timeout_and_sends_nothin
     d.pump(&disk, &service, &rt(), Some(alice()), 5).await;
     assert_eq!(service.ats(), [1], "nothing after the off");
     assert_eq!(waiting(&disk).await, 0);
+}
+
+/// The offs written down and not yet cleared for.
+async fn clear_marks(disk: &Disk) -> usize {
+    Queue::new(disk.clone(), dir()).clear_marks().await.len()
+}
+
+/// The person saves "off" and then "on" while a send is in flight, and the
+/// tab closes before the off's clear could run (its step is dropped). The
+/// clear is written down, so the next worker, started with the page's saved
+/// "on", clears it before anything is sent: nothing from before the off is
+/// sent, and none of it is left on the disk.
+#[tokio::test]
+async fn an_off_owed_when_the_worker_ends_is_cleared_by_the_next_one_before_it_sends() {
+    let disk = Disk::memory();
+    let service = Service::holding_first();
+    let d = WorkerDiagnostics::new("1.0.0", "web");
+    three_batches_waiting(&disk, &service, &d).await;
+
+    let runtime = rt();
+    {
+        let pump = d.pump(&disk, &service, &runtime, Some(alice()), 4);
+        tokio::pin!(pump);
+        tokio::select! {
+            biased;
+            arrived = tokio::time::timeout(DEADLINE, service.arrived.notified()) => arrived.expect("the pump's first request"),
+            () = &mut pump => panic!("the first request is held, so the pump cannot end"),
+        }
+        let off = d.configure(&disk, false, None, 4);
+        let on = d.configure(&disk, true, None, 4);
+        tokio::pin!(off, on);
+        assert!(futures::poll!(off.as_mut()).is_pending(), "the off waits for the pump in flight");
+        assert!(futures::poll!(on.as_mut()).is_pending(), "and so does the on");
+        // The tab closes: the pump, the off and the on are dropped mid-way.
+    }
+    drop(d);
+    assert_eq!(waiting(&disk).await, 3, "the clear was still owed when the worker ended");
+    assert_eq!(clear_marks(&disk).await, 1, "and it is written down");
+
+    let next = WorkerDiagnostics::new("1.0.0", "web");
+    let next_service = Service::default();
+    // A pump before the folder is known, or while a mark waits, does nothing.
+    next.pump(&disk, &next_service, &rt(), Some(alice()), 5).await;
+    assert_eq!(next.attach(&disk, dir()).await, Applied::Done, "the page has not said yet");
+    assert_eq!(waiting(&disk).await, 0, "the next worker clears what the off owed as soon as it has the folder");
+    assert_eq!(clear_marks(&disk).await, 0, "and then the mark");
+    assert_eq!(next.configure(&disk, true, None, 6).await, Applied::FirstOn, "the page's saved choice");
+    next.record("stores", json!({ "at": 10 }), "t".into());
+    next.pump(&disk, &next_service, &rt(), Some(alice()), 7).await;
+    assert_eq!(next_service.ats(), [10], "only what was recorded after the on");
+    assert_eq!(service.ats(), [1], "the first worker sent only the request on the wire before the off");
+    assert_eq!(waiting(&disk).await, 0);
+}
+
+/// While an off written down waits to be cleared for, no pump writes or
+/// sends anything, even one with diagnostics on.
+#[tokio::test]
+async fn no_pump_runs_while_an_off_is_written_down() {
+    let disk = Disk::memory();
+    let service = Service::default();
+    let d = WorkerDiagnostics::new("1.0.0", "web");
+    d.attach(&disk, dir()).await;
+    d.configure(&disk, true, None, 1).await;
+    // An off from another session's worker, written down and not cleared for.
+    Queue::new(disk.clone(), dir()).mark_cleared_before(1, "other-1").await.unwrap();
+    d.record("stores", json!({ "at": 2 }), "t".into());
+    d.pump(&disk, &service, &rt(), Some(alice()), 2).await;
+    assert!(service.sent().is_empty(), "nothing is sent while the mark waits");
+    assert_eq!(waiting(&disk).await, 0, "nor written");
+    // The next say clears for it, and pumps go on.
+    d.configure(&disk, true, None, 3).await;
+    assert_eq!(clear_marks(&disk).await, 0);
+    d.pump(&disk, &service, &rt(), Some(alice()), 4).await;
+    assert_eq!(service.ats(), [2], "what was recorded after the off");
 }

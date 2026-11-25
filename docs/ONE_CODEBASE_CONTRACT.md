@@ -1937,6 +1937,18 @@ its own step. The old path is not deleted yet.
   `offs > cleared`, whatever the switch says by then. So nothing recorded before the latest off
   is sent, and none of it stays on the disk. Tested with an off then an on during a send (the
   service holding the request) and during a pump's write (a disk holding the batch).
+- **An off is written down before it is waited on** (2026-11-25, part 5). The counts above are
+  in memory, so a tab or app closed between an off and its clear left the batches recorded
+  before it on the disk, and the next run sent them. Now `configure(off)` writes a mark,
+  `clear-before-<wall ms>-<session>-<offs>` (outside the `records-*` names, so no pump takes
+  it), in the queue's folder before it waits for the step (`on_disk::mark_cleared_before`).
+  `attach` and `apply` delete every batch older than the newest mark (`clear_through`) and,
+  once every one went, remove the marks they read; `pump` takes nothing while any mark exists.
+  The in-memory counts keep their guarantees beside it. Tested by a worker ended between an
+  off and its clear: the next worker clears the batch before it sends anything. Residual: an
+  off said before the server has given the queue's folder (before `attach`) has nowhere to be
+  written; it is kept in memory (`unmarked_off`) and written down by `attach`, so a run closed
+  before `attach` loses it, but a run that never attached has sent nothing either.
 - **A send is never waited for longer than 15 s** (`SEND_TIMEOUT`). The step is held across a
   request, and a browser's `fetch` has no timeout, so a stalled request delayed an off's clear
   for as long as it stalled. The pump's requests go through `pimble_host::http::Bounded`, which
@@ -2074,10 +2086,11 @@ from a device that holds them; the keystore of this device needs no change.
 
 ### A new recovery code
 
-`cloudNewRecoveryCode {}` → `{ code }`, Service-only: `pimble_crypto::new_recovery_material`
+`cloudNewRecoveryCode { current_password }` → `{ code }` (the password since part 5, Joe,
+2026-11-25), Service-only: `pimble_crypto::new_recovery_material`
 makes the code, a salt and the account keys wrapped under the code's KEK (run off the async
-thread), the server sends `POST /me/recovery-code { recovery_salt, recovery_key_blob }`, and only
-then answers the code. Neither the request nor the response type prints it (`Debug` is
+thread), the server sends `POST /me/recovery-code { current_auth_key, recovery_salt,
+recovery_key_blob }`, and only then answers the code. Neither the request nor the response type prints it (`Debug` is
 redacted, `NewRecoveryMaterial` zeroes it on drop), and it is never written to the keystore.
 The page shows it with "Shown once. The old code no longer works.", a checkbox "I have written
 this down somewhere safe" and "Done", which drops it.
@@ -2244,9 +2257,36 @@ racing sign-in, and deletes the rows after, as the password change does.
   built.
 - The relay's owner tunnel is authorized with the session when it opens; a tunnel opened before
   the change stays up until it drops, and is refused when it reconnects.
-- Two password changes from two sessions at the same moment: the later write's password holds;
-  the session whose epoch is the higher stays signed in, and if the earlier write's epoch was the
-  higher both changing sessions stay. Every other session ends either way.
+- ~~Two password changes from two sessions at the same moment~~ (fixed 2026-11-25, part 5):
+  they run one at a time under the account's lock, and the second, whose session the first
+  ended, writes nothing and is refused in a sentence.
+
+## Built: wave 5, part 5 (2026-11-25, not merged or released): review fixes
+
+### Joe's decision (2026-11-25: "Password and an email")
+
+- **A new recovery code needs the current password**, checked as a password change checks it:
+  the server worker proves it first (`prove_current_password` in
+  `crates/pimble-server/src/handler/account.rs`: `GET /me/keys`, the password's keys derived and
+  the account keys unwrapped with them) and the accounts service checks its `auth_key` again.
+  `cloudNewRecoveryCode { current_password }`; an empty one reads "Enter your current password
+  to make a new recovery code.", a wrong one "That is not your current password.", and nothing
+  is sent then. The browser's account pages (both modes) ask for it beside "New Recovery Code".
+- **Every change of an account's recovery code mails the account** (docs/CRYPTO_CONTRACT.md,
+  "Every change of an account's recovery code is mailed"); the mail carries no secret.
+
+### The rest
+
+- **Last owner under races** (docs/CLOUD_CONTRACT.md, "A store always keeps an owner"), and
+  **one write per account at a time** (docs/CRYPTO_CONTRACT.md): the per-key locks of
+  `crates/pimble-cloud/src/locks.rs`, with the check made inside the lock on data read there.
+- **A new code whose answer is lost** (no answer, an undecodable one, or a 5xx) reads "Pimble
+  Cloud did not answer, so this computer cannot tell whether the new recovery code was saved.
+  Your old recovery code may have stopped working, so make a new one now."
+  (`RECOVERY_CODE_OUTCOME_UNKNOWN`, `cloud::outcome_unknown`). A refusal the service gave before
+  writing (an ended session, a wrong password, a 409) keeps its own sentence.
+- **An off in diagnostics is written down** before it is waited on (part 2 of this wave's
+  diagnostics notes, "An off is written down before it is waited on").
 
 ### Proof
 

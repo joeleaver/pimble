@@ -84,7 +84,7 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for Layer {
 /// running; a say that comes before the server has started is applied when
 /// it starts.
 pub async fn configure(handler: &RpcHandler, enabled: bool, install: Option<String>) {
-    let applied = diagnostics().configure(handler.disk(), enabled, install).await;
+    let applied = diagnostics().configure(handler.disk(), enabled, install, wall_millis(handler)).await;
     said(applied);
 }
 
@@ -107,9 +107,14 @@ pub async fn run(handler: RpcHandler, dir: PathBuf) {
     }
 }
 
+/// The wall time now, in the milliseconds batches and offs are named by.
+fn wall_millis(handler: &RpcHandler) -> u128 {
+    handler.runtime().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
+}
+
 /// One pump as the signed-in account, if one is and its session holds.
 async fn pump(handler: &RpcHandler) {
-    let millis = handler.runtime().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let millis = wall_millis(handler);
     let account = handler.keystore().account().await.filter(|_| !handler.keystore().session_expired());
     let send_as = account.as_ref().map(|a| SendAs { url: &a.url, session: &a.session, user_id: &a.user_id });
     diagnostics().pump(handler.disk(), handler.http(), handler.runtime(), send_as, millis).await;

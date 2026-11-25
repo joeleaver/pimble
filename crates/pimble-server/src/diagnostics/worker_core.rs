@@ -17,6 +17,15 @@
 //! owed. So nothing recorded before the latest off is ever sent, and none of
 //! it stays on the disk. A request is never waited for longer than
 //! [`SEND_TIMEOUT`] (the host's [`Bounded`]), so neither is an off.
+//!
+//! The count lives in memory, so the clear an off owes is also written down
+//! on the disk, before the off waits for its turn: a mark outside the
+//! `records-*` names holding the off's wall time (batches are named by
+//! theirs). [`WorkerDiagnostics::attach`] and every say delete each batch
+//! written at or before a mark and then the mark, and no pump runs while a
+//! mark is there. So a session that ends with the clear still owed (the tab
+//! closed during a send, after an off and an "on", or the off's step
+//! dropped) leaves it to the next one, which clears before it sends.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -56,6 +65,9 @@ struct State {
     offs: u64,
     /// How many of them the queue has been cleared for.
     cleared: u64,
+    /// The latest off said before the queue's folder was known, when it was
+    /// said: [`WorkerDiagnostics::attach`] writes it down first.
+    unmarked_off: Option<u128>,
 }
 
 /// The signed-in account a pump sends as.
@@ -91,7 +103,7 @@ pub struct WorkerDiagnostics {
 impl WorkerDiagnostics {
     /// A new session recording as `app` on `os`, waiting for the page's say.
     pub fn new(app: &str, os: &str) -> Self {
-        let state = State { recorder: Recorder::new(app, os), install: None, dir: None, unapplied: None, said_system: false, offs: 0, cleared: 0 };
+        let state = State { recorder: Recorder::new(app, os), install: None, dir: None, unapplied: None, said_system: false, offs: 0, cleared: 0, unmarked_off: None };
         WorkerDiagnostics { state: RefCell::new(state), step: tokio::sync::Mutex::new(()), send_timeout: SEND_TIMEOUT }
     }
 
@@ -150,44 +162,79 @@ impl WorkerDiagnostics {
         s.recorder.report(&install, ts, note, logs, "worker.log", stores)
     }
 
-    /// The page's say: on or off, and its install number. The switch turns
-    /// at once (off drops what waits in memory, and stops a pump in flight
-    /// before its next batch); the queue follows once no pump is running,
-    /// emptied for every off said, whatever came after it. Before the server
-    /// has given the queue's folder, the choice is kept for [`Self::attach`].
-    pub async fn configure(&self, disk: &Disk, enabled: bool, install: Option<String>) -> Applied {
-        {
+    /// The page's say, at `millis` of wall time: on or off, and its install
+    /// number. The switch turns at once (off drops what waits in memory, and
+    /// stops a pump in flight before its next batch), and an off is written
+    /// down on the disk before it waits for its turn; the queue follows once
+    /// no pump is running, emptied for every off said, whatever came after
+    /// it. Before the server has given the queue's folder, the choice is kept
+    /// for [`Self::attach`].
+    pub async fn configure(&self, disk: &Disk, enabled: bool, install: Option<String>, millis: u128) -> Applied {
+        let mark = {
             let mut s = self.state.borrow_mut();
             s.recorder.set_enabled(enabled);
-            if !enabled {
-                s.offs += 1;
-            }
             s.unapplied = Some(Choice { install });
+            if enabled {
+                None
+            } else {
+                s.offs += 1;
+                match s.dir.clone() {
+                    Some(dir) => Some((dir, format!("{}-{}", s.recorder.session(), s.offs))),
+                    None => {
+                        s.unmarked_off = Some(s.unmarked_off.map_or(millis, |at| at.max(millis)));
+                        None
+                    }
+                }
+            }
+        };
+        if let Some((dir, tag)) = mark {
+            mark_off(disk, dir, millis, &tag).await;
         }
         let _step = self.step.lock().await;
         self.apply(disk).await
     }
 
-    /// The server has started: the queue is in `dir`, and a choice that came
-    /// before it is applied now.
+    /// The server has started: the queue is in `dir`. An off said before it
+    /// is written down, the clears owed by this session or an earlier one
+    /// run, and a choice that came before it is applied.
     pub async fn attach(&self, disk: &Disk, dir: PathBuf) -> Applied {
-        self.state.borrow_mut().dir = Some(dir);
+        let unmarked = {
+            let mut s = self.state.borrow_mut();
+            s.dir = Some(dir.clone());
+            s.unmarked_off.take().map(|at| (at, format!("{}-{}", s.recorder.session(), s.offs)))
+        };
+        if let Some((at, tag)) = unmarked {
+            mark_off(disk, dir, at, &tag).await;
+        }
         let _step = self.step.lock().await;
         self.apply(disk).await
     }
 
-    /// The choice waiting and the clear owed, applied to the queue. Called
+    /// The choice waiting and the clears owed, applied to the queue. Called
     /// with the step held.
     async fn apply(&self, disk: &Disk) -> Applied {
-        let (choice, dir, offs) = {
+        let Some(dir) = self.state.borrow().dir.clone() else { return Applied::Done };
+        let queue = Queue::new(disk.clone(), dir);
+        // The offs written down, by this session or one before it: every
+        // batch from before the latest goes, then the marks this read (an
+        // off said meanwhile wrote its own, which its own step clears for).
+        let marks = queue.clear_marks().await;
+        if let Some(latest) = marks.iter().map(|(_, at)| *at).max() {
+            if queue.clear_through(latest).await {
+                for (mark, _) in &marks {
+                    if let Err(e) = disk.remove_file(mark).await {
+                        tracing::debug!("a diagnostics clear mark was not removed: {e}");
+                    }
+                }
+            }
+        }
+        let (choice, offs) = {
             let mut s = self.state.borrow_mut();
-            let Some(dir) = s.dir.clone() else { return Applied::Done };
             if s.unapplied.is_none() && s.offs == s.cleared {
                 return Applied::Done;
             }
-            (s.unapplied.take(), dir, s.offs)
+            (s.unapplied.take(), s.offs)
         };
-        let queue = Queue::new(disk.clone(), dir);
         if let Some(choice) = choice {
             let install = queue.install(choice.install.as_deref()).await;
             self.state.borrow_mut().install = Some(install);
@@ -215,11 +262,16 @@ impl WorkerDiagnostics {
     /// Write what was recorded as batches on the disk, one per account, then
     /// send what waits as `account` (its own batches and no one's), taken at
     /// `millis`, waiting for each request at most the send timeout on
-    /// `runtime`. Nothing happens while off, before the page has said, or
-    /// while a say or an off's clear waits to be applied; once an off is said,
+    /// `runtime`. Nothing happens while off, before the page has said, while
+    /// a say or an off's clear waits to be applied, or while an off written
+    /// down on the disk has not been cleared for; once an off is said,
     /// nothing more is written or sent, even if an "on" follows it.
     pub async fn pump(&self, disk: &Disk, http: &dyn Http, runtime: &Runtime, account: Option<SendAs<'_>>, millis: u128) {
         let _step = self.step.lock().await;
+        let Some(dir) = self.state.borrow().dir.clone() else { return };
+        if !Queue::new(disk.clone(), dir).clear_marks().await.is_empty() {
+            return;
+        }
         let taken = {
             let mut s = self.state.borrow_mut();
             let settled = s.recorder.enabled() && s.unapplied.is_none() && s.offs == s.cleared;
@@ -249,6 +301,14 @@ impl WorkerDiagnostics {
         let Some(account) = account else { return };
         let http = Bounded::new(http, runtime, self.send_timeout);
         queue.send(&http, &records_url(account.url), account.session, account.user_id, &go_on).await;
+    }
+}
+
+/// Write down an off said at `millis` in the queue in `dir`. A mark that
+/// cannot be written leaves the clear to this session's memory alone.
+async fn mark_off(disk: &Disk, dir: PathBuf, millis: u128, tag: &str) {
+    if let Err(e) = Queue::new(disk.clone(), dir).mark_cleared_before(millis, tag).await {
+        tracing::debug!("a diagnostics off was not written down: {e}");
     }
 }
 

@@ -337,7 +337,46 @@ impl Queue {
             let _ = self.disk.remove_file(&path).await;
         }
     }
+
+    /// An off said at `millis`, written down before its clear has run, so
+    /// that the clear is owed by whichever session opens this queue next
+    /// (`tag` makes the name this off's own). Outside the `records-*` names.
+    pub async fn mark_cleared_before(&self, millis: u128, tag: &str) -> io::Result<()> {
+        self.disk.create_dir_all(&self.dir).await?;
+        self.disk.write(self.dir.join(format!("{CLEAR_MARK}{millis:013}-{tag}")), b"").await
+    }
+
+    /// The offs written down and not yet cleared for: each mark's path and
+    /// its time.
+    pub async fn clear_marks(&self) -> Vec<(PathBuf, u128)> {
+        let Ok(entries) = self.disk.list(&self.dir).await else { return Vec::new() };
+        entries
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .filter_map(|e| {
+                let millis = e.name()?.strip_prefix(CLEAR_MARK)?.split('-').next()?.parse::<u128>().ok();
+                // A mark whose time cannot be read asks for everything.
+                Some((e.path.clone(), millis.unwrap_or(u128::MAX)))
+            })
+            .collect()
+    }
+
+    /// Every batch written at or before `millis` goes (one whose name gives
+    /// no time goes too); whether all of them did.
+    pub async fn clear_through(&self, millis: u128) -> bool {
+        let mut all = true;
+        for path in self.waiting().await {
+            let written = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("records-")?.split('-').next()?.parse::<u128>().ok());
+            if written.is_none_or(|written| written <= millis) && self.disk.remove_file(&path).await.is_err() {
+                all = false;
+            }
+        }
+        all
+    }
 }
+
+/// The name an off written down starts with: `clear-before-<millis>-<tag>`.
+const CLEAR_MARK: &str = "clear-before-";
 
 /// Send one report's `body` to the accounts service at `service` as the
 /// account `bearer` holds: the report's code, or a sentence.
