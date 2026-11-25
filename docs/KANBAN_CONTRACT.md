@@ -360,7 +360,7 @@ The height cap was taken back on 2026-11-23 (see "Columns grow with their cards"
 - A lane's row is drawn from the lane without its columns (rinch's `for` draws a row again
   when its item changes): its cells follow the board on their own, so an edit to one card
   redraws only its column's cell, never a card being dragged in another.
-- **Tests:** kanban-viewer 12 (`a_board_is_aligned_when_every_lane_has_the_same_columns`,
+- **Tests:** kanban-viewer 13 (`a_board_is_aligned_when_every_lane_has_the_same_columns`,
   `the_look_is_remembered_as_json_and_read_back`,
   `a_column_grows_with_its_cards_unless_its_lane_is_minimized`); pimble-plugin-host kanban
   6, updated for the keyboard in place of "Move to", "Add card" on hover, and a drop into a
@@ -400,4 +400,56 @@ host's rinch stylesheet: the plugin and the app ship together. pimble-plugin-hos
 kanban tests check the collapse and the gap's shifted items in place of the old caret.
 Checked in the release desktop app: Charlie dragged from Doing over To do showed its
 picture at the pointer, To do opened a gap, Doing closed up, and the drop landed there.
+
+### Where a card lands, lit (2026-11-24)
+
+Joe (installed 0.30.2): nothing lit up where a dragged card would land; the gap alone,
+cards sliding apart, did not say it. Two things now say it:
+
+- **The cell the drop goes to is lit** (`styles::drop_lit`, `pimble_ui::viewer::drop_panel`):
+  while a card is dragged over a column's list, that cell takes the accent border, a ring
+  in its shadow and a faint accent wash; red border and ring when the drop would be
+  refused. It reads rinch's `sortable_drag()` (group `cards`; the offered place's list,
+  else the list under the pointer), so only the cell the drop would go to is lit (the
+  one holding the slot, when one is drawn), and a column drag lights none.
+- **The gap holds a slot** (rinch, a general mechanism of `SortIndicator::Gap`): the space
+  a gap list opens is drawn as a card-sized box where the card will land, styled by
+  `--rinch-sortable-slot-background`, `-border` and `-radius`, which `SORT_THEME` sets to
+  a dashed accent outline over an accent wash. Between cards it is the `::before` of the
+  card after the gap, riding that card's shift, so it moves nothing; at the end of a
+  column (an empty one included) it is the list's own `::after`, in the flow, so the
+  column grows to hold it rather than the slot hanging over the next lane. In the card's
+  own column, where the collapsed card's room is already open at the end, the last card
+  draws it in that room. It needs nothing from the plugin.
+
+### Leftover lines after a drag (2026-11-24)
+
+Joe's screenshot: thin blue lines stayed right of the last column and along the next
+lane's bar after drags. They were the chosen card's 2 px border in the drag ghost: the
+GPU frame repainted the ghost's old place at its translate truncated to whole pixels and
+at its box, while the ghost was drawn at the fractional translate (and its paint can
+reach past its box), so the right column and bottom row of each old ghost position were
+never repainted. rinch now damages the ghost's painted bounds at the real translate,
+rounded out (`ghost_overlay_rect`, `paint_subtree_bounds`). Checking the slot found one
+more of the same kind: a card sliding aside for a gap (a `transform` transition) left a copy
+of its slot at its old place, because a transform that changes without starting or stopping
+damaged the card's box alone; rinch now damages the box's whole painted subtree then, as it
+does for a layout move. All three are rinch
+joeleaver/rinch#3065; until it is merged every rinch dependency names its branch
+`fix/drag-ghost-damage-and-sortable-slot` (move them back to `main` when it lands).
+
+- **Tests:** kanban-viewer `the_cell_a_card_is_dragged_over_is_lit` (the offered place's cell, else the one under the pointer, red when refused, none for
+  a column drag); in rinch, `sortable_2154_tests` (the slot between items, at the end of
+  another list in its flow, at the end of its own collapsed list, in an empty list, none
+  for a caret list), `gpu_drag_ghost_damage_tests` and rinch-dom's
+  `transformed_subtree_damage_tests`.
+- **Checked in the release desktop app** (port 7497, scratch dirs, a board with lanes Work
+  and Untitled, 3840x2128 window): before the fix, dragging the chosen Hotel W past Done
+  and back left a row of thin blue vertical lines and a horizontal one on the GPU, and none
+  with `--cpu`; after it, the same drag leaves nothing. Held over Untitled's To do, that
+  cell is lit and a dashed slot shows above Alpha U; the drop lands there. A card dragged
+  to the end of another column (Delta U under Work's Golf W) shows the slot inside that
+  column, which grows to hold it; one dragged to the end of its own column (Alpha W) shows
+  one slot in the room it left (before the transform fix a second, stale one stayed a card
+  lower), and lands last with nothing left behind.
 

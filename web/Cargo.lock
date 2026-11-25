@@ -25,6 +25,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fca89247609239eeb6915e6991111866b92d7b31025e69302bbf430cc4d2c38"
 dependencies = [
  "cfg-if",
+ "getrandom 0.3.4",
  "getrandom 0.4.3",
  "once_cell",
  "serde",
@@ -2136,7 +2137,7 @@ dependencies = [
 [[package]]
 name = "parlance"
 version = "0.1.1"
-source = "git+https://github.com/joeleaver/parley-fork?rev=a95d78063bc05502327e384d9fdac927016d877a#a95d78063bc05502327e384d9fdac927016d877a"
+source = "git+https://github.com/joeleaver/parley-fork?rev=73e8afa10c482d69be6763efd1a85b1ca04a448f#73e8afa10c482d69be6763efd1a85b1ca04a448f"
 
 [[package]]
 name = "password-hash"
@@ -3176,7 +3177,7 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "js-sys",
  "log",
@@ -3196,7 +3197,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -3209,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "arboard",
  "js-sys",
@@ -3222,7 +3223,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -3234,7 +3235,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -3244,7 +3245,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "rinch-words",
 ]
@@ -3252,7 +3253,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -3262,7 +3263,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -3274,7 +3275,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -3285,7 +3286,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3295,7 +3296,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "web-time",
 ]
@@ -3303,18 +3304,23 @@ dependencies = [
 [[package]]
 name = "rinch-spell"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
+ "dispatch2",
  "icu_normalizer",
  "icu_properties",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "spellbook",
  "unicode-segmentation",
+ "windows",
 ]
 
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "heck",
  "rinch-core",
@@ -3326,12 +3332,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "js-sys",
  "rinch",
@@ -3347,7 +3353,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#e8e04ccca995e97c31780633481ea276c8e1ade4"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fdrag-ghost-damage-and-sortable-slot#b2596d5c8d0a4158f12414f4129f7b7853e1b753"
 dependencies = [
  "regex",
  "unicode-segmentation",
@@ -3883,7 +3889,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4733,6 +4739,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4743,6 +4770,17 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
 ]
 
 [[package]]
@@ -4772,6 +4810,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
 
 [[package]]
 name = "windows-result"
@@ -4882,6 +4930,15 @@ dependencies = [
  "windows_x86_64_gnu 0.53.1",
  "windows_x86_64_gnullvm 0.53.1",
  "windows_x86_64_msvc 0.53.1",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

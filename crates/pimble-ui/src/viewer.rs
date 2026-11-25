@@ -31,9 +31,22 @@ pub const FIELD_STYLE: &str = "flex: 1 1 0; min-width: 0; width: 100%; box-sizin
 /// A line of small dimmed text: a status, a count.
 pub const LINE_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed);";
 
-/// rinch's sortable lists' caret and refusal box in the app's own theme
-/// colors, through the properties its stylesheet reads.
-pub const SORT_THEME: &str = " --rinch-sortable-caret-color: var(--rinch-primary-color); --rinch-sortable-refused-color: var(--rinch-color-red-6); --rinch-sortable-reason-bg: var(--rinch-color-red-6); --rinch-sortable-reason-color: var(--rinch-color-white, #ffffff); --rinch-sortable-reason-font-size: 12px; --rinch-sortable-reason-radius: 4px; --rinch-sortable-reason-white-space: normal; --rinch-sortable-reason-max-width: 220px; --rinch-sortable-dragging-opacity: 0.45;";
+/// rinch's sortable lists' caret, refusal box and slot in the app's own theme
+/// colors, through the properties its stylesheet reads. The slot is the
+/// place a gap list opens for a drop, card-sized, lit in the accent: where
+/// the dragged item will land.
+pub const SORT_THEME: &str = " --rinch-sortable-caret-color: var(--rinch-primary-color); --rinch-sortable-refused-color: var(--rinch-color-red-6); --rinch-sortable-reason-bg: var(--rinch-color-red-6); --rinch-sortable-reason-color: var(--rinch-color-white, #ffffff); --rinch-sortable-reason-font-size: 12px; --rinch-sortable-reason-radius: 4px; --rinch-sortable-reason-white-space: normal; --rinch-sortable-reason-max-width: 220px; --rinch-sortable-dragging-opacity: 0.45; --rinch-sortable-slot-background: color-mix(in srgb, var(--rinch-primary-color) 16%, transparent); --rinch-sortable-slot-border: 2px dashed var(--rinch-primary-color); --rinch-sortable-slot-radius: 6px;";
+
+/// What a panel ([`PANEL`]) adds while a dragged item is over it: lit in the
+/// accent when the drop would be taken, in red when it would be refused. A
+/// ring in its shadow, so lighting it moves nothing.
+pub fn drop_panel(refused: bool) -> &'static str {
+    if refused {
+        " border-color: var(--rinch-color-red-6); box-shadow: 0 0 0 1px var(--rinch-color-red-6);"
+    } else {
+        " border-color: var(--rinch-primary-color); box-shadow: 0 0 0 1px var(--rinch-primary-color); background: color-mix(in srgb, var(--rinch-primary-color) 8%, var(--viewer-panel));"
+    }
+}
 
 /// The icon a plain note has (`appearance::node_icon`), which an item leaves
 /// out: it says nothing there.

@@ -243,7 +243,8 @@ pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column,
         div {
             class: "kanban__cell",
             data-kanban-column: key_of(addr),
-            style: cell_style(size),
+            // Lit while a dragged card is over it: where it will land.
+            style: {move || format!("{}{}", cell_style(size), drop_lit(sortable_drag().as_ref(), &key_of(addr)))},
             onmouseenter: move || kenter.hovered.set(Some(addr)),
             onmouseleave: move || {
                 if untracked(|| kleave.hovered.get()) == Some(addr) {
