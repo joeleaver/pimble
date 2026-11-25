@@ -5,6 +5,7 @@
 //! - Request/response types
 //! - Server and client traits
 
+pub mod account;
 pub mod app_links;
 pub mod diagnostics;
 pub mod dispatch;
@@ -15,6 +16,7 @@ pub mod types;
 pub mod vault;
 pub mod vault_cursor;
 
+pub use account::*;
 pub use app_links::*;
 pub use diagnostics::*;
 pub use error::*;

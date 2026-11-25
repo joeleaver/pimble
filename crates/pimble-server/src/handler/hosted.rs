@@ -16,23 +16,20 @@ use super::{hosted_plain, to_rpc_error, RpcHandler, RELAYED_PLACEHOLDER_NAME};
 use crate::cloud::HeldAs;
 use crate::vault_link::LinkEndpoint;
 
-/// What to do when the account's rows do not name the store at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unlisted {
-    /// Held as it always was, whole and writable (`cloudAddHostedStore`:
-    /// an accounts service that lists nothing).
-    AsOwner,
-    /// Refused: the account holds nothing of it (a mount's source, which
-    /// the person did not ask to add).
-    Refuse,
+/// The sentence for a store the signed-in account has no row for: nothing
+/// of it is the account's to add, whole or in part. Before 2026-11-25
+/// `cloudAddHostedStore` added such a store whole and writable, and the
+/// link's first grant refresh ended it at once as "no longer shared".
+pub(crate) fn not_held_refusal(store_id: StoreId) -> String {
+    format!("The signed-in Pimble Cloud account does not hold store {store_id}, so it cannot be added here.")
 }
 
 impl RpcHandler {
     /// Add the hosted store `store_id` as a replica here, as the signed-in
     /// account holds it, or add to the share's replica already here the
-    /// roots of a share given since. `unlisted` says what a store no row
-    /// names is.
-    pub(crate) async fn add_hosted_store(&self, store_id: StoreId, unlisted: Unlisted) -> Result<OpenStoreResponse, ErrorObjectOwned> {
+    /// roots of a share given since. A store no row names is refused
+    /// ([`not_held_refusal`]).
+    pub(crate) async fn add_hosted_store(&self, store_id: StoreId) -> Result<OpenStoreResponse, ErrorObjectOwned> {
         info!("Adding hosted store {} as a local replica", store_id);
 
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
@@ -40,12 +37,7 @@ impl RpcHandler {
         // How the account holds the store: the whole of it, or shares of it
         // (a row per grant, docs/NODE_DOCUMENT_CONTRACT.md section 5).
         let rows = crate::cloud::list_stores(self.http(), &account.url, &account.session).await.map_err(to_rpc_error)?;
-        // No row for it: what `unlisted` says.
-        let held_as = match (HeldAs::from_rows(&rows, store_id), unlisted) {
-            (Some(held_as), _) => held_as,
-            (None, Unlisted::AsOwner) => HeldAs::owner(),
-            (None, Unlisted::Refuse) => return Err(to_rpc_error(format!("the signed-in Pimble Cloud account holds nothing of store {}", store_id))),
-        };
+        let held_as = HeldAs::from_rows(&rows, store_id).ok_or_else(|| to_rpc_error(not_held_refusal(store_id)))?;
         // A store shared from its owner's computer has no name on Pimble
         // Cloud (docs/RELAY_CONTRACT.md), and a store's name is in no
         // document: held whole (the owner's other device), it is called what

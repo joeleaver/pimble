@@ -4833,3 +4833,6 @@ async fn a_queued_notice_is_pushed_encrypted_to_the_subscription() {
 // does not take for a test of its own.
 #[path = "integration/watches.rs"]
 mod watches;
+
+#[path = "integration/account_worker.rs"]
+mod account_worker;

@@ -20,9 +20,11 @@ use pimble_host::http::{Body, Http, HttpRequest, HttpResponse, Method};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod account;
 mod members;
 mod notices;
 
+pub use account::*;
 pub use members::*;
 pub use notices::*;
 

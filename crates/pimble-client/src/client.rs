@@ -36,6 +36,8 @@ use url::Url;
 
 use crate::error::{ClientError, Result};
 
+mod account;
+
 /// Client for connecting to a Pimble server via WebSocket.
 ///
 /// Uses WebSocket transport to support both RPC calls and subscriptions.

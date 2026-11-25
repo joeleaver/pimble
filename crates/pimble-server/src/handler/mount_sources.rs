@@ -14,7 +14,6 @@
 use pimble_core::{AuthMethod, MountRef, RemoteEndpoint, StoreId};
 use tracing::{debug, info, warn};
 
-use super::hosted::Unlisted;
 use super::RpcHandler;
 
 /// One place a mount's source may be had from, in the order they are tried.
@@ -77,7 +76,7 @@ impl RpcHandler {
 
         for route in &candidates {
             let (made, from) = match route {
-                SourceRoute::Account => (self.add_hosted_store(source, Unlisted::Refuse).await.map(|_| ()), "the signed-in account".to_string()),
+                SourceRoute::Account => (self.add_hosted_store(source).await.map(|_| ()), "the signed-in account".to_string()),
                 SourceRoute::Remote(remote) => (self.create_replica_from(remote.clone(), source, None, false).await.map(|_| ()), remote.url.to_string()),
             };
             match made {

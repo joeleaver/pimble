@@ -40,6 +40,7 @@
 //! several documents' updates, is applied whole before repair judges it
 //! (see [`Repair`]).
 
+mod account;
 mod diagnostics;
 mod hosted;
 mod hosted_plain;
@@ -4569,7 +4570,7 @@ impl PimbleApiServer for RpcHandler {
 
     async fn cloud_add_hosted_store(&self, ext: &Extensions, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudAddHostedStore")?;
-        self.add_hosted_store(request.store_id, hosted::Unlisted::AsOwner).await
+        self.add_hosted_store(request.store_id).await
     }
 
     /// Hosted side (docs/NODE_DOCUMENT_CONTRACT.md section 5): the accounts
@@ -4717,6 +4718,33 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_stop_sharing(&self, ext: &Extensions, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudStopSharing")?;
         self.stop_sharing(request).await
+    }
+
+    // The account page (`handler/account.rs`).
+
+    async fn cloud_change_password(&self, ext: &Extensions, request: pimble_rpc::CloudChangePasswordRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudChangePassword")?;
+        self.change_password(request.current_password, request.new_password).await.map(|()| EmptyResponse {})
+    }
+
+    async fn cloud_new_recovery_code(&self, ext: &Extensions) -> Result<pimble_rpc::CloudNewRecoveryCodeResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudNewRecoveryCode")?;
+        self.new_recovery_code().await.map(|code| pimble_rpc::CloudNewRecoveryCodeResponse { code })
+    }
+
+    async fn cloud_store_members(&self, ext: &Extensions, request: pimble_rpc::CloudStoreRef) -> Result<pimble_rpc::CloudStoreMembersResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStoreMembers")?;
+        self.store_members(request.store_id).await
+    }
+
+    async fn cloud_store_set_member(&self, ext: &Extensions, request: pimble_rpc::CloudStoreSetMemberRequest) -> Result<pimble_rpc::CloudStoreMembersResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStoreSetMember")?;
+        self.store_set_member(request.store_id, &request.email, request.role).await
+    }
+
+    async fn cloud_store_remove_member(&self, ext: &Extensions, request: pimble_rpc::CloudStoreRemoveMemberRequest) -> Result<pimble_rpc::CloudStoreMembersResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStoreRemoveMember")?;
+        self.store_remove_member(request.store_id, &request.email).await
     }
 
     async fn create_store(
