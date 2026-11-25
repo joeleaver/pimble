@@ -1,5 +1,29 @@
 # Next session: start here
 
+**2026-11-25 (master local_198b8f9e, transcript 3e8511e5): 0.32.0 shipped.**
+- Release 0.32.0: themes wave 1 (built-ins, the Node menu, the two-column chooser), spellcheck
+  and Markdown shortcuts in the note editor (rinch main f9d15abf). Tag `v0.32.0`, Release green
+  with 13 assets, installed here, web on jkbase v70 (sw.js 200), Bear summary posted 11/25.
+- Pinned rinch: every lock (root, web, plugins) names the branch `fix/editor-blocks-before-overlays`
+  (joeleaver/rinch#3070, Book/Manuscript first-line indent). rinch's main needs its batched
+  `batch/` run to merge it. When #3070 is on main, move every pin back to main (`cargo update rinch
+  rinch-tabler-icons rinch-editor-core` at the root, in `web/` and `plugins/`).
+- Kanban drags (session local_97f04d79 / child local_22a130b9): `claude/priceless-fermi-4489df`
+  (d5dfc63) lights the landing column and stops GPU trails; it pins rinch to #3065's branch. It
+  can't merge until #3065 and #3070 both reach rinch main. Then rebase onto main, do an independent
+  review, merge, release.
+- 0.32.0 web deploy failure: web/Cargo.lock left ahash 0.8.13 with two getrandoms (E0464 in the
+  worker). Fixed with ahash 0.8.14 (80e0de1). CI now has a `cargo check (web, wasm)` job.
+- rinch spellcheck gaps filed: #3067 (no web suggestions or Add to dictionary), #3068 (an editor
+  focused before the dictionary loads isn't checked). Read-only notes get no underlines, on purpose (Joe).
+- No working keyboard shortcut for center-align: Ctrl+Shift+E opens Focus Explorer. Pimble has no
+  left-align UI at all.
+- Notifications wave 5 (local_29e8b449, /home/joe/dev/pimble-wave5): its `hosted_plain` test was
+  hung for 14h at 0% CPU (pid 1740428 on 2026-11-25). Left for that session.
+- Next: themes waves 2 (theme nodes, editor, copying) and 3 (app themes), which can run side by side,
+  then waves 4 and 5 (MCP). The splits of handler.rs, vault_link.rs, canvas_tools.rs and
+  sheet_tools.rs are still open.
+
 **2026-11-23 (master session local_198b8f9e, transcript 3e8511e5): wave 5 started.**
 Cleanup of session 78e7f30f done: its scratch (1.8 GB) deleted. It is the app session
 `local_0e9ad72e` ("Pimble"); archiving it was refused while a Remote Control client is
