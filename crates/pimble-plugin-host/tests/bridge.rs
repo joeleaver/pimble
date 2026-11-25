@@ -79,8 +79,12 @@ fn the_hello_plugin_reads_renames_and_moves_through_the_api() {
     running.pump_until(&f, "the move", |r| r.text().contains("Moved to the top."));
     let (_, children) = f.rt.block_on(f.service.get_children(store, f.board)).unwrap();
     assert_eq!(children.iter().map(|n| n.id).collect::<Vec<_>>(), vec![f.write, f.plan]);
-    let text = running.text();
-    assert!(text.find("Write it").unwrap() < text.find("Planned").unwrap(), "{text}");
+    // The plugin's own order comes from the change stream, after its "Moved"
+    // line: wait for it rather than read it at once.
+    running.pump_until(&f, "the plugin's new order", |r| {
+        let text = r.text();
+        matches!((text.find("Write it"), text.find("Planned")), (Some(write), Some(plan)) if write < plan)
+    });
 
     // A move into itself is refused by `plan`, in the plugin, with the explorer's
     // sentence; nothing is sent.
