@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
+        # A runner whose apt hangs fails here, not six hours later (2026-11-26).
+        timeout-minutes: 15
         run: |
           # ubuntu-22.04 runners ship a google-chrome apt source this build
           # never uses; its CDN intermittently serves a stale index and
@@ -116,6 +118,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
+        # A runner whose apt hangs fails here, not six hours later (2026-11-26).
+        timeout-minutes: 15
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list \
                      /etc/apt/sources.list.d/google-chrome*.sources

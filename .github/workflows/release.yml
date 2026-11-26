@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
+        # A runner whose apt hangs fails here, not six hours later (2026-11-26).
+        timeout-minutes: 15
         run: |
           # See ci.yml for why the google-chrome source is dropped first.
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list \
