@@ -31,6 +31,11 @@ jobs:
             libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev \
             libpango1.0-dev libgdk-pixbuf2.0-dev libxdo-dev libmpv-dev
 
+      # The browser holds one path since wave 5 of
+      # docs/ONE_CODEBASE_CONTRACT.md: its own server, nothing beside it.
+      - name: No second path in web/
+        run: scripts/check-one-path.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
