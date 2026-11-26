@@ -342,13 +342,16 @@ Each wave is checked in the desktop app and in the browser on the local stack
 
 **The desktop's server** (`pimble-server`):
 - `crate::people` keeps `<store>/people.json`: per scope the store is held through,
-  each person's id and name, plus `my_name` and `my_name_chosen`. It is derived data,
-  never synced.
+  each person's id and name, plus `my_name` and `my_name_chosen`; and, under `alone`,
+  the account's own shares that nobody else is in (docs/MCP_CONTRACT.md "Who can open a
+  note"). It is derived data, never synced.
 - `people.json` is refreshed:
   - at every vault-link connect and on its two-minute grant check (spawned, so it does
     not hold the link up);
   - on `cloudPeople`, which answers the cache when the service cannot be reached;
-  - after a name is set.
+  - after a name is set;
+  - after this device shares a node, invites, removes a member or stops a share, whether
+    or not the call went through.
 - A refresh that changes anything sends `StoreChangeKind::PeopleChanged`, which links
   never forward.
 - New Service-only RPCs:
