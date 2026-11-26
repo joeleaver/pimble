@@ -4,7 +4,6 @@
 //! any cursor that rests; Ctrl+A selects every row at the cursor's level under
 //! its parent. `tree_keys` maps the keys here.
 
-use std::cell::Cell;
 use std::collections::HashSet;
 
 use rinch::prelude::{set_timeout, untracked, TreeNodeData, UseTreeReturn};
@@ -55,11 +54,6 @@ pub(crate) fn siblings(data: &[TreeNodeData], cursor: &str) -> Vec<String> {
     find(data, cursor).unwrap_or_default()
 }
 
-thread_local! {
-    /// Which page move is the latest: an older one's rest does nothing.
-    static PAGE_MOVE: Cell<u64> = const { Cell::new(0) };
-}
-
 /// PageDown (`down`) or PageUp with the cursor on `cursor`.
 pub(crate) fn page(store: AppStore, tree_state: UseTreeReturn, cursor: &str, down: bool) {
     let data = untracked(|| store.build_tree_data_structural());
@@ -68,16 +62,9 @@ pub(crate) fn page(store: AppStore, tree_state: UseTreeReturn, cursor: &str, dow
     // The row takes the keyboard and is scrolled to, as an arrow's row is.
     tree_state.controller.set_cursor(&target);
     tree_state.controller.focus();
-    let this = PAGE_MOVE.with(|m| {
-        m.set(m.get() + 1);
-        m.get()
-    });
-    let _ = set_timeout(REST_MS, move || {
-        let latest = PAGE_MOVE.with(|m| m.get()) == this;
-        if latest && untracked(|| tree_state.controller.cursor()).as_deref() == Some(target.as_str()) {
-            cursor_rested(store, tree_state, target);
-        }
-    });
+    // It opens once it rests there (`cursor_rested` skips a rest the
+    // cursor has left since).
+    let _ = set_timeout(REST_MS, move || cursor_rested(store, tree_state, target));
 }
 
 /// Ctrl+A with the cursor on `cursor`: its level under its parent becomes the
@@ -94,8 +81,13 @@ pub(crate) fn select_siblings(store: AppStore, tree_state: UseTreeReturn, cursor
 /// The cursor came to rest on `value` (the Tree's `oncursor`, and a page
 /// move's): the document follows it. A cursor that rests on one of several
 /// selected rows (the end of a Shift run) opens nothing: opening selects the
-/// row alone. Off the selection it opens the row, as a click would.
+/// row alone. Off the selection it opens the row, as a click would. A rest
+/// the cursor has since left (an arrow's, overtaken by a page move inside
+/// the rest) opens nothing.
 pub(crate) fn cursor_rested(store: AppStore, tree_state: UseTreeReturn, value: String) {
+    if untracked(|| tree_state.controller.cursor()).as_deref() != Some(value.as_str()) {
+        return;
+    }
     let selected = untracked(|| tree_state.selected.get());
     if selected.len() > 1 && selected.contains(&value) {
         return;

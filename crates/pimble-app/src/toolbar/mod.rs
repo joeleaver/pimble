@@ -549,4 +549,25 @@ mod tests {
             assert_eq!(after[i], expected, "button {i}");
         }
     }
+
+    /// The Block Quote button (and Ctrl+Shift+B, crate::editor_keys) wraps
+    /// the paragraph in a quote, lifts it out when pressed again, and leaves a
+    /// note this device may only read alone.
+    #[test]
+    fn the_quote_toggle_wraps_lifts_and_leaves_a_read_only_note_alone() {
+        let store = AppStore::new();
+        let pane = store.focused();
+        let h = editor(pane);
+        assert!(h.load_html("<p>quote me</p>"));
+        h.set_selection(Selection::cursor(Pos(2)));
+        toggle_quote(store, pane);
+        assert_eq!(block_type(&h), "blockquote");
+        toggle_quote(store, pane);
+        assert_eq!(block_type(&h), "paragraph");
+
+        h.set_read_only(true);
+        toggle_quote(store, pane);
+        assert_eq!(block_type(&h), "paragraph", "a read-only note is not changed");
+        h.set_read_only(false);
+    }
 }

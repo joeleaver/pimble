@@ -368,8 +368,9 @@ deletes, creates, renames from the tree), cleared on restart.
 
 - **rinch** (#1601, merged to `main`): `Tree { keyboard, handle_key, oncursor, cursor_delay_ms,
   label_of }`, `UseTreeReturn::cursor`, `TreeController::{set_cursor, cursor, focus}`.
-  The Tree moves the cursor (arrows, Home, End, PageUp, PageDown, Right and Left, `*`,
-  type-ahead) and offers every key to `handle_key` first, with
+  The Tree moves the cursor (arrows, Home, End, Right and Left, `*`, type-ahead; PageUp
+  and PageDown until rinch #3062, Pimble's own since: `tree_pages.rs`, ten drawn rows, the
+  document following once the cursor rests) and offers every key to `handle_key` first, with
   `TreeKey::drop_for(TreeMove::{Indent, Outdent, Up, Down})` turning one into the same
   `TreeDrop` a drag would make, and `above`/`below` naming the neighbors. Keys are the
   tree's only while focus is on one of its rows. The hook is `handle_key`, not `onkey`:
@@ -417,7 +418,8 @@ deletes, creates, renames from the tree), cleared on restart.
   refused node leaves everything where it was.
 - **rinch** (#1598, merged to `main` as `dc6a87bf`; Pimble is back on rinch `main`): with `UseTreeOptions::multiple`, Ctrl-click (or Cmd) adds or
   removes a row, Shift-click and Shift+arrows select the run of drawn rows from the anchor,
-  Ctrl+A the cursor row's siblings; none opens anything. `onselectionchange`,
+  Ctrl+A the cursor row's siblings (rinch's until #3062, Pimble's own since: `tree_pages.rs`
+  `select_siblings`); none opens anything. `onselectionchange`,
   `TreeController::set_selection`. Collapsing a row unselects what it hides. A drag of a
   selected row and `TreeKey::drop_for` carry the selection top to bottom, leaving out rows
   inside other selected rows; a keyboard move of several needs them to share a parent.

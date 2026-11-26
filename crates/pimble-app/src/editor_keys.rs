@@ -67,8 +67,8 @@ mod tests {
     use crate::rinch_editor::create_editor;
 
     /// Ctrl+Shift+B is the editor's again: the key is taken (the toggle itself
-    /// runs a turn later, through the toolbar's code, which needs the app's
-    /// store and is covered by the toolbar's tests), and the chords Pimble
+    /// runs a turn later, through the toolbar's code: `toolbar::tests::
+    /// the_quote_toggle_wraps_lifts_and_leaves_a_read_only_note_alone`), and the chords Pimble
     /// never advertised are still left to the app.
     #[test]
     fn ctrl_shift_b_is_the_editors_and_the_rest_are_not() {
