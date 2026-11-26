@@ -65,6 +65,13 @@ fn a_drop_into_a_group_is_a_drop_into_its_parent() {
     // A note beside the root's Themes row: the root's last place.
     let beside = plan_drop(app, &drop(&[row(&t, t.recipes)], &format!("store_{s}"), TreeSlot::After(themes.clone())));
     assert_eq!(moved_to(beside), (t.root, Place::Last));
+    // A theme beside its own group (Alt+Shift+Left out of Themes) stays:
+    // the parent's list is not reordered unseen.
+    let outdent = plan_drop(app, &drop(&[row(&t, t.book)], &format!("store_{s}"), TreeSlot::After(themes.clone())));
+    assert!(matches!(outdent, DropPlan::Stays(_)), "{outdent:?}");
+    // Beside another parent's group it moves there.
+    let elsewhere = plan_drop(app, &drop(&[row(&t, t.book)], &row(&t, t.folder), TreeSlot::After(folder_themes.clone())));
+    assert_eq!(moved_to(elsewhere), (t.folder, Place::Last));
 }
 
 /// A drop that would put something else in a group is refused with the

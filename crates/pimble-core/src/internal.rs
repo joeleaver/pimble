@@ -68,8 +68,8 @@ impl InternalKind {
         }
     }
 
-    /// Why a drop into this kind's group of the explorer (Internal >
-    /// Themes) is refused when it carries something else: the group shows
+    /// Why a drop into this kind's group of the explorer ("Themes") is
+    /// refused when it carries something else: the group shows
     /// the parent's nodes of this kind and nothing more.
     pub fn only_here(self) -> &'static str {
         match self {

@@ -53,7 +53,7 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
     if let Some(opening) = store.opening_row(&node_value) {
         return opening_row_view(__scope, &opening);
     }
-    // A grouping row over shown internal nodes (Internal, Themes): no node.
+    // A grouping row over shown internal nodes ("Themes"): no node.
     if let Some(group) = crate::state::internal_group(&node_value) {
         return super::internal_row::internal_group_view(__scope, store, tree_state, menu, &node_value, &group);
     }

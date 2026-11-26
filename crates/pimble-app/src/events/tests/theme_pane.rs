@@ -79,3 +79,57 @@ fn an_ordinary_reveal_opens_no_group() {
     assert!(untracked(|| tree_state.expanded.get()).iter().all(|v| !crate::state::is_internal_group(v)));
     assert_eq!(untracked(|| tree_state.controller.cursor()), None);
 }
+
+/// docs/TREE_CONTRACT.md "Internal groups": once a theme moves, the group
+/// it shows in is opened: the one dropped into, or under the row dropped
+/// on (a mount's own Themes for a drop on a mount row). A drop into a group
+/// that this move does not answer (refused, or a move made elsewhere) opens
+/// nothing of it.
+#[test]
+fn a_moved_theme_is_seen_in_its_group() {
+    use crate::state::{internal_group_value, set_last_drop_target_value, test_fixtures::a_store_with_themes};
+    use pimble_core::internal::InternalKind;
+    let (store, t) = a_store_with_themes();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::bounded::<BackendCommand>(64);
+    let (events, event_rx) = crossbeam_channel::bounded::<BackendEvent>(64);
+    store.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
+    let s = t.store_id;
+    let mount = Node::document("Mounted");
+    let m = mount.id;
+    store.upsert_node(s, mount);
+    let source = pimble_core::MountRef { source_store: s, source_node: t.folder, source_path: None, source_remote: None };
+    store.set_mount_state(s, m, pimble_core::MountState::Live, source);
+    store.internal_shown[InternalKind::Theme.index()].set(true);
+    let moved = |node_id, new_parent_id| BackendEvent::NodeMoved { store_id: s, node_id, old_parent_id: t.root, new_parent_id };
+    let opened = |tree_state: UseTreeReturn| untracked(|| tree_state.expanded.get());
+
+    // Into the folder's Themes: the folder and its group open.
+    let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    let folder_themes = internal_group_value(s, t.folder, InternalKind::Theme, "");
+    untracked(|| store.build_tree_data_structural());
+    set_last_drop_target_value(folder_themes.clone());
+    events.send(moved(t.book, t.folder)).unwrap();
+    process_backend_events(store, tree_state);
+    let open = opened(tree_state);
+    assert!(open.contains(&folder_themes) && open.contains(&format!("node_{s}_{}", t.folder)), "{open:?}");
+
+    // On the mount row: the mount and the mount's own Themes open.
+    let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    let mount_row = format!("node_{s}_{m}");
+    set_last_drop_target_value(mount_row.clone());
+    events.send(moved(t.code, t.folder)).unwrap();
+    process_backend_events(store, tree_state);
+    let open = opened(tree_state);
+    let mount_themes = internal_group_value(s, m, InternalKind::Theme, &format!("/{s}_{m}"));
+    assert!(open.contains(&mount_row) && open.contains(&mount_themes), "{open:?}");
+
+    // A group drop left behind by a move into somewhere else opens nothing
+    // of that group.
+    let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    set_last_drop_target_value(folder_themes.clone());
+    events.send(moved(t.inner, t.root)).unwrap();
+    process_backend_events(store, tree_state);
+    let open = opened(tree_state);
+    assert!(!open.contains(&folder_themes), "{open:?}");
+    assert!(open.contains(&internal_group_value(s, t.root, InternalKind::Theme, "")), "the root's Themes, where it went");
+}

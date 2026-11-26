@@ -531,10 +531,14 @@ Themes; a theme moved into a folder or a share is under that folder's.
   parent's last place. A theme dropped on an ordinary row goes in it, as any node, and shows in that
   row's group; nothing goes inside a theme. Through a mount a group's parent row is the
   mount's, and the drop moves into the source as any drop into a mount does. After the
-  move the group is opened so the node is seen (`events::nodes::node_moved`).
+  move the group is opened so the node is seen (`events::nodes::node_moved`): the group
+  dropped into when the move answers it, else the group under the row dropped on (a
+  mount row's own Themes, at the mount's level).
 - **The keyboard** follows from the drops: Alt+Shift+Up/Down moves a theme among its
-  group's rows, Outdent out of Themes is beside the group, the parent's last place (it
-  stays in the group), Indent into a theme is refused. Ctrl+A on a theme takes the themes of its group.
+  group's rows, Outdent out of Themes (beside the group, among the nodes it already shows
+  with) stays where it is and sends nothing, as does a theme dragged to just below its
+  own group (`internal_drop::beside_own_group`), so the parent's list is never reordered
+  unseen; Indent into a theme is refused. Ctrl+A on a theme takes the themes of its group.
 
 ## Out of scope
 

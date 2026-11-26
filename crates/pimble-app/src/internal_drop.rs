@@ -44,6 +44,21 @@ pub(crate) fn group_drop(store: AppStore, parent: Option<&str>, slot: &TreeSlot,
     Some(Ok(GroupDrop { parent_row: group.parent_row, place, expand: value.to_string() }))
 }
 
+/// Whether a drop of `nodes` right after the grouping row in `slot` puts
+/// them where they already show: each of the group's kind and a child of
+/// the parent it groups (an Outdent out of Themes, or a theme dragged to
+/// just below its own group). Beside the group means the parent's last
+/// place, so sending it would reorder the parent's list unseen.
+pub(crate) fn beside_own_group(store: AppStore, slot: &TreeSlot, nodes: &[(StoreId, NodeId)]) -> bool {
+    let TreeSlot::After(value) = slot else { return false };
+    let Some(group) = internal_group(value) else { return false };
+    let view = store.view();
+    nodes.iter().all(|&(s, n)| {
+        view.internal_kind(s, n) == Some(group.kind)
+            && view.parent(s, n).is_some_and(|p| lands_under(store, (group.store_id, group.parent_id), s, p))
+    })
+}
+
 /// What refuses making a node in the grouping row `group` (a new node, a
 /// paste, pictures).
 pub(crate) fn nothing_made_in(group: &InternalGroup) -> String {
@@ -55,6 +70,25 @@ pub(crate) fn nothing_made_in(group: &InternalGroup) -> String {
 /// children carry (`children_suffix`).
 pub(crate) fn row_to_open(store_id: StoreId, parent_id: NodeId, children_suffix: &str, kind: InternalKind) -> String {
     internal_group_value(store_id, parent_id, kind, children_suffix)
+}
+
+/// Whether a node that moved into `(store_id, parent_id)` landed under the
+/// row of `row`: that node's own row, or a mount of it.
+pub(crate) fn lands_under(store: AppStore, row: (StoreId, NodeId), store_id: StoreId, parent_id: NodeId) -> bool {
+    row == (store_id, parent_id) || store.view().mount_source(row.0, row.1) == Some((store_id, parent_id))
+}
+
+/// The grouping row of `kind` under the node row `row` (`node_...`, mount
+/// path and all): the row's own node, and the mount path its children
+/// carry (one level more when the row is a mount's).
+pub(crate) fn group_under_row(store: AppStore, row: &str, kind: InternalKind) -> Option<String> {
+    let (s, n) = match parse_tree_value(row)? {
+        (s, Some(n)) => (s, n),
+        (_, None) => return None,
+    };
+    let path = row.find('/').map_or("", |at| &row[at..]);
+    let suffix = if store.view().is_mount(s, n) { format!("{path}/{s}_{n}") } else { path.to_string() };
+    Some(internal_group_value(s, n, kind, &suffix))
 }
 
 #[cfg(test)]

@@ -177,7 +177,11 @@ pub(crate) fn plan_drop(store: AppStore, drop: &TreeDrop) -> DropPlan {
     }
     // Into a grouping row ("Themes"): into the parent it groups
     // (`internal_drop`). Beside one, the place falls to the parent's last,
-    // as beside any row that is no node.
+    // as beside any row that is no node, except for the group's own nodes,
+    // which already show there.
+    if crate::internal_drop::beside_own_group(store, &drop.slot, &nodes) {
+        return DropPlan::Stays(DropHint { line: WHERE_IT_IS.to_string(), warning: None, refused: false });
+    }
     let (parent_row, place, expand) = match crate::internal_drop::group_drop(store, drop.parent.as_deref(), &drop.slot, &nodes) {
         Some(Err(line)) => return DropPlan::Refused(DropHint { line, warning: None, refused: true }),
         Some(Ok(group)) => (Some(group.parent_row), group.place, Some(group.expand)),

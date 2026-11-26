@@ -78,11 +78,14 @@ pub(crate) fn a_store_with_themes() -> (AppStore, WithThemes) {
         node.node_type = pimble_core::node_types::THEME.to_string();
         node
     };
-    let (book, code, folder, inner) = (theme("Book"), theme("Code"), Node::folder("Shared"), theme("Inner"));
+    let (book, code, folder, mut inner) = (theme("Book"), theme("Code"), Node::folder("Shared"), theme("Inner"));
     let ids = WithThemes { store_id, root, recipes, book: book.id, code: code.id, folder: folder.id, inner: inner.id };
-    for n in [book, code, folder, inner] {
+    inner.parent_id = Some(ids.folder);
+    for mut n in [book, code, folder] {
+        n.parent_id = Some(root);
         app.upsert_node(store_id, n);
     }
+    app.upsert_node(store_id, inner);
     app.set_children(store_id, root, vec![(store_id, ids.book), (store_id, recipes), (store_id, ids.code), (store_id, ids.folder)]);
     app.set_children(store_id, ids.folder, vec![(store_id, ids.inner)]);
     (app, ids)
