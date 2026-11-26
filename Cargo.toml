@@ -71,18 +71,17 @@ rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "ma
 # rinch-web), because the same UI library builds for the browser. The desktop build
 # renders on the GPU (`rinch/gpu`); rinch carries its own wgpu and winit, so nothing here
 # patches them (rinch main 57bc511d+, #1960/#1965).
-# Every rinch line in this workspace and in web/ names the branch of
-# joeleaver/rinch#3070 (blocks stay ahead of the editor's caret and selection
-# overlays, so a theme's `p + p` indent holds) until it merges; then they all go
+# Every rinch line in this workspace, in web/ and in plugins/ names `main`; a rinch
+# fix Pimble waits on goes on its branch here until it merges, then they all go
 # back to `main` together.
-rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays" }
-rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays" }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 # The editor view both rinch backends share: the app names its spellcheck plugin
 # from here, which rinch-web does not re-export.
-rinch-editor-view = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays" }
+rinch-editor-view = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 # Headless collab session (yrs projection of the editor model); pure Rust, no
 # platform deps, so the server and store can link it for text projection.
-rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays" }
+rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 
 # CRDT for node content: the same engine rinch's editor collaboration uses.
 yrs = "0.27"
