@@ -103,7 +103,7 @@ jobs:
       - name: Find the rhypedb revision Cargo.lock pins
         id: rhypedb
         run: |
-          rev="$(grep -A2 '^name = "rhypedb-client"$' Cargo.lock | grep -oE '#[0-9a-f]{40}' | tr -d '#')"
+          rev="$(grep -A2 '^name = "rhypedb-client"$' Cargo.lock | grep -oE '#[0-9a-f]{40}' | head -1 | tr -d '#')"
           if [ -z "$rev" ]; then
             echo "Cargo.lock names no git revision for rhypedb-client" >&2
             exit 1
@@ -130,9 +130,13 @@ jobs:
           cp "$RUNNER_TEMP/rhypedb/target/release/rhypedb-server" ~/rhypedb-server/
 
       # RHYPEDB_SERVER_REQUIRED makes a missing server fail those tests
-      # instead of skipping them.
+      # instead of skipping them, and PIMBLE_CLOUD_REQUIRED does the same for
+      # the pimble-cloud binary the sharing tests run (built into
+      # target/release by this same command, for pimble-cloud's own
+      # integration tests).
       - name: cargo test --workspace --release
         run: |
           export RHYPEDB_SERVER_BIN="$HOME/rhypedb-server/rhypedb-server"
           export RHYPEDB_SERVER_REQUIRED=1
+          export PIMBLE_CLOUD_REQUIRED=1
           cargo test --workspace --release

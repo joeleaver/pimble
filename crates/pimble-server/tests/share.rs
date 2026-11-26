@@ -18,6 +18,7 @@
 //! stopped and see each other.
 
 mod common;
+mod pimble_cloud_bin;
 mod rhypedb_bin;
 use pimble_host::disk::testfs as tfs;
 use common::*;
@@ -1212,17 +1213,6 @@ async fn run_edge_proxy(listen_port: u16, cloud_port: u16, h_port: u16) {
     }
 }
 
-fn find_pimble_cloud_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("PIMBLE_CLOUD_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.to_path_buf();
-    ["target/release/pimble-cloud", "target/debug/pimble-cloud"].iter().map(|rel| workspace_root.join(rel)).find(|p| p.is_file())
-}
-
 /// A real signup with real `pimble-crypto` output, then the verification
 /// link `LogMailer` logged for it (the newest one in the log).
 async fn sign_up_and_verify(cloud_url: &str, cloud_log: &Path, email: &str, password: &str) {
@@ -1278,7 +1268,7 @@ async fn sharing_against_the_real_accounts_service() {
         eprintln!("SKIPPING sharing_against_the_real_accounts_service: no rhypedb-server binary found (set RHYPEDB_SERVER_BIN, or build ~/dev/rhypedb)");
         return;
     };
-    let Some(cloud_bin) = find_pimble_cloud_binary() else {
+    let Some(cloud_bin) = pimble_cloud_bin::find() else {
         eprintln!("SKIPPING sharing_against_the_real_accounts_service: no pimble-cloud binary found (set PIMBLE_CLOUD_BIN, or `cargo build -p pimble-cloud --release`)");
         return;
     };

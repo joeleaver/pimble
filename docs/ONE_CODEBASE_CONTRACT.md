@@ -2338,7 +2338,11 @@ racing sign-in, and deletes the rows after, as the password change does.
 
 Parts 1 to 5 built into the server what only the old path gave (plain hosted stores, an owner
 away, diagnostics, the account page's sections), so the browser's own server is now its only
-path:
+path. The old sign-in page's part of email verification came over in review: the worker sign-in
+page shows the `?verify_error=expired|invalid` banners the accounts service redirects with, and
+offers "Send the verification link again" when `cloudSignIn` is refused for an unverified address,
+which the server now answers with its own code (`RpcError::EmailUnverified`, `-32011`;
+`ClientError::is_email_unverified`) in the same sentence as before:
 
 - Deleted from `web/src`: the `?server=old` switch (`worker_mode::enabled`/`decide`/`end`,
   `hub.js`'s `leaveOffline`), the vault client (`vault.rs`, `vault/`, `vault_backend.rs` and
@@ -2363,6 +2367,12 @@ path:
   (`vault_append*`, `vault_fetch*`, `vault_list_docs*`, `vault_snapshot*`, `vault_report(s)`,
   `vault_set_doc_keys`) or its wire name; an `impl ... Backend for`; `mod vault`,
   `mod vault_backend`, `mod routed`, `mod endpoints`; and `server=old` anywhere in `web/`.
+  An RPC path to any server but the page's own fails too: a `pimble_api::Router`, an
+  `RpcBackend` made over anything but `LocalConnector`, an `impl ... Connector for` anything
+  else, a `PimbleClient::` constructor other than `over_message_port` (or the type renamed by
+  `as`), `pimble_server` in `web/src`, and `pimble-server` in `web/Cargo.toml` (the worker crate,
+  `web/worker`, is the server's). The `impl ... Backend for` and the other Rust-shape bans read
+  each file whole, so a declaration wrapped across lines is caught.
   PimbleClient's store methods are not banned (the worker backend calls `create_store` and
   `list_stores` on its own server), nor a bare "vault" (`localStorage` keys, `kind != "vault"`).
 - **The web wasm32 check** (`cargo check --locked --workspace --target wasm32-unknown-unknown`
@@ -2374,7 +2384,11 @@ path:
   With that variable a missing binary, or a `RHYPEDB_SERVER_BIN` that names no file, fails
   the test (`crates/pimble-cloud/tests/integration/rhypedb_bin.rs`,
   `crates/pimble-server/tests/rhypedb_bin/mod.rs`); without it the test skips with a `SKIP:`
-  line as before.
+  line as before. The sharing tests that run the real accounts service
+  (`sharing_against_the_real_accounts_service`, `interop_with_the_real_accounts_service`) look
+  for the `pimble-cloud` binary the same way (`crates/pimble-server/tests/pimble_cloud_bin/mod.rs`:
+  `PIMBLE_CLOUD_BIN`, beside the test binary, `CARGO_TARGET_DIR`, the workspace's `target/`), and
+  CI sets `PIMBLE_CLOUD_REQUIRED=1`, so a missing one fails there instead of skipping.
 
 ### Proof
 
@@ -2394,6 +2408,17 @@ path:
   failed, 8 ignored, over 145 test binaries; `sharing_against_the_real_accounts_service` and
   `interop_with_the_real_accounts_service` ran rather than skipped, and
   `a_reader_is_refused_in_process` and the relay's twenty-megabyte test passed this run.
+- Review fixes: `check-one-path.sh` passes on the tree and fails on a probe holding each new
+  form (a `pimble_api::{ ... Router }` import wrapped across lines, `Router::new`,
+  `RpcBackend::over`, `RpcBackend::new(Connected(..))`, a wrapped `impl ... Connector for
+  Remote`, `PimbleClient::connect_with_auth`, `PimbleClient as`, `pimble_server::`, a wrapped
+  `impl<T> pimble_api::Backend for`, and `pimble-server` in `web/Cargo.toml`). The two
+  real-accounts tests pass with `PIMBLE_CLOUD_REQUIRED=1` and the binary found beside the test
+  binary; they fail with a `PIMBLE_CLOUD_BIN` that names no file and with no binary found, and
+  skip with no binary and no variable. `interop_with_the_real_accounts_service` now signs in
+  before following the link and gets `is_email_unverified`. The sign-in page's banners are a
+  `wasm_bindgen_test` in `web/` (`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  cargo test --target wasm32-unknown-unknown -p pimble-web`, runner 0.2.128; not in CI yet).
 
 ### Not done
 

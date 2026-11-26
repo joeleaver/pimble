@@ -43,6 +43,13 @@ impl ClientError {
         self.code() == Some(-32004)
     }
 
+    /// Whether `cloudSignIn` was refused because the account's address is not
+    /// verified yet (`-32011`, `pimble_rpc::RpcError::EmailUnverified`): a
+    /// sign-in page then offers to send the verification link again.
+    pub fn is_email_unverified(&self) -> bool {
+        self.code() == Some(-32011)
+    }
+
     /// Whether the server does not know the method (`-32601`): a server from
     /// before it, which a caller treats as "not here" and carries on.
     pub fn is_method_not_found(&self) -> bool {
@@ -86,6 +93,16 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server's code for an unverified address is what a sign-in page
+    /// reads, never the words.
+    #[test]
+    fn an_unverified_address_is_known_by_its_code() {
+        let code = pimble_rpc::RpcError::EmailUnverified(String::new()).code();
+        assert!(ClientError::Server { code, message: "Check your inbox".into() }.is_email_unverified());
+        assert!(!ClientError::Server { code: -32000, message: "Check your inbox".into() }.is_email_unverified());
+        assert!(!ClientError::Rpc("connection closed".into()).is_email_unverified());
+    }
 
     /// jsonrpsee's "too big" answers and the transport's refusal are told
     /// apart from every other error, and the sentence names the document

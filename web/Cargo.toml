@@ -87,6 +87,11 @@ tracing-wasm = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 getrandom = { version = "0.2", features = ["js"] }
 
+[dev-dependencies]
+# The page's unit tests run in Node: `wasm-bindgen-test-runner` as the
+# wasm32 target's runner (the crate builds only for the browser).
+wasm-bindgen-test = "0.3"
+
 [profile.dev]
 opt-level = 1
 

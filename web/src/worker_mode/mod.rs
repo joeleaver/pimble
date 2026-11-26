@@ -134,9 +134,9 @@ pub fn start_app() {
         if let Some(link) = crate::open_link::take_open_link() {
             pimble_app::app_links::set_launch_link(link);
         }
-        // A notification or a notice email opened this page (wave 2).
         // The diagnostics notice, once, the first time this browser records.
         pimble_app::diagnostics_ui::notice_once(store);
+        // A notification or a notice email opened this page (wave 2).
         pimble_app::inbox::browser_push::hear_clicks(store);
         route::mount_app(store, view);
         mark_usable(started);

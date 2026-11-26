@@ -18,7 +18,7 @@
 
 use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::StoreId;
-use pimble_rpc::{to_rpc_error, CloudStoreMembersResponse, MemberRole, ShareMember, ShareMemberStatus};
+use pimble_rpc::{to_rpc_error, CloudStoreMembersResponse, RpcError, MemberRole, ShareMember, ShareMemberStatus};
 use tracing::{info, warn};
 
 use super::{hosted_plain, RpcHandler};
@@ -35,6 +35,16 @@ const OWNERS_ONLY: &str = "Only an owner of this store can see and change who ho
 /// the service may hold the new code, which this computer never showed.
 pub(crate) const RECOVERY_CODE_OUTCOME_UNKNOWN: &str =
     "Pimble Cloud did not answer, so this computer cannot tell whether the new recovery code was saved. Your old recovery code may have stopped working, so make a new one now.";
+
+/// `cloudSignIn`'s refusal by `POST /login`: an address not verified yet
+/// carries its own code (`pimble_rpc::RpcError::EmailUnverified`), so a
+/// sign-in page can offer to send the link again; any other in its sentence.
+pub(super) fn sign_in_refusal(e: CloudError) -> ErrorObjectOwned {
+    match e {
+        CloudError::Refused { refusal: Refusal::Unverified, .. } => RpcError::EmailUnverified(Refusal::Unverified.to_string()).into(),
+        other => to_rpc_error(other),
+    }
+}
 
 /// A refusal of the accounts service's on a store's members, said as a
 /// sentence: the ones this page meets in its own words, any other in the
@@ -288,6 +298,18 @@ mod tests {
 
     fn view(status: &str, has_key: bool, role: &str) -> MemberView {
         MemberView { user_id: Some("u".into()), email: "m@example.com".into(), name: None, role: role.into(), status: status.into(), has_key, public_keys: None }
+    }
+
+    /// An unverified address is told apart by its code, in the refusal's
+    /// sentence; a wrong password keeps the generic code.
+    #[test]
+    fn an_unverified_sign_in_carries_its_own_code() {
+        let unverified = sign_in_refusal(CloudError::Refused { status: 403, refusal: Refusal::Unverified });
+        assert_eq!(unverified.code(), RpcError::EmailUnverified(String::new()).code());
+        assert_eq!(unverified.message(), Refusal::Unverified.to_string());
+        let wrong = sign_in_refusal(CloudError::Refused { status: 401, refusal: Refusal::WrongPassword });
+        assert_eq!(wrong.code(), -32000);
+        assert_eq!(wrong.message(), Refusal::WrongPassword.to_string());
     }
 
     #[test]

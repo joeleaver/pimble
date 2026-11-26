@@ -41,6 +41,7 @@
 //! (see [`Repair`]).
 
 mod account;
+use account::sign_in_refusal;
 mod diagnostics;
 mod hosted;
 mod hosted_plain;
@@ -4097,7 +4098,7 @@ impl PimbleApiServer for RpcHandler {
         let password_keys = pimble_crypto::derive_password_keys(&request.password, &kdf_params).map_err(to_rpc_error)?;
         let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
 
-        let login = crate::cloud::login(self.http(), &request.url, &request.email, &auth_key).await.map_err(to_rpc_error)?;
+        let login = crate::cloud::login(self.http(), &request.url, &request.email, &auth_key).await.map_err(sign_in_refusal)?;
         let me_keys = crate::cloud::me_keys(self.http(), &request.url, &login.session).await.map_err(to_rpc_error)?;
         let account_keys = pimble_crypto::unwrap_account_keys(&me_keys.account_key_blob, &password_keys.kek).map_err(to_rpc_error)?;
 

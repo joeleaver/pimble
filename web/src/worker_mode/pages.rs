@@ -5,6 +5,9 @@
 //!
 //! The sign-in page offers "Don't remember this browser" and says, beside it,
 //! what remembering protects and what it does not (section 7, in its words).
+//! It shows how a followed verification link went (the accounts service
+//! redirects every outcome here), and offers to send the link again when the
+//! server refuses a sign-in because the address is not verified yet.
 //! The account page signs out or forgets this browser; each deletes the
 //! device key first, then everything this browser kept. Its other sections
 //! (the members of the stores this account owns, the password, the recovery
@@ -29,18 +32,47 @@ fn origin() -> String {
     web_sys::window().and_then(|w| w.location().origin().ok()).unwrap_or_default()
 }
 
+/// What the URL said about a just-followed verification link or a password
+/// just set: the values of `verified`, `recovered` and `verify_error`.
+fn banner_for(verified: Option<&str>, recovered: Option<&str>, verify_error: Option<&str>) -> &'static str {
+    if verified == Some("1") {
+        return "Your email is verified. Sign in to get started.";
+    }
+    if recovered == Some("1") {
+        return "Your password is set. Sign in.";
+    }
+    match verify_error {
+        Some("expired") => "That verification link has expired. Sign in and we will send a new one.",
+        Some("invalid") => "That verification link is not valid.",
+        _ => "",
+    }
+}
+
 fn banner() -> String {
-    if query_param("verified").as_deref() == Some("1") {
-        return "Your email is verified. Sign in to get started.".to_string();
+    banner_for(query_param("verified").as_deref(), query_param("recovered").as_deref(), query_param("verify_error").as_deref()).to_string()
+}
+
+/// Why a sign-in did not happen: the sentence to show, and whether the
+/// address is not verified yet (the page then offers the link again).
+struct SignInFailure {
+    sentence: String,
+    unverified: bool,
+}
+
+impl From<String> for SignInFailure {
+    fn from(sentence: String) -> Self {
+        Self { sentence, unverified: false }
     }
-    if query_param("recovered").as_deref() == Some("1") {
-        return "Your password is set. Sign in.".to_string();
+}
+
+impl From<pimble_client::ClientError> for SignInFailure {
+    fn from(e: pimble_client::ClientError) -> Self {
+        Self { unverified: e.is_email_unverified(), sentence: e.to_string() }
     }
-    String::new()
 }
 
 /// Sign in through this browser's server. The keys stay in its worker.
-async fn sign_in(email: &str, password: &str, remember: bool) -> Result<(), String> {
+async fn sign_in(email: &str, password: &str, remember: bool) -> Result<(), SignInFailure> {
     let local = backend::local();
     let client = local.client().await?;
     let status = client.cloud_status().await.map_err(|e| e.to_string())?;
@@ -57,7 +89,7 @@ async fn sign_in(email: &str, password: &str, remember: bool) -> Result<(), Stri
         local.reset().await;
     }
     let client = local.client().await?;
-    client.cloud_sign_in(origin(), email, password).await.map_err(|e| e.to_string())?;
+    client.cloud_sign_in(origin(), email, password).await?;
     if remember {
         super::ask_to_persist();
     }
@@ -72,6 +104,8 @@ pub fn login_page() -> NodeHandle {
     let error = Signal::new(String::new());
     let notice = Signal::new(banner());
     let busy = Signal::new(false);
+    // True once a sign-in was refused because the address is not verified.
+    let show_resend = Signal::new(false);
 
     // The account this browser's server last held (a session that ran out):
     // the address is offered again.
@@ -101,6 +135,7 @@ pub fn login_page() -> NodeHandle {
             return;
         }
         error.set(String::new());
+        show_resend.set(false);
         busy.set(true);
         spawn_local(async move {
             yield_to_browser().await;
@@ -110,7 +145,10 @@ pub fn login_page() -> NodeHandle {
                     route::go(Route::App);
                     return;
                 }
-                Err(e) => error.set(e),
+                Err(failure) => {
+                    show_resend.set(failure.unverified);
+                    error.set(failure.sentence);
+                }
             }
             busy.set(false);
         });
@@ -155,6 +193,23 @@ pub fn login_page() -> NodeHandle {
                 }
                 if !error.get().is_empty() {
                     div { class: "pimble-page__error", {|| error.get()} }
+                }
+                if show_resend.get() {
+                    Button {
+                        variant: "light",
+                        full_width: true,
+                        onclick: move || {
+                            let address = untracked(|| email.get()).trim().to_string();
+                            notice.set("Sending...".to_string());
+                            spawn_local(async move {
+                                match crate::accounts::resend_verification(&address).await {
+                                    Ok(()) => notice.set("Sent. Follow the link, then sign in.".to_string()),
+                                    Err(e) => notice.set(e.message),
+                                }
+                            });
+                        },
+                        "Send the verification link again"
+                    }
                 }
                 Button {
                     variant: "filled",
@@ -281,5 +336,26 @@ pub fn account_page() -> NodeHandle {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::banner_for;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// The banners the accounts service's redirects ask for, in the old
+    /// sign-in page's words.
+    #[wasm_bindgen_test]
+    fn each_redirect_reads_as_its_banner() {
+        assert_eq!(banner_for(Some("1"), None, None), "Your email is verified. Sign in to get started.");
+        assert_eq!(banner_for(None, Some("1"), None), "Your password is set. Sign in.");
+        assert_eq!(banner_for(None, None, Some("expired")), "That verification link has expired. Sign in and we will send a new one.");
+        assert_eq!(banner_for(None, None, Some("invalid")), "That verification link is not valid.");
+        assert_eq!(banner_for(None, None, Some("other")), "");
+        assert_eq!(banner_for(Some("0"), Some("0"), None), "");
+        assert_eq!(banner_for(None, None, None), "");
+        // A verified link wins over anything else the URL says.
+        assert_eq!(banner_for(Some("1"), None, Some("invalid")), "Your email is verified. Sign in to get started.");
     }
 }
