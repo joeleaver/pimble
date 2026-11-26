@@ -42,6 +42,19 @@ pub(crate) fn cell_style(size: Size) -> String {
     format!("width: {COLUMN_W}px; min-height: {CELL_MIN}px;{cap} position: relative; display: flex; flex-direction: column; box-sizing: border-box; {CELL_BG}")
 }
 
+/// What a column's cell adds while a dragged card would land in its list
+/// (`list`, its id): lit in the accent, red where the drop would be refused.
+/// The place on offer (`target`, which rinch's slot shows too) decides, else
+/// the list under the pointer. Nothing for a column drag (its header row has
+/// the slot) or a card bound for another column.
+pub(crate) fn drop_lit(drag: Option<&SortDragState>, list: &str) -> &'static str {
+    let Some(drag) = drag.filter(|d| d.group == CARDS) else { return "" };
+    if drag.target.as_ref().or(drag.over.as_ref()).is_none_or(|t| t.list != list) {
+        return "";
+    }
+    viewer_look::drop_panel(matches!(drag.verdict, Some(SortVerdict::Refuse(_))))
+}
+
 /// A column's card list: the whole of its cell (it grows to fill a cell the
 /// row stretched), the cell's padding its own, so every point of the column
 /// is over the list. In a minimized lane it scrolls inside the cell's cap.
@@ -56,6 +69,41 @@ pub(crate) fn card_list_style(size: Size) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn drag(over: Option<&str>, verdict: Option<SortVerdict>) -> SortDragState {
+        SortDragState {
+            group: CARDS.to_string(),
+            keys: vec!["card".into()],
+            source_key: "card".into(),
+            from_list: "a".into(),
+            keyboard: false,
+            over: over.map(|list| SortTarget { list: list.into(), index: 0 }),
+            target: over.map(|list| SortTarget { list: list.into(), index: 0 }),
+            verdict,
+        }
+    }
+
+    /// Joe (2026-11-24): nothing lit up where a dragged card would land. The
+    /// cell under the pointer is lit, in red when the drop is refused, and
+    /// no other is.
+    #[test]
+    fn the_cell_a_card_is_dragged_over_is_lit() {
+        assert_eq!(drop_lit(None, "b"), "");
+        let over_b = drag(Some("b"), Some(SortVerdict::Accept));
+        assert_eq!(drop_lit(Some(&over_b), "b"), viewer_look::drop_panel(false));
+        assert_eq!(drop_lit(Some(&over_b), "a"), "");
+        // Over its own place: no move on offer, still where it lands.
+        assert_eq!(drop_lit(Some(&drag(Some("a"), None)), "a"), viewer_look::drop_panel(false));
+        let refused = drag(Some("b"), Some(SortVerdict::Refuse("You can read this, not change it.".into())));
+        assert_eq!(drop_lit(Some(&refused), "b"), viewer_look::drop_panel(true));
+        assert_eq!(drop_lit(Some(&drag(None, None)), "b"), "");
+        // The offer kept while the pointer is off every list: still lit.
+        let kept = SortDragState { over: None, ..over_b.clone() };
+        assert_eq!(drop_lit(Some(&kept), "b"), viewer_look::drop_panel(false));
+        let columns = SortDragState { group: COLUMNS.to_string(), ..over_b };
+        assert_eq!(drop_lit(Some(&columns), "b"), "", "a column drag lights no cell");
+        assert_ne!(viewer_look::drop_panel(false), viewer_look::drop_panel(true));
+    }
 
     /// Joe's "Done" column (2026-11-23): eight cards in a window one card tall.
     /// Nothing but a minimized lane caps a column, and no column's list is
