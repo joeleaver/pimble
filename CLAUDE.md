@@ -71,7 +71,7 @@ the hosted server to this version together.
 | `pimble-plugin-abi` / `-host` / `-sdk` | plugins: the ABI (6), the host (wasmtime on the desktop, the page's WebAssembly in the browser), the guest SDK in the `plugins/` workspace (with `hello-viewer`, `stuck-viewer`, `kanban-viewer`, `todo-viewer`, `timeline-viewer`; `scripts/plugins/install.sh`; viewers share `pimble_ui::viewer`, the kanban's look) | Desktop and browser hosts built (docs/PLUGINS_CONTRACT.md) |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
-| `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace; account pages and the vault client | Complete (phases 1 and 2a) |
+| `web/` (`pimble-web`) | the same UI built for the browser with trunk, over the same Pimble server run in a worker (`crates/pimble-worker`, docs/ONE_CODEBASE_CONTRACT.md); its own cargo workspace; the account pages | Complete (one code base, wave 5) |
 
 A node's document (`pimble_crdt::NodeDoc`, stored as `nodes/{id}.yrs`) has five roots:
 `content` and `meta` (rinch's rich text, untouched), `node` (type, title, `parent_id`,
@@ -91,7 +91,7 @@ diffs and the server's vectors out, plus the ids the caller did not name).
 `syncStoreDocument`, `applyStoreUpdate`, `syncNodeContents`, `setNodeText` and
 `ServerSyncManager` do not exist.
 `NodeFields::into_node` (`pimble-crdt`) is the one mapping of a document's stored fields
-to a `Node`; `LocalStore` and the web's vault client both read nodes through it.
+to a `Node`; `LocalStore` reads nodes through it, on the desktop and in the browser's worker alike.
 
 ### Search index
 
@@ -223,8 +223,8 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   `BackendEvent::Shown` reaches `events::apply_view`, the one place the tree takes a
   change: rows it shows, lists it loaded (a store's shown roots always), every loaded mount
   of them, subtrees gone. This window's own structural calls show theirs before their
-  answer (`Pimble::shown_after`); the browser's vault feeds the same view from what it
-  pumps (`web/src/backend.rs` `owe`/`show_owed`). Only what no document says is asked
+  answer (`Pimble::shown_after`); the browser runs the same server and the same
+  adapter, so it takes changes the same way. Only what no document says is asked
   again: a store's changed access sends one `Rejudge` for the nodes shown. Deleting a node deletes its subtree; the root cannot be deleted.
 - **`closeStore` releases the search index** before answering (the old flaky reopen test).
 - rinch's Tree re-renders a row only when its `TreeNodeData` changes: anything a row
@@ -473,12 +473,20 @@ target takes about 12 minutes to build.
   declared in `crates/pimble-app/Cargo.toml` with default features off, not in the root
   workspace. `--no-default-features` alone means "the UI library"; the keyword-only desktop
   build is `--no-default-features --features native`.
-- **web/** is its own cargo workspace (`pimble-web`, trunk, `public_url = "/app/"`). On
-  start it `POST`s `/api/v1/token` with the session cookie (401 sends the visitor to
-  `/login.html`), connects `PimbleClient` to the returned `rpc_url` with the token in the
-  query string, fills the tree from `listStores`, refreshes the token five minutes before
-  expiry and reconnects with backoff. Both `Cargo.lock`s must pin the same rinch revision
-  (`cd web && cargo update -p rinch --precise <sha>` alongside the root update).
+- **web/** is its own cargo workspace (`pimble-web`, trunk, `public_url = "/app/"`, with
+  `worker/` building `crates/pimble-worker`). Since wave 5 of docs/ONE_CODEBASE_CONTRACT.md
+  the browser has one path: the same Pimble server the desktop embeds runs in a dedicated
+  worker of the leader tab (`web/hub.js`), keeps the account's keys (wrapped by a
+  remembered device key) and this browser's replicas (in OPFS, sealed; or in memory), and
+  syncs them through
+  the same vault and plain links; the page reaches it over a `MessagePort` through
+  `pimble_api::Pimble` and `pimble_app::commands` (`web/src/worker_mode/`). Sign-in and the
+  account page are that server's RPCs; signup and recovery are pages that call the accounts
+  service directly. `scripts/check-one-path.sh` (run by CI) fails if a second path (a
+  vault client, a `Backend` of the page's own, `server=old`) comes back. Check it with
+  `cargo check --workspace --target wasm32-unknown-unknown` in `web/` (CI does). Both
+  `Cargo.lock`s must pin the same rinch revision (`cd web && cargo update -p rinch --precise
+  <sha>` alongside the root update).
 - **Site and CI.** `site/` is static HTML/CSS/JS. `.github/workflows/ci.yml` checks and
   tests; `release.yml` builds Linux and Windows packages on a `v*` tag and attaches them
   to a GitHub release, which the download page reads through `/api/v1/releases`.
@@ -526,18 +534,13 @@ store-name question). Pimble Cloud holds ciphertext only.
   never sent, and every later edit from that device sat pending on every other one);
   `Store.sync_mode`/`GetStoreSyncResponse.sync_mode` tell the app it is encrypted. CLI
   `cloud-*` commands. The desktop sign-in UI is not built yet.
-- **Web app**: keys in memory only (a reload asks for the password to unlock); one
-  `PimbleClient` per endpoint with per-store `rpc_url` and token ready for relayed shares;
-  the page's commands go through a `pimble_api::Pimble` over a `Router` (plain stores to
-  their server, encrypted ones to `VaultBackend`); the vault client is the one holder of a
-  decrypted `Tree` of `NodeDoc`s in the browser (`StoreCapabilities::local_documents`:
-  the API reads through it and keeps no copy), answers the API's reads and writes from
-  them, encrypts outbound edits, pumps what it decrypts as the app's events, seals
-  presence and searches client-side; it outlives its socket (replaced on every token refresh), so on
-  every connect `catch_up` fetches what each held document missed and resends what a
-  failed append left unsent (`known_sv`/`unsent` per document); the explorer's `+` creates an encrypted store through the accounts
-  service and re-mints the token; menus are data in `crates/pimble-app/src/menus.rs` and the
-  browser mounts them through `rinch_web::mount_with_menu_bar` (rinch PR #791, merged to `main` 2026-09-16).
+- **Web app**: the browser's own server (above, `web/`) holds the account's keys and runs
+  the same `VaultLink` as the desktop; the page's vault client of phase 2a (keys in the
+  page, its own decrypted `Tree`, a `Router` between it and the hosted server) was removed
+  in wave 5 of docs/ONE_CODEBASE_CONTRACT.md. The explorer's `+` creates an encrypted store
+  on that server and hosts it (`cloudHostStore`); menus are data in
+  `crates/pimble-app/src/menus.rs` and the browser mounts them through
+  `rinch_web::mount_into_with_menu_bar`.
 - **Verified by the PM** in a browser through trunk's proxies against the real stack:
   signup with the recovery code, verification, unlock, an encrypted store, a node typed in
   one tab, only `PB` ciphertext on the hosted disk (no typed words, title or store name in
@@ -600,8 +603,9 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
   `Store.relay` says which end a device is; a member whose owner is off is plain `Offline`,
   and `GetStoreSyncResponse.owner_offline` says so only when the relay did. The Share
   dialog on an unhosted store offers both ways and chooses neither; the owner's row reads
-  `shared from here`, a member's `owner offline`; the web lists relayed stores from their
-  own endpoints and turns an open one read-only while its owner is away.
+  `shared from here`, a member's `owner offline`; the browser's server keeps a relayed
+  store as a replica like the desktop's, says `owner offline` the same way and keeps it
+  editable (docs/ONE_CODEBASE_CONTRACT.md, wave 5 part 1).
 - **Known limits**, all in the contract or `docs/NEXT_SESSION.md`: a scoped editor can move
   a node out of the share by setting its `parent_id`; no data-key rotation when a node or
   a member leaves; a removed member's connection lives until its token expires if their
@@ -686,7 +690,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-app/src/backend.rs` - desktop background thread, the API over RPC, and `Local` (the connection: join or start the embedded server, reconnect) (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
-- `web/src/backend.rs` - the browser backend (token, connection, reconnect)
+- `web/src/worker_mode/` - the browser's side of its own server: the hub (`web/hub.js`), the backend over the `MessagePort`, sign-in and the account page; `crates/pimble-worker` - the server's worker entry
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
 - `crates/pimble-app/src/events/` - `BackendEvent` -> UI state: `mod.rs` dispatches, a module per concern (`connection`, `stores`, `nodes`, `sync`, `cloud`, `view`, `links`)
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text

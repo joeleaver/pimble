@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 
-use pimble_core::diagnostics::{is_info_target, random_hex, report_code, timestamp, valid_install, Envelope, LogBudget, SavedChoice, Scrubber, Severity};
+use pimble_core::diagnostics::{is_info_target, random_hex, timestamp, valid_install, Envelope, LogBudget, SavedChoice, Scrubber, Severity};
 use serde_json::{json, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -29,7 +29,7 @@ const EVERY_MS: i32 = 60_000;
 /// The page's targets whose `info` lines are recorded: how its connections
 /// go, and what the app makes of them (the worker's server records its own,
 /// `pimble_core::diagnostics::INFO_TARGETS`).
-const INFO_TARGETS: &[&str] = &["pimble_web::vault", "pimble_web::backend", "pimble_web::endpoints", "pimble_web::worker_mode", "pimble_app::events", "pimble_client"];
+const INFO_TARGETS: &[&str] = &["pimble_web::worker_mode", "pimble_app::events", "pimble_client"];
 
 struct State {
     envelope: Envelope,
@@ -250,23 +250,9 @@ async fn send_waiting() {
 }
 
 /// This page's recent log lines, oldest first: what a report carries as
-/// `page.log` (worker mode hands it to its server, which adds its own).
+/// `page.log` (handed to this browser's server, which adds its own).
 pub fn recent_log() -> String {
     STATE.with(|st| st.borrow().as_ref().map(|s| s.recent.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default())
-}
-
-/// Help > "Send Diagnostics...": this page's recent log lines, the stores
-/// the window knows, and the note; the report's code.
-pub async fn send_report(note: String, stores: Value) -> Result<String, String> {
-    let log = recent_log();
-    let body = STATE.with(|st| {
-        let st = st.borrow();
-        let st = st.as_ref()?;
-        Some(st.envelope.report(&st.scrubber, &now(), &note, vec![("page.log".to_string(), log)], stores, st.account.as_deref()).to_string())
-    });
-    let body = body.ok_or_else(|| "Diagnostics did not start on this page.".to_string())?;
-    let text = post("/api/v1/diagnostics/reports", "application/json", body).await.map_err(|e| format!("Pimble Cloud did not take the report ({e})."))?;
-    report_code(&text).ok_or_else(|| "Pimble Cloud answered without a report code.".to_string())
 }
 
 /// The `tracing` layer beside the console's.

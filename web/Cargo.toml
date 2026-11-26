@@ -36,22 +36,14 @@ pimble-app = { path = "../crates/pimble-app", default-features = false, features
 pimble-client = { path = "../crates/pimble-client" }
 pimble-core = { path = "../crates/pimble-core" }
 pimble-rpc = { path = "../crates/pimble-rpc" }
-# The vault client holds every node's document in the browser and the tree
-# over them (docs/CRYPTO_CONTRACT.md, "Web app"; docs/NODE_DOCUMENT_CONTRACT.md);
-# the same yrs documents the desktop's server holds, built from decrypted blobs.
-pimble-crdt = { path = "../crates/pimble-crdt" }
-pimble-sheet = { path = "../crates/pimble-sheet" }
-# Every byte that leaves this page is encrypted here. Pure Rust, no I/O, so
-# the browser runs exactly what the desktop runs.
+# The account pages that run before any server (signing up, recovery) derive
+# and wrap keys here, as the desktop does. Pure Rust, no I/O.
 pimble-crypto = { path = "../crates/pimble-crypto" }
-pimble-discussion = { path = "../crates/pimble-discussion" }
-# The one API (docs/API_CONTRACT.md): the vault is a `Backend` of it, and a
-# `Router` picks the vault or the server per store.
+# The one API (docs/API_CONTRACT.md), over this browser's own server.
 pimble-api = { path = "../crates/pimble-api" }
 async-trait = "0.1"
 futures = "0.3"
 
-base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "wasmbind"] }
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
@@ -94,10 +86,6 @@ tracing-wasm = "0.2"
 # The diagnostics layer beside the console's (src/diagnostics.rs).
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 getrandom = { version = "0.2", features = ["js"] }
-
-[dev-dependencies]
-# The conformance suite the vault runs, as the RPC backend does.
-pimble-api = { path = "../crates/pimble-api", features = ["conformance"] }
 
 [profile.dev]
 opt-level = 1

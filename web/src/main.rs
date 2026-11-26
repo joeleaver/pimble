@@ -1,42 +1,32 @@
 //! Pimble in the browser.
 //!
 //! One wasm binary serves everything under `/app/`: the account pages
-//! (`/app/signup`, `/app/login`, `/app/account`) and the app itself — the same
-//! UI as the desktop, `pimble_app` built without its `native` feature, mounted
-//! through `rinch-web` instead of a window.
+//! (`/app/signup`, `/app/login`, `/app/account`, ...) and the app itself — the
+//! same UI as the desktop, `pimble_app` built without its `native` feature,
+//! mounted through `rinch-web` instead of a window.
 //!
-//! They are one binary because they share something that cannot be handed
-//! between pages: the account keys. Signing in derives them from the password
-//! and they stay in this page's memory, never in storage and never on the wire
-//! (docs/CRYPTO_CONTRACT.md). A link that reloads would lose them, so
-//! `crate::route` moves between pages in place.
+//! Behind the UI runs the same Pimble server the desktop embeds, in a worker
+//! of this origin's leader tab (`crate::worker_mode`, docs/ONE_CODEBASE_CONTRACT.md).
+//! It holds the account's keys and this browser's replicas of the stores, and
+//! the page reaches it through the same `pimble_api::Pimble` and
+//! `pimble_app::commands` the desktop uses, so there is one path for every
+//! read and write.
 //!
-//! The collaboration path is unchanged and deliberately so: the app's four
-//! pane slots, an `EditorHandle` each, edits travelling as yrs bytes through
-//! `BroadcastChanges` and `RemoteChanges`. For an encrypted store those bytes
-//! are encrypted on their way out and decrypted on their way in
-//! (`crate::vault`), and the editor never learns the difference.
+//! The collaboration path is the desktop's: the app's four pane slots, an
+//! `EditorHandle` each, edits travelling as yrs bytes through
+//! `BroadcastChanges` and `RemoteChanges`. An encrypted store's bytes are
+//! encrypted and decrypted by the server's vault link, and the editor never
+//! learns the difference.
 
 mod accounts;
-mod api;
-mod app_page;
-mod backend;
 mod diagnostics;
-mod endpoints;
 mod http;
 mod kdf;
-mod keys;
-mod menu;
 mod open_link;
-mod personal_sync;
 mod pages;
 mod route;
-mod routed;
-mod session;
 mod shortcuts;
 mod util;
-mod vault;
-mod vault_backend;
 mod worker_mode;
 
 use wasm_bindgen::prelude::*;
@@ -62,11 +52,7 @@ pub fn start() {
     let _ = console_log::init_with_level(log::Level::Info);
 
     shortcuts::install();
-    if worker_mode::enabled() {
-        worker_mode::begin();
-    } else {
-        worker_mode::end();
-    }
+    worker_mode::begin();
     route::start();
 }
 

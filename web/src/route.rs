@@ -1,16 +1,15 @@
 //! Which page this URL means, and how to get to another one.
 //!
 //! The account pages and the app itself are one wasm binary served under
-//! `/app/`, so moving between them must never reload the page: the unwrapped
-//! account keys live in memory (`crate::session`) and a reload is exactly what
-//! throws them away. Every move therefore goes through [`go`], which pushes a
-//! history entry and swaps what is on screen.
+//! `/app/`, so moving between them never reloads the page. Every move goes
+//! through [`go`], which pushes a history entry and swaps what is on screen.
 //!
 //! The two halves are kept apart on purpose. An account page is mounted and
 //! unmounted freely; the app is mounted **once** and afterwards only hidden and
-//! shown, because behind it sit a WebSocket, a set of subscriptions, an editor
-//! session and a vault client, none of which should be torn down because
-//! somebody looked at their store list.
+//! shown, because behind it sit a connection to this browser's own server
+//! (`crate::worker_mode`), its subscriptions and the editors' collaboration
+//! sessions, none of which should be torn down because somebody looked at
+//! their account page.
 //!
 //! The server side of this is one rule: every path under `/app/` serves the
 //! same `index.html`. `trunk serve` does that for unknown paths already, and
@@ -135,36 +134,24 @@ pub fn render(route: Route) {
             unmount_page();
             show(&page_host(), false);
             show(&app_host(), true);
+            // The app is built once; coming back from an account page only
+            // shows it again: the browser's own server lists what the account
+            // holds by itself, so there is nothing to fetch again.
             if !APP_STARTED.get() {
                 APP_STARTED.set(true);
-                if crate::worker_mode::enabled() {
-                    crate::worker_mode::start_app();
-                } else {
-                    crate::app_page::start();
-                }
-            } else if crate::worker_mode::enabled() {
-                // The browser's own server lists what the account holds by
-                // itself; nothing to mint again.
-            } else {
-                // Coming back from the account pages, where a store may have
-                // been created or shared. The token this app holds predates
-                // that grant and `listStores` answers strictly by the token,
-                // so both are redone before the tree is believed again.
-                crate::backend::request_refresh();
+                crate::worker_mode::start_app();
             }
         }
         Route::Signup => mount_page(crate::pages::signup::signup_page),
-        Route::Login if crate::worker_mode::enabled() => mount_page(crate::worker_mode::pages::login_page),
-        Route::Account if crate::worker_mode::enabled() => mount_page(crate::worker_mode::pages::account_page),
-        Route::Login => mount_page(crate::pages::login::login_page),
+        Route::Login => mount_page(crate::worker_mode::pages::login_page),
         Route::Forgot => mount_page(crate::pages::forgot::forgot_page),
         Route::Recover => mount_page(crate::pages::recover::recover_page),
-        Route::Account => mount_page(crate::pages::account::account_page),
+        Route::Account => mount_page(crate::worker_mode::pages::account_page),
     }
 }
 
 /// Build the app into its own host, under its menu bar. Called once, by
-/// `app_page`.
+/// `worker_mode::start_app`.
 ///
 /// The menus are `pimble_app::menus`, the same values the desktop hands its
 /// native bar, rendered here by rinch-web's DOM bar. Every item's accelerator

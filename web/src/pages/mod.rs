@@ -1,18 +1,15 @@
-//! The account pages, inside the app.
-//!
-//! `/app/signup`, `/app/login` and `/app/account` are rinch views in the same
-//! wasm binary as the tree and the editor, for one reason: signing in derives
-//! keys that must stay in this page's memory, and a static HTML page could not
-//! hold them (docs/CRYPTO_CONTRACT.md, "Web app"). Moving between these and the
-//! app is `crate::route::go`, never a link that reloads.
+//! The account pages that need no server: signing up, "I forgot my
+//! password" and the recovery link's page. Signing in and the account page
+//! itself go through this browser's own server (`crate::worker_mode::pages`).
+//! All are rinch views in the same wasm binary as the tree and the editor;
+//! moving between them and the app is `crate::route::go`, never a link that
+//! reloads.
 
-pub mod account;
 pub mod forgot;
-pub mod login;
 pub mod recover;
 pub mod signup;
 
-/// Layout for the three account pages. Everything else comes from rinch's
+/// Layout for the account pages. Everything else comes from rinch's
 /// theme, so both colour schemes work with no extra rules here.
 pub const PAGE_CSS: &str = "
 .pimble-page {

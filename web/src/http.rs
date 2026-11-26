@@ -1,13 +1,10 @@
-//! The one way this page talks to the accounts service.
+//! The one way this page talks to the accounts service directly: the pages
+//! that run before any server (signing up, recovery; `crate::accounts`).
 //!
 //! Every call is same-origin with the session cookie attached, and every
-//! failure comes back as an [`ApiError`] carrying the service's own
-//! `{ error, message }` shape (`crates/pimble-cloud/src/error.rs`), so a page
-//! can branch on a code like `email_unverified` instead of matching strings.
-//!
-//! Nothing here knows about keys. Key material is derived and unwrapped in
-//! `crate::session`, and only ever the *wrapped* form travels through these
-//! calls.
+//! failure comes back as an [`ApiError`] whose message is the service's own
+//! (`{ error, message }`, `crates/pimble-cloud/src/error.rs`) when it sent
+//! one, fit to show someone.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,12 +12,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestCredentials, RequestInit, Response};
 
-/// A failed call: the HTTP status, the service's error code (empty when the
-/// body was not the service's error shape) and a message fit to show someone.
+/// A failed call, as a message fit to show someone.
 #[derive(Debug, Clone)]
 pub struct ApiError {
-    pub status: u16,
-    pub code: String,
     pub message: String,
 }
 
@@ -28,12 +22,7 @@ impl ApiError {
     /// A failure that never reached the service (no window, a dead network, a
     /// body that would not parse).
     pub fn local(message: impl Into<String>) -> Self {
-        Self { status: 0, code: String::new(), message: message.into() }
-    }
-
-    /// Whether this is "no session, or one the server no longer accepts".
-    pub fn is_unauthorized(&self) -> bool {
-        self.status == 401
+        Self { message: message.into() }
     }
 }
 
@@ -55,19 +44,9 @@ pub async fn post<B: Serialize, R: DeserializeOwned>(path: &str, body: &B) -> Ap
     call("POST", path, Some(body)).await
 }
 
-/// `POST path` with no body at all (the token and logout endpoints).
+/// `POST path` with no body at all (the logout endpoint).
 pub async fn post_empty<R: DeserializeOwned>(path: &str) -> ApiResult<R> {
     call::<(), R>("POST", path, None).await
-}
-
-/// `PUT path` with a JSON body, decoded as `R`.
-pub async fn put<B: Serialize, R: DeserializeOwned>(path: &str, body: &B) -> ApiResult<R> {
-    call("PUT", path, Some(body)).await
-}
-
-/// `DELETE path`, decoded as `R`.
-pub async fn delete<R: DeserializeOwned>(path: &str) -> ApiResult<R> {
-    call::<(), R>("DELETE", path, None).await
 }
 
 /// One request, start to finish.
@@ -140,12 +119,9 @@ fn parse_error(status: u16, body: &str, path: &str) -> ApiError {
         message: String,
     }
     match serde_json::from_str::<Body>(body) {
-        Ok(b) if !b.message.is_empty() || !b.error.is_empty() => ApiError {
-            status,
-            code: b.error,
-            message: if b.message.is_empty() { format!("{path} failed ({status})") } else { b.message },
-        },
-        _ => ApiError { status, code: String::new(), message: format!("{path} answered {status}") },
+        Ok(b) if !b.message.is_empty() => ApiError { message: b.message },
+        Ok(b) if !b.error.is_empty() => ApiError { message: format!("{path} failed ({status})") },
+        _ => ApiError { message: format!("{path} answered {status}") },
     }
 }
 

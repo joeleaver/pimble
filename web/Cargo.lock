@@ -2575,7 +2575,6 @@ name = "pimble-web"
 version = "0.32.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "chrono",
  "console_error_panic_hook",
  "console_log",
@@ -2588,11 +2587,8 @@ dependencies = [
  "pimble-app",
  "pimble-client",
  "pimble-core",
- "pimble-crdt",
  "pimble-crypto",
- "pimble-discussion",
  "pimble-rpc",
- "pimble-sheet",
  "rinch",
  "rinch-core",
  "rinch-editor-core",
