@@ -37,17 +37,17 @@ impl RpcHandler {
 
         // The node and what is above it, a discussion's subject included.
         let chain = crate::notices::chain_of(self, store_id, node_id).await;
-        {
-            // A share that ended is no longer this account's: who holds it now
-            // cannot be known here, and what was kept would be stale.
-            let manager = self.store_manager.read().await;
-            if chain.iter().any(|&id| manager.under_ended_root(store_id, id)) {
-                return Ok(WhoCanOpenResponse { people: Vec::new(), incomplete: true });
-            }
-        }
         let kept = crate::people::kept(self, store_id).await.map_err(to_rpc_error)?;
         let manager = self.store_manager.read().await;
         let tree = manager.tree(store_id).map_err(to_rpc_error)?;
+        // A share that ended is no longer this account's: who holds it now
+        // cannot be known here, and what was kept would be stale.
+        if manager.under_ended_root(store_id, node_id) {
+            return Ok(WhoCanOpenResponse { people: Vec::new(), incomplete: true });
+        }
+        // The node may be in a share still held inside one that ended: the
+        // ended one's members are left out, and may open it all the same.
+        let (chain, ended): (Vec<_>, Vec<_>) = chain.into_iter().partition(|&id| !manager.under_ended_root(store_id, id));
         // A share this node is in, by the marker on its root, that the kept
         // list does not name.
         let unlisted_share = chain.iter().any(|&root| {
@@ -58,6 +58,6 @@ impl RpcHandler {
         // no marker says.
         let never_told = kept.is_none() && self.link_kind_of_locked(&manager, store_id).await.0 == StoreKind::Vault;
         let people = kept.unwrap_or_default().members_of(&chain).into_iter().map(|person| Opener { user_id: person.user_id, name: person.name }).collect();
-        Ok(WhoCanOpenResponse { people, incomplete: unlisted_share || never_told })
+        Ok(WhoCanOpenResponse { people, incomplete: unlisted_share || never_told || !ended.is_empty() })
     }
 }

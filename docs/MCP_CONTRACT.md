@@ -140,10 +140,14 @@ Decided by Joe, 2026-11-26: an agent that can read a note may see who else can o
   account id and the name they go by there. No email, no notice key, no share's name.
 - It is read from the kept `people.json` (docs/PRESENCE_CONTRACT.md section 3). Pimble
   Cloud is not asked, so an agent never spends the person's account session.
-- The list is as this computer last learned it. It is asked again at once after this
-  computer shares, invites, removes or stops sharing, and otherwise as
-  docs/PRESENCE_CONTRACT.md section 3 says, so a change made elsewhere shows a little
-  later (or once this computer is online).
+- The list is as this computer last learned it. It is asked again after this computer
+  shares, invites, removes or stops sharing (which waits a few seconds at most for the
+  answer), and otherwise as docs/PRESENCE_CONTRACT.md section 3 says, so a change made
+  elsewhere shows a little later (or once this computer is online).
+- A store's other owners are among those who can open every note in it. A signed-in
+  account that holds nothing of the store leaves the list as it was.
+- In a share still held inside one that ended, the answer names the held share's members
+  and says there may be others.
 - `incomplete` says the note is shared with members this computer does not have (not
   learned yet, or a share that ended), and the tool says so rather than answering
   "nobody". A share of the account's own that nobody else is in is kept as such

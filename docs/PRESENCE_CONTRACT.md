@@ -350,8 +350,12 @@ Each wave is checked in the desktop app and in the browser on the local stack
     not hold the link up);
   - on `cloudPeople`, which answers the cache when the service cannot be reached;
   - after a name is set;
-  - after this device shares a node, invites, removes a member or stops a share, whether
-    or not the call went through.
+  - after this device asks the accounts service to share a node, invite, remove a member
+    or stop a share, whether or not an answer came back. The call waits 3 s at most for
+    it, and a deletion that stops a share does not wait.
+- A refresh keeps nothing when the signed-in account holds nothing of the store. For an
+  owner it asks who holds the whole store as well, since `GET /me/shares` leaves out the
+  other owners; they are kept as the whole-store scope.
 - A refresh that changes anything sends `StoreChangeKind::PeopleChanged`, which links
   never forward.
 - New Service-only RPCs:

@@ -12,14 +12,21 @@
 //! (its own name in each share), so it is this computer's and not the
 //! folder's (docs/STORE_FOLDERS_CONTRACT.md rule 1, decided 2026-11-19).
 
+use std::time::Duration;
+
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc::{Person, ScopePeople, StorePeople};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::handler::RpcHandler;
 use crate::keystore::SignedInAccount;
 
 const FILE_NAME: &str = "people.json";
+
+/// How long a change to a share waits to see itself in what is kept. The
+/// asking goes on after that.
+const CHANGE_WAIT: Duration = Duration::from_secs(3);
 
 async fn file_of(handler: &RpcHandler, store_id: StoreId) -> Option<std::path::PathBuf> {
     let manager = handler.store_manager_handle();
@@ -51,8 +58,21 @@ pub(crate) async fn kept(handler: &RpcHandler, store_id: StoreId) -> Result<Opti
 }
 
 /// Ask the accounts service now. `None` when it cannot be asked (nobody
-/// signed in, no network, a store no row names).
+/// signed in, no network) or the account holds nothing of the store, whose
+/// empty answer would read as "nobody".
 pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedInAccount, store_id: StoreId) -> Option<StorePeople> {
+    let id = store_id.to_string();
+    let rows = match crate::cloud::list_stores(http, &account.url, &account.session).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            debug!("People of store {}: could not list the account's stores: {}", store_id, e);
+            return None;
+        }
+    };
+    let Some(row) = rows.iter().find(|row| row.store_id == id) else {
+        debug!("People of store {}: the signed-in account does not hold it", store_id);
+        return None;
+    };
     let shares = match crate::cloud::list_shares(http, &account.url, &account.session).await {
         Ok(shares) => shares,
         Err(e) => {
@@ -60,7 +80,6 @@ pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedIn
             return None;
         }
     };
-    let id = store_id.to_string();
     let mut scopes = Vec::new();
     for share in shares.iter().filter(|share| share.store_id == id) {
         let root: Option<NodeId> = share.scope_root();
@@ -73,13 +92,53 @@ pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedIn
         };
         scopes.push(ScopePeople {
             root,
-            people: listing.people.into_iter().map(|person| Person { user_id: person.user_id, name: person.name, notice_key: person.notice_key }).collect(),
+            people: persons(listing.people),
             my_name: share.appears_as.clone(),
             my_name_chosen: !share.my_name.trim().is_empty(),
             share_name: share.name.clone(),
         });
     }
+    // An owner's list of shares leaves out the store's other owners, so who
+    // holds the whole of it is asked for itself.
+    if crate::cloud::is_owner_of(&rows, store_id) && !scopes.iter().any(|scope| scope.root.is_none()) {
+        let listing = match crate::cloud::list_members(http, &account.url, &account.session, &id, None).await {
+            Ok(listing) => listing,
+            Err(e) => {
+                debug!("People of store {}: could not list who holds it: {}", store_id, e);
+                return None;
+            }
+        };
+        if listing.people.iter().any(|person| person.user_id != account.user_id) {
+            let my_name = listing.people.iter().find(|person| person.user_id == account.user_id).map(|person| person.name.clone()).unwrap_or_default();
+            // Not a share anyone is asked to choose a name for.
+            scopes.push(ScopePeople { root: None, people: persons(listing.people), my_name, my_name_chosen: true, share_name: row.name.clone() });
+        }
+    }
     Some(StorePeople { scopes, alone: Vec::new() })
+}
+
+fn persons(listed: Vec<crate::cloud::PersonView>) -> Vec<Person> {
+    listed.into_iter().map(|person| Person { user_id: person.user_id, name: person.name, notice_key: person.notice_key }).collect()
+}
+
+/// [`refresh`] in a task of its own; the receiver answers when it is done.
+pub(crate) fn refresh_in_background(handler: &RpcHandler, store_id: StoreId) -> oneshot::Receiver<()> {
+    let (done, finished) = oneshot::channel();
+    let handler = handler.clone();
+    let runtime = handler.runtime().clone();
+    runtime.spawn(async move {
+        refresh(&handler, store_id).await;
+        let _ = done.send(());
+    });
+    finished
+}
+
+/// Ask again after this device has asked the accounts service to change who
+/// is in a share, so that the next question is answered with the change,
+/// waiting [`CHANGE_WAIT`] at most.
+pub(crate) async fn refresh_after_change(handler: &RpcHandler, store_id: StoreId) {
+    let finished = refresh_in_background(handler, store_id);
+    let _ = handler.runtime().timeout(CHANGE_WAIT, finished).await;
 }
 
 /// Ask again and, when the answer differs from what is kept, keep it and

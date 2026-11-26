@@ -20,7 +20,7 @@
 use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -267,6 +267,10 @@ pub struct Stub {
     pub inner: Mutex<StubInner>,
     /// The members endpoints answer 503 while set: "the service is unreachable".
     pub members_down: AtomicBool,
+    /// `GET /me/shares` takes a minute to answer, as a hung service would.
+    pub shares_stalled: AtomicBool,
+    /// How many times `GET /me/shares` was asked.
+    pub share_list_calls: AtomicUsize,
     /// `/token` answers 401 "invalid session" while set: the session expired.
     pub refuse_sessions: AtomicBool,
     /// How many times `/token` was asked.
@@ -754,6 +758,10 @@ pub async fn stub_put_me(State(state): State<StubState>, headers: HeaderMap, Jso
 }
 
 pub async fn stub_list_shares(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    state.share_list_calls.fetch_add(1, Ordering::SeqCst);
+    if state.shares_stalled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
     let s = state.inner.lock().unwrap();
     let me = s.account_of(&headers).user_id.clone();
     let mut out = Vec::new();
@@ -1115,6 +1123,8 @@ pub async fn spawn_env() -> Env {
             token_role: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
+        shares_stalled: AtomicBool::new(false),
+        share_list_calls: AtomicUsize::new(0),
         refuse_sessions: AtomicBool::new(false),
         token_calls: std::sync::atomic::AtomicUsize::new(0),
         inbox_wake: tokio::sync::Notify::new(),

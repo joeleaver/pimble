@@ -794,6 +794,7 @@ async fn sharing_from_a_store_that_is_not_hosted_is_refused_and_nothing_is_uploa
         assert!(s.stores.is_empty() && s.key_grants.is_empty() && s.invitations.is_empty());
         assert_eq!(s.sharing_calls, 0);
     }
+    assert_eq!(env.stub.share_list_calls.load(Ordering::SeqCst), 0, "a refused share asks nothing about who is in it");
     assert!(alice.get_node(store_id, folder).await.unwrap().metadata.share().is_none());
     assert!(scope_keys_in(a_dir.path(), store_id).is_empty(), "no share key was made");
     let (remote, _, mode) = alice.get_store_sync_with_mode(store_id).await.unwrap();
@@ -1497,4 +1498,113 @@ async fn a_members_create_made_while_down_reaches_the_owner_after_a_stop_inside_
 
     a.stop().await.unwrap();
     b.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn who_can_open_names_a_co_owner_and_an_account_without_the_store_changes_nothing() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let store_id = fx.store_id;
+    let agent = agent_of(&a, &alice, store_id).await;
+    let (alice_id, bob_id) = (env.user_id(ALICE.0), env.user_id(BOB.0));
+
+    // Bob owns the whole store too, and nothing else is shared with anyone.
+    {
+        let mut s = env.stub.inner.lock().unwrap();
+        let id = store_id.to_string();
+        let row = s.stores.iter().find(|row| row.store_id == id && row.root.is_none()).expect("Alice's grant");
+        let row = common::StubStoreRow { user_id: bob_id.clone(), store_id: id, name: row.name.clone(), kind: row.kind.clone(), created_at: row.created_at.clone(), role: "owner".into(), root: None, shared_by: None };
+        s.stores.push(row);
+    }
+    alice.cloud_people(store_id).await.unwrap();
+    let both = openers(&agent, store_id, fx.inside).await;
+    assert!(both.0.len() == 2 && !both.1, "{both:?}");
+    // A share only the owners can open is not an unknown one.
+    alice.cloud_share_node(store_id, fx.shared, "Holiday Plans").await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, both);
+
+    // An account that holds nothing of the store learns nothing about it,
+    // and what was kept stays.
+    let held: Vec<common::StubStoreRow> = {
+        let mut s = env.stub.inner.lock().unwrap();
+        let (alices, others) = std::mem::take(&mut s.stores).into_iter().partition(|row| row.user_id == alice_id);
+        s.stores = others;
+        alices
+    };
+    let kept = alice.cloud_people(store_id).await.unwrap();
+    assert!(!kept.scopes.is_empty(), "{kept:?}");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, both);
+
+    // A list that cannot be read is written again, an empty one included.
+    {
+        let mut s = env.stub.inner.lock().unwrap();
+        s.stores.retain(|row| row.user_id != bob_id);
+        s.stores.extend(held);
+    }
+    let file = a_dir.path().join("stores").join(store_id.to_string()).join("people.json");
+    tfs::write(&file, "not json").unwrap();
+    alice.cloud_people(store_id).await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_change_to_a_share_and_a_deletion_do_not_wait_for_a_hung_list_of_shares() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, fx.deeper, "Tickets").await.unwrap();
+    alice.cloud_share_invite(store_id, fx.deeper, BOB.0, MemberRole::Editor).await.unwrap();
+
+    env.stub.shares_stalled.store(true, Ordering::SeqCst);
+    // Longer than a change waits, shorter than one request's own limit.
+    let limit = Duration::from_secs(10);
+    tokio::time::timeout(limit, alice.cloud_share_remove_member(store_id, fx.deeper, BOB.0)).await.expect("a removal answers").unwrap();
+    tokio::time::timeout(limit, alice.cloud_share_invite(store_id, fx.deeper, BOB.0, MemberRole::Editor)).await.expect("an invitation answers").unwrap();
+    tokio::time::timeout(Duration::from_millis(2500), alice.delete_node(store_id, shared)).await.expect("a deletion does not wait for who is who").unwrap();
+    assert_eq!(env.scoped_rows(store_id, fx.deeper), 0, "its share was stopped all the same");
+    env.stub.shares_stalled.store(false, Ordering::SeqCst);
+
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_share_held_inside_an_ended_one_still_names_its_members() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, outer, inner) = (fx.store_id, fx.shared, fx.deeper);
+    alice.cloud_share_node(store_id, outer, "Holiday Plans").await.unwrap();
+    alice.cloud_share_node(store_id, inner, "Tickets").await.unwrap();
+    alice.cloud_share_invite(store_id, outer, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, inner, BOB.0, MemberRole::Editor).await.unwrap();
+
+    let b_dir = tempfile::tempdir().unwrap();
+    let mut b = PimbleServer::with_config(ServerConfig { grant_check_interval: Some(Duration::from_secs(1)), ..device_config(b_dir.path()) });
+    b.start().await.unwrap();
+    let bob = PimbleClient::connect(format!("http://{}", b.addr())).await.unwrap();
+    env.sign_in(&bob, BOB).await;
+    bob.cloud_add_hosted_store(store_id).await.unwrap();
+    let learned = wait_until(Duration::from_secs(30), || async {
+        bob.who_can_open(store_id, fx.leaf).await.is_ok_and(|answer| answer.people.len() == 2 && !answer.incomplete)
+    })
+    .await;
+    assert!(learned, "Bob's device learns who is in both shares: {:?}", bob.who_can_open(store_id, fx.leaf).await);
+
+    alice.cloud_share_remove_member(store_id, outer, BOB.0).await.unwrap();
+    let ended = wait_until(Duration::from_secs(30), || async { bob.get_store_sync_response(store_id).await.is_ok_and(|held| held.ended_roots == vec![outer]) }).await;
+    assert!(ended, "the outer share ends");
+    // The inner share's members, and that there may be others.
+    let still = wait_until(Duration::from_secs(30), || async {
+        bob.who_can_open(store_id, fx.leaf).await.is_ok_and(|answer| answer.people.len() == 2 && answer.incomplete)
+    })
+    .await;
+    assert!(still, "{:?}", bob.who_can_open(store_id, fx.leaf).await);
+    assert_eq!(openers(&bob, store_id, fx.inside).await, (Vec::<String>::new(), true));
+
+    b.stop().await.unwrap();
+    a.stop().await.unwrap();
 }

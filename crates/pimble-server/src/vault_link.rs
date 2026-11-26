@@ -982,11 +982,7 @@ async fn connect_and_sync(
 /// (`crate::people`); a name someone chose reaches this device within one
 /// [`crate::grant::GRANT_CHECK_EVERY`].
 fn spawn_people_refresh(handler: &RpcHandler, store_id: StoreId) {
-    let handler = handler.clone();
-    let runtime = handler.runtime().clone();
-    runtime.spawn(async move {
-        crate::people::refresh(&handler, store_id).await;
-    });
+    drop(crate::people::refresh_in_background(handler, store_id));
 }
 
 /// Read again, from the accounts service, how the signed-in account holds
