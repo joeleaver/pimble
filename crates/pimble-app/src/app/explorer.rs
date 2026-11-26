@@ -37,6 +37,7 @@ pub fn focus_explorer() {
 /// either gives the keyboard back to the tree. `false` when the row cannot
 /// be renamed here (a mount, or a node this device may only read).
 pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) -> bool {
+    rename_starts();
     // Don't allow rename on mount nodes
     let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(value) {
         store.is_mount(sid, nid)
@@ -99,7 +100,21 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
 thread_local! {
     /// The row of a node just made whose name is being typed: its box starts
     /// empty, and an empty Enter keeps the name it was made with ("Metanode").
-    pub(super) static FRESH_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+    static FRESH_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Every rename starts as an ordinary one; the row of a node just made marks
+/// its own as fresh after this (`mark_fresh`). A fresh rename left with
+/// Escape (or a click elsewhere) must not make a later F2 on that row move
+/// the keyboard into its document.
+fn rename_starts() {
+    FRESH_RENAME.with(|f| f.borrow_mut().take());
+}
+
+/// Marks the rename of `value`, just started, as the naming of a node just
+/// made (`FRESH_RENAME`).
+pub(super) fn mark_fresh(value: &str) {
+    FRESH_RENAME.with(|f| *f.borrow_mut() = Some(value.to_string()));
 }
 
 /// The title a rename of `value` commits, or `None` to keep the one it has: a
@@ -319,4 +334,25 @@ pub(super) fn render_explorer(
     };
     let tree_scroll = explorer_menu(__scope, store, tree_state, menu, tree_scroll);
     (tree_scroll, cancel_rename)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_fresh, rename_starts, rename_title};
+
+    #[test]
+    fn a_fresh_rename_left_with_escape_leaves_a_later_rename_ordinary() {
+        mark_fresh("node_a");
+        // Escape: nothing reads the mark. Then F2 on the same row.
+        rename_starts();
+        assert_eq!(rename_title("node_a", String::new()), (Some(String::new()), false));
+    }
+
+    #[test]
+    fn a_fresh_rename_is_fresh_once() {
+        rename_starts();
+        mark_fresh("node_b");
+        assert_eq!(rename_title("node_b", "  ".into()), (None, true));
+        assert_eq!(rename_title("node_b", "Title".into()), (Some("Title".into()), false));
+    }
 }
