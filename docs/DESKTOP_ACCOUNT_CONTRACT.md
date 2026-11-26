@@ -64,7 +64,7 @@ app restart and `cloudStatus` reports it on the next start.
    (the wrappers compile for wasm); the menu entries, the row item, the modals and the
    status-bar text are `native` only. The browser signs in through its own pages.
 
-## Protocol (`crates/pimble-app/src/protocol.rs`)
+## Protocol (`crates/pimble-app/src/protocol/`)
 
 ```rust
 // BackendCommand
@@ -93,7 +93,7 @@ client returns `GetStoreSyncResponse` fields, so the mode comes for free (add a
 `set_store_sync_with_mode` to `pimble-client` only if the existing wrapper drops it, and
 keep the old wrapper).
 
-## State (`crates/pimble-app/src/state.rs`)
+## State (`crates/pimble-app/src/state/mod.rs`)
 
 ```rust
 pub cloud_signed_in: Signal<bool>,
@@ -123,7 +123,7 @@ pub hosted_modal_error: Signal<String>,
 `CloudHostedStoreInfo` is `Clone` but not `PartialEq`; if a reactive `for` needs it,
 resolve rows to a local `PartialEq` struct as `search_rows` does.
 
-## Events (`crates/pimble-app/src/events.rs`)
+## Events (`crates/pimble-app/src/events/cloud.rs`)
 
 - `CloudStatusChanged`: set the three `cloud_*` signals. If the account modal is busy
   (a sign-in or sign-out just answered): busy false, error empty, password cleared; on a
@@ -149,7 +149,7 @@ sends `CloudListHostedStores` at once; not signed in: the hosted modal shows
 "Sign in first" with a button that opens the Account modal). Update the test's
 minimum count if it matters.
 
-## App (`crates/pimble-app/src/app.rs`)
+## App (`crates/pimble-app/src/app/`: `account.rs`, `hosting.rs`)
 
 - `open_account_modal(store, hint: &str)`, `open_host_modal(store, store_id)`,
   `open_hosted_modal(store)`; the three modals rendered beside the existing ones (both

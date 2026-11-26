@@ -53,7 +53,7 @@ use rinch::core::dom::NodeId as DomId;
 
 use std::collections::BTreeMap;
 
-use board::{board_of, column_key, drop_of, key_of, step_card, step_column, Board, Lane, Step, Target};
+use board::{board_of, column_board, column_key, drop_of, key_of, step_card, step_column, Board, Lane, Step, Target};
 
 use cards::*;
 use columns::*;
@@ -73,12 +73,18 @@ const COLUMNS: &str = "columns";
 /// The viewer's id, as a metanode names it in `metanode:viewer`.
 pub const VIEWER: &str = "kanban";
 
+/// The viewer of a kanban's column opened on its own: the column, as it is
+/// on the board. The app shows a kanban's children with it (ABI 7's child
+/// viewers); nothing is stored on the column.
+pub const COLUMN_VIEWER: &str = "kanban-column";
+
 /// The columns "New Kanban" starts with (open decision 4, as recommended).
 pub const FIRST_COLUMNS: &[&str] = &["To do", "Doing", "Done"];
 
 fn describe() -> Manifest {
     manifest("kanban-viewer", "Kanban", env!("CARGO_PKG_VERSION"))
         .with(viewer(VIEWER, "Kanban", &[SourceShape::Subtree { depth: 2 }]))
+        .with(child_viewer(COLUMN_VIEWER, "Kanban column", VIEWER, Some("layout-columns")))
         .with(recipe("new-kanban", "New Kanban", "Kanban", Some("layout-kanban"), VIEWER, 2, FIRST_COLUMNS))
         .writes(StoreAsk::Chosen)
 }
@@ -119,6 +125,9 @@ struct Kanban {
     api: Arc<Pimble>,
     host: Host,
     metanode: Addr,
+    /// Shown with [`COLUMN_VIEWER`]: `metanode` is a kanban's column, drawn
+    /// alone, with nothing to add around it.
+    column_only: bool,
     board: Signal<Board>,
     /// The forest has been read once.
     loaded: Signal<bool>,
@@ -156,6 +165,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         api: mount.api.clone(),
         host: mount.host.clone(),
         metanode,
+        column_only: mount.viewer == COLUMN_VIEWER,
         board: Signal::new(Board::default()),
         loaded: Signal::new(false),
         chosen: Signal::new(None),
@@ -258,7 +268,7 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
                     {lane_tools(__scope, &kt)}
                 }
             }
-            if loaded.get() && board.with(|b| b.lanes.len() < 2 && b.lanes.iter().all(|l| l.columns.is_empty())) {
+            if loaded.get() && !k.column_only && board.with(|b| b.lanes.len() < 2 && b.lanes.iter().all(|l| l.columns.is_empty())) {
                 div { style: LINE_STYLE, "This kanban has no columns yet." }
             }
             div {
@@ -317,6 +327,9 @@ mod tests {
     fn it_provides_the_kanban_viewer_and_new_kanban() {
         let m = describe();
         assert_eq!(m.viewers().next().map(|v| v.id.as_str()), Some(VIEWER));
+        // A kanban's column opened on its own shows as a column.
+        let column = m.child_viewers().next().expect("the column viewer");
+        assert_eq!((column.id.as_str(), column.of.as_str(), column.icon.as_deref()), (COLUMN_VIEWER, VIEWER, Some("layout-columns")));
         let recipe = m.recipes().next().expect("New Kanban");
         assert_eq!(recipe.label, "New Kanban");
         assert_eq!(recipe.depth, 2);

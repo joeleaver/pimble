@@ -41,11 +41,39 @@ pub use bridge::{Approval, Approved};
 pub use instance::{host_calls, Answered, ApiSide, Call, Failure, GuestEngine, HostCalls, HostKey, Instance, InstanceOptions};
 pub use pimble_plugin_abi as abi;
 
-use pimble_plugin_abi::{refusal_for_abi, Manifest, ABI_VERSION};
+use pimble_plugin_abi::{refusal_for_abi, Manifest, ManifestHead, ABI_VERSION};
+pub use registry::NotLoaded;
 
 /// The rinch git revision the app is built against (from the workspace's
 /// `Cargo.lock`), to compare with the one each plugin's manifest names.
 pub const HOST_RINCH_REVISION: &str = env!("PIMBLE_RINCH_REVISION");
+
+/// What a plugin's `describe` answered (`described`; `file` is its file's
+/// name): the manifest of a plugin this app runs, or why not, with what it
+/// said it is as far as that could be read. A manifest built for another ABI
+/// may not decode in full; its head still names the plugin, so the library can
+/// replace it (docs/PLUGINS_CONTRACT.md section 7).
+pub fn describe(file: &str, described: &[u8]) -> Result<Manifest, NotLoaded> {
+    match pimble_plugin_abi::decode::<Manifest>(described) {
+        Ok(manifest) => match check_manifest(&manifest) {
+            Ok(()) => Ok(manifest),
+            Err(sentence) => Err(NotLoaded::described(manifest, sentence)),
+        },
+        Err(_) => match ManifestHead::decode(described) {
+            Ok(head) if head.abi != ABI_VERSION => {
+                let name = if head.name.is_empty() { head.id.as_str() } else { head.name.as_str() };
+                let sentence = refusal_for_abi(name, head.abi);
+                Err(NotLoaded::headed(head, sentence))
+            }
+            Ok(head) => Err(NotLoaded::headed(head, unreadable(file))),
+            Err(_) => Err(NotLoaded::new(unreadable(file))),
+        },
+    }
+}
+
+fn unreadable(file: &str) -> String {
+    format!("The plugin {file} described itself in a form this Pimble cannot read.")
+}
 
 /// Whether the app runs a plugin that describes itself as `manifest`, or the
 /// sentence a person reads when it does not.
@@ -68,6 +96,17 @@ pub fn check_manifest(manifest: &Manifest) -> Result<(), String> {
     if manifest.viewers().any(|v| v.id.is_empty()) {
         return Err(format!("The {name} plugin provides a viewer with no id."));
     }
+    if manifest.child_viewers().any(|c| c.id.is_empty()) {
+        return Err(format!("The {name} plugin provides a viewer with no id."));
+    }
+    // A child viewer shows the children of the plugin's own viewer: no
+    // plugin decides how another's metanodes' children look.
+    if let Some(child) = manifest.child_viewers().find(|c| !manifest.viewers().any(|v| v.id == c.of)) {
+        return Err(format!("The {name} plugin's {} viewer is for the children of a {} viewer it does not provide.", child.name, child.of));
+    }
+    if let Some(child) = manifest.child_viewers().find(|c| manifest.viewers().any(|v| v.id == c.id)) {
+        return Err(format!("The {name} plugin provides two viewers named {}.", child.id));
+    }
     // Decision 6: no plugin reaches the network in these waves, so one that
     // needs it would not work if it ran.
     if manifest.asks.network {
@@ -79,7 +118,7 @@ pub fn check_manifest(manifest: &Manifest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pimble_plugin_abi::{Provision, SourceShape, ViewerDecl};
+    use pimble_plugin_abi::{ChildViewerDecl, Provision, SourceShape, ViewerDecl};
 
     fn manifest(abi: u32) -> Manifest {
         Manifest {
@@ -108,5 +147,22 @@ mod tests {
         let mut online = manifest(ABI_VERSION);
         online.asks.network = true;
         assert_eq!(check_manifest(&online).unwrap_err(), "The Hello viewer plugin asks to use the network, which Pimble does not allow plugins yet.");
+    }
+
+    fn with_child(id: &str, of: &str) -> Manifest {
+        let mut m = manifest(ABI_VERSION);
+        m.provides.push(Provision::ChildViewer(ChildViewerDecl { id: id.into(), name: "Hello child".into(), of: of.into(), icon: None }));
+        m
+    }
+
+    #[test]
+    fn a_child_viewer_is_for_the_plugins_own_viewer() {
+        assert_eq!(check_manifest(&with_child("hello-child", "hello")), Ok(()));
+        assert_eq!(
+            check_manifest(&with_child("hello-child", "kanban")).unwrap_err(),
+            "The Hello viewer plugin's Hello child viewer is for the children of a kanban viewer it does not provide."
+        );
+        assert_eq!(check_manifest(&with_child("hello", "hello")).unwrap_err(), "The Hello viewer plugin provides two viewers named hello.");
+        assert!(check_manifest(&with_child("", "hello")).is_err());
     }
 }

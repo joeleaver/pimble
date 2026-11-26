@@ -37,7 +37,7 @@ fn run() -> Result<(), String> {
         }
         let crate_name = package["name"].as_str().unwrap_or_default();
         let wasm = Path::new(wasm_dir).join(format!("{}.wasm", crate_name.replace('-', "_")));
-        let plugin = load_file(&wasm, DEFAULT_BUDGET).map_err(|(_, sentence)| format!("{}: {sentence}", wasm.display()))?;
+        let plugin = load_file(&wasm, DEFAULT_BUDGET).map_err(|refused| format!("{}: {}", wasm.display(), refused.sentence))?;
         let manifest = &plugin.manifest;
         let summary = pimble["summary"].as_str().ok_or_else(|| format!("{crate_name} has no [package.metadata.pimble] summary"))?;
         let bytes = std::fs::read(&wasm).map_err(|e| format!("{}: {e}", wasm.display()))?;

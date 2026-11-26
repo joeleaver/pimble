@@ -51,6 +51,14 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
             .get_or_insert_with(|| {
                 let handle = create_editor();
                 // Before any content: adding a plugin resets history.
+                // Markdown shortcuts before Pimble's other plugins, as rinch
+                // places its own: their input rules are tried first
+                // (crate::markdown_shortcuts).
+                handle.add_plugin(std::rc::Rc::new(crate::markdown_shortcuts::MarkdownShortcutsPlugin));
+                // Ctrl+Shift+7 makes no task list (crate::task_lists).
+                handle.add_plugin(std::rc::Rc::new(crate::task_lists::NoTaskListsPlugin));
+                // Spellchecking that leaves code alone (crate::spelling).
+                crate::spelling::install(&handle);
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
                 // After the links plugin: a pasted link is claimed there.
                 handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));
@@ -107,7 +115,7 @@ pub(crate) fn set_dark_mode(dark: bool) {
 
 /// A key was pressed in pane `pane`'s editor, so that is where the keyboard
 /// is and the pane has the focus (a press of the pointer reaches the pane
-/// itself: `pane_view::render_pane`). The link picker belongs to the pane it
+/// itself: `pane_view::pane::render_pane`). The link picker belongs to the pane it
 /// was opened in and closes when the focus leaves it.
 fn editor_took_focus(store: AppStore, pane: PaneId) {
     crate::pane_view::focus_pane(store, pane);

@@ -1,0 +1,263 @@
+/* Measuring (docs/MEASURE_CONTRACT.md): the Scale panel over the top of a
+   canvas, not modal; the readout near the pointer; the selection's
+   measures picker. */
+.pimble-board__scale {
+    position: absolute;
+    z-index: 6;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 340px;
+    max-width: calc(100% - 32px);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.pimble-board__scale-head {
+    display: flex;
+    align-items: center;
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.pimble-board__scale-ways {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.pimble-board__scale-way {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.pimble-board__scale-way .pimble-board__row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+
+.pimble-board__scale-note {
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+    white-space: normal;
+}
+
+.pimble-board__scale-preview {
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: var(--rinch-color-default);
+    white-space: normal;
+}
+
+.pimble-board__scale-preview--bad {
+    color: var(--rinch-color-red-6);
+}
+
+.pimble-board__scale-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-board__readout {
+    position: absolute;
+    z-index: 4;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.pimble-board__measures {
+    min-width: 220px;
+}
+
+.pimble-board__measure-value {
+    font-variant-numeric: tabular-nums;
+}
+
+.pimble-board__layers {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.pimble-board__layer {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    border: 1px solid transparent;
+}
+
+.pimble-board__layer--picked {
+    border-color: var(--rinch-primary-color-4);
+}
+
+.pimble-board__layer-icon {
+    display: inline-flex;
+    width: 16px;
+    height: 16px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__layer-name {
+    flex: 1;
+    min-width: 48px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-board__meaning-heading {
+    font-size: 12px;
+    margin-bottom: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-board__note {
+    width: 100%;
+    min-height: 54px;
+    font-size: 12px;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+/* The Meaning section's note box and field inputs: the same quiet box as
+   the rest of the floating chrome. */
+.pimble-board__note,
+.pimble-board__field-name-input,
+.pimble-board__field-value,
+.pimble-board__pattern {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    padding: 3px 6px;
+    font-family: inherit;
+    outline: none;
+}
+
+.pimble-board__note:focus,
+.pimble-board__field-name-input:focus,
+.pimble-board__field-value:focus,
+.pimble-board__pattern:focus {
+    border-color: var(--rinch-primary-color);
+}
+
+/* The context bar's custom dash pattern; red while it does not read as one. */
+.pimble-board__pattern {
+    width: 110px;
+    font-size: 12px;
+}
+
+.pimble-board__pattern--bad,
+.pimble-board__pattern--bad:focus {
+    border-color: var(--rinch-color-red-6, #e03131);
+}
+
+.pimble-board__fields {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 4px;
+}
+
+.pimble-board__field {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.pimble-board__field--new {
+    margin-top: 4px;
+}
+
+.pimble-board__field-name {
+    flex: 0 0 38%;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__field-name-input {
+    flex: 0 0 38%;
+    min-width: 0;
+    font-size: 12px;
+    height: 24px;
+    box-sizing: border-box;
+}
+
+.pimble-board__field-value {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    height: 18px;
+}
+
+.pimble-board__layer-name-input {
+    flex: 1;
+    width: 100%;
+    min-width: 0;
+    font-size: 12px;
+    height: 18px;
+}
+
+.pimble-board__layer-count {
+    color: var(--rinch-color-dimmed);
+    font-size: 11px;
+}
+
+.pimble-board-tool {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board-tool--active {
+    border-color: var(--rinch-primary-color-4);
+    color: var(--rinch-primary-color-4);
+}
+
+.pimble-board-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    cursor: pointer;
+    border: 2px solid transparent;
+    /* The black swatch on the dark theme. */
+    box-shadow: 0 0 0 1px var(--rinch-color-border);
+}
+
+.pimble-board-swatch--active {
+    border-color: var(--rinch-color-text);
+}
+
+.pimble-board-width {
+    border-radius: 50%;
+    background: currentColor;
+}
+

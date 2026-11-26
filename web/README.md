@@ -405,7 +405,7 @@ no "press Ctrl+N to create a new store" in the empty editor. Stores are created
 and shared on the account pages. "New Node", "Copy as Mount Source", "Paste
 Mount Here", "Rename", "Appearance..." and "Delete" are ordinary writes and stay.
 
-One flag decides this, `CAN_ADMINISTER_STORES` in `crates/pimble-app/src/app.rs`,
+One flag decides this, `CAN_ADMINISTER_STORES` in `crates/pimble-app/src/app/mod.rs`,
 so the desktop app is unchanged.
 
 ## Build

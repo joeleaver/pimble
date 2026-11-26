@@ -218,7 +218,7 @@ Built on branch `pictures-ui` (2026-10-07, not merged), on the storage half abov
 rinch's `pimble/images` branch. One module, `crates/pimble-app/src/pictures.rs`, serves the
 desktop and the browser; only the file picker differs between them.
 
-- **Protocol** (`protocol.rs`, `commands.rs`): `BackendCommand::PutBlob { store_id, node_id,
+- **Protocol** (`protocol/`, `commands/api.rs`): `BackendCommand::PutBlob { store_id, node_id,
   bytes, request_id }` answers `BlobStored { request_id, result }` with the `BlobUrl` and
   the notice sentence, or a refusal sentence; `GetBlob { url }` answers `BlobLoaded`. Both
   run as tasks beside the command loop, so typing does not wait behind a picture, and on

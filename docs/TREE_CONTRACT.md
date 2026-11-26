@@ -14,7 +14,7 @@ on 2026-10-19.
   selected sets (`UseTreeReturn`), and hands each row to the app (`render_node`). It has no
   keyboard handling, no drag and drop, no drop positions, and no virtualization.
   `UseTreeOptions::multiple` exists; nothing reads modifiers on a click.
-- Pimble's row (`app.rs`, `render_node_fn`) adds drag and drop on `DragContext`. A drop is
+- Pimble's row (`app/tree_row.rs`, `render_tree_row`) adds drag and drop on `DragContext`. A drop is
   always **into** the row: `decide_drop` sends `MoveNode { position: None }` (last
   child). `Tree::move_node`, `moveNode` and `transplantNode` already take a position; no
   caller passes one.
@@ -304,8 +304,8 @@ deletes, creates, renames from the tree), cleared on restart.
 
 **Pimble:**
 
-- P1 `Place` through `pimble-rpc`, `pimble-crdt` (`Tree`), `pimble-server`, `protocol.rs`,
-  `commands.rs`, `web/src/vault.rs` and `pimble-cli`, plus `moveNodes`.
+- P1 `Place` through `pimble-rpc`, `pimble-crdt` (`Tree`), `pimble-server`, `protocol/`,
+  `commands/`, `web/src/vault.rs` and `pimble-cli`, plus `moveNodes`.
 - P2 `judge_drop` (from `decide_drop`): access, self-or-descendant, mounts, stores,
   leaving a share, with the sentences above; pure and unit-tested like `decide_drop`.
 - P3 the destination strip at the foot of the explorer.

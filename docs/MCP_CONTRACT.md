@@ -221,10 +221,10 @@ The write tools name the blocks they change:
 | Tool | Edit |
 | --- | --- |
 | `append` | blocks after the content (`NodeDoc::append_blocks`, exists) |
-| `insert_after` | blocks after the block a quote names, or after a heading's section |
+| `insert_after` | blocks after the block a quote or `block_index` names, or after a heading's section |
 | `replace_section` | the blocks under a heading, up to the next heading of its level or higher |
-| `replace_text` | an exact quote inside one block, replaced by new text; marks outside the quote untouched |
-| `replace_block` | the one top-level block a quote names, replaced by Markdown or removed when it is empty (a heading removed or re-levelled) |
+| `replace_text` | an exact quote inside one block (with `occurrence` when it appears several times), replaced by new text; marks outside the quote untouched |
+| `replace_block` | the one top-level block a quote or `block_index` names, replaced by Markdown or removed when it is empty (a heading removed or re-levelled) |
 | `remove_section` | a heading and everything under it, up to the next heading of its level or higher |
 | `replace_content` | the whole content, written as the smallest set of block edits: blocks whose Markdown is the same before and after stay the same nodes, and each changed stretch is recorded as its own step (last first), so an unchanged block between two changed ones is never touched and anyone typing in it keeps their words. The node keeps its id and link |
 
@@ -246,9 +246,118 @@ search hits and outlines write them) or `"/"`, each one inside the section of th
 before. Several matches are refused with each one's heading path, so the next call can
 name one.
 
-A quote names a block by its text, the way a deep link's quote does
-(`docs/LINKS_CONTRACT.md`, `quote`). It must match exactly one block; zero or several
-matches fail with a sentence that says which, and how many.
+### Naming what an edit touches (2026-11-23)
+
+An agent once passed `block: "13"` with empty Markdown meaning block 13; the tool read it
+as a quote, removed the paragraph holding the characters "13", and answered "Removed the
+block". So a block, a heading and a place in the text are named in ways that cannot be
+mistaken for each other, and every tool's description opens with that rule:
+
+- **`quote`** (`replace_block`, `insert_after`, `replace_text`) is text, matched as text,
+  the way a deep link's quote is (`docs/LINKS_CONTRACT.md`, `quote`): "13" is the
+  characters 1 and 3. A list item's text names its whole list.
+- **`block_index`** (`replace_block`, `insert_after`, and for a heading `replace_section`,
+  `remove_section`, `insert_after` with `after_section`) is the block's number as
+  `get_node`'s `outline` and `blocks` print it: top-level blocks from 0, none in an empty
+  note. A number past the last is refused with the range there is; a section named by a
+  block that is not a heading is refused with what that block is. Every description of
+  `block_index` says where the numbers come from: read the note with `get_node`'s
+  `outline` or `blocks` first (they print them), or try the edit with `dry_run`.
+- **`expect`** (with `block_index`, on every tool that takes one) is some text that must be
+  in that block now (for a heading, in the heading), matched as a quote is. A number read
+  before the note changed names another block; with `expect` given and absent, nothing is
+  written and the refusal says what the block is and reads now, and to read the outline
+  or blocks again (`markdown::quotes::check_expected`, 2026-11-24). It does not go with
+  `quote`/`heading`.
+- **`heading`** (`replace_section`, `remove_section`) is some of a heading's text or a
+  heading path, found as above.
+- Exactly one of `quote`/`heading` and `block_index`; both or neither is refused.
+- **`occurrence`** (1, 2, ... or `"last"`) picks among the places a quote appears: every
+  place in the text, for a block as for `replace_text` (a quote twice in one block, as in
+  two items of one list, is two places; until 2026-11-24 a block counted once and such a
+  quote removed the whole list unasked). Overlapping places count too, each its own
+  occurrence: "aa" appears twice in "aaa", and either can be chosen. Without `occurrence`
+  a quote must appear exactly once; several are refused with every place listed, numbered
+  as `occurrence` counts, each with its block number and the 30 characters either side
+  (`markdown::quotes::pick`). The refusal advises only what the caller takes
+  (`markdown::Narrowing`): `occurrence` or `block_index` for `replace_block` and
+  `insert_after`, `occurrence` for `replace_text`, and quoting more for the tools that
+  take a quote alone (`after_text` of `create_table`, `move_table` and
+  `start_discussion`). It does not go with `block_index`.
+
+The parameters were renamed (`block` and `after` became `quote`), and the edit tools'
+parameters deny unknown fields, so a call with an old name is refused by name rather than
+read as something else. There is no compatibility alias: the MCP has no compatibility
+policy of its own, and `docs/API_CONTRACT.md` keeps no shims. A client that reads tool
+schemas (every MCP client does at connect) sees the new names.
+
+**Safe deletes.** Removing a block by a quote (`replace_block` with empty Markdown) is
+refused when the quote is shorter than 12 characters (`markdown::MIN_DELETE_QUOTE`) or
+reads like a number (digits and nothing but `#`, `.`, `-`, `,` and spaces). The sentence
+says what it would have removed ("It would have removed block 2 (...); to remove that
+block give `block_index: 2`"), every block when the quote appears in several, and when
+the quote is a number of a block that exists, "If you meant block 13, give
+`block_index: 13`". Replacing by a short quote stays allowed: what was there comes back in
+the answer. The same refusal (`markdown::judge`, 2026-11-24) covers the other ways to
+delete by a name:
+
+- **A heading named for removal or emptying** (`remove_section`, and `replace_section` with
+  empty Markdown): headings match by part of their text, so `remove_section(heading: "3")`
+  would take out "Phase 3". A name (for a heading path, its last segment) that is short or
+  reads like a number is refused when it matches only part of the heading's text, saying
+  which heading and block it names and to give the heading's whole text or its block
+  number. A name that is the heading's whole text (as `find_heading` compares, ignoring
+  case and punctuation) is sure however short: a heading titled "3" is removed by "3", and
+  "Plan/3" removes the "3" under "Plan". Replacing a section with something stays allowed
+  by any name.
+- **Text deleted by `replace_text`** (an empty `text`) by a quote that is short or reads
+  like a number: refused with where it appears, and the sure way, which deletes exactly the
+  same: quote it with the words either side and give those words back without it (quote
+  "the 13 apples", text "the apples"); only what differs changes.
+
+### What an edit says it did
+
+Every edit that removes or replaces answers what was there (`markdown::Echo`): its block
+numbers before the edit, its text run together and cut at 120 characters with "…"
+(`EXCERPT`), and the text either side of it (60 characters, `NEIGHBOR`: the neighboring
+blocks, or for `replace_text` the rest of the paragraph), or that it was the start or end
+of the note. `insert_after` says between which blocks the new ones went.
+`replace_content` lists each changed stretch with its old text (the first 20, then how
+many more). The echo puts the old text in the agent's own transcript, which is also the
+one recovery there is (below).
+
+### Dry runs
+
+Every destructive edit (`insert_after`, `replace_section`, `replace_text`,
+`replace_block`, `remove_section`, `replace_content`) takes `dry_run: true`: the same
+judgement, the same refusals and the same echo, starting "Dry run, nothing written", and
+nothing sent (`NodeDoc::preview_markdown`). It goes through `Pimble::edit` with an edit
+that changes nothing, so the document is brought up to date and the write's access is
+judged as for the real edit, and an edit that would change nothing is refused as the real
+one is.
+
+### Recovery: an open question for Joe
+
+There is no undo of an agent's edit, and nothing is built for it. What the documents can
+honestly offer was looked at (2026-11-23):
+
+- A node document is created with yrs's garbage collection on (`skip_gc` false), so the
+  text of a removed block is gone from the document once the deletion is merged; there is
+  no history to read it back from.
+- **(a) Snapshots.** `skip_gc` on every replica, and a yrs `Snapshot` per agent edit to
+  read the state before it. The documents grow forever; removed text stays in every
+  shared and encrypted document, readable by every member of a share after its author
+  removed it; and one replica with garbage collection on (an older version, the web)
+  breaks it.
+- **(b) An undo manager in the MCP.** A yrs `UndoManager` over the MCP's own edits keeps
+  the items it tracks from collection and undoes by an ordinary new edit, which fits
+  "everything is co-editable". But it lives in the MCP process's memory: a restart, a
+  reconnect that reloads the held document, or a second MCP process loses it.
+- **(c) What is given now.** The echo returns the old text (up to 120 characters a stretch)
+  to the agent, which can write it back with `insert_after`; a deleted node comes back with
+  `undelete_node`.
+
+Which of these, if any, to build is Joe's call.
 
 New in `pimble-crdt`, both edits of the existing history like `replace_plain_text`:
 
@@ -697,5 +806,5 @@ assistant:
 ## Later
 
 - Streamable HTTP on the app's server, with a token of its own.
-- Marking or attributing LLM edits; an undo for them.
+- Marking or attributing LLM edits; an undo for them (the options are under "Recovery: an open question for Joe").
 - A write scope narrower than the person's (an allowlist, or read-only mode).

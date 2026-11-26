@@ -34,6 +34,9 @@ pimble-image = { workspace = true }
 pimble-board = { workspace = true }
 pimble-sheet = { workspace = true }
 pimble-discussion = { workspace = true }
+# Document themes (docs/THEMES_CONTRACT.md): tokens, built-ins, resolution and
+# the custom properties a pane draws with; the font files are in assets/fonts.
+pimble-themes = { workspace = true }
 yrs = { workspace = true }
 # A stored picture's pixel size (an image node places it at one unit per
 # pixel), and a pasted clipboard bitmap as PNG. The same build pimble-board's is.
@@ -47,7 +50,7 @@ chrono = { workspace = true }
 # (and `collaboration`, which implies it) must stay out of a web build, and a
 # member cannot switch a workspace dependency's defaults off. Still GitHub
 # `main`, never a path; `cargo update rinch` moves the pin as before.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays", default-features = false, features = [
     "components",
     "theme",
 ] }
@@ -58,6 +61,8 @@ pimble-ui = { workspace = true }
 # data, on both targets (the browser lists none until its host, wave 3).
 pimble-plugin-abi = { workspace = true }
 rinch-editor-core = { workspace = true }
+# The note editor's spellchecker (`spelling.rs`), the same type on both targets.
+rinch-editor-view = { workspace = true }
 rinch-editor-collab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -94,7 +99,7 @@ toml_edit = "0.20"
 # --- web only (the browser DOM backend) ------------------------------------
 # The same `EditorHandle` / `Editor` as desktop, reached through the browser
 # backend instead of the desktop one, with the same yrs collaboration adapter.
-rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/editor-blocks-before-overlays", features = [
     "collaboration",
 ], optional = true }
 js-sys = { version = "0.3", optional = true }
@@ -114,6 +119,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "Notification", "NotificationOptions", "NotificationPermission",
     # Web push (wave 2): a notification clicked opens the app at it.
     "Location", "CustomEvent",
+    # `spelling.rs` fetches the bundled dictionary.
+    "Response",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 

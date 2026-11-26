@@ -67,6 +67,7 @@ the hosted server to this version together.
 | `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server, canvases included (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
 | `pimble-import` | Scrivener + RTF import | Complete |
 | `pimble-ui` | rinch components with no app state, drawn alike by the app and plugins: presence chips and dots, icons, theme colors | Complete |
+| `pimble-themes` | document themes as data: the token table (today's look as every default), typed checks, the nine built-ins, bases, the theme in force on a chain, `draw` to `--pd-*` properties and modifier classes, the bundled fonts (`docs/THEMES_CONTRACT.md`) | Wave 1 done; theme nodes, app themes to come |
 | `pimble-plugin-abi` / `-host` / `-sdk` | plugins: the ABI (6), the host (wasmtime on the desktop, the page's WebAssembly in the browser), the guest SDK in the `plugins/` workspace (with `hello-viewer`, `stuck-viewer`, `kanban-viewer`, `todo-viewer`, `timeline-viewer`; `scripts/plugins/install.sh`; viewers share `pimble_ui::viewer`, the kanban's look) | Desktop and browser hosts built (docs/PLUGINS_CONTRACT.md) |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
@@ -256,7 +257,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
 - A document this device may only read is locked with rinch's `EditorHandle::set_read_only`
-  (joeleaver/rinch#832), driven by an effect per pane in `pane_view.rs` over
+  (joeleaver/rinch#832), driven by an effect per pane in `pane_view/pane.rs` over
   `AppStore::node_access` of that pane's node (`editor::set_read_only`), so a role that
   changes while the document is open flips it in every pane holding it; remote changes keep
   applying while locked. The outbound closure's access
@@ -272,6 +273,14 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   the scope as data, less rules, hard breaks and images (nothing builds those from outside
   yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
   tables arrive as tables). The toolbar has a quote button and table buttons.
+- Markdown input shortcuts (`# `, `- `, `1. `, `> `, a code fence, `**bold**`, ...) are
+  rinch's input rules less the task list (`markdown_shortcuts.rs`), and Ctrl+Shift+7 makes no
+  task list (`task_lists.rs` overrides the base keymap's `toggleTaskList` command).
+- Spellcheck (`spelling.rs`): rinch's, leaving code out; the system checker on the desktop
+  (Windows and macOS platform checkers, Linux Hunspell with the bundled `en_US` from
+  `assets/dictionaries/` as the fallback), the same `en_US` fetched in the browser. Added
+  words stay on the device (`<data dir>/pimble/dictionary.txt`, `localStorage`
+  `pimble.dictionary`) and never sync. rinch does not check a read-only editor.
 - Pictures (`crates/pimble-app/src/pictures.rs`, both targets): a paste, a drop and Edit >
   "Insert Image..." all end in `add_picture`, which sends `BackendCommand::PutBlob`
   (`pimble_image::fit`, then `putBlob`, beside the command loop) and inserts the image at
@@ -285,7 +294,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 
 Contract: `docs/SPLIT_VIEW_CONTRACT.md`. The area beside the explorer is a `Tiling`
 (`pimble-app/src/panes.rs`: a binary tree of at most four `PaneId` leaves, with pure
-`split`/`close`/`rects`/`dividers`/`drag_ratio` and serde). `pane_view.rs` renders four pane
+`split`/`close`/`rects`/`dividers`/`drag_ratio` and serde). `pane_view/` renders four pane
 slots and three divider slots once and positions them in percent from the tiling; a slot
 not in the tiling is `display: none`. Splitting, closing and dragging change styles only.
 `AppStore` holds `tiling`, `focused_pane` and `panes: [PaneState; 4]` (`selected`,
@@ -361,6 +370,34 @@ clicks and keys select several rows; drops, keyboard moves, Delete, cut/paste an
 menu act on the selection; several nodes of one store move with the `moveNodes` RPC (all
 judged first, one refusal refuses all).
 
+### Document themes (wave 1 built 2026-11-24, not merged)
+
+Contract: `docs/THEMES_CONTRACT.md` (wave 1 in section 13, "Built" at the end). A node
+names a theme in `custom["theme"]` (`custom_keys::THEME`, `NodeMetadata::theme`), written
+through `SetNodeAppearance` like an icon; the theme in force is the node's or its nearest
+ancestor's, looked up and never copied (`themes::resolve`, `pimble_themes::in_force`; a
+missing ancestor is fetched once with `GetThemeChain`). With none, a note whose
+paragraphs were spaced before themes reads in Document, every other in Default;
+`custom["paragraphs"]` is only read now and Edit > "Compact Paragraphs" is gone. A mount
+reads as its source does. Each pane's `.pimble-editor__content-wrap` carries the theme
+drawn (`themes::pane_drawn`): `--pd-*` custom properties inline and modifier classes,
+which `styles/document_theme.css` reads with the look before themes as every fallback,
+so Default and Document draw exactly as before. A measure makes the editor a centered
+column, never the blocks' margins (rinch writes each text block's indent as an inline
+`margin-left`, and a heading's `em` is not the body's); no calc() there mixes in a
+percentage (rinch drops it against a pane's width, which it cannot prove definite). Built-ins only so far (Default,
+Document, Book, Manuscript, Code, Markdown, Report, Journal, Compact). Fonts: Inter,
+Source Serif 4, EB Garamond, JetBrains Mono, Atkinson Hyperlegible in `assets/fonts/`
+(OFL), registered with `App::fonts` on the desktop and served as `@font-face` from
+`/app/fonts/` in the browser. A row's "Theme..." (beside "Appearance..."), Node >
+"Theme..." in the menu bar (the Node menu holds what acts on the selected node: New,
+Discuss, Appearance, Theme, Cut, Copy, Paste, Delete; docs/MENUS_CONTRACT.md section 11),
+the Properties panel's Theme line and the Appearance picker's Theme row open the picker: the themes on the left,
+a live preview on the right of the node's own text in the theme under the pointer
+(`themes::preview` reads the editor's blocks, `app/theme_preview.rs` draws them in a wrap
+of its own so the same rules apply). Theme nodes, app themes, shares and MCP are waves 2
+to 5.
+
 ### Tree appearance (done 2026-09-15)
 
 A node's custom icon and colour live in `metadata.custom` under
@@ -427,7 +464,7 @@ target takes about 12 minutes to build.
   against a real `rhypedb-server` process (`~/dev/rhypedb/target/debug/rhypedb-server`) and
   skip when it is absent.
 - **App split.** `pimble-app` is a library: UI, state, events, editor wiring,
-  `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (the adapter onto
+  `protocol/` (`BackendCommand`/`BackendEvent`), `commands/` (the adapter onto
   `pimble_api::Pimble`, shared by both backends: `api_command` for every read and write of
   a store, `host_command` for the server operator's RPCs, `change_events` for what the API
   hears (the update for the views, the change, and `Shown` for the tree); docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
@@ -642,19 +679,20 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
-- `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
+- `crates/pimble-app/src/app/` - the UI tree: `mod.rs` (`build_view`), `explorer.rs`, `tree_row.rs`, `explorer_menu.rs` (the tree, rename, drag-and-drop, the row menu), `shell.rs` (the page and status bar), `search.rs`, and the dialogs (`store_modals.rs`, `share_modal.rs`, `hosting.rs`, `account.rs`, ...)
 - `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
-- `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view.rs` - the split view: the tiling model, and the pane and divider slots
-- `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
+- `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view/` - the split view: the tiling model, and the pane and divider slots
+- `crates/pimble-app/src/protocol/` - `BackendCommand` (`commands.rs`), `BackendEvent` (`events.rs`), `Asked`/`CloudOp` (`asked.rs`); `commands/` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
 - `crates/pimble-app/src/backend.rs` - desktop background thread, the API over RPC, and `Local` (the connection: join or start the embedded server, reconnect) (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
 - `web/src/backend.rs` - the browser backend (token, connection, reconnect)
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
-- `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
+- `crates/pimble-app/src/events/` - `BackendEvent` -> UI state: `mod.rs` dispatches, a module per concern (`connection`, `stores`, `nodes`, `sync`, `cloud`, `view`, `links`)
 - `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
+- `docs/THEMES_CONTRACT.md`, `crates/pimble-themes/`, `crates/pimble-app/src/themes/`, `styles/document_theme.css` - document themes: tokens, resolution, drawing per pane, the picker
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
-- `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties.rs` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter)
+- `docs/PROPERTIES_CONTRACT.md`, `crates/pimble-app/src/properties/` - the Properties panel: the focused pane's node's tags, fields and place (View > Properties, Alt+Enter); `mod.rs` draws the panel, `tags.rs`, `fields.rs`, `place.rs` and `references.rs` its sections
 
 ## Build & Run
 

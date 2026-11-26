@@ -156,6 +156,17 @@ pub fn board_of(forest: &Forest, lanes: &[(Addr, Forest)], label: impl Fn(&Node)
     Board { metanode: Some(forest.metanode), writable: writable(&forest.node), lanes: out }
 }
 
+/// What a kanban's column opened on its own draws (the `kanban-column`
+/// viewer): `board`, its kanban's, with only the lane holding `column` and
+/// only `column` in it, and nothing to add to the board around it. Cards
+/// move, are added and are judged as on the board, in the same lane.
+/// `None` when the kanban has no such column (it moved out).
+pub fn column_board(board: Board, column: Addr) -> Option<Board> {
+    let lane = board.lanes.into_iter().find(|l| l.columns.iter().any(|c| c.addr == column))?;
+    let only = lane.columns.into_iter().filter(|c| c.addr == column).collect();
+    Some(Board { metanode: board.metanode, writable: false, lanes: vec![Lane { columns: only, ..lane }] })
+}
+
 /// A column's name as lanes match it: case and spaces do not count.
 pub fn column_key(name: &str) -> String {
     name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
@@ -485,5 +496,23 @@ mod tests {
     fn column_names_match_without_case_or_spacing() {
         assert!(same_name("To  do", "to do"));
         assert!(!same_name("To do", "Done"));
+    }
+
+    #[test]
+    fn a_column_opened_on_its_own_is_its_lane_with_it_alone() {
+        let b = laned(&[&[1, 2], &[3, 1]]);
+        let lane = b.lanes[1].clone();
+        let column = lane.columns[0].addr;
+        let only = column_board(b.clone(), column).unwrap();
+        assert_eq!(only.lanes.len(), 1);
+        assert_eq!(only.lanes[0].metanode, lane.metanode);
+        assert_eq!(only.lanes[0].columns, vec![lane.columns[0].clone()]);
+        assert!(!only.writable, "nothing is added to the board around a column");
+        // A card steps within the column, and nowhere beside it.
+        let card = only.lanes[0].columns[0].cards[1].addr;
+        assert_eq!(step_card(&only, card, Step::Up).map(|t| t.parent), Some(column));
+        assert_eq!(step_card(&only, card, Step::Left), None);
+        assert_eq!(step_card(&only, card, Step::Right), None);
+        assert!(column_board(b, Addr::new(column.store, NodeId::new())).is_none());
     }
 }

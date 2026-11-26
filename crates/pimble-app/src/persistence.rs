@@ -7,7 +7,7 @@
 //! answer with defaults and drop what they are given. The theme choice it does
 //! remember, in `localStorage` — per browser, which is the right scope for it.
 //! Keeping the module's surface identical on both targets is what lets `app.rs`
-//! and `events.rs` stay free of `cfg`.
+//! and `events/` stay free of `cfg`.
 
 #[cfg(feature = "native")]
 mod imp {

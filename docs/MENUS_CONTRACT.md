@@ -22,9 +22,9 @@ as recommended, and Joe's idea for copying (section 3.1). Submenus asked of rinc
   "Start a Discussion" (a discussion on this node). Three "paste"-like items each paste
   one kind of thing (Paste Picture, Paste Mount Here, and Edit's paste of cut nodes).
 - **The explorer's "+"** makes an empty text node under the root of the selected row's
-  store (`app.rs` `on_new_node`). Canvases, sheets, discussions and kanbans exist only in
+  store (`app/shell.rs` `on_new_node`). Canvases, sheets, discussions and kanbans exist only in
   the row menu.
-- The New items are written out twice, once per menu (`app.rs`), with the plugins'
+- The New items are written out twice, once per menu (`app/shell.rs`, `app/explorer_menu.rs`), with the plugins'
   recipes (`AppStore::recipes`) appended to each.
 - **rinch**: the app menu bar and the tray have submenus; `DropdownMenu` and
   `ContextMenu` do not (only a separate dropdown opened by click inside one). Cascading
@@ -218,3 +218,39 @@ Store: 10 lines. A mount row's New is New ▸. Checked in the release desktop ap
 menus, New ▸ and Sync ▸ opening on hover. All three locks pin rinch `c69c65ec`; the
 plugins, pimble-plugin-host's tests (kanban included), pimble-app's 216 tests and the web
 check pass on it.
+
+## 11. The Node menu, and Theme... (2026-11-24, docs/THEMES_CONTRACT.md wave 1)
+
+A theme is how a node and its subtree are drawn, not a format of its text (Joe,
+2026-11-24: "you're not formatting anything, you're editing the node/tree's rendering
+method"), so there is no Format menu. Joe asked instead for a **Node** menu, "where you
+put node-specific activities, like the Add submenu". The menu bar is File, (Account,
+desktop), Edit, Node, View, Help, from `crates/pimble-app/src/menus.rs` on both targets.
+
+Node acts on the explorer's selected row as that row's own menu does (a store row's root
+node; Theme... on a mount row acts on the source node):
+
+```
+New ▸            (was Edit > New; File > New keeps the same list)
+Discuss          (was Edit > Discuss: a discussion on the focused pane's node)
+─────────
+Appearance...    (new on the bar; the row menu's)
+Theme...         (new: the document theme picker)
+─────────
+Cut              (was Edit > Cut Node)
+Copy             (was Edit > Copy Node)
+Paste...         (was Edit > Paste into Node...)
+─────────
+Delete           (was Edit > Delete)
+```
+
+Edit keeps what acts on the focused pane's text at its caret: Insert ▸, Text Color ▸,
+Split Note at Caret, Join Note Below, Start a Discussion Here. Edit > "Compact
+Paragraphs" is gone: a note's paragraphs are its theme's now. Rename and Open in Split
+View stay in the row menu (they act on the tree's row, its inline editor and its panes).
+
+Every row menu (a node's, a store's, a mount's) has "Theme..." right after
+"Appearance...", and the Properties panel has a Theme line for the focused pane's node:
+the theme in force, where it comes from, and "Choose theme..." (docs/THEMES_CONTRACT.md
+section 9). The Appearance picker's Theme row opens the same picker. A node's row menu is
+13 lines, a store's 11.

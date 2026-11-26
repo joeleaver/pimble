@@ -36,6 +36,40 @@ where
     }
 }
 
+/// One replica at one instant: `validate_tree`'s issues, and the stored
+/// `parent_id` and document state vector of each of `ids` (`None` for one not
+/// live there), read under one lock on its `StoreManager` so no merge lands
+/// between them. The state vectors make agreement mean "both hold the same
+/// edits", not "one has not merged yet and happens to say the same". A
+/// convergence check must read them together: read apart, a poll can find
+/// both trees well formed (before either has merged the other's moves) and
+/// then read parents that already agree (after both merged them, before
+/// either repaired), and pass on a cycle neither has broken yet.
+type Placed = Option<(Option<NodeId>, Vec<u8>)>;
+
+async fn snapshot(server: &PimbleServer, store_id: StoreId, ids: &[NodeId]) -> (Vec<pimble_crdt::TreeIssue>, Vec<Placed>) {
+    let manager = server.store_manager();
+    let manager = manager.read().await;
+    let tree = manager.tree(store_id).expect("store is open");
+    let placed = ids
+        .iter()
+        .map(|&id| {
+            let parent = tree.node(id).ok()?.parent_id;
+            Some((parent, tree.doc(id)?.state_vector()))
+        })
+        .collect();
+    (tree.validate_tree(), placed)
+}
+
+/// Both replicas well formed, every one of `ids` live on both, and the two
+/// holding the same edits of each and agreeing on where it is, each replica
+/// read at one instant ([`snapshot`]).
+async fn agree(server_a: &PimbleServer, server_b: &PimbleServer, store_id: StoreId, ids: &[NodeId]) -> bool {
+    let (a_issues, a_parents) = snapshot(server_a, store_id, ids).await;
+    let (b_issues, b_parents) = snapshot(server_b, store_id, ids).await;
+    a_issues.is_empty() && b_issues.is_empty() && a_parents.iter().all(Option::is_some) && a_parents == b_parents
+}
+
 /// Start a `PimbleServer` bound to an OS-assigned loopback port and return it
 /// plus a `PimbleClient` already connected to it.
 async fn start_server() -> (TempServer, pimble_client::PimbleClient) {
@@ -115,14 +149,7 @@ async fn concurrent_moves_to_different_parents_repair_to_one_winner() {
     // wait for the two replicas to actually agree — otherwise "both trees
     // are locally well formed" can be true well before either has seen the
     // other's diff.
-    let converged = wait_until(Duration::from_secs(5), || async {
-        if !validate_tree(&server_a, store_id).await.is_empty() || !validate_tree(&server_b, store_id).await.is_empty() {
-            return false;
-        }
-        let a_parent = client_a.get_node(store_id, child).await.map(|n| n.parent_id).ok();
-        let b_parent = client_b.get_node(store_id, child).await.map(|n| n.parent_id).ok();
-        a_parent.is_some() && a_parent == b_parent
-    }).await;
+    let converged = wait_until(Duration::from_secs(5), || async { agree(&server_a, &server_b, store_id, &[child]).await }).await;
     assert!(
         converged,
         "expected both trees well formed and in agreement within 5s; A: {:?}, B: {:?}",
@@ -169,14 +196,7 @@ async fn concurrent_a_under_b_and_b_under_a_repairs_the_cycle() {
 
     // See the previous test's comment: well formed on both sides isn't
     // enough, the two replicas must also agree.
-    let converged = wait_until(Duration::from_secs(5), || async {
-        if !validate_tree(&server_a, store_id).await.is_empty() || !validate_tree(&server_b, store_id).await.is_empty() {
-            return false;
-        }
-        let a_parent = client_a.get_node(store_id, folder_a).await.map(|n| n.parent_id).ok();
-        let b_parent = client_b.get_node(store_id, folder_a).await.map(|n| n.parent_id).ok();
-        a_parent.is_some() && a_parent == b_parent
-    }).await;
+    let converged = wait_until(Duration::from_secs(5), || async { agree(&server_a, &server_b, store_id, &[folder_a, folder_b]).await }).await;
     assert!(
         converged,
         "expected both trees well formed and in agreement within 5s; A: {:?}, B: {:?}",
@@ -192,7 +212,8 @@ async fn concurrent_a_under_b_and_b_under_a_repairs_the_cycle() {
     assert_eq!(a_folder_b.parent_id, b_folder_b.parent_id);
     assert!(
         (a_folder_a.parent_id == Some(root_id)) ^ (a_folder_b.parent_id == Some(root_id)),
-        "expected exactly one of the two under the root"
+        "expected exactly one of the two under the root (root {root_id}): folder A under {:?}, folder B under {:?}",
+        a_folder_a.parent_id, a_folder_b.parent_id
     );
 }
 

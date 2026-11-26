@@ -1,0 +1,361 @@
+/* ── Modals ─────────────────────────────────────────────────── */
+
+/* A Select's list is absolutely positioned inside the modal, whose
+   `overflow-y: auto` clipped it at the modal's bottom edge (the Add Hosted
+   Store list showed one row). While a Select in it is open the modal stops
+   clipping, so the list hangs past its edge as a native one would. */
+.rinch-modal:has([aria-expanded="true"]) {
+    overflow: visible;
+}
+
+/* ── Sidebar ────────────────────────────────────────────────── */
+
+.pimble-sidebar {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--rinch-color-body);
+}
+
+/* The explorer's right edge: a hairline with a wider strip to catch the drag. */
+.pimble-sidebar__resizer {
+    flex-shrink: 0;
+    width: 5px;
+    margin-right: -4px;
+    z-index: 1;
+    cursor: col-resize;
+    border-left: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sidebar__resizer:hover {
+    border-left-color: var(--rinch-primary-color);
+}
+
+.pimble-sidebar__header {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px 6px;
+    gap: 8px;
+    border-top: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sidebar__heading {
+    flex: 1;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The tree and the search results each sit in a pane that takes the rest of
+   the sidebar and may be shorter than what it holds (`min-height: 0`), so the
+   pane's content is what scrolls. Without it the pane grew to its content
+   (the tree was 1134px in a 707px sidebar on the family store with a few
+   folders open): the tree ran off the window with nothing to scroll, and a
+   revealed row below the fold could not be reached. */
+.pimble-sidebar__pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Its own stacking context, so a positioned row is drawn inside it and under
+   its scrollbar; and room on the right for that scrollbar (rinch's is an
+   overlay, 6px wide and 2px in from the edge), so no row runs under it. */
+.pimble-sidebar__tree {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 10px 8px 8px;
+    position: relative;
+    z-index: 0;
+}
+
+/* ── Tree refinements ───────────────────────────────────────── */
+
+.rinch-tree__chevron, .rinch-tree__spacer {
+    width: 0.875rem;
+    height: 0.875rem;
+    margin-right: 2px;
+}
+.rinch-tree__chevron svg, .rinch-tree__icon svg {
+    width: 0.8rem;
+    height: 0.8rem;
+}
+.rinch-tree__icon {
+    width: 1rem;
+    height: 1rem;
+    margin-right: 4px;
+    color: var(--rinch-color-dimmed);
+}
+.rinch-tree__node-content {
+    border-radius: var(--rinch-radius-sm);
+    margin: 0;
+    padding: 2px 4px;
+}
+.rinch-tree__node-content:hover {
+    background-color: var(--rinch-color-option-hover);
+}
+.rinch-tree__node-content--selected {
+    background-color: var(--rinch-color-option-hover);
+    color: var(--rinch-color-text);
+}
+.rinch-tree__node-content--selected:hover {
+    background-color: var(--rinch-color-option-selected);
+}
+.rinch-tree__node-content--selected .rinch-tree__icon {
+    color: var(--rinch-primary-color-4);
+}
+.rinch-tree__node-content--selected .rinch-tree__chevron {
+    color: var(--rinch-color-text);
+}
+/* A node's row color (`custom_keys::BACKGROUND`): a band the label draws
+   across the whole row, indent included, under the chevron, icon and title.
+   Held back on the selected row so the selection still shows through it.
+   Each row is one stacking context and the band sits at its bottom
+   (`z-index: -1`), above the row's own hover and selection background and
+   under everything in it. Before 2026-10-21 the chevron, the spacer and the
+   title were each lifted over the band with their own `z-index`, three or
+   four layers a row: about 430 stacking-order builds a frame on the family
+   store with a few folders open, on every hover and scroll. */
+.rinch-tree__node-content {
+    position: relative;
+    z-index: 0;
+}
+.rinch-tree__label > .pimble-row-band {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: -1;
+    border-radius: var(--rinch-radius-sm);
+    pointer-events: none;
+}
+.rinch-tree__node-content--selected .pimble-row-band {
+    opacity: 0.5;
+}
+/* Guides sit under the middle of this stylesheet's smaller chevron, and a
+   drop indicator draws over a row's band (docs/TREE_CONTRACT.md). */
+.rinch-tree {
+    --tree-guide-offset: 0.4375rem;
+}
+.rinch-tree__drop-indicator {
+    z-index: 2;
+}
+
+/* The strip at the foot of the explorer that says, during a drag, where the
+   dragged row lands. */
+.pimble-drop-hint {
+    flex-shrink: 0;
+    padding: 6px 10px;
+    border-top: 1px solid var(--rinch-color-border);
+    background-color: var(--rinch-color-surface);
+    font-size: 12px;
+    color: var(--rinch-color-text);
+}
+.pimble-drop-hint__line {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pimble-drop-hint--refused .pimble-drop-hint__line {
+    color: var(--rinch-color-red-6);
+}
+.pimble-drop-hint__warning {
+    margin-top: 2px;
+    color: var(--rinch-color-dimmed);
+}
+
+/* ── Context menu ───────────────────────────────────────────── */
+
+.rinch-context-menu__dropdown {
+    background-color: var(--rinch-color-surface);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-default);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.rinch-dropdown-menu__item {
+    color: var(--rinch-color-text);
+    padding: 6px 12px;
+    font-size: 13px;
+}
+
+.rinch-dropdown-menu__item:hover {
+    background-color: var(--rinch-color-option-hover);
+}
+
+.rinch-dropdown-menu__divider {
+    border-color: var(--rinch-color-border);
+}
+
+/* One dimmed line at the top of a context menu saying why the items below
+   are greyed out (docs/NODE_DOCUMENT_CONTRACT.md section 5): a menu that
+   disables items without a reason is what this prevents. */
+.pimble-menu-note {
+    padding: 6px 12px;
+    max-width: 260px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--rinch-color-dimmed);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+/* The badge a shared node's row carries after its label
+   (docs/NODE_DOCUMENT_CONTRACT.md section 5). */
+.pimble-tree__share {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    color: var(--rinch-color-dimmed);
+    opacity: 0.75;
+}
+.pimble-tree__share svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+/* The mark on the row of a note out of step on this device
+   (docs/CONVERGENCE_CONTRACT.md section 4); the reason is its tooltip. */
+.pimble-tree__out-of-step {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    color: var(--rinch-color-orange-6);
+}
+.pimble-tree__out-of-step svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+/* The line at the top of a pane whose note is out of step. */
+.pimble-pane__out-of-step {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-surface);
+    border-left: 3px solid var(--rinch-color-orange-6);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+/* What a store row says about a store someone shared with this account:
+   who shared it and what it may do here. */
+/* Starting up (docs/STARTUP_CONTRACT.md): a saved store still opening, its
+   search index on its way, children slow to come, the status bar waiting. */
+.pimble-tree__opening, .pimble-tree__indexing {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    opacity: 0.6;
+    cursor: default;
+    white-space: nowrap;
+}
+.pimble-tree__opening--failed {
+    color: var(--rinch-color-red-6);
+    opacity: 0.9;
+}
+.pimble-tree__opening-spinner {
+    display: inline-flex;
+    margin-left: 6px;
+}
+.pimble-tree__opening-spinner .rinch-loader,
+.pimble-tree__children-loading .rinch-loader,
+.pimble-status-bar__spinner .rinch-loader {
+    width: 0.625rem;
+    height: 0.625rem;
+    color: var(--rinch-color-dimmed);
+}
+.pimble-tree__opening-spinner .rinch-loader__oval,
+.pimble-tree__children-loading .rinch-loader__oval,
+.pimble-status-bar__spinner .rinch-loader__oval {
+    border-width: 1.5px;
+    /* The whole ring faintly, its turning quarter in full: a quarter alone
+       read as a parenthesis at this size. */
+    border-color: rgba(128, 128, 128, 0.35);
+    border-top-color: currentColor;
+}
+/* Where the chevron goes: positioned against the row (the label is not a
+   containing block), on the spacer rinch draws for a row with no children. */
+.rinch-tree__label > .pimble-tree__children-loading {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0.875rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+.pimble-status-bar__spinner {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 6px;
+}
+.pimble-search-results__indexing {
+    padding: 6px 4px;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-tree__shared-by {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    opacity: 0.6;
+    cursor: default;
+}
+
+/* Query metanodes and what they find (docs/QUERY_METANODES_CONTRACT.md
+   section 6): violet, drawn at render time. A found row's arrow at its end,
+   its metanode's guide line beside it, and a mark on a metanode's icon when
+   the person colored it. */
+.pimble-tree__found {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    margin-left: 6px;
+    cursor: default;
+}
+.pimble-tree__found svg {
+    width: 0.8rem;
+    height: 0.8rem;
+}
+.rinch-tree__label > .pimble-found-guide {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    margin-left: -0.5px;
+    pointer-events: none;
+}
+.rinch-tree__label .rinch-tree__icon {
+    position: relative;
+}
+.pimble-query-mark {
+    position: absolute;
+    right: -2px;
+    bottom: -1px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    pointer-events: none;
+}
+
+/* Mount point icon gets a distinct color */
+.rinch-tree__icon--mount {
+    color: var(--rinch-primary-color-6) !important;
+}
+.rinch-tree__node-content--selected .rinch-tree__icon--mount {
+    color: var(--rinch-primary-color-4) !important;
+}
+

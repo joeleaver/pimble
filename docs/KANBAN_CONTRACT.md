@@ -218,7 +218,7 @@ main at `8421ff53`, so the app carries the sortable stylesheet too.
     `notify_element_drag_ended`, which ends a drag whose dragged card a co-edit
     re-rendered away (its `data-ondragend` goes to the gone node). The app registers one
     `rinch::core::on_element_drag_end` listener when the plugins first load
-    (`crates/pimble-app/src/plugins.rs` `loaded`) that calls `drag_ended` on every
+    (`crates/pimble-app/src/plugins/mod.rs` `loaded`) that calls `drag_ended` on every
     running instance (2026-11-03).
   - `dispatch` answers flags (`dispatched::CONSUMED`; the other bits are free).
 - **Not yet:** a lift is not cancelled by focus leaving the item inside a plugin (the

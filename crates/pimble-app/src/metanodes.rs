@@ -18,7 +18,7 @@
 //! wait until changes rest ([`REREAD_MS`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pimble_api::Forest;
 use pimble_core::metanode::outline_line;
@@ -104,6 +104,8 @@ thread_local! {
     /// Forests a change touched, waiting for changes to rest.
     static TOUCHED: RefCell<Vec<(StoreId, NodeId)>> = const { RefCell::new(Vec::new()) };
     static REREAD: RefCell<Option<rinch::prelude::TimeoutHandle>> = const { RefCell::new(None) };
+    /// The parents `ask_for_parent` asked for: each is asked once.
+    static PARENTS_ASKED: RefCell<HashSet<(StoreId, NodeId)>> = RefCell::new(HashSet::new());
 }
 
 /// Whether `node` is a query metanode, whose row shows what it finds.
@@ -131,10 +133,54 @@ pub(crate) fn is_metanode(node: &Node) -> bool {
     node.metadata.metanode.is_some()
 }
 
+/// Whether a pane shows `node` (of `store_id`) as a metanode: it is one, or
+/// a child viewer shows it from where it is (a kanban's column opened on its
+/// own, docs/PLUGINS_CONTRACT.md ABI 7; `AppStore::child_viewer`).
+pub(crate) fn shows_as_metanode(store: AppStore, store_id: StoreId, node: &Node) -> bool {
+    is_metanode(node) || store.child_viewer(store_id, node).is_some()
+}
+
+/// A pane holds `node` (of `store_id`), whose parent the window does not
+/// have: it is asked for, once, since a child viewer of the parent's may show
+/// the node, and the parent's arrival judges the pane again. Nothing is asked
+/// for a node no pane holds, for a root the explorer shows of its store (a
+/// share's scope root on a member's replica has a parent outside what this
+/// device may read), or for a metanode or a mount (no child viewer shows
+/// them).
+pub(crate) fn ask_for_parent(store: AppStore, store_id: StoreId, node: &Node) {
+    if is_metanode(node) || node.is_mount() {
+        return;
+    }
+    let Some(parent) = node.parent_id else { return };
+    if store.panes_showing(store_id, node.id).is_empty()
+        || store.shown_roots(store_id).contains(&node.id)
+        || store.get_node_signal(store_id, parent).is_some()
+    {
+        return;
+    }
+    if PARENTS_ASKED.with(|asked| asked.borrow_mut().insert((store_id, parent))) {
+        store.send(BackendCommand::GetNode { store_id, node_id: parent });
+    }
+}
+
+/// `GetNode` of `(store_id, node_id)` failed: if `ask_for_parent` asked for
+/// it, the ask is forgotten, so the next time a pane needs it (the pane opened
+/// again, the store reconnected) it is asked for again.
+pub(crate) fn parent_not_loaded(store_id: StoreId, node_id: NodeId) {
+    PARENTS_ASKED.with(|asked| asked.borrow_mut().remove(&(store_id, node_id)));
+}
+
+/// Store `store_id` closed: the parents asked for in it are forgotten, so a
+/// pane showing one of its columns after it opens again asks afresh.
+pub(crate) fn store_closed(store_id: StoreId) {
+    PARENTS_ASKED.with(|asked| asked.borrow_mut().retain(|(s, _)| *s != store_id));
+}
+
 /// Show metanode `(store_id, node_id)` in pane `pane`, instead of whatever
 /// it held, and ask for its forest.
 pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId) {
-    // A pane holds one thing: whatever it held goes.
+    // A pane holds one thing: whatever it held goes (`stop_editing` stops a
+    // board and a discussion too).
     crate::editor::stop_editing(store, pane);
     crate::sheets::stop(store, pane);
     let state = store.pane(pane);
@@ -333,8 +379,15 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     let mut newer = None;
     // A query metanode shows its setup, built into the app.
     let setup = forest.spec.as_ref().is_some_and(|spec| spec.shows_setup());
-    if let Some(spec) = forest.spec.as_ref().filter(|_| !setup) {
-        match viewer(store, pane, &spec.viewer, forest) {
+    // Its own viewer, or (a node with none) the child viewer its place gives
+    // it: the forest of a kanban's column is the column's children.
+    let shown_by = match forest.spec.as_ref() {
+        Some(_) if setup => None,
+        Some(spec) => Some(spec.viewer.clone()),
+        None => store.child_viewer(forest.metanode.store, &forest.node).map(|c| c.id),
+    };
+    if let Some(shown_by) = shown_by {
+        match viewer(store, pane, &shown_by, forest) {
             Viewer::Plugin => plugin = true,
             Viewer::PluginAsking(sentence) => {
                 plugin = true;
@@ -346,7 +399,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             }
             Viewer::Outline(sentence) => lines.push(sentence),
             Viewer::Ask(sentence) => asking = Some(sentence),
-            Viewer::Missing => lines.push(outline_line(&spec.viewer)),
+            Viewer::Missing => lines.push(outline_line(&shown_by)),
         }
     }
     if let Some(why) = forest.not_understood() {
@@ -360,7 +413,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
             node_id: entry.addr.node,
             depth: entry.depth,
             label: display_label_from_node(&entry.node),
-            icon: store.node_icon(&entry.node),
+            icon: store.node_icon(entry.addr.store, &entry.node),
             color: entry.node.metadata.color().map(str::to_string),
         })
         .collect();
@@ -439,9 +492,11 @@ fn decline_plugin(store: AppStore, pane: PaneId) {
     crate::plugins::decline(store, pane);
 }
 
-/// The plugins folder finished loading: every pane showing a metanode looks for
-/// its viewer again.
+/// The plugins folder finished loading: every pane is judged again (a child
+/// viewer may show its node now, or no longer), and every pane showing a
+/// metanode looks for its viewer again.
 pub(crate) fn plugins_ready(store: AppStore) {
+    crate::events::rejudge_panes(store);
     for pane in PaneId::ALL {
         let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { continue };
         let forest = FORESTS.with(|f| f.borrow().get(&(held.store_id, held.node_id)).cloned());

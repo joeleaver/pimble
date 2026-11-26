@@ -97,19 +97,21 @@ fn start(plugin: &Plugin, budget: Duration) -> (Rc<RefCell<MockDomDocument>>, No
 #[test]
 fn a_plugin_built_for_another_abi_is_refused_at_load() {
     let module = guest(&manifest(ABI_VERSION + 1, "old"), "", &[]);
-    let Err((described, sentence)) = load_bytes(Path::new("old.wasm"), &module, Duration::from_secs(1)) else {
+    let Err(not_loaded) = load_bytes(Path::new("old.wasm"), &module, Duration::from_secs(1)) else {
         panic!("a plugin for another ABI loads");
     };
     assert_eq!(
-        sentence,
+        not_loaded.sentence,
         format!("The old test plugin was built for plugin ABI {}, and this Pimble runs ABI {ABI_VERSION} plugins.", ABI_VERSION + 1)
     );
-    assert_eq!(described.map(|m| m.id), Some("old-test".to_string()));
+    assert_eq!(not_loaded.manifest.map(|m| m.id), Some("old-test".to_string()));
+    assert_eq!(not_loaded.head.map(|h| (h.id, h.abi)), Some(("old-test".to_string(), ABI_VERSION + 1)));
     // Not a module at all.
-    let Err((None, sentence)) = load_bytes(Path::new("junk.wasm"), b"\0asm junk", Duration::from_secs(1)) else {
+    let Err(junk) = load_bytes(Path::new("junk.wasm"), b"\0asm junk", Duration::from_secs(1)) else {
         panic!("junk loads");
     };
-    assert!(sentence.starts_with("The plugin junk.wasm is not a WebAssembly module"), "{sentence}");
+    assert!(junk.head.is_none() && junk.manifest.is_none());
+    assert!(junk.sentence.starts_with("The plugin junk.wasm is not a WebAssembly module"), "{}", junk.sentence);
 
     // In a folder, the refused plugin's viewer says why it is missing.
     let dir = std::env::temp_dir().join(format!("pimble-plugin-host-test-{}", std::process::id()));

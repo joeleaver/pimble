@@ -53,6 +53,9 @@ pub fn start() {
         // component; here the backend exists first and is handed in, which is
         // the same seam either way.
         let (store, view) = pimble_app::app::build_view();
+        // The note editor's spellchecking: the browser lends rinch no
+        // dictionaries, so the app fetches its own.
+        pimble_app::spelling::start_web();
         // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
         // section 6): the account this page is unlocked for.
         pimble_app::boards::set_author(session::user_id(), session::email());

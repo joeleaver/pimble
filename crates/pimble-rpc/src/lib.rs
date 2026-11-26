@@ -6,6 +6,7 @@
 //! - Server and client traits
 
 pub mod account;
+pub mod agent_key;
 pub mod app_links;
 pub mod diagnostics;
 pub mod dispatch;
@@ -17,6 +18,7 @@ pub mod vault;
 pub mod vault_cursor;
 
 pub use account::*;
+pub use agent_key::{agent_id_of_key, agent_key, AGENT_KEY_PREFIX};
 pub use app_links::*;
 pub use diagnostics::*;
 pub use error::*;

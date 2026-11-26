@@ -125,6 +125,13 @@ pub struct Running {
 /// The plugin built as `file` mounted showing `viewer` over the fixture's
 /// board.
 pub fn mount(f: &Fixture, approval: Approval, file: &str, viewer: &str) -> Running {
+    mount_on(f, approval, file, viewer, f.board)
+}
+
+/// [`mount`] with viewer `viewer` showing `node` of the fixture's store: a
+/// child viewer is handed the child, as the app hands it.
+#[allow(dead_code)]
+pub fn mount_on(f: &Fixture, approval: Approval, file: &str, viewer: &str, node: NodeId) -> Running {
     rinch_core::set_timer_backend(arm);
     let path = built_plugin(file).expect("checked by the caller");
     let plugin = load_file(&path, Duration::from_secs(2)).expect("the plugin loads");
@@ -156,7 +163,7 @@ pub fn mount(f: &Fixture, approval: Approval, file: &str, viewer: &str) -> Runni
     let requests: Rc<RefCell<Vec<HostRequest>>> = Rc::default();
     let heard = requests.clone();
     instance.on_request(move |r| heard.borrow_mut().push(r));
-    let props = Props { metanode: NodeAddr::from(Addr::new(f.store, f.board)), settings: None, remembered: None };
+    let props = Props { metanode: NodeAddr::from(Addr::new(f.store, node)), settings: None, remembered: None };
     assert!(instance.mount(viewer, &props));
     Running {
         doc,

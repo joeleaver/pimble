@@ -39,6 +39,8 @@ pub(crate) fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lan
     let Some(owner) = lane.clone().or(first) else { return rsx! { span { style: "display: none;" } } };
     let spacer = lane.is_none() && board.lanes.iter().any(|l| l.node.is_some());
     let writable = owner.writable;
+    // A column opened on its own has no columns beside it to add or reorder.
+    let alone = k.column_only;
     let (list_lane, list_label) = (owner.metanode, owner.label.clone().unwrap_or_else(|| "Columns".to_string()));
     let shared = lane.is_none() && board.lanes.len() > 1;
     rsx! {
@@ -62,7 +64,7 @@ pub(crate) fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lan
                 label: list_label,
                 class: "kanban__column-list",
                 style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
-                disabled: !writable,
+                disabled: !writable || alone,
                 lift_keys: lift_keys(),
                 indicator: SortIndicator::Gap,
                 source: SortSource::Collapse,
@@ -84,7 +86,7 @@ pub(crate) fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lan
                     }
                 }
             }
-            if writable {
+            if writable && !alone {
                 div {
                     class: "kanban__add-column",
                     style: "flex-shrink: 0; padding: 4px 8px; font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer; white-space: nowrap;",

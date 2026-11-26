@@ -18,11 +18,11 @@ app does, the way the app does it. Today there is no such "way": there are three
 ### Three layers, none of them "the API"
 
 1. **RPC** (`pimble-rpc`, 75 methods, `PimbleClient` a thin typed wrapper). Authorization,
-   notifications and `applyEdit` live here. Used by the app (through `commands.rs`), the
+   notifications and `applyEdit` live here. Used by the app (through `commands/`), the
    MCP, the CLI and the sync and vault links.
 2. **Document libraries** (`NodeDoc`, `Tree`, `markdown`, `pimble-board`, `pimble-sheet`,
    `pimble-discussion`). Pure and shared. In good shape.
-3. **The app's `BackendCommand`/`BackendEvent`** (66 commands, 52 events, `protocol.rs`)
+3. **The app's `BackendCommand`/`BackendEvent`** (66 commands, 52 events, `protocol/`)
    plus `AppStore` signals. This is what the UI talks to, on both targets: desktop and
    plain web stores go through `process_command` to RPC, encrypted web stores go to
    `web/src/vault.rs`, which answers the same commands itself. It is fire-and-forget with
@@ -67,7 +67,7 @@ connected to the hosted server can reach them. Nobody calls them.
 | New sheet / canvas / discussion recipes | app `sheets.rs:738`, `boards.rs:1820`, `discussions.rs:846`; MCP `ops.rs:1410`, `canvas_tools.rs:1505`, `discussion_tools.rs:328` | an attached discussion made by the MCP has no icon; MCP creates in two writes |
 | Sheet type-change carry-over, `write_formulas`, tied-table check | app `sheets.rs:2080`, `in_text.rs:467,553`; MCP `ops.rs:1196`, `sheet_tools.rs:1052,1121` | copied verbatim |
 | Embed atoms in Markdown | MCP hand-built strings and line scanners (`sheet_tools.rs:506,511,522`, `discussion_tools.rs:141,343`) | attribute order must match rinch by hand |
-| Access | `node_access`/`_tracked`/`_in` (`state.rs:1355`), MCP `edit_doc` (checks `Read` only), vault `access_of`, server `judge_access`/`Reach` | MCP lets a commenter through to a server refusal; "unknown access = Full" is unstated policy |
+| Access | `node_access`/`_tracked`/`_in` (`state/access.rs`), MCP `edit_doc` (checks `Read` only), vault `access_of`, server `judge_access`/`Reach` | MCP lets a commenter through to a server refusal; "unknown access = Full" is unstated policy |
 | `derive_kinds`, `DocShape` | `handler.rs:730`, `vault.rs:3827` | verbatim copy |
 | Partial-replica repair, `document_root`, `list_deleted`, link hops, node assembly | `pimble-store`/`handler.rs` and `vault.rs` | copied because `web` cannot depend on `pimble-store` |
 | Vault protocol (encrypt, keys, snapshot policy) | `vault_link.rs`, `vault.rs` | `SNAPSHOT_EVERY` and its due rule already differ |
@@ -317,7 +317,7 @@ API's held documents and change stream; `DocSession` replaces the five session c
 deleted. Error routing uses answers, not modal flags.
 
 Built 2026-11-02 (part; what is left is listed at the end). **The backend loop is over
-`Pimble`.** `crates/pimble-app/src/commands.rs` is the adapter: `api_command` answers every
+`Pimble`.** `crates/pimble-app/src/commands/` is the adapter: `api_command` answers every
 command that reads or writes a store with `Pimble` calls (`node`, the new `listing`,
 `attachments`, the new `discussions`, `apply`, `edit`, `delete`, `undelete`,
 `list_deleted`, the new `reconcile`, `watch`, `search`, `put_blob`/`get_blob`, and

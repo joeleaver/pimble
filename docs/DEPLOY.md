@@ -153,22 +153,26 @@ an MCP server over stdio that an LLM client launches. Check Windows before taggi
 Every client is an **agent** with access the person chose (docs/AGENTS_CONTRACT.md):
 `pimble-mcp` started without an agent key answers every tool with "Pimble needs this app
 set up as an agent: in Pimble, Account > AI Agents... > New Agent." The Agents window
-writes the client's config itself; until it ships, make an agent with the CLI and pass
-its key in the client's `env`, never on its command line:
+writes the client's config itself (for Claude, one agent in both
+`claude_desktop_config.json` and `~/.claude.json` under the same name, so the Claude
+app's Code tab loads it once; docs/AGENTS_CONTRACT.md section 6). By hand, make an agent
+with the CLI and pass its key in the client's `env`, never on its command line, and give
+Claude the same entry name in both files:
 
 ```bash
-pimble-cli create-agent "Claude Desktop" <store-id>=reader <store-id>/<node-id>=editor
+pimble-cli create-agent "Claude" <store-id>=reader <store-id>/<node-id>=editor
 ```
 
 ```jsonc
-// Claude Desktop: claude_desktop_config.json (Settings > Developer > Edit Config)
-{ "mcpServers": { "pimble": {
+// The Claude app (Chat and Code tabs): claude_desktop_config.json
+// (Settings > Developer > Edit Config)
+{ "mcpServers": { "pimble-claude": {
     "command": "/home/<you>/.local/share/pimble/app/pimble-mcp",
     "env": { "PIMBLE_AGENT_KEY": "pmbl_agent_…" } } } }
 ```
 
 ```bash
-claude mcp add pimble -e PIMBLE_AGENT_KEY=pmbl_agent_… -- ~/.local/share/pimble/app/pimble-mcp
+claude mcp add --scope user pimble-claude -e PIMBLE_AGENT_KEY=pmbl_agent_… -- ~/.local/share/pimble/app/pimble-mcp
 ```
 
 It joins the app's server when the app runs and starts the same server (opening the app's

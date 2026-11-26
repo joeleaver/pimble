@@ -45,6 +45,7 @@ pub mod link_picker;
 pub mod links;
 pub mod app_links;
 pub mod web_links;
+pub mod markdown_shortcuts;
 pub mod mentions;
 pub mod menus;
 pub mod metanodes;
@@ -60,9 +61,11 @@ pub mod rinch_editor;
 pub mod state;
 pub mod styles;
 pub mod text_color;
+pub mod themes;
 pub mod sheets;
 pub mod settings;
 pub mod shortcuts;
+pub mod spelling;
 pub mod splitting;
 pub mod shares;
 pub mod discussions;
@@ -82,6 +85,9 @@ pub mod update;
 /// the tray or out of the app.
 #[cfg(feature = "native")]
 pub mod desktop;
+/// The font files document themes draw with, carried by the desktop.
+#[cfg(feature = "native")]
+pub mod fonts;
 /// Which window process owns the tray and the notifications.
 #[cfg(feature = "native")]
 pub mod instance;
@@ -102,6 +108,7 @@ pub(crate) const RELEASE_KEY: &str = include_str!("../update-key.pub");
 pub mod plugins;
 /// Plugins' calls through the Pimble API, on either backend.
 pub mod plugin_calls;
+pub mod task_lists;
 pub mod tree_drop;
 pub mod tree_keys;
 pub mod tree_view;

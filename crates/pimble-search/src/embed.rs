@@ -107,10 +107,19 @@ impl Queue {
     }
 }
 
+/// What stores a batch of vectors in an index.
+type Sink = Box<dyn Fn(&[(u64, Vec<f32>)]) + Send + Sync>;
+
 /// An index's share of the background work: its queue and where its vectors go.
 pub(crate) struct Pending {
     queue: Mutex<Queue>,
-    sink: Box<dyn Fn(&[(u64, Vec<f32>)]) + Send + Sync>,
+    /// `None` once the index has closed ([`Pending::close`]). The sink owns
+    /// the index's vector index, and through it the database's storage and
+    /// its directory's lock, so it must go with the index, not with the
+    /// last `Arc<Pending>`: the worker holds every index's queue for a whole
+    /// round of batches (model loading included), and a store closed then
+    /// reopened in that window found its own index locked (CI, 2026-11-24).
+    sink: Mutex<Option<Sink>>,
 }
 
 impl Pending {
@@ -118,7 +127,7 @@ impl Pending {
     /// vectors in that index. The worker holds it weakly: dropping the
     /// returned `Arc` (the index closing) ends its work.
     pub(crate) fn register(sink: impl Fn(&[(u64, Vec<f32>)]) + Send + Sync + 'static) -> Arc<Pending> {
-        let pending = Arc::new(Pending { queue: Mutex::new(Queue::default()), sink: Box::new(sink) });
+        let pending = Arc::new(Pending { queue: Mutex::new(Queue::default()), sink: Mutex::new(Some(Box::new(sink))) });
         let worker = worker();
         worker.indexes.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&pending));
         pending
@@ -135,7 +144,17 @@ impl Pending {
         worker().wake.notify_one();
     }
 
-    /// Embed one batch of this index's queue now, returning how many ran.
+    /// The index has closed: drop its queue and its sink, waiting for a
+    /// batch being stored right now to finish. Once this returns nothing
+    /// here holds the index's storage, whoever still holds this `Pending`.
+    pub(crate) fn close(&self) {
+        *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = Queue::default();
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(sink);
+    }
+
+    /// Embed one batch of this index's queue now, returning how many ran
+    /// (none once the index has closed).
     fn run_batch(&self) -> Result<usize> {
         let batch = self.queue.lock().unwrap_or_else(|e| e.into_inner()).take(BATCH);
         if batch.is_empty() {
@@ -144,8 +163,16 @@ impl Pending {
         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
         let vectors = embed_now(&texts)?;
         let rows: Vec<(u64, Vec<f32>)> = batch.iter().map(|(id, _)| *id).zip(vectors).collect();
-        (self.sink)(&rows);
-        Ok(rows.len())
+        // Held while storing, so `close` waits for a batch under way; never
+        // while embedding, so a close never waits for the model.
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        match sink.as_ref() {
+            Some(sink) => {
+                sink(&rows);
+                Ok(rows.len())
+            }
+            None => Ok(0),
+        }
     }
 
     /// Embed everything queued for this index now (tests, and a caller that
@@ -227,6 +254,28 @@ mod tests {
         }
         assert_eq!(q.take(8), vec![(1, "a2".to_string()), (2, "b".to_string())]);
         assert!(q.take(8).is_empty());
+    }
+
+    /// Closing drops the sink (and what it owns: the index's storage) at
+    /// once, though the worker still holds the queue, and nothing queued
+    /// is stored after.
+    #[test]
+    fn closing_drops_the_sink_while_the_worker_holds_the_queue() {
+        let storage = Arc::new(());
+        let watch = Arc::downgrade(&storage);
+        let stored = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&stored);
+        let pending = Pending::register(move |rows| {
+            let _owned = &storage;
+            counted.fetch_add(rows.len(), Ordering::SeqCst);
+        });
+        let held_by_worker = Arc::clone(&pending);
+        pending.push(1, "text".into());
+        pending.close();
+        drop(pending);
+        assert!(watch.upgrade().is_none(), "the sink outlived the index's close");
+        assert_eq!(held_by_worker.run_batch().unwrap(), 0);
+        assert_eq!(stored.load(Ordering::SeqCst), 0);
     }
 
     #[test]

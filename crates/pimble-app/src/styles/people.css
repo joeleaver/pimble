@@ -1,0 +1,131 @@
+/* ── Presence (presence.rs; the chips and dots are pimble-ui's) ── */
+
+/* Following someone, on a pane strip (presence/follow.rs). */
+.pimble-pane__follow {
+    flex-shrink: 0;
+    white-space: nowrap;
+    color: var(--rinch-color-text);
+}
+
+.pimble-pane__follow-stop {
+    cursor: pointer;
+    color: var(--rinch-primary-color);
+}
+
+.pimble-presence-caret__flag--agent {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    cursor: default;
+}
+
+/* ── Shares (shares.rs) ────────────────────────────────────────── */
+
+.pimble-shares {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pimble-shares__intro, .pimble-shares__hint, .pimble-shares__role {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-shares__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-shares__name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-shares__label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.pimble-shares__error {
+    font-size: 12px;
+    color: var(--rinch-color-red-6);
+}
+
+/* ── AI Agents (agents.rs) ─────────────────────────────────────── */
+
+.pimble-agents__intro, .pimble-agents__hint {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-agents__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-agents__name {
+    font-weight: 600;
+}
+
+.pimble-agents__reach {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-agents__label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.pimble-agents__picker {
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    padding: 4px;
+}
+
+.pimble-agents__pick {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 26px;
+    font-size: 13px;
+}
+
+.pimble-agents__chevron {
+    width: 14px;
+    cursor: pointer;
+    color: var(--rinch-color-dimmed);
+    user-select: none;
+}
+
+.pimble-agents__from {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    margin-right: 4px;
+}
+
+.pimble-agents__snippet {
+    font-size: 11px;
+    padding: 8px;
+    margin: 0;
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-default);
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+

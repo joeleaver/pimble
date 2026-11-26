@@ -196,7 +196,7 @@ first plugin.
    not what section 3.5 says:** rinch is 0.1.0 at every revision and revisions have no
    order outside its repository, so the host checks the ABI exactly and only logs a
    plugin built against another rinch revision; an exact match would refuse every plugin
-   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins.rs`,
+   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins/`,
    desktop only): the folder loads off the UI thread at start; a pane opening a metanode
    whose viewer a loaded plugin provides mounts it in a slot in `render_metanode` (props
    updated in place as the forest changes); a refused plugin's viewer, or a plugin that
@@ -342,7 +342,7 @@ first plugin.
    `HostLink::request`, `recipe(..)`, `display_label(node)` (the explorer's label),
    `person(..)`, re-exports `pimble_ui`. **Host:** `Instance::on_request`,
    `Instance::set_host_state`, `Call::HostState`, the engine links the import and needs
-   the export. **App:** `plugins.rs` pushes host state from one effect over presence, the
+   the export. **App:** `plugins/host.rs` pushes host state from one effect over presence, the
    theme and every pane's following; answers `Open` with the pane's link-open, `Focus`
    with `presence::say_within`, `Follow` with `follow::start`; lists every loaded
    plugin's recipes in `AppStore::recipes`, offered in the explorer's row and store menus,
@@ -391,9 +391,9 @@ first plugin.
    made says why. **Shared code:** the applier, bridge, instance and approvals are
    unchanged; the registry moved out of the wasmtime engine (`registry.rs`, generic
    over an engine's loaded plugin; `wasmtime_engine::load_dir` is the folder loader).
-   `crates/pimble-app/src/plugins.rs` is one module for both targets, with only a
-   `place` per target (engine, where plugins and approvals are kept, the window's
-   add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
+   `crates/pimble-app/src/plugins/` is one module for both targets, with only a
+   `place` per target (`place_desktop.rs`, `place_browser.rs`: engine, where plugins and
+   approvals are kept, the window's add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
    the desktop, `spawn_local` in the page). **Where plugins live in the browser:** there
    is no folder, so the Plugins window (File > "Plugins...") has "Add plugin...", which
    takes a `.wasm` file the person picks, compiles and describes it in the page, and
@@ -501,6 +501,35 @@ first plugin.
    splits the plugin's pane to the right when there is none, uses another pane shown when
    four are open, and the plugin's own pane when it is the only one. A guest that wants a
    double-click times its clicks itself: WASI's clock answers on both hosts.
+   **ABI 7** (2026-11-23, Joe: a kanban's column opened on its own shows as a column, and
+   its row looks like one): `Provision::ChildViewer(ChildViewerDecl { id, name, of, icon })`
+   (`sdk::child_viewer`) is a viewer for the children of the plugin's own viewer `of`'s
+   metanodes. Nothing is stored on a child (Joe chose "derived from place"): the app
+   shows a node with it because its parent is a metanode shown with `of`, so a column
+   moved out of a kanban is a plain node again and one moved in becomes a column. It
+   mounts as any viewer (`MountArgs::viewer` is its id, the props' metanode the child,
+   whose source is its children); its `icon` is what the children's rows show when they
+   have none of their own. `check_manifest` refuses a child viewer of a viewer the plugin
+   does not provide (no plugin decides how another's metanodes' children look) and one
+   whose id is also a viewer's. `Registry::child_viewer(of)` finds it; `Registry::viewer`
+   mounts it. The kanban provides `kanban-column` ("Kanban column", `layout-columns`).
+   The app (both targets) keeps the loaded plugins' child viewers in
+   `AppStore::child_viewers`; `AppStore::child_viewer(store, node)` is the one judgement
+   (no viewer of its own, a parent held whose non-query metanode's viewer has one), and
+   `metanodes::shows_as_metanode` is what every open asks. A pane showing such a node is a
+   metanode pane: its forest is the node's children (`Forest.spec` is `None`) and `fill`
+   mounts the child viewer. The row, the pane's strip and the outline take its icon
+   (`AppStore::node_icon(store, node)`, part of the row's snapshot). A pane is judged again
+   when what decides it changes elsewhere (`events/panes.rs`): the parent arriving or
+   changing (a pane holding a node whose parent the window lacks asks for it,
+   `metanodes::ask_for_parent`), and the plugins loading or changing
+   (`events::rejudge_panes` from `metanodes::plugins_ready`). Every plugin is built
+   again for ABI 7 and ships with the release that brings it.
+   Checked 2026-11-23 in a scratch release app (port 7494) with the kanban built for
+   ABI 7: a kanban's columns show `layout-columns` in the explorer and a lane keeps the
+   kanban's icon; opening Done shows that one column (its 8 cards, no lane or "+ Add
+   column"), with the column icon in the pane's strip; it comes back the same after a
+   restart; a card under it still opens as text.
 
 ## 5. How it is checked
 
@@ -546,3 +575,98 @@ reads, and its settings with a schema. The plugin's crate holds it as `guide.jso
 is embedded with `plugin!(describe: ..., view: ..., guide: include_bytes!("../guide.json"))`
 as the module's `pimble-guide` custom section. The MCP reads it from the file; nothing
 runs. No ABI change. docs/AGENT_GUIDES_CONTRACT.md.
+
+## 7. Every plugin updates, and one list (2026-11-24)
+
+Joe, 2026-11-24: "We do need to get plugins auto-updating too. Also the plugins interface
+isn't great. There's two complete listings, one for the library, one for what's
+installed, that's not how most library systems work." This replaces what
+docs/SETTINGS_CONTRACT.md sections 4 and 5 said about a plugin added from a file ("never
+touched") and about the Library list beside the installed one.
+
+**Joe's answers (2026-11-24):** a plugin installed from a file follows the library; no
+pinning ("Keep This Version" was proposed and declined); a plugin can be turned off without
+being removed.
+
+**A plugin is its id.** The library, the plugins folder, the browser's store and
+`library.json` all name a plugin by its manifest id (`kanban-viewer`). A plugin installed
+from a file whose id the library lists is the library's plugin at whatever version the file
+holds; where it came from only says what its row says.
+
+**What updates on its own** (`pimble_plugin_host::library::offer` and `updates_due`). At
+start (20 s), every six hours, and whenever Settings > Plugins is shown, the index is read,
+and for every plugin installed here whose id the library lists with an entry this Pimble
+runs (the entry's ABI is the app's):
+
+- it is updated when the library's version is newer than the installed one, wherever the
+  installed one came from;
+- it is updated when the installed one was built for an earlier plugin ABI (refused after
+  the app updated), whatever its version, since a plugin that does not run has nothing to
+  keep (`Runs::BuiltFor`, judged from its manifest's head);
+- one refused for anything else is left alone and its row offers "Use Library Version"
+  (`Offer::Replace`): one built for a later ABI (a development build ahead of this Pimble),
+  and one refused for another reason (it faulted or ran past its time while it described
+  itself, its description could not be read), since the library's version may not settle
+  that, and replacing it on its own would repeat at every check;
+- a file at the library's version or later (a development build, or a version that is not
+  a version) is left alone; its row offers "Use Library Version".
+
+Installing bytes identical to the file already there writes nothing, and the folder's next
+scan judges that file again (a refusal cached from a bad moment does not outlive it).
+
+Nothing is asked: the person did nothing to get an update, and what each plugin was allowed
+carries over (a version that asks for more asks the way a first use does). A refused plugin
+is known by the head of its manifest (`ManifestHead`: id, name, version, ABI, the first four
+fields, which every ABI has encoded the same way and first), so one whose full manifest no
+longer decodes is still known by id; failing that, by its file name (`kanban_viewer.wasm`
+is `kanban-viewer`, `Refused::id`).
+
+**One file per plugin.** The folder holds a plugin as `<id>.wasm`. Installing (from the
+library or a file) writes that name and removes every other file holding the same id;
+`scripts/plugins/install.sh` writes that name too and removes its old `kanban_viewer.wasm`
+(it wrote that name before, so a library install beside it made two files of one plugin).
+A registry that still meets two files of one id runs the later version and logs it, and a
+refused file of a plugin that loaded from another file is set aside.
+
+**Turned off.** `library.json` (`localStorage` in the browser) keeps `off`, plugin ids,
+beside the library version of each plugin installed from it; an older Pimble ignores it.
+"Turn Off" keeps a plugin installed and updating but not running: its viewers' metanodes
+show the outline under "Shown as an outline: the Kanban plugin is turned off (Settings >
+Plugins).", its recipes leave the new-node menu, its child viewers stop applying, and panes
+showing it stop. "Turn On" brings it back in place. Remove forgets that it was off. The
+MCP reads the same `library.json`: `list_viewers` lists a turned-off plugin's file under
+"Turned off", `call_plugin_tool` refuses its tools with a sentence that says so, and
+`set_viewer_settings` and `set_fields` do not run its checks (the guide's schema still
+applies). It learns which file holds which id by compiling the files, only while any plugin
+is off.
+
+**One list** (`crates/pimble-app/src/plugins/listing.rs` decides, `window.rs` draws).
+Settings > Plugins is one list, each plugin once, from the union of what is installed here
+and what the library offers: installed first, then by name. "All" / "Installed" filter it;
+"Add from a File..." sits beside them. A row has the plugin's name and version (the
+installed one, else the library's), its summary (the library's, else the viewers it
+provides), one state, and at most one button:
+
+| State | Says | Button |
+| --- | --- | --- |
+| Not installed | "Asks to read and change the stores you choose." | Install |
+| Installed, current | "Installed" | |
+| Update available (an automatic update failed) | "Version 0.2.0 is in the library." | Update |
+| Updating, updated while open, downloading | "Updating to 0.2.0...", "Updated to 0.2.0." | |
+| From a file, not in the library | "From a file" | |
+| From a file at the library's version or later | "From a file" | Use Library Version |
+| Built for an earlier ABI | the refusal, then "The library's version replaces it." | Update |
+| Does not run here otherwise | the refusal | Use Library Version, when the library has it |
+| Library's needs a newer Pimble | "Needs a newer Pimble" | |
+| Turned off | "Turned off" | Turn On |
+
+"Details" opens the row under it: what it asks for, where it came from and its file, the
+library's version when it differs, what it was allowed here, and the actions that apply
+(Turn Off / Turn On, Remove, Revoke). Remove deletes every file of the plugin; a file that
+will not go is named, and the plugin keeps what it was allowed until Remove finishes. A `pimble:settings/plugins?install=<id>` link marks
+the plugin's row and shows All.
+
+**Known limit.** `library.json` names the plugins the app installed from the library; a
+file `install.sh` writes over one of them later is still recorded as the library's until it
+is replaced, so its row says "Installed" rather than "From a file". What updates is the
+same either way (only a newer library version replaces it).

@@ -108,7 +108,7 @@ pub fn showing(store: AppStore, section: Section) -> bool {
 }
 
 /// The window, made once. `account` is the Account page (it lives in
-/// `app.rs`, beside the sign-in it sends).
+/// `app/account.rs`, beside the sign-in it sends).
 pub fn render(__scope: &mut RenderScope, store: AppStore, account: NodeHandle) -> NodeHandle {
     let general = render_general(__scope, store);
     let keyboard = render_keyboard(__scope);

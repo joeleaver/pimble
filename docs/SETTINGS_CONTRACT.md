@@ -59,7 +59,7 @@ as a shortcut for the same setting.
 ## 3. Plugin changes take effect at once (wave 1)
 
 The browser already does this (`place::add`, `place::remove` in
-`crates/pimble-app/src/plugins.rs`). The desktop does the same:
+`crates/pimble-app/src/plugins/place_browser.rs`). The desktop does the same:
 
 - **Add, replace and remove** from Settings. The plugin loads (or is checked and compiled) on
   a background thread. Every pane showing the old version stops it (`stop_everywhere`) and
@@ -122,12 +122,18 @@ neither needs an account: plugins are public code, not anyone's data.
 from the library, at which version. A failure is said in a sentence on the plugin's row:
 "The download did not verify, so nothing was installed."
 
-**The Library list in Settings** shows every plugin in the index: its screenshot, name,
+**The Library list in Settings** (since 2026-11-24 one list with the installed plugins,
+docs/PLUGINS_CONTRACT.md section 7) shows every plugin in the index: its screenshot, name,
 summary, version, and what it will ask for ("Reads and changes the stores you choose"). The
 row's button reads Install, Installed or Update. A plugin the running Pimble cannot load (a
 newer ABI) says "Needs a newer Pimble" and has no button.
 
 ## 5. Updates (wave 3)
+
+(Amended 2026-11-24 by docs/PLUGINS_CONTRACT.md section 7: every installed plugin the
+library lists follows it, including one added from a file, and one built for an older ABI
+is replaced; Settings > Plugins is one list instead of an installed list and a Library
+list.)
 
 When the app starts, and every 6 hours after, it reads the index. Each library plugin with a
 newer version that the running Pimble can load is downloaded, verified and installed as in
@@ -233,7 +239,7 @@ release app on the scratch copy, with the browser checked on the local stack.
     name never changes its bytes.
   - `GET /releases` no longer lists the library's files, so the download page shows
     packages only.
-- **The app** (`crates/pimble-app/src/plugins.rs`):
+- **The app** (`crates/pimble-app/src/plugins/`):
   - Settings > Plugins has a Library below the installed plugins. Each row shows the name
     and version, the summary, what the plugin asks for, and its button or label.
   - Installed plugins say "From the library." or "Added from a file.".

@@ -1,0 +1,121 @@
+/* ── Settings (docs/SETTINGS_CONTRACT.md section 2) ─────────────── */
+
+.pimble-settings {
+    display: flex;
+    gap: 20px;
+    min-height: 420px;
+}
+
+.pimble-settings__nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 150px;
+    flex-shrink: 0;
+    padding-right: 12px;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-settings__tab {
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--rinch-color-text);
+    opacity: 0.8;
+}
+
+.pimble-settings__tab:hover {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+}
+
+.pimble-settings__tab--on {
+    background: var(--rinch-color-option-hover);
+    opacity: 1;
+    font-weight: 600;
+}
+
+/* A library row a link asked about (pimble:settings/plugins?install=<id>). */
+.pimble-plugins__row--asked {
+    border-left: 3px solid var(--rinch-primary-color);
+    padding-left: 10px;
+}
+
+.pimble-settings__page {
+    flex: 1;
+    min-width: 0;
+    max-height: 70vh;
+    overflow-y: auto;
+    /* Room for the scrollbar, which is drawn over the content. */
+    padding-right: 16px;
+}
+
+.pimble-settings__section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.pimble-settings__section + .pimble-settings__section {
+    margin-top: 24px;
+}
+
+.pimble-settings__heading {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.pimble-settings__line {
+    font-size: 13px;
+}
+
+.pimble-settings__note {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-settings__choices {
+    display: flex;
+    gap: 6px;
+}
+
+.pimble-settings__choice {
+    padding: 4px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--rinch-color-border);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.pimble-settings__choice:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-settings__choice--on {
+    border-color: var(--rinch-primary-color-6);
+    color: var(--rinch-primary-color-6);
+}
+
+.pimble-settings__key {
+    display: grid;
+    grid-template-columns: 180px 180px auto;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 2px;
+}
+
+.pimble-settings__key-name {
+    font-size: 13px;
+}
+
+.pimble-settings__key-problem {
+    grid-column: 2 / 4;
+    font-size: 12px;
+    color: var(--rinch-color-orange-6);
+}
+
+.pimble-settings__buttons {
+    display: flex;
+    gap: 8px;
+}
+

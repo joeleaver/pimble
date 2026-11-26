@@ -1,5 +1,29 @@
 # Next session: start here
 
+**2026-11-25 (master local_198b8f9e, transcript 3e8511e5): 0.32.0 shipped.**
+- Release 0.32.0: themes wave 1 (built-ins, the Node menu, the two-column chooser), spellcheck
+  and Markdown shortcuts in the note editor (rinch main f9d15abf). Tag `v0.32.0`, Release green
+  with 13 assets, installed here, web on jkbase v70 (sw.js 200), Bear summary posted 11/25.
+- Pinned rinch: every lock (root, web, plugins) names the branch `fix/editor-blocks-before-overlays`
+  (joeleaver/rinch#3070, Book/Manuscript first-line indent). rinch's main needs its batched
+  `batch/` run to merge it. When #3070 is on main, move every pin back to main (`cargo update rinch
+  rinch-tabler-icons rinch-editor-core` at the root, in `web/` and `plugins/`).
+- Kanban drags (session local_97f04d79 / child local_22a130b9): `claude/priceless-fermi-4489df`
+  (d5dfc63) lights the landing column and stops GPU trails; it pins rinch to #3065's branch. It
+  can't merge until #3065 and #3070 both reach rinch main. Then rebase onto main, do an independent
+  review, merge, release.
+- 0.32.0 web deploy failure: web/Cargo.lock left ahash 0.8.13 with two getrandoms (E0464 in the
+  worker). Fixed with ahash 0.8.14 (80e0de1). CI now has a `cargo check (web, wasm)` job.
+- rinch spellcheck gaps filed: #3067 (no web suggestions or Add to dictionary), #3068 (an editor
+  focused before the dictionary loads isn't checked). Read-only notes get no underlines, on purpose (Joe).
+- No working keyboard shortcut for center-align: Ctrl+Shift+E opens Focus Explorer. Pimble has no
+  left-align UI at all.
+- Notifications wave 5 (local_29e8b449, /home/joe/dev/pimble-wave5): its `hosted_plain` test was
+  hung for 14h at 0% CPU (pid 1740428 on 2026-11-25). Left for that session.
+- Next: themes waves 2 (theme nodes, editor, copying) and 3 (app themes), which can run side by side,
+  then waves 4 and 5 (MCP). The splits of handler.rs, vault_link.rs, canvas_tools.rs and
+  sheet_tools.rs are still open.
+
 **2026-11-23 (master session local_198b8f9e, transcript 3e8511e5): wave 5 started.**
 Cleanup of session 78e7f30f done: its scratch (1.8 GB) deleted. It is the app session
 `local_0e9ad72e` ("Pimble"); archiving it was refused while a Remote Control client is
@@ -25,6 +49,11 @@ Roles (Joe, 2026-11-23: one master, one worker, one Bear liaison), agreed by all
   `notifications-ready.md`). Then the worker starts wave 5 from master.
 - Markdown typing shortcuts (rinch #2975, on rinch main): Joe said 2026-11-23 "Turn them on" for the
   note editor. Do it with the pin move for #2997 (code-block Enter): one pin move, one release.
+- Asked for (via the Bear liaison, 2026-11-23): make pimble-mcp's block edits safe. A
+  `replace_block` with `block: "13"` read it as a quote and deleted a paragraph silently. Wanted:
+  echo of what changed, refuse tiny/numeric quotes for deletes, `block_index`, `occurrence`,
+  `dry_run`, a recovery path within "everything is co-editable" (ask Joe if none fits), tests,
+  MCP_CONTRACT.md. Not started: needs its own session.
 - Possibly flaky on master under load (passed 3 of 3 reruns): pimble-server `--test search`
   `a_locked_index_is_waited_for_and_never_rebuilt`, `--test vault_link`
   `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`.
@@ -409,7 +438,7 @@ Windows user reported no File/Edit/View menu and a console window beside the app
 growth fixed.** Joe's window reached 5 GB while an agent wrote notes: every note
 rebuilt every explorer row (about 500 DOM nodes each, mostly an eager context menu), and
 rinch never frees a discarded node (rinch#723). Fixed by:
-- **One explorer menu** (`ExplorerMenu`, `explorer_menu` in `app.rs`): a right press on a
+- **One explorer menu** (`ExplorerMenu` in `app/row_menu.rs`, `explorer_menu` in `app/explorer_menu.rs`): a right press on a
   row aims it; one signal per flag, written only on change.
 - **rinch#2573** (on rinch main since 758adc72, with #2549, the scrollbar over an editor):
   a change under a tree row redraws that row's list only. All three locks pin 758adc72.
