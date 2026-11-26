@@ -39,11 +39,18 @@
     column-gap: 8px;
     font-size: 13px;
 }
-/* An inherited value is the base's: drawn dimmed, with where it is from. */
-.pimble-theme-editor__line .pimble-theme-editor__control {
+/* An inherited value is the base's: drawn dimmed, with where it is from.
+   The fields themselves are dimmed, never a box that holds a list's dropdown:
+   opacity below 1 makes a stacking context, so an open list inside it drew
+   at 60% and under the lines after it. */
+.pimble-theme-editor__line .pimble-theme-editor__control .rinch-select__input,
+.pimble-theme-editor__line .pimble-theme-editor__control input,
+.pimble-theme-editor__line .pimble-theme-editor__control .rinch-checkbox__box {
     opacity: 0.6;
 }
-.pimble-theme-editor__line--own .pimble-theme-editor__control {
+.pimble-theme-editor__line--own .pimble-theme-editor__control .rinch-select__input,
+.pimble-theme-editor__line--own .pimble-theme-editor__control input,
+.pimble-theme-editor__line--own .pimble-theme-editor__control .rinch-checkbox__box {
     opacity: 1;
 }
 .pimble-theme-editor__line--own .pimble-theme-editor__label {

@@ -180,6 +180,32 @@ mod tests {
         }
     }
 
+    /// The theme editor dims an inherited value on its fields alone. Opacity
+    /// below 1 makes a stacking context, so dimming a box that holds a list's
+    /// dropdown drew the open list at 60% and under the lines after it.
+    #[test]
+    fn the_theme_editor_dims_fields_never_their_dropdowns() {
+        const FIELDS: [&str; 3] = [".rinch-select__input", "input", ".rinch-checkbox__box"];
+        let css = AREAS.iter().find(|(file, _)| *file == "theme_editor.css").expect("the theme editor's area").1;
+        let rules = without_comments(css).expect("its comments close");
+        let mut dimmed = 0;
+        for rule in rules.split_terminator('}') {
+            let Some((selectors, body)) = rule.split_once('{') else { continue };
+            let dims = body.split(';').filter_map(|d| d.split_once(':')).any(|(property, value)| {
+                property.trim() == "opacity" && value.trim().parse::<f32>().is_ok_and(|v| v < 1.0)
+            });
+            if !dims {
+                continue;
+            }
+            for selector in selectors.split(',') {
+                let last = selector.split_whitespace().last().unwrap_or_default();
+                assert!(FIELDS.contains(&last), "{:?} dims something that may hold a dropdown", selector.trim());
+                dimmed += 1;
+            }
+        }
+        assert!(dimmed > 0, "an inherited value is still drawn dimmed");
+    }
+
     /// The sheet is the areas in order and nothing else.
     #[test]
     fn the_sheet_is_its_areas_in_order() {
