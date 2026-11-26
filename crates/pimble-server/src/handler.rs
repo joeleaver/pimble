@@ -5611,6 +5611,9 @@ impl PimbleApiServer for RpcHandler {
             if manager.write_refused(request.store_id, &[request.new_parent_id]) {
                 return Err(read_only_error());
             }
+            // Nothing goes inside an internal node (docs/THEMES_CONTRACT.md
+            // section 3.1a): the place is the same for every node.
+            manager.check_parent(request.store_id, request.new_parent_id).map_err(to_rpc_error)?;
             let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
             for &id in &node_ids {
                 judge_move_source(&manager, &reach, request.store_id, id)?;
@@ -6388,6 +6391,11 @@ impl PimbleApiServer for RpcHandler {
                         return Err(if discussion || manager.comment_refused(request.store_id, &[id]) { read_only_error() } else { comment_only_error() });
                     }
                 }
+                // Nothing goes inside an internal node (docs/THEMES_CONTRACT.md
+                // section 3.1a), judged on what the merge would leave. A
+                // relayed edit was judged where it was made, and refusing
+                // one here would leave two replicas apart for good.
+                manager.judge_placement(request.store_id, request.node_id, &bytes).map_err(to_rpc_error)?;
             }
         }
 

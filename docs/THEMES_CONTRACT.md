@@ -735,9 +735,19 @@ cut or add.
   children), `find_node` and `search` (`include_internal: ["themes"]`; an unknown kind is
   refused with the ones there are) leave internal nodes and their subtrees out. Nothing
   goes inside an internal node: every create and move is judged by `plan::parent_of_row`,
-  which refuses one with "Nothing goes inside a theme." (`Refusal::IntoInternal`). A
-  child an older client put under a theme is hidden with it in the tree, but search still
-  finds it by its own kind. View > "Show Internal" has a check per kind, kept per device in the
+  which refuses one with "Nothing goes inside a theme." (`Refusal::IntoInternal`). The
+  server enforces it for plain stores with the same sentence (`StoreError::InsideInternal`,
+  `pimble-store`'s `manager/placement.rs`): `createNode`, `moveNode`, `moveNodes` (before
+  any node moves) and `transplantNode` by the parent they name, and an `applyEdit` by what
+  merging it would leave, judged on a copy of the document before the merge (a `parent_id`
+  newly naming an internal node, or an id added to an internal node's children). Only
+  what an update changes is judged, so a child put under a theme before this keeps its
+  place and its edits; a relayed edit (a sync or vault link's) is not judged, since it
+  was judged where it was made and a replica that refused it would stay apart from its
+  peer. An encrypted (vault) store is ciphertext to the server, which cannot judge it:
+  there only the clients refuse it. A child an older client put under a theme in an
+  encrypted store, or before the server judged it, is hidden with it in the tree, but
+  search still finds it by its own kind. View > "Show Internal" has a check per kind, kept per device in the
   view preferences (`views::internal_shown`); a shown node is dimmed and drawn with its
   kind's icon; the store row's tooltip counts what is hidden once the store's themes are
   listed.
