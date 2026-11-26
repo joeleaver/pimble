@@ -468,7 +468,7 @@ first plugin.
 5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`). Wave 1 built 2026-11-02 (its
    contract's "Built" note), before waves 3 and 4: it needed no host slot.
    **ABI 4** (2026-11-02, for its drags on rinch #2093, merged 2026-11-03): `Query::BoundingRect`
-   answers `DomDocument::bounding_rect` (the painted box in the click context's frame;
+   answers `DomLayout::bounding_rect` (the painted box in the click context's frame;
    the SDK's `bounding_rect` had answered the parent-relative `Layout`); `Key::target`, the
    guest node a key was sent to (the focused element), passed as rinch's
    `KeyEventData::target`; an export `pimble_drag_ended` (`Instance::drag_ended`), which
