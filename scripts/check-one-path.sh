@@ -107,8 +107,11 @@ ban_joined "web/src implements a pimble_api Backend (the page's one backend is i
 ban_joined_where "web/src builds a pimble_api Router (stores routed to another server)" \
     '\bpimble_api\b' '\bRouter\b' "$src"
 ban_joined "web/src builds a Router (stores routed to another server)" '\bRouter\s*::' "$src"
+# `RpcBackend` anywhere in web/src, in any form (a turbofish, an alias, a type
+# named elsewhere), but the one constructor over `LocalConnector` and a plain
+# import (a name followed by `,`, `}` or `;`).
 ban_joined "web/src makes an RPC backend over anything but LocalConnector (the page's one server is its worker)" \
-    '\bRpcBackend\s*::\s*(?!new\s*\(\s*LocalConnector\b)\w+' "$src"
+    '\bRpcBackend\b(?!\s*::\s*new\s*\(\s*LocalConnector\b)(?!\s*[,};])' "$src"
 ban_joined "web/src implements a pimble_api Connector other than LocalConnector (the page's one server is its worker)" \
     '\bimpl\b[^{;]*\bConnector\s+for\s+(?!LocalConnector\b)\w+' "$src"
 ban_joined "web/src opens a PimbleClient other than over_message_port (the page's one server is its worker)" \
@@ -122,6 +125,11 @@ manifests=()
 while IFS= read -r -d '' manifest; do
     manifests+=("$manifest")
 done < <(find "$web" -name Cargo.toml -not -path "$web/worker/*" -not -path '*/target/*' -not -path '*/dist/*' -print0)
+# With no manifest, grep would search the working directory instead.
+if [[ ${#manifests[@]} -eq 0 ]]; then
+    echo "check-one-path: no Cargo.toml found under $web; the manifest check could not run" >&2
+    exit 2
+fi
 ban "the page's Cargo.toml names pimble-server (the server runs in the worker)" \
     'pimble[-_]server' "${manifests[@]}"
 
