@@ -32,7 +32,9 @@
 }
 .pimble-theme-editor__line {
     display: grid;
-    grid-template-columns: 110px 1fr auto;
+    /* The control's column may be narrower than what it holds: it never
+       pushes the line, and the tokens column, wider than it is. */
+    grid-template-columns: 110px minmax(0, 1fr) auto;
     align-items: center;
     column-gap: 8px;
     font-size: 13px;
@@ -66,10 +68,25 @@
 .pimble-theme-editor__reset:hover {
     color: var(--rinch-color-text);
 }
+.pimble-theme-editor__control {
+    min-width: 0;
+}
 .pimble-theme-editor__pair,
 .pimble-theme-editor__color-ref {
     display: flex;
     gap: 4px;
+}
+/* A color line: the slot list takes the room the pair leaves, and the pair
+   goes under it when both do not fit beside each other. */
+.pimble-theme-editor__color-ref {
+    flex-wrap: wrap;
+}
+.pimble-theme-editor__color-ref .rinch-select {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.pimble-theme-editor__color-ref .pimble-theme-editor__pair {
+    flex: 0 0 auto;
 }
 .pimble-theme-editor__pair input {
     width: 76px;
