@@ -21,6 +21,11 @@ pub(crate) fn open_node(store: AppStore, tree_state: UseTreeReturn, value: Strin
 /// Open a tree value in pane `pane`. The tree's selected row follows when
 /// the pane has the focus, and the pane's history ([`crate::nav`]) records it.
 pub(crate) fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+    // A grouping row (Internal, Themes) is no node: there is nothing to
+    // open, and a cursor resting on it leaves the pane as it is.
+    if crate::state::is_internal_group(&value) {
+        return;
+    }
     store.pane(pane).history.update(|h| h.visit(&value));
     show_in_pane(store, tree_state, pane, value);
 }

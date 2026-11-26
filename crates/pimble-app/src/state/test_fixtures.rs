@@ -3,7 +3,7 @@
 use super::*;
 
 /// A store with one child under its root, and the child's canonical pair.
-pub(super) fn store_with_a_child() -> (AppStore, StoreId, NodeId) {
+pub(crate) fn store_with_a_child() -> (AppStore, StoreId, NodeId) {
     let app = AppStore::new();
     let mut store = Store::new_local("Notes", "/tmp/notes.pimble".into());
     let root = Node::folder("Notes");
@@ -54,4 +54,36 @@ pub(super) fn a_replica_of_two_shares() -> (AppStore, StoreId, [NodeId; 2], [Nod
         app.upsert_node(store_id, node);
     }
     (app, store_id, ids.0, ids.1)
+}
+
+/// The nodes of [`a_store_with_themes`].
+pub(crate) struct WithThemes {
+    pub store_id: StoreId,
+    pub root: NodeId,
+    pub recipes: NodeId,
+    pub book: NodeId,
+    pub code: NodeId,
+    /// A folder holding the theme `inner`.
+    pub folder: NodeId,
+    pub inner: NodeId,
+}
+
+/// A store whose root holds `Book` (a theme), `Recipes`, `Code` (a theme)
+/// and the folder `Shared`, which holds the theme `Inner`.
+pub(crate) fn a_store_with_themes() -> (AppStore, WithThemes) {
+    let (app, store_id, recipes) = store_with_a_child();
+    let root = app.root_node_id(store_id).unwrap();
+    let theme = |name: &str| {
+        let mut node = Node::document(name);
+        node.node_type = pimble_core::node_types::THEME.to_string();
+        node
+    };
+    let (book, code, folder, inner) = (theme("Book"), theme("Code"), Node::folder("Shared"), theme("Inner"));
+    let ids = WithThemes { store_id, root, recipes, book: book.id, code: code.id, folder: folder.id, inner: inner.id };
+    for n in [book, code, folder, inner] {
+        app.upsert_node(store_id, n);
+    }
+    app.set_children(store_id, root, vec![(store_id, ids.book), (store_id, recipes), (store_id, ids.code), (store_id, ids.folder)]);
+    app.set_children(store_id, ids.folder, vec![(store_id, ids.inner)]);
+    (app, ids)
 }

@@ -181,9 +181,13 @@ pub(crate) fn preview_blocks(store: AppStore, store_id: StoreId, node_id: NodeId
 }
 
 /// Open theme node `(store_id, node_id)` in the focused pane, as a followed
-/// link opens a node: "Edit Theme..." and a theme just made. It opens
-/// whether or not Themes are shown in the explorer (section 3.1a).
+/// link opens a node, and show it in the explorer: "Edit Theme..." and a
+/// theme just made (New Theme, Customize, a copy to customize; Joe,
+/// 2026-11-26). Themes are shown if they were not, kept as View > Show
+/// Internal keeps them, and the theme's row is revealed under its parent's
+/// Themes row, selected with the cursor on it (section 3.1a).
 pub(crate) fn open_theme_node(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    store.internal_shown[pimble_core::internal::InternalKind::Theme.index()].set(true);
     let value = format!("node_{store_id}_{node_id}");
     store.link_open.set(Some(crate::state::LinkOpen { value, store_id, node_id, anchor: None, pane: None }));
 }

@@ -32,6 +32,30 @@ pub fn focus_explorer() {
     }
 }
 
+/// Open a grouping row ("Themes") or close it, as its chevron does.
+pub(crate) fn toggle_group(store: AppStore, tree_state: UseTreeReturn, value: &str) {
+    let open = untracked(|| tree_state.expanded.with(|e| e.contains(value)));
+    tree_state.controller.toggle(value);
+    if open {
+        // A closed group's rows leave the selection, as a chevron's do.
+        let kept: Vec<String> = untracked(|| tree_state.selected.get()).into_iter().filter(|v| !hidden_by(store, value, v)).collect();
+        tree_state.controller.set_selection(kept);
+    }
+}
+
+/// Whether the row `row` is inside the grouping row `group` (as the tree
+/// was last built).
+fn hidden_by(store: AppStore, group: &str, row: &str) -> bool {
+    fn find<'a>(rows: &'a [TreeNodeData], value: &str) -> Option<&'a TreeNodeData> {
+        rows.iter().find_map(|r| if r.value == value { Some(r) } else { find(&r.children, value) })
+    }
+    fn holds(row: &TreeNodeData, value: &str) -> bool {
+        row.children.iter().any(|c| c.value == value || holds(c, value))
+    }
+    let data = untracked(|| store.build_tree_data_structural());
+    find(&data, group).is_some_and(|g| holds(g, row))
+}
+
 /// Start renaming the row of tree value `value` in place: a double-click, F2,
 /// or a node the keyboard just made. Enter commits and Escape cancels, and
 /// either gives the keyboard back to the tree. `false` when the row cannot
@@ -183,6 +207,14 @@ pub(super) fn render_explorer(
     let cancel_rename_for_select = cancel_rename.clone();
     let on_tree_select = ValueCallback::new(move |value: String| {
         tracing::info!("Tree node selected: {}", value);
+
+        // A grouping row ("Themes") opens nothing: a click opens
+        // or closes it (docs/THEMES_CONTRACT.md section 3.1a).
+        if crate::state::is_internal_group(&value) {
+            cancel_rename_for_select(true);
+            toggle_group(store, tree_state, &value);
+            return;
+        }
 
         // Double-click on a node → enter rename mode
         {

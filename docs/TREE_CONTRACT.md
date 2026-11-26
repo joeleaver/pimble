@@ -507,6 +507,35 @@ dragged it onto the parent first, then reordered. What was found before changing
   further right, as "Zones" above says for any expanded row. The middle (inside) is
   refused, and so is any row under a store.
 
+## Internal groups (Joe, 2026-11-26)
+
+A shown internal node (View > "Show Internal", docs/THEMES_CONTRACT.md section 3.1a) is
+not drawn among its parent's other children: it is under that parent's row of its kind
+(**Themes**; Joe, 2026-11-26: "Actually, not Internal. Just Themes", so there is no
+"Internal" row above the kinds). The grouping is the explorer's alone
+(`state::internal_rows`): nothing is stored, the node stays where it lives, and every
+parent that holds shown internal nodes has its own group per kind, last among its rows
+(after a query metanode's finds). A store's root-level themes are under the store row's
+Themes; a theme moved into a folder or a share is under that folder's.
+
+- **Rows.** A grouping row's value is `internal_{store}_{parent}_{kind id}{mount path}`
+  (`state::internal_group_value`), recorded as the tree is built, as found rows are
+  (`state::internal_group`). It is drawn dimmed in italics with the kind's icon, its tooltip says what it holds ("2 themes here."), and it is no node:
+  a click or Enter opens or closes it, a cursor resting on it opens nothing, F2, a split
+  and New Child do nothing, Delete and Cut leave it out of what they carry, it is never
+  dragged, and a right press aims the explorer's menu at no row. Making anything in one
+  is refused with "Nothing is made in Themes. Node > New Theme makes a theme."
+- **Drops** (`internal_drop::group_drop`, inside `plan_drop`, the one judgement): into
+  Themes is into the parent it groups, at the place among the group's rows (First, after
+  a theme), themes only ("Only themes go in Themes."); beside a grouping row is the
+  parent's last place. A theme dropped on an ordinary row goes in it, as any node, and shows in that
+  row's group; nothing goes inside a theme. Through a mount a group's parent row is the
+  mount's, and the drop moves into the source as any drop into a mount does. After the
+  move the group is opened so the node is seen (`events::nodes::node_moved`).
+- **The keyboard** follows from the drops: Alt+Shift+Up/Down moves a theme among its
+  group's rows, Outdent out of Themes is beside the group, the parent's last place (it
+  stays in the group), Indent into a theme is refused. Ctrl+A on a theme takes the themes of its group.
+
 ## Out of scope
 
 Duplicating a node (a separate decision: its content

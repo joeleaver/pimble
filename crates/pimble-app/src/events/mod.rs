@@ -160,7 +160,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::ThemeMade { store_id, node_id } => {
-                crate::app::open_node(store, tree_state, format!("node_{store_id}_{node_id}"));
+                crate::themes::open_theme_node(store, *store_id, *node_id);
             }
 
             BackendEvent::NodeNotLoaded { store_id, node_id, message } => {
@@ -231,8 +231,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     follow_resolution(store, url, *hops, resolution);
                 }
             }
-            BackendEvent::AncestorsLoaded { store_id, node_id, ancestors } => {
-                reveal_in_tree(store, tree_state, *store_id, *node_id, ancestors);
+            BackendEvent::AncestorsLoaded { store_id, node_id, ancestors, kind } => {
+                reveal_in_tree(store, tree_state, *store_id, *node_id, ancestors, *kind);
             }
             BackendEvent::PropertiesLoaded { store_id, node_id, lives_in, store_tags } => {
                 store.properties_context.set(Some(crate::properties::Context {

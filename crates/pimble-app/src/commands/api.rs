@@ -166,6 +166,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             // longer than any real tree is broken.
             let mut ancestors = Vec::new();
             let mut at = api.node(Addr::new(store_id, node_id)).await.ok();
+            let kind = at.as_ref().and_then(|node| pimble_core::internal::internal_kind(&node.node_type));
             while let Some(node) = at.take() {
                 let Some(parent) = node.parent_id else { break };
                 if ancestors.contains(&parent) || ancestors.len() >= 256 {
@@ -177,7 +178,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                 }
             }
             ancestors.reverse();
-            Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
+            Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors, kind })
         }
 
         C::GetThemeChain { store_id, node_id } => {

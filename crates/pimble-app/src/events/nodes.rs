@@ -51,11 +51,29 @@ pub(super) fn node_moved(
     let is_root = store.root_node_id(*store_id)
         .map_or(false, |rid| rid == *new_parent_id);
     let dropped_value = take_last_drop_target_value();
-    if !is_root {
+    // A drop into a grouping row ("Themes") records the group: the
+    // parent it stands for and the group open.
+    if let Some(group) = dropped_value.as_deref().and_then(crate::state::internal_group) {
+        if group.parent_row.starts_with("node_") {
+            tree_state.controller.expand(&group.parent_row);
+        }
+        if let Some(value) = &dropped_value {
+            tree_state.controller.expand(value);
+        }
+    } else {
         let expand_value = dropped_value
             .filter(|v| parse_tree_value(v).map_or(false, |(sid, nid)| sid == *store_id && nid == Some(*new_parent_id)))
             .unwrap_or_else(|| format!("node_{}_{}", store_id, new_parent_id));
-        tree_state.controller.expand(&expand_value);
+        if !is_root {
+            tree_state.controller.expand(&expand_value);
+        }
+        // A shown internal node dropped on an ordinary row is in that
+        // row's group of its kind: open it, so the node is seen.
+        let kind = store.get_node_signal(*store_id, *node_id).and_then(|sig| untracked(|| sig.with(|n| pimble_core::internal::internal_kind(&n.node_type))));
+        if let Some(kind) = kind.filter(|kind| untracked(|| store.internal_kinds_shown()).contains(kind)) {
+            let suffix = if is_root { String::new() } else { expand_value.find('/').map(|at| expand_value[at..].to_string()).unwrap_or_default() };
+            tree_state.controller.expand(&crate::internal_drop::row_to_open(*store_id, *new_parent_id, &suffix, kind));
+        }
     }
     if !store.has_children_loaded(*store_id, *new_parent_id) {
         // Opened for the first time: its list is loaded once.

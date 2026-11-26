@@ -82,6 +82,10 @@ impl TreeView for AppView {
 /// making something on a row comes here: the row menus, the keyboard, the
 /// toolbar's "+", pictures dropped or pasted on a row, "Paste Mount Here".
 pub(crate) fn create_parent_of_row(store: AppStore, row: &str) -> Option<(StoreId, NodeId)> {
+    if let Some(group) = crate::state::internal_group(row) {
+        crate::events::show_notice(store, crate::internal_drop::nothing_made_in(&group));
+        return None;
+    }
     let (store_id, node_id) = parse_tree_value(row)?;
     match plan::create_parent(&store.view(), store_id, node_id) {
         Ok(parent) => Some(parent),
