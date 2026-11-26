@@ -44,18 +44,21 @@ use crate::error::{CrdtError, Result};
 // (`content`), its Markdown edits (`markdown_edits`) and splitting it
 // (`split`); the `node` and `children` roots (`structure`, and `transactions`
 // for the writes `Tree` makes); the plugin root (`data`) and the board text
-// read from it (`boards`).
+// read from it (`boards`); what a merge reads as once saved
+// (`round_trip`).
 mod boards;
 mod content;
 mod data;
 mod markdown_edits;
 mod placing;
+mod round_trip;
 mod split;
 mod structure;
 mod transactions;
 
 pub use data::{DataEdit, DataStep};
 pub use markdown_edits::{Outline, SplitPart, SplitParts};
+pub use round_trip::READS_DIFFERENTLY_ONCE_SAVED;
 pub use split::SplitOff;
 
 /// The root map holding a node's structure and metadata.

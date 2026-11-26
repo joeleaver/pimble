@@ -49,7 +49,10 @@ impl StoreManager {
     /// An update that cannot place anything (`NodeDoc::may_place`: nothing
     /// it brings lands in the `node` or `children` root, which is every
     /// keystroke) is let through as it is. Any other is merged into a copy
-    /// of the document, which is judged; the document is not touched.
+    /// of the document, saved and loaded again, which is judged; the
+    /// document is not touched. One whose merge reads differently from that
+    /// reload is refused outright: merged here it would leave the live
+    /// document disagreeing with its own file and with every peer.
     pub fn judge_placement(&self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<()> {
         let tree = self.local(store_id)?.tree();
         let held = tree.doc(node_id);
@@ -62,11 +65,11 @@ impl StoreManager {
         let parent_before = fields_before.as_ref().and_then(|f| f.parent_id);
         let was_internal = fields_before.as_ref().is_some_and(|f| internal_kind(&f.node_type).is_some());
         let children_before = held.map(|doc| doc.children()).unwrap_or_default();
-        let mut merged = match held {
-            Some(doc) => NodeDoc::load(&doc.save())?,
-            None => NodeDoc::new(),
-        };
-        merged.apply_update(update)?;
+        // Judged as the document will be once persisted and loaded again,
+        // which is what every peer and every later open sees: a forged
+        // update can merge in memory to a state its own save does not keep,
+        // and that one is refused (`NodeDoc::merged_as_saved`).
+        let merged = NodeDoc::merged_as_saved(held, update)?;
         let Ok(fields) = merged.stored_fields() else {
             // No `node` root yet: nothing places this document.
             return Ok(());

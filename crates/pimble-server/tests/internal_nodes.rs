@@ -304,3 +304,151 @@ async fn apply_edit_refuses_making_a_node_with_children_a_theme() {
         fx.apply(store, *id, "older-client", update).await.unwrap();
     }
 }
+
+/// What one raced `applyEdit` answered: taken, or refused because the
+/// theme holds nothing. Any other answer fails the test.
+async fn raced_apply(handler: RpcHandler, store_id: StoreId, node_id: NodeId, update: Vec<u8>, start: Arc<tokio::sync::Barrier>) -> bool {
+    start.wait().await;
+    let answer = handler
+        .apply_edit(&service_extensions(), ApplyEditRequest {
+            store_id,
+            node_id,
+            client_id: "older-client".into(),
+            operation: EditOperation::IncrementalChanges { changes: b64(&update) },
+        })
+        .await;
+    match answer {
+        Ok(_) => true,
+        Err(err) => {
+            assert_eq!(err.message(), holds_nothing(), "{err:?}");
+            false
+        }
+    }
+}
+
+/// Two edits that each pass alone but together put a node inside a theme:
+/// one makes an empty folder a theme, the other moves a note under it (the
+/// note's own `parent_id`, and the folder's list). Raced on several
+/// threads, each is judged under the same write lock as its merge, so
+/// either the theme is taken and both halves of the move are refused, or
+/// the theme is refused; and the end state never holds anything inside a
+/// theme.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_edits_never_put_a_node_inside_a_theme() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    const ROUNDS: usize = 24;
+    let fx = Fixture::new();
+    let (mut themes_taken, mut moves_taken) = (0, 0);
+    for round in 0..ROUNDS {
+        let (store, root) = fx.store(&format!("Store {round}")).await;
+        let folder = fx.create(store, root, "folder", "Folder").await;
+        let note = fx.create(store, root, "document", "Note").await;
+
+        let mut mover = fx.peer_tree(store, root).await;
+        let moved = mover.move_node(note, folder, Place::Last, T0).unwrap();
+        let note_update = moved.touched.iter().find(|(id, _)| *id == note).expect("the move writes the note").1.clone();
+        let list_update = moved.touched.iter().find(|(id, _)| *id == folder).expect("the move writes the folder's list").1.clone();
+        let mut themer = fx.peer_tree(store, root).await;
+        let themed = themer.set_node_type(folder, node_types::THEME, T0).unwrap();
+        let [(themed_id, type_update)] = themed.touched.as_slice() else { panic!("a type change writes one document, not {}", themed.touched.len()) };
+        assert_eq!(*themed_id, folder);
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let tasks = [(note, note_update), (folder, list_update), (folder, type_update.clone())]
+            .map(|(id, update)| tokio::spawn(raced_apply(fx.handler.clone(), store, id, update, start.clone())));
+        let mut answers = Vec::new();
+        for task in tasks {
+            answers.push(tokio::time::timeout(Duration::from_secs(30), task).await.expect("a raced edit answers in time").unwrap());
+        }
+        let [note_taken, list_taken, type_taken] = answers[..] else { unreachable!() };
+
+        if type_taken {
+            themes_taken += 1;
+            assert!(!note_taken && !list_taken, "round {round}: the folder became a theme, so the move into it is refused");
+        } else {
+            moves_taken += 1;
+            assert!(note_taken || list_taken, "round {round}: the theme is refused only for what the move put in");
+        }
+
+        let manager = fx.manager.read().await;
+        let tree = manager.tree(store).unwrap();
+        let fields = tree.doc(folder).unwrap().stored_fields().unwrap();
+        assert_eq!(fields.node_type == node_types::THEME, type_taken, "round {round}");
+        if type_taken {
+            assert!(tree.doc(folder).unwrap().children().is_empty(), "round {round}: the theme lists nothing");
+            assert!(tree.documents_under(&HashSet::from([folder])).is_empty(), "round {round}: no document names the theme as its parent");
+        }
+    }
+    println!("{ROUNDS} rounds: the theme won {themes_taken}, the move {moves_taken}");
+}
+
+/// The client and clock of the one struct `update` inserts.
+fn only_struct_of(update: &[u8]) -> (yrs::ClientID, u32) {
+    use yrs::encoding::read::{Cursor, Read};
+    use yrs::updates::decoder::{Decoder, DecoderV1};
+
+    let mut decoder = DecoderV1::new(Cursor::new(update));
+    assert_eq!(decoder.read_var::<u32>().unwrap(), 1, "one client");
+    assert_eq!(decoder.read_var::<u32>().unwrap(), 1, "one struct");
+    let client = decoder.read_client().unwrap();
+    (client, decoder.read_var().unwrap())
+}
+
+/// An update carrying a struct the theme holds in part: its first item
+/// the theme's list entry for a child already there, its second a new id,
+/// under a forged header naming `content`. yrs merges the new item beside
+/// the held entry but keeps the forged parent, so the merge does not list
+/// it and its own save does: judged on the merge it passed and the child
+/// landed in the theme once the document was saved and loaded. It is
+/// refused, the live document and its save stay as they were, and so does
+/// what a peer loads.
+#[tokio::test]
+async fn apply_edit_refuses_a_forged_update_that_lists_a_child_once_saved() {
+    use yrs::block::BLOCK_ITEM_ANY_REF_NUMBER;
+    use yrs::encoding::write::Write;
+    use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+
+    let fx = Fixture::new();
+    let (store, root) = fx.store("Store").await;
+    let theme = fx.create(store, root, node_types::THEME, "Theme").await;
+    let note = fx.create(store, root, "document", "Note").await;
+    // A child already under the theme: a relayed move, judged where it was
+    // made and never here.
+    let mut peer = fx.peer_tree(store, root).await;
+    let edit = peer.move_node(note, theme, Place::Last, T0).unwrap();
+    for (id, update) in &edit.touched {
+        fx.apply(store, *id, "sync-link:peer", update).await.unwrap();
+    }
+    assert_eq!(fx.children(store, theme).await, vec![note]);
+    let list_update = &edit.touched.iter().find(|(id, _)| *id == theme).expect("the move writes the theme's list").1;
+    let (client, clock) = only_struct_of(list_update);
+
+    let smuggled = NodeId::new();
+    let mut encoder = EncoderV1::new();
+    encoder.write_var(1u32);
+    encoder.write_var(1u32);
+    encoder.write_client(client);
+    encoder.write_var(clock);
+    encoder.write_info(BLOCK_ITEM_ANY_REF_NUMBER);
+    encoder.write_parent_info(true);
+    encoder.write_string("content");
+    encoder.write_len(2);
+    encoder.write_any(&yrs::Any::from(note.to_string()));
+    encoder.write_any(&yrs::Any::from(smuggled.to_string()));
+    yrs::IdSet::new().encode(&mut encoder);
+    let forged = encoder.to_vec();
+    {
+        let manager = fx.manager.read().await;
+        assert!(manager.tree(store).unwrap().doc(theme).unwrap().may_place(&forged).unwrap(), "judged, not let through");
+    }
+
+    let err = fx.apply(store, theme, "older-client", &forged).await.expect_err("the forged update must be refused");
+    assert!(err.message().contains(pimble_crdt::READS_DIFFERENTLY_ONCE_SAVED), "{err:?}");
+    assert_eq!(fx.children(store, theme).await, vec![note]);
+    let manager = fx.manager.read().await;
+    let held = manager.tree(store).unwrap().doc(theme).unwrap();
+    assert_eq!(held.children(), vec![note]);
+    assert_eq!(NodeDoc::load(&held.save()).unwrap().children(), vec![note], "nor once saved and loaded");
+}

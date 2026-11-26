@@ -324,6 +324,106 @@ mod tests {
         assert!(doc.children().contains(&smuggled), "yrs does list it");
     }
 
+    /// A note whose list holds one entry, written by a peer, and an update
+    /// that carries a struct the note holds in part: its first item that
+    /// held entry, its second a new id (answered too), under a forged
+    /// header naming `content`. yrs merges only the new part, with the held
+    /// part as its origin, so it lands in the list; the header says nothing
+    /// about where. No honest update needs this to answer `true` (an honest
+    /// header names the list), so the forged one is the only kind that
+    /// tells whether the partly-held rule is there.
+    fn note_and_forged_part_held_update() -> (NodeDoc, Vec<u8>, NodeId) {
+        use yrs::block::BLOCK_ITEM_ANY_REF_NUMBER;
+        use yrs::encoding::write::Write;
+        use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+        use yrs::IdSet;
+
+        let (mut doc, _) = note_and_peer();
+        let mut lister = NodeDoc::load(&doc.save()).unwrap();
+        let before = doc.state_vector();
+        lister.insert_child(0, NodeId::new()).unwrap();
+        doc.apply_update(&lister.diff_since(&before).unwrap()).unwrap();
+        let client = lister.doc.client_id();
+        let held_entry = doc.children()[0];
+        assert_eq!(held_lands(&doc.doc.transact(), &ID::new(client, 0)), Some(Lands::Placing));
+
+        let smuggled = NodeId::new();
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(1u32);
+        encoder.write_var(1u32);
+        encoder.write_client(client);
+        encoder.write_var(0u32);
+        // One struct of two items at clocks 0 and 1: the held entry and a
+        // new one, said to be in `content`.
+        encoder.write_info(BLOCK_ITEM_ANY_REF_NUMBER);
+        encoder.write_parent_info(true);
+        encoder.write_string("content");
+        encoder.write_len(2);
+        encoder.write_any(&yrs::Any::from(held_entry.to_string()));
+        encoder.write_any(&yrs::Any::from(smuggled.to_string()));
+        IdSet::new().encode(&mut encoder);
+        let forged = encoder.to_vec();
+
+        // The update is what this test means it to be: one struct the
+        // document holds the first clock of and not the second.
+        let structs = inserted_structs(&forged).unwrap();
+        let known = doc.doc.transact().state_vector().get(&client);
+        let only = &structs[&client];
+        assert_eq!(only.len(), 1);
+        assert!(only[0].clock < known && known < only[0].clock + only[0].len, "held in part: {only:?}, known {known}");
+        assert_eq!(only[0].parent, Parent::Root("content".into()));
+        (doc, forged, smuggled)
+    }
+
+    #[test]
+    fn a_struct_held_in_part_may_place_whatever_its_header_says() {
+        let (mut doc, forged, smuggled) = note_and_forged_part_held_update();
+        assert!(doc.may_place(&forged).unwrap());
+        // yrs links the new item after the held entry but keeps the forged
+        // parent on it: the merged document does not list it, and lists it
+        // once saved and loaded again. The document in memory disagrees
+        // with its own save.
+        doc.apply_update(&forged).unwrap();
+        assert!(!doc.children().contains(&smuggled));
+        assert!(NodeDoc::load(&doc.save()).unwrap().children().contains(&smuggled), "yrs does list it once reloaded");
+    }
+
+    /// The forged update reads differently merged than reloaded, so the
+    /// copy a placement is judged on refuses it, and the note is untouched.
+    #[test]
+    fn a_merge_that_reads_differently_once_saved_is_refused() {
+        let (doc, forged, smuggled) = note_and_forged_part_held_update();
+        let before = doc.save();
+        let err = NodeDoc::merged_as_saved(Some(&doc), &forged).err().expect("refused");
+        assert_eq!(err.to_string(), crate::READS_DIFFERENTLY_ONCE_SAVED);
+        assert_eq!(doc.save(), before);
+        assert!(!doc.children().contains(&smuggled));
+    }
+
+    /// An honest update can hold a struct the document holds in part too:
+    /// a peer that listed two entries one after the other sends its whole
+    /// state (one struct of both) to a document that has the first. That
+    /// one merges as it reloads, and the copy lists both.
+    #[test]
+    fn an_honest_struct_held_in_part_merges_as_it_reloads() {
+        let (mut doc, _) = note_and_peer();
+        let mut lister = NodeDoc::load(&doc.save()).unwrap();
+        let (first, second) = (NodeId::new(), NodeId::new());
+        let before = doc.state_vector();
+        lister.insert_child(0, first).unwrap();
+        doc.apply_update(&lister.diff_since(&before).unwrap()).unwrap();
+        lister.insert_child(1, second).unwrap();
+        let whole = lister.save();
+        let structs = inserted_structs(&whole).unwrap();
+        let known = doc.doc.transact().state_vector().get(&lister.doc.client_id());
+        let listed = &structs[&lister.doc.client_id()];
+        assert!(listed.iter().any(|s| s.clock < known && known < s.clock + s.len), "held in part: {listed:?}, known {known}");
+
+        assert!(doc.may_place(&whole).unwrap());
+        let merged = NodeDoc::merged_as_saved(Some(&doc), &whole).unwrap();
+        assert_eq!(merged.children(), vec![first, second]);
+    }
+
     #[test]
     fn what_is_held_already_or_cannot_be_told() {
         let (doc, mut peer) = note_and_peer();

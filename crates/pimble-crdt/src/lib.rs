@@ -33,7 +33,7 @@ pub use blocks::{blocks_from_plain_text, Align, Block, Image, Inline, ListItem, 
 pub use blobs::BlobRef;
 pub use content_doc::*;
 pub use error::*;
-pub use node_doc::{DataEdit, DataStep, NodeDoc, NodeFields, NodeUpdateEffect, Outline, SplitOff, SplitPart, SplitParts, ROOT_CHILDREN, ROOT_DATA, ROOT_NODE};
+pub use node_doc::{DataEdit, DataStep, NodeDoc, NodeFields, NodeUpdateEffect, Outline, SplitOff, SplitPart, SplitParts, READS_DIFFERENTLY_ONCE_SAVED, ROOT_CHILDREN, ROOT_DATA, ROOT_NODE};
 pub use store_document::*;
 pub use links::{LinkRef, Resolved, Spot};
 pub use rules::{derive_changes, move_order, DeletedEntry, DocShape, LinkHop, LinkWalk, MoveRefused, NodeChange};
