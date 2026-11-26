@@ -20,7 +20,8 @@ pub struct WhoCanOpenResponse {
     /// names them.
     pub people: Vec<Opener>,
     /// The node is in a share (or a Pimble Cloud store) whose members this
-    /// device has not been told, so `people` may leave some out.
+    /// device does not have (not learned yet, or a share that ended), so
+    /// `people` may leave some out.
     #[serde(default)]
     pub incomplete: bool,
 }

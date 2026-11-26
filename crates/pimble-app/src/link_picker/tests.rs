@@ -150,7 +150,7 @@ fn shared_note(people: bool) -> (crate::state::AppStore, StoreId, NodeId) {
             my_name_chosen: true,
             share_name: String::new(),
         };
-        store.shares_ui.people.set(std::collections::HashMap::from([(s, pimble_rpc::StorePeople { scopes: vec![scope] })]));
+        store.shares_ui.people.set(std::collections::HashMap::from([(s, pimble_rpc::StorePeople { scopes: vec![scope], ..Default::default() })]));
     }
     store.pane(store.focused()).active_edit.set(Some(crate::state::ActiveEdit { store_id: s, node_id: n }));
     (store, s, n)

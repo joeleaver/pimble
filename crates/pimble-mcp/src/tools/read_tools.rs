@@ -414,9 +414,9 @@ impl Pimble {
         let answer = self.api.backend().who_can_open(addr.store, addr.node).await?;
         if answer.people.is_empty() {
             return Ok(if answer.incomplete {
-                "Who can open this note is not known on this computer yet: it is shared, and Pimble has not learned its members.".into()
+                "Who can open this note is not known on this computer: it is or was shared, and Pimble does not have the members of that share.".into()
             } else {
-                "Nobody else can open this note: it is in no share.".into()
+                "Nobody else can open this note: it is in no share with other members.".into()
             });
         }
         let mut out = String::from("People who can open it (mention one with its Markdown):\n");
@@ -425,7 +425,7 @@ impl Pimble {
             out.push_str(&format!("- {}: [{}]({})\n", person.name, mention.words(), mention.href()));
         }
         if answer.incomplete {
-            out.push_str("There may be others: this computer has not learned the members of every share this note is in.\n");
+            out.push_str("There may be others: this computer does not have the members of every share this note is in.\n");
         }
         Ok(out)
     }

@@ -37,15 +37,22 @@ impl RpcHandler {
 
         // The node and what is above it, a discussion's subject included.
         let chain = crate::notices::chain_of(self, store_id, node_id).await;
+        {
+            // A share that ended is no longer this account's: who holds it now
+            // cannot be known here, and what was kept would be stale.
+            let manager = self.store_manager.read().await;
+            if chain.iter().any(|&id| manager.under_ended_root(store_id, id)) {
+                return Ok(WhoCanOpenResponse { people: Vec::new(), incomplete: true });
+            }
+        }
         let kept = crate::people::kept(self, store_id).await.map_err(to_rpc_error)?;
         let manager = self.store_manager.read().await;
         let tree = manager.tree(store_id).map_err(to_rpc_error)?;
         // A share this node is in, by the marker on its root, that the kept
         // list does not name.
         let unlisted_share = chain.iter().any(|&root| {
-            !manager.under_ended_root(store_id, root)
-                && tree.get_node_info(root).is_ok_and(|info| info.custom.contains_key(custom_keys::SHARE))
-                && !kept.as_ref().is_some_and(|people| people.scopes.iter().any(|scope| scope.root == Some(root)))
+            tree.get_node_info(root).is_ok_and(|info| info.custom.contains_key(custom_keys::SHARE))
+                && !kept.as_ref().is_some_and(|people| people.alone.contains(&root) || people.scopes.iter().any(|scope| scope.root == Some(root)))
         });
         // A store on Pimble Cloud may have members of the whole of it, which
         // no marker says.

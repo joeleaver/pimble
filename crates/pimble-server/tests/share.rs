@@ -222,8 +222,16 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     let (a, alice, a_dir) = start_local_server().await;
     let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
     let (store_id, shared) = (fx.store_id, fx.shared);
+    let agent = agent_of(&a, &alice, store_id).await;
+    // Hosted and shared with nobody: known, not "never told".
+    alice.cloud_people(store_id).await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
     alice.cloud_share_node(store_id, shared, "Holiday Plans").await.expect("sharing a folder");
+    // A share nobody was invited to yet.
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
     alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob");
+    let (invited, incomplete) = openers(&agent, store_id, fx.inside).await;
+    assert!(invited.len() == 2 && !incomplete, "{invited:?}");
 
     let (_b, bob, b_dir) = start_local_server().await;
     env.sign_in(&bob, BOB).await;
@@ -253,16 +261,7 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
 
     // An AI agent on Alice's computer learns who can open a note in the
     // share, by those names (docs/MCP_CONTRACT.md "Who can open a note").
-    let created = alice
-        .create_agent("Claude", vec![pimble_rpc::AgentGrant { store: store_id, node: Some(shared), role: pimble_rpc::AgentRole::Reader }])
-        .await
-        .unwrap();
-    let agent = PimbleClient::connect_with_auth(format!("http://{}", a.addr()), &pimble_core::AuthMethod::Bearer { token: created.key }).await.unwrap();
-    let answer = agent.who_can_open(store_id, fx.inside).await.expect("an agent asks");
-    let mut named: Vec<_> = answer.people.iter().map(|p| (p.user_id.clone(), p.name.clone())).collect();
-    named.sort_by(|x, y| x.1.cmp(&y.1));
-    assert_eq!(named, vec![(env.user_id(ALICE.0), "Alice A.".to_string()), (env.user_id(BOB.0), "Bobby".to_string())]);
-    assert!(!answer.incomplete, "{answer:?}");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (vec!["Alice A.".to_string(), "Bobby".to_string()], false));
 
     // The Share dialog on Bob's side names Alice and shows no email; Alice's
     // own shows Bob's name with his email, for her to manage the share.
@@ -271,6 +270,30 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     assert!(info.members.iter().any(|m| m.role == MemberRole::Owner && m.name == "Alice A."), "{:?}", info.members);
     let info = alice.cloud_share_info(store_id, shared).await.expect("the owner's view");
     assert!(info.members.iter().any(|m| m.email == BOB.0 && m.name == "Bobby"), "{:?}", info.members);
+
+    // A removal and a stop are answered at once, not at the next refresh.
+    alice.cloud_share_remove_member(store_id, shared, BOB.0).await.expect("removing Bob");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob again");
+    assert_eq!(openers(&agent, store_id, fx.inside).await.0.len(), 2);
+    alice.cloud_stop_sharing(store_id, shared).await.expect("stopping the share");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+}
+
+/// An AI agent on `server` that reads the whole of `store_id`.
+async fn agent_of(server: &PimbleServer, operator: &PimbleClient, store_id: pimble_core::StoreId) -> PimbleClient {
+    let grant = pimble_rpc::AgentGrant { store: store_id, node: None, role: pimble_rpc::AgentRole::Reader };
+    let created = operator.create_agent("Claude", vec![grant]).await.unwrap();
+    PimbleClient::connect_with_auth(format!("http://{}", server.addr()), &pimble_core::AuthMethod::Bearer { token: created.key }).await.unwrap()
+}
+
+/// The names `whoCanOpen` gives for a node, sorted, and whether it says
+/// there may be others.
+async fn openers(client: &PimbleClient, store_id: pimble_core::StoreId, node: NodeId) -> (Vec<String>, bool) {
+    let answer = client.who_can_open(store_id, node).await.expect("asking who can open");
+    let mut names: Vec<String> = answer.people.into_iter().map(|person| person.name).collect();
+    names.sort();
+    (names, answer.incomplete)
 }
 
 #[tokio::test]
@@ -1077,6 +1100,9 @@ async fn a_share_that_ended_is_announced_and_kept_on_disk_until_the_replica_is_r
     let listed = bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
     assert_eq!(sorted(listed.roots.clone()), sorted(vec![holiday, recipes]), "the scope roots are never shrunk");
     assert_eq!((listed.ended_roots.clone(), listed.shown_roots()), (vec![holiday], vec![recipes]));
+    // Who can open what ended cannot be known here any more.
+    let ended = bob.who_can_open(store_id, holiday).await.expect("asking about an ended share");
+    assert!(ended.people.is_empty() && ended.incomplete, "{ended:?}");
     let held = bob.get_store_sync_response(store_id).await.unwrap();
     assert_eq!((held.ended_roots.clone(), held.access), (vec![holiday], StoreAccess::Full));
     assert!(held.read_only_roots.contains(&holiday), "an ended root is held read only, as before: {:?}", held.read_only_roots);

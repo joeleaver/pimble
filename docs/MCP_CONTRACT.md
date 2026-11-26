@@ -140,8 +140,14 @@ Decided by Joe, 2026-11-26: an agent that can read a note may see who else can o
   account id and the name they go by there. No email, no notice key, no share's name.
 - It is read from the kept `people.json` (docs/PRESENCE_CONTRACT.md section 3). Pimble
   Cloud is not asked, so an agent never spends the person's account session.
-- `incomplete` says the note is shared with members this computer has not been told, and
-  the tool says so rather than answering "nobody".
+- The list is as this computer last learned it. It is asked again at once after this
+  computer shares, invites, removes or stops sharing, and otherwise as
+  docs/PRESENCE_CONTRACT.md section 3 says, so a change made elsewhere shows a little
+  later (or once this computer is online).
+- `incomplete` says the note is shared with members this computer does not have (not
+  learned yet, or a share that ended), and the tool says so rather than answering
+  "nobody". A share of the account's own that nobody else is in is kept as such
+  (`people.json`'s `alone`).
 - A failure is answered as a failure. Until 2026-11-26 the tool called `cloudPeople`,
   which is the operator's alone and stays so: every agent was refused, and the tool
   reported the refusal as "its store is not shared".

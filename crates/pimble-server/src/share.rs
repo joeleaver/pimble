@@ -141,7 +141,7 @@ fn marker_of(tree: &Tree, id: NodeId) -> Option<ShareMarker> {
 }
 
 /// Every live node that carries a marker, in id order.
-fn markers_in(tree: &Tree) -> Vec<(NodeId, ShareMarker)> {
+pub(crate) fn markers_in(tree: &Tree) -> Vec<(NodeId, ShareMarker)> {
     let mut markers: Vec<(NodeId, ShareMarker)> = tree.list_node_ids().into_iter().filter_map(|id| Some((id, marker_of(tree, id)?))).collect();
     markers.sort_by_key(|(id, _)| id.to_string());
     markers
@@ -1361,6 +1361,8 @@ impl RpcHandler {
                 );
             }
         }
+        // Whoever was removed is not named any longer.
+        crate::people::refresh(self, store_id).await;
     }
 }
 

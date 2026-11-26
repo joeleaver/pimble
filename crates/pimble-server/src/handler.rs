@@ -4719,7 +4719,12 @@ impl PimbleApiServer for RpcHandler {
 
     async fn cloud_share_node(&self, ext: &Extensions, request: CloudShareNodeRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareNode")?;
-        self.share_node(request).await
+        let store_id = request.store_id;
+        let answer = self.share_node(request).await;
+        // Who is in the share may have changed, a call that failed part of
+        // the way included.
+        crate::people::refresh(self, store_id).await;
+        answer
     }
 
     async fn cloud_share_info(&self, ext: &Extensions, request: CloudShareRef) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
@@ -4729,17 +4734,32 @@ impl PimbleApiServer for RpcHandler {
 
     async fn cloud_share_invite(&self, ext: &Extensions, request: CloudShareInviteRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareInvite")?;
-        self.share_invite(request).await
+        let store_id = request.store_id;
+        let answer = self.share_invite(request).await;
+        // Who is in the share may have changed, a call that failed part of
+        // the way included.
+        crate::people::refresh(self, store_id).await;
+        answer
     }
 
     async fn cloud_share_remove_member(&self, ext: &Extensions, request: CloudShareRemoveMemberRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareRemoveMember")?;
-        self.share_remove_member(request).await
+        let store_id = request.store_id;
+        let answer = self.share_remove_member(request).await;
+        // Who is in the share may have changed, a call that failed part of
+        // the way included.
+        crate::people::refresh(self, store_id).await;
+        answer
     }
 
     async fn cloud_stop_sharing(&self, ext: &Extensions, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudStopSharing")?;
-        self.stop_sharing(request).await
+        let store_id = request.store_id;
+        let answer = self.stop_sharing(request).await;
+        // Who is in the share may have changed, a call that failed part of
+        // the way included.
+        crate::people::refresh(self, store_id).await;
+        answer
     }
 
     // The account page (`handler/account.rs`).

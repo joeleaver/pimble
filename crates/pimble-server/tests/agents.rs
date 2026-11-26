@@ -204,6 +204,18 @@ async fn an_agent_learns_who_can_open_a_note_it_reads_and_no_more() {
     assert!(!known.incomplete, "{known:?}");
     assert!(!serde_json::to_string(&known).unwrap().contains("a-notice-key"));
 
+    // Members of the whole store can open every note in it.
+    let whole = serde_json::json!({ "people": [{ "user_id": "u-ann", "name": "Ann" }] });
+    keep_people(&f, &serde_json::json!({ "scopes": [scope(f.project, "u-will", "Will"), whole, scope(f.journal, "u-sam", "Sam")] }).to_string());
+    let both = agent.who_can_open(f.store, f.drafts).await.unwrap();
+    assert_eq!(both.people.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["Will", "Ann"]);
+
+    // A share known to have nobody else in it is not an unknown one.
+    keep_people(&f, &serde_json::json!({ "scopes": [], "alone": [f.project] }).to_string());
+    let empty = agent.who_can_open(f.store, f.drafts).await.unwrap();
+    assert!(empty.people.is_empty() && !empty.incomplete, "{empty:?}");
+    keep_people(&f, &serde_json::json!({ "scopes": [scope(f.project, "u-will", "Will"), scope(f.journal, "u-sam", "Sam")] }).to_string());
+
     // Only for a note it may read, and `cloudPeople` stays closed.
     for node in [f.journal, f.project, NodeId::new()] {
         let refused = agent.who_can_open(f.store, node).await.expect_err("outside its grant").to_string();

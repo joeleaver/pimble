@@ -36,12 +36,12 @@ async fn an_agent_lists_who_can_open_a_shared_note() {
     let pimble = Pimble::new(Arc::new(Connection::with_client(agent)));
     let ask = || pimble.list_people(p(json!({ "node": "Work/Shared/Plans" })));
 
-    assert_eq!(ask().await.unwrap(), "Nobody else can open this note: it is in no share.");
+    assert_eq!(ask().await.unwrap(), "Nobody else can open this note: it is in no share with other members.");
 
     let marker = json!({ "v": 1, "key_id": uuid::Uuid::new_v4(), "url": "https://pimble.app", "name": "Shared" });
     service.edit_node(store, shared, "test", |doc, now| doc.set_custom(custom_keys::SHARE, &marker, now)).await.unwrap();
     let unknown = ask().await.unwrap();
-    assert!(unknown.contains("not known on this computer yet"), "{unknown}");
+    assert!(unknown.contains("not known on this computer"), "{unknown}");
 
     // What the server keeps once the accounts service has said who is in it.
     let state = dir.path().join("stores").join(store.to_string());

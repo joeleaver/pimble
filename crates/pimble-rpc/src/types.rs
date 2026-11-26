@@ -1666,6 +1666,11 @@ pub struct CloudPeopleRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorePeople {
     pub scopes: Vec<ScopePeople>,
+    /// Roots of this account's own shares that nobody else holds or is
+    /// invited to: known to be empty, where a marked share named in neither
+    /// list is one this device has not learned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alone: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1758,6 +1763,7 @@ mod people_tests {
                 scope(Some(folder), vec![person("joe", "Joe"), person("will", "Will"), person("ann", "Ann")]),
                 scope(Some(elsewhere), vec![person("sam", "Sam")]),
             ],
+            ..Default::default()
         };
         let members = people.members_of(&[note, folder]);
         let names: Vec<_> = members.iter().map(|p| (p.user_id.as_str(), p.name.as_str())).collect();

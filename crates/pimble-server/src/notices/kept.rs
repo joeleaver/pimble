@@ -145,7 +145,7 @@ mod tests {
         let (note, folder) = (NodeId::new(), NodeId::new());
         let person = |id: &str| pimble_rpc::Person { user_id: id.into(), name: id.into(), notice_key: Some("k".into()) };
         let scope = |root, ids: &[&str]| pimble_rpc::ScopePeople { root, people: ids.iter().map(|i| person(i)).collect(), my_name: String::new(), my_name_chosen: true, share_name: String::new() };
-        let people = StorePeople { scopes: vec![scope(None, &["joe", "ann"]), scope(Some(folder), &["joe", "will"])] };
+        let people = StorePeople { scopes: vec![scope(None, &["joe", "ann"]), scope(Some(folder), &["joe", "will"])], ..Default::default() };
         assert_eq!(scope_for(&people, &[note, folder], "will").map(|s| s.root), Some(Some(folder)));
         assert_eq!(scope_for(&people, &[note, folder], "ann").map(|s| s.root), Some(None), "the whole store's");
         assert!(scope_for(&people, &[note], "will").is_none(), "Will cannot open a note outside his share");

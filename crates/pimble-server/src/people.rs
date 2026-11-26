@@ -79,17 +79,21 @@ pub(crate) async fn fetch(http: &dyn pimble_host::http::Http, account: &SignedIn
             share_name: share.name.clone(),
         });
     }
-    Some(StorePeople { scopes })
+    Some(StorePeople { scopes, alone: Vec::new() })
 }
 
 /// Ask again and, when the answer differs from what is kept, keep it and
 /// tell this server's subscribers (`StoreChangeKind::PeopleChanged`).
 /// Best effort: what is kept stays when the service cannot be asked.
 pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId) -> StorePeople {
-    let kept = cached(handler, store_id).await;
-    let Some(account) = handler.keystore().account().await else { return kept };
-    let Some(fresh) = fetch(handler.http(), &account, store_id).await else { return kept };
-    if fresh != kept {
+    // `None` when nothing readable is kept: an empty answer is then written
+    // too, since "nobody" and "never told" are not the same.
+    let on_disk = kept(handler, store_id).await.ok().flatten();
+    let held = on_disk.clone().unwrap_or_default();
+    let Some(account) = handler.keystore().account().await else { return held };
+    let Some(mut fresh) = fetch(handler.http(), &account, store_id).await else { return held };
+    fresh.alone = shares_with_nobody_else(handler, &account, store_id, &fresh).await;
+    if on_disk.as_ref() != Some(&fresh) {
         if let Some(path) = file_of(handler, store_id).await {
             match serde_json::to_vec_pretty(&fresh) {
                 Ok(bytes) => {
@@ -100,7 +104,36 @@ pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId) -> StorePeo
                 Err(e) => warn!("People of store {}: {}", store_id, e),
             }
         }
+    }
+    if fresh != held {
         handler.notify_people_changed(store_id).await;
     }
     fresh
+}
+
+/// The shares marked in this store that `fresh` does not name and that
+/// nobody but this account is in: the account's list of shares leaves out one
+/// of its own that nobody else holds or is invited to. Asked on the owner's
+/// devices only (a member's replica has scope roots).
+async fn shares_with_nobody_else(handler: &RpcHandler, account: &SignedInAccount, store_id: StoreId, fresh: &StorePeople) -> Vec<NodeId> {
+    let unlisted: Vec<NodeId> = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        if !manager.scope_roots(store_id).is_empty() {
+            return Vec::new();
+        }
+        let Ok(tree) = manager.tree(store_id) else { return Vec::new() };
+        crate::share::markers_in(tree).into_iter().map(|(root, _)| root).filter(|root| !fresh.scopes.iter().any(|scope| scope.root == Some(*root))).collect()
+    };
+    let mut alone = Vec::new();
+    for root in unlisted {
+        match crate::cloud::list_members(handler.http(), &account.url, &account.session, &store_id.to_string(), Some(&root)).await {
+            // `members` is the share's own grants and invitations.
+            Ok(listing) if listing.members.iter().all(|member| member.user_id.as_deref() == Some(account.user_id.as_str())) => alone.push(root),
+            Ok(_) => {}
+            Err(e) => debug!("People of store {}: could not list scope {}: {}", store_id, root, e),
+        }
+    }
+    alone.sort_by_key(|root| root.to_string());
+    alone
 }
