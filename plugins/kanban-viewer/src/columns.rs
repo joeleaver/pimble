@@ -65,6 +65,7 @@ pub(crate) fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lan
                 class: "kanban__column-list",
                 style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
                 disabled: !writable || alone,
+                keyboard: true,
                 lift_keys: lift_keys(),
                 indicator: SortIndicator::Gap,
                 source: SortSource::Collapse,
@@ -263,6 +264,7 @@ pub(crate) fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column,
                 // writable board still judges a drop into it, so the caret says
                 // why not ("You can read this, not change it.").
                 disabled: !lane_writable,
+                keyboard: true,
                 lift_keys: lift_keys(),
                 // Trello's feel (Joe, 2026-11-04): the card follows the
                 // pointer, and the list opens a gap where it lands.
