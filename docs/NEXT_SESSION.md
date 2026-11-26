@@ -1,5 +1,22 @@
 # Next session: start here
 
+**2026-11-26 (master local_198b8f9e, transcript 3e8511e5): 0.34.0 cut.**
+- In 0.34.0:
+  - who can open a note: the `whoCanOpen` RPC (names and account ids only) and people refreshes
+    numbered per store;
+  - the Themes group in the explorer: with View > Show Internal > Themes on, a parent's themes sit
+    under a Themes row at the end of its rows (presentation only, nothing stored); Edit, New Theme
+    and Customize turn it on and select the theme;
+  - the theme editor's dropdowns open opaque and on top (an inherited line dimmed its whole
+    control box, dropdown included; now only the fields are dimmed);
+  - tests that wait on conditions, not the clock (Joe asked whether load-failing tests meant
+    load-failing code: they did not; the indexer, relay and vault link only slow down under load).
+- The full suite passed on the combined master: 2,215 tests, 0 failed.
+- Follow-up from the load work: fixed sleeps remain in `src/vault_link.rs`, `tests/share.rs` and
+  pimble-cloud `tests/integration.rs` (all over 700 lines: fix them in their splits), and a few
+  quiet-window append counts (`link_faults`, `convergence`). Details: `load-robustness.md` in the
+  shared notes folder of session local_0e9ad72e.
+
 **2026-11-26 (master local_198b8f9e, transcript 3e8511e5): 0.33.0 cut.**
 - In 0.33.0:
   - themes wave 2 (theme nodes, the theme editor, New Theme, bases, copying, internal nodes the
