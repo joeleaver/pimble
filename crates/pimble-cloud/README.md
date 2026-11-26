@@ -671,8 +671,13 @@ process's own `argv` via `clap` and calls `std::process::exit` on any
 problem — unusable from inside a test. So each test spawns the `rhypedb-server`
 binary as a subprocess, found (in order) via `$RHYPEDB_SERVER_BIN`,
 `~/dev/rhypedb/target/release/rhypedb-server`,
-`~/dev/rhypedb/target/debug/rhypedb-server`, or `$PATH`, and **skips itself
-cleanly with a message on stderr** if none of those exist. `AppState`'s
+`~/dev/rhypedb/target/debug/rhypedb-server`, or `$PATH`
+(`tests/integration/rhypedb_bin.rs`), and **skips itself cleanly with a
+`SKIP:` line on stderr** if none of those exist. With
+`RHYPEDB_SERVER_REQUIRED=1` a missing binary (or a `$RHYPEDB_SERVER_BIN` that
+names no file) fails the test instead: CI builds `rhypedb-server` at the
+revision `Cargo.lock` pins and sets both variables, so these tests run there
+rather than skip. `AppState`'s
 `ReleasesCache` can point at a local stub instead of the real GitHub API
 (`PIMBLE_CLOUD_RELEASES_BASE_URL`, wired through in tests, not documented
 elsewhere) so the `/releases` tests never touch the network.

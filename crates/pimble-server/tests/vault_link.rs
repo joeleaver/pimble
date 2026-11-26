@@ -20,6 +20,8 @@
 //!   the "desktop" side under test — each with its own temp keystore,
 //!   credentials file and replicas directory.
 
+mod rhypedb_bin;
+
 use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1597,23 +1599,6 @@ async fn run_edge_proxy(listener: std::net::TcpListener, cloud_port: u16, h_port
     }
 }
 
-fn find_rhypedb_server() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RHYPEDB_SERVER_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let home = dirs::home_dir()?;
-    for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
-        let p = home.join(rel);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// `pimble-cloud` is a workspace member, not an external checkout: look for
 /// an already-built binary next to this crate's own target directory
 /// (`cargo build -p pimble-cloud --release` builds it there) rather than
@@ -1657,7 +1642,7 @@ async fn wait_for_verify_url(log_path: &Path, timeout: Duration) -> Option<Strin
 
 #[tokio::test]
 async fn interop_with_the_real_accounts_service() {
-    let Some(rhypedb_bin) = find_rhypedb_server() else {
+    let Some(rhypedb_bin) = rhypedb_bin::find() else {
         eprintln!(
             "SKIPPING interop_with_the_real_accounts_service: no rhypedb-server binary found \
              (set RHYPEDB_SERVER_BIN, or build ~/dev/rhypedb in release or debug mode)"

@@ -9,11 +9,12 @@
 //! in-process on an ephemeral port: `rhypedb_server::run()` parses this test
 //! binary's own argv via `clap` and calls `std::process::exit` on any
 //! problem, which is exactly wrong for a test. Every test therefore spawns
-//! the real `rhypedb-server` binary as a subprocess (found at
-//! `~/dev/rhypedb/target/{release,debug}/rhypedb-server` or on `PATH`) and
-//! skips cleanly, printing why, when it can't be found.
+//! the real `rhypedb-server` binary as a subprocess (found by
+//! `integration/rhypedb_bin.rs`) and skips cleanly, printing why, when it
+//! can't be found, unless `RHYPEDB_SERVER_REQUIRED=1` (CI) makes that a
+//! failure.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -54,34 +55,6 @@ const PUBLIC_URL: &str = "http://cloud.test";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
-fn find_rhypedb_server_binary() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("RHYPEDB_SERVER_BIN") {
-        let p = PathBuf::from(explicit);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
-            let p = PathBuf::from(&home).join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            for name in ["rhypedb-server", "rhypedb"] {
-                let p = dir.join(name);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    None
 }
 
 struct RhypeDbGuard {
@@ -333,9 +306,10 @@ async fn spawn_stack_inner(
     relay_limits: Option<pimble_cloud::relay::RelayLimits>,
 ) -> Option<Stack> {
     // The ONLY skip condition: no rhypedb-server binary exists anywhere we
-    // know to look. A binary that exists but fails to start (even after
+    // know to look (and `RHYPEDB_SERVER_REQUIRED` turns even that into a
+    // failure). A binary that exists but fails to start (even after
     // `spawn_rhypedb`'s retries) is a real test failure, not a skip.
-    let binary = find_rhypedb_server_binary()?;
+    let binary = rhypedb_bin::find()?;
 
     // Acquired before starting anything below, held for the whole `Stack`'s
     // lifetime: caps how many of these run at once (`MAX_CONCURRENT_STACKS`).
@@ -4799,6 +4773,9 @@ async fn a_queued_notice_is_pushed_encrypted_to_the_subscription() {
 // A test file at the root of `tests/` is a crate root, whose modules are
 // looked for beside it; this one's live in `tests/integration/`, which cargo
 // does not take for a test of its own.
+#[path = "integration/rhypedb_bin.rs"]
+mod rhypedb_bin;
+
 #[path = "integration/watches.rs"]
 mod watches;
 

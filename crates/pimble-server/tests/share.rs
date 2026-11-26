@@ -18,6 +18,7 @@
 //! stopped and see each other.
 
 mod common;
+mod rhypedb_bin;
 use pimble_host::disk::testfs as tfs;
 use common::*;
 
@@ -1211,17 +1212,6 @@ async fn run_edge_proxy(listen_port: u16, cloud_port: u16, h_port: u16) {
     }
 }
 
-fn find_rhypedb_server() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RHYPEDB_SERVER_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let home = dirs::home_dir()?;
-    ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"].iter().map(|rel| home.join(rel)).find(|p| p.is_file())
-}
-
 fn find_pimble_cloud_binary() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PIMBLE_CLOUD_BIN") {
         let p = PathBuf::from(p);
@@ -1284,7 +1274,7 @@ async fn sign_up_and_verify(cloud_url: &str, cloud_log: &Path, email: &str, pass
 
 #[tokio::test]
 async fn sharing_against_the_real_accounts_service() {
-    let Some(rhypedb_bin) = find_rhypedb_server() else {
+    let Some(rhypedb_bin) = rhypedb_bin::find() else {
         eprintln!("SKIPPING sharing_against_the_real_accounts_service: no rhypedb-server binary found (set RHYPEDB_SERVER_BIN, or build ~/dev/rhypedb)");
         return;
     };
