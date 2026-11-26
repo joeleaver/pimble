@@ -146,6 +146,10 @@ Diagnostics..." for when something goes wrong.
    and the account (`X-Pimble-Account`); no page carries the key. Records go only as the
    signed-in account, by the rule the worker's queue follows too
    (`pimble_core::diagnostics::may_send`/`sendable`): signed out, nothing is sent and they
-   wait; an account's records go only as that account, no one's as whoever signs in next. Settings > Diagnostics is
+   wait; an account's records go only as that account, no one's as whoever signs in next.
+   The page names that account in `X-Pimble-Account`, and the service refuses a cookie of
+   another (409 `account_changed`; another tab signed in again), so the lines wait; a sender
+   without the header (the worker, its bearer the session it chose) is not asked. Settings > Diagnostics is
    in both apps (`diagnostics_ui::Hooks`). Tests: `report_round_trip` (ignored; against
-   `dev.sh`, run once), `diagnostics_from_a_page_go_on_with_the_key_and_the_account`.
+   `dev.sh`, run once), `diagnostics_from_a_page_go_on_with_the_key_and_the_account`,
+   `diagnostics_named_for_another_account_than_the_cookies_are_refused`.

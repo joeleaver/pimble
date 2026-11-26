@@ -207,48 +207,51 @@ fn save_queue() {
     }
 }
 
-/// POST `body` to the accounts service, as the session cookie allows.
-async fn post(path: &str, content_type: &str, body: String) -> Result<String, String> {
-    let window = web_sys::window().ok_or("no window")?;
+/// POST `body` to the accounts service as `account`, with the session
+/// cookie this browser holds now, which another tab may have changed: the
+/// service refuses a cookie that is not `account`'s (`X-Pimble-Account`,
+/// 409 `account_changed`). The answer's status, `None` when the service
+/// could not be reached.
+async fn post(path: &str, content_type: &str, account: &str, body: String) -> Option<u16> {
+    let window = web_sys::window()?;
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_credentials(RequestCredentials::Include);
     init.set_body(&JsValue::from_str(&body));
-    let headers = Headers::new().map_err(|_| "no headers")?;
+    let headers = Headers::new().ok()?;
     let _ = headers.set("content-type", content_type);
+    let _ = headers.set("x-pimble-account", account);
     init.set_headers(&headers);
-    let request = Request::new_with_str_and_init(path, &init).map_err(|_| "the request could not be made")?;
-    let response: Response = JsFuture::from(window.fetch_with_request(&request)).await.map_err(|_| "Pimble Cloud could not be reached")?.dyn_into().map_err(|_| "no response")?;
-    let text = JsFuture::from(response.text().map_err(|_| "no body")?).await.ok().and_then(|t| t.as_string()).unwrap_or_default();
-    if response.ok() {
-        Ok(text)
-    } else {
-        Err(format!("{} {}", response.status(), text.trim()))
-    }
+    let request = Request::new_with_str_and_init(path, &init).ok()?;
+    let response: Response = JsFuture::from(window.fetch_with_request(&request)).await.ok()?.dyn_into().ok()?;
+    Some(response.status())
+}
+
+/// Whether the lines a send carried leave the queue, given the status it
+/// was answered with (`None`: not reached). Taken, or refused for good
+/// (unreadable, too big): they go. Anything else, the session gone or
+/// another account's (`account_changed`) among them, keeps them for a later
+/// send as their own account.
+fn lines_go(status: Option<u16>) -> bool {
+    matches!(status, Some(200..=299 | 400 | 413))
 }
 
 /// Send what may go as the signed-in account (`sendable`, the rule the
 /// worker's queue follows too): nothing while no one is signed in, an
 /// account's records only as that account, no one's as whoever is.
 async fn send_waiting() {
-    let batch: Vec<String> = STATE.with(|st| {
+    let waiting: Option<(String, Vec<String>)> = STATE.with(|st| {
         let st = st.borrow();
-        let Some(st) = st.as_ref().filter(|s| s.enabled) else { return Vec::new() };
-        sendable(&st.queue, st.account.as_deref()).into_iter().cloned().collect()
+        let st = st.as_ref().filter(|s| s.enabled)?;
+        let account = st.account.clone()?;
+        let batch: Vec<String> = sendable(&st.queue, Some(&account)).into_iter().cloned().collect();
+        (!batch.is_empty()).then_some((account, batch))
     });
-    if batch.is_empty() {
-        return;
-    }
-    let sent = post("/api/v1/diagnostics/records", "application/x-ndjson", batch.join("\n")).await;
-    // Taken (or refused for good: unreadable, too big): dropped. Anything
-    // else waits for the next minute. Each line is its own (a session and a
-    // number), so the ones sent are found again whatever was queued or
-    // dropped meanwhile.
-    let done = match &sent {
-        Ok(_) => true,
-        Err(e) => e.starts_with("400") || e.starts_with("413"),
-    };
-    if done {
+    let Some((account, batch)) = waiting else { return };
+    let status = post("/api/v1/diagnostics/records", "application/x-ndjson", &account, batch.join("\n")).await;
+    // Each line is its own (a session and a number), so the ones sent are
+    // found again whatever was queued or dropped meanwhile.
+    if lines_go(status) {
         let gone: HashSet<String> = batch.into_iter().collect();
         STATE.with(|st| {
             if let Some(st) = st.borrow_mut().as_mut() {
@@ -329,5 +332,20 @@ pub fn hooks() -> pimble_app::diagnostics_ui::Hooks {
         save: |enabled, noticed| save_settings(enabled, noticed).map_err(pimble_app::diagnostics_ui::SaveFailed::NotSaved),
         install,
         available: || true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lines_go;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn lines_sent_as_another_account_than_the_cookies_stay_queued() {
+        assert!(!lines_go(Some(409)), "account_changed: kept for their own account");
+        assert!(!lines_go(Some(401)), "signed out meanwhile: kept");
+        assert!(!lines_go(Some(503)) && !lines_go(Some(502)) && !lines_go(None), "not taken: kept");
+        assert!(lines_go(Some(200)) && lines_go(Some(204)), "taken: gone");
+        assert!(lines_go(Some(400)) && lines_go(Some(413)), "refused for good: gone");
     }
 }

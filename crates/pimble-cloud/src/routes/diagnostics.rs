@@ -2,13 +2,17 @@
 //! records and reports from the browser, passed on to `pimble-diagnostics`
 //! with the send key this service holds. A page never carries the key, and
 //! what it sends is tied to the signed-in account here, whatever the page
-//! says.
+//! says. A page names the account it means in `X-Pimble-Account`; one that
+//! is not the session's is refused (`account_changed`), so records queued as
+//! one account never go under another's cookie. A sender with no such header
+//! (the browser's worker, whose bearer is the session it chose) is not asked.
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use crate::error::CloudError;
 use crate::session::AuthedUser;
 use crate::state::AppState;
 
@@ -23,7 +27,15 @@ pub async fn reports(State(state): State<AppState>, authed: AuthedUser, headers:
     forward(&state, &authed, &headers, body, "/v1/reports").await
 }
 
+/// The account a request names (`X-Pimble-Account`), if it names one.
+const ACCOUNT_HEADER: &str = "x-pimble-account";
+
 async fn forward(state: &AppState, authed: &AuthedUser, headers: &HeaderMap, body: Bytes, path: &str) -> Response {
+    if let Some(named) = headers.get(ACCOUNT_HEADER) {
+        if named.to_str().ok() != Some(authed.user.user_uuid.as_str()) {
+            return CloudError::AccountChanged.into_response();
+        }
+    }
     let Some(key) = state.config.diagnostics_key.as_deref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "diagnostics are not set up on this service").into_response();
     };
