@@ -194,9 +194,14 @@ later), so this is a general mechanism, not a theme feature:
   still replicates, encrypts, is reached by shares (section 3.2), opens by link, and is
   listed by the tools made for it (the Theme picker, `list_themes`).
 - **Show or hide each kind.** View > "Show Internal" is a submenu with one check item per
-  kind ("Themes", ...), all off by default. A shown kind's nodes appear where they are in the
-  tree, dimmed and marked with the kind's icon, and can be moved, renamed and deleted like
-  any node. The choice is a view preference kept per device with the explorer's expanded
+  kind ("Themes", ...), all off by default. A shown kind's nodes stay where they are, and
+  the explorer draws them under their parent's row of their kind (**Themes**), dimmed and marked with the kind's icon; they can be moved, renamed and
+  deleted like any node (Joe, 2026-11-26: "each different kind of internal thing should be
+  in its own tree", then "Actually, not Internal. Just Themes": no "Internal" row above
+  the kinds). The grouping is drawn, never stored: "Themes" is no node, so nothing changes in the data
+  model or in what the server refuses, and a theme moved into a share shows under the
+  share's own Themes. How the grouping rows behave (no rename, delete, drag or
+  make; what a drop into one means) is docs/TREE_CONTRACT.md "Internal groups". The choice is a view preference kept per device with the explorer's expanded
   rows (`views.json`, `localStorage` in the browser), because it is how one window shows
   the tree, not anything about the store. The MCP takes `include_internal: [kinds]` on its
   listing tools.
@@ -208,6 +213,12 @@ later), so this is a general mechanism, not a theme feature:
 - **Reaching a hidden theme.** The Theme picker lists every theme in the store wherever it
   sits; "Edit Theme..." beside one opens its node in the focused pane. A link to a theme
   node opens it whether or not Themes are shown.
+- **Editing or making a theme shows it** (Joe, 2026-11-26). "Edit" in the picker, New
+  Theme from the Node menu, and "Customize..." (or a copy made to customize) turn View >
+  "Show Internal" > "Themes" on if it was off, kept as that item keeps it, and reveal the
+  theme's row under its parent's Themes, selected with the tree's cursor on it
+  (`themes::open_theme_node`; the reveal is `events::reveal_in_tree`, told the node's
+  kind by `AncestorsLoaded`). A link to a theme leaves the preference alone.
 - **Counting.** The store row's tooltip says how many internal nodes are hidden ("12 themes
   hidden"), so a store is never silently larger than it looks.
 

@@ -51,11 +51,35 @@ pub(super) fn node_moved(
     let is_root = store.root_node_id(*store_id)
         .map_or(false, |rid| rid == *new_parent_id);
     let dropped_value = take_last_drop_target_value();
-    if !is_root {
-        let expand_value = dropped_value
-            .filter(|v| parse_tree_value(v).map_or(false, |(sid, nid)| sid == *store_id && nid == Some(*new_parent_id)))
-            .unwrap_or_else(|| format!("node_{}_{}", store_id, new_parent_id));
-        tree_state.controller.expand(&expand_value);
+    let lands_under = |row: (StoreId, NodeId)| crate::internal_drop::lands_under(store, row, *store_id, *new_parent_id);
+    // A drop into a grouping row ("Themes") that this move answers
+    // records the group: the parent it stands for and the group open.
+    let group = dropped_value.as_deref().and_then(crate::state::internal_group).filter(|g| lands_under((g.store_id, g.parent_id)));
+    if let (Some(group), Some(value)) = (group, &dropped_value) {
+        if group.parent_row.starts_with("node_") {
+            tree_state.controller.expand(&group.parent_row);
+        }
+        tree_state.controller.expand(value);
+    } else {
+        // The row dropped on, when this move answers it (a mount's row
+        // for a drop through a mount), else the new parent's plain row.
+        let landed = dropped_value.filter(|v| matches!(parse_tree_value(v), Some((s, Some(n))) if lands_under((s, n))));
+        let shown_row = landed.clone().or_else(|| (!is_root).then(|| format!("node_{}_{}", store_id, new_parent_id)));
+        if let Some(row) = &shown_row {
+            tree_state.controller.expand(row);
+        }
+        // A shown internal node dropped on an ordinary row is in that
+        // row's group of its kind: open it, so the node is seen.
+        let kind = store.get_node_signal(*store_id, *node_id).and_then(|sig| untracked(|| sig.with(|n| pimble_core::internal::internal_kind(&n.node_type))));
+        if let Some(kind) = kind.filter(|kind| untracked(|| store.internal_kinds_shown()).contains(kind)) {
+            let group = match &shown_row {
+                Some(row) => crate::internal_drop::group_under_row(store, row, kind),
+                None => Some(crate::internal_drop::row_to_open(*store_id, *new_parent_id, "", kind)),
+            };
+            if let Some(group) = group {
+                tree_state.controller.expand(&group);
+            }
+        }
     }
     if !store.has_children_loaded(*store_id, *new_parent_id) {
         // Opened for the first time: its list is loaded once.

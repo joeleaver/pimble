@@ -42,6 +42,7 @@ mod notice_show;
 mod notification_settings;
 pub mod watches;
 pub mod import;
+pub(crate) mod internal_drop;
 pub mod link_picker;
 pub mod links;
 pub mod app_links;

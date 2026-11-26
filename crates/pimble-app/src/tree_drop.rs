@@ -175,21 +175,35 @@ pub(crate) fn plan_drop(store: AppStore, drop: &TreeDrop) -> DropPlan {
         let Some((s, Some(n))) = parse_tree_value(value) else { return refused(Refusal::NotANode) };
         nodes.push((s, n));
     }
-    let target = match drop.parent.as_deref().map(parse_tree_value) {
+    // Into a grouping row ("Themes"): into the parent it groups
+    // (`internal_drop`). Beside one, the place falls to the parent's last,
+    // as beside any row that is no node, except for the group's own nodes,
+    // which already show there.
+    if crate::internal_drop::beside_own_group(store, &drop.slot, &nodes) {
+        return DropPlan::Stays(DropHint { line: WHERE_IT_IS.to_string(), warning: None, refused: false });
+    }
+    let (parent_row, place, expand) = match crate::internal_drop::group_drop(store, drop.parent.as_deref(), &drop.slot, &nodes) {
+        Some(Err(line)) => return DropPlan::Refused(DropHint { line, warning: None, refused: true }),
+        Some(Ok(group)) => (Some(group.parent_row), group.place, Some(group.expand)),
+        None => {
+            let place = match &drop.slot {
+                TreeSlot::First => Place::First,
+                TreeSlot::Last => Place::Last,
+                TreeSlot::After(value) => match parse_tree_value(value) {
+                    Some((_, Some(anchor))) => Place::After(anchor),
+                    _ => Place::Last,
+                },
+            };
+            (drop.parent.clone(), place, drop.parent.clone().filter(|v| v.starts_with("node_")))
+        }
+    };
+    let target = match parent_row.as_deref().map(parse_tree_value) {
         None => return refused(Refusal::BesideAStore),
         Some(None) => return refused(Refusal::NotANode),
         Some(Some(row)) => row,
     };
-    let place = match &drop.slot {
-        TreeSlot::First => Place::First,
-        TreeSlot::Last => Place::Last,
-        TreeSlot::After(value) => match parse_tree_value(value) {
-            Some((_, Some(anchor))) => Place::After(anchor),
-            _ => Place::Last,
-        },
-    };
     match plan_move(&store.view(), &nodes, target, place) {
-        Ok(plan) => plan_of(plan, drop.parent.clone().filter(|v| v.starts_with("node_"))),
+        Ok(plan) => plan_of(plan, expand),
         Err(refusal) => refused(refusal),
     }
 }

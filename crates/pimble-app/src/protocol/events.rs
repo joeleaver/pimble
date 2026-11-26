@@ -122,7 +122,9 @@ pub enum BackendEvent {
     LinkResolved { url: PimbleUrl, hops: usize, resolution: LinkResolution },
     /// Answer to `GetAncestors`: the store's root first, down to `node_id`'s
     /// parent. Empty for the root, or when the chain could not be read.
-    AncestorsLoaded { store_id: StoreId, node_id: NodeId, ancestors: Vec<NodeId> },
+    /// `kind` is the node's internal kind, if it is one: its row is in its
+    /// parent's group of that kind ("Themes"), which the reveal opens too.
+    AncestorsLoaded { store_id: StoreId, node_id: NodeId, ancestors: Vec<NodeId>, kind: Option<pimble_core::internal::InternalKind> },
     /// Answer to `GetThemeChain`: the node asked for, then its parent, and
     /// so on up, each taken as `NodeLoaded` takes one. Empty when the node
     /// itself could not be read.

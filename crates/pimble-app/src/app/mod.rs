@@ -26,6 +26,7 @@ mod deleted_modal;
 mod explorer;
 mod explorer_menu;
 mod hosting;
+mod internal_row;
 mod navigation;
 mod row_menu;
 mod rows;
@@ -47,7 +48,7 @@ pub use account::{open_account_modal, run_account_action, run_sign_out_action, s
 pub(crate) use account::{account_hidden, account_showing, account_shown};
 pub use deleted_modal::{open_deleted_modal, open_deleted_modal_for_selection};
 pub use explorer::focus_explorer;
-pub(crate) use explorer::start_rename;
+pub(crate) use explorer::{start_rename, toggle_group};
 pub use hosting::{host_to_share, open_host_modal, open_hosted_modal, open_stop_relay_modal, share_from_this_computer};
 pub(crate) use navigation::{open_node, open_node_in};
 pub(crate) use rows::{copy_rows, reveal_row};

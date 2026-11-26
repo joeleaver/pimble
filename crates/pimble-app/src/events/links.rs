@@ -14,8 +14,18 @@ use crate::state::{AppStore, LinkOpen};
 /// docs/LINKS_CONTRACT.md): the store's row and every ancestor below the
 /// root expanded, their children fetched where they are not loaded. The
 /// root's own children are the store row's. Only if the node is still the
-/// one selected: a later click has the last word.
-pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_id: StoreId, node_id: NodeId, ancestors: &[NodeId]) {
+/// one selected: a later click has the last word. A shown internal node
+/// (`kind`) is in its parent's group of that kind ("Themes"), which opens too, and its row
+/// takes the tree's cursor (docs/THEMES_CONTRACT.md section 3.1a: a theme
+/// edited or made is shown where it is, Joe 2026-11-26).
+pub(crate) fn reveal_in_tree(
+    store: AppStore,
+    tree_state: UseTreeReturn,
+    store_id: StoreId,
+    node_id: NodeId,
+    ancestors: &[NodeId],
+    kind: Option<pimble_core::internal::InternalKind>,
+) {
     let value = format!("node_{store_id}_{node_id}");
     if untracked(|| store.selected_id.get()).as_deref() != Some(value.as_str()) {
         return;
@@ -32,6 +42,11 @@ pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_i
         if !store.has_children_loaded(store_id, ancestor) {
             store.send(BackendCommand::GetChildren { store_id, node_id: ancestor });
         }
+    }
+    let shown = kind.filter(|kind| untracked(|| store.internal_kinds_shown()).contains(kind));
+    if let (Some(kind), Some(&parent)) = (shown, ancestors.last()) {
+        tree_state.controller.expand(&crate::internal_drop::row_to_open(store_id, parent, "", kind));
+        tree_state.controller.set_cursor(&value);
     }
     tree_state.controller.set_selection([value.clone()]);
     store.bump_tree_structure();

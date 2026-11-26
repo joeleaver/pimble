@@ -269,3 +269,14 @@ One path on both backends: `creating::make` and `tree_keys::new_node` set
 renames the node it names. A canvas, a sheet, a plugin's kind and a canvas from a picture
 are named by what they are and neither open nor rename; a discussion opens as it always
 did; a mount is not made from New.
+
+## 13. New Theme and Edit show the theme (Joe, 2026-11-26)
+
+Node > "New Theme", the Theme picker's "Edit" and "Customize..." (the picker opens from a
+row menu's Theme..., the Node menu, the Properties panel's Theme line and the Appearance
+picker), and a theme copied to customize all end in `themes::open_theme_node`: View >
+"Show Internal" > "Themes" is checked if it was not, and kept as that item keeps it (the
+view preferences), the theme opens in the theme editor in the focused pane, and its row is
+revealed under its parent's Themes (docs/TREE_CONTRACT.md "Internal groups"),
+selected, with the tree's cursor on it. A link to a theme opens the editor as before and
+leaves the view preference alone.

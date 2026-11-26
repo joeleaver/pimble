@@ -37,6 +37,15 @@ impl InternalKind {
         }
     }
 
+    /// How a count of this kind's nodes in one place reads ("2 themes
+    /// here."), as the explorer's group of them says it.
+    pub fn here_text(self, count: usize) -> String {
+        match (self, count) {
+            (InternalKind::Theme, 1) => "1 theme here.".to_string(),
+            (InternalKind::Theme, n) => format!("{n} themes here."),
+        }
+    }
+
     /// The kind as stored in a view preference and named by the MCP
     /// (`"themes"`).
     pub fn id(self) -> &'static str {
@@ -56,6 +65,23 @@ impl InternalKind {
     pub fn holds_nothing(self) -> &'static str {
         match self {
             InternalKind::Theme => "Nothing goes inside a theme.",
+        }
+    }
+
+    /// Why a drop into this kind's group of the explorer ("Themes") is
+    /// refused when it carries something else: the group shows
+    /// the parent's nodes of this kind and nothing more.
+    pub fn only_here(self) -> &'static str {
+        match self {
+            InternalKind::Theme => "Only themes go in Themes.",
+        }
+    }
+
+    /// How a node of this kind is made, as a refusal to make one in its
+    /// group of the explorer says it.
+    pub fn how_made(self) -> &'static str {
+        match self {
+            InternalKind::Theme => "Node > New Theme makes a theme.",
         }
     }
 
@@ -112,5 +138,8 @@ mod tests {
         assert_eq!(InternalKind::Theme.count_text(1), "1 theme hidden");
         assert_eq!(InternalKind::Theme.count_text(12), "12 themes hidden");
         assert_eq!(InternalKind::from_id("nope"), None);
+        assert_eq!(InternalKind::Theme.here_text(1), "1 theme here.");
+        assert_eq!(InternalKind::Theme.here_text(4), "4 themes here.");
+        assert_eq!(InternalKind::Theme.only_here(), "Only themes go in Themes.");
     }
 }

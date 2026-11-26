@@ -147,6 +147,19 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
         return false;
     }
     let cursor = key.cursor.clone();
+    // On a grouping row ("Themes") Enter opens or closes it; what
+    // acts on a node acts on none there (docs/THEMES_CONTRACT.md 3.1a).
+    if crate::state::is_internal_group(&cursor) {
+        match action {
+            Action::Enter => {
+                crate::app::toggle_group(store, tree_state, &cursor);
+                return true;
+            }
+            // Not a node: nothing to rename, split, make in, move or link.
+            Action::Rename | Action::OpenInSplit | Action::NewChild | Action::Move(_) | Action::CopyLink => return true,
+            _ => {}
+        }
+    }
     match action {
         Action::Enter => {
             let pane = store.focused();

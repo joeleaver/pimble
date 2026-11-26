@@ -4,6 +4,7 @@
 
 use super::*;
 use super::found::FOUND_ROWS;
+use super::internal_rows::{group_rows, GROUP_ROWS};
 
 /// Extract plain-text content from node content bytes, for tree previews / labels.
 ///
@@ -102,6 +103,7 @@ impl AppStore {
         // and the item never enables.
         let paste = self.mount_source.with(|s| s.is_some());
         FOUND_ROWS.with(|rows| rows.borrow_mut().clear());
+        GROUP_ROWS.with(|rows| rows.borrow_mut().clear());
         let mut result = Vec::new();
         // The saved stores still opening, each a row in its saved place
         // (docs/STARTUP_CONTRACT.md); the label carries what the row draws.
@@ -189,7 +191,9 @@ impl AppStore {
                 if ended_roots.contains(&root_id) {
                     Vec::new()
                 } else {
-                    self.build_children_structural(sid, root_id, paste, &[], 0)
+                    let (mut rows, internal) = self.build_children_structural(sid, root_id, &format!("store_{sid}"), paste, &[], 0);
+                    rows.extend(internal);
+                    rows
                 }
             } else {
                 roots
@@ -219,24 +223,29 @@ impl AppStore {
     /// (docs/QUERY_METANODES_CONTRACT.md section 4), and `finds_crossed`
     /// counts the finds crossed to get here: a found metanode shows its own
     /// finds, one level down only.
+    ///
+    /// Answers the ordinary children's rows and, apart, a row per kind over
+    /// the shown internal ones ("Themes", `internal_rows`), which go last
+    /// among the parent's rows, after a query metanode's finds. `parent_row`
+    /// is the parent's own row (its store's row for a root).
     fn build_children_structural(
         &self,
         store_id: StoreId,
         parent_id: NodeId,
+        parent_row: &str,
         paste: bool,
         mount_path: &[(StoreId, NodeId)],
         finds_crossed: u8,
-    ) -> Vec<TreeNodeData> {
+    ) -> (Vec<TreeNodeData>, Vec<TreeNodeData>) {
         let children = self.children_of.with(|map| {
             map.get(&(store_id, parent_id)).map(|sig| sig.get())
         });
-        let Some(children) = children else { return Vec::new() };
-
-        children
-            .iter()
-            .filter(|&&(child_store, child_id)| !self.hides_row(child_store, child_id))
-            .map(|&(child_store, child_id)| self.structural_node(child_store, child_id, paste, mount_path, finds_crossed, None))
-            .collect()
+        let Some(children) = children else { return (Vec::new(), Vec::new()) };
+        let sorted = self.sort_children(&children);
+        let row = |&(child_store, child_id): &(StoreId, NodeId)| self.structural_node(child_store, child_id, paste, mount_path, finds_crossed, None);
+        let ordinary = sorted.ordinary.iter().map(row).collect();
+        let kinds = sorted.internal.into_iter().map(|(kind, nodes)| (kind, nodes.iter().map(row).collect())).collect();
+        (ordinary, group_rows(store_id, parent_id, parent_row, &mount_path_suffix(mount_path), kinds))
     }
 
     /// One row: the node itself plus whatever hangs below it. Used for every
@@ -327,7 +336,7 @@ impl AppStore {
         } else {
             mount_path.to_vec()
         };
-        let mut children_data = self.build_children_structural(child_store, child_id, paste, &below_path, finds_crossed);
+        let (mut children_data, internal) = self.build_children_structural(child_store, child_id, &value, paste, &below_path, finds_crossed);
         // A query metanode's finds, after its own children: reached through
         // the metanode, so each is its own row wherever else it shows. A
         // found metanode shows its own finds, and no deeper.
@@ -348,6 +357,7 @@ impl AppStore {
                 ));
             }
         }
+        children_data.extend(internal);
         let has_children = !children_data.is_empty();
         let has_loaded_children = self.children_of.with(|map| {
             map.contains_key(&(child_store, child_id))
