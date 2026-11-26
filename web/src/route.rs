@@ -250,8 +250,9 @@ fn host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn paths_map_to_routes() {
         assert_eq!(from_path("/app/login"), Route::Login);
         assert_eq!(from_path("/app/login/"), Route::Login);

@@ -2,5 +2,12 @@
 # pimble-board's renderer (tiny-skia) is up to twice as fast with it, and a 4K
 # board view settling a zoom needs it to stay under 200 ms
 # (docs/IMAGE_MARKUP_CONTRACT.md, "Spike 3 numbers").
+#
+# The crate builds only for wasm32, so its tests run there too:
+# `cargo test --target wasm32-unknown-unknown` hands each test binary to
+# wasm-bindgen-test-runner (wasm-bindgen-cli at exactly the version the lock
+# pins for `wasm-bindgen`), which runs it in Node. Trunk's builds never read
+# `runner`.
 [target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
 rustflags = ["-C", "target-feature=+simd128"]
