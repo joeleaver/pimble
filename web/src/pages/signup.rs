@@ -214,7 +214,10 @@ pub fn signup_page() -> NodeHandle {
                                 spawn_local(async move {
                                     match accounts::resend_verification(&address).await {
                                         Ok(()) => resent.set(
-                                            "Sent. It can take a minute to arrive.".to_string(),
+                                            // 202 even when a resend inside the one-minute limit
+                                            // (signup's own send counts) is dropped.
+                                            "If the link can be sent, it is on its way. It can take a minute to arrive."
+                                                .to_string(),
                                         ),
                                         Err(e) => resent.set(e.message),
                                     }

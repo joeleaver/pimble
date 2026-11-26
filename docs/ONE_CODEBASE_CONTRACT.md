@@ -2418,7 +2418,7 @@ which the server now answers with its own code (`RpcError::EmailUnverified`, `-3
   skip with no binary and no variable. `interop_with_the_real_accounts_service` now signs in
   before following the link and gets `is_email_unverified`. The sign-in page's banners are a
   `wasm_bindgen_test` in `web/` (`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
-  cargo test --target wasm32-unknown-unknown -p pimble-web`, runner 0.2.128; not in CI yet).
+  cargo test --target wasm32-unknown-unknown -p pimble-web`, runner 0.2.128; CI runs it in the web job since 67f0a4d).
 
 ### Not done
 

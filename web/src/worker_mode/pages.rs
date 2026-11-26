@@ -203,7 +203,12 @@ pub fn login_page() -> NodeHandle {
                             notice.set("Sending...".to_string());
                             spawn_local(async move {
                                 match crate::accounts::resend_verification(&address).await {
-                                    Ok(()) => notice.set("Sent. Follow the link, then sign in.".to_string()),
+                                    // The service answers 202 even when it drops a resend
+                                    // inside its one-minute limit, so say only what is true.
+                                    Ok(()) => notice.set(
+                                        "If the link can be sent, it is on its way. Follow it, then sign in."
+                                            .to_string(),
+                                    ),
                                     Err(e) => notice.set(e.message),
                                 }
                             });
