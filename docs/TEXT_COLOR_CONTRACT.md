@@ -4,7 +4,7 @@ Joe, 2026-11-21: "We need a way of coloring text in the text nodes. Needs smart 
 both light/dark mode."
 
 Status: **built 2026-11-21**, not merged or released. Code: `crates/pimble-app/src/text_color.rs`
-(palette, plugin, apply), `toolbar.rs` (`render_color_btn`), `menus.rs` (Edit > Text Color),
+(palette, plugin, apply), `toolbar/mod.rs` (`render_color_btn`), `menus.rs` (Edit > Text Color),
 `styles/editor_content.css` (`EDITOR_CSS`, "Text color") and `styles/toolbar.css` (the swatches beside `.pimble-toolbar__label`).
 
 ## 1. Palette

@@ -158,7 +158,7 @@ the formatting at the caret of the focused pane's editor and act on that editor;
 focus moves to another pane they follow it at once. While the focused pane holds no
 document, or one this device may only read, the toolbar is dimmed and takes no presses
 (the pane itself shows the read-only sentence). Pressing a button never moves the pane
-focus or the keyboard. Built in `toolbar.rs` (one set of button signals, `TARGET` kept in
+focus or the keyboard. Built in `toolbar/mod.rs` (one set of button signals, `TARGET` kept in
 step with `focused_pane` by an effect) and `pane_view::render_panes`. It replaced one
 toolbar per pane, which wrapped onto two or three rows in a narrow pane and took the
 keyboard from the editor when another pane's button was pressed.

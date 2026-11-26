@@ -1,7 +1,7 @@
 //! The Properties panel (docs/PROPERTIES_CONTRACT.md): the focused pane's
 //! node's tags and fields, and where it lives, in one panel on the right of
 //! the pane area, under the one toolbar. One panel for the window, following
-//! the focused pane as the toolbar does (`toolbar.rs`, `TARGET`), on the
+//! the focused pane as the toolbar does (`toolbar/mod.rs`, `TARGET`), on the
 //! desktop and in the browser from this module.
 //!
 //! Every write is one the app already had: a tag is one edit of the node's

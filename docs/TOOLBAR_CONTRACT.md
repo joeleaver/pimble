@@ -93,7 +93,7 @@ text toolbar's contents are unchanged.
 
 ## Built (2026-11-21, v2)
 
-`toolbar.rs` (`Item`, `Picked`, `which`, `item_changed`), `state/pane_state.rs` (`PaneState::item`),
+`toolbar/mod.rs` (`Item`, `Picked`, `which`, `item_changed`), `state/pane_state.rs` (`PaneState::item`),
 `editor.rs` (the selection callback), `text_boards.rs` (`selected_item`, `embed_raw`,
 `mark_up_at` for embeds), `pane_view/mod.rs` (one rule), `pane_view/pane.rs` (the release that ends a text table's
 cell), `boards/toolbar.rs` (Canvas group, contextual groups, embeds), `boards/rail.rs`
@@ -209,7 +209,7 @@ strip goes.
 
 - The toolbar's percentage is the canvas's zoom; the status bar's is the window zoom
   (docs/ZOOM_CONTRACT.md). Keep the two labeled apart.
-- Web and desktop alike, from shared `pimble-app` code (`toolbar.rs`, `boards/`).
+- Web and desktop alike, from shared `pimble-app` code (`toolbar/mod.rs`, `boards/`).
 - Read-only canvases: View and Export stay live, Snap and History dim.
 
 ### Built (2026-11-21)
@@ -269,7 +269,7 @@ groups when the selection leaves it.
   as before.
 
 Built: `crates/pimble-app/src/boards/toolbar.rs` (`Aim::Board` or `Aim::Picked`),
-`toolbar.rs` (`Picked`, `picked()`, refreshed by the toolbar's watcher from the focused pane's
+`toolbar/mod.rs` (`Picked`, `picked()`, refreshed by the toolbar's watcher from the focused pane's
 editor), `text_boards.rs` (`selected_canvas`, `raw_board`, `mark_up_at`), `boards/export.rs`
 (`copy_picked`, `save_picked`, `save_picked_original`, `flatten_picked`), `pane_view/`.
 Tests: a selection of exactly a picture (not a caret beside it, not an embed), the opening zoom.
