@@ -274,8 +274,9 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
   tables arrive as tables). The toolbar has a quote button and table buttons.
 - Markdown input shortcuts (`# `, `- `, `1. `, `> `, a code fence, `**bold**`, ...) are
-  rinch's input rules less the task list (`markdown_shortcuts.rs`), and Ctrl+Shift+7 makes no
-  task list (`task_lists.rs` overrides the base keymap's `toggleTaskList` command).
+  rinch's input rules less the task list (`markdown_shortcuts.rs`), and no command makes a
+  task list (`task_lists.rs` overrides rinch's `toggleTaskList`; rinch #3062 dropped its
+  Ctrl+Shift+7).
 - Spellcheck (`spelling.rs`): rinch's, leaving code out; the system checker on the desktop
   (Windows and macOS platform checkers, Linux Hunspell with the bundled `en_US` from
   `assets/dictionaries/` as the fallback), the same `en_US` fetched in the browser. Added

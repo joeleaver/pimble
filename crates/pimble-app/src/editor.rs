@@ -55,7 +55,7 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 // places its own: their input rules are tried first
                 // (crate::markdown_shortcuts).
                 handle.add_plugin(std::rc::Rc::new(crate::markdown_shortcuts::MarkdownShortcutsPlugin));
-                // Ctrl+Shift+7 makes no task list (crate::task_lists).
+                // No command makes a task list (crate::task_lists).
                 handle.add_plugin(std::rc::Rc::new(crate::task_lists::NoTaskListsPlugin));
                 // Spellchecking that leaves code alone (crate::spelling).
                 crate::spelling::install(&handle);
