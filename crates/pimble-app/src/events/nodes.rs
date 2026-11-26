@@ -83,15 +83,15 @@ pub(super) fn node_created(
     let parent = parent_id.unwrap_or_else(|| {
         store.root_node_id(*store_id).unwrap()
     });
-    // A node the explorer's keyboard made: the cursor goes to it,
-    // and its row starts renaming once drawn.
+    // A node the explorer made (a text or a query metanode): the cursor
+    // goes to it, it opens in the focused pane (a metanode shows its
+    // setup), and its row starts renaming once drawn. Opening leaves the
+    // keyboard where it is, so the rename box keeps it; Enter there hands
+    // it to the note (`app::explorer::start_rename`).
     if let Some(value) = crate::state::take_pending_create(*store_id, parent, *node_id) {
         tree_state.controller.set_cursor(&value);
         tree_state.controller.set_selection([value.clone()]);
-        // A new query metanode opens its setup in the pane.
-        if crate::state::take_open_when_created() {
-            crate::app::open_node(store, tree_state, value);
-        }
+        crate::app::open_node(store, tree_state, value);
     }
     // The list it went into was shown just before this answer
     // (`Shown`) when it is loaded; one never loaded is loaded

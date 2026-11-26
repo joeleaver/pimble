@@ -37,6 +37,7 @@ pub fn focus_explorer() {
 /// either gives the keyboard back to the tree. `false` when the row cannot
 /// be renamed here (a mount, or a node this device may only read).
 pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) -> bool {
+    rename_starts();
     // Don't allow rename on mount nodes
     let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(value) {
         store.is_mount(sid, nid)
@@ -83,17 +84,7 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
         }
         if data.key == "Enter" {
             let nv = nv_interceptor.clone();
-            run_on_main_thread(move || {
-                let new_title = rename_title(&nv, untracked(|| store.rename_text.get()));
-                store.renaming_node.set(None);
-                clear_keyboard_interceptor();
-                tree_state.controller.focus();
-                if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(&nv), new_title) {
-                    store.send(BackendCommand::RenameNode {
-                        store_id: s_id, node_id: n_id, title: new_title,
-                    });
-                }
-            });
+            run_on_main_thread(move || commit_rename(store, tree_state, &nv));
             return true;
         }
         false
@@ -109,14 +100,52 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
 thread_local! {
     /// The row of a node just made whose name is being typed: its box starts
     /// empty, and an empty Enter keeps the name it was made with ("Metanode").
-    pub(super) static FRESH_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+    static FRESH_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Every rename starts as an ordinary one; the row of a node just made marks
+/// its own as fresh after this (`mark_fresh`). A fresh rename left with
+/// Escape (or a click elsewhere) must not make a later F2 on that row move
+/// the keyboard into its document.
+fn rename_starts() {
+    FRESH_RENAME.with(|f| f.borrow_mut().take());
+}
+
+/// Marks the rename of `value`, just started, as the naming of a node just
+/// made (`FRESH_RENAME`).
+pub(super) fn mark_fresh(value: &str) {
+    FRESH_RENAME.with(|f| *f.borrow_mut() = Some(value.to_string()));
 }
 
 /// The title a rename of `value` commits, or `None` to keep the one it has: a
-/// node just made, named nothing, keeps the name it was made with.
-pub(super) fn rename_title(value: &str, text: String) -> Option<String> {
+/// node just made, named nothing, keeps the name it was made with. The
+/// second half says whether `value` was that node just made.
+pub(super) fn rename_title(value: &str, text: String) -> (Option<String>, bool) {
     let fresh = FRESH_RENAME.with(|f| f.borrow_mut().take()).as_deref() == Some(value);
-    (!(fresh && text.trim().is_empty())).then_some(text)
+    ((!(fresh && text.trim().is_empty())).then_some(text), fresh)
+}
+
+/// Enter in the rename box of `value` (the keyboard interceptor's Enter and
+/// the box's own submit alike): the name is committed and the keyboard goes
+/// back to the tree, or, for a node just made, which opened in the focused
+/// pane as it was made, on to its document once that shows (Joe,
+/// 2026-11-26: the title is typed first, then the text).
+pub(super) fn commit_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) {
+    // Both may hear one Enter; the first ends the rename, and the second
+    // must not take the keyboard back from the document.
+    if untracked(|| store.renaming_node.get()).as_deref() != Some(value) {
+        return;
+    }
+    let (new_title, fresh) = rename_title(value, untracked(|| store.rename_text.get()));
+    store.renaming_node.set(None);
+    clear_keyboard_interceptor();
+    tree_state.controller.focus();
+    if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(value), new_title) {
+        store.send(BackendCommand::RenameNode { store_id: s_id, node_id: n_id, title: new_title });
+    }
+    if fresh {
+        crate::tree_keys::keyboard_to_document(store, store.focused(), value.to_string(), 40);
+    }
 }
 
 /// The explorer's tree, its one context menu, drops and keys, and the
@@ -134,7 +163,7 @@ pub(super) fn render_explorer(
     let cancel_rename = move |commit: bool| {
         if let Some(prev_value) = untracked(|| store.renaming_node.get()) {
             if commit {
-                let new_title = rename_title(&prev_value, untracked(|| store.rename_text.get()));
+                let (new_title, _) = rename_title(&prev_value, untracked(|| store.rename_text.get()));
                 if let (Some((sid, Some(nid))), Some(new_title)) = (parse_tree_value(&prev_value), new_title) {
                     store.send(BackendCommand::RenameNode {
                         store_id: sid, node_id: nid, title: new_title,
@@ -295,4 +324,25 @@ pub(super) fn render_explorer(
     };
     let tree_scroll = explorer_menu(__scope, store, tree_state, menu, tree_scroll);
     (tree_scroll, cancel_rename)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_fresh, rename_starts, rename_title};
+
+    #[test]
+    fn a_fresh_rename_left_with_escape_leaves_a_later_rename_ordinary() {
+        mark_fresh("node_a");
+        // Escape: nothing reads the mark. Then F2 on the same row.
+        rename_starts();
+        assert_eq!(rename_title("node_a", String::new()), (Some(String::new()), false));
+    }
+
+    #[test]
+    fn a_fresh_rename_is_fresh_once() {
+        rename_starts();
+        mark_fresh("node_b");
+        assert_eq!(rename_title("node_b", "  ".into()), (None, true));
+        assert_eq!(rename_title("node_b", "Title".into()), (Some("Title".into()), false));
+    }
 }

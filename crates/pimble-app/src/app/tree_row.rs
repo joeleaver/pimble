@@ -1,14 +1,12 @@
 //! One explorer row, drawn for rinch's Tree.
 
 use rinch::prelude::*;
-use rinch::core::clear_keyboard_interceptor;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
-use crate::protocol::BackendCommand;
 use crate::appearance::{display_color, icon_by_name, row_background, IconGlyph};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore};
 use pimble_ui::presence::PersonDot;
-use super::explorer::{FRESH_RENAME, RENAME_INPUTS, rename_title, start_rename};
+use super::explorer::{RENAME_INPUTS, commit_rename, mark_fresh, start_rename};
 use super::row_menu::ExplorerMenu;
 use super::rows::{REVEAL_ROW, TREE_ROWS};
 use super::status::{badge_with_waiting, sync_badge_text};
@@ -368,17 +366,7 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
             oninput: move |value: String| {
                 store.rename_text.set(value);
             },
-            onsubmit: move || {
-                let new_title = store.rename_text.get();
-                let new_title = rename_title(&nv_submit, new_title);
-                store.renaming_node.set(None);
-                clear_keyboard_interceptor();
-                if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(&nv_submit), new_title) {
-                    store.send(BackendCommand::RenameNode {
-                        store_id: s_id, node_id: n_id, title: new_title,
-                    });
-                }
-            },
+            onsubmit: move || commit_rename(store, tree_state, &nv_submit),
         }
     };
 
@@ -392,7 +380,7 @@ pub(super) fn render_tree_row(__scope: &mut RenderScope, store: AppStore, tree_s
             if start_rename(store, tree_state, &value) {
                 // Typed from nothing, not after the name it was made
                 // with.
-                FRESH_RENAME.with(|f| *f.borrow_mut() = Some(value.clone()));
+                mark_fresh(&value);
                 store.rename_text.set(String::new());
             }
         });
