@@ -385,7 +385,7 @@ deletes, creates, renames from the tree), cleared on restart.
   gives its editor the keyboard (waiting for a document that is still loading; a folder
   has no editor and leaves the keyboard in the tree); Ctrl+Enter or Alt+Enter opens in
   split view; F2 renames; Ctrl+Shift+Enter or Insert makes a sibling after the cursor and
-  Ctrl+Alt+Enter a child, each renamed at once; Alt+Shift+arrows move (judged and sent by
+  Ctrl+Alt+Enter a child, each renamed at once and opened in the focused pane (docs/MENUS_CONTRACT.md section 12); Alt+Shift+arrows move (judged and sent by
   `tree_drop::plan_drop`, as a drop is; outdenting from a store's top level does
   nothing); Delete moves the cursor on and deletes; Ctrl+X then Ctrl+V or Ctrl+Shift+V
   cut and paste (the strip says what is cut); Ctrl+C copies the link; Escape drops a cut

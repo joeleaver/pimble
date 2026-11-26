@@ -279,7 +279,7 @@ What is built, on `master`. The person sees one word for it: **Metanode** (decis
   over its own store (`within` absent, which section 3 defines as its own store, so it keeps
   meaning that if the node moves to another store) whose one condition is a blank "tagged"
   line; named "Metanode", renamed in place wherever it is made (the row menus' New too),
-  and opened in the focused pane (`state::open_when_created`), which shows its setup.
+  and opened in the focused pane (`state::set_pending_create`, as a new text is), which shows its setup.
 - **Tests**: `pimble-app` `state::tests::a_query_metanode_shows_its_finds_after_its_own_children`,
   `a_found_rows_children_are_ordinary`; `tree_drop::tests::a_found_rows_place_is_not_changed_by_a_drop`;
   `metanode_setup::tests` (`a_setup_edits_its_source_as_a_match`,

@@ -83,17 +83,7 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
         }
         if data.key == "Enter" {
             let nv = nv_interceptor.clone();
-            run_on_main_thread(move || {
-                let new_title = rename_title(&nv, untracked(|| store.rename_text.get()));
-                store.renaming_node.set(None);
-                clear_keyboard_interceptor();
-                tree_state.controller.focus();
-                if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(&nv), new_title) {
-                    store.send(BackendCommand::RenameNode {
-                        store_id: s_id, node_id: n_id, title: new_title,
-                    });
-                }
-            });
+            run_on_main_thread(move || commit_rename(store, tree_state, &nv));
             return true;
         }
         false
@@ -113,10 +103,34 @@ thread_local! {
 }
 
 /// The title a rename of `value` commits, or `None` to keep the one it has: a
-/// node just made, named nothing, keeps the name it was made with.
-pub(super) fn rename_title(value: &str, text: String) -> Option<String> {
+/// node just made, named nothing, keeps the name it was made with. The
+/// second half says whether `value` was that node just made.
+pub(super) fn rename_title(value: &str, text: String) -> (Option<String>, bool) {
     let fresh = FRESH_RENAME.with(|f| f.borrow_mut().take()).as_deref() == Some(value);
-    (!(fresh && text.trim().is_empty())).then_some(text)
+    ((!(fresh && text.trim().is_empty())).then_some(text), fresh)
+}
+
+/// Enter in the rename box of `value` (the keyboard interceptor's Enter and
+/// the box's own submit alike): the name is committed and the keyboard goes
+/// back to the tree, or, for a node just made, which opened in the focused
+/// pane as it was made, on to its document once that shows (Joe,
+/// 2026-11-26: the title is typed first, then the text).
+pub(super) fn commit_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) {
+    // Both may hear one Enter; the first ends the rename, and the second
+    // must not take the keyboard back from the document.
+    if untracked(|| store.renaming_node.get()).as_deref() != Some(value) {
+        return;
+    }
+    let (new_title, fresh) = rename_title(value, untracked(|| store.rename_text.get()));
+    store.renaming_node.set(None);
+    clear_keyboard_interceptor();
+    tree_state.controller.focus();
+    if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(value), new_title) {
+        store.send(BackendCommand::RenameNode { store_id: s_id, node_id: n_id, title: new_title });
+    }
+    if fresh {
+        crate::tree_keys::keyboard_to_document(store, store.focused(), value.to_string(), 40);
+    }
 }
 
 /// The explorer's tree, its one context menu, drops and keys, and the
@@ -134,7 +148,7 @@ pub(super) fn render_explorer(
     let cancel_rename = move |commit: bool| {
         if let Some(prev_value) = untracked(|| store.renaming_node.get()) {
             if commit {
-                let new_title = rename_title(&prev_value, untracked(|| store.rename_text.get()));
+                let (new_title, _) = rename_title(&prev_value, untracked(|| store.rename_text.get()));
                 if let (Some((sid, Some(nid))), Some(new_title)) = (parse_tree_value(&prev_value), new_title) {
                     store.send(BackendCommand::RenameNode {
                         store_id: sid, node_id: nid, title: new_title,

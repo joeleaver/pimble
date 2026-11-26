@@ -254,3 +254,18 @@ Every row menu (a node's, a store's, a mount's) has "Theme..." right after
 the theme in force, where it comes from, and "Choose theme..." (docs/THEMES_CONTRACT.md
 section 9). The Appearance picker's Theme row opens the same picker. A node's row menu is
 13 lines, a store's 11.
+
+## 12. A new text opens (Joe, 2026-11-26)
+
+A text made from anywhere in the explorer ("+", a row menu's New, the menu bar's New, the
+keyboard's new sibling or child) opens in the focused pane as soon as it is made, as a new
+query metanode already did, and is named in place wherever it is made (a row menu's New
+too, which before named only a metanode). The rename box keeps the keyboard while the
+note opens behind it: opening a note never moves the keyboard. Enter commits the name and
+hands the keyboard to the note once it shows (`app::explorer::commit_rename`, through
+`tree_keys::keyboard_to_document`, as Enter on a row does); Escape leaves it in the tree.
+One path on both backends: `creating::make` and `tree_keys::new_node` set
+`state::set_pending_create`, and `NodeCreated` (`events::nodes::node_created`) opens and
+renames the node it names. A canvas, a sheet, a plugin's kind and a canvas from a picture
+are named by what they are and neither open nor rename; a discussion opens as it always
+did; a mount is not made from New.

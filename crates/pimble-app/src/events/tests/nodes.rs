@@ -427,3 +427,71 @@ fn a_failed_put_back_lands_in_the_deleted_modal() {
     assert!(!store.deleted_modal_pending.get(), "the flag clears once the error lands");
     assert!(store.notice.get().is_empty(), "not the status bar's error");
 }
+
+/// What the explorer's New makes, as `NodeCreated` answers it: the
+/// command sent and the node made under `parent`.
+fn made(store: AppStore, events: &crossbeam_channel::Sender<BackendEvent>, commands: &crossbeam_channel::Receiver<BackendCommand>, kind: crate::creating::Kind, store_id: StoreId, parent: NodeId, suffix: &str) -> NodeId {
+    crate::creating::make(store, &kind, store_id, parent, pimble_core::Place::Last, suffix.to_string());
+    assert!(
+        commands.try_iter().any(|c| matches!(c, BackendCommand::CreateNode { store_id: s, parent_id: Some(p), .. } if s == store_id && p == parent)),
+        "{kind:?} is made under its parent"
+    );
+    let node_id = NodeId::new();
+    events.send(BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request: None }).unwrap();
+    pump(store);
+    node_id
+}
+
+/// A new text note opens in the focused pane as soon as it is made (Joe,
+/// 2026-11-26), at the tree value of its level, and its row is the one
+/// renamed when drawn; the other panes keep what they show.
+#[test]
+fn a_new_text_opens_in_the_focused_pane_and_is_named_in_place() {
+    use crate::panes::PaneId;
+    let (store, events, commands) = store_with_events();
+    let (store_id, parent, shared, _other) = two_panes_on_one_document(store);
+    store.focus_pane(PaneId::ALL[2]);
+    let _ = commands.try_iter().count();
+
+    let suffix = format!("/{store_id}_{}", NodeId::new());
+    let node_id = made(store, &events, &commands, crate::creating::Kind::Text, store_id, parent, &suffix);
+
+    let value = format!("node_{store_id}_{node_id}{suffix}");
+    assert_eq!(store.panes[2].selected.get(), Some(value.clone()), "the focused pane opens it");
+    assert_eq!(store.selected_id.get(), Some(value.clone()), "and the tree's row is it");
+    assert!(
+        commands.try_iter().any(|c| matches!(c, BackendCommand::GetNode { store_id: s, node_id: n } if s == store_id && n == node_id)),
+        "a node the cache has not seen is fetched, which starts its session"
+    );
+    for pane in [0, 1] {
+        assert_eq!(store.panes[pane].selected.get(), Some(format!("node_{store_id}_{shared}")), "pane {pane} keeps its note");
+    }
+    assert!(crate::state::take_pending_rename(&value), "its row starts renaming once drawn");
+}
+
+/// A new query metanode opens too (its setup), as it did before texts did.
+#[test]
+fn a_new_metanode_opens_in_the_focused_pane() {
+    let (store, events, commands) = store_with_events();
+    let (store_id, parent) = (StoreId::new(), NodeId::new());
+    let node_id = made(store, &events, &commands, crate::creating::Kind::Metanode, store_id, parent, "");
+    let value = format!("node_{store_id}_{node_id}");
+    assert_eq!(store.selected_id.get(), Some(value.clone()));
+    assert!(crate::state::take_pending_rename(&value));
+}
+
+/// A kind named by what it is (a sheet) is made and left where it is: it
+/// neither opens nor renames, and a node made by anyone else opens nothing.
+#[test]
+fn a_new_sheet_or_a_node_made_elsewhere_opens_nothing() {
+    let (store, events, commands) = store_with_events();
+    let (store_id, parent) = (StoreId::new(), NodeId::new());
+    let node_id = made(store, &events, &commands, crate::creating::Kind::Sheet, store_id, parent, "");
+    assert_eq!(store.selected_id.get(), None);
+    assert!(!crate::state::take_pending_rename(&format!("node_{store_id}_{node_id}")));
+
+    let elsewhere = NodeId::new();
+    events.send(BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id: elsewhere, request: None }).unwrap();
+    pump(store);
+    assert_eq!(store.selected_id.get(), None, "only the node the explorer asked for opens");
+}

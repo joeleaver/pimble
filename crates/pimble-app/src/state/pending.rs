@@ -1,6 +1,6 @@
 //! What the explorer waits for between a gesture and the event that answers
-//! it: the drop target a `NodeMoved` expands, and the node the keyboard asked
-//! for, renamed (or opened) when its row comes.
+//! it: the drop target a `NodeMoved` expands, and the node the explorer asked
+//! for, opened when it is made and renamed when its row comes.
 
 use super::*;
 
@@ -26,38 +26,25 @@ pub fn take_last_drop_target_value() -> Option<String> {
 }
 
 thread_local! {
-    /// A node the explorer's keyboard asked for (docs/TREE_CONTRACT.md "The
-    /// keyboard": a new sibling or child, renamed at once): its store, its
-    /// parent, and the mount-path suffix its tree value will carry.
+    /// A node the explorer asked for (docs/TREE_CONTRACT.md "The keyboard": a
+    /// new sibling or child, renamed at once; "+" and New alike): its store,
+    /// its parent, and the mount-path suffix its tree value will carry.
     static PENDING_CREATE: RefCell<Option<(StoreId, NodeId, String)>> = const { RefCell::new(None) };
     /// The tree value of that node once it exists, renamed when its row is
     /// drawn.
     static PENDING_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The pending node opens in the focused pane once made (a query metanode
-    /// opens its setup, docs/QUERY_METANODES_CONTRACT.md section 7).
-    static OPEN_CREATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The node [`set_pending_create`] asks for opens in the focused pane once
-/// it is made.
-pub fn open_when_created() {
-    OPEN_CREATED.with(|o| o.set(true));
-}
-
-/// Whether the node just made opens ([`open_when_created`]), once.
-pub fn take_open_when_created() -> bool {
-    OPEN_CREATED.with(|o| o.replace(false))
-}
-
-/// The keyboard is making a node under `parent`; its row, when it comes,
-/// starts renaming.
+/// The explorer is making a text node or a query metanode under `parent`
+/// (its keyboard, "+", a row menu's New, File > New): once made it opens in
+/// the focused pane (Joe, 2026-11-26), and its row, when it comes, starts
+/// renaming.
 pub fn set_pending_create(store_id: StoreId, parent: NodeId, suffix: String) {
-    OPEN_CREATED.with(|o| o.set(false));
     PENDING_CREATE.with(|cell| *cell.borrow_mut() = Some((store_id, parent, suffix)));
 }
 
-/// `NodeCreated` for `node` under `parent`: the tree value to rename, when
-/// it is the node the keyboard asked for.
+/// `NodeCreated` for `node` under `parent`: the tree value to open and
+/// rename, when it is the node the explorer asked for.
 pub fn take_pending_create(store_id: StoreId, parent: NodeId, node: NodeId) -> Option<String> {
     PENDING_CREATE.with(|cell| {
         let mut pending = cell.borrow_mut();

@@ -52,8 +52,8 @@ pub use mounts::{mount_is_dimmed, mount_label_suffix, mount_state_kind, MountInf
 pub use nodes::SLOW_CHILDREN_MS;
 pub use pane_state::{ActiveEdit, PaneState};
 pub use pending::{
-    open_when_created, set_last_drop_target_value, set_pending_create, take_last_drop_target_value,
-    take_open_when_created, take_pending_create, take_pending_rename,
+    set_last_drop_target_value, set_pending_create, take_last_drop_target_value, take_pending_create,
+    take_pending_rename,
 };
 pub use share_words::{
     access_note, access_words, ENDED_REPLICA_NOTE, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE,

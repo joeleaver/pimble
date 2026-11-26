@@ -217,7 +217,7 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
 /// cursor had not rested on long enough to open yet loads first), looking
 /// again every 50 ms, `tries` more times; a folder, which opens no editor,
 /// leaves the keyboard in the tree.
-fn keyboard_to_document(store: AppStore, pane: crate::panes::PaneId, value: String, tries: u32) {
+pub(crate) fn keyboard_to_document(store: AppStore, pane: crate::panes::PaneId, value: String, tries: u32) {
     let state = store.pane(pane);
     let showing = untracked(|| state.selected.get()).as_deref() == Some(value.as_str());
     if !showing {
@@ -230,7 +230,8 @@ fn keyboard_to_document(store: AppStore, pane: crate::panes::PaneId, value: Stri
     }
 }
 
-/// A new node after the cursor row (or inside it, last), named at once.
+/// A new node after the cursor row (or inside it, last), named at once and
+/// opened in the focused pane.
 fn new_node(store: AppStore, key: &TreeKey, child: bool) {
     // Beside a found row: one of its metanode's own children, after them
     // (nothing is put at a found row's place, section 4).

@@ -61,14 +61,15 @@ pub(crate) fn kinds(store: AppStore) -> Vec<NewItem> {
     items
 }
 
-/// Make `kind` under `parent` of `store_id`, at `place`. A text node made at
-/// `rename_row`'s level is named in place as soon as its row is drawn.
-pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: NodeId, place: Place, rename_suffix: Option<String>) {
+/// Make `kind` under `parent` of `store_id`, at `place`. A text node or a
+/// query metanode is named in place as soon as its row is drawn (its tree
+/// value is the new node's address followed by `suffix`, the mount path of
+/// its level) and opens in the focused pane (Joe, 2026-11-26): the rename box
+/// keeps the keyboard until Enter, which hands it to the note.
+pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: NodeId, place: Place, suffix: String) {
     match kind {
         Kind::Text => {
-            if let Some(suffix) = rename_suffix {
-                crate::state::set_pending_create(store_id, parent, suffix);
-            }
+            crate::state::set_pending_create(store_id, parent, suffix);
             store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent), title: String::new(), init: None, place });
         }
         Kind::Canvas => crate::boards::new_whiteboard(store, store_id, parent, place),
@@ -77,10 +78,9 @@ pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: Node
         Kind::Recipe(recipe) => crate::plugins::make(store, store_id, parent, recipe.clone(), place),
         Kind::CanvasFromPicture => crate::boards::pick_images(store, crate::boards::Dest::Under(store_id, parent)),
         Kind::Metanode => {
-            // Named in place as a new text is, and opened: the cursor goes to
-            // it, which opens its setup in the pane.
-            crate::state::set_pending_create(store_id, parent, rename_suffix.unwrap_or_default());
-            crate::state::open_when_created();
+            // Named in place as a new text is, and opened: the pane shows
+            // its setup.
+            crate::state::set_pending_create(store_id, parent, suffix);
             let (title, init) = crate::protocol::NodeInit::of(pimble_api::recipes::query_metanode(METANODE), None);
             store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent), title, init: Some(init), place });
         }
@@ -91,10 +91,10 @@ pub(crate) fn make(store: AppStore, kind: &Kind, store_id: StoreId, parent: Node
 /// in the node it mounts), last: a row menu's New.
 pub(crate) fn make_in_row(store: AppStore, kind: &Kind, row: &str) {
     if let Some((s, parent)) = crate::tree_view::create_parent_of_row(store, row) {
-        // A query metanode is named in place wherever it is made; its row sits
-        // one level below `row` (under a mount or a found row: through it).
-        let suffix = (*kind == Kind::Metanode).then(|| children_suffix(store, row));
-        make(store, kind, s, parent, Place::Last, suffix);
+        // A text or a query metanode is named in place wherever it is made;
+        // its row sits one level below `row` (under a mount or a found row:
+        // through it).
+        make(store, kind, s, parent, Place::Last, children_suffix(store, row));
     }
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn where_plus(store: AppStore) -> Option<(StoreId, NodeId, Place, Str
 pub(crate) fn make_from_plus(store: AppStore, kind: &Kind) -> bool {
     match where_plus(store) {
         Some((s, parent, place, suffix)) => {
-            make(store, kind, s, parent, place, Some(suffix));
+            make(store, kind, s, parent, place, suffix);
             true
         }
         None => false,
