@@ -329,7 +329,7 @@ impl Visit for Message {
 pub fn hooks() -> pimble_app::diagnostics_ui::Hooks {
     pimble_app::diagnostics_ui::Hooks {
         settings,
-        save: save_settings,
+        save: |enabled, noticed| save_settings(enabled, noticed).map_err(pimble_app::diagnostics_ui::SaveFailed::NotSaved),
         install,
         available: || true,
     }

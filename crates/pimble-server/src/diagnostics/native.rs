@@ -46,31 +46,53 @@ pub fn settings() -> Settings {
     settings_path().and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-/// Save the choice; turning it off deletes what waits and stops recording at
-/// once, turning it on starts the next time a program starts. An off that
-/// could not delete everything waiting is saved and answers an error (each
-/// start while off tries again); an on after an off first deletes whatever
-/// that off left, and stays off with an error when it cannot, so nothing
-/// recorded before an off is ever sent.
-pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
-    let path = settings_path().ok_or_else(|| std::io::Error::other("no config folder"))?;
-    if settings.enabled && !self::settings().enabled {
-        if let Some(dir) = queue_dir() {
-            clear_queue(&dir).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("Diagnostics stay off: what they kept before they were turned off could not be deleted ({e})."))
-            })?;
+/// Why [`save_settings`] did not end where it was asked to.
+#[derive(Debug)]
+pub enum SaveError {
+    /// What was recorded could not all be deleted. An off is saved and in
+    /// force regardless (recording has stopped, and each start while off
+    /// tries again); an on is not saved, and diagnostics stay off.
+    RecordsKept(std::io::Error),
+    /// The choice could not be saved; the one before it stands.
+    NotSaved(std::io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::RecordsKept(e) => write!(f, "what diagnostics recorded could not all be deleted ({e})"),
+            SaveError::NotSaved(e) => write!(f, "the diagnostics setting could not be saved ({e})"),
         }
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+}
+
+impl std::error::Error for SaveError {}
+
+/// Save the choice; turning it off deletes what waits and stops recording at
+/// once, turning it on starts the next time a program starts. An off that
+/// could not delete everything waiting is saved and answers
+/// [`SaveError::RecordsKept`] (each start while off tries again); an on after
+/// an off first deletes whatever that off left, and stays off with
+/// [`SaveError::RecordsKept`] when it cannot, so nothing recorded before an
+/// off is ever sent.
+pub fn save_settings(settings: &Settings) -> Result<(), SaveError> {
+    let path = settings_path().ok_or_else(|| SaveError::NotSaved(std::io::Error::other("no config folder")))?;
+    if settings.enabled && !self::settings().enabled {
+        if let Some(dir) = queue_dir() {
+            clear_queue(&dir).map_err(SaveError::RecordsKept)?;
+        }
     }
-    fs::write(&path, serde_json::to_vec_pretty(settings)?)?;
+    let written = match path.parent() {
+        Some(dir) => fs::create_dir_all(dir),
+        None => Ok(()),
+    }
+    .and_then(|()| Ok(serde_json::to_vec_pretty(settings)?))
+    .and_then(|bytes| fs::write(&path, bytes));
+    written.map_err(SaveError::NotSaved)?;
     if !settings.enabled {
         ENABLED.store(false, Ordering::SeqCst);
         if let Some(dir) = queue_dir() {
-            clear_queue(&dir).map_err(|e| {
-                std::io::Error::new(e.kind(), format!("Diagnostics are off, but what they kept could not all be deleted ({e}); it is never sent, and is deleted next time."))
-            })?;
+            clear_queue(&dir).map_err(SaveError::RecordsKept)?;
         }
     }
     Ok(())

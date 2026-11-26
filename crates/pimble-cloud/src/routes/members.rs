@@ -613,13 +613,11 @@ pub async fn delete_invitation(
 /// afterwards) must not have that role overwritten by the older invitation.
 ///
 /// The grants are written under the account's lock, as every grant is
-/// (`AppState::lock_live_account`): an account being deleted claims nothing,
-/// and its invitations are left for the address's next account.
-async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usize> {
-    let (_account, live) = state.lock_live_account(user.rid).await?;
-    if live.is_none() {
-        return Ok(0);
-    }
+/// (`AppState::lock_live_account`): the caller holds it (`_account`) and
+/// read `user` inside it, so an account being deleted claims nothing (the
+/// caller found it gone and asked nothing), and its invitations are left for
+/// the address's next account.
+async fn claim_invitations(state: &AppState, user: &UserRow, _account: &tokio::sync::OwnedMutexGuard<()>) -> CloudResult<usize> {
     let mut claimed = 0usize;
     for invitation in state.db.invitations_for_email(&user.email).await? {
         let store = state.db.get_hosted_store(invitation.store_rid).await?;
@@ -652,8 +650,10 @@ async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usiz
 /// by the time this runs, and neither should fail — or, worse, leave an
 /// account verified but unable to log in — because a share could not be
 /// handed over. The next login tries again.
-pub(crate) async fn claim_invitations_best_effort(state: &AppState, user: &UserRow) {
-    match claim_invitations(state, user).await {
+///
+/// `user` is the account as read under its lock, which `account` holds.
+pub(crate) async fn claim_invitations_best_effort(state: &AppState, user: &UserRow, account: &tokio::sync::OwnedMutexGuard<()>) {
+    match claim_invitations(state, user, account).await {
         Ok(0) => {}
         Ok(claimed) => tracing::info!(email = %user.email, count = claimed, "claimed invitation(s) as grants"),
         Err(e) => tracing::warn!(email = %user.email, error = %e, "claiming this address's invitations failed; the next login will try again"),

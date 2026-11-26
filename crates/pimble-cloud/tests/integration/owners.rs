@@ -8,6 +8,15 @@
 //! feature) right after it counted the owners, and let go only once the
 //! second has counted too or is provably queued behind the first's lock.
 //! With the locks gone every test here fails; with them, exactly one wins.
+//!
+//! Every write of a grant (a member added or changed, a store created for its
+//! owner, a key given, an invitation claimed at login) takes the account's
+//! lock first (`AppState::lock_live_account`), which an account deletion
+//! holds from listing the account's grants until the account is gone. The
+//! tests at the end hold a deletion right after that listing, send each of
+//! those writes for the account, and let the deletion go once the write is
+//! queued on the lock: the write finds the account gone and leaves nothing
+//! behind it.
 
 use super::*;
 use pimble_cloud::checkpoints::Checkpoint;
@@ -262,4 +271,112 @@ async fn a_grant_made_while_its_account_is_deleted_does_not_survive_it() {
     let left = remove(&stack, &b_cookie, &s2, &b_id).send().await.unwrap();
     assert_eq!(left.status(), 409, "b cannot leave b's store with no live owner");
     assert_eq!(owners_of(&stack, &s2).await, 1);
+}
+
+/// `email`'s account row id, while it exists.
+async fn rid_of(stack: &Stack, email: &str) -> u64 {
+    stack.app_state.db.find_user_by_email(email).await.unwrap().expect("the account").rid
+}
+
+/// Nothing is left that names the deleted account `rid`: no grant, no key,
+/// no session.
+async fn nothing_left_for(stack: &Stack, rid: u64, what: &str) {
+    assert!(stack.app_state.db.get_user(rid).await.unwrap().is_none(), "{what}: the account is deleted");
+    let grants = stack.app_state.db.grants_for_user(rid).await.unwrap();
+    assert!(grants.is_empty(), "{what}: no grant names the deleted account, got {grants:?}");
+    let keys = stack.app_state.db.key_grants_for_user(rid).await.unwrap();
+    assert!(keys.is_empty(), "{what}: no key is held for the deleted account, got {} key grant(s)", keys.len());
+    let sessions = stack.app_state.db.sessions_for_user(rid).await.unwrap();
+    assert!(sessions.is_empty(), "{what}: no session is left for the deleted account, got {} session(s)", sessions.len());
+}
+
+/// a creates a store while a's deletion has listed a's grants: the creation
+/// waits for a's account lock and makes nothing, so no store is left whose
+/// one owner is a deleted account.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_made_while_its_account_is_deleted_is_not_made() {
+    let stack = skip_without_rhypedb!();
+    let a = "created-gone-a@example.com";
+    let (_, a_cookie) = signup_verify_login(&stack, a, "owner a password!").await;
+    let a_rid = rid_of(&stack, a).await;
+    let tokens = recovery_tokens(&stack, &[a]).await;
+
+    let create = stack.http.post(format!("{}/stores", stack.base_url)).header("Cookie", &a_cookie).json(&json!({ "name": "Made too late" }));
+    let (deleted, created) = change_during_deletion(&stack, a, &tokens[0], create).await;
+    assert_eq!(deleted.status(), 200);
+    let status = created.status().as_u16();
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(status, 409, "the creation is refused, got {status} {body}");
+    assert_eq!(body["message"], "This account was deleted while the store waited to be made, so nothing was made.", "said in a sentence");
+    nothing_left_for(&stack, a_rid, "the creation").await;
+}
+
+/// b, the owner, gives a (a member) the store's key while a's deletion has
+/// listed a's keys: the key waits for a's account lock and is refused once a
+/// is gone, so no key is held for an account that is no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_given_while_its_account_is_deleted_is_not_kept() {
+    let stack = skip_without_rhypedb!();
+    let (a, b) = ("keyed-gone-a@example.com", "keyed-gone-b@example.com");
+    let (_, a_keys) = signup_with_material(&stack, a, "member a password!").await;
+    let (a_login, _a_cookie) = verify_then_login(&stack, a, "member a password!").await;
+    let (_, b_keys) = signup_with_material(&stack, b, "owner b password!").await;
+    let (_, b_cookie) = verify_then_login(&stack, b, "owner b password!").await;
+    let a_id = a_login["user"]["id"].as_str().unwrap().to_string();
+    let a_rid = rid_of(&stack, a).await;
+    let store_id = create_store_with_body(&stack, &b_cookie, json!({ "name": "Keyed", "kind": "vault" })).await["store_id"].as_str().unwrap().to_string();
+    assert_eq!(put_member(&stack, &b_cookie, &store_id, a, "editor").await.status(), 200, "a is a member");
+    let tokens = recovery_tokens(&stack, &[a]).await;
+
+    let key_id = uuid::Uuid::new_v4();
+    let envelope = wrap_store_key(&pimble_crypto::SymmetricKey::generate(), key_id, &store_id, &b_keys, &a_keys.public_keys());
+    let give = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &b_cookie)
+        .json(&json!({ "envelopes": [ { "user_id": a_id, "key_id": key_id.to_string(), "envelope": envelope } ] }));
+    let (deleted, given) = change_during_deletion(&stack, a, &tokens[0], give).await;
+    assert_eq!(deleted.status(), 200);
+    let status = given.status().as_u16();
+    let body: Value = given.json().await.unwrap();
+    assert_eq!(status, 409, "the key is refused, got {status} {body}");
+    assert_eq!(body["message"], "That account was deleted while this change waited, so no key was given to it.", "said in a sentence");
+    nothing_left_for(&stack, a_rid, "the key").await;
+    let store = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    assert!(!store.deleted, "b's store survives a's deletion");
+    assert_eq!(owners_of(&stack, &store_id).await, 1, "b is still its owner");
+}
+
+/// a logs in, which claims the invitations standing for a's address, while
+/// a's deletion has listed a's grants: the login waits for a's account lock,
+/// finds the account gone, and claims nothing and opens no session; the
+/// invitation is left for the address's next account.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invitation_claimed_while_its_account_is_deleted_is_left_standing() {
+    let stack = skip_without_rhypedb!();
+    let (a, b) = ("claimed-gone-a@example.com", "claimed-gone-b@example.com");
+    let a_password = "member a password!";
+    signup_verify_login(&stack, a, a_password).await;
+    let (_, b_cookie) = signup_verify_login(&stack, b, "owner b password!").await;
+    let a_rid = rid_of(&stack, a).await;
+    let b_rid = rid_of(&stack, b).await;
+    let store_id = create_store_with_body(&stack, &b_cookie, json!({ "name": "Invited" })).await["store_id"].as_str().unwrap().to_string();
+    let store = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    // An invitation that stands for a's address although a has an account:
+    // one sent before a's account existed whose claim at verification
+    // failed, which every login tries again.
+    stack.app_state.db.create_invitation(store.rid, &store_id, a, "editor", "", "", b_rid).await.unwrap();
+    let tokens = recovery_tokens(&stack, &[a]).await;
+
+    let auth_key = auth_key_of(&stack, a, a_password).await;
+    let log_in = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": a, "auth_key": auth_key }));
+    let (deleted, logged_in) = change_during_deletion(&stack, a, &tokens[0], log_in).await;
+    assert_eq!(deleted.status(), 200);
+    let status = logged_in.status().as_u16();
+    let body: Value = logged_in.json().await.unwrap();
+    assert_eq!(status, 401, "no login into a deleted account, got {status} {body}");
+    nothing_left_for(&stack, a_rid, "the claim").await;
+    let standing = stack.app_state.db.invitations_for_email(a).await.unwrap();
+    assert_eq!(standing.len(), 1, "the invitation is left for the address's next account");
+    assert_eq!(standing[0].store_rid, store.rid);
 }

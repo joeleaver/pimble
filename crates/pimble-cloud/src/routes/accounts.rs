@@ -309,12 +309,19 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
     if user.verify_expires_at_ms <= chrono::Utc::now().timestamp_millis() {
         return Ok(redirect_to("/app/login?verify_error=expired"));
     }
+    // Verified and claimed under the account's lock, as every grant is
+    // written (`AppState::lock_live_account`): an account deleted meanwhile
+    // is neither verified nor given a share.
+    let (account, live) = state.lock_live_account(user.rid).await?;
+    let Some(user) = live else {
+        return Ok(redirect_to("/app/login?verify_error=invalid"));
+    };
     state.db.mark_user_verified(user.rid).await?;
     // Claiming: this address may have
     // been invited to shares before it had an account. Best effort — a share
     // that cannot be handed over right now must not make verification itself
     // fail; the next login claims it.
-    super::members::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user, &account).await;
     Ok(redirect_to("/app/login?verified=1"))
 }
 
@@ -352,12 +359,21 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     if !user.verified {
         return Err(CloudError::EmailUnverified);
     }
+    // The claim and the session are made under the account's lock
+    // (`AppState::lock_live_account`), read again inside it: an account
+    // whose deletion is under way waits for it, finds the account gone, and
+    // gets neither a grant nor a session for an account that is no more; a
+    // password changed meanwhile is no longer the one checked above.
+    let (account, live) = state.lock_live_account(user.rid).await?;
+    let Some(user) = live.filter(|live| live.password_hash == user.password_hash) else {
+        return Err(CloudError::Unauthorized("invalid email or password".to_string()));
+    };
     // Claim any invitations for this address before the token is minted, so
     // the `stores` claim in it already carries a share invited moments ago
     // (claiming runs at every login). Verification
     // usually does this first; login covers an invitation sent afterwards,
     // and any claim that failed then.
-    super::members::claim_invitations_best_effort(&state, &user).await;
+    super::members::claim_invitations_best_effort(&state, &user, &account).await;
     issue_session(&state, &user).await
 }
 
