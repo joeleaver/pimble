@@ -1,5 +1,37 @@
 # Next session: start here
 
+**2026-11-26 (master local_198b8f9e, transcript 3e8511e5): 0.33.0 cut.**
+- In 0.33.0:
+  - themes wave 2 (theme nodes, the theme editor, New Theme, bases, copying, internal nodes the
+    server refuses to place anything inside, View > Show Internal);
+  - notifications wave 5 (plain hosted stores, readers' replicas, the account pages, members,
+    diagnostics tied to the signed-in account) and part 5c (the browser's old store path deleted;
+    CI builds rhypedb-server, runs the web tests and scripts/check-one-path.sh);
+  - rinch main 7236314 (kanban drags light the drop target, keyboard drag in the kanban and todo
+    lists; Ctrl+Shift+B quote, Tab indent, PageUp/PageDown and Ctrl+A in the tree, all bound by Pimble
+    now that rinch #3062 left them to the app);
+  - a new note opens as it is made (Joe, 2026-11-26): its rename box keeps the keyboard, Enter
+    moves it into the note.
+- The full suite passed on the combined master: 2,197 tests, 0 failed.
+- The web deploy is Joe's: jkbase never finished the 0.32.1 builds, so the web stayed on v70
+  (0.32.0). Joe said he would handle the jkbase builder.
+- Deferred by Joe (2026-11-26): link identity. `is_link_client` (handler.rs) trusts a
+  `sync-link:`/`vault-link:` prefix the caller sends. Such a caller skips its own replica's
+  read-only lock, the internal-node placement rule and the modified-at stamp. Grants and Reach
+  still apply. Related: an update parked as pending and released later by a real link's relay is
+  merged unjudged. And yrs can merge a crafted part-held struct into a state its own reload does
+  not keep. That is closed only where edits are judged (`NodeDoc::merged_as_saved`); relayed,
+  vault and client merges still accept it.
+- Next: split handler.rs (about 7,000 lines; Joe agreed, its own session), then vault_link.rs,
+  canvas_tools.rs, sheet_tools.rs, and pimble-cloud tests/integration.rs, pimble-server
+  tests/share.rs and tests/vault_link.rs. Then themes wave 3 (app themes).
+- Small follow-ups:
+  - A kanban card lifts by keyboard only once it has Tab focus; a click doesn't give it.
+  - Opening a new note logs `start_collaboration_guest failed: expected meta.format`, which is
+    harmless: the join could check for content first.
+  - The desktop Account modal could offer a resend on the new -32011 (email unverified).
+  - Opening the browser logs one reconnect right after sign-in.
+
 **2026-11-25 (master local_198b8f9e, transcript 3e8511e5): 0.32.0 shipped.**
 - Release 0.32.0: themes wave 1 (built-ins, the Node menu, the two-column chooser), spellcheck
   and Markdown shortcuts in the note editor (rinch main f9d15abf). Tag `v0.32.0`, Release green
