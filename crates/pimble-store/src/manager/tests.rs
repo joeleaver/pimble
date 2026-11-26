@@ -340,3 +340,24 @@ async fn create_node_refuses_a_mount_as_parent() {
     let err = manager.create_node(store_id, Node::document("Nowhere"), Some(NodeId::new())).unwrap_err();
     assert!(matches!(err, StoreError::NodeNotFound(_)), "{err:?}");
 }
+
+/// A node made a theme while a document names it as its parent is
+/// refused even when its list does not name that document: repair would
+/// list the document under the theme.
+#[tokio::test]
+async fn judge_placement_refuses_a_theme_over_a_child_named_only_by_its_parent_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = StoreManager::new();
+    let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
+    let root_id = manager.root_node_id(store_id).unwrap();
+    let (folder, _) = manager.create_node(store_id, Node::folder("Folder"), Some(root_id)).unwrap();
+    let (child, _) = manager.create_node(store_id, Node::document("Child"), Some(folder)).unwrap();
+    assert!(manager.node_doc(store_id, folder).unwrap().remove_child(child).unwrap());
+
+    let doc = manager.node_doc(store_id, folder).unwrap();
+    let (mut peer, before) = (NodeDoc::load(&doc.save()).unwrap(), doc.state_vector());
+    peer.set_node_type(pimble_core::node_types::THEME, T).unwrap();
+    let update = peer.diff_since(&before).unwrap();
+    let err = manager.judge_placement(store_id, folder, &update).unwrap_err();
+    assert!(matches!(err, StoreError::InsideInternal { .. }), "{err:?}");
+}

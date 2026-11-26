@@ -740,11 +740,21 @@ cut or add.
   `pimble-store`'s `manager/placement.rs`): `createNode`, `moveNode`, `moveNodes` (before
   any node moves) and `transplantNode` by the parent they name, and an `applyEdit` by what
   merging it would leave, judged on a copy of the document before the merge (a `parent_id`
-  newly naming an internal node, or an id added to an internal node's children). Only
-  what an update changes is judged, so a child put under a theme before this keeps its
-  place and its edits; a relayed edit (a sync or vault link's) is not judged, since it
-  was judged where it was made and a replica that refused it would stay apart from its
-  peer. An encrypted (vault) store is ciphertext to the server, which cannot judge it:
+  newly naming an internal node, an id added to an internal node's children, or a node
+  made internal while it holds children, listed or only named by a child's `parent_id`).
+  Only what an update changes is judged, so a
+  child put under a theme before this keeps its place and its edits. A move by such a
+  client sends three updates: the old parent's list, the theme's list and the node's
+  own. The last two are refused and the first goes in, since taking an entry out of a
+  list places nothing; the node then names a parent whose list says it left, which
+  repair leaves alone by design (docs/MOVE_CONTRACT.md "Repair"), so it shows in
+  "Recently Deleted..." as a node no list names, with "Put Back" to the root. A refused update
+  stays in the copy of the client that sent it, and that client's later edits of the
+  same document build on it, so the server parks them and they never show: only a client
+  that does not judge placement itself (an older one, a script) gets there, and it loses
+  its later edits of that document until it takes a fresh copy. A relayed edit (a sync
+  or vault link's) is not judged, since it was judged where it was made and a replica
+  that refused it would stay apart from its peer. An encrypted (vault) store is ciphertext to the server, which cannot judge it:
   there only the clients refuse it. A child an older client put under a theme in an
   encrypted store, or before the server judged it, is hidden with it in the tree, but
   search still finds it by its own kind. View > "Show Internal" has a check per kind, kept per device in the

@@ -13,7 +13,7 @@ use pimble_core::internal::InternalKind;
 use pimble_core::{node_types, NodeId, Place, StoreId};
 use pimble_crdt::{NodeDoc, Tree};
 use pimble_rpc::{
-    ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetChildrenRequest, MoveNodeRequest,
+    ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetChildrenRequest, ListDeletedRequest, MoveNodeRequest,
     MoveNodesRequest, NodeStateVector, PimbleApiServer, SyncNodesRequest, TransplantNodeRequest,
 };
 use pimble_server::{service_extensions, RpcHandler};
@@ -219,6 +219,23 @@ async fn apply_edit_refuses_an_update_that_puts_a_child_under_a_theme() {
         }
     }
     assert!(fx.children(store, theme).await.is_empty());
+    // The old parent's update went in: it only takes the note out of its
+    // list, and records there that the note left. Repair leaves it so (a
+    // device whose copy of a node names a parent that says it left must
+    // not put it back, or it and the client that made the move would undo
+    // each other's repair for as long as both are connected), so the note
+    // is a live node no list names: in "Recently Deleted..." with a Put
+    // Back to the root, never lost.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(!fx.children(store, root).await.contains(&note), "repair does not undo the old parent's update");
+    let deleted = fx.handler.list_deleted(&service_extensions(), ListDeletedRequest { store_id: store }).await.unwrap();
+    let entry = deleted.nodes.iter().find(|d| d.node.id == note).expect("the note is offered back");
+    assert_eq!((entry.deleted_at.as_deref(), entry.put_back_under), (None, Some(root)));
+    fx.handler
+        .move_node(&service_extensions(), MoveNodeRequest { store_id: store, node_id: note, new_parent_id: root, place: Place::Last })
+        .await
+        .unwrap();
+    assert!(fx.children(store, root).await.contains(&note), "Put Back lists it under the root again");
 
     // A new node made under the theme: its first update and the theme's list.
     let mut peer = fx.peer_tree(store, root).await;
@@ -258,6 +275,28 @@ async fn apply_edit_takes_a_relayed_edit_and_edits_of_a_child_already_there() {
 
     let mut peer = fx.peer_tree(store, root).await;
     let edit = peer.set_title(note, "Renamed", T0).unwrap();
+    for (id, update) in &edit.touched {
+        fx.apply(store, *id, "older-client", update).await.unwrap();
+    }
+}
+
+/// An update that makes a node holding children a theme would put them
+/// inside one: refused, whether the children are listed or only named by
+/// their own `parent_id`. A childless node may become one.
+#[tokio::test]
+async fn apply_edit_refuses_making_a_node_with_children_a_theme() {
+    let fx = Fixture::new();
+    let (store, root) = fx.store("Store").await;
+    let folder = fx.create(store, root, "folder", "Folder").await;
+    fx.create(store, folder, "document", "Child").await;
+    let empty = fx.create(store, root, "folder", "Empty").await;
+
+    let mut peer = fx.peer_tree(store, root).await;
+    let edit = peer.set_node_type(folder, node_types::THEME, T0).unwrap();
+    for (id, update) in &edit.touched {
+        assert_refused(fx.apply(store, *id, "older-client", update).await);
+    }
+    let edit = peer.set_node_type(empty, node_types::THEME, T0).unwrap();
     for (id, update) in &edit.touched {
         fx.apply(store, *id, "older-client", update).await.unwrap();
     }

@@ -40,19 +40,19 @@ impl StoreManager {
     /// Judge `update` to `node_id`'s document of plain store `store_id` by
     /// what merging it would leave, before it is merged: refused when it
     /// gives the node a `parent_id` naming an internal node it did not name
-    /// before, or adds an id to an internal node's children. The update is
-    /// merged into a copy of the document; the document is not touched.
-    ///
-    /// Only what the update changes is judged: a child an older client put
-    /// under a theme before this was enforced keeps its place, and edits of
-    /// it and of the theme still merge.
+    /// before, adds an id to an internal node's children, or makes a node
+    /// internal while it holds children. Only what the update changes is
+    /// judged: a child an older client put under a theme before this was
+    /// enforced keeps its place, and edits of it and of the theme still
+    /// merge. The update is merged into a copy of the document; the
+    /// document is not touched.
     pub fn judge_placement(&self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<()> {
         let tree = self.local(store_id)?.tree();
         let held = tree.doc(node_id);
-        let (parent_before, children_before) = match held {
-            Some(doc) => (doc.stored_fields().ok().and_then(|f| f.parent_id), doc.children()),
-            None => (None, Vec::new()),
-        };
+        let fields_before = held.and_then(|doc| doc.stored_fields().ok());
+        let parent_before = fields_before.as_ref().and_then(|f| f.parent_id);
+        let was_internal = fields_before.as_ref().is_some_and(|f| internal_kind(&f.node_type).is_some());
+        let children_before = held.map(|doc| doc.children()).unwrap_or_default();
         let mut merged = match held {
             Some(doc) => NodeDoc::load(&doc.save())?,
             None => NodeDoc::new(),
@@ -66,7 +66,14 @@ impl StoreManager {
             refuse_internal_parent(tree, parent_id)?;
         }
         if let Some(kind) = internal_kind(&fields.node_type) {
-            if merged.children().iter().any(|child| !children_before.contains(child)) {
+            let children = merged.children();
+            if children.iter().any(|child| !children_before.contains(child)) {
+                return Err(StoreError::InsideInternal { kind });
+            }
+            // A node made internal by this update must hold nothing already:
+            // no list entry, and no document naming it as its parent (which
+            // repair would list under it).
+            if !was_internal && (!children.is_empty() || !tree.documents_under(&HashSet::from([node_id])).is_empty()) {
                 return Err(StoreError::InsideInternal { kind });
             }
         }
