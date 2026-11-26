@@ -510,6 +510,12 @@ pub mod node_types {
     /// topic; its `content` is unused. A standalone one is a tree node; one
     /// on a node is an attachment of it (`attached_to`).
     pub const DISCUSSION: &str = "discussion";
+
+    /// Theme node - a document theme (docs/THEMES_CONTRACT.md section 3.1).
+    /// Its document's `data.theme` holds the tokens it sets and its base;
+    /// its title is the theme's name. Internal: hidden by its kind
+    /// ([`crate::internal::InternalKind::Theme`]).
+    pub const THEME: &str = "theme";
 }
 
 fn is_zero(n: &u32) -> bool {

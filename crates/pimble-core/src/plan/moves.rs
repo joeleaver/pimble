@@ -2,6 +2,7 @@
 //! docs/MOVE_CONTRACT.md): where they land, whether they may happen, what the
 //! person is told before they do, and which requests make them.
 
+use crate::internal::InternalKind;
 use crate::{NodeId, Place, StoreAccess, StoreId};
 
 use super::{access, ancestors, TreeView};
@@ -30,6 +31,9 @@ pub enum Refusal {
     MountNotHere,
     /// Something it would change may only be read here.
     ReadOnly,
+    /// The new parent is an internal node (docs/THEMES_CONTRACT.md section
+    /// 3.1a), which holds nothing.
+    IntoInternal(InternalKind),
 }
 
 impl Refusal {
@@ -40,6 +44,7 @@ impl Refusal {
             Refusal::IntoItself => INTO_ITSELF,
             Refusal::MountNotHere => MOUNT_NOT_HERE,
             Refusal::ReadOnly => StoreAccess::READ_ONLY_REFUSAL,
+            Refusal::IntoInternal(kind) => kind.holds_nothing(),
         }
     }
 }
@@ -90,8 +95,8 @@ impl MovePlan {
 
 /// The node a row stands for as a parent: a store row its root, a mount the
 /// node it mounts (whose children are the ones drawn under it), anything
-/// else itself. Refused for a store row with no root and a mount whose store
-/// is not open here.
+/// else itself. Refused for a store row with no root, a mount whose store
+/// is not open here, and an internal node, which holds nothing.
 pub fn parent_of_row<V: TreeView + ?Sized>(view: &V, store: StoreId, node: Option<NodeId>) -> Result<(StoreId, NodeId), Refusal> {
     match node {
         None => view.store(store).map(|facts| (store, facts.root)).ok_or(Refusal::NotANode),
@@ -99,7 +104,10 @@ pub fn parent_of_row<V: TreeView + ?Sized>(view: &V, store: StoreId, node: Optio
             .mount_source(store, node)
             .filter(|(source, _)| view.store(*source).is_some())
             .ok_or(Refusal::MountNotHere),
-        Some(node) => Ok((store, node)),
+        Some(node) => match view.internal_kind(store, node) {
+            Some(kind) => Err(Refusal::IntoInternal(kind)),
+            None => Ok((store, node)),
+        },
     }
 }
 

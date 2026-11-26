@@ -99,6 +99,10 @@ pub trait TreeView {
     /// The node's children in order, when the list is held.
     fn children(&self, store: StoreId, node: NodeId) -> Option<Vec<NodeId>>;
 
+    /// The node's internal kind (`internal::internal_kind` of its type),
+    /// when it is held and internal.
+    fn internal_kind(&self, store: StoreId, node: NodeId) -> Option<crate::internal::InternalKind>;
+
     /// Whether the node is a mount.
     fn is_mount(&self, store: StoreId, node: NodeId) -> bool;
 

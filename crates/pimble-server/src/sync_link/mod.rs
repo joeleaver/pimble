@@ -37,7 +37,7 @@ use pimble_host::{Runtime, Task};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::handler::{LocalChange, Repair, RpcHandler};
+use crate::handler::{LocalChange, Placement, Repair, RpcHandler};
 
 mod account;
 mod reconcile;
@@ -550,7 +550,7 @@ async fn forward_local_change(
 /// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 4).
 pub(super) async fn apply_update_locally(handler: &RpcHandler, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8], repair: Repair) -> anyhow::Result<()> {
     handler
-        .apply_node_update_from(store_id, node_id, update, Some(link_id), repair)
+        .apply_node_update_from(store_id, node_id, update, Some(link_id), repair, Placement::Relayed)
         .await
         .map_err(|e| anyhow::anyhow!("local applyEdit for node {} failed: {}", node_id, e.message()))?;
     Ok(())

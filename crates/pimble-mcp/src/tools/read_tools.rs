@@ -6,7 +6,8 @@ use std::collections::HashSet;
 
 use pimble_api::names::{label, stop_sentence, store_tops};
 use pimble_api::{Addr, Pimble as Api};
-use pimble_core::{LinkResolution, PimbleUrl, Store, StoreAccess, StoreKind, SyncState};
+use pimble_core::{LinkResolution, Node, PimbleUrl, Store, StoreAccess, StoreKind, SyncState};
+use pimble_core::internal::{hidden, InternalKind};
 use pimble_crdt::{CrdtError, NodeDoc};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -44,6 +45,10 @@ pub struct ListChildrenParams {
     /// How many levels to list; 1 lists the children only. At most 6.
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Internal kinds to list too, such as `["themes"]`; internal nodes
+    /// (themes) are left out otherwise.
+    #[serde(default)]
+    pub include_internal: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -54,6 +59,10 @@ pub struct FindNodeParams {
     /// Only this store (a name or id).
     #[serde(default)]
     pub store: Option<String>,
+    /// Internal kinds to find too, such as `["themes"]`; internal nodes
+    /// (themes) are left out otherwise.
+    #[serde(default)]
+    pub include_internal: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -69,6 +78,10 @@ pub struct SearchParams {
     /// How many results, at most 50 (default 20).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Internal kinds to list too, such as `["themes"]`; internal nodes
+    /// (themes) are left out otherwise.
+    #[serde(default)]
+    pub include_internal: Option<Vec<String>>,
 }
 
 #[tool_router(router = read_router, vis = "pub(super)")]
@@ -118,6 +131,7 @@ impl Pimble {
     #[tool(name = "list_children")]
     pub(super) async fn list_children(&self, Parameters(p): Parameters<ListChildrenParams>) -> Result<String, String> {
         let depth = p.depth.unwrap_or(1).clamp(1, 6);
+        let shown = internal_kinds(p.include_internal.as_deref())?;
         // A store with several shared roots lists them as its top level.
         let tops = match self.find_store(&p.node).await {
             Ok(store) if !store.roots.is_empty() => store_tops(&store),
@@ -130,7 +144,10 @@ impl Pimble {
             if !store_listing_is_top(&stores, top) {
                 out.push_str(&format!("{}:\n", self.describe(top).await));
             }
-            outline(&self.api, top, depth, 0, &mut seen, &mut out).await?;
+            if seen.insert(top) {
+                let children = shown_children(&self.api, top, &shown).await?;
+                outline(&self.api, children, depth, 0, &shown, &mut seen, &mut out).await?;
+            }
         }
         if out.is_empty() {
             out = "(no children)".into();
@@ -146,6 +163,7 @@ impl Pimble {
         if wanted.is_empty() {
             return Err("Give some of the title to look for.".into());
         }
+        let shown = internal_kinds(p.include_internal.as_deref())?;
         let searched: Vec<Store> = match &p.store {
             Some(name) => vec![self.find_store(name).await?],
             None => self.api.known_stores().await?,
@@ -155,7 +173,7 @@ impl Pimble {
         for store in &searched {
             // The tops themselves are the store's rows, not names to find.
             let Ok(walked) = self.api.walk(store).await else { continue };
-            for w in walked.into_iter().filter(|w| w.parent.is_some()) {
+            for w in walked.into_iter().filter(|w| w.parent.is_some() && !hidden(&w.node.node_type, &shown)) {
                 let lower = label(&w.node).to_lowercase();
                 let rank = if lower == wanted {
                     Some(0)
@@ -312,12 +330,13 @@ impl Pimble {
             None => Vec::new(),
         };
         let limit = p.limit.unwrap_or(20).clamp(1, 50);
-        let mut results = self.api.search(&p.query, only.clone(), p.semantic, limit).await?;
+        let shown = internal_kinds(p.include_internal.as_deref())?;
+        let mut results = self.api.search_shown(&p.query, only.clone(), p.semantic, limit, &shown).await?;
         // Unscoped: the store this session last worked in first, its hits in
         // their own order, then everyone else's in theirs.
         let mut favored = None;
         if let (None, Some(store)) = (&p.store, self.last_store()) {
-            let mine = self.api.search(&p.query, vec![store], p.semantic, limit).await.unwrap_or_default();
+            let mine = self.api.search_shown(&p.query, vec![store], p.semantic, limit, &shown).await.unwrap_or_default();
             if !mine.is_empty() {
                 let others: Vec<_> = results.into_iter().filter(|r| r.store_id != store).collect();
                 results = mine.into_iter().chain(others).take(limit).collect();
@@ -496,30 +515,59 @@ fn outline_of(doc: &NodeDoc) -> Result<String, CrdtError> {
     Ok(out)
 }
 
-/// An indented outline of `at`'s subtree, `depth` levels deep.
+/// The internal kinds a listing named in `include_internal`; a kind that
+/// does not exist is refused with the ones that do.
+fn internal_kinds(named: Option<&[String]>) -> Result<Vec<InternalKind>, String> {
+    named
+        .unwrap_or_default()
+        .iter()
+        .map(|id| {
+            InternalKind::from_id(id.trim()).ok_or_else(|| {
+                let known: Vec<&str> = InternalKind::ALL.iter().map(|k| k.id()).collect();
+                format!("\"{id}\" is not an internal kind; the kinds are {}.", known.join(", "))
+            })
+        })
+        .collect()
+}
+
+/// The children of `at` this listing shows.
+async fn shown_children(api: &Api, at: Addr, shown: &[InternalKind]) -> Result<Vec<(Addr, Node)>, String> {
+    Ok(api.children(at).await?.into_iter().filter(|(_, node)| !hidden(&node.node_type, shown)).collect())
+}
+
+/// An indented outline of `children` (the shown children of a node) and
+/// their subtrees, `depth` levels deep. Each node's children are read once,
+/// for the count its line shows (so it matches the lines under it) and for
+/// the lines under it.
 fn outline<'a>(
     api: &'a Api,
-    at: Addr,
+    children: Vec<(Addr, Node)>,
     depth: u32,
     indent: usize,
+    shown: &'a [InternalKind],
     seen: &'a mut HashSet<Addr>,
     out: &'a mut String,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
-        if !seen.insert(at) {
-            return Ok(());
-        }
-        for (addr, node) in api.children(at).await? {
-            let count = node.children.len();
-            let mount = if node.node_type == "mount" { ", a mount" } else { "" };
-            let children = match count {
+        for (addr, node) in children {
+            let is_mount = node.node_type == "mount";
+            // A mount's children are its source's: not counted on its line,
+            // read only when the outline goes under it.
+            let under = if !node.children.is_empty() || (is_mount && depth > 1) {
+                shown_children(api, addr, shown).await?
+            } else {
+                Vec::new()
+            };
+            let count = if node.children.is_empty() { 0 } else { under.len() };
+            let mount = if is_mount { ", a mount" } else { "" };
+            let counted = match count {
                 0 => String::new(),
                 1 => ", 1 child".into(),
                 n => format!(", {n} children"),
             };
-            out.push_str(&format!("{}- {} ({}{children}{mount})\n", "  ".repeat(indent), label(&node), addr.link()));
-            if depth > 1 && (count > 0 || node.node_type == "mount") {
-                outline(api, addr, depth - 1, indent + 1, seen, out).await?;
+            out.push_str(&format!("{}- {} ({}{counted}{mount})\n", "  ".repeat(indent), label(&node), addr.link()));
+            if depth > 1 && !under.is_empty() && seen.insert(addr) {
+                outline(api, under, depth - 1, indent + 1, shown, seen, out).await?;
             }
         }
         Ok(())

@@ -50,6 +50,8 @@ app_css!(
     "editor_pane.css",
     // A metanode's outline and a query metanode's setup.
     "metanodes.css",
+    // The theme editor: a theme node's tokens beside a sample in it.
+    "theme_editor.css",
     // The empty state, the search bar and its results.
     "search.css",
     // Settings (docs/SETTINGS_CONTRACT.md section 2).

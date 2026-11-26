@@ -91,6 +91,8 @@ pub(super) fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, 
     // `GetStoreSync`'s answer (`StoreSyncChanged`) fills in the real state.
     store.ensure_sync_entry(store_id);
     store.send(BackendCommand::GetStoreSync { store_id });
+    // Its themes are listed once something needs them
+    // (`themes::want_listed`), not here: listing holds the whole store.
 
     // Auto-expand the store node in the tree — and, for a partial replica,
     // each shared root under it, so the store row does not open onto a list of
@@ -231,6 +233,10 @@ pub(super) fn store_closed(store: AppStore, store_id: &StoreId) {
 
     // Structural: remove store and all its signals
     store.remove_store(*store_id);
+    store.store_themes.update(|all| {
+        all.remove(store_id);
+    });
+    crate::themes::listing_ended(*store_id);
     crate::presence::forget_store(store, *store_id);
 
     // Persist open store paths

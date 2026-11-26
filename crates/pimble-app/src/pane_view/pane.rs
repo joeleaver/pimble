@@ -67,6 +67,7 @@ pub(super) fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: Pane
     let discussion_view = crate::discussions::render_discussion(__scope, store, pane);
     // A metanode's outline (docs/METANODES_CONTRACT.md section 1.4), likewise.
     let metanode_view = crate::metanodes::render_metanode(__scope, store, pane);
+    let theme_view = crate::app::render_theme_editor(__scope, store, pane);
     // The discussions on the pane's node, under its content: in the text's
     // scroll for a note, under the view for a board or a sheet.
     let discussions_in_text = crate::discussions::render_host_panel(__scope, store, pane, true);
@@ -330,12 +331,13 @@ pub(super) fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: Pane
             {sheet_view}
             {discussion_view}
             {metanode_view}
+            {theme_view}
             {discussions_panel}
             {picture_controls}
             {presence_carets}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() || state.show_metanode.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() || state.show_metanode.get() || state.show_theme.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}

@@ -23,10 +23,14 @@ mod changes;
 mod cloud;
 mod host;
 mod structure;
+mod themes;
+#[cfg(all(test, feature = "native"))]
+mod theme_tests;
 
 pub use api::{api_command, presence_frame};
 pub use changes::{change_events, shown};
 pub use host::host_command;
+pub use themes::{as_themes, copy_of, customized_name};
 
 use std::future::Future;
 use std::sync::Arc;

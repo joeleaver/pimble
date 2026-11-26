@@ -50,8 +50,7 @@ pub(super) fn render(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     };
     let theme_line = move || -> String {
         let Some((s_id, n_id)) = theme_node() else { return String::new() };
-        let (in_force, walk) = crate::themes::resolve(store, s_id, n_id);
-        crate::themes::in_force_sentence(&in_force, &walk)
+        crate::themes::sentence(store, s_id, n_id)
     };
     let open_theme = move || {
         if let Some((store_id, node_id)) = untracked(theme_node) {

@@ -234,6 +234,7 @@ impl AppStore {
 
         children
             .iter()
+            .filter(|&&(child_store, child_id)| !self.hides_row(child_store, child_id))
             .map(|&(child_store, child_id)| self.structural_node(child_store, child_id, paste, mount_path, finds_crossed, None))
             .collect()
     }

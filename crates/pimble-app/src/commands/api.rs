@@ -196,6 +196,8 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Some(BackendEvent::ThemeChainLoaded { store_id, nodes })
         }
 
+        C::Themes(cmd) => super::themes::theme_command(ctx, cmd).await,
+
         C::GetProperties { store_id, node_id } => {
             // Where it lives: parent by parent, as `GetAncestors` reads them.
             let mut lives_in = Vec::new();
@@ -253,11 +255,11 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", error_message(&e)) }),
         },
 
-        C::Search { query, stores, limit, purpose } => {
+        C::Search { query, stores, limit, shown, purpose } => {
             // Hybrid (keyword + semantic) where a store's backend can; a
             // server built without an ONNX link mode, or an encrypted store
             // searched in the page, answers by words.
-            let results = api.search(&query, stores, true, limit).await.map_err(|e| error_message(&e));
+            let results = api.search_shown(&query, stores, true, limit, &shown).await.map_err(|e| error_message(&e));
             Some(BackendEvent::SearchResults { purpose, results })
         }
 

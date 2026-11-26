@@ -35,6 +35,8 @@ mod api_tests;
 #[cfg(test)]
 mod hashtags_tests;
 #[cfg(test)]
+mod internal_tests;
+#[cfg(test)]
 mod large_notes_tests;
 #[cfg(test)]
 mod presence_tests;

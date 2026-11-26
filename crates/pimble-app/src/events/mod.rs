@@ -145,6 +145,24 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::ThemesNotListed { store_id } => crate::themes::listing_failed(*store_id),
+            BackendEvent::ThemesListed { store_id, themes } => {
+                crate::themes::listing_ended(*store_id);
+                if store.get_store_signal(*store_id).is_some() {
+                    let same = rinch::prelude::untracked(|| store.store_themes.with(|all| all.get(store_id) == Some(themes)));
+                    if !same {
+                        let (store_id, themes) = (*store_id, themes.clone());
+                        store.store_themes.update(|all| {
+                            all.insert(store_id, themes);
+                        });
+                    }
+                }
+            }
+
+            BackendEvent::ThemeMade { store_id, node_id } => {
+                crate::app::open_node(store, tree_state, format!("node_{store_id}_{node_id}"));
+            }
+
             BackendEvent::NodeNotLoaded { store_id, node_id, message } => {
                 crate::metanodes::parent_not_loaded(*store_id, *node_id);
                 connection::error(store, message);
@@ -268,6 +286,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // one of its nodes reconciles. What the catch-up changed in
                 // the tree follows as `Shown`.
                 crate::doc_session::resynced(store, *store_id);
+                // Anything may have changed while it was away, themes too.
+                crate::themes::relist(store, *store_id);
             }
 
             BackendEvent::BlobStored { request_id, result } => {

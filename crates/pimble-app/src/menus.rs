@@ -259,6 +259,9 @@ fn node_entries(store: AppStore) -> Vec<MenuEntry> {
         // docs/THEMES_CONTRACT.md section 9: the document theme the node and
         // its subtree read in.
         MenuEntry::item("Theme...", "", move || crate::app::open_theme_picker_for_selected(store)),
+        // A new theme of the selected row's store, opened in the theme
+        // editor (docs/THEMES_CONTRACT.md section 3.1).
+        MenuEntry::item("New Theme", "", move || crate::themes::new_theme_for_selected(store)),
         MenuEntry::Separator,
         MenuEntry::item("Cut", "", move || {
             if let Some(row) = selected().filter(|v| matches!(crate::state::parse_tree_value(v), Some((_, Some(_))))) {
@@ -307,6 +310,15 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         // The focused pane's node's tags, fields and place
         // (docs/PROPERTIES_CONTRACT.md): checked while open.
         MenuEntry::Check { label: "Properties", shortcut: "Alt+Enter", checked: store.properties_open },
+        // Internal nodes, each kind shown or hidden on its own
+        // (docs/THEMES_CONTRACT.md section 3.1a); none by default.
+        MenuEntry::Sub {
+            label: "Show Internal",
+            entries: pimble_core::internal::InternalKind::ALL
+                .into_iter()
+                .map(|kind| MenuEntry::Check { label: kind.name(), shortcut: "", checked: store.internal_shown[kind.index()] })
+                .collect(),
+        },
         MenuEntry::Separator,
         // The split view (docs/SPLIT_VIEW_CONTRACT.md): each acts on the
         // focused pane. A native menu item cannot be greyed out reactively,

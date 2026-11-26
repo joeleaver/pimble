@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use pimble_core::metanode::{leaves_metanode_warning, parse_node_ref, Condition, Metanode, Named, Query, Source, Within};
 use pimble_core::plan::{found_refusal, lives_in, MovePlan};
 use pimble_core::{node_types, Node, NodeId, Place, StoreId};
+use pimble_core::internal::internal_kind;
 use pimble_crdt::{NodeDoc, NodeFields};
 use pimble_rpc::StoreChangeKind;
 
@@ -221,6 +222,11 @@ impl Pimble {
             if !seen.insert(addr) {
                 continue;
             }
+            // An internal node (a theme) and what is under it are never a
+            // metanode's (docs/THEMES_CONTRACT.md section 3.1a).
+            if internal_kind(&node.node_type).is_some() {
+                continue;
+            }
             if let Some(parent) = parent {
                 if let Some(p) = entries.iter_mut().find(|e| e.addr == parent) {
                     p.children.push(addr);
@@ -315,6 +321,9 @@ impl Pimble {
                         let doc = if child.content.is_empty() { self.doc(addr).await.ok() } else { NodeDoc::load(&child.content).ok() };
                         let Some(doc) = doc else { continue };
                         let Ok(fields) = doc.stored_fields() else { continue };
+                        if internal_kind(&fields.node_type).is_some() {
+                            continue;
+                        }
                         if child.node_type != node_types::MOUNT {
                             stack.push(addr);
                         }
@@ -338,6 +347,9 @@ impl Pimble {
                 for id in h.tree.get_children(at).unwrap_or_default() {
                     let Some(doc) = h.tree.doc(id) else { continue };
                     let Ok(fields) = doc.stored_fields() else { continue };
+                    if internal_kind(&fields.node_type).is_some() {
+                        continue;
+                    }
                     if fields.node_type != node_types::MOUNT {
                         stack.push(id);
                     }

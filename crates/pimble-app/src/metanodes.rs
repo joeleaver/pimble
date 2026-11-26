@@ -183,6 +183,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     // board and a discussion too).
     crate::editor::stop_editing(store, pane);
     crate::sheets::stop(store, pane);
+    crate::app::stop_theme_editor(store, pane);
     let state = store.pane(pane);
     state.show_editor.set(false);
     state.show_board.set(false);

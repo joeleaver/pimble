@@ -127,6 +127,16 @@ pub enum BackendEvent {
     /// so on up, each taken as `NodeLoaded` takes one. Empty when the node
     /// itself could not be read.
     ThemeChainLoaded { store_id: StoreId, nodes: Vec<Node> },
+    /// Every theme node of a store (`ThemeCommand::List`, and again
+    /// whenever one changes or the store is caught up).
+    ThemesListed { store_id: StoreId, themes: Vec<pimble_api::StoreTheme> },
+    /// `ThemeCommand::List` could not read the store's themes (the
+    /// connection dropped as it asked): the store is asked again when it is
+    /// caught up (`Resynced`).
+    ThemesNotListed { store_id: StoreId },
+    /// A theme node was made to be edited (`ThemeCommand::New`, or a copy
+    /// customized): open it in the focused pane.
+    ThemeMade { store_id: StoreId, node_id: NodeId },
     /// Answer to `GetProperties`: the nodes above `node_id`, the store's top
     /// first, each with the label its row shows (empty for a store's root,
     /// or when the chain could not be read), and the tags used in the store.

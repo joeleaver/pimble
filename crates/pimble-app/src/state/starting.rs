@@ -58,6 +58,8 @@ impl AppStore {
             link_modal_pending: Signal::new(false),
             appearance_modal_node: Signal::new(None),
             theme_picker_node: Signal::new(None),
+            store_themes: Signal::new(HashMap::new()),
+            internal_shown: std::array::from_fn(|_| Signal::new(false)),
             appearance_icon_query: Signal::new(String::new()),
             properties_open: Signal::new(false),
             properties_width: Signal::new(crate::properties::DEFAULT_WIDTH),

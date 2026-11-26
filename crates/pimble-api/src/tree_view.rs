@@ -64,6 +64,10 @@ impl TreeView for HeldView<'_> {
         self.held(store)?.tree.get_children(node).ok()
     }
 
+    fn internal_kind(&self, store: StoreId, node: NodeId) -> Option<pimble_core::internal::InternalKind> {
+        pimble_core::internal::internal_kind(&self.bare(store, node)?.node_type)
+    }
+
     fn is_mount(&self, store: StoreId, node: NodeId) -> bool {
         self.bare(store, node).is_some_and(|n| n.node_type == node_types::MOUNT)
     }

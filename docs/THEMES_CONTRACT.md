@@ -522,9 +522,10 @@ text good at any width. Until either lands, no token depends on it.
 - **A theme node opens as the theme editor**: the tokens in groups (section 2.1), each with
   a control fitting its type; a token it does not set shows the inherited value greyed with
   where it comes from ("17 px, from Book"), a token it sets has a reset that clears it back
-  to inherited, and a "Show only what this theme changes" switch lists the tweaks alone; a
-  sample text
-  under it drawn live, and a scheme switch to preview dark and light. Edits are `applyEdit`s
+  to inherited, and a "Show only what this theme changes" switch lists the tweaks alone.
+  Like the picker it has two columns (Joe, 2026-11-25): the tokens on the left, and on the
+  right a sample text drawn live in the theme as it stands, with a scheme switch to preview
+  dark and light. Edits are `applyEdit`s
   of `data.theme`, so two people editing a theme see each other's changes as they land.
 - **Settings > General > Theme**: the app theme, from the built-ins and the person's own
   app themes, with "Customize..." (a new personal app theme based on the one in use, opened
@@ -706,6 +707,115 @@ cut or add.
   spaced note before (only the title in the pane's header differs, the notes being
   different); each built-in was looked at in a pane and in the picker's preview. Not yet:
   `--cpu`, and the browser side by side.
+
+### Built: wave 2 (2026-11-25, not merged)
+
+- **Theme nodes** (`node_types::THEME`): a theme's base, the tokens it sets and, for a
+  copy, `copied_from { store, node, at }` are the keys of its node document's `data.theme`
+  (`pimble_api::themes::DATA_KEY`), written in the create that makes the node
+  (`recipes::theme`) and edited one key at a time (`Pimble::edit_theme`, an `applyEdit`
+  of the keys it names; setting what is there writes nothing). `Pimble::themes(store)`
+  lists a store's live theme nodes wherever they sit, by name; the app holds that list
+  per open store (`AppStore::store_themes`, `ThemeCommand::List` /
+  `BackendEvent::ThemesListed`), listed only once something needs it (a chain naming a
+  theme that is not a built-in, the picker, the theme editor, New Theme), then again after
+  a `Resynced` and whenever a store change touches a theme's document while the store's
+  themes are at hand (`Pimble::themes_at_hand`: the API holds every document of the store,
+  or the store passes changes through), so a store nobody reads themes in is never walked
+  for them. A listing that fails (the connection dropped as it asked) answers
+  `ThemesNotListed`, and the store's themes are asked for again when it is caught up. That list is what every theme
+  reader resolves through (`pimble_themes::WithStore`), the pane's drawing included: it
+  is read from the documents, never kept beside them.
+- **Internal kinds** (`pimble_core::internal`: `InternalKind`, `internal_kind`, `hidden`):
+  the explorer (`state::internal::hides_row`), the agents' picker, search in every app view
+  (`Pimble::search_shown`: hidden hits are left out before the limit, asking the index for
+  more until the limit is filled or it has no more), metanode sources and finds (always, since a metanode is a shared
+  document and a per-device preference must not change what it shows), the Properties
+  panel's references, and the MCP's `list_children` (whose child counts count only shown
+  children), `find_node` and `search` (`include_internal: ["themes"]`; an unknown kind is
+  refused with the ones there are) leave internal nodes and their subtrees out. Nothing
+  goes inside an internal node: every create and move is judged by `plan::parent_of_row`,
+  which refuses one with "Nothing goes inside a theme." (`Refusal::IntoInternal`). The
+  server enforces it for plain stores with the same sentence (`StoreError::InsideInternal`,
+  `pimble-store`'s `manager/placement.rs`): `createNode`, `moveNode`, `moveNodes` (before
+  any node moves) and `transplantNode` by the parent they name, and an `applyEdit` by what
+  merging it would leave, judged on a copy of the document before the merge (a `parent_id`
+  newly naming an internal node, an id added to an internal node's children, or a node
+  made internal while it holds children, listed or only named by a child's `parent_id`).
+  Only an update that could place something is judged: one with a struct that lands in
+  the `node` or `children` root, or whose landing cannot be told (`NodeDoc::may_place`
+  reads it from the update's struct headers and the document's own structs, without
+  merging). A keystroke is let through as it is: on a 5,000-paragraph note (788 KB) the
+  judgement of a one-character edit went from 10.9 ms to 25 µs. Only what an update
+  changes is judged, so a
+  child put under a theme before this keeps its place and its edits. A move by such a
+  client sends three updates: the old parent's list, the theme's list and the node's
+  own. The last two are refused and the first goes in, since taking an entry out of a
+  list places nothing; the node then names a parent whose list says it left, which
+  repair leaves alone by design (docs/MOVE_CONTRACT.md "Repair"), so it shows in
+  "Recently Deleted..." as a node no list names, with "Put Back" to the root. A refused update
+  stays in the copy of the client that sent it, and that client's later edits of the
+  same document build on it, so the server parks them and they never show: only a client
+  that does not judge placement itself (an older one, a script) gets there, and it loses
+  its later edits of that document until it takes a fresh copy. A relayed edit (a sync
+  or vault link's) is not judged, since it was judged where it was made and a replica
+  that refused it would stay apart from its peer. An encrypted (vault) store is ciphertext to the server, which cannot judge it:
+  there only the clients refuse it. A child an older client put under a theme in an
+  encrypted store, or before the server judged it, is hidden with it in the tree, but
+  search still finds it by its own kind. View > "Show Internal" has a check per kind, kept per device in the
+  view preferences (`views::internal_shown`); a shown node is dimmed and drawn with its
+  kind's icon; the store row's tooltip counts what is hidden once the store's themes are
+  listed.
+- **New Theme** (Node menu): a theme of the selected row's store, named "New theme" (or
+  "New theme 2", ..., numbered by the backend against the themes the store holds, so does
+  "Customize"), made under the store root as every create is made (`Pimble::create`, so
+  a store this device may only read refuses it) and opened in the theme editor.
+- **The picker** (section 9): "This store's themes" (each with "Edit" beside its name),
+  Built-in, and "From other open stores" (each saying its store, and "copied here" once a
+  copy exists). Choosing another store's theme copies it in, or applies the copy made
+  before (`ThemeCommand::Copy`; a copy keeps a built-in base and folds every theme of the
+  source store between it and that built-in into its own tokens, `edit::flatten`).
+  "Customize <theme>..." makes a new theme based on the previewed theme (or the one in
+  force) named "<theme> (customized)", applies it to the node and opens it in the editor;
+  "Customize at '<ancestor>'..." does the same on the ancestor that names the theme in
+  force.
+- **The theme editor** (`app/theme_editor/`): a theme node opens in a pane as two columns.
+  On the left: a line saying what a copy was copied from, "Based on" (built-ins and the
+  store's themes, less itself and every theme that would make a cycle; a cycle is refused
+  again when chosen), "Show only what this theme changes", and the tokens in their groups,
+  each with a control fitting its type (typed lengths and numbers checked by
+  `edit::typed`, lists for words and fonts, a check for a switch, light and dark fields for
+  a pair, a slot list and a pair for a block's color; choosing "Own colors" for a block
+  that used a slot starts from that slot's colors, the chain's palette or the app's,
+  read from the app's own sheet as the page resolves it: the last declaration of a
+  variable, through the variables it names). A token the theme does not set reads
+  dimmed with where its value comes from ("17px, from Book"; "Default" for the look before
+  themes); a token it sets has "Reset"; a stored value that was refused says why. Setting
+  one half of an unset pair offers the other (the light color lifted for dark with
+  `display_color`). On the right: the sample text drawn in the theme as it stands, with a
+  Light/Dark switch (the app's scheme when it opens). The sample's wrap carries the app's
+  color variables of the scheme chosen (`model::root_vars` over `theme_css`), so a theme
+  that sets no palette still draws the page the chosen scheme would. The editor holds nothing of its own:
+  it draws the listed theme and sends `ThemeCommand::Edit`, so an edit from anywhere shows
+  as it lands. A theme this device may only read shows the read-only sentence and refuses
+  every change with it. A theme node reached any other way (a link, a pane's layout
+  restored at start) opens in the editor too (`events::panes::open_in_panes`), the layout
+  remembers it like any pane's node, and the pane's strip shows the palette icon.
+- **Read as follows where the sections above left room**: New Theme on a mount row acts
+  on the source's store; the editor fills in the other half of a pair rather than offering
+  a "Suggest the dark one" button (the half filled in can be changed); the theme's name is
+  its node's title, renamed in the explorer or the pane's header like any node's.
+- **Checked**: unit tests (`theme_editor::model`, `themes`, `plan` with
+  `nothing_goes_inside_an_internal_node`, `pimble-api/tests/themes.rs`, the MCP's
+  `internal_tests`), the commands end to end on a real server
+  (`commands::theme_tests`: New numbering, a copy folded, reused, customized,
+  `themes_at_hand`), a theme pane opening from an arriving node
+  (`events::tests::theme_pane`), and screenshots on the desktop: Show Internal, the
+  editor in both schemes, the pane restored at start, the picker's other-store group
+  previewed and copied, Edit on the copy, Customize; and in the browser on the local
+  stack, on an encrypted store: New Theme opening the editor, an edit drawing in the
+  sample and in a note the theme is applied to (and again after a reload), the store's
+  group in the picker, Show Internal, and "Own colors" starting from a slot's pair.
 
 ## 14. How it is checked
 

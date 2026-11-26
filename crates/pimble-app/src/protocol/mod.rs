@@ -20,10 +20,12 @@
 mod asked;
 mod commands;
 mod events;
+mod themes;
 
 pub use asked::{Asked, CloudOp};
 pub use commands::{BackendCommand, NodeInit, TagEdit};
 pub use events::{BackendEvent, NoteName, StoredBlob};
+pub use themes::ThemeCommand;
 
 use crossbeam_channel::{Receiver, Sender};
 

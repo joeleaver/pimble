@@ -118,3 +118,4 @@ mod column_view;
 mod nodes;
 mod replicas;
 mod sharing;
+mod theme_pane;

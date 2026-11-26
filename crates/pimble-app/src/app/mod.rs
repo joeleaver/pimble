@@ -35,7 +35,9 @@ mod shell;
 mod status;
 mod store_modals;
 mod theme;
+mod theme_editor;
 mod theme_picker;
+mod theme_picker_list;
 mod theme_preview;
 mod tree_row;
 #[cfg(test)]
@@ -56,8 +58,10 @@ pub use share_modal::open_share_modal;
 pub use store_modals::{pick_and_create_store, pick_and_open_store};
 pub use store_modals::{open_connect_modal, open_mount_picker, open_new_store_modal};
 pub(crate) use appearance_modal::open_appearance_for_selected;
+pub use theme_editor::ThemeUi;
+pub(crate) use theme_editor::{render_theme_editor, start as start_theme_editor, stop as stop_theme_editor};
 pub use theme::{apply_theme, theme_css, theme_props, toggle_dark_mode};
-pub(crate) use theme_picker::{open_theme_picker, open_theme_picker_for_selected};
+pub(crate) use theme_picker::{open_theme_picker, open_theme_picker_for_selected, theme_target};
 
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
@@ -144,6 +148,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         store.properties_open.set(panel.open);
         store.properties_width.set(panel.width.clamp(crate::properties::MIN_WIDTH, crate::properties::MAX_WIDTH));
     }
+    // The internal kinds this device shows (View > "Show Internal").
+    store.keep_internal_shown();
     // The first run only subscribes (no timer before the window exists).
     let panel_subscribed = Cell::new(false);
     let _ = rinch::Effect::new(move || {

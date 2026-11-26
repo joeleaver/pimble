@@ -17,6 +17,7 @@ pub mod plan;
 pub mod metanode;
 pub mod mention;
 pub mod watch;
+pub mod internal;
 
 pub use blob::*;
 pub use index_unit::*;

@@ -8,6 +8,7 @@
 
 pub mod color;
 pub mod css;
+pub mod edit;
 pub mod fonts;
 pub mod resolve;
 pub mod theme;
@@ -16,6 +17,6 @@ pub mod value;
 
 pub use color::{ColorRef, Pair, Rgb, Slot};
 pub use css::{draw, Drawn};
-pub use resolve::{fold, in_force, Builtins, Folded, InForce, Link, Origin, ThemeSource};
-pub use theme::{builtin, builtin_ids, builtins, Theme, Tokens, DEFAULT, DOCUMENT};
+pub use resolve::{fold, in_force, Builtins, Folded, InForce, Link, Origin, ThemeSource, WithStore};
+pub use theme::{builtin, builtin_ids, builtins, Theme, Tokens, BASE, COPIED_FROM, DEFAULT, DOCUMENT};
 pub use value::{Refusal, Value};

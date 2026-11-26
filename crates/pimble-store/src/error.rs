@@ -45,6 +45,11 @@ pub enum StoreError {
     #[error("Node {node_id} is a mount point and has no children of its own; create under the mount's source instead")]
     MountHasNoChildren { node_id: NodeId },
 
+    /// Nothing goes inside an internal node (docs/THEMES_CONTRACT.md
+    /// section 3.1a): the sentence the clients refuse it with.
+    #[error("{}", kind.holds_nothing())]
+    InsideInternal { kind: pimble_core::internal::InternalKind },
+
     /// A vault blob (docs/CRYPTO_CONTRACT.md) exceeds the per-blob limit.
     #[error("Vault blob of {size} bytes exceeds the vault's per-blob limit")]
     VaultBlobTooLarge { size: usize },
