@@ -170,7 +170,7 @@ use uuid::Uuid;
 
 use pimble_store::sync_state;
 
-use crate::handler::{LocalChange, Repair, RpcHandler};
+use crate::handler::{LocalChange, Placement, Repair, RpcHandler};
 use crate::share::{ShareCommand, Upkeep};
 
 pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -2106,7 +2106,7 @@ async fn apply_unit_locally(
         }
     };
 
-    if let Err(e) = handler.apply_node_update_from(store_id, *node_id, &plaintext, Some(link_id), repair).await {
+    if let Err(e) = handler.apply_node_update_from(store_id, *node_id, &plaintext, Some(link_id), repair, Placement::Relayed).await {
         // One document's update that will not merge holds back that
         // document, never the link.
         warn!("Vault link for store {} doc {:?}: the update would not apply: {}", store_id, doc_id, e.message());

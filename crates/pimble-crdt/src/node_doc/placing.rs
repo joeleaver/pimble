@@ -13,8 +13,13 @@
 //! Where a struct lands is in its header. One with neither origin names
 //! its parent: a root by name, or a nested type by the id of the struct
 //! that holds it. One with an origin lands where that origin is (its left
-//! origin first, then its right, as yrs integrates it), and the origin is
-//! another struct of the same update or one the document holds.
+//! origin first, then its right, as yrs integrates it): where the document
+//! has it when the document holds it, and otherwise where the update's own
+//! header of it says. yrs merges no header of a struct it holds already,
+//! so such a header is never believed: an update could carry a held
+//! struct under a forged parent to hide where a new one lands. A struct
+//! the document holds in part counts as placing (yrs gives its new part
+//! the held part as its origin, beside its own header).
 //! [`yrs::Update`] keeps its structs to itself, so the headers are read
 //! here with yrs's own v1 decoder, exactly as `Update::decode_v1` reads
 //! them, and the content with [`ItemContent::decode`]. Whatever cannot be
@@ -140,16 +145,17 @@ impl NodeDoc {
         let lands_at = |id: &ID| -> Option<Lands> {
             let mut id = *id;
             for _ in 0..=bound {
-                match struct_holding(&structs, &id) {
-                    Some(inserted) => match &inserted.parent {
-                        Parent::Root(name) => return Some(root_lands(name)),
-                        Parent::Nested => return Some(Lands::Elsewhere),
-                        // Followed by its left origin (or its right when it
-                        // has no left); a left that cannot be told is "cannot
-                        // be told" here, though yrs might take the right.
-                        Parent::Beside(left, right) => id = left.or(*right)?,
-                    },
-                    None => return held_lands(&txn, &id),
+                if id.clock < held.get(&id.client) {
+                    return held_lands(&txn, &id);
+                }
+                // Neither held nor in the update: the struct waits for it.
+                match &struct_holding(&structs, &id)?.parent {
+                    Parent::Root(name) => return Some(root_lands(name)),
+                    Parent::Nested => return Some(Lands::Elsewhere),
+                    // Followed by its left origin (or its right when it has
+                    // no left); a left that cannot be told is "cannot be
+                    // told" here, though yrs might take the right.
+                    Parent::Beside(left, right) => id = left.or(*right)?,
                 }
             }
             None
@@ -160,6 +166,9 @@ impl NodeDoc {
                 // What the document holds already is not merged again.
                 if inserted.clock + inserted.len <= known {
                     continue;
+                }
+                if inserted.clock < known {
+                    return Ok(true);
                 }
                 let lands = match &inserted.parent {
                     Parent::Root(name) => Some(root_lands(name)),
@@ -267,6 +276,52 @@ mod tests {
         let mut fresh = NodeDoc::new();
         fresh.init("document", "New", Some(NodeId::new()), T0).unwrap();
         assert!(NodeDoc::new().may_place(&fresh.save()).unwrap());
+    }
+
+    /// An update that carries a struct the document holds (a `children`
+    /// entry) under a forged header naming `content`, and a new struct
+    /// after it: yrs puts the new one where the held one really is, in the
+    /// list, so it may place.
+    #[test]
+    fn a_forged_header_of_a_held_struct_is_not_believed() {
+        use yrs::block::BLOCK_ITEM_ANY_REF_NUMBER;
+        use yrs::encoding::write::Write;
+        use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+        use yrs::IdSet;
+
+        let (mut doc, _) = note_and_peer();
+        // A peer whose only struct is one list entry, at its clock 0.
+        let mut lister = NodeDoc::load(&doc.save()).unwrap();
+        let before = doc.state_vector();
+        lister.insert_child(0, NodeId::new()).unwrap();
+        doc.apply_update(&lister.diff_since(&before).unwrap()).unwrap();
+        let client = lister.doc.client_id();
+        let entry = ID::new(client, 0);
+        assert_eq!(held_lands(&doc.doc.transact(), &entry), Some(Lands::Placing));
+
+        let smuggled = NodeId::new();
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(1u32);
+        encoder.write_var(2u32);
+        encoder.write_client(client);
+        encoder.write_var(0u32);
+        // The held entry again, said to be in `content`.
+        encoder.write_info(BLOCK_ITEM_ANY_REF_NUMBER);
+        encoder.write_parent_info(true);
+        encoder.write_string("content");
+        encoder.write_len(1);
+        encoder.write_any(&yrs::Any::from(NodeId::new().to_string()));
+        // A new struct after it.
+        encoder.write_info(BLOCK_ITEM_ANY_REF_NUMBER | HAS_ORIGIN);
+        encoder.write_left_id(&entry);
+        encoder.write_len(1);
+        encoder.write_any(&yrs::Any::from(smuggled.to_string()));
+        IdSet::new().encode(&mut encoder);
+        let forged = encoder.to_vec();
+
+        assert!(doc.may_place(&forged).unwrap());
+        doc.apply_update(&forged).unwrap();
+        assert!(doc.children().contains(&smuggled), "yrs does list it");
     }
 
     #[test]

@@ -466,6 +466,18 @@ impl RepairDebouncer {
     }
 }
 
+/// Whether `apply_node_update_from` judges where an update puts things.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A client's own edit: refused, before it is merged and under the same
+    /// write lock, when it would put something inside an internal node
+    /// (docs/THEMES_CONTRACT.md section 3.1a), so no other update lands
+    /// between the judgement and the merge.
+    Judged,
+    /// A relayed edit (a sync or vault link's), judged where it was made.
+    Relayed,
+}
+
 /// When the tree is repaired after a merged update touched `node` or
 /// `children` (docs/NODE_DOCUMENT_CONTRACT.md section 2). One peer's tree
 /// edit is several documents' updates, and they arrive one at a time: a
@@ -2885,9 +2897,13 @@ impl RpcHandler {
         update: &[u8],
         source: Option<&str>,
         repair: Repair,
+        placement: Placement,
     ) -> Result<NodeUpdateEffect, ErrorObjectOwned> {
         let (effect, kinds, released) = {
             let mut manager = self.store_manager.write().await;
+            if placement == Placement::Judged {
+                manager.judge_placement(store_id, node_id, update).map_err(to_rpc_error)?;
+            }
             let tree = manager.tree(store_id).map_err(to_rpc_error)?;
             let before = tree.shape(node_id);
             // A document holding a parked update: what was held back before
@@ -6226,19 +6242,19 @@ impl PimbleApiServer for RpcHandler {
                         return Err(if discussion || manager.comment_refused(request.store_id, &[id]) { read_only_error() } else { comment_only_error() });
                     }
                 }
-                // Nothing goes inside an internal node (docs/THEMES_CONTRACT.md
-                // section 3.1a), judged on what the merge would leave. A
-                // relayed edit was judged where it was made, and refusing
-                // one here would leave two replicas apart for good.
-                manager.judge_placement(request.store_id, request.node_id, &bytes).map_err(to_rpc_error)?;
             }
         }
+        // Nothing goes inside an internal node (docs/THEMES_CONTRACT.md
+        // section 3.1a), judged with the merge. A relayed edit was judged
+        // where it was made, and refusing one here would leave two replicas
+        // apart for good.
+        let placement = if is_link_client(&request.client_id) { Placement::Relayed } else { Placement::Judged };
 
         // Merged, persisted on the flush debounce, broadcast with the same
         // bytes (never re-encoded or reinterpreted), indexed, repaired: all
         // in one place, shared with the links.
         let effect = self
-            .apply_node_update_from(request.store_id, request.node_id, &bytes, Some(&request.client_id), Repair::Debounced)
+            .apply_node_update_from(request.store_id, request.node_id, &bytes, Some(&request.client_id), Repair::Debounced, placement)
             .await?;
 
         // A person's content edit stamps the node's `modified_at`: as a tree

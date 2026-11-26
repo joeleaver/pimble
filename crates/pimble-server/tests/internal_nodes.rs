@@ -33,14 +33,16 @@ fn assert_refused<T: std::fmt::Debug>(answer: Result<T, ErrorObjectOwned>) {
 
 struct Fixture {
     handler: RpcHandler,
+    manager: Arc<RwLock<StoreManager>>,
     dir: tempfile::TempDir,
 }
 
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let handler = RpcHandler::in_dir(Arc::new(RwLock::new(StoreManager::new())), dir.path());
-        Fixture { handler, dir }
+        let manager = Arc::new(RwLock::new(StoreManager::new()));
+        let handler = RpcHandler::in_dir(manager.clone(), dir.path());
+        Fixture { handler, manager, dir }
     }
 
     async fn store(&self, name: &str) -> (StoreId, NodeId) {
@@ -226,8 +228,9 @@ async fn apply_edit_refuses_an_update_that_puts_a_child_under_a_theme() {
     // each other's repair for as long as both are connected), so the note
     // is a live node no list names: in "Recently Deleted..." with a Put
     // Back to the root, never lost.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    assert!(!fx.children(store, root).await.contains(&note), "repair does not undo the old parent's update");
+    let repaired = fx.manager.write().await.repair_tree(store).unwrap();
+    assert!(repaired.is_none(), "repair leaves the old parent's update as it is: {repaired:?}");
+    assert!(!fx.children(store, root).await.contains(&note));
     let deleted = fx.handler.list_deleted(&service_extensions(), ListDeletedRequest { store_id: store }).await.unwrap();
     let entry = deleted.nodes.iter().find(|d| d.node.id == note).expect("the note is offered back");
     assert_eq!((entry.deleted_at.as_deref(), entry.put_back_under), (None, Some(root)));
