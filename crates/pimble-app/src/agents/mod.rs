@@ -30,6 +30,8 @@ use crate::protocol::BackendCommand;
 use crate::state::AppStore;
 use client_config::{Format, NewEntry};
 
+// Settings draws the AI Agents page on the desktop only.
+#[cfg(feature = "native")]
 pub(crate) use view::render_page;
 
 /// The apps Pimble can set up itself, and "another one".
