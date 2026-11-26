@@ -20,6 +20,9 @@
 //!   the "desktop" side under test — each with its own temp keystore,
 //!   credentials file and replicas directory.
 
+mod pimble_cloud_bin;
+mod rhypedb_bin;
+
 use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1597,44 +1600,6 @@ async fn run_edge_proxy(listener: std::net::TcpListener, cloud_port: u16, h_port
     }
 }
 
-fn find_rhypedb_server() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RHYPEDB_SERVER_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let home = dirs::home_dir()?;
-    for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
-        let p = home.join(rel);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// `pimble-cloud` is a workspace member, not an external checkout: look for
-/// an already-built binary next to this crate's own target directory
-/// (`cargo build -p pimble-cloud --release` builds it there) rather than
-/// building it from inside this test.
-fn find_pimble_cloud_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("PIMBLE_CLOUD_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.to_path_buf();
-    for rel in ["target/release/pimble-cloud", "target/debug/pimble-cloud"] {
-        let p = workspace_root.join(rel);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// The verification link `pimble-cloud`'s `LogMailer` writes at `info`
 /// (`RUST_LOG=pimble_cloud=info`, set on the child below) — polls the
 /// captured log file until the link appears.
@@ -1657,14 +1622,14 @@ async fn wait_for_verify_url(log_path: &Path, timeout: Duration) -> Option<Strin
 
 #[tokio::test]
 async fn interop_with_the_real_accounts_service() {
-    let Some(rhypedb_bin) = find_rhypedb_server() else {
+    let Some(rhypedb_bin) = rhypedb_bin::find() else {
         eprintln!(
             "SKIPPING interop_with_the_real_accounts_service: no rhypedb-server binary found \
              (set RHYPEDB_SERVER_BIN, or build ~/dev/rhypedb in release or debug mode)"
         );
         return;
     };
-    let Some(cloud_bin) = find_pimble_cloud_binary() else {
+    let Some(cloud_bin) = pimble_cloud_bin::find() else {
         eprintln!(
             "SKIPPING interop_with_the_real_accounts_service: no pimble-cloud binary found \
              (set PIMBLE_CLOUD_BIN, or `cargo build -p pimble-cloud --release`)"
@@ -1802,6 +1767,12 @@ async fn interop_with_the_real_accounts_service() {
         .expect("signup request sends");
     assert_eq!(signup_resp.status(), 202, "signup must accept a well-formed real body");
 
+    // Before the link is followed, `cloudSignIn` is refused with the code a
+    // sign-in page reads to offer the link again (the password matched).
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    let unverified = client_a.cloud_sign_in(&cloud_url, &email, password).await.expect_err("an unverified address cannot sign in");
+    assert!(unverified.is_email_unverified(), "an unverified address is told apart by its code, got {unverified:?}");
+
     let verify_url = wait_for_verify_url(&cloud_log_path, Duration::from_secs(5))
         .await
         .expect("the verification link must appear in pimble-cloud's log (LogMailer, RUST_LOG=pimble_cloud=info)");
@@ -1812,7 +1783,6 @@ async fn interop_with_the_real_accounts_service() {
     assert!(location.contains("verified=1"), "verification must succeed, got redirect to {location}");
 
     // The desktop side: real `cloudSignIn`/`cloudHostStore` against the real service.
-    let (mut a, client_a, a_dir) = start_local_server().await;
     client_a.cloud_sign_in(&cloud_url, &email, password).await.expect("cloudSignIn against the real service succeeds");
     let status = client_a.cloud_status().await.unwrap();
     assert!(status.signed_in);

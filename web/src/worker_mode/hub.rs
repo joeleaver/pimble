@@ -20,14 +20,6 @@ extern "C" {
     fn hub_status() -> JsValue;
     #[wasm_bindgen(js_namespace = PimbleHub, js_name = take)]
     fn hub_take(name: &str) -> Promise;
-    #[wasm_bindgen(js_namespace = PimbleHub, js_name = leaveOffline)]
-    fn hub_leave_offline() -> Promise;
-}
-
-/// The switch off: the service worker that kept this app's files for a page
-/// opened with no network is unregistered and its caches deleted.
-pub fn leave_offline() {
-    let _ = hub_leave_offline();
 }
 
 fn object(fields: &[(&str, JsValue)]) -> JsValue {

@@ -13,9 +13,11 @@ use std::collections::HashSet;
 
 mod choice;
 mod records;
+mod sending;
 
 pub use choice::*;
 pub use records::*;
+pub use sending::*;
 
 /// The scrubbing rules for one computer: its home folder, and the note titles
 /// known not to be sent.

@@ -9,11 +9,12 @@
 //! in-process on an ephemeral port: `rhypedb_server::run()` parses this test
 //! binary's own argv via `clap` and calls `std::process::exit` on any
 //! problem, which is exactly wrong for a test. Every test therefore spawns
-//! the real `rhypedb-server` binary as a subprocess (found at
-//! `~/dev/rhypedb/target/{release,debug}/rhypedb-server` or on `PATH`) and
-//! skips cleanly, printing why, when it can't be found.
+//! the real `rhypedb-server` binary as a subprocess (found by
+//! `integration/rhypedb_bin.rs`) and skips cleanly, printing why, when it
+//! can't be found, unless `RHYPEDB_SERVER_REQUIRED=1` (CI) makes that a
+//! failure.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -54,34 +55,6 @@ const PUBLIC_URL: &str = "http://cloud.test";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
-fn find_rhypedb_server_binary() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("RHYPEDB_SERVER_BIN") {
-        let p = PathBuf::from(explicit);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
-            let p = PathBuf::from(&home).join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            for name in ["rhypedb-server", "rhypedb"] {
-                let p = dir.join(name);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    None
 }
 
 struct RhypeDbGuard {
@@ -333,9 +306,10 @@ async fn spawn_stack_inner(
     relay_limits: Option<pimble_cloud::relay::RelayLimits>,
 ) -> Option<Stack> {
     // The ONLY skip condition: no rhypedb-server binary exists anywhere we
-    // know to look. A binary that exists but fails to start (even after
+    // know to look (and `RHYPEDB_SERVER_REQUIRED` turns even that into a
+    // failure). A binary that exists but fails to start (even after
     // `spawn_rhypedb`'s retries) is a real test failure, not a skip.
-    let binary = find_rhypedb_server_binary()?;
+    let binary = rhypedb_bin::find()?;
 
     // Acquired before starting anything below, held for the whole `Stack`'s
     // lifetime: caps how many of these run at once (`MAX_CONCURRENT_STACKS`).
@@ -4338,65 +4312,6 @@ async fn a_session_in_use_is_renewed_and_its_cookie_set_again() {
     assert_eq!(stack.app_state.db.find_session_by_token_hash(&hash).await.unwrap().unwrap().expires_at_ms, after.expires_at_ms);
 }
 
-/// The browser's diagnostics go through this service (docs/DIAGNOSTICS_CONTRACT.md
-/// section 5): passed on with the send key it holds and the signed-in
-/// account named; nothing without a session; 503 while no key is set.
-#[tokio::test(flavor = "multi_thread")]
-async fn diagnostics_from_a_page_go_on_with_the_key_and_the_account() {
-    let stack = skip_without_rhypedb!();
-    let (_, cookie) = signup_verify_login(&stack, "diag@example.com", "correct horse battery").await;
-
-    // No key: refused, and the page keeps what it queued.
-    let resp = stack.http.post(format!("{}/diagnostics/records", stack.base_url)).header("Cookie", &cookie).body("{}\n").send().await.unwrap();
-    assert_eq!(resp.status(), 503);
-
-    // A stand-in diagnostics server that records what it is sent.
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>> = Default::default();
-    let app = {
-        let seen = seen.clone();
-        axum::Router::new().route(
-            "/v1/:what",
-            axum::routing::post(move |axum::extract::Path(what): axum::extract::Path<String>, headers: axum::http::HeaderMap, body: String| {
-                let seen = seen.clone();
-                async move {
-                    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-                    seen.lock().unwrap().push((what.clone(), h("authorization"), h("x-pimble-account"), body));
-                    if what == "reports" { r#"{"report":"ABCD2345"}"#.to_string() } else { r#"{"accepted":1,"rejected":0}"#.to_string() }
-                }
-            }),
-        )
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let mut config = stack.app_state.config.clone();
-    config.diagnostics_url = format!("http://{addr}");
-    config.diagnostics_key = Some("send-key".to_string());
-    let state = pimble_cloud::build_state(config).await.unwrap();
-    let router = pimble_cloud::router_from_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let cloud = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let base = format!("http://{cloud}/api/v1");
-
-    let resp = stack.http.post(format!("{base}/diagnostics/records")).body("{\"kind\":\"log\"}\n").send().await.unwrap();
-    assert_eq!(resp.status(), 401, "no session, nothing goes");
-    let resp = stack.http.post(format!("{base}/diagnostics/records")).header("Cookie", &cookie).body("{\"kind\":\"log\"}\n").send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let resp = stack.http.post(format!("{base}/diagnostics/reports")).header("Cookie", &cookie).header("content-type", "application/json").body("{\"note\":\"x\"}").send().await.unwrap();
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["report"], "ABCD2345");
-
-    let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 2);
-    let user = stack.app_state.db.find_user_by_email("diag@example.com").await.unwrap().unwrap();
-    for (what, auth, account, _) in &seen {
-        assert_eq!(auth, "Bearer send-key", "{what} carries the service's key");
-        assert_eq!(account, &user.user_uuid, "{what} names the account");
-    }
-    assert_eq!(seen[0].3, "{\"kind\":\"log\"}\n");
-}
-
 // ── Notices (docs/NOTIFICATIONS_CONTRACT.md, wave 1) ─────────────────────
 
 /// The notice key: made once by the account's own device (its envelope
@@ -4799,6 +4714,9 @@ async fn a_queued_notice_is_pushed_encrypted_to_the_subscription() {
 // A test file at the root of `tests/` is a crate root, whose modules are
 // looked for beside it; this one's live in `tests/integration/`, which cargo
 // does not take for a test of its own.
+#[path = "integration/rhypedb_bin.rs"]
+mod rhypedb_bin;
+
 #[path = "integration/watches.rs"]
 mod watches;
 
@@ -4813,3 +4731,6 @@ mod owners;
 
 #[path = "integration/recovery_code.rs"]
 mod recovery_code;
+
+#[path = "integration/diagnostics.rs"]
+mod diagnostics;

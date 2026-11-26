@@ -1,8 +1,7 @@
 // Pimble's service worker (docs/ONE_CODEBASE_CONTRACT.md, "Built: wave 4",
 // the follow-ups): keeps this build's own files so the page opens with no
 // network and runs on the browser's own server from OPFS. Registered by
-// hub.js on the default path (the browser's own server); the old path
-// (`?server=old`, until wave 5) unregisters it and drops its caches.
+// hub.js.
 //
 // Written by build/post_build.sh from build/sw.template.js: BUILD is this
 // build's id and FILES its files, every one of them, and nothing else. It

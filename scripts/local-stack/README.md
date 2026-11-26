@@ -152,8 +152,7 @@ pointing at it worked the same. `edge.js` stops at the first request if `web/dis
 
 ## The browser on its own server (wave 4, docs/ONE_CODEBASE_CONTRACT.md)
 
-The web app's default since 2026-11-23 (`?server=old` reaches the old path until wave 5;
-the choice is kept in `localStorage`, `?server=worker` forgets it). The sign-in page
+The web app's only path since wave 5 (the default since 2026-11-23). The sign-in page
 sends the password to the server in the leader tab's worker, which keeps the account's
 stores as replicas in OPFS (sealed with the remembered device's key) or, with "Don't remember
 this browser", in memory. `PimbleHub.status()` in a tab's console says which tab leads and

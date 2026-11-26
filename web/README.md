@@ -1,72 +1,38 @@
 # pimble-web
 
 Pimble in the browser. The same UI as the desktop app, mounted through
-`rinch-web` instead of a window, talking to a hosted Pimble server instead of an
-embedded one.
+`rinch-web` instead of a window, over the same Pimble server the desktop
+embeds, run here in a worker of the browser (docs/ONE_CODEBASE_CONTRACT.md).
 
 This is its own cargo workspace on purpose: a wasm build wants its own lock, its
 own profiles, and above all its own dependency graph. `cargo check --workspace`
-in the repo root does not see it.
+in the repo root does not see it. Check it with
+`cargo check --workspace --target wasm32-unknown-unknown` here (CI does): a
+plain check skips the worker crate, which builds for wasm32 only.
 
 ## How it fits together
 
 | Piece | Where |
 | --- | --- |
 | The UI, the state, the editor wiring | `pimble-app` built with `--no-default-features --features web` |
-| What a `BackendCommand` means | `pimble_app::commands::process_command`, shared with the desktop |
-| Credential, connection, reconnect | `src/backend.rs` |
-| Minting a token from the session cookie | `src/api.rs` |
+| What a `BackendCommand` means | `pimble_app::commands`, shared with the desktop |
+| The server, in the leader tab's worker | `crates/pimble-worker` (built through `worker/`), `hub.js` |
+| The page's side of it: the hub, the backend, sign-in and the account page | `src/worker_mode/` |
 | Which page a URL means | `src/route.rs` |
-| Sign up, sign in, the account | `src/pages/` |
-| The account keys, in memory | `src/session.rs` |
-| Store keys and envelopes | `src/keys.rs` |
-| Encrypted stores | `src/vault.rs` |
-| Everything the accounts service answers | `src/accounts.rs`, over `src/http.rs` |
-| Starting the app | `src/app_page.rs` |
+| Sign up, "I forgot my password", the recovery link | `src/pages/`, over `src/accounts.rs` and `src/http.rs` |
+| The page's own diagnostics recorder | `src/diagnostics.rs` |
 
-Startup is three steps. `POST /api/v1/token` exchanges the `pimble_session`
-cookie for a one-hour JWT and the server's WebSocket URL; a 401 sends the
-visitor to `/app/login`. The backend connects `PimbleClient` to that URL with
-the token in the query string (a browser `WebSocket` cannot set headers, so the
-server reads `access_token`). `ListStores` then fills the tree with whatever the
-token's grants allow. There is no "open a store by path" here: the accounts
-service creates stores, and the token says which ones this account may see.
+## The browser's own server
 
-The token is refreshed five minutes before it expires. The loop reconnects
-whenever the socket drops, using the freshest token it holds.
-
-A word on what counts as connected. jsonrpsee's wasm client answers `connect`
-before the browser has opened the socket, so a refused endpoint looks like a
-success for an instant. The backend therefore proves every connection with one
-RPC (`listStores`, which the tree wants anyway) before telling the UI it is
-connected, and it only forgets the current backoff once a connection has also
-stayed up for two seconds. Failed attempts back off from one second to thirty
-and say so once per outage, not once per attempt.
-
-## One binary, several servers
-
-Nothing here talks to "the" Pimble server. `POST /api/v1/token` names the server
-the store list comes from, and may name a different one per store; `src/endpoints.rs`
-holds one credential and one `PimbleClient` per URL, and every command is
-answered through the endpoint that serves the store it names
-(docs/CRYPTO_CONTRACT.md, "Endpoint-agnostic"). Today the token response names
-one URL and every store resolves to it, so there is exactly one connection. When
-a relayed share arrives — served by its owner's machine rather than the hosted
-server — it becomes a second entry with its own token, and nothing else in the
-app changes.
-
-The backend loop supervises the endpoint the store list comes from, because that
-is the one whose absence means there is nothing to show. Any other endpoint
-connects the first time a store on it is touched.
-
-## The browser's own server (the default)
-
-Since 2026-11-23 the page runs the same Pimble server the desktop runs, in a dedicated worker
-of one leader tab (docs/ONE_CODEBASE_CONTRACT.md wave 4). It was behind `?server=worker` until
-Joe flipped it: "There's no active users of the web app ... you might as well just flip the
-switch" (2026-11-23). The old path below (keys in the page, `vault.rs`, the hosted server read
-directly) stays reachable with `?server=old` (remembered in `localStorage` as `pimble.server`;
-`?server=worker` forgets it) until wave 5 deletes it.
+The page runs the same Pimble server the desktop runs, in a dedicated worker of one leader
+tab (docs/ONE_CODEBASE_CONTRACT.md sections 4 to 7, waves 4 and 5). Every read and write the
+UI makes goes through the same `pimble_api::Pimble` and `pimble_app::commands` the desktop
+uses, over `PimbleClient::over_message_port`; the server keeps the account's keys and this
+browser's stores as replicas, and syncs them with Pimble Cloud through the same links the
+desktop's server uses (the vault link for an encrypted store, the plain link for a plain
+hosted one). Until wave 5 the page had a second path of its own (keys in the page, a vault
+client, the hosted server read directly); it is gone, and `scripts/check-one-path.sh` (run by
+CI) keeps a second one from coming back.
 
 - `hub.js`: the leader tab (a Web Lock), the other tabs over a `BroadcastChannel`, the worker it
   starts, and the service worker it registers.
@@ -76,250 +42,40 @@ directly) stays reachable with `?server=old` (remembered in `localStorage` as `p
   `sw.js` from `build/sw.template.js`: the service worker that keeps this build's own files so
   the page opens with no network (never `/api`, `/rpc` or any store data; a new build replaces
   the cache whole).
-- `src/worker_mode/`: the switch, the hub's bindings, the backend (the desktop's shape over
-  `PimbleClient::over_message_port`), and the sign-in and account pages that talk to that
-  server.
-
-The sections that follow describe the old path, as it is until wave 5.
+- `src/worker_mode/`: the hub's bindings, the backend (the desktop's shape over the
+  `MessagePort`), and the sign-in and account pages that talk to that server.
+- The stores live in OPFS, sealed with the remembered device's disk key, or in memory with
+  "Don't remember this browser" (docs/ONE_CODEBASE_CONTRACT.md section 7). A reload asks for
+  no password: the device key unwraps the account's keys.
 
 ## The account pages
 
-`/app/signup`, `/app/login` and `/app/account` are rinch views in this same wasm
-binary, not static HTML, and they are here rather than in `site/` for one
-reason: signing in derives keys that have to stay in the page's memory, and a
-page that reloads cannot hold them.
+`/app/signup`, `/app/login`, `/app/forgot`, `/app/recover` and `/app/account` are rinch views
+in this same wasm binary, not static HTML. Moving between any of them and the app is
+`crate::route`, which pushes a history entry and swaps what is mounted, never a link that
+reloads: the app is mounted once and afterwards only hidden and shown, because behind it sit
+the connection to this browser's server, its subscriptions and the editors' sessions.
 
-**Signup** takes an email and a password twice (a mismatch is refused here,
-before anything is derived or sent). It then generates a fresh `KdfParams`,
-derives the password into an `auth_key` and a KEK, generates an X25519/Ed25519
-account keypair, and wraps that keypair twice: once under the password's KEK and
-once under a KEK derived from a recovery code. `POST /api/v1/signup` carries
-`auth_key`, `kdf`, `public_keys`, `account_key_blob`, `recovery_salt` and
-`recovery_key_blob` — never the password, never an unwrapped key. The recovery
-code is then shown once, behind an "I have written this down" confirmation,
-after which it is dropped from the page and the inbox state takes over.
+**Signup** (`src/pages/signup.rs`) takes an email and a password twice (a mismatch is refused
+here, before anything is derived or sent). It then generates a fresh `KdfParams`, derives the
+password into an `auth_key` and a KEK, generates an X25519/Ed25519 account keypair, and wraps
+that keypair twice: once under the password's KEK and once under a KEK derived from a recovery
+code. `POST /api/v1/signup` carries `auth_key`, `kdf`, `public_keys`, `account_key_blob`,
+`recovery_salt` and `recovery_key_blob`, never the password, never an unwrapped key. The
+recovery code is shown once, behind an "I have written this down" confirmation.
 
-**Login** fetches `GET /api/v1/kdf?email=` for the salt, derives, and sends
-`POST /api/v1/login { email, auth_key }`. `?verified=1` and
-`?verify_error=expired|invalid` become banners (the accounts service redirects
-verification outcomes to this path), and a `403 email_unverified` offers to send
-the link again. After login it fetches `GET /api/v1/me/keys` and unwraps the
-account keys with the KEK.
+**Forgot and recover** (`src/pages/forgot.rs`, `recover.rs`) mail a recovery link and, on the
+link's page, unwrap the account keys with the recovery code and wrap them under a new password.
 
-The same page also **unlocks**. If the session cookie is still good but the keys
-are gone — which is every reload — it asks only for the password, fetches the
-wrapped blob once, and either opens it or does not. A wrong password fails right
-there, in the browser, with nothing further sent.
+**Sign-in and the account page** (`src/worker_mode/pages.rs`, `account_sections.rs`) go to the
+server: `cloudSignIn` derives and unwraps there, and the account page's sections (the
+password, a new recovery code, whole-store members, keeping what you have read in step) are
+the server's RPCs (docs/ONE_CODEBASE_CONTRACT.md, wave 5 parts 3 and 4). The sidebar's
+account button is registered by this crate through `pimble_app::app::set_account_action`, so
+the desktop, which registers nothing, does not draw one.
 
-**The account page** lists the account's stores, creates one (encrypted by
-default, which also mints its key and seals it to the creator), adds and removes
-members with roles, and logs out. Adding a member to an encrypted store also
-seals that store's key to them; without that they would have a grant and
-unreadable blobs.
-
-It lists **whole-store** memberships only, so it asks `GET .../members` for no
-scope: a share's members belong to the Share dialog, on the desktop that owns
-the store. That answer is now `{ members, share_name }` rather than a bare array
-(both are read), and a row's `user_id` is `null` for an address that has been
-invited and has no account yet — such a row is listed as "invited" and has no
-Remove, since withdrawing an invitation is its own endpoint and its owner's to
-offer.
-
-Moving between any of these and the app is `crate::route`, which pushes a
-history entry and swaps what is mounted — never a link that reloads. The app is
-mounted once and afterwards only hidden and shown, because behind it sit a
-WebSocket, subscriptions, an editor session and the vault client. Coming back to
-it re-mints the token and reconnects, since a store created on the account page
-is invisible to a token minted before that grant existed. The sidebar's account
-button is registered by this crate through `pimble_app::app::set_account_action`,
-so the desktop, which registers nothing, does not draw one.
-
-Every path under `/app/` has to serve the same `index.html`. `trunk serve` does
-that already, and jkbase's edge routes the whole prefix.
-
-## Keys, and where they are not
-
-The unwrapped account keys live in one thread-local in `src/session.rs` for as
-long as the page does. They are never written to `localStorage`,
-`sessionStorage`, a cookie or the console, and never sent anywhere. The session
-cookie survives a reload; the keys deliberately do not, so a reload asks for the
-password again and `/app/` with no keys sends the visitor to `/app/login`.
-
-A **scope key** reaches an account as a `KeyEnvelope`: sealed to their X25519
-public key, signed by whoever sent it, held by the accounts service, which
-cannot open it. `src/keys.rs` fetches the envelopes for one scope — the store
-key with no `root`, a share's key with one — and opens the ones this account
-can, keeping every key id so a rotated store still reads its own history.
-
-Who may have signed one changed with sharing. An envelope used to be believed
-only when this account had signed it, which is true of one's own store and
-false of a share: the key is handed over by its owner. `GET .../keys` now also
-lists the store's owners as `signers`, and `expected_signer` verifies an
-envelope against its own signer only when that signer is this account or one of
-them; a stranger's signature opens nothing. Trust is still on first use — the
-signers come from the same service as the envelopes, which the contract's
-threat model states out loud and phase 2a accepts — but a *later* substitution
-stays detectable.
-
-A scope key encrypts no blob directly any more. It wraps the **data key** of
-each document in its scope (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"),
-which is what `src/vault.rs`'s `StoreKeys` resolves; see below.
-
-Argon2id at the contract's cost (32 MiB, 3 passes) takes between about 60 and
-260 ms in Chrome on a desktop machine, measured through the line
-`src/session.rs` logs on every derivation. It blocks the only thread there is,
-so every page that derives yields to the browser first — otherwise the button
-never repaints as busy.
-
-## Encrypted stores
-
-A store of kind `vault` holds nothing the server can read: an append-only log of
-opaque blobs per document, and nothing else. `src/vault.rs` is what makes those
-blobs a tree of notes.
-
-It sits in front of `pimble_app::commands::process_command`. A command naming a
-vault store is answered from documents this page holds; anything else is handed
-straight back, so the plain path is untouched. Every node is one document
-(`pimble_crdt::NodeDoc`: its text, its place in the tree and its metadata in
-one, docs/NODE_DOCUMENT_CONTRACT.md), and the tree is `pimble_crdt::Tree` over
-those documents, starting from the root the store's manifest names — the same
-documents the desktop's server holds, just decrypted here. There is no tree
-document any more; a hosted twin from before may still list one, which is
-skipped. On connect the client fetches each vault store's keys, lists its
-documents, fetches every log (titles and children lists live in the documents,
-so nothing of the tree can be drawn until they are here; the fetches go out in
-windows of 32), decrypts and merges every blob, and repairs the tree once, after
-the whole pull — never between the updates of one edit, since a half-applied
-move looks like an orphan and repair's answer to an orphan is a new parent
-written into the node's document. The tree UI then reads that instead of
-calling `getChildren`.
-
-The manifest's root is a placeholder for a store hosted from a desktop, whose
-documents name their own root; the client takes the one node with no parent as
-the root and lists the store under it (`describe`). A store the accounts service
-has just created has an empty log: its root document is written at the first
-edit under it, not at open, so a page that merely looked at a store whose
-documents are still on their way from a desktop's link never gives it a second
-root.
-
-Tree edits — create, rename, move, delete, appearance — are `Tree` operations,
-and every `TreeEdit` they return is appended per touched document, in the order
-it names them (a new document before its parent's list), each blob carrying that
-transaction's update and nothing else. Node content goes through the same
-document: outbound edits arrive as `BroadcastChanges` exactly as they do for a
-plain store, are merged with `NodeDoc::apply_update`, encrypted with
-`Blob::encrypt` (associated data `blob_aad(store_id, doc_id)`, so a blob cannot
-be replayed into another document) and appended with `vaultAppend`. The editor
-is handed the whole node document through the ordinary `NodeLoaded` path, as it
-is on the desktop; Pimble's roots ride along.
-
-### One key per document
-
-A blob's header names the **data key** of the document it belongs to, not a
-store key. The server holds that key wrapped under every scope key that may
-read it — the store key, and the key of each share the node is under — and
-serves the wraps beside the log (`VaultFetchResponse.keys`, and `dek_id` on
-every `vaultListDocs` row). `StoreKeys` resolves a blob's key in the order the
-contract gives: the data key it has already unwrapped, then the document's
-wraps opened with whichever scope key this page holds, then a scope key of that
-id held directly — which is what a blob from before data keys names.
-
-A document **this page creates** gets a fresh data key, wrapped under every
-scope key it holds that covers the node: the store key when it holds the whole
-store, and the key of every share on the way up the tree, which each share's
-root names in its own `ShareMarker`. A scoped member holds only their share's
-key, so that is the one wrap. The append that creates the document names its
-`parent_id` (`vault_append_new`) — which is how a scoped member's new document
-joins their scope — and the keys are set immediately afterwards
-(`vault_set_doc_keys`), because the server admits keys only for a document it
-already has. A document whose data key this page cannot open is left alone: it
-is not read, and nothing is written to it.
-
-### A share is a scope of somebody else's store
-
-`GET /api/v1/stores` is one row per grant, so one store can reach this page as
-several shares. `learn_rows` collects the rows of each store into an
-`AccountStore`, which decides what the UI is told (`describe`):
-
-- the **name** is the share's own, never the owner's store name — the hosted
-  server's `listStores` still answers with the store's, and a recipient has no
-  business learning it;
-- `shared_by` is an owner's address;
-- `access` is `Read` only when *every* grant on the store is a reader's. A
-  reader of one folder and an editor of another gets `Full`, because a
-  store-wide `Read` would take away the editing they do have; the server
-  refuses the writes under the reader's root one at a time, and those are
-  handled below;
-- `roots` are the shared roots, and `root_node_id` the first of them for
-  callers that know only one.
-
-What the page holds of such a store is only the documents the server lists. Each
-shared root is a root of the `Tree` whose own `parent_id` names a document that
-will never arrive — which is **not** an orphan, so `Tree::repair` cannot be let
-near it: its answer to an orphan is a new parent written into the node's
-document, which would then travel to the owner and to every other member.
-`repair_scopes` is the browser's half of `pimble_store::LocalStore::repair_scopes`
-and repairs one scope at a time, each handed to `Tree::repair` as the honest
-tree it is (rooted at its scope root, holding exactly the documents that lead to
-it). A document that leads to no scope root is left alone — moved out of the
-share by its owner, or not under it yet — and a scope whose lists name a
-document not held yet is not judged at all, because removing that entry would
-delete a child from the owner's folder.
-
-### Refusals, and waiting for a key
-
-A **reader's write** is refused in the browser, with no request made: the
-backend loop asks `VaultClient::refuse_write` before it hands a command
-anywhere, so an encrypted store and a plain one answer the same way, with
-`StoreAccess::READ_ONLY_REFUSAL` and nothing else. That sentence is written for
-the person and the app shows it as it is.
-
-A **refusal from the server** on an append — a reader's root inside a store this
-account edits elsewhere, or "no grant for this document" — must not wedge the
-client. There is nothing to resend, because the same bytes would be refused for
-ever, so the document is not left `unsent`; and a yrs document cannot un-merge
-the edit that was refused, so keeping it would show work that exists nowhere and
-never will. The document is dropped and pulled again from the beginning, the UI
-is told, and what is on screen becomes what the server holds.
-
-A grant with **no usable envelope yet** is the ordinary state of a fresh share:
-the owner's Pimble has not been online since to hand the key over. The store is
-listed with " (waiting for the key)" on its name, the page says once per store
-per session that it is waiting for that owner's Pimble to come online, and it
-asks again every thirty seconds and on every reconnect. When the key arrives the
-store opens and is announced again, since `StoresListed` has long since been and
-gone.
-
-`VaultAppended` notifications come back through the store subscription with the
-blob attached. The subscription task only forwards them; decrypting and merging
-needs the vault client itself, which lives in the backend loop, so they travel
-down a channel it drains once per turn. This client's own appends are recognised
-by the client id they carry. What a merged update changed decides what the UI
-hears — the same kinds the server derives (`NodeCreated`, `NodeDeleted`,
-`NodeMoved`, `MetadataUpdated`, `TreeStructure`), and a content change as
-`RemoteChanges` for the node the editor has open or `NodeContentUpdated` for
-any other — and a structural merge schedules a repair 250 ms after the last one,
-whose edit is appended like any other. A blob whose key id this device does not
-hold is logged and skipped, never fatal. A snapshot (`NodeDoc::save`) goes up
-every 200 appends per document, stamped only with a number the client has read
-through.
-
-Two things are worth knowing. `RemoteChanges` carries no node identity and the
-app has one editor pane, so a decrypted content update only becomes one for the
-node the editor has open — learned from `SubscribeNodeChanges`, which the vault
-client answers itself rather than subscribing again. And every child
-`getChildren` returns carries its document's bytes, because the app derives a
-document's tree label from its first line and opens it from the bytes it was
-handed, with no second fetch in between.
-
-The backend remembers which stores the UI subscribed to and subscribes again on
-every new connection, before the catch-up: a subscription belongs to the socket
-it was made on, and the socket is replaced on every token refresh.
-
-Search over an encrypted store is client-side: a case-insensitive substring over
-decrypted titles and every document's text. There is no server index for such a
-store and there cannot be one. Plain stores named in the same query still go to
-the server, and the two sets of hits are merged.
+Every path under `/app/` has to serve the same `index.html`. `trunk serve` does that already,
+and jkbase's edge routes the whole prefix.
 
 ## Controls, and the ones that would do nothing
 
@@ -329,10 +85,8 @@ menu has to be reachable another way or not be offered. What that came to:
 - **The explorer's "+"** makes a node under the selected store, as on the
   desktop. With no store open the desktop offers "New Store..." from the File
   menu; here "+" opens that modal instead of doing nothing. It asks for a name,
-  creates the store through `POST /api/v1/stores` as a vault, mints its key and
-  seals it to the account, then asks for a fresh token and reconnects — a store
-  is invisible to a token minted before the grant existed. The store then
-  arrives through `listStores` like any other.
+  creates the store on this browser's server (encrypted) and hosts it with
+  `cloudHostStore`, and the store arrives through `listStores` like any other.
 - **Ctrl+K** focuses the search box, whose placeholder has always advertised it.
   Both shells carry that accelerator on their View menu, and rinch-web's menu
   bar arms it against the document, so neither binds it by hand.
@@ -347,8 +101,7 @@ menu has to be reachable another way or not be offered. What that came to:
   the desktop has.
 - **Right-click** shows Pimble's menu and not the browser's (see below).
 - **Rebuild Search Index** and **Sign Out** are in the menu bar, which the
-  browser now has. Rebuilding skips encrypted stores, which have no server-side
-  index and cannot have one.
+  browser now has.
 
 The desktop's items that do nothing (Undo/Redo/Cut/Copy/Paste, disabled; Toggle
 Sidebar, the zoom items, Documentation, About, which log and return) were left
@@ -371,10 +124,6 @@ dialogs and the remote-store items.
 That call also arms every item's accelerator against the document, which is why
 nothing in this crate binds Ctrl+K any more.
 
-`src/menu.rs` registers the two actions no shared crate could perform on its own
-(reaching the accounts service, dropping this page's keys) and holds the test
-that every item the web configuration offers has an action behind it.
-
 ### The browser's own context menu
 
 A right-click used to show Pimble's menu with the browser's on top of it.
@@ -395,14 +144,13 @@ closes a gap a page-level listener cannot reach, where a stale
 
 ## What the browser build leaves out
 
-A browser connects as a signed-in user, whose token carries per-store grants and
-nothing else. The service principal's RPCs — open a store from a path, add a
-remote as a replica, link, unlink, remove a replica, close a store, create one —
-are refused for that principal, so the web build does not offer them: no "Mount
+The browser's stores are the account's, kept as replicas by this browser's
+server; there are no folders to open or remotes to link by hand. So the web
+build does not offer what administers stores on a disk: no "Mount
 Store...", "Mount Remote Store Here...", "Link to Remote...", "Unlink from
 Remote", "Remove Replica..." or "Close Store" in the tree's context menus, and
 no "press Ctrl+N to create a new store" in the empty editor. Stores are created
-and shared on the account pages. "New Node", "Copy as Mount Source", "Paste
+with the explorer's "+". "New Node", "Copy as Mount Source", "Paste
 Mount Here", "Rename", "Appearance..." and "Delete" are ordinary writes and stay.
 
 One flag decides this, `CAN_ADMINISTER_STORES` in `crates/pimble-app/src/app/mod.rs`,
@@ -521,8 +269,8 @@ service's log:
 curl -s -o /dev/null -w '%{redirect_url}\n' "http://127.0.0.1:8081/api/v1/verify?token=..."
 ```
 
-That redirects to `/app/login?verified=1`. Sign in there, make a store on
-`/app/account` (encrypted by default), and open it with "Open Pimble".
+That redirects to `/app/login?verified=1`. Sign in there and make a store with
+the explorer's "+".
 
 Because the session cookie is set by the accounts service, the browser must
 reach the app and the API on one origin. Everything above assumes `trunk
@@ -531,107 +279,16 @@ serve`'s port is that origin, which is why `PIMBLE_CLOUD_PUBLIC_URL`,
 
 ### Without pimble-cloud
 
-There are two smaller arrangements, depending on what is being looked at.
-
-For the **account pages alone**, anything that stores what signup sends and
-hands it back at login will do: the crypto under test is the browser's, and a
-stub service never needs to understand a blob. That is enough to walk signup,
-the recovery code, login, unlock and a wrong password.
-
-For the **app alone**, all it needs is something that answers
-`POST /api/v1/token` with `{ "token": ..., "exp": ..., "rpc_url": ... }`, with
-an empty token against a tokenless loopback Pimble server:
-
-```bash
-cargo run -p pimble-cli --release -- server \
-  --addr 127.0.0.1:7462 --open ./demo.pimble \
-  --allow-origin http://127.0.0.1:8099
-```
-
-That is how the collaboration path below was first verified.
+For the **signup and recovery pages alone**, anything that stores what signup sends and
+hands it back will do: the crypto under test is the browser's, and a stub service never
+needs to understand a blob.
 
 ## What has been verified
 
-### The account pages and the encrypted store, against the real stack
-
-In headless Chrome against all four processes (RhypeDB, `pimble-cloud`,
-`pimble-cli server`, and the release bundle behind a one-origin reverse proxy
-standing in for `trunk serve`):
-
-- signing up derives keys in the browser, shows a 32-character recovery code
-  once behind an acknowledgement, and lands on the check-your-inbox state;
-- mismatched passwords are refused by the page, with nothing sent;
-- the verification link redirects to `/app/login?verified=1`, and signing in
-  there reaches the app;
-- a wrong password on the unlock path fails locally: `GET /me` and
-  `GET /me/keys` and nothing after them, no `POST /login`;
-- `/app/account` creates an encrypted store, mints its key and seals it to the
-  creator, and lists it as encrypted;
-- the app opens that store: the tree is built from a decrypted store document,
-  a new node is created through it, and typing into that node works;
-- the server's copy is `vault/tree/log` and `vault/<node id>/log`, each blob
-  `PB` + version + key id + nonce + ciphertext, with neither the store's name
-  nor a word of the note anywhere on its disk (this was the layout before
-  docs/NODE_DOCUMENT_CONTRACT.md; a store made now has only the per-node logs,
-  and the client on that branch has not been run against the stack yet);
-- a second tab, signed in separately, decrypts the same store and shows the
-  text — in the tree label and in the editor.
-
-Argon2id at the contract's cost took 56–254 ms across runs in that browser.
-
-### The controls, against the same stack
-
-From a fresh account each run, so the tree starts empty:
-
-- the explorer's "+" opens the New Store modal, refuses an empty name in the
-  page, and otherwise creates an encrypted store that appears in the tree once
-  the backend has a token carrying the new grant;
-- a right-click on a tree row opens Pimble's menu with the event's
-  `defaultPrevented` true, and a right-click anywhere else is cancelled too;
-- that menu, on an encrypted store, offers "New Node" and "Appearance..." and
-  no mount items;
-- Ctrl+K puts the caret in the search box;
-- the theme choice written to `localStorage` survives a reload.
-
-The encrypted round trip was then re-run against a store made by "+" rather than
-by the account page, after the endpoint registry replaced the single connection:
-a node created, typed into, the server holding only ciphertext, and a second tab
-decrypting the same text.
-
-### The plain path
-
-In Chromium, against a real `pimble-cli server` started with `--allow-origin`,
-with the release build served by a plain static server and a stub answering
-`POST /api/v1/token`. That arrangement gives the app one origin without trunk in
-the way, so it exercises the app and the server but **not** the `trunk serve`
-proxies:
-
-- the app boots, mints a token, connects, and `listStores` fills the tree;
-- clicking a document opens it in the browser editor with its content;
-- two tabs on the same document see each other's typing live, in both
-  directions, and the result is on disk afterwards (`pimble-cli show-node`);
-- pointed at a port with nothing listening, the backend makes 7 attempts in 65
-  seconds (1s, 2s, 4s, 8s, 16s, 30s, 30s), never claims to be connected, and
-  writes one error to the status bar rather than one per attempt;
-- pointed at the real server, it connects once and stays connected, with no
-  retries and no errors.
-
-Not yet verified here: the flow through `trunk serve`'s own proxies (the runs
-above used an equivalent reverse proxy), key rotation, and the snapshot path
-(200 appends to one document).
-
-**Sharing has not been run against the stack at all yet.** The browser half is
-in and unit-tested (rows to access and roots, the key resolution order, a
-created document's wraps, a scope root left where it is by repair, the refusal
-path), but no owner has yet shared a node from a desktop, so nothing here has
-seen a real scoped token, a real share key or a real `scopes.json`. What the PM
-has to see, once the owner side exists: a share listed under its own name with
-"shared by" and never the owner's store name; the shared folder's own root as
-the row's root; a recipient editing text, titles and structure inside it and the
-owner's web app seeing all three; a reader refused with the one sentence and
-nothing sent; a reader-root write inside a mixed store refused by the server
-without wedging the page; and a share whose key has not been handed over yet
-listed as waiting and opening on its own once it has.
+What each wave proved, in Chromium and Firefox against the local stack, is in the "Proof"
+sections of docs/ONE_CODEBASE_CONTRACT.md (waves 4 and 5). The verification of the page's
+earlier path (the account pages, the vault client and the controls, 2026-09-16 to 2026-11-22)
+is in this file's git history.
 
 ## Two dev-only traps seen on 2026-09-16
 

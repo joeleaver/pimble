@@ -1,6 +1,6 @@
 # One code base: the browser runs the same Pimble server (draft, 2026-11-22)
 
-Status: **draft; waves 0, 1, 2 (with its runtime), 3 and 4 built** (2026-11-22 and 23, not merged or released; see the "Built" sections at the end; wave 4, the browser on its own server, is the web app's default since its follow-ups, the old path `?server=old` until wave 5; what it left undone and what needs Joe's word are at the end of each section). Decisions taken so far are under "Decisions"; the rest
+Status: **draft; waves 0 to 4 built, and wave 5 through its part 6** (2026-11-22 to 26; see the "Built" sections at the end; since wave 5 part 6 the browser's own server is the web app's only path, the old one and its `?server=old` switch deleted, and CI's `scripts/check-one-path.sh` keeps a second from coming back; what each part left undone and what needs Joe's word are at the end of each section). Decisions taken so far are under "Decisions"; the rest
 are "Questions for Joe", each with a recommendation. Follows docs/CONVERGENCE_CONTRACT.md
 ("Next: one sync engine for both apps") and docs/STORE_FOLDERS_CONTRACT.md.
 
@@ -1585,6 +1585,9 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
 
 ### What is left for wave 5
 
+(As written at the end of wave 4. Each item is answered in a "Built: wave 5" section below;
+the old path was deleted in part 6.)
+
 - Delete the old path (`vault.rs`, `vault_backend.rs`, `routed.rs`, `endpoints.rs`, the old
   backend loop, `session.rs`/`keys.rs`/`personal_sync.rs`/`diagnostics.rs` as they are, the old
   login's unlock) and the switch, with the no-second-path check.
@@ -2328,3 +2331,102 @@ racing sign-in, and deletes the rows after, as the password change does.
   unknown address, and for an unverified one reads as the sentences above, the first two
   identical.
 - Unit tests: `cloud::refusal` (every mapping, the status kept) and `handler::account`.
+
+## Built: wave 5, part 6 (2026-11-26, not merged or released): the old path deleted, and CI
+
+### The old path is gone
+
+Parts 1 to 5 built into the server what only the old path gave (plain hosted stores, an owner
+away, diagnostics, the account page's sections), so the browser's own server is now its only
+path. The old sign-in page's part of email verification came over in review: the worker sign-in
+page shows the `?verify_error=expired|invalid` banners the accounts service redirects with, and
+offers "Send the verification link again" when `cloudSignIn` is refused for an unverified address,
+which the server now answers with its own code (`RpcError::EmailUnverified`, `-32011`;
+`ClientError::is_email_unverified`) in the same sentence as before:
+
+- Deleted from `web/src`: the `?server=old` switch (`worker_mode::enabled`/`decide`/`end`,
+  `hub.js`'s `leaveOffline`), the vault client (`vault.rs`, `vault/`, `vault_backend.rs` and
+  their tests), `routed.rs`, `endpoints.rs`, `keys.rs`, `session.rs`, `personal_sync.rs`,
+  `api.rs`, `menu.rs`, `app_page.rs`, the old backend loop (`backend.rs`), the old login and
+  account pages, the page's own `send_report`, and the accounts and HTTP calls only they made
+  (about 12,000 lines).
+- `web/Cargo.toml` drops `pimble-crdt`, `pimble-sheet`, `pimble-discussion`, `base64` and the
+  `pimble-api` `conformance` dev-dependency.
+- Two things only the old `app_page` did now happen in worker mode too: the browser's
+  spellcheck dictionary (`pimble_app::spelling::start_web`) and the diagnostics notice
+  (`diagnostics_ui::notice_once`). Since the flip in wave 4, the default path had neither.
+- The page's diagnostics recorder stays (`web/src/diagnostics.rs`: its records, the choice,
+  the recent log handed to `sendDiagnostics`), without the old path's info targets.
+- `inherited()` still hands a browser's old report slot (`pimble.vault-device`,
+  `pimble.vault-answered.*` in `localStorage`) to its server at the first start.
+
+### CI (section 8)
+
+- **No second path**: `scripts/check-one-path.sh`, run by the check job, fails on
+  `pimble_crdt`, `pimble_store` or `Tree` in `web/src`; a vault RPC by its Rust name
+  (`vault_append*`, `vault_fetch*`, `vault_list_docs*`, `vault_snapshot*`, `vault_report(s)`,
+  `vault_set_doc_keys`) or its wire name; an `impl ... Backend for`; `mod vault`,
+  `mod vault_backend`, `mod routed`, `mod endpoints`; and `server=old` anywhere in `web/`.
+  An RPC path to any server but the page's own fails too: a `pimble_api::Router`, an
+  `RpcBackend` made over anything but `LocalConnector`, an `impl ... Connector for` anything
+  else, a `PimbleClient::` constructor other than `over_message_port` (or the type renamed by
+  `as`), `pimble_server` in `web/src`, and `pimble-server` in `web/Cargo.toml` (the worker crate,
+  `web/worker`, is the server's). The `impl ... Backend for` and the other Rust-shape bans read
+  each file whole, so a declaration wrapped across lines is caught.
+  PimbleClient's store methods are not banned (the worker backend calls `create_store` and
+  `list_stores` on its own server), nor a bare "vault" (`localStorage` keys, `kind != "vault"`).
+- **The web wasm32 check** (`cargo check --locked --workspace --target wasm32-unknown-unknown`
+  in `web/`, which covers the worker crate) was already a CI job; its one warning, the unused
+  `agents::render_page` re-export outside `native`, is fixed.
+- **A real `rhypedb-server`**: the test job builds it from the revision `Cargo.lock` pins for
+  `rhypedb-client` (`--no-default-features`, no ONNX; rhypedb publishes no binaries), cached
+  per revision, and runs the suite with `RHYPEDB_SERVER_BIN` and `RHYPEDB_SERVER_REQUIRED=1`.
+  With that variable a missing binary, or a `RHYPEDB_SERVER_BIN` that names no file, fails
+  the test (`crates/pimble-cloud/tests/integration/rhypedb_bin.rs`,
+  `crates/pimble-server/tests/rhypedb_bin/mod.rs`); without it the test skips with a `SKIP:`
+  line as before. The sharing tests that run the real accounts service
+  (`sharing_against_the_real_accounts_service`, `interop_with_the_real_accounts_service`) look
+  for the `pimble-cloud` binary the same way (`crates/pimble-server/tests/pimble_cloud_bin/mod.rs`:
+  `PIMBLE_CLOUD_BIN`, beside the test binary, `CARGO_TARGET_DIR`, the workspace's `target/`), and
+  CI sets `PIMBLE_CLOUD_REQUIRED=1`, so a missing one fails there instead of skipping.
+
+### Proof
+
+- `scripts/check-one-path.sh` passes on the tree, and fails on a probe file holding each banned
+  form (`pimble_crdt`, `Tree`, `vault_append`, `pimble_vaultFetch`, `vaultSetDocKeys`, both
+  `impl ... Backend for` shapes, `mod vault`, `mod routed`, `server=old`).
+- `web/`: `cargo check --locked --workspace --target wasm32-unknown-unknown`, with and without
+  `--tests`, has no warnings.
+- `ci.yml` parses as YAML and passes `actionlint`. The rhypedb step was run by hand: the
+  revision extracted from `Cargo.lock` (c73cc88d), a clone checked out at it, and the
+  `--no-default-features` release build.
+- pimble-cloud's integration suite (122 tests) passes with `RHYPEDB_SERVER_REQUIRED=1` against
+  `~/dev/rhypedb/target/debug/rhypedb-server` and against the binary built as CI builds it;
+  it fails all 122 with a `RHYPEDB_SERVER_BIN` that names no file, and with no binary found;
+  with no binary and no variable all 122 skip with the `SKIP:` line.
+- `cargo test --workspace --release --no-fail-fast` with the CI variables: 2,142 passed, 0
+  failed, 8 ignored, over 145 test binaries; `sharing_against_the_real_accounts_service` and
+  `interop_with_the_real_accounts_service` ran rather than skipped, and
+  `a_reader_is_refused_in_process` and the relay's twenty-megabyte test passed this run.
+- Review fixes: `check-one-path.sh` passes on the tree and fails on a probe holding each new
+  form (a `pimble_api::{ ... Router }` import wrapped across lines, `Router::new`,
+  `RpcBackend::over`, `RpcBackend::new(Connected(..))`, a wrapped `impl ... Connector for
+  Remote`, `PimbleClient::connect_with_auth`, `PimbleClient as`, `pimble_server::`, a wrapped
+  `impl<T> pimble_api::Backend for`, and `pimble-server` in `web/Cargo.toml`). The two
+  real-accounts tests pass with `PIMBLE_CLOUD_REQUIRED=1` and the binary found beside the test
+  binary; they fail with a `PIMBLE_CLOUD_BIN` that names no file and with no binary found, and
+  skip with no binary and no variable. `interop_with_the_real_accounts_service` now signs in
+  before following the link and gets `is_email_unverified`. The sign-in page's banners are a
+  `wasm_bindgen_test` in `web/` (`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  cargo test --target wasm32-unknown-unknown -p pimble-web`, runner 0.2.128; CI runs it in the web job since 67f0a4d).
+
+### Not done
+
+- No browser walk-through after the deletion: worker mode's code is untouched apart from the
+  switch, the spellcheck start and the notice.
+- Other contracts still name the deleted files in their dated "Built" notes (API, CONVERGENCE,
+  IMAGES, SYNC_LIMITS, LINKS, TREE, RELAY, PRESENCE, NOTIFICATIONS, DISCUSSIONS); they are
+  records of what was built then and were left as they are.
+- `crates/pimble-cloud/tests/integration.rs` and `crates/pimble-server/tests/share.rs` and
+  `vault_link.rs` were touched (their rhypedb lookup moved out into a module) and are still
+  over 700 lines; splitting them is the separate change planned after the wave 5 merge.

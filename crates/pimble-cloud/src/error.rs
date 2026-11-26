@@ -50,6 +50,11 @@ pub enum CloudError {
     /// for all three, matching docs/CRYPTO_CONTRACT.md's "Unknown or
     /// expired: 404 `{ error: "recovery_invalid" }`" literally.
     RecoveryInvalid,
+    /// 409 `account_changed` — diagnostics a page queued as one account,
+    /// sent with the session of another (signed out and in again in another
+    /// tab): refused, so the page keeps them for their own account
+    /// (docs/DIAGNOSTICS_CONTRACT.md section 5).
+    AccountChanged,
 }
 
 impl CloudError {
@@ -70,6 +75,11 @@ impl CloudError {
             ),
             CloudError::RateLimited(m) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", m.as_str()),
             CloudError::RecoveryInvalid => (StatusCode::NOT_FOUND, "recovery_invalid", "This recovery link is invalid or has expired."),
+            CloudError::AccountChanged => (
+                StatusCode::CONFLICT,
+                "account_changed",
+                "These diagnostics were recorded as another account than the one signed in now; they wait for that account.",
+            ),
         }
     }
 }

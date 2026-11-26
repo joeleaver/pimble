@@ -42,6 +42,12 @@ pub enum RpcError {
     /// before more updates are appended.
     #[error("Snapshot required: {0}")]
     SnapshotRequired(String),
+
+    /// `cloudSignIn` refused because the account's address is not verified
+    /// yet (the password matched). The message is the sentence a person
+    /// reads; the code lets a sign-in page offer to send the link again.
+    #[error("{0}")]
+    EmailUnverified(String),
 }
 
 impl RpcError {
@@ -57,7 +63,15 @@ impl RpcError {
             RpcError::Forbidden(_) => -32004,
             RpcError::EncryptedStore(_) => -32005,
             RpcError::SnapshotRequired(_) => -32006,
+            RpcError::EmailUnverified(_) => -32011,
         }
+    }
+}
+
+impl From<RpcError> for jsonrpsee::types::ErrorObjectOwned {
+    /// The error as a JSON-RPC error object: its code and its sentence.
+    fn from(e: RpcError) -> Self {
+        jsonrpsee::types::ErrorObjectOwned::owned(e.code(), e.to_string(), None::<()>)
     }
 }
 

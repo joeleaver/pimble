@@ -1,7 +1,7 @@
-//! The encrypted-store protocol, once: what the desktop's vault link
-//! (`pimble-server/src/vault_link.rs`) and the browser's vault client
-//! (`web/src/vault.rs`) both do to a vault store's logs, as pure functions
-//! over what each of them holds (docs/CRYPTO_CONTRACT.md,
+//! The encrypted-store protocol, once: what the vault link
+//! (`pimble-server/src/vault_link.rs`, the desktop's server and the browser's
+//! alike) does to a vault store's logs, as pure functions over what it
+//! holds (docs/CRYPTO_CONTRACT.md,
 //! docs/NODE_DOCUMENT_CONTRACT.md section 5 "Keys", docs/API_CONTRACT.md
 //! wave 1). Transport, files, tasks and the documents themselves stay with
 //! the callers.

@@ -1,19 +1,18 @@
-//! The accounts service, typed.
+//! The accounts service, typed: the calls the pages that run before any
+//! server make (signing up, resending the verification mail, signing out of
+//! the cookie session, and recovery; `docs/CRYPTO_CONTRACT.md`, "Accounts
+//! service endpoints"). Signing in, the account's keys, stores, members and
+//! names go through this browser's own server (`crate::worker_mode`).
 //!
-//! Every endpoint under "Accounts service endpoints" in
-//! `docs/CRYPTO_CONTRACT.md`, plus the phase-1 ones the account page still
-//! uses (members, store deletion, resend verification).
-//!
-//! Two shapes here are deliberately forgiving on the way in. A key blob and a
-//! key envelope are JSON objects in this file's requests, but the contract
-//! describes the columns behind them as "JSON string", so a service that
-//! stores and echoes them as strings is read back just as happily
-//! ([`lenient`]). Nothing is forgiving on the way out: what this page sends is
-//! always the object.
+//! One shape here is deliberately forgiving on the way in. A key blob is a
+//! JSON object in this file's requests, but the contract describes the
+//! columns behind it as "JSON string", so a service that stores and echoes
+//! it as a string is read back just as happily ([`lenient`]). Nothing is
+//! forgiving on the way out: what this page sends is always the object.
 
-use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams, KeyEnvelope, KeyId};
+use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::http::{self, ApiError, ApiResult};
@@ -44,14 +43,7 @@ fn lenient<T: DeserializeOwned>(value: &Value, what: &'static str) -> ApiResult<
     parsed.map_err(|e| ApiError::local(format!("the {what} the server sent did not parse: {e}")))
 }
 
-// ── Sign-up, sign-in, the session ───────────────────────────────────────────
-
-/// `GET /api/v1/kdf?email=` — the salt and costs to derive this email's keys
-/// with. An unknown email gets a deterministic decoy, so a failure here never
-/// means "no such account".
-pub async fn kdf(email: &str) -> ApiResult<KdfParams> {
-    http::get(&format!("/api/v1/kdf?email={}", query_escape(email))).await
-}
+// ── Sign-up, the session ────────────────────────────────────────────────────
 
 /// The signup body: a password never appears in it, only what the password
 /// derived to (`auth_key`) and what it wrapped (`account_key_blob`).
@@ -74,43 +66,9 @@ pub async fn signup(request: &SignupRequest) -> ApiResult<()> {
     http::post::<_, Value>("/api/v1/signup", request).await.map(|_| ())
 }
 
-#[derive(Debug, Serialize)]
-struct LoginRequest<'a> {
-    email: &'a str,
-    auth_key: &'a str,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserView {
-    pub id: String,
-    pub email: String,
-    /// The default name chosen, `""` for none (docs/PRESENCE_CONTRACT.md
-    /// section 3). Absent from a service from before names.
-    #[serde(default)]
-    pub display_name: String,
-    /// What the account is called where nothing more particular applies.
-    #[serde(default)]
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LoginResponse {
-    pub user: UserView,
-}
-
-/// `POST /api/v1/login`. The server sees `auth_key`, never the password.
-pub async fn login(email: &str, auth_key: &str) -> ApiResult<LoginResponse> {
-    http::post("/api/v1/login", &LoginRequest { email, auth_key }).await
-}
-
 /// `POST /api/v1/logout`.
 pub async fn logout() -> ApiResult<()> {
     http::post_empty::<Value>("/api/v1/logout").await.map(|_| ())
-}
-
-/// `GET /api/v1/me` — who this session belongs to.
-pub async fn me() -> ApiResult<UserView> {
-    http::get("/api/v1/me").await
 }
 
 #[derive(Debug, Serialize)]
@@ -125,38 +83,7 @@ pub async fn resend_verification(email: &str) -> ApiResult<()> {
         .map(|_| ())
 }
 
-/// What `GET /api/v1/me/keys` answers: never the recovery blob.
-#[derive(Debug, Clone)]
-pub struct MyKeys {
-    pub public_keys: AccountPublicKeys,
-    pub kdf: KdfParams,
-    pub account_key_blob: AccountKeyBlob,
-}
-
-/// `GET /api/v1/me/keys` — the wrapped account keys, which only the password's
-/// KEK opens. The server holds this and cannot read it.
-pub async fn my_keys() -> ApiResult<MyKeys> {
-    let raw: Value = http::get("/api/v1/me/keys").await?;
-    Ok(MyKeys {
-        public_keys: lenient(&raw["public_keys"], "public keys")?,
-        kdf: lenient(&raw["kdf"], "KDF parameters")?,
-        account_key_blob: lenient(&raw["account_key_blob"], "account key blob")?,
-    })
-}
-
-/// `GET /api/v1/users/lookup?email=` — a verified user's public keys, for
-/// wrapping a store key to them. 404 for anyone else.
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserLookup {
-    pub id: String,
-    pub public_keys: AccountPublicKeys,
-}
-
-pub async fn lookup_user(email: &str) -> ApiResult<UserLookup> {
-    http::get(&format!("/api/v1/users/lookup?email={}", query_escape(email))).await
-}
-
-// ── Recovery, and changing what the password is ─────────────────────────────
+// ── Recovery ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 struct EmailRequest<'a> {
@@ -241,321 +168,6 @@ pub async fn recover_delete_account(token: &str) -> ApiResult<()> {
         "/api/v1/recover/{}/delete-account",
         query_escape(token)
     ))
-    .await
-    .map(|_| ())
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChangePasswordRequest {
-    /// The current password's `auth_key`, checked the way login checks one.
-    pub current_auth_key: String,
-    pub auth_key: String,
-    pub kdf: KdfParams,
-    pub account_key_blob: AccountKeyBlob,
-}
-
-/// `POST /api/v1/me/password`.
-pub async fn change_password(request: &ChangePasswordRequest) -> ApiResult<()> {
-    http::post::<_, Value>("/api/v1/me/password", request).await.map(|_| ())
-}
-
-#[derive(Debug, Serialize)]
-pub struct NewRecoveryCodeRequest {
-    /// The current password's `auth_key` (Joe, 2026-11-25: a new code needs
-    /// the password).
-    pub current_auth_key: String,
-    pub recovery_salt: String,
-    pub recovery_key_blob: AccountKeyBlob,
-}
-
-/// `POST /api/v1/me/recovery-code`, replacing the old code's material with a
-/// new one the client wrapped while holding the keys.
-pub async fn replace_recovery_code(request: &NewRecoveryCodeRequest) -> ApiResult<()> {
-    http::post::<_, Value>("/api/v1/me/recovery-code", request).await.map(|_| ())
-}
-
-// ── Stores and members ──────────────────────────────────────────────────────
-
-/// One **grant** this account holds, not one store: a store somebody holds
-/// two shares of is two rows with the same `store_id` and different `root`s
-/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, and `crates/pimble-cloud/README.md`
-/// "Sharing").
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct StoreView {
-    pub store_id: String,
-    /// The store's name for a whole-store grant, and the **share's own name**
-    /// for a scoped one. The owner's store name never reaches a recipient, so
-    /// this is the only name a scoped row may be shown under — the hosted
-    /// server's `listStores` still answers with the store's.
-    pub name: String,
-    pub role: String,
-    #[serde(default)]
-    pub created_at: String,
-    /// `plain` or `vault`. Absent on a service that predates the kind column,
-    /// which means plain.
-    #[serde(default = "default_kind")]
-    pub kind: String,
-    /// The shared node when this row is a share's grant; absent for a
-    /// whole-store one, and on a service from before shares had scopes.
-    #[serde(default)]
-    pub root: Option<String>,
-    /// An owner's email when this row is somebody else's share; absent for
-    /// one's own store.
-    #[serde(default)]
-    pub shared_by: Option<String>,
-    /// `hosted` or `relay` (docs/RELAY_CONTRACT.md): whether the store's
-    /// encrypted twin is on Pimble Cloud, or the store is served from its
-    /// owner's computer through the relay and reached at its own endpoint
-    /// (`POST /token`'s `stores`). Absent on a service from before the relay,
-    /// which means hosted.
-    #[serde(default = "default_tier")]
-    pub tier: String,
-}
-
-fn default_kind() -> String {
-    "plain".to_string()
-}
-
-fn default_tier() -> String {
-    "hosted".to_string()
-}
-
-pub async fn list_stores() -> ApiResult<Vec<StoreView>> {
-    http::get("/api/v1/stores").await
-}
-
-#[derive(Debug, Serialize)]
-struct CreateStoreRequest<'a> {
-    name: &'a str,
-    kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_id: Option<&'a str>,
-}
-
-/// `POST /api/v1/stores`. `kind` is `vault` for an encrypted store, which is
-/// what the account page creates by default.
-pub async fn create_store(name: &str, kind: &str, store_id: Option<&str>) -> ApiResult<StoreView> {
-    http::post("/api/v1/stores", &CreateStoreRequest { name, kind, store_id }).await
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct MemberView {
-    /// `None` for an invitation: an address asked but with no account yet, so
-    /// there is nothing to name and nothing to remove by id.
-    #[serde(default)]
-    pub user_id: Option<String>,
-    pub email: String,
-    pub role: String,
-    /// The scope this membership is of: the shared node, or `None` for the
-    /// whole store.
-    #[serde(default)]
-    pub root: Option<String>,
-    /// `"active"` (a grant) or `"invited"`. Absent on a service from before
-    /// invitations, where every row was a grant.
-    #[serde(default = "default_status")]
-    pub status: String,
-    /// Whether this member has been handed the scope's key yet. An active
-    /// member with `false` is the desktop's "waiting for the key".
-    #[serde(default)]
-    pub has_key: bool,
-}
-
-fn default_status() -> String {
-    "active".to_string()
-}
-
-/// What `GET /stores/{id}/members` answers now: the rows, and the scope's own
-/// name beside them (`None` for a whole-store listing, which `GET /stores`
-/// names instead).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct MembersView {
-    #[serde(default)]
-    pub members: Vec<MemberView>,
-    #[serde(default)]
-    pub share_name: Option<String>,
-    /// Everyone who reaches the scope and the name they go by in it
-    /// (docs/PRESENCE_CONTRACT.md section 3). Never an email.
-    #[serde(default)]
-    pub people: Vec<PersonView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct PersonView {
-    pub user_id: String,
-    pub name: String,
-}
-
-// ── Names (docs/PRESENCE_CONTRACT.md section 3) ─────────────────────────────
-
-pub async fn put_display_name(display_name: &str) -> ApiResult<()> {
-    http::put::<_, Value>("/api/v1/me", &serde_json::json!({ "display_name": display_name })).await.map(|_| ())
-}
-
-/// One row of `GET /api/v1/me/shares`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ShareView {
-    pub store_id: String,
-    #[serde(default)]
-    pub root: Option<String>,
-    pub name: String,
-    pub role: String,
-    pub owned: bool,
-    #[serde(default)]
-    pub owner_name: Option<String>,
-    #[serde(default = "default_tier")]
-    pub tier: String,
-    #[serde(default)]
-    pub my_name: String,
-    pub appears_as: String,
-}
-
-pub async fn list_shares() -> ApiResult<Vec<ShareView>> {
-    http::get("/api/v1/me/shares").await
-}
-
-pub async fn put_share_name(store_id: &str, root: Option<&str>, name: &str) -> ApiResult<()> {
-    http::put::<_, Value>(&format!("/api/v1/me/shares/{store_id}"), &serde_json::json!({ "root": root, "name": name }))
-        .await
-        .map(|_| ())
-}
-
-/// `GET /api/v1/stores/{id}/members[?root=]`.
-///
-/// The answer used to be a bare array and is now an object; both are read, so
-/// this page works against a service on either side of that change. Anything
-/// else is the object's own parse error, which says what did not fit.
-pub async fn list_members(store_id: &str, root: Option<&str>) -> ApiResult<MembersView> {
-    let raw: Value = http::get(&format!(
-        "/api/v1/stores/{store_id}/members{}",
-        root_query(root)
-    ))
-    .await?;
-    match raw {
-        Value::Array(_) => Ok(MembersView {
-            members: serde_json::from_value(raw)
-                .map_err(|e| ApiError::local(format!("the member list the server sent did not parse: {e}")))?,
-            share_name: None,
-            people: Vec::new(),
-        }),
-        other => serde_json::from_value(other)
-            .map_err(|e| ApiError::local(format!("the member list the server sent did not parse: {e}"))),
-    }
-}
-
-/// `?root=<node id>` where a scope is meant (a share), nothing for the whole
-/// store: how every scoped endpoint of the accounts service takes it.
-fn root_query(root: Option<&str>) -> String {
-    root.map(|root| format!("?root={}", query_escape(root))).unwrap_or_default()
-}
-
-#[derive(Debug, Serialize)]
-struct PutMemberRequest<'a> {
-    email: &'a str,
-    role: &'a str,
-}
-
-pub async fn put_member(store_id: &str, email: &str, role: &str) -> ApiResult<MemberView> {
-    http::put(
-        &format!("/api/v1/stores/{store_id}/members"),
-        &PutMemberRequest { email, role },
-    )
-    .await
-}
-
-pub async fn delete_member(store_id: &str, user_id: &str) -> ApiResult<()> {
-    http::delete::<Value>(&format!("/api/v1/stores/{store_id}/members/{user_id}"))
-        .await
-        .map(|_| ())
-}
-
-// ── Key envelopes ───────────────────────────────────────────────────────────
-
-/// One envelope as the service stores it: whose it is, which key it carries,
-/// and the sealed key itself.
-#[derive(Debug, Clone, Serialize)]
-pub struct EnvelopeUpload {
-    pub user_id: String,
-    pub key_id: KeyId,
-    pub envelope: KeyEnvelope,
-    /// Which scope key this envelope carries: the shared node for a share's
-    /// key, absent for the store key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub root: Option<String>,
-}
-
-/// An account whose signature on a key envelope is worth believing besides
-/// one's own: the store's owners, as `GET /stores/{id}/keys` lists them. A
-/// recipient is handed a share's key by its owner, so "signed by me" is not
-/// the only legitimate signature any more.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct SignerView {
-    #[serde(default)]
-    pub user_id: String,
-    #[serde(default)]
-    pub email: String,
-    pub public_signing_key: String,
-}
-
-/// The caller's own envelopes for one scope, and who may have signed them.
-#[derive(Debug, Clone, Default)]
-pub struct ScopeKeys {
-    pub envelopes: Vec<KeyEnvelope>,
-    pub signers: Vec<SignerView>,
-}
-
-#[derive(Debug, Serialize)]
-struct PutKeysRequest {
-    envelopes: Vec<EnvelopeUpload>,
-}
-
-/// `GET /api/v1/stores/{id}/keys[?root=]` — the caller's own envelopes for one
-/// scope (the store key without a `root`, that share's key with one), and the
-/// signers whose signature on them is legitimate.
-///
-/// Tolerant of both plausible shapes (`{ envelopes: [...] }` and a bare
-/// array), and of an envelope carried as an object or as its JSON text: B and
-/// C are landing their halves concurrently and this page would rather work
-/// against either than insist. A service from before sharing sends no
-/// `signers`, and then only the account's own signature is believed.
-pub async fn store_keys(store_id: &str, root: Option<&str>) -> ApiResult<ScopeKeys> {
-    let raw: Value = http::get(&format!(
-        "/api/v1/stores/{store_id}/keys{}",
-        root_query(root)
-    ))
-    .await?;
-    let list = match &raw {
-        Value::Array(items) => items.clone(),
-        Value::Object(map) => match map.get("envelopes") {
-            Some(Value::Array(items)) => items.clone(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    };
-
-    let mut envelopes = Vec::with_capacity(list.len());
-    for item in &list {
-        // An entry is either the envelope itself or a row wrapping one.
-        let candidate = match item {
-            Value::Object(map) if map.contains_key("envelope") => &map["envelope"],
-            other => other,
-        };
-        envelopes.push(lenient::<KeyEnvelope>(candidate, "key envelope")?);
-    }
-
-    let signers = match raw.get("signers") {
-        Some(value) => lenient::<Vec<SignerView>>(value, "key signers")?,
-        None => Vec::new(),
-    };
-    Ok(ScopeKeys { envelopes, signers })
-}
-
-/// `PUT /api/v1/stores/{id}/keys` — upsert envelopes, each signed by this
-/// account's signing key.
-pub async fn put_store_keys(store_id: &str, envelopes: Vec<EnvelopeUpload>) -> ApiResult<()> {
-    http::put::<_, Value>(
-        &format!("/api/v1/stores/{store_id}/keys"),
-        &PutKeysRequest { envelopes },
-    )
     .await
     .map(|_| ())
 }

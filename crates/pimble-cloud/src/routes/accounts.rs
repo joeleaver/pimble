@@ -488,8 +488,8 @@ pub struct TokenResponse {
     stores: Vec<StoreEndpoint>,
 }
 
-/// Where one relayed store is reached, and with what (`web/src/api.rs`'s
-/// `StoreEndpoint`).
+/// Where one relayed store is reached, and with what (read by
+/// `pimble-server/src/cloud/sessions.rs` `StoreEndpoint`).
 #[derive(Serialize)]
 pub struct StoreEndpoint {
     store_id: String,

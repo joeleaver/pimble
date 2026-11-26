@@ -1,10 +1,5 @@
-//! The browser on its own Pimble server (docs/ONE_CODEBASE_CONTRACT.md wave
-//! 4): the default since 2026-11-23 (Joe: "There's no active users of the web
-//! app ... you might as well just flip the switch"). The old path (keys in the
-//! page, stores from the hosted server) stays reachable until wave 5 deletes
-//! it: `?server=old` for this browser (kept in `localStorage` as
-//! `pimble.server`), `?server=worker` back to the default. With the old path
-//! nothing here runs but [`end`].
+//! The browser on its own Pimble server (docs/ONE_CODEBASE_CONTRACT.md
+//! sections 4 and 6, built in waves 4 and 5): the only way the web app runs.
 //!
 //! The server runs in a dedicated worker of the leader tab (`hub.js`,
 //! [`hub`]), keeps this browser's stores in OPFS sealed with the remembered
@@ -22,47 +17,14 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::route::{self, Route};
 
-const SWITCH_KEY: &str = "pimble.server";
-
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
-}
-
-/// Whether this browser uses its own server: yes, unless `?server=old` (or
-/// the earlier `?server=page`) asked for the old path, which is remembered
-/// until `?server=worker` asks for this one again. A browser that used the old
-/// path before this was the default has nothing remembered and gets this one.
-pub fn enabled() -> bool {
-    thread_local! {
-        static ON: bool = decide();
-    }
-    ON.with(|on| *on)
-}
-
-fn decide() -> bool {
-    let asked = crate::util::query_param("server");
-    let storage = storage();
-    match asked.as_deref() {
-        Some("old") | Some("page") => {
-            if let Some(s) = &storage {
-                let _ = s.set_item(SWITCH_KEY, "old");
-            }
-            false
-        }
-        Some("worker") => {
-            if let Some(s) = &storage {
-                let _ = s.remove_item(SWITCH_KEY);
-            }
-            true
-        }
-        _ => storage.and_then(|s| s.get_item(SWITCH_KEY).ok().flatten()).as_deref() != Some("old"),
-    }
 }
 
 /// Start the hub: this tab asks for the leader's lock, and whichever tab
 /// holds it runs the server. Called once, before routing.
 pub fn begin() {
-    tracing::info!("This browser runs its own Pimble server (?server=old for the old path, until wave 5)");
+    tracing::info!("This browser runs its own Pimble server");
     hub::start("auto", inherited());
     // A new build took over the kept files (the service worker, hub.js): this
     // page is still the one it loaded.
@@ -75,14 +37,10 @@ pub fn begin() {
     }
 }
 
-/// The switch off: nothing of the browser's own server is kept for offline.
-pub fn end() {
-    hub::leave_offline();
-}
-
 /// The device this browser reported as before it ran its own server, and the
-/// reports it answered, from `localStorage` (`web/src/vault.rs`:
-/// `pimble.vault-device`, `pimble.vault-answered.<store>`), handed to the
+/// reports it answered, from `localStorage` (where the page's own vault client
+/// kept them until wave 5 removed it: `pimble.vault-device`,
+/// `pimble.vault-answered.<store>`), handed to the
 /// server so the browser keeps its report slot (wave 4). JSON, or nothing
 /// when this browser never had one.
 fn inherited() -> Option<String> {
@@ -169,10 +127,15 @@ pub fn start_app() {
         });
 
         let (store, view) = pimble_app::app::build_view();
+        // The note editor's spellchecking: the browser lends rinch no
+        // dictionaries, so the app fetches its own.
+        pimble_app::spelling::start_web();
         store.backend.set(Some(backend::spawn()));
         if let Some(link) = crate::open_link::take_open_link() {
             pimble_app::app_links::set_launch_link(link);
         }
+        // The diagnostics notice, once, the first time this browser records.
+        pimble_app::diagnostics_ui::notice_once(store);
         // A notification or a notice email opened this page (wave 2).
         pimble_app::inbox::browser_push::hear_clicks(store);
         route::mount_app(store, view);

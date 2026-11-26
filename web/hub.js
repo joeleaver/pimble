@@ -1,7 +1,5 @@
 // The browser's one Pimble server, shared by every tab of this origin
-// (docs/ONE_CODEBASE_CONTRACT.md section 4): the web app's default; idle on
-// the old path (`?server=old`, kept in localStorage `pimble.server`, until
-// wave 5 deletes it), which only calls `leaveOffline`.
+// (docs/ONE_CODEBASE_CONTRACT.md section 4).
 //
 // Every tab asks for one Web Lock, `pimble-server`. The tab that holds it is
 // the leader: it runs the server in a dedicated worker (the page's build
@@ -317,8 +315,7 @@
 
     // ---- The page with no network (build/sw.template.js) ----
 
-    // Keep this build's files for a page opened with no network (this path
-    // only: the old path unregisters it, `leaveOffline`). A new build
+    // Keep this build's files for a page opened with no network. A new build
     // that takes over says so: `pimble-update-ready` on the window.
     function keepForOffline() {
         if (!("serviceWorker" in navigator)) return;
@@ -332,15 +329,6 @@
             (reg) => { reg.update().catch(() => {}); },
             (e) => log("no service worker; the page needs the network to load:", e.message),
         );
-    }
-
-    // The switch off: no service worker and no kept files.
-    function leaveOffline() {
-        if (!("serviceWorker" in navigator)) return Promise.resolve();
-        return navigator.serviceWorker.getRegistrations().then(async (regs) => {
-            for (const reg of regs) if (reg.scope.endsWith("/app/")) await reg.unregister();
-            if (self.caches) for (const name of await caches.keys()) if (name.startsWith("pimble-app-")) await caches.delete(name);
-        }).catch(() => {});
     }
 
     function start(given) {
@@ -464,5 +452,5 @@
         });
     }
 
-    window.PimbleHub = { start, connect, control, status, take, leaveOffline, pushSubscribe, pushUnsubscribe };
+    window.PimbleHub = { start, connect, control, status, take, pushSubscribe, pushUnsubscribe };
 })();

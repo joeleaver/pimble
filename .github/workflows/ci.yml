@@ -31,6 +31,11 @@ jobs:
             libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev \
             libpango1.0-dev libgdk-pixbuf2.0-dev libxdo-dev libmpv-dev
 
+      # The browser holds one path since wave 5 of
+      # docs/ONE_CODEBASE_CONTRACT.md: its own server, nothing beside it.
+      - name: No second path in web/
+        run: scripts/check-one-path.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -68,6 +73,42 @@ jobs:
         working-directory: web
         run: cargo check --locked --workspace --target wasm32-unknown-unknown
 
+      # The crate builds only for wasm32, so its tests run there, through
+      # wasm-bindgen-test-runner (web/.cargo/config.toml's runner) in Node.
+      # The runner must be the wasm-bindgen-cli of exactly the version
+      # web/Cargo.lock pins for `wasm-bindgen`.
+      - name: Find the wasm-bindgen version web/Cargo.lock pins
+        id: wasm-bindgen
+        run: |
+          version="$(grep -A1 '^name = "wasm-bindgen"$' web/Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          if [ -z "$version" ]; then
+            echo "web/Cargo.lock names no wasm-bindgen version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen-cli
+        id: wasm-bindgen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/wasm-bindgen-cli
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ steps.wasm-bindgen.outputs.version }}
+
+      - name: Install wasm-bindgen-cli
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        env:
+          VERSION: ${{ steps.wasm-bindgen.outputs.version }}
+        run: cargo install wasm-bindgen-cli --version "$VERSION" --locked --root ~/wasm-bindgen-cli
+
+      - name: Put wasm-bindgen-cli on the path
+        run: echo "$HOME/wasm-bindgen-cli/bin" >> "$GITHUB_PATH"
+
+      - name: cargo test the web app and its worker
+        working-directory: web
+        # A local run once hung after the tests passed; never sit for 6 hours.
+        timeout-minutes: 10
+        run: cargo test --locked --workspace --target wasm32-unknown-unknown
+
   test:
     name: cargo test
     runs-on: ubuntu-24.04
@@ -89,5 +130,49 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The accounts service's integration tests (and the sharing tests that
+      # run it) need a real rhypedb-server, which skipped every one of them
+      # here until it was built. rhypedb publishes no binaries, so it is built
+      # from the revision Cargo.lock pins for rhypedb-client (the server's
+      # protocol must match the client's), once per revision, without the
+      # ONNX embedder (the accounts schema has no @vectorize field).
+      - name: Find the rhypedb revision Cargo.lock pins
+        id: rhypedb
+        run: |
+          rev="$(grep -A2 '^name = "rhypedb-client"$' Cargo.lock | grep -oE '#[0-9a-f]{40}' | head -1 | tr -d '#')"
+          if [ -z "$rev" ]; then
+            echo "Cargo.lock names no git revision for rhypedb-client" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Cache rhypedb-server
+        id: rhypedb-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/rhypedb-server
+          key: rhypedb-server-${{ runner.os }}-${{ steps.rhypedb.outputs.rev }}
+
+      - name: Build rhypedb-server
+        if: steps.rhypedb-cache.outputs.cache-hit != 'true'
+        env:
+          REV: ${{ steps.rhypedb.outputs.rev }}
+        run: |
+          git clone --filter=blob:none https://github.com/joeleaver/rhypedb.git "$RUNNER_TEMP/rhypedb"
+          git -C "$RUNNER_TEMP/rhypedb" checkout --detach "$REV"
+          cargo build --release --locked --no-default-features -p rhypedb-server \
+            --manifest-path "$RUNNER_TEMP/rhypedb/Cargo.toml"
+          mkdir -p ~/rhypedb-server
+          cp "$RUNNER_TEMP/rhypedb/target/release/rhypedb-server" ~/rhypedb-server/
+
+      # RHYPEDB_SERVER_REQUIRED makes a missing server fail those tests
+      # instead of skipping them, and PIMBLE_CLOUD_REQUIRED does the same for
+      # the pimble-cloud binary the sharing tests run (built into
+      # target/release by this same command, for pimble-cloud's own
+      # integration tests).
       - name: cargo test --workspace --release
-        run: cargo test --workspace --release
+        run: |
+          export RHYPEDB_SERVER_BIN="$HOME/rhypedb-server/rhypedb-server"
+          export RHYPEDB_SERVER_REQUIRED=1
+          export PIMBLE_CLOUD_REQUIRED=1
+          cargo test --workspace --release
