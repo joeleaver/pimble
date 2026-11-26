@@ -24,12 +24,23 @@ pub struct Hooks {
     /// Whether diagnostics are on, and whether the notice was shown.
     pub settings: fn() -> (bool, bool),
     /// Save both.
-    pub save: fn(enabled: bool, noticed: bool) -> Result<(), String>,
+    pub save: fn(enabled: bool, noticed: bool) -> Result<(), SaveFailed>,
     /// This install's number, while diagnostics record.
     pub install: fn() -> Option<String>,
     /// Whether this copy sends at all (a build that carries the key, or a
     /// page whose service takes them).
     pub available: fn() -> bool,
+}
+
+/// Why [`Hooks::save`] did not end where it was asked to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveFailed {
+    /// What was recorded could not all be deleted: an off is saved and in
+    /// force regardless, an on is not saved and diagnostics stay off.
+    RecordsKept,
+    /// The choice could not be saved, for this reason; the one before it
+    /// stands.
+    NotSaved(String),
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -46,7 +57,13 @@ fn native_hooks() -> Hooks {
             let s = pimble_server::diagnostics::settings();
             (s.enabled, s.noticed)
         },
-        save: |enabled, noticed| pimble_server::diagnostics::save_settings(&pimble_server::diagnostics::Settings { enabled, noticed }).map_err(|e| e.to_string()),
+        save: |enabled, noticed| {
+            use pimble_server::diagnostics::{save_settings, SaveError, Settings};
+            save_settings(&Settings { enabled, noticed }).map_err(|e| match e {
+                SaveError::RecordsKept(_) => SaveFailed::RecordsKept,
+                SaveError::NotSaved(why) => SaveFailed::NotSaved(why.to_string()),
+            })
+        },
         install: || pimble_server::diagnostics::ids().map(|(install, _)| install),
         available: || pimble_server::diagnostics::ids().is_some(),
     }
@@ -75,16 +92,47 @@ pub fn notice_once(store: AppStore) {
     crate::settings::open_at(store, crate::settings::Section::Diagnostics);
 }
 
+/// What the switch shows after a flip: whether diagnostics are on, and the
+/// sentence that says why the flip did not end where it was asked to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shown {
+    enabled: bool,
+    said: Option<String>,
+}
+
+/// Off, but the records kept before could not all be deleted.
+const OFF_RECORDS_KEPT: &str =
+    "Diagnostics are off, but some saved records could not be deleted yet; they will be deleted before anything is sent.";
+/// Asked on, but the records an earlier off left could not be deleted.
+const STAY_OFF: &str = "Diagnostics stay off until the saved records can be deleted.";
+
+/// The switch after `save(asked, ..)` answered `saved`: what is in force,
+/// never merely what was asked, and the sentence saying why they differ.
+fn shown_after_save(asked: bool, saved: Result<(), SaveFailed>) -> Shown {
+    match saved {
+        Ok(()) => Shown { enabled: asked, said: None },
+        // An off is saved and in force even when its records stay behind.
+        Err(SaveFailed::RecordsKept) if !asked => Shown { enabled: false, said: Some(OFF_RECORDS_KEPT.to_string()) },
+        Err(SaveFailed::RecordsKept) => Shown { enabled: false, said: Some(STAY_OFF.to_string()) },
+        Err(SaveFailed::NotSaved(why)) => {
+            let still = if asked { "off" } else { "on" };
+            Shown { enabled: !asked, said: Some(format!("The setting could not be saved ({why}); diagnostics are still {still}.")) }
+        }
+    }
+}
+
 /// Settings > Diagnostics.
 pub fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
     let enabled = Signal::new(hooks().map(|h| (h.settings)().0).unwrap_or(true));
+    let refused = Signal::new(None::<String>);
     let install = hooks().and_then(|h| (h.install)());
     let flip = move || {
         let Some(h) = hooks() else { return };
-        let on = !untracked(|| enabled.get());
-        if (h.save)(on, true).is_ok() {
-            enabled.set(on);
-        }
+        let asked = !untracked(|| enabled.get());
+        let saved = (h.save)(asked, true);
+        let shown = shown_after_save(asked, saved);
+        enabled.set(shown.enabled);
+        refused.set(shown.said);
     };
     let when = if cfg!(feature = "native") { "the next time Pimble starts" } else { "the next time this page loads" };
     let wait = if cfg!(feature = "native") { "on this computer" } else { "in this browser" };
@@ -110,6 +158,9 @@ pub fn render_page(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                 } else {
                     format!("Off: nothing is recorded or sent. Turned on, sending starts {when}.")
                 }}
+            }
+            if refused.with(Option::is_some) {
+                div { class: "pimble-settings__note", {move || refused.get().unwrap_or_default()} }
             }
             div {
                 class: "pimble-settings__note",
@@ -209,5 +260,36 @@ pub fn render_send(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_off_that_could_not_delete_the_records_reads_off_and_says_so() {
+        let shown = shown_after_save(false, Err(SaveFailed::RecordsKept));
+        assert_eq!(shown, Shown { enabled: false, said: Some(OFF_RECORDS_KEPT.to_string()) });
+    }
+
+    #[test]
+    fn an_on_that_could_not_delete_the_leftovers_reads_off_and_says_so() {
+        let shown = shown_after_save(true, Err(SaveFailed::RecordsKept));
+        assert_eq!(shown, Shown { enabled: false, said: Some(STAY_OFF.to_string()) });
+    }
+
+    #[test]
+    fn a_flip_that_saved_reads_what_was_asked_and_says_nothing() {
+        assert_eq!(shown_after_save(true, Ok(())), Shown { enabled: true, said: None });
+        assert_eq!(shown_after_save(false, Ok(())), Shown { enabled: false, said: None });
+    }
+
+    #[test]
+    fn a_flip_that_saved_nothing_reads_as_before() {
+        let shown = shown_after_save(false, Err(SaveFailed::NotSaved("disk full".into())));
+        assert_eq!(shown, Shown { enabled: true, said: Some("The setting could not be saved (disk full); diagnostics are still on.".to_string()) });
+        let shown = shown_after_save(true, Err(SaveFailed::NotSaved("disk full".into())));
+        assert_eq!(shown, Shown { enabled: false, said: Some("The setting could not be saved (disk full); diagnostics are still off.".to_string()) });
     }
 }

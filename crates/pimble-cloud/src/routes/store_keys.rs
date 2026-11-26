@@ -135,6 +135,13 @@ pub async fn put_store_keys(
             .find_user_by_uuid(&item.user_id)
             .await?
             .ok_or_else(|| CloudError::NotFound(format!("no such user: {}", item.user_id)))?;
+        // Judged and written under the recipient's account lock, as every
+        // grant is (`AppState::lock_live_account`): an account being deleted
+        // is given no key after its deletion listed its keys.
+        let (_account, live) = state.lock_live_account(target.rid).await?;
+        if live.is_none() {
+            return Err(CloudError::Conflict("That account was deleted while this change waited, so no key was given to it.".to_string()));
+        }
         // The key only goes to somebody the scope is already shared with: a
         // whole-store grant reaches every scope, a scoped one only its own.
         let covered = state

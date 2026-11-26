@@ -182,9 +182,15 @@ impl AppStore {
             // so opening, renaming and the context menu need no special case.
             // A share that has ended is not shown: its root is still one of
             // the replica's, and is no row (`Store::shown_roots`). When every
-            // share has ended the row has nothing under it.
+            // share has ended the row has nothing under it, and so has a
+            // whole replica whose own root has (the account holds the store
+            // no more).
             let children = if roots.is_empty() {
-                self.build_children_structural(sid, root_id, paste, &[], 0)
+                if ended_roots.contains(&root_id) {
+                    Vec::new()
+                } else {
+                    self.build_children_structural(sid, root_id, paste, &[], 0)
+                }
             } else {
                 roots
                     .iter()

@@ -188,16 +188,22 @@ pub(super) fn store_changed(
     // Whoever made it, it may change what points at the node
     // the Properties panel shows.
     crate::properties::store_changed(store);
-    // A note a notice named may be named differently now.
-    if let pimble_rpc::StoreChangeKind::MetadataUpdated { node_id } | pimble_rpc::StoreChangeKind::ContentUpdated { node_id } = change_kind {
-        crate::inbox::note_changed(store, *store_id, *node_id);
-    }
     // Skip our own echoes
     let my_id = untracked(|| store.client_id.get());
     if let Some(source) = source_client_id {
         if !my_id.is_empty() && source == &my_id {
             return;
         }
+    }
+    // A note a notice named may be named differently now.
+    match change_kind {
+        pimble_rpc::StoreChangeKind::MetadataUpdated { node_id } => {
+            crate::inbox::note_changed(store, *store_id, *node_id, crate::inbox::NoteChange::Metadata);
+        }
+        pimble_rpc::StoreChangeKind::ContentUpdated { node_id } => {
+            crate::inbox::note_changed(store, *store_id, *node_id, crate::inbox::NoteChange::Text);
+        }
+        _ => {}
     }
     // An index's progress is said several times a second while it
     // is built: not a line each.

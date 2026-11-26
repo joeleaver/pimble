@@ -13,30 +13,9 @@ use crate::backend;
 use crate::route::{self, Route};
 use crate::session;
 
-/// Where a `?open=` link waits while the visitor signs in or unlocks: this
-/// tab's session storage, so it survives the trip to the login page.
-const OPEN_KEY: &str = "pimble.open";
-
-/// `/app/?open=<pimble: link>` (docs/SETTINGS_CONTRACT.md section 12: the
-/// website's "Open in the web app"): kept until the app is up, then opened as
-/// the desktop opens a link it is started with.
-pub(crate) fn keep_open_link() {
-    let Some(link) = crate::util::query_pairs().into_iter().find(|(k, _)| k == "open").map(|(_, v)| v) else { return };
-    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
-        let _ = storage.set_item(OPEN_KEY, &link);
-    }
-}
-
-pub(crate) fn take_open_link() -> Option<String> {
-    let storage = web_sys::window()?.session_storage().ok().flatten()?;
-    let link = storage.get_item(OPEN_KEY).ok().flatten()?;
-    let _ = storage.remove_item(OPEN_KEY);
-    Some(link)
-}
-
 /// Build the app into its host, once.
 pub fn start() {
-    keep_open_link();
+    crate::open_link::keep_open_link();
     spawn_local(async move {
         let session_token = match api::fetch_token().await {
             Ok(session) => session,
@@ -90,7 +69,7 @@ pub fn start() {
         // The name it goes by (docs/PRESENCE_CONTRACT.md section 3), which
         // stamps carry instead of the email's local part.
         store.send(pimble_app::protocol::BackendCommand::CloudListShares);
-        if let Some(link) = take_open_link() {
+        if let Some(link) = crate::open_link::take_open_link() {
             pimble_app::app_links::set_launch_link(link);
         }
         pimble_app::diagnostics_ui::notice_once(store);

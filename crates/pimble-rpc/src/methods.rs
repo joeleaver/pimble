@@ -11,8 +11,10 @@ use jsonrpsee::types::ErrorObjectOwned;
 use pimble_core::{NodeId, StoreId};
 use pimble_rpc_macros::pimble_api;
 
+use crate::account::*;
 use crate::app_links::*;
 use crate::notices::*;
+use crate::diagnostics::*;
 use crate::types::*;
 
 /// Pimble RPC API
@@ -358,6 +360,18 @@ pub trait PimbleApi {
     #[method(name = "handOver", with_extensions)]
     async fn hand_over(&self) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    /// Whether diagnostics are on, and the install they are recorded under:
+    /// what the browser's page tells its server at every connect and when
+    /// the person changes it, with a clear it noted as owed; whether that
+    /// clear has run. `Service`-only.
+    #[method(name = "setDiagnostics", with_extensions)]
+    async fn set_diagnostics(&self, request: SetDiagnosticsRequest) -> Result<SetDiagnosticsResponse, ErrorObjectOwned>;
+
+    /// Help > "Send Diagnostics...": the client's logs, this server's own,
+    /// the note and the stores, sent as one report; its code. `Service`-only.
+    #[method(name = "sendDiagnostics", with_extensions)]
+    async fn send_diagnostics(&self, request: SendDiagnosticsRequest) -> Result<SendDiagnosticsResponse, ErrorObjectOwned>;
+
     /// Whether an account is currently signed in, and as whom. `Service`-only.
     #[method(name = "cloudStatus", with_extensions)]
     async fn cloud_status(&self) -> Result<CloudStatusResponse, ErrorObjectOwned>;
@@ -528,6 +542,36 @@ pub trait PimbleApi {
     /// where they were. `Service`-only.
     #[method(name = "cloudStopSharing", with_extensions)]
     async fn cloud_stop_sharing(&self, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    // ── The account page (crate::account) ──
+
+    /// Wrap the account keys under a new password, proved by the current
+    /// one, and tell the accounts service. Every other session of the account
+    /// is signed out; the one that asked stays signed in (Joe, 2026-11-25).
+    /// Refused in a sentence, with nothing changed, when a password change or
+    /// a recovery elsewhere got there first. `Service`-only.
+    #[method(name = "cloudChangePassword", with_extensions)]
+    async fn cloud_change_password(&self, request: CloudChangePasswordRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Make a new recovery code, proved by the current password (checked
+    /// here and again by the accounts service), wrap the account keys under
+    /// it, replace the old one; the account is mailed that its code changed
+    /// (Joe, 2026-11-25). The code is answered once. `Service`-only.
+    #[method(name = "cloudNewRecoveryCode", with_extensions)]
+    async fn cloud_new_recovery_code(&self, request: CloudNewRecoveryCodeRequest) -> Result<CloudNewRecoveryCodeResponse, ErrorObjectOwned>;
+
+    /// A whole store's members and invitations. `Service`-only.
+    #[method(name = "cloudStoreMembers", with_extensions)]
+    async fn cloud_store_members(&self, request: CloudStoreRef) -> Result<CloudStoreMembersResponse, ErrorObjectOwned>;
+
+    /// Give an address a role on a whole store, owner included, or change
+    /// it; an encrypted store's key is sealed to a new member. `Service`-only.
+    #[method(name = "cloudStoreSetMember", with_extensions)]
+    async fn cloud_store_set_member(&self, request: CloudStoreSetMemberRequest) -> Result<CloudStoreMembersResponse, ErrorObjectOwned>;
+
+    /// Remove a whole store's member or an invitation to it. `Service`-only.
+    #[method(name = "cloudStoreRemoveMember", with_extensions)]
+    async fn cloud_store_remove_member(&self, request: CloudStoreRemoveMemberRequest) -> Result<CloudStoreMembersResponse, ErrorObjectOwned>;
 }
 
 /// Helper function to convert any error to ErrorObjectOwned

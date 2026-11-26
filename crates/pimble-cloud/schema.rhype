@@ -95,6 +95,13 @@ type User {
     // Section 4: when the last notice email went to this person (at most one
     // an hour). Absent or epoch zero: never.
     notice_emailed_at: DateTime
+    // docs/ONE_CODEBASE_CONTRACT.md "Built: wave 5, part 4": a session whose
+    // `Session.epoch` is below this is ended. A password change raises it in
+    // the same `.update()` that writes the new password (after raising the
+    // changing session's own epoch to the new value), so every other session
+    // ends at the moment the password changes, and a recovery raises it with
+    // the recovery's update. Absent on every row from before: 0.
+    session_epoch: u64
 }
 
 type Session {
@@ -103,6 +110,10 @@ type Session {
     user_rid: u64 @indexed
     expires_at: DateTime
     created_at: DateTime
+    // The owner's `User.session_epoch` when the session was made (raised for
+    // the session that changes the password); valid only while it is not
+    // below the owner's. Absent on every row from before: 0.
+    epoch: u64
 }
 
 type HostedStore {

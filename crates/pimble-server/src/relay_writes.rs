@@ -453,7 +453,7 @@ mod tests {
     impl Http for Service {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
             let status = { self.answers.lock().unwrap().pop().unwrap_or(200) };
-            let body: serde_json::Value = serde_json::from_slice(&request.json.unwrap()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body.unwrap().bytes).unwrap();
             let id = body["report"].as_str().expect("every report has an id").to_string();
             match status {
                 0 => return Err(HttpError("the service is not reachable".into())),
@@ -469,6 +469,12 @@ mod tests {
                 return Err(HttpError("the connection broke before the answer".into()));
             }
             Ok(HttpResponse { status, body: b"{}".to_vec() })
+        }
+
+        /// Reports go to the accounts service over plain calls only; a test of
+        /// them never asks a relay how it answers a socket.
+        async fn websocket_close_code(&self, _url: &str, _token: &str) -> Option<u16> {
+            None
         }
     }
 

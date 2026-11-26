@@ -2349,6 +2349,7 @@ dependencies = [
  "pimble-crypto",
  "reqwest",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "wasm-bindgen",

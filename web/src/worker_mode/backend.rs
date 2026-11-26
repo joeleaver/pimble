@@ -115,6 +115,7 @@ impl Local {
         *held = Some(client.clone());
         drop(held);
         self.generation.set(self.generation.get() + 1);
+        spawn_local(tell_diagnostics(client.clone()));
         self.watch(client.clone());
         self.hear_cloud(client.clone());
         self.hear_notices(client.clone());
@@ -307,6 +308,7 @@ async fn run(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>) {
                 spawn_local(async move {
                     let ctx = Context { api: &api, host, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
                     if let Some(event) = process_command(&ctx, cmd).await {
+                        heard(&event);
                         let _ = event_tx.try_send(event);
                         signal_ui();
                     }
@@ -319,9 +321,7 @@ async fn run(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>) {
                     let mut runner = Runner { ctx: &ctx };
                     Some(pimble_app::import::import(&mut runner, store_id, parent_id, format, &name, &files).await)
                 }
-                BackendCommand::SendDiagnostics { .. } => Some(BackendEvent::DiagnosticsSent {
-                    result: Err("Diagnostics are not sent from the browser's own server yet; the old path (?server=old) sends them.".to_string()),
-                }),
+                BackendCommand::SendDiagnostics { note, stores } => Some(BackendEvent::DiagnosticsSent { result: send_diagnostics(&ctx, note, stores).await }),
                 BackendCommand::CreateHostedStore { name, kind } => {
                     let event = create_store(&ctx, &name, &kind).await;
                     Asked::answer(Some(Asked::CreateStore), Some(event))
@@ -329,6 +329,7 @@ async fn run(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>) {
                 cmd => process_command(&ctx, cmd).await,
             };
             if let Some(event) = event {
+                heard(&event);
                 let _ = event_tx.try_send(event);
                 signal_ui();
             }
@@ -353,6 +354,50 @@ impl pimble_app::import::Runner for Runner<'_, '_> {
 /// Pimble Cloud at once, encrypted, which is what the button has always made
 /// here (the person asked for a store on their account; nothing else is
 /// uploaded). The desktop's "Host on Pimble Cloud..." is the same call.
+/// What the page itself takes from an event before the UI does: the
+/// signed-in account's id, which its own diagnostics records carry.
+fn heard(event: &BackendEvent) {
+    if let BackendEvent::CloudStatusChanged { user_id, .. } = event {
+        crate::diagnostics::set_account(user_id.clone());
+    }
+}
+
+/// Tell this browser's server the diagnostics choice, the page's install
+/// number and a clear the page owes it (`setDiagnostics`): at every
+/// connection, since a new worker knows none of them, and whenever Settings
+/// > Diagnostics saves it. The note of the clear goes once the server says
+/// it has run.
+async fn tell_diagnostics(client: Arc<PimbleClient>) {
+    let (enabled, _) = crate::diagnostics::settings();
+    let owed = crate::diagnostics::clear_owed();
+    match client.set_diagnostics(enabled, crate::diagnostics::install(), owed.is_some()).await {
+        Ok(cleared) => {
+            if let (true, Some(tag)) = (cleared, owed) {
+                crate::diagnostics::clear_confirmed(&tag);
+            }
+        }
+        Err(e) => tracing::debug!("This browser's server was not told the diagnostics choice: {e}"),
+    }
+}
+
+/// Settings > Diagnostics saved: the server hears it at once.
+pub fn diagnostics_saved() {
+    spawn_local(async {
+        if let Ok(client) = local().client().await {
+            tell_diagnostics(client).await;
+        }
+    });
+}
+
+/// Help > "Send Diagnostics...": the page's recent log goes to this
+/// browser's server, which adds its own and sends the report as the
+/// signed-in account (`sendDiagnostics`).
+async fn send_diagnostics(ctx: &Context<'_>, note: String, stores: serde_json::Value) -> Result<String, String> {
+    let client = ctx.host.clone().ok_or_else(|| "This browser's server is not connected.".to_string())?;
+    let page = pimble_rpc::DiagnosticsLog { name: "page.log".to_string(), text: crate::diagnostics::recent_log() };
+    client.send_diagnostics(note, stores, vec![page]).await.map_err(|e| e.to_string())
+}
+
 async fn create_store(ctx: &Context<'_>, name: &str, kind: &str) -> BackendEvent {
     let Some(client) = ctx.host.as_ref() else { return BackendEvent::Error { message: "Not connected".into() } };
     if kind != "vault" {
@@ -373,8 +418,10 @@ async fn create_store(ctx: &Context<'_>, name: &str, kind: &str) -> BackendEvent
 }
 
 /// Every store the account is granted, a replica in this browser (section 5):
-/// each encrypted store not here yet (or a share of one whose root is not) is
-/// added as the desktop's "Add Hosted Store..." adds it. Answers the stores
+/// each hosted store not here yet (or a share of one whose root is not),
+/// encrypted or plain, is added as the desktop's "Add Hosted Store..." adds
+/// it (`cloudAddHostedStore`: a vault link for an encrypted store, a plain
+/// link held through the account for a plain one; wave 5, part 1). Answers the stores
 /// this server has open, for the tree; `None` when nobody is signed in.
 /// Taken one tab at a time (a Web Lock), so two tabs never add one store
 /// twice.
@@ -389,10 +436,6 @@ pub async fn keep_account_stores(client: &PimbleClient) -> Option<Vec<pimble_cor
             let open = client.list_stores().await.unwrap_or_default();
             let mut asked: HashSet<String> = HashSet::new();
             for row in &rows {
-                if row.kind != "vault" {
-                    tracing::info!("{} is a plain hosted store; the browser's own server keeps encrypted stores only for now", row.store_id);
-                    continue;
-                }
                 let Ok(store_id) = pimble_core::StoreId::parse(&row.store_id) else { continue };
                 let here = open.iter().find(|s| s.id == store_id);
                 let wanted = match here {

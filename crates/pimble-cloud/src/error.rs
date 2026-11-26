@@ -17,6 +17,10 @@ pub enum CloudError {
     /// login attempt). Always a generic message on login so a wrong
     /// password and an unknown email are indistinguishable to the caller.
     Unauthorized(String),
+    /// 401 `wrong_current_password` — `POST /me/password` with a
+    /// `current_auth_key` that is not the account's: told apart from a
+    /// session the service no longer takes, which is plain `Unauthorized`.
+    WrongCurrentPassword,
     /// 403 — a login attempt with the right password for an account whose
     /// email hasn't been verified yet (Phase 1b, checked after the
     /// password so it never substitutes for "wrong password").
@@ -53,6 +57,7 @@ impl CloudError {
         match self {
             CloudError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.as_str()),
             CloudError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m.as_str()),
+            CloudError::WrongCurrentPassword => (StatusCode::UNAUTHORIZED, "wrong_current_password", "current password is incorrect"),
             CloudError::EmailUnverified => (StatusCode::FORBIDDEN, "email_unverified", "Check your inbox for the verification link."),
             CloudError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.as_str()),
             CloudError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m.as_str()),

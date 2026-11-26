@@ -59,10 +59,12 @@ pub fn entry() {
     answer(&[("t", JsValue::from_str("loaded"))]);
 }
 
-/// The server's log in the worker's console, at INFO (the page's level).
+/// The server's log in the worker's console, at INFO (the page's level),
+/// and in its diagnostics recorder (`pimble_server::diagnostics::Layer`: the
+/// recent log a report carries, and the lines diagnostics record).
 fn install_tracing() {
     use tracing_subscriber::prelude::*;
-    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Console));
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Console).with(pimble_server::diagnostics::Layer));
 }
 
 /// Each event at INFO or above as one console line: level, where, message

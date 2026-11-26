@@ -365,6 +365,13 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
         .transpose()
         .map_err(|e| CloudError::BadRequest(format!("store_id is not a valid id: {e}")))?;
     let kind_str = store_kind_str(req.kind);
+    // The owner's grant is written under the creator's account lock, as every
+    // grant is (`AppState::lock_live_account`), taken before anything is
+    // made: an account being deleted makes no store it would own once gone.
+    let (_account, live) = state.lock_live_account(authed.user.rid).await?;
+    if live.is_none() {
+        return Err(CloudError::Conflict("This account was deleted while the store waited to be made, so nothing was made.".to_string()));
+    }
 
     // A chosen id may already have a row. A live one is somebody's store and
     // is refused. A deleted one is what "stop hosting" and "stop sharing from
@@ -430,6 +437,9 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
 
 pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Path(store_id): Path<String>) -> CloudResult<Json<Value>> {
     let store = require_live_store(&state, &store_id).await?;
+    // Under the owner lock: an owner being demoted or removed right now is
+    // judged after that, not before (`AppState::store_owner_locks`).
+    let _owners = state.store_owner_locks.lock(&store.store_id).await;
     require_owner(&state, &store, authed.user.rid).await?;
     // Everything that names the store goes with it: nobody keeps a grant, an
     // envelope, or a standing invitation to a store that no longer exists

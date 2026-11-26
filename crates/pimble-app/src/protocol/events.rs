@@ -5,6 +5,17 @@ use pimble_core::{BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, Mou
 
 use super::{Asked, CloudOp, SearchPurpose};
 
+/// What a note a notice names is called (`NotesNamed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteName {
+    /// The label, as the explorer shows it.
+    pub label: String,
+    /// Whether the label is read from the note's text
+    /// (`pimble_core::plan::label_follows_text`), so an edit of the text
+    /// alone can change it.
+    pub follows_text: bool,
+}
+
 /// A picture that was stored (`BackendEvent::BlobStored`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredBlob {
@@ -280,7 +291,7 @@ pub enum BackendEvent {
     NoticeReceived { notice: pimble_rpc::Notice },
     /// The names `NameNodes` asked for, as the explorer would show them;
     /// `None` for a note this device cannot read.
-    NotesNamed { names: Vec<((StoreId, NodeId), Option<String>)> },
+    NotesNamed { names: Vec<((StoreId, NodeId), Option<NoteName>)> },
     /// The notices this device keeps, newest first, and whether
     /// notifications are on (`ListNotices`, `SetNotifications`).
     NoticesListed { notices: Vec<pimble_rpc::Notice>, on: bool, email: bool, push: bool, push_key: Option<String>, watches: bool },

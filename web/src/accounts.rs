@@ -261,6 +261,9 @@ pub async fn change_password(request: &ChangePasswordRequest) -> ApiResult<()> {
 
 #[derive(Debug, Serialize)]
 pub struct NewRecoveryCodeRequest {
+    /// The current password's `auth_key` (Joe, 2026-11-25: a new code needs
+    /// the password).
+    pub current_auth_key: String,
     pub recovery_salt: String,
     pub recovery_key_blob: AccountKeyBlob,
 }

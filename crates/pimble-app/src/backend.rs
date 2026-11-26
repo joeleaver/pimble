@@ -301,7 +301,7 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
                 Some(crate::import::import(&mut runner, store_id, parent_id, format, &name, &files).await)
             }
             BackendCommand::SendDiagnostics { note, stores } => {
-                let result = tokio::task::spawn_blocking(move || pimble_server::diagnostics::send_report(&note, stores)).await.unwrap_or_else(|e| Err(e.to_string()));
+                let result = tokio::task::spawn_blocking(move || pimble_server::diagnostics::send_report(&note, stores, Vec::new())).await.unwrap_or_else(|e| Err(e.to_string()));
                 Some(BackendEvent::DiagnosticsSent { result })
             }
             cmd => process_command(&ctx, cmd).await,

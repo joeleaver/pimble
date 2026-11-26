@@ -221,7 +221,7 @@ Every store in the browser is a replica, as on a desktop that added hosted store
   to the twin, made as `cloudAddHostedStore` makes one; members' partial replicas, scope
   roots, ended shares and `owner offline` all as on the desktop.
 - **Plain stores hosted on Pimble Cloud**: a replica with a plain sync link to the hosted
-  server, as `addRemoteStore` makes one. Today the page reads them straight from the
+  server, made by `cloudAddHostedStore` and held through the account (built in wave 5, part 1). Today the page reads them straight from the
   hosted server; afterwards the page reads its own server, and the link keeps it level.
 - **Stores the account owns, shared from a computer** (relay tier): the browser is a
   member-side replica like any other. Sharing *from* a browser is not offered: a tab is not
@@ -1359,8 +1359,8 @@ this is the transport adapter of section 6), loaded before the page's wasm.
 - **The account's stores, kept here** (`keep_account_stores`, section 5): at connect and every
   two minutes, under the `pimble-account-stores` lock: `cloudListHostedStores`, and for each
   encrypted store not open here (or a share of one whose root is not), `cloudAddHostedStore`, the
-  desktop's "Add Hosted Store..." call; then `StoresListed`. A plain hosted store is logged and
-  skipped (below).
+  desktop's "Add Hosted Store..." call; then `StoresListed`. A plain hosted store was logged and
+  skipped (below; replicated since wave 5, part 1).
 - `pages.rs`: the sign-in page (email, password, "Don't remember this browser" with section 7's
   sentence beside it in its words) and the account page (who is signed in, how the stores are
   kept, "Sign Out", "Forget This Browser", "Sign in again"). Signing up, verifying and recovering
@@ -1519,8 +1519,8 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
   hosted twin as it is taken (so only offline is there a window), and the other tabs' editors
   reconcile on reconnect (the typing test above). Whether the browser (or both apps) adopts the
   log is still wave 0's question.
-- **Plain hosted stores** are not replicated in the browser yet (section 5's second bullet): they
-  are logged and skipped. The link would be `addRemoteStore` with `AuthMethod::CloudSession` to
+- **Plain hosted stores** are not replicated in the browser yet (section 5's second bullet; built
+  in wave 5, part 1, through `cloudAddHostedStore`): they are logged and skipped. The link would be `addRemoteStore` with `AuthMethod::CloudSession` to
   the session's `rpc_url`; not built or tried. The local stack makes only encrypted stores.
 - **No Settings switch**: `?server=worker` only. "Forget This Browser" is on the account page,
   not in Settings.
@@ -1528,7 +1528,7 @@ desktop as the owner on 17491, carol's on 17493, bob in the browser; made-up acc
   worker's files (no service worker; the edge says `no-store`). Offline use needs the page served
   (or a service worker, which is a decision of its own).
 - A relayed store whose owner is away reads as plainly offline in the worker
-  (`owner_is_offline` is `false` there, as wave 3 left it).
+  (`owner_is_offline` is `false` there, as wave 3 left it; shared since wave 5, part 1).
 - Diagnostics are not sent from the worker; the old path's are untouched.
 - Semantic search in the browser is wave 6.
 - **Firefox and Safari were not run**: there is no Firefox in this machine's Playwright cache
@@ -1750,3 +1750,581 @@ before.
   a page offline on the older build until then; this one never runs two builds' files in one
   page.
 - Safari is still not run.
+
+## Built: wave 5, part 1 (2026-11-23, not merged or released): plain hosted stores, and an owner away
+
+The two things the worker's server still could not do that the old browser path could, built in
+the shared server so the desktop and the browser do them by one code path. The old path is not
+deleted yet (part 2).
+
+### Plain hosted stores as replicas
+
+- **The call is `cloudAddHostedStore`**, not `addRemoteStore` as section 5 and wave 4's notes
+  guessed: the row's `kind` (`"plain"`) says which link the store gets, so the worker's
+  `keep_account_stores` and the desktop's "Add Hosted Store..." make one call for every hosted
+  store. The request and answer are unchanged; what the call accepts widened (a plain store was
+  refused before, for want of key envelopes). Built in `pimble-server/src/handler/hosted_plain.rs`
+  (`add_hosted_plain_store`): a whole replica for a whole-store grant (an empty replica with a
+  placeholder root, corrected by `adopt_document_root` once the pull lands, as for a vault twin),
+  a partial one rooted at the shared nodes for a share, another root added to the open partial
+  replica for a share given since; `sync.json` is `mode: "sync"` with the new
+  `via_account: true` (`pimble-store` `SyncConfig`), the hosted server's address and no
+  credential, and how the account holds the store (`access`, `shared_by`, the roots read only or
+  commented).
+- **The link is the plain `SyncLink`**, with the vault link's way of reaching its remote
+  (`pimble-server/src/sync_link/account.rs`): before every connect the grant is read again and a
+  token minted from the account's session, sent as `Bearer` (`credentials.json` is neither read
+  nor written); while connected the grant is asked about every `grant_check_interval` and a
+  change connects again at once. A refused session waits for a sign-in, as the vault link does.
+- **What the account's grant decides, now shared** (`pimble-server/src/grant.rs`, moved out of
+  `vault_link.rs` and used by both links): `refresh` (rows read at connect: role, shares added,
+  shares ended, `sync.json` kept in line), `grant_shape` and `GRANT_CHECK_EVERY`, `mint` with
+  `SessionExpired`, `record_ended_roots`, and `may_push` (an editor or owner pushes, a commenter
+  only discussions, a reader nothing).
+- **The plain link pushes only what the account may write** (`sync_link/reconcile.rs`
+  `send_edit`, every push of the reconcile and of the live loop): nothing for a reader's replica,
+  and a document the hosted server refuses (`is_refusal`: out of scope now, or under a root only
+  read) is left for a later connect rather than taking the link down. For a link with a saved
+  credential nothing changes: its access is always full. `sync_link.rs` became
+  `sync_link/{mod,reconcile,account}.rs` (594, 192, 54 lines).
+- **A whole replica whose grant is gone ends like a share** (review fix, 2026-11-24). Before it,
+  `grant::refresh` handled a store no row names only for a partial replica: a member removed
+  from a whole store, or another account signed in on the device, kept `access: Full`, every
+  connect was denied, and local edits looked saved and never left the device. The gap was older
+  than this part: the code came from `vault_link.rs`, so encrypted whole replicas had it too, and
+  the one fix covers both links. Now a whole *replica* (under the replicas directory; a person's
+  own store is never ended by whoever is signed in) is made read only and its own root is
+  recorded in `StoreManifest::ended_roots`, announced once with `SharesEnded`: the decided
+  ended-share behavior (CLAUDE.md, "A member's desktop"), no new state or wording.
+  `Store::held_roots` (the listed roots, or a whole store's own) is what `ended_roots` is a subset
+  of, so `shown_roots` is empty and `every_share_ended` is true: the row says `no longer shared`,
+  shows nothing under it, and its menu leaves "Remove Replica..." alone on. `LocalStore`
+  keeps a whole replica's ended set to its root (`set_ended_roots`), follows the root the first
+  pull adopts (`set_root_node_id`), and judges everything in it ended (`under_ended_root`: no
+  link followed into it, no search hit). Rows naming the store again un-end it at the next
+  connect, which also restores the access.
+- **A mount's source, when the mounting store is held through the account** (a plain replica with
+  `via_account`, or a vault link's), is added through the account the way `cloudAddHostedStore`
+  adds a store (`handler/mount_sources.rs` `SourceRoute::Account`, then
+  `handler/hosted.rs` `add_hosted_store`: a source the account holds nothing of is refused,
+  never made a whole replica held as owner; since wave 5, part 3 `cloudAddHostedStore` refuses
+  the same way, and the `Unlisted` choice is gone). Before it the source was
+  tried at the mounting store's address with whatever `credentials.json` held for it, which for
+  an account replica is nothing: the mount went `Unavailable`. A mount ref's own
+  `source_remote` is still tried after the account when it names another server.
+  `cloudAddHostedStore`'s body moved to `handler/hosted.rs`, and the mount-source resolution to
+  `handler/mount_sources.rs`; `handler.rs` shrank by both.
+- **Adding another share to an open replica keeps its `last_sync`** (and `last_seq`): the
+  rewrite of `sync.json` in `hosted_plain.rs` reads what was there first. Before it a mount of the
+  replica read `Connecting` rather than `Cached` until the next sync.
+- **The browser**: `keep_account_stores` no longer skips plain rows. **The desktop**: "Add Hosted
+  Store..." lists plain hosted stores too (`pimble-app/src/events.rs`), the same call.
+- "New Store..." in the browser still makes an encrypted store only, as the button always has.
+
+### A relayed store whose owner is away
+
+- The relay accepts a member's upgrade and closes it with 4404 when the owner's computer is not
+  connected; the desktop asked with a raw tokio-tungstenite socket. That question is now a seam
+  method, `Http::websocket_close_code(url, token)` (`pimble-host/src/http.rs`): natively
+  tokio-tungstenite with `Authorization: Bearer` (`http/native_socket.rs`), in the browser a
+  `web_sys::WebSocket` with the token as `access_token` (`http/browser_socket.rs`; a code is read
+  only after the socket opened, so a refused handshake's 1006 is never taken for an answer). Both
+  answer a code only when the first thing after opening is a close, within
+  `FIRST_WORD_WAIT` (2 s) after a `SOCKET_CONNECT_TIMEOUT` (15 s) connect.
+- `owner_is_offline` is shared (`pimble-server/src/relay_probe.rs`); the wasm32 stub that
+  answered `false` is gone, and the vault link asks through `handler.http()` on both targets.
+- So the worker shows `owner offline` exactly as the desktop does, and, as on the desktop, the
+  store stays editable from its replica (edits go when the owner is back; docs/RELAY_CONTRACT.md).
+  The old browser path made such a store read-only because it held no copy of its own; the worker
+  holds one, so it does not.
+
+### Proof
+
+- `crates/pimble-server/tests/hosted_plain.rs` (new, the sharing harness's stub accounts service
+  and JWT-mode hosted server): a plain hosted store replicated through the account both ways,
+  `sync.json` with `via_account` and no token, the placeholder root corrected, a restart whose
+  link comes back from `sync.json` alone (a server opens no store by itself; its client opens
+  the replica by path, as the app's open-store list and the worker's replicas folder do); a reader
+  whose replica refuses edits and sends nothing (H is made to take Bob's writes through a stub
+  knob, `token_role`, and a change slipped onto the replica's disk while it was off never reaches
+  H until Bob is made an editor, when it goes), made an editor while connected and then writing
+  to `H`; a share as a partial replica that never receives what is outside it, writes inside it,
+  and records its removal as an ended share; a whole replica removed, granted again, then ended
+  by another account signing in and held again by its own; another share joining the open
+  replica with `last_sync` kept (the link held offline by `LinkFaults`); a mount in an account
+  replica whose source resolves through the account. `pimble-store`
+  `tests/ended_whole_replica.rs`, the core's and the app's tests of a whole store's ended root.
+- `pimble-host` `http::socket` tests: a server that closes with 4404 answers `Some(4404)`, one that
+  speaks first answers `None`, no listener answers `None`. The relay suite (`tests/relay.rs`)
+  covers the owner-away path end to end on the desktop.
+- The server suites (`pimble-host`, `pimble-store`, `pimble-server`) pass on the real disk and with
+  `PIMBLE_TEST_DISK=memory`.
+- In a browser (headless Chromium through Playwright, on `scripts/local-stack` with made-up
+  accounts, the default worker path): a plain store created on the hosted server and held by
+  Alice showed in her page as `synced`; text she typed into a note reached her desktop replica
+  (added with `cloud-add-hosted`, `via_account` in its `sync.json`) and its search, and a note
+  made on the desktop appeared in the page live. A relayed store's folder shared with Bob showed
+  in his page as `shared by alice · encrypted · synced`; with the owner's desktop stopped, the
+  row read `owner offline` within a second.
+
+### Not done
+
+- `handler.rs` (about 7,050 lines) and `vault_link.rs` (about 3,480) are still far over the
+  700-line limit; this part moved code out of both (`grant.rs`, `hosted_plain.rs`) but did not
+  split them.
+- This part's browser proof ran in Chromium only, not Firefox.
+- No test covers an expired sign-in on a plain link held through the account (the link waits
+  while the session is expired, as the vault link does; the vault link's tests cover that path).
+- `tests/in_process.rs` `a_reader_is_refused_in_process` fails on `master` (2ff7163) as on this
+  branch, and was not caused by it: the store's index turns ready after the reader subscribes,
+  and the first notification it hears is `IndexStateChanged { Ready }` (source `None`, since
+  eb60d11's startup work), not the service's edit the test waits for.
+- An ended whole replica is un-ended only by its link's next connect (the plain link backs off
+  to 30 s); "Add Hosted Store..." does not list it, since it is open here.
+- `tests/vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`
+  fails about one run in two at this part's base as with it (line 1408: the member's new
+  document is found wrapped under a second scope key as well as the share's), a race between the
+  test's look at H and the owner's upkeep; not caused by this part and not fixed here.
+- The old browser path is still there (wave 5's later parts remove it).
+
+## Built: wave 5, part 2 (2026-11-23, not merged or released): diagnostics, the account page, shared helpers
+
+What the worker's browser path still lacked next to the old one, so that the old path can go in
+its own step. The old path is not deleted yet.
+
+### Diagnostics are the server's (section 6, item 10)
+
+- **One core, three recorders.** `pimble_core::diagnostics` (`records.rs`) holds what every
+  recorder shares, with no I/O: the envelope (`Envelope::record`, `Envelope::report`), the log
+  budget (`LogBudget`: repeats at 1, 2, 3, then tens; 500 warnings, 2,000 info lines), the info
+  targets, scrubbing a record's values, ids and the report code. The desktop's recorder
+  (`pimble-server/src/diagnostics/native.rs`, `queue.rs`, `system.rs`, `report.rs`: the old
+  799-line `diagnostics.rs` split by job), the worker's, and the page's (`web/src/diagnostics.rs`)
+  are each built on it.
+- **The worker's server records** (`diagnostics/worker.rs` over `diagnostics/worker_core.rs` and
+  `diagnostics/on_disk.rs`, the latter two built for both targets and tested natively): a `tracing` layer installed beside the console's
+  (`pimble-worker/src/entry.rs`) keeps the recent log and admits lines through the budget; the
+  records wait in memory (at most 1 MiB) until the page has said its choice, then go every
+  minute onto the server's own disk (`Paths::diagnostics()`,
+  `records-<millis>-<session>-<owner>.ndjson`,
+  at most 4 MiB, the oldest dropped), and are sent through the host's `Http` to the accounts
+  service's `/api/v1/diagnostics/records` with the keystore's session as the bearer. The
+  accounts service adds the send key as before; no browser carries it. Signed out, they wait.
+  Records say `os: "web"`, and a `system` record says `program: "worker"` (once per session, the
+  first time diagnostics are on, even after an off).
+- **A batch is sent only as the account that recorded it** (review of e31e31e, 2026-11-25). A
+  pump writes one batch per account that was signed in when its records were made; the batch's
+  name carries the owner (`none`, or `u` and the account id in hex). A send takes the signed-in
+  account's own batches and the ones recorded while no one was signed in (those carry no
+  `account`, and wait for the next sign-in as before); another account's batches wait on the
+  disk for that account (or the 4 MiB cap, or an off). A batch whose name names no owner is
+  deleted unsent.
+- **An off is never overtaken by a pump** (same review). `WorkerDiagnostics` holds the
+  recorder, the choice, the install number and the queue's folder, and its two steps that touch
+  the queue (applying a choice, a pump) take turns behind one async lock. `setDiagnostics`
+  turns the switch at once; a pump already sending asks the switch before reading and before
+  sending each batch, so after the off nothing more leaves (a request already on the wire when
+  the person saved finishes); the off's clearing runs once that pump has ended, so nothing it
+  wrote stays on the disk. A choice that comes before the server has given the queue's folder
+  is kept and applied when the folder comes (`attach`, from `run`).
+- **Every off owes a clear, even when an on follows it** (2026-11-25). Saving "off" and then
+  "on" while a send was in flight kept only the later choice: the pump, asking only the switch,
+  went on sending batches recorded before the off, and the step saw "on" and never cleared.
+  Now every off advances a count (`State::offs`) and the queue records how many it has been
+  cleared for (`State::cleared`). A pump notes the count when it takes its records and goes on
+  (before each write, each read and each send) only while the switch is on and no off has come
+  since; no pump starts while a clear is owed; and applying a choice clears the queue whenever
+  `offs > cleared`, whatever the switch says by then. So nothing recorded before the latest off
+  is sent, and none of it stays on the disk. Tested with an off then an on during a send (the
+  service holding the request) and during a pump's write (a disk holding the batch).
+- **An off is written down before it is waited on** (2026-11-25, part 5). The counts above are
+  in memory, so a tab or app closed between an off and its clear left the batches recorded
+  before it on the disk, and the next run sent them. Now `configure(off)` writes a mark,
+  `clear-before-<wall ms>-<session>-<offs>` (outside the `records-*` names, so no pump takes
+  it), in the queue's folder before it waits for the step (`on_disk::mark_cleared_before`).
+  `attach` and `apply` delete every batch older than the newest mark (`clear_through`) and,
+  once every one went, remove the marks they read; `pump` takes nothing while any mark exists.
+  The in-memory counts keep their guarantees beside it. Tested by a worker ended between an
+  off and its clear: the next worker clears the batch before it sends anything.
+- **Batches and offs are numbered, never timed** (2026-11-25, review of part 5). Naming both by
+  wall time let a clock that stepped back between a pump and an off name the off earlier than
+  a batch from before it, and a worker that ended before the clear left that batch to be sent.
+  Batches are now `records-s<seq>-<session>-<owner>.ndjson`, `seq` from the queue's own
+  sequence: kept in `batch-seq` beside them (`Queue::keep_seq`, written before any batch is
+  named by it) and read at `attach` as the greater of that and every number a batch or a mark
+  on the disk names (`Queue::last_seq`). A pump takes its numbers when it takes its records, so
+  an off's mark, `clear-through-<seq>-<session>-<offs>` naming the last number given
+  (`Queue::mark_cleared_through`), covers every batch from before it; `clear_through` deletes
+  the batches numbered at or below it. Nothing in the worker's queue reads the wall clock. A
+  batch named by a version before this (`records-<wall ms>-...`) sorts first and is before any
+  mark: every off clears it, and an old `clear-before-...` mark asks for everything. Tested
+  with the runtime's wall clock stepped back between two pumps and the off, and the worker ended
+  before the clear: the next worker deletes both batches, and the clock was never read.
+- **The page notes a clear it owes** (2026-11-25, review of part 5). An off said before the
+  server has given the queue's folder has nowhere to be written, so a worker that heard "off"
+  and "on" and ended before `attach` lost the off, and the next one sent what came before it.
+  Now saving "off" stores a tag beside the choice (`localStorage` `pimble.diagnostics`
+  `clear_owed`, through `pimble_core::diagnostics::SavedChoice`, which keeps the rules: an off
+  gives a new tag, an on keeps one owed, a confirmation drops only its own tag). The page sends
+  `setDiagnostics { clear_owed: true }` while one is noted; the worker counts it as an off at
+  once, waits for the folder, clears (`WorkerDiagnostics::clear_owed_by_the_page`) and answers
+  `{ cleared: true }`, and only then does the page drop its note. The desktop's server answers
+  `cleared: true` always (its off deletes at once). Tested by a restart after an off said
+  before the folder: with the note nothing from before the off is sent; the control without
+  it sends the earlier batch.
+- **A send is never waited for longer than 15 s** (`SEND_TIMEOUT`). The step is held across a
+  request, and a browser's `fetch` has no timeout, so a stalled request delayed an off's clear
+  for as long as it stalled. The pump's requests go through `pimble_host::http::Bounded`, which
+  ends a call on the server's `Runtime` clock alike on the desktop and in the worker (a request
+  already on the wire is not taken back; only the waiting ends, and the batch waits for the
+  next send or the clear). Tested with a request that never answers and an off: the clear runs
+  within the timeout and nothing more is sent.
+- **The choice stays the page's** (Settings > Diagnostics, `localStorage`): the page tells the
+  server `setDiagnostics { enabled, install, clear_owed }` at every connection and whenever it
+  saves. The
+  install number is the page's, so the page's records and the worker's share one
+  (`Queue::install`: an offered valid id wins and is kept). Off clears the worker's queue.
+- **Send Diagnostics** in worker mode is `sendDiagnostics { note, stores, logs }`: the page hands
+  over its recent log as `page.log`, the server adds `worker.log` and posts the report to
+  `/api/v1/diagnostics/reports` as the signed-in account. It answers the code, or a sentence
+  (signed out: "Sign in to send diagnostics from this browser."). On the desktop the same two
+  RPCs save `diagnostics.json` and run `send_report` (the app still calls its server's
+  `send_report` in process, as before). Both RPCs are Service-only.
+- `HttpRequest` carries a `Body { content_type, bytes }` (`Body::json`, `Body::ndjson`) in
+  place of `json`, so the NDJSON batches go through the same seam.
+- The page's recorder keeps its own records (`program: "web"`, queued in `localStorage`, sent
+  with the cookie) in both modes, and in worker mode takes the account's id from
+  `CloudStatusChanged`.
+
+### The account page
+
+- **Keep what I've read in step** is already the server's in worker mode: Settings > Account's
+  switch sends `cloudPersonalSync`, which the worker's server answers as the desktop's does. The
+  worker's account page now says where the switch is; it has no second switch.
+- **Change password, a new recovery code, members per store: not built. They need Joe's call**
+  (the brief's stop rule: new security-sensitive RPCs, where keys live, roles). What the old
+  page does in the page (derive, rewrap the account keys, `PUT` them) has to happen where the
+  keys are, which in worker mode is the server's keystore. The proposal:
+  - `cloudChangePassword { current_password, new_password }` → empty: in the keystore, derive
+    the old and new password keys (`pimble_crypto`), unwrap and rewrap the account keys, and send
+    the accounts service the new `auth_key` and wrapped blob, as `cloudSignIn` does in reverse.
+    Service-only. The session stays.
+  - `cloudNewRecoveryCode {}` → `{ code }`: the code is made in the server and wraps the account
+    keys under its KEK; the answer is the one place it is shown. This is the first RPC that would
+    answer a secret to the page. It is the person's own, shown once, as on the old page.
+  - Members of a whole store: either the share RPCs (`cloudShareInfo`, `cloudInvite`,
+    `cloudRemoveMember`) take `node_id: Option<NodeId>` (`None` meaning the whole store), or
+    three new ones (`cloudStoreMembers`, `cloudStoreAddMember`, `cloudStoreRemoveMember`). Adding
+    a member of a vault store seals the current store key for them. The old page could also
+    make someone an owner; the share RPCs refuse Owner. Which roles a whole-store invite may
+    give is the roles model, so it is Joe's.
+
+### Shared helpers out of old-only files
+
+- `web/src/open_link.rs`: `keep_open_link` and `take_open_link`, out of `app_page.rs`; both
+  modes call them.
+- `web/src/kdf.rs`: `derive_timed`, out of `session.rs`; the signup, recover and account pages
+  and the old session call it.
+
+### Proof
+
+Chromium (Playwright), the local stack, a made-up account, in worker mode. The accounts service
+was pointed at a stub diagnostics server on loopback that kept what it was sent and answered a
+report code; nothing left the machine.
+
+- Help > "Send Diagnostics..." with a note answered "Sent. Its code is STUB4242". The report
+  reached the stub through `/api/v1/diagnostics/reports`, with the accounts service's key and
+  the account's id. It carried the note, `page.log` (16 lines) and `worker.log` (4 lines), and
+  its install number was the page's.
+- The worker's own records arrived through `/api/v1/diagnostics/records` about ten seconds after
+  it started (its `system` record says `program: "worker"`), with the same install number and
+  account as the page's records. No address reached the stub.
+- Settings > Account, "Keep what I've read in step": off sent `DELETE /api/v1/me/personal`
+  from the worker, and on sent `GET` then `PUT`.
+- `cargo test` passes for pimble-core, pimble-host, pimble-rpc, pimble-client and pimble-server
+  (the new `diagnostics::on_disk` tests among them), with one exception:
+  `tests/in_process.rs` `a_reader_is_refused_in_process` fails. It fails the same way at
+  eed398e without this part's changes: the first notification has no source where the test
+  expects `"service"`. `cargo check --workspace --tests` and both browser crates' checks for
+  wasm32 are clean.
+
+### Not done
+
+- Change password, a new recovery code and members per store in worker mode wait for the
+  decisions above.
+- A panic in the worker is not recorded: a panic traps the wasm instance before any write to
+  its disk can finish. The page's panic hook still records the page's own.
+- A report's `page.log` can name the account's email local part: `pimble_app::boards` logs the
+  author stamp at info ("board edits are stamped as ..."), and the scrubber takes out whole
+  addresses only. The old path sends the same line.
+- `a_reader_is_refused_in_process` fails at eed398e and here (above); not looked into.
+- `handler.rs` (about 7,060 lines), `pimble-rpc/src/types.rs` (2,163) and
+  `pimble-client/src/client.rs` (1,815) are still over the 700-line limit. This part put its
+  code in new modules (`handler/diagnostics.rs`, `pimble-rpc/src/diagnostics.rs`) but split none
+  of them.
+
+## Built: wave 5, part 3 (2026-11-25, not merged or released): the account page's own sections, and adding only what the account holds
+
+### Joe's decisions (2026-11-25)
+
+- **(e) Change password happens in the worker**, through a Service-only `cloudChangePassword`:
+  the server that holds the account keys derives the new password's keys, rewraps the account
+  keys and updates the accounts service. The page sends what was typed and nothing else.
+- **(f) A new recovery code: allowed, shown once.** `cloudNewRecoveryCode` answers the code once;
+  it is never stored or logged. It is the only RPC that answers the page a secret.
+- **(g) Whole-store members: an owner may make another owner** from the browser. A store always
+  keeps at least one owner, which the accounts service enforces (409, said as a sentence). An
+  owner lists a whole store's members and changes or removes them, as the old page did.
+- **(h) `cloudAddHostedStore` refuses a store the account holds no row for**, with a whole
+  sentence, in place of adding it whole and writable as an owner (`Unlisted::AsOwner`, which the
+  link's first grant refresh then ended as "no longer shared").
+
+### Changing the password (`crates/pimble-server/src/handler/account.rs`)
+
+`cloudChangePassword { current_password, new_password }`, Service-only, signed in:
+
+1. A new password under 8 characters is refused in a sentence before anything is derived.
+2. The account's keys as the accounts service holds them (`GET /me/keys`) must be the keystore's
+   (same public keys), or the change is refused: it would wrap keys this device does not hold.
+3. Off the async thread (`runtime().run_heavy`), the current password's keys are derived and the
+   served blob unwrapped with them. A wrong current password fails here, as "That is not your
+   current password.", and nothing is sent. Then `pimble_crypto::new_password_material`
+   (`crates/pimble-crypto/src/rotate.rs`) makes a fresh salt, the new `auth_key` and the account
+   keys wrapped under the new KEK.
+4. One `POST /api/v1/me/password { current_auth_key, auth_key, kdf, account_key_blob }`. The
+   service checks the current auth key as login does and writes the hash, the kdf and the blob
+   in one update.
+
+**Atomic from the person's view**: the only write is that one update, so the account always
+opens with exactly one password, old or new, whose blob holds the same keys. A change that never
+reached the service leaves the old password; one whose answer was lost leaves the new one, and
+asking again with the old password says "That is not your current password." Both are tested
+through a proxy that refuses or drops the answer
+(`crates/pimble-cloud/tests/integration/account_worker.rs`).
+
+**A password change signs out the account's other sessions; the session that made it stays
+signed in** (Joe, 2026-11-25: "Sign out the others"). Built in part 4 below, which replaces
+what this part first built (other sessions stayed signed in, as the old page had them). The
+account keys do not change with the password, so ending sessions does not take keys back
+from a device that holds them; the keystore of this device needs no change.
+
+### A new recovery code
+
+`cloudNewRecoveryCode { current_password }` → `{ code }` (the password since part 5, Joe,
+2026-11-25), Service-only: `pimble_crypto::new_recovery_material`
+makes the code, a salt and the account keys wrapped under the code's KEK (run off the async
+thread), the server sends `POST /me/recovery-code { current_auth_key, recovery_salt,
+recovery_key_blob }`, and only then answers the code. Neither the request nor the response type prints it (`Debug` is
+redacted, `NewRecoveryMaterial` zeroes it on drop), and it is never written to the keystore.
+The page shows it with "Shown once. The old code no longer works.", a checkbox "I have written
+this down somewhere safe" and "Done", which drops it.
+
+### Whole-store members
+
+Three new Service-only RPCs (the contract's second proposal; the share RPCs are left alone,
+since a share's members are never owners): `cloudStoreMembers { store_id }`,
+`cloudStoreSetMember { store_id, email, role }` (adds, or changes a role) and
+`cloudStoreRemoveMember { store_id, email }` (a member, or an invitation withdrawn). Each answers
+the store's members after it, so the page needs no second call.
+
+- Only an owner of the store, by the account's rows, is answered; anyone else is told "Only an
+  owner of this store can see and change who holds it."
+- **Encrypted stores**: an address that holds nothing of the store yet must belong to a verified
+  account (`GET /users/lookup`; a role change of a member asks no lookup, since lookups are
+  limited to one per 200 ms per caller and a 429 is said as "Pimble Cloud asks to slow down."), or
+  the answer is "No verified Pimble account has that address. An
+  encrypted store is shared only with an account, whose key can be sealed to it." Once the
+  member is put, the current store key (`fetch_scope_keys`) is sealed to their public key with
+  the context `store:{id}` and `PUT` to the store's keys. If that hand-over fails, the person
+  holds the store but not the key yet, and the sentence says to add them again.
+- **Plain stores** take an invitation for an address with no account, as before.
+- An owner needs a verified account (the service's own 400, as a sentence). The last owner is
+  neither demoted nor removed (the service's 409: "A store always keeps at least one owner. Make
+  someone else an owner first.").
+
+The page (`web/src/worker_mode/account_sections.rs`) lists the stores this account owns whole
+(`cloudListHostedStores`, `root` none and role `owner`), each with "Members": a row per member
+with a role select (owner, editor, commenter, reader) and "Remove", and "Add by email" with a
+role.
+
+### (h) Adding only what the account holds
+
+`handler/hosted.rs` `add_hosted_store` takes the account's rows for the store
+(`HeldAs::from_rows`) or refuses with "The signed-in Pimble Cloud account does not hold store
+<id>, so it cannot be added here." Nothing is created. The mount-source route
+(`handler/mount_sources.rs`) uses the same call. Tests: `crates/pimble-server/tests/hosted_add.rs`
+(a store with no row, and an unknown id, are refused and nothing is open; a store the account
+owns, added on a second device, is still whole and writable after its first grant refreshes).
+
+### Known limits
+
+- Removing a member of an encrypted store does not rotate the store key, as on the old page
+  (docs/NODE_DOCUMENT_CONTRACT.md's known limits).
+- The service counts owners and then writes, outside a transaction: two owners demoting each
+  other at the same moment could both pass the check. The old page had the same window.
+
+### Proof
+
+Chromium (Playwright), the local stack, made-up accounts (`erin.w5c@example.com`,
+`frank.w5c@example.com`) with fixture passwords, in worker mode. Evidence (screenshots, step
+logs, the desks' answers) is under the session's scratchpad, `wave5efg/`.
+
+- **Members.** Erin's encrypted store "Garden" was hosted from a headless desk. On the account
+  page "Your stores" listed it; "Members" showed Erin as owner. Adding Frank as **owner** showed
+  him as owner, and Frank's own desk then listed the store as `role=owner`, added it and read
+  the note's title "Tomato beds" from the encrypted replica: the key was sealed to him. His role
+  changed to editor; demoting Erin, then the last owner, answered "A store always keeps at
+  least one owner." and her row still read owner; removing Frank took his row away; removing
+  Erin was refused with the same sentence.
+- **Password.** A wrong current password answered "That is not your current password."; the
+  change answered "Your password is changed.". After "Sign Out", the old password was refused
+  at sign-in and the new one signed in. Erin's desk, signed in before the change, still listed
+  her stores.
+- **Recovery code.** "New Recovery Code" showed the code with "Shown once. The old code no
+  longer works.", "Done" stayed disabled until the checkbox was ticked, and the code left the
+  page at "Done" (screenshots mask it). Then Forgot -> the mailed link (logged by the stack) ->
+  that code and a new password: the account was recovered, and the new password signed in.
+- No password appears in the stack's logs or the pages' consoles.
+- `cargo test`: pimble-crypto, pimble-rpc, pimble-client and pimble-server pass except the two
+  tests below; pimble-cloud's integration suite runs against `rhypedb-server` and passes
+  (104 tests, the four in `account_worker.rs` among them). `cargo check --workspace --tests` and
+  `web/`'s `cargo check --workspace --target wasm32-unknown-unknown` are clean.
+
+### Found while building
+
+- The accounts service takes one `/users/lookup` per 200 ms per caller. The first cut looked up
+  every address it was given, so changing a member's role right after adding them answered 429.
+  Only an address that holds nothing of the store is looked up now, and a 429 is a sentence.
+- After a refused role change the row's select kept showing the role just picked. Each row's
+  select now reads the member's role from the last answer, and a refusal makes it read again.
+
+### Not done, and open
+
+- `tests/in_process.rs` `a_reader_is_refused_in_process` fails as at this part's base (part 2
+  above). `tests/vault_link.rs` `a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner`
+  failed in every run here (four of four) at line 1408, the known race between the test's look
+  at H and the owner's upkeep (part 1's notes); the test does not touch what this part changed.
+- A sign-in refused for a wrong password showed the service's raw answer ("cloud service at
+  ... answered 401: ...") on the worker's sign-in page. Part 4 makes it a sentence.
+- `handler.rs`, `pimble-rpc/src/types.rs`, `pimble-client/src/client.rs` and
+  `crates/pimble-cloud/tests/integration.rs` are still over the 700-line limit; this part's code
+  is in new modules (`handler/account.rs`, `cloud/account.rs`, `pimble-rpc/src/account.rs`,
+  `client/account.rs`, `web/src/worker_mode/account_sections.rs`,
+  `tests/integration/account_worker.rs`).
+- The old browser path is still there.
+
+## Built: wave 5, part 4 (2026-11-25, not merged or released): a refused sign-in in a sentence, and a password change signs out the others
+
+### Joe's decision (2026-11-25)
+
+- **A password change signs out the account's other sessions** ("Sign out the others"). The
+  session that made the change stays signed in. This replaces part 3's "Other devices'
+  sessions stay signed in".
+
+### A refused sign-in is a sentence (`crates/pimble-server/src/cloud/refusal.rs`)
+
+The shared server turns the accounts service's refusals into `CloudError::Refused { status,
+refusal }`, whose Display is a whole sentence (`Refusal`), and whose `status()` is still the
+service's, so code that reads a 401 reads it as before. The browser's worker-mode sign-in page,
+the account page and the desktop's Account modal show the server's answer as it is, so all of
+them say:
+
+- `POST /login` 401: "That email and password do not match." An address with no account
+  reads exactly the same: `GET /kdf` answers it with a decoy and `/login` with the same 401, so
+  the sentence cannot say whether an account exists, and does not try.
+- `POST /login` 403 `email_unverified`: "Check your inbox: this address has not been verified
+  yet." The service says it only once the password matched.
+- A call made with the session (`GET /me/keys`, `POST /me/password`, `POST /me/recovery-code`)
+  answered 401: "Your Pimble Cloud sign-in has ended. Sign in again.", and the keystore marks
+  the session ended (as minting a token does), so the account's status asks to sign in again.
+  `POST /me/password` with a wrong current password now answers 401 `wrong_current_password`
+  (it was `unauthorized`, like an ended session), which reads "That is not your current
+  password."
+- 429 anywhere in these: "Pimble Cloud asks to slow down. Wait a moment and try again."; a 5xx:
+  "Pimble Cloud could not answer just now. Try again in a moment."
+- The members RPCs (part 3) say an ended session and a 5xx the same way.
+
+The old browser path's wording (`web/src/session.rs`) was the model. `cloud.rs` (724 lines) is
+split by responsibility into `cloud/` (`sessions`, `stores`, `keys`, `people`, `members`,
+`account`, `notices`, `refusal`), with no change of behavior; the accounts service's recovery
+and password routes moved from `routes/accounts.rs` (865 lines) to `routes/password.rs`.
+
+### A password change ends every other session (`crates/pimble-cloud/src/routes/password.rs`)
+
+`User.session_epoch` and `Session.epoch` (u64, absent on old rows: 0): a session is valid
+while its epoch is not below its account's (`SessionRow::ended_for`, checked by
+`AuthedUser`, so the cookie, a session bearer, `/me`, `/token` and the relay's owner tunnel
+all refuse an ended session as "invalid session"). A session is made with the account's epoch
+as read when its password was checked.
+
+`POST /me/password`, after the current password is checked: the new epoch is the clock in
+milliseconds (above the stored epoch should the clock be behind); the changing session's epoch
+is raised to it first, which ends nothing; then the one `User.update` that writes the new
+hash, the KDF parameters and the wrapped keys raises the account's epoch to it, which ends
+every other session at that moment. So the change and the sign-out are one write: a change that
+never reached that update leaves the old password and every session; one that did leaves the
+new password and only the changing session. A sign-in that checked the old password and is
+written after the change carries the old epoch and is ended too. The ended sessions' rows are
+then deleted, as housekeeping (they are refused already; a failure there is logged).
+
+**Recovery** (`POST /recover/{token}/complete`) already ended every session (docs/CRYPTO_CONTRACT.md
+"Phase 2a-2", "deletes every session"), so it is the same decision and nothing about what it
+does changed: it now raises the epoch in its own one update, so no session survives even a
+racing sign-in, and deletes the rows after, as the password change does.
+
+### Known limits
+
+- **JWTs are not revoked.** Pimble servers keep no session state and verify hour-long JWTs
+  against the JWKS, so a JWT minted before the change stays valid until it expires (at most an
+  hour). A device whose session ended keeps a live connection until its token expires or it
+  reconnects; it then fails to mint a new one and asks to sign in again. JWT revocation is not
+  built.
+- The relay's owner tunnel is authorized with the session when it opens; a tunnel opened before
+  the change stays up until it drops, and is refused when it reconnects.
+- ~~Two password changes from two sessions at the same moment~~ (fixed 2026-11-25, part 5):
+  they run one at a time under the account's lock, and the second, whose session the first
+  ended, writes nothing and is refused in a sentence.
+
+## Built: wave 5, part 5 (2026-11-25, not merged or released): review fixes
+
+### Joe's decision (2026-11-25: "Password and an email")
+
+- **A new recovery code needs the current password**, checked as a password change checks it:
+  the server worker proves it first (`prove_current_password` in
+  `crates/pimble-server/src/handler/account.rs`: `GET /me/keys`, the password's keys derived and
+  the account keys unwrapped with them) and the accounts service checks its `auth_key` again.
+  `cloudNewRecoveryCode { current_password }`; an empty one reads "Enter your current password
+  to make a new recovery code.", a wrong one "That is not your current password.", and nothing
+  is sent then. The browser's account pages (both modes) ask for it beside "New Recovery Code".
+- **Every change of an account's recovery code mails the account** (docs/CRYPTO_CONTRACT.md,
+  "Every change of an account's recovery code is mailed"); the mail carries no secret.
+
+### The rest
+
+- **Last owner under races** (docs/CLOUD_CONTRACT.md, "A store always keeps an owner"), and
+  **one write per account at a time** (docs/CRYPTO_CONTRACT.md): the per-key locks of
+  `crates/pimble-cloud/src/locks.rs`, with the check made inside the lock on data read there.
+- **A new code whose answer is lost** (no answer, an undecodable one, or a 5xx) reads "Pimble
+  Cloud did not answer, so this computer cannot tell whether the new recovery code was saved.
+  Your old recovery code may have stopped working, so make a new one now."
+  (`RECOVERY_CODE_OUTCOME_UNKNOWN`, `cloud::outcome_unknown`). A refusal the service gave before
+  writing (an ended session, a wrong password, a 409) keeps its own sentence.
+- **An off in diagnostics is written down** before it is waited on (part 2 of this wave's
+  diagnostics notes, "An off is written down before it is waited on").
+
+### Proof
+
+- `crates/pimble-cloud/tests/integration/sessions.rs`, against a real `rhypedb-server`
+  (`RHYPEDB_SERVER_BIN=~/dev/rhypedb/target/debug/rhypedb-server`, not skipped): after a change,
+  another session is refused as a cookie and as a bearer (`/me`, `/me/keys`, `/token` all 401);
+  the changing session's `/me` and `/token` answer 200; only its row is left; a later sign-in
+  works and ends nothing; a change from that session ends the first changer's. A refused change
+  ends nothing and answers `wrong_current_password`. A session written for the old password
+  after the change is refused. A recovery ends every session.
+- `tests/integration/account_worker.rs`: the device that changes the password stays signed in
+  (`cloudStatus`, `cloudListHostedStores`, `cloudNewRecoveryCode` work); another device signed
+  in before is told "Your Pimble Cloud sign-in has ended. Sign in again.", changes nothing, and
+  signs in again with the new password. A device's sign-in refused for a wrong password, for an
+  unknown address, and for an unverified one reads as the sentences above, the first two
+  identical.
+- Unit tests: `cloud::refusal` (every mapping, the status kept) and `handler::account`.

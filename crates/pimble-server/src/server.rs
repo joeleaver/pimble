@@ -475,6 +475,14 @@ impl PimbleServer {
         if !self.face {
             handler.restart_notices();
         }
+        // A browser's worker records on its own disk and sends as the
+        // signed-in account (crate::diagnostics::worker); dropping the task's
+        // handle leaves it running for the server's life.
+        #[cfg(target_arch = "wasm32")]
+        if !self.face {
+            let dir = self.config.paths.diagnostics();
+            drop(handler.runtime().spawn(crate::diagnostics::run(handler.clone(), dir)));
+        }
         Ok(())
     }
 

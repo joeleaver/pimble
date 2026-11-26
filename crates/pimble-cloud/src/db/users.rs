@@ -112,10 +112,11 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
-    /// Replaces `user_rid`'s password material — `POST /me/password`
-    /// (current session kept) and the password half of
-    /// `POST /recover/{token}/complete` both go through this. Public keys
-    /// and recovery material are untouched.
+    /// Replaces `user_rid`'s password material (`POST /me/password`) and
+    /// raises its `session_epoch` to `session_epoch`, in one `.update()`: the
+    /// moment the new password holds, every session below that epoch is
+    /// ended. Public keys and recovery material are untouched.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_password_material(
         &self,
         user_rid: u64,
@@ -125,9 +126,10 @@ impl RhypeDb {
         kdf_t_cost: u32,
         kdf_p_cost: u32,
         account_key_blob: &str,
+        session_epoch: u64,
     ) -> CloudResult<()> {
         let q = format!(
-            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob} }})",
+            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob}, session_epoch: {session_epoch} }})",
             hash = ql_str(password_hash),
             salt = ql_str(kdf_salt),
             m = kdf_m_cost,
@@ -154,7 +156,8 @@ impl RhypeDb {
 
     /// `POST /recover/{token}/complete`: password material and recovery
     /// material both rotate (the client generates a new recovery code too),
-    /// and the token that got the caller here is consumed — all in the one
+    /// the token that got the caller here is consumed, and `session_epoch`
+    /// is raised so every session of the account is ended — all in the one
     /// `.update()` call so there's no window where only some of it landed.
     /// Public keys are unchanged (docs/CRYPTO_CONTRACT.md: "so every store
     /// envelope stays valid").
@@ -170,9 +173,10 @@ impl RhypeDb {
         account_key_blob: &str,
         recovery_salt: &str,
         recovery_key_blob: &str,
+        session_epoch: u64,
     ) -> CloudResult<()> {
         let q = format!(
-            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob}, recovery_salt: {rsalt}, recovery_key_blob: {rblob}, recovery_token_hash: {empty} }})",
+            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob}, recovery_salt: {rsalt}, recovery_key_blob: {rblob}, recovery_token_hash: {empty}, session_epoch: {session_epoch} }})",
             hash = ql_str(password_hash),
             salt = ql_str(kdf_salt),
             m = kdf_m_cost,
@@ -192,9 +196,14 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
+    /// `None` once the account is deleted (`User.get` on a deleted id is an
+    /// error, not an empty answer).
     pub async fn get_user(&self, user_rid: u64) -> CloudResult<Option<UserRow>> {
-        let q = format!("User.get({user_rid})");
-        self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
+        match self.client.query(&format!("User.get({user_rid})")).await {
+            Ok(result) => result.into_objects().first().map(user_from_object).transpose(),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn delete_user(&self, user_rid: u64) -> CloudResult<()> {

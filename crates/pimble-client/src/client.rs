@@ -14,6 +14,7 @@ use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_core::MountRef;
 use pimble_rpc::{
+    DiagnosticsLog, SendDiagnosticsRequest, SetDiagnosticsRequest,
     AddScopeBlobsRequest, AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
     CloudHostStoreRequest, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
@@ -34,6 +35,8 @@ use tracing::debug;
 use url::Url;
 
 use crate::error::{ClientError, Result};
+
+mod account;
 
 /// Client for connecting to a Pimble server via WebSocket.
 ///
@@ -1692,6 +1695,20 @@ impl PimbleClient {
     /// Ask the server to write everything and stop, for a newer one.
     pub async fn hand_over(&self) -> Result<()> {
         self.client.hand_over().await.map(|_| ()).map_err(rpc_error)
+    }
+
+    /// Tell the server whether diagnostics are on, the install number this
+    /// client keeps, and whether it noted a clear no server has confirmed;
+    /// whether that clear has run.
+    pub async fn set_diagnostics(&self, enabled: bool, install: Option<String>, clear_owed: bool) -> Result<bool> {
+        self.client.set_diagnostics(SetDiagnosticsRequest { enabled, install, clear_owed }).await.map(|answer| answer.cleared).map_err(rpc_error)
+    }
+
+    /// Send a report with this client's `logs` beside the server's own: its
+    /// code.
+    pub async fn send_diagnostics(&self, note: String, stores: serde_json::Value, logs: Vec<DiagnosticsLog>) -> Result<String> {
+        let response = self.client.send_diagnostics(SendDiagnosticsRequest { note, stores, logs }).await.map_err(rpc_error)?;
+        Ok(response.report)
     }
 
     /// Whether an account is signed in, and as whom.

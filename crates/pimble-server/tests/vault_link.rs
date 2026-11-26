@@ -1345,6 +1345,10 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
     seed_content(&alice, store_id, private, "seed", "PRIVATE-DIARY-TEXT").await;
     alice.cloud_host_store(store_id).await.unwrap();
     wait_all_seeded(&env, store_id, &[root_id, shared, inside, deeper, leaf, private]).await;
+    // Hosting made one key, the store's; every later key is a share's.
+    let hosted_keys = scope_keys_in(a_dir.path(), store_id);
+    assert_eq!(hosted_keys.len(), 1, "hosting made exactly the store key");
+    let store_key_id = hosted_keys[0].0;
 
     let (share_key_id, _) = share_by_hand(&env, &alice, a_dir.path(), store_id, shared, &[inside, deeper, leaf], "editor", "Holiday Plans").await;
     // The owner's device picks the share key up at its next connect.
@@ -1404,13 +1408,19 @@ async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner(
     })
     .await;
     assert!(created_at_alice, "a recipient's create reaches the owner, readable: its data key is wrapped under the share's key, which the owner holds");
-    let from_bob_keys = env.h_admin.vault_fetch(store_id, VaultDocId::Node(from_bob), u64::MAX).await.unwrap().keys.expect("its maker set its keys");
-    let wraps: Vec<Uuid> = from_bob_keys.wraps.iter().map(|w| w.scope_key_id).collect();
-    assert!(wraps.contains(&share_key_id), "wrapped under the scope key its maker holds: {wraps:?}");
-    // The owner's upkeep may since have wrapped it under the store's own key
-    // too (it holds every key of the store); nothing else may wrap it.
-    let owner_keys: Vec<Uuid> = scope_keys_in(a_dir.path(), store_id).into_iter().map(|(id, _)| id).collect();
-    assert!(wraps.iter().all(|id| owner_keys.contains(id)), "only keys of the store wrap it: {wraps:?}, the owner holds {owner_keys:?}");
+    // Its maker wraps its data key under the share's key, the one scope key
+    // a member holds; the owner's share upkeep then adds the store key's wrap
+    // (share.rs, a debounce after the owner's tree takes the document), so the
+    // owner's other devices read it. The wraps are read until they reach that
+    // end state: whether the upkeep has run yet when the text arrives is timing.
+    let wraps_of_from_bob = || async {
+        let keys = env.h_admin.vault_fetch(store_id, VaultDocId::Node(from_bob), u64::MAX).await.unwrap().keys.expect("its maker set its keys");
+        keys.wraps.iter().map(|w| w.scope_key_id).collect::<std::collections::BTreeSet<Uuid>>()
+    };
+    assert!(wraps_of_from_bob().await.contains(&share_key_id), "wrapped under the scope key its maker holds");
+    let both: std::collections::BTreeSet<Uuid> = [store_key_id, share_key_id].into_iter().collect();
+    let owner_wrapped = wait_until(Duration::from_secs(10), || async { wraps_of_from_bob().await == both }).await;
+    assert!(owner_wrapped, "the owner's device adds the store key's wrap to a member's document: {:?}, wanted {both:?}", wraps_of_from_bob().await);
     let scope: Vec<NodeId> = env.h_admin.get_scopes(store_id).await.unwrap().into_iter().find(|s| s.root == shared).unwrap().doc_ids;
     assert!(scope.contains(&from_bob), "and the server put it in the scope itself");
     assert!(!env.hosted_store_contains_plaintext(store_id, "ferry at nine"));

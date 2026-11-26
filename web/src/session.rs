@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pimble_crypto::{
-    derive_password_keys, encode_auth_key, unwrap_account_keys, AccountKeys, AccountPublicKeys,
+    encode_auth_key, unwrap_account_keys, AccountKeys, AccountPublicKeys,
     KdfParams,
 };
 
@@ -105,21 +105,8 @@ fn store(account: Account) {
     SESSION.with(|s| *s.borrow_mut() = Some(account));
 }
 
-/// Argon2id over the password, timed. The cost is the contract's (32 MiB, 3
-/// passes) and a browser feels it, so the duration goes to the console once per
-/// derivation — it is the number that decides whether the cost is tolerable
-/// here.
-pub fn derive_timed(password: &str, params: &KdfParams) -> Result<pimble_crypto::PasswordKeys, SignInError> {
-    let started = now_ms();
-    let derived = derive_password_keys(password, params)
-        .map_err(|e| SignInError::Failed(format!("Deriving your keys failed: {e}")))?;
-    tracing::info!(
-        "Argon2id ({} MiB, {} passes) took {:.0} ms in this browser",
-        params.m_cost / 1024,
-        params.t_cost,
-        now_ms() - started
-    );
-    Ok(derived)
+fn derive_timed(password: &str, params: &KdfParams) -> Result<pimble_crypto::PasswordKeys, SignInError> {
+    crate::kdf::derive_timed(password, params).map_err(SignInError::Failed)
 }
 
 /// Sign in from nothing: derive, prove, fetch, unwrap.
@@ -166,12 +153,4 @@ pub async fn unlock(password: &str) -> Result<(), SignInError> {
         public_keys: my_keys.public_keys,
     });
     Ok(())
-}
-
-/// The page's monotonic-enough clock, in milliseconds.
-fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or_else(js_sys::Date::now)
 }

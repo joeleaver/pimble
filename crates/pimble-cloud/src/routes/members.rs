@@ -21,11 +21,13 @@ use super::stores::{
     is_store_owner, normalize_root, owner_count, require_live_store, require_owner, require_role_for_scope, root_view, stored_name, ScopeQuery, LAST_OWNER_ERROR,
     NO_SHARE_NAME, ROLES, UNNAMED_SHARE, WHOLE_STORE,
 };
+use crate::checkpoints::Checkpoint;
 use crate::db::{GrantRow, HostedStoreRow, UserRow};
 use crate::error::{CloudError, CloudResult};
 use crate::mail::{invitation_email, shared_with_you_email};
 use crate::session::AuthedUser;
 use crate::state::AppState;
+use tokio::sync::OwnedMutexGuard;
 
 /// One row of `GET /stores/{id}/members`: either a member (a `Grant`,
 /// `status: "active"`) or an address that has been invited and has no account
@@ -304,6 +306,27 @@ pub async fn put_member(
     Json(req): Json<PutMemberRequest>,
 ) -> CloudResult<Json<MemberView>> {
     let store = require_live_store(&state, &store_id).await?;
+    // "A verified account" for this purpose means one a key can actually be
+    // wrapped to: verified, with key material. An unverified or legacy row is
+    // invited instead, and the invitation becomes a grant the moment that
+    // address really has an account (see `claim_invitations`).
+    let email = req.email.trim();
+    let found = match valid_email(email) {
+        true => state.db.find_user_by_email(email).await?.filter(|u| u.verified && u.has_key_material()),
+        false => None,
+    };
+    // A grant is written for that account under its lock, taken before the
+    // store's (the lock order: account, then store): an account being
+    // deleted holds it from listing its grants until it is gone, so this
+    // waits, and finds the account deleted.
+    let account = match &found {
+        Some(found) => Some(state.lock_live_account(found.rid).await?),
+        None => None,
+    };
+    // Who is an owner, and how many there are, is read and written under the
+    // store's lock (see `AppState::store_owner_locks`): the caller's own
+    // ownership too, which another owner may be taking away at this moment.
+    let owners = state.store_owner_locks.lock(&store.store_id).await;
     require_owner(&state, &store, authed.user.rid).await?;
 
     if !ROLES.contains(&req.role.as_str()) {
@@ -325,21 +348,24 @@ pub async fn put_member(
     } else {
         stored_name(req.name.as_deref().unwrap_or_default(), "a share's name")?
     };
-    let email = req.email.trim();
-    if email.is_empty() || !email.contains('@') {
+    if !valid_email(email) {
         return Err(CloudError::BadRequest("email is not valid".to_string()));
     }
 
-    // "A verified account" for this purpose means one a key can actually be
-    // wrapped to: verified, with key material. An unverified or legacy row is
-    // invited instead, and the invitation becomes a grant the moment that
-    // address really has an account (see `claim_invitations`).
-    let target = state.db.find_user_by_email(email).await?.filter(|u| u.verified && u.has_key_material());
-
-    match target {
-        Some(target) => grant_member(&state, &store, &authed.user, target, &req.role, &root, &share_name).await,
-        None => invite_member(&state, &store, &authed.user, email, &req.role, &root, &share_name).await,
+    match account {
+        Some((held, Some(target))) => grant_member(&state, &store, (held, owners), &authed.user, target, &req.role, &root, &share_name).await,
+        Some((_, None)) => Err(CloudError::Conflict(ACCOUNT_DELETED_REFUSAL.to_string())),
+        None => invite_member(&state, &store, owners, &authed.user, email, &req.role, &root, &share_name).await,
     }
+}
+
+/// The refusal of a grant for an account that was deleted before it could
+/// be written.
+pub const ACCOUNT_DELETED_REFUSAL: &str = "That account was deleted while this change waited, so nothing was shared with it.";
+
+/// Whether `email` (trimmed) can name an account at all.
+fn valid_email(email: &str) -> bool {
+    !email.is_empty() && email.contains('@')
 }
 
 /// Gives every grant and every invitation of `(store, root)` the name the
@@ -366,10 +392,15 @@ async fn rename_share(state: &AppState, store: &HostedStoreRow, root: &str, shar
 
 /// `PUT members` for an address that has a usable account: a grant on this
 /// scope, plus the "shared with you" mail and the public keys the caller
-/// needs to wrap the scope's key straight away.
+/// needs to wrap the scope's key straight away. `locks` are `target`'s
+/// account lock and the store's owner lock, taken in that order, held until
+/// the grant is written and let go before the mail; `target` was read under
+/// the first.
+#[allow(clippy::too_many_arguments)]
 async fn grant_member(
     state: &AppState,
     store: &HostedStoreRow,
+    locks: (OwnedMutexGuard<()>, OwnedMutexGuard<()>),
     caller: &UserRow,
     target: UserRow,
     role: &str,
@@ -381,9 +412,15 @@ async fn grant_member(
             // Demoting the store's last owner to editor/reader is exactly as
             // forbidden as removing them outright (`delete_member` below) —
             // both leave the store with zero owners. Only a whole-store grant
-            // can be that owner.
-            if existing.role == "owner" && role != "owner" && owner_count(state, store.rid).await? <= 1 {
-                return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+            // can be that owner. The count is read under the store's lock,
+            // after `existing`, so two owners demoting each other at once
+            // cannot both count two.
+            if existing.role == "owner" && role != "owner" {
+                let owners = owner_count(state, store.rid).await?;
+                state.checkpoints.reach(Checkpoint::OwnersCounted).await;
+                if owners <= 1 {
+                    return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+                }
             }
             state.db.update_grant_role(existing.rid, role).await?;
         }
@@ -406,6 +443,10 @@ async fn grant_member(
     if let Some(invitation) = state.db.find_invitation(store.rid, &target.email, root).await? {
         state.db.delete_invitation(invitation.rid).await?;
     }
+    // The store's lock first, then the account's: the reverse of taking them.
+    let (account, owners) = locks;
+    drop(owners);
+    drop(account);
 
     send_share_mail(state, store, share_name, &caller.email, &target.email, false).await;
     let has_key = has_key(state, target.rid, store.rid, root).await?;
@@ -428,9 +469,12 @@ async fn grant_member(
 
 /// `PUT members` for an address with no usable account yet: an invitation,
 /// upserted so the same address is never invited twice to the same scope.
+/// `owners` as in [`grant_member`].
+#[allow(clippy::too_many_arguments)]
 async fn invite_member(
     state: &AppState,
     store: &HostedStoreRow,
+    owners: OwnedMutexGuard<()>,
     caller: &UserRow,
     email: &str,
     role: &str,
@@ -462,6 +506,7 @@ async fn invite_member(
     }
     // As in `grant_member`: one name for the share, on every row of it.
     rename_share(state, store, root, share_name).await?;
+    drop(owners);
 
     send_share_mail(state, store, share_name, &caller.email, email, true).await;
     Ok(Json(MemberView {
@@ -489,6 +534,11 @@ pub async fn delete_member(
 ) -> CloudResult<Json<Value>> {
     let store = require_live_store(&state, &store_id).await?;
     let root = normalize_root(&scope.root)?;
+    // Everything below is read and written under the store's owner lock, so
+    // the grant and the owner count are what is stored when it is deleted:
+    // two owners removing each other (or one leaving while the other is
+    // demoted) cannot both count two.
+    let _owners = state.store_owner_locks.lock(&store.store_id).await;
     // Authorization before the lookup, so who exists is never leaked by which
     // error comes back: a caller with no grant is 403 whatever `user_id` they
     // name.
@@ -511,8 +561,12 @@ pub async fn delete_member(
         .await?
         .ok_or_else(|| CloudError::NotFound("no such member".to_string()))?;
 
-    if grant.role == "owner" && grant.is_whole_store() && owner_count(&state, store.rid).await? <= 1 {
-        return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+    if grant.role == "owner" && grant.is_whole_store() {
+        let owners = owner_count(&state, store.rid).await?;
+        state.checkpoints.reach(Checkpoint::OwnersCounted).await;
+        if owners <= 1 {
+            return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
+        }
     }
     // The envelopes for this scope go with the grant: the service stops
     // handing this account that key. What they already decrypted is theirs —
@@ -557,7 +611,13 @@ pub async fn delete_invitation(
 /// An existing grant on that same scope wins — an owner who invited an
 /// address and then added the account directly (or changed its role
 /// afterwards) must not have that role overwritten by the older invitation.
-async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usize> {
+///
+/// The grants are written under the account's lock, as every grant is
+/// (`AppState::lock_live_account`): the caller holds it (`_account`) and
+/// read `user` inside it, so an account being deleted claims nothing (the
+/// caller found it gone and asked nothing), and its invitations are left for
+/// the address's next account.
+async fn claim_invitations(state: &AppState, user: &UserRow, _account: &tokio::sync::OwnedMutexGuard<()>) -> CloudResult<usize> {
     let mut claimed = 0usize;
     for invitation in state.db.invitations_for_email(&user.email).await? {
         let store = state.db.get_hosted_store(invitation.store_rid).await?;
@@ -590,8 +650,10 @@ async fn claim_invitations(state: &AppState, user: &UserRow) -> CloudResult<usiz
 /// by the time this runs, and neither should fail — or, worse, leave an
 /// account verified but unable to log in — because a share could not be
 /// handed over. The next login tries again.
-pub(crate) async fn claim_invitations_best_effort(state: &AppState, user: &UserRow) {
-    match claim_invitations(state, user).await {
+///
+/// `user` is the account as read under its lock, which `account` holds.
+pub(crate) async fn claim_invitations_best_effort(state: &AppState, user: &UserRow, account: &tokio::sync::OwnedMutexGuard<()>) {
+    match claim_invitations(state, user, account).await {
         Ok(0) => {}
         Ok(claimed) => tracing::info!(email = %user.email, count = claimed, "claimed invitation(s) as grants"),
         Err(e) => tracing::warn!(email = %user.email, error = %e, "claiming this address's invitations failed; the next login will try again"),

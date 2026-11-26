@@ -80,6 +80,23 @@ pub struct Inner {
     /// One relay report taken at a time, so a report sent twice at once is
     /// gathered once (`POST /api/v1/watches/writes`).
     pub relay_reports_lock: tokio::sync::Mutex<()>,
+    /// Per store: every change that could leave it with no owner (a demotion,
+    /// a removal, an account deleted) counts the owners and writes under its
+    /// store's lock, so two owners dropping each other at once cannot both
+    /// count two (`crate::routes::members`).
+    pub store_owner_locks: crate::locks::KeyedLocks,
+    /// Per account: a password change, a recovery and a new recovery code
+    /// read the account again and write under its lock, so neither writes
+    /// over the other (`crate::routes::password`). An account deleted
+    /// through recovery holds it from listing its grants until it is gone,
+    /// and every grant made or changed for an account takes it first
+    /// ([`Inner::lock_live_account`]), so none survives the deletion. Where
+    /// a store's owner lock is held too, this one comes first.
+    pub account_locks: crate::locks::KeyedLocks,
+    /// Where a test may hold a request to make a race overlap; nothing can
+    /// be held outside builds with the `test-hooks` feature
+    /// (`crate::checkpoints`).
+    pub checkpoints: crate::checkpoints::Checkpoints,
     /// The hosted stores whose watched documents (or their watchers' shares)
     /// changed, for the hosted server to be told (`crate::watches`).
     pub watch_interest: crate::watches::InterestChanges,
@@ -95,6 +112,24 @@ pub struct Inner {
 }
 
 impl Inner {
+    /// Waits for `user_rid`'s account lock (`account_locks`) and holds it
+    /// until the guard drops.
+    pub async fn lock_account(&self, user_rid: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        self.account_locks.lock(&user_rid.to_string()).await
+    }
+
+    /// `user_rid`'s account lock, held, and the account as stored once it is:
+    /// `None` when it was deleted meanwhile. Every request that makes or
+    /// changes a grant for an account takes this first (then the store's
+    /// owner lock, if it needs one), so a grant is never written for an
+    /// account whose deletion has already listed its grants: the deletion
+    /// holds this lock from its listing until the account is gone.
+    pub async fn lock_live_account(&self, user_rid: u64) -> crate::error::CloudResult<(tokio::sync::OwnedMutexGuard<()>, Option<crate::db::UserRow>)> {
+        let held = self.lock_account(user_rid).await;
+        let user = self.db.get_user(user_rid).await?;
+        Ok((held, user))
+    }
+
     /// The waker of `recipient`'s drains.
     pub fn inbox_waker(&self, recipient: &str) -> Arc<tokio::sync::Notify> {
         let mut wakers = self.inbox_wakers.lock().expect("inbox wakers poisoned");
@@ -176,6 +211,9 @@ impl AppState {
             personal_lock: tokio::sync::Mutex::new(()),
             watches_lock: tokio::sync::Mutex::new(()),
             relay_reports_lock: tokio::sync::Mutex::new(()),
+            store_owner_locks: Default::default(),
+            account_locks: Default::default(),
+            checkpoints: Default::default(),
             watch_interest: crate::watches::InterestChanges::default(),
             inbox_quota: QuotaLimiter::new(crate::routes::inbox::SEND_WINDOW, crate::routes::inbox::SENDS_PER_WINDOW),
             inbox_wakers: Default::default(),

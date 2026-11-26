@@ -171,6 +171,36 @@ pub fn recovery_email(link: &str) -> (&'static str, String, String) {
     (subject, text, html)
 }
 
+/// Subject, plain-text body and HTML body of the mail every change of an
+/// account's recovery code sends (Joe, 2026-11-25): a new code made while
+/// signed in, or the new code a recovery sets. It carries no secret, only
+/// `account_link` (`<PIMBLE_CLOUD_PUBLIC_URL>/app/account`) and what to do if
+/// the person did not make the change.
+pub fn recovery_code_changed_email(account_link: &str) -> (&'static str, String, String) {
+    let subject = "Your Pimble recovery code was changed";
+    let text = format!(
+        "The recovery code of your Pimble account was just replaced. The old code no longer \
+         recovers the account.\n\n\
+         If you made this change, there is nothing to do.\n\n\
+         If you did not, someone else knows your password. Sign in at {account_link} now, \
+         change your password (that signs out every other device and browser) and make a new \
+         recovery code. If you can no longer sign in, follow the sign-in page's link for a \
+         forgotten password: without the new code the account cannot be recovered, but it can \
+         be deleted from there."
+    );
+    let html = format!(
+        "<p>The recovery code of your Pimble account was just replaced. The old code no longer \
+         recovers the account.</p>\
+         <p>If you made this change, there is nothing to do.</p>\
+         <p>If you did not, someone else knows your password. Sign in at \
+         <a href=\"{account_link}\">{account_link}</a> now, change your password (that signs out \
+         every other device and browser) and make a new recovery code. If you can no longer sign \
+         in, follow the sign-in page's link for a forgotten password: without the new code the \
+         account cannot be recovered, but it can be deleted from there.</p>"
+    );
+    (subject, text, html)
+}
+
 // ── Sharing mails: every interpolated value is attacker-controlled ───────
 //
 // A share's name is typed by whoever owns it and the inviter's address by

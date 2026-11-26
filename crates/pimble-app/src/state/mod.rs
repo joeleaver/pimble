@@ -530,7 +530,7 @@ pub struct AppStore {
     pub notices: Signal<Vec<pimble_rpc::Notice>>,
     /// The names of the notes notices name that no view holds, as this
     /// device read them for the Inbox (`NotesNamed`, `crate::inbox::named`).
-    pub notice_names: Signal<std::collections::HashMap<(StoreId, NodeId), String>>,
+    pub notice_names: Signal<std::collections::HashMap<(StoreId, NodeId), crate::protocol::NoteName>>,
     /// Whether notifications are on for the account (section 6): the switch
     /// in the Account window and in Settings.
     pub notifications_on: Signal<bool>,

@@ -338,27 +338,6 @@ async fn serve_once(handler: &RpcHandler, serve: &mut watch::Receiver<HashSet<St
     }
 }
 
-/// The relay's close code for a member's connection to a store nobody is
-/// serving right now (`pimble-cloud`'s `relay::CLOSE_OWNER_OFFLINE`).
-const CLOSE_OWNER_OFFLINE: u16 = 4404;
-
-/// A member's side: whether the relay at `url` says the store's owner is
-/// not there (close code 4404, `owner offline`). The JSON-RPC client a vault
-/// link connects with does not pass a close frame's code on, so a link whose
-/// connection to a relayed store just failed asks here, with the token it
-/// had, to tell "the owner's computer is off" (an ordinary `Offline`) from
-/// something worth a warning. Anything else, a refusal before the upgrade
-/// included, is `false`.
-pub(crate) async fn owner_is_offline(url: &Url, token: &str) -> bool {
-    let Ok(request) = bearer_request(url, token) else { return false };
-    let Ok(Ok((mut socket, _))) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request)).await else { return false };
-    // The refusal is the first thing the relay says, or it says nothing.
-    let first = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
-    let offline = matches!(&first, Ok(Some(Ok(Message::Close(Some(close))))) if u16::from(close.code) == CLOSE_OWNER_OFFLINE);
-    let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
-    offline
-}
-
 /// How one member's connection ended.
 enum Ended {
     /// The face closed it, refused it (the token did not verify), or broke:

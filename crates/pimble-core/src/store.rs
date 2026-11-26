@@ -123,10 +123,11 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_roots: Vec<NodeId>,
 
-    /// The roots among [`Store::roots`] the account no longer holds: it was
-    /// removed from that share, or the share was stopped
-    /// (`StoreManifest::ended_roots`). They are still on this device, read
-    /// only, until the replica is removed; they are not shown
+    /// The roots among [`Store::held_roots`] the account no longer holds: it
+    /// was removed from that share, or the share was stopped
+    /// (`StoreManifest::ended_roots`); for a whole replica, its own root once
+    /// the account holds the store no more. They are still on this device,
+    /// read only, until the replica is removed; they are not shown
     /// ([`Store::shown_roots`]). Missing in older serializations: none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ended_roots: Vec<NodeId>,
@@ -380,18 +381,31 @@ impl Store {
     /// root at all, never the fallback to `root_node_id`, which is a whole
     /// store's alone (a partial replica's `root_node_id` is its first scope
     /// root: the very folder that is no longer shared).
+    ///
+    /// A whole replica whose account holds the store no more (removed from
+    /// it, or another account signed in on this device) has its own root
+    /// ended, and so shows nothing either: it is what a share's replica is
+    /// once every share ended (Joe, 2026-09-21), the same row and the same
+    /// "Remove Replica...".
     pub fn shown_roots(&self) -> Vec<NodeId> {
+        self.held_roots().into_iter().filter(|root| !self.ended_roots.contains(root)).collect()
+    }
+
+    /// The roots this store can show: the ones a partial replica lists, or
+    /// a whole store's own root. What [`Store::ended_roots`] is a subset of.
+    pub fn held_roots(&self) -> Vec<NodeId> {
         if self.roots.is_empty() {
             vec![self.root_node_id]
         } else {
-            self.roots.iter().filter(|root| !self.ended_roots.contains(root)).copied().collect()
+            self.roots.clone()
         }
     }
 
-    /// Whether this is a share's replica whose every share has ended: it
-    /// lists roots and shows none of them.
+    /// Whether this is a replica the account holds nothing of any more: a
+    /// share's replica whose every share has ended, or a whole replica whose
+    /// root has. It shows no root at all.
     pub fn every_share_ended(&self) -> bool {
-        !self.roots.is_empty() && self.roots.iter().all(|root| self.ended_roots.contains(root))
+        !self.ended_roots.is_empty() && self.held_roots().iter().all(|root| self.ended_roots.contains(root))
     }
 
     /// Create a new local store
@@ -775,9 +789,11 @@ pub struct StoreManifest {
     /// The scope roots this account no longer holds: it was removed from
     /// that share, or the share was stopped. A subset of `scope_roots`,
     /// which is never shrunk: it is what makes the replica partial, and a
-    /// replica whose every share ended stays partial and read only. The
-    /// documents stay on disk until the replica is removed. Missing in older
-    /// serializations: none.
+    /// replica whose every share ended stays partial and read only. A whole
+    /// replica (no scope roots) whose account holds the store no more lists
+    /// its own `root_node_id` here, and nothing else. The documents stay on
+    /// disk until the replica is removed. Missing in older serializations:
+    /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ended_roots: Vec<NodeId>,
 }
@@ -904,6 +920,21 @@ mod tests {
         let store = partial(vec![trips, recipes], vec![recipes, trips]);
         assert_eq!(store.shown_roots(), Vec::<NodeId>::new());
         assert!(store.every_share_ended());
+    }
+
+    /// A whole replica the account holds no more (Joe, 2026-09-21's ended
+    /// share, for a whole-store grant): its own root has ended, so it shows
+    /// nothing and reads as a replica whose every share ended.
+    #[test]
+    fn a_whole_replica_whose_root_ended_shows_nothing() {
+        let mut store = Store::new_local("Notes", PathBuf::from("/tmp/notes.pimble"));
+        assert_eq!(store.held_roots(), vec![store.root_node_id]);
+        store.ended_roots = vec![store.root_node_id];
+        assert_eq!(store.shown_roots(), Vec::<NodeId>::new());
+        assert!(store.every_share_ended());
+        store.ended_roots = vec![NodeId::new()];
+        assert_eq!(store.shown_roots(), vec![store.root_node_id], "only its own root ends a whole store");
+        assert!(!store.every_share_ended());
     }
 
     #[test]

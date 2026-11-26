@@ -465,3 +465,24 @@ fn who_manages_a_share() {
     assert!(!manages_share(None, [("Me@Example.com", false)], " me@example.com "));
     assert!(manages_share(None, [("", false)], ""), "no account names no row");
 }
+
+/// A label follows the text only where `display_label` reads it: not for an
+/// explicit, non-empty title, and never for a discussion (its topic).
+#[test]
+fn a_label_follows_the_text_unless_titled_or_a_discussion() {
+    let mut untitled = crate::Node::new("text");
+    assert!(super::label_follows_text(&untitled));
+    untitled.metadata.title = "Packing".into();
+    assert!(super::label_follows_text(&untitled), "a title not marked explicit yields to the text");
+    let mut titled = untitled.clone();
+    titled.metadata.custom.insert(crate::custom_keys::EXPLICIT_TITLE.into(), serde_json::json!(true));
+    assert!(!super::label_follows_text(&titled));
+    assert_eq!(super::display_label(&titled, |_| "first line".into()), "Packing");
+    titled.metadata.title.clear();
+    assert!(super::label_follows_text(&titled), "an empty explicit title yields to the text");
+    let mut discussion = crate::Node::new(crate::node_types::DISCUSSION);
+    assert!(!super::label_follows_text(&discussion));
+    assert_eq!(super::display_label(&discussion, |_| unreachable!()), "Discussion");
+    discussion.metadata.title = "Budget".into();
+    assert_eq!(super::display_label(&discussion, |_| unreachable!()), "Budget");
+}
