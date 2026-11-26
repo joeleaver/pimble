@@ -13,6 +13,7 @@ pub mod dispatch;
 pub mod error;
 pub mod methods;
 pub mod notices;
+pub mod openers;
 pub mod types;
 pub mod vault;
 pub mod vault_cursor;
@@ -24,6 +25,7 @@ pub use diagnostics::*;
 pub use error::*;
 pub use methods::*;
 pub use notices::*;
+pub use openers::*;
 pub use types::*;
 pub use vault_cursor::VaultCursor;
 

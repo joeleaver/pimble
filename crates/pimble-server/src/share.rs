@@ -141,7 +141,7 @@ fn marker_of(tree: &Tree, id: NodeId) -> Option<ShareMarker> {
 }
 
 /// Every live node that carries a marker, in id order.
-fn markers_in(tree: &Tree) -> Vec<(NodeId, ShareMarker)> {
+pub(crate) fn markers_in(tree: &Tree) -> Vec<(NodeId, ShareMarker)> {
     let mut markers: Vec<(NodeId, ShareMarker)> = tree.list_node_ids().into_iter().filter_map(|id| Some((id, marker_of(tree, id)?))).collect();
     markers.sort_by_key(|(id, _)| id.to_string());
     markers
@@ -1202,6 +1202,7 @@ impl RpcHandler {
                 let _ = self.runtime().timeout(PASS_WAIT, ran).await;
             }
         }
+        crate::people::refresh_after_change(self, store_id).await;
         // The share is made; a listing that fails now must not say otherwise.
         match self.share_answer(&account, store_id, node_id, &marker).await {
             Ok(answer) => Ok(answer),
@@ -1236,9 +1237,10 @@ impl RpcHandler {
         }
         info!("Inviting {} to share {} of store {} as {}", email, node_id, store_id, request.role.as_str());
 
-        let member = crate::cloud::put_member(self.http(), &account.url, &account.session, &store_id.to_string(), email, request.role.as_str(), Some(&node_id), Some(&marker.name))
-            .await
-            .map_err(to_rpc_error)?;
+        let put = crate::cloud::put_member(self.http(), &account.url, &account.session, &store_id.to_string(), email, request.role.as_str(), Some(&node_id), Some(&marker.name)).await;
+        // Whether or not an answer came back, who is in the share may have changed.
+        crate::people::refresh_after_change(self, store_id).await;
+        let member = put.map_err(to_rpc_error)?;
         // An address that has an account already gets the key at once. One
         // that does not is the sweep's, the moment the account appears.
         if member.is_active() && !member.has_key {
@@ -1272,17 +1274,23 @@ impl RpcHandler {
             .iter()
             .find(|member| member.email.eq_ignore_ascii_case(email))
             .ok_or_else(|| to_rpc_error(format!("{} is not a member of this share and has no invitation to it", email)))?;
-        match &member.user_id {
+        let removed = match &member.user_id {
             Some(user_id) => crate::cloud::delete_member(self.http(), &account.url, &account.session, &store, user_id, Some(&node_id)).await,
             None => crate::cloud::delete_invitation(self.http(), &account.url, &account.session, &store, &member.email, Some(&node_id)).await,
-        }
-        .map_err(to_rpc_error)?;
+        };
+        crate::people::refresh_after_change(self, store_id).await;
+        removed.map_err(to_rpc_error)?;
         self.share_answer(&account, store_id, node_id, &marker).await
     }
 
     pub(crate) async fn stop_sharing(&self, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned> {
         info!("Stopping share {} of store {}", request.node_id, request.store_id);
-        self.stop_share(request.store_id, request.node_id).await.map_err(to_rpc_error)?;
+        let mut asked = false;
+        let stopped = self.stop_share(request.store_id, request.node_id, &mut asked).await;
+        if asked {
+            crate::people::refresh_after_change(self, request.store_id).await;
+        }
+        stopped.map_err(to_rpc_error)?;
         Ok(EmptyResponse {})
     }
 
@@ -1296,8 +1304,10 @@ impl RpcHandler {
     /// after that leaves a share that can be stopped again: members first
     /// (nobody is minted the root any more), then the scope (a token minted
     /// before that lives an hour; without the scope it reaches nothing),
-    /// then the marker.
-    async fn stop_share(&self, store_id: StoreId, node_id: NodeId) -> Result<(), String> {
+    /// then the marker. `asked` is set once Pimble Cloud has been asked to
+    /// change anything, which is when who is in the share is worth asking
+    /// again.
+    async fn stop_share(&self, store_id: StoreId, node_id: NodeId, asked: &mut bool) -> Result<(), String> {
         self.require_owners_device(store_id).await.map_err(|e| e.message().to_string())?;
         let account = self.keystore().account().await.ok_or_else(|| NOT_SIGNED_IN.to_string())?;
         let marker = self.marker_on(store_id, node_id).await.map_err(|e| e.message().to_string())?;
@@ -1309,6 +1319,7 @@ impl RpcHandler {
             .await
             .map_err(|e| format!("{STOP_UNREACHABLE_REFUSAL} ({e})"))?;
 
+        *asked = true;
         // The owner's own grant is on the whole store and no scope's
         // listing names it; were one to, it is not a share's to remove.
         for member in listing.members.iter().filter(|member| member.user_id.as_deref() != Some(account.user_id.as_str())) {
@@ -1348,9 +1359,10 @@ impl RpcHandler {
     /// best effort. Signed out, offline, or slow, the deletion goes ahead,
     /// and the log says which share's grants were left on the account.
     pub(crate) async fn stop_shares_before_delete(&self, store_id: StoreId, deleting: NodeId, roots: Vec<NodeId>) {
+        let mut asked = false;
         for root in roots {
             let name = self.marker_on(store_id, root).await.map(|marker| marker.name).unwrap_or_default();
-            let stopped = match self.runtime().timeout(STOP_BEFORE_DELETE_WAIT, self.stop_share(store_id, root)).await {
+            let stopped = match self.runtime().timeout(STOP_BEFORE_DELETE_WAIT, self.stop_share(store_id, root, &mut asked)).await {
                 Ok(result) => result,
                 Err(_) => Err("Pimble Cloud did not answer in time".to_string()),
             };
@@ -1360,6 +1372,11 @@ impl RpcHandler {
                     deleting, store_id, name, root, e
                 );
             }
+        }
+        // Whoever was removed is not named any longer. Not waited for: the
+        // deletion goes ahead.
+        if asked {
+            drop(crate::people::refresh_in_background(self, store_id));
         }
     }
 }

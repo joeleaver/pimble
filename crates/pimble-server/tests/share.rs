@@ -219,11 +219,19 @@ fn sorted_uuids(mut ids: Vec<Uuid>) -> Vec<Uuid> {
 #[tokio::test]
 async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     let env = spawn_env().await;
-    let (_a, alice, a_dir) = start_local_server().await;
+    let (a, alice, a_dir) = start_local_server().await;
     let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
     let (store_id, shared) = (fx.store_id, fx.shared);
+    let agent = agent_of(&a, &alice, store_id).await;
+    // Hosted and shared with nobody: known, not "never told".
+    alice.cloud_people(store_id).await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
     alice.cloud_share_node(store_id, shared, "Holiday Plans").await.expect("sharing a folder");
+    // A share nobody was invited to yet.
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
     alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob");
+    let (invited, incomplete) = openers(&agent, store_id, fx.inside).await;
+    assert!(invited.len() == 2 && !incomplete, "{invited:?}");
 
     let (_b, bob, b_dir) = start_local_server().await;
     env.sign_in(&bob, BOB).await;
@@ -251,6 +259,10 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     assert_eq!(alice_people.name_of(&env.user_id(BOB.0), Some(shared)), Some("Bobby"), "{alice_people:?}");
     assert!(!contains_bytes_recursive(b_dir.path(), b"alice@example.com"), "no owner email on the member's disk");
 
+    // An AI agent on Alice's computer learns who can open a note in the
+    // share, by those names (docs/MCP_CONTRACT.md "Who can open a note").
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (vec!["Alice A.".to_string(), "Bobby".to_string()], false));
+
     // The Share dialog on Bob's side names Alice and shows no email; Alice's
     // own shows Bob's name with his email, for her to manage the share.
     let info = bob.cloud_share_info(store_id, shared).await.expect("a member's view of the share");
@@ -258,6 +270,30 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     assert!(info.members.iter().any(|m| m.role == MemberRole::Owner && m.name == "Alice A."), "{:?}", info.members);
     let info = alice.cloud_share_info(store_id, shared).await.expect("the owner's view");
     assert!(info.members.iter().any(|m| m.email == BOB.0 && m.name == "Bobby"), "{:?}", info.members);
+
+    // A removal and a stop are answered at once, not at the next refresh.
+    alice.cloud_share_remove_member(store_id, shared, BOB.0).await.expect("removing Bob");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob again");
+    assert_eq!(openers(&agent, store_id, fx.inside).await.0.len(), 2);
+    alice.cloud_stop_sharing(store_id, shared).await.expect("stopping the share");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+}
+
+/// An AI agent on `server` that reads the whole of `store_id`.
+async fn agent_of(server: &PimbleServer, operator: &PimbleClient, store_id: pimble_core::StoreId) -> PimbleClient {
+    let grant = pimble_rpc::AgentGrant { store: store_id, node: None, role: pimble_rpc::AgentRole::Reader };
+    let created = operator.create_agent("Claude", vec![grant]).await.unwrap();
+    PimbleClient::connect_with_auth(format!("http://{}", server.addr()), &pimble_core::AuthMethod::Bearer { token: created.key }).await.unwrap()
+}
+
+/// The names `whoCanOpen` gives for a node, sorted, and whether it says
+/// there may be others.
+async fn openers(client: &PimbleClient, store_id: pimble_core::StoreId, node: NodeId) -> (Vec<String>, bool) {
+    let answer = client.who_can_open(store_id, node).await.expect("asking who can open");
+    let mut names: Vec<String> = answer.people.into_iter().map(|person| person.name).collect();
+    names.sort();
+    (names, answer.incomplete)
 }
 
 #[tokio::test]
@@ -739,7 +775,12 @@ async fn sharing_from_a_store_that_is_not_hosted_is_refused_and_nothing_is_uploa
     let doc = alice.create_node(store_id, Some(folder), "document", "Packing").await.unwrap();
     seed_content(&alice, store_id, doc, "seed", "NEVER-HOSTED-TEXT").await;
 
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = env.stub.store_list_calls.load(Ordering::SeqCst);
     let refused = alice.cloud_share_node(store_id, folder, "Holiday Plans").await.expect_err("sharing never hosts");
+    // Who is in a share is asked again from the account's stores on, and a
+    // share refused here changes nothing to ask about.
+    assert_eq!(env.stub.store_list_calls.load(Ordering::SeqCst), asked, "a refused share asks nothing");
     assert_eq!(refused.to_string(), "Sharing needs this store hosted on Pimble Cloud or shared from this computer.");
     // Whoever is or is not signed in: the sentence is about the store.
     alice.cloud_sign_out().await.unwrap();
@@ -1064,6 +1105,9 @@ async fn a_share_that_ended_is_announced_and_kept_on_disk_until_the_replica_is_r
     let listed = bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
     assert_eq!(sorted(listed.roots.clone()), sorted(vec![holiday, recipes]), "the scope roots are never shrunk");
     assert_eq!((listed.ended_roots.clone(), listed.shown_roots()), (vec![holiday], vec![recipes]));
+    // Who can open what ended cannot be known here any more.
+    let ended = bob.who_can_open(store_id, holiday).await.expect("asking about an ended share");
+    assert!(ended.people.is_empty() && ended.incomplete, "{ended:?}");
     let held = bob.get_store_sync_response(store_id).await.unwrap();
     assert_eq!((held.ended_roots.clone(), held.access), (vec![holiday], StoreAccess::Full));
     assert!(held.read_only_roots.contains(&holiday), "an ended root is held read only, as before: {:?}", held.read_only_roots);
@@ -1458,4 +1502,168 @@ async fn a_members_create_made_while_down_reaches_the_owner_after_a_stop_inside_
 
     a.stop().await.unwrap();
     b.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn who_can_open_names_a_co_owner_and_an_account_without_the_store_changes_nothing() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let store_id = fx.store_id;
+    let agent = agent_of(&a, &alice, store_id).await;
+    let (alice_id, bob_id) = (env.user_id(ALICE.0), env.user_id(BOB.0));
+
+    // Bob owns the whole store too, and nothing else is shared with anyone.
+    {
+        let mut s = env.stub.inner.lock().unwrap();
+        let id = store_id.to_string();
+        let row = s.stores.iter().find(|row| row.store_id == id && row.root.is_none()).expect("Alice's grant");
+        let row = common::StubStoreRow { user_id: bob_id.clone(), store_id: id, name: row.name.clone(), kind: row.kind.clone(), created_at: row.created_at.clone(), role: "owner".into(), root: None, shared_by: None };
+        s.stores.push(row);
+    }
+    alice.cloud_people(store_id).await.unwrap();
+    let both = openers(&agent, store_id, fx.inside).await;
+    assert!(both.0.len() == 2 && !both.1, "{both:?}");
+    // A share only the owners can open is not an unknown one.
+    alice.cloud_share_node(store_id, fx.shared, "Holiday Plans").await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, both);
+
+    // An account that holds nothing of the store learns nothing about it,
+    // and what was kept stays.
+    let held: Vec<common::StubStoreRow> = {
+        let mut s = env.stub.inner.lock().unwrap();
+        let (alices, others) = std::mem::take(&mut s.stores).into_iter().partition(|row| row.user_id == alice_id);
+        s.stores = others;
+        alices
+    };
+    let kept = alice.cloud_people(store_id).await.unwrap();
+    assert!(!kept.scopes.is_empty(), "{kept:?}");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, both);
+
+    // A list that cannot be read is written again, an empty one included.
+    {
+        let mut s = env.stub.inner.lock().unwrap();
+        s.stores.retain(|row| row.user_id != bob_id);
+        s.stores.extend(held);
+    }
+    let file = a_dir.path().join("stores").join(store_id.to_string()).join("people.json");
+    tfs::write(&file, "not json").unwrap();
+    alice.cloud_people(store_id).await.unwrap();
+    assert_eq!(openers(&agent, store_id, fx.inside).await, (Vec::<String>::new(), false));
+
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_change_to_a_share_and_a_deletion_do_not_wait_for_a_hung_list_of_shares() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, fx.deeper, "Tickets").await.unwrap();
+    alice.cloud_share_invite(store_id, fx.deeper, BOB.0, MemberRole::Editor).await.unwrap();
+
+    env.stub.shares_stalled.store(true, Ordering::SeqCst);
+    // Longer than a change waits, shorter than one request's own limit.
+    let limit = Duration::from_secs(10);
+    tokio::time::timeout(limit, alice.cloud_share_remove_member(store_id, fx.deeper, BOB.0)).await.expect("a removal answers").unwrap();
+    tokio::time::timeout(limit, alice.cloud_share_invite(store_id, fx.deeper, BOB.0, MemberRole::Editor)).await.expect("an invitation answers").unwrap();
+    tokio::time::timeout(Duration::from_millis(2500), alice.delete_node(store_id, shared)).await.expect("a deletion does not wait for who is who").unwrap();
+    assert_eq!(env.scoped_rows(store_id, fx.deeper), 0, "its share was stopped all the same");
+    env.stub.shares_stalled.store(false, Ordering::SeqCst);
+
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_share_held_inside_an_ended_one_still_names_its_members() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, outer, inner) = (fx.store_id, fx.shared, fx.deeper);
+    alice.cloud_share_node(store_id, outer, "Holiday Plans").await.unwrap();
+    alice.cloud_share_node(store_id, inner, "Tickets").await.unwrap();
+    alice.cloud_share_invite(store_id, outer, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, inner, BOB.0, MemberRole::Editor).await.unwrap();
+
+    let b_dir = tempfile::tempdir().unwrap();
+    let mut b = PimbleServer::with_config(ServerConfig { grant_check_interval: Some(Duration::from_secs(1)), ..device_config(b_dir.path()) });
+    b.start().await.unwrap();
+    let bob = PimbleClient::connect(format!("http://{}", b.addr())).await.unwrap();
+    env.sign_in(&bob, BOB).await;
+    bob.cloud_add_hosted_store(store_id).await.unwrap();
+    let learned = wait_until(Duration::from_secs(30), || async {
+        bob.who_can_open(store_id, fx.leaf).await.is_ok_and(|answer| answer.people.len() == 2 && !answer.incomplete)
+    })
+    .await;
+    assert!(learned, "Bob's device learns who is in both shares: {:?}", bob.who_can_open(store_id, fx.leaf).await);
+
+    alice.cloud_share_remove_member(store_id, outer, BOB.0).await.unwrap();
+    let ended = wait_until(Duration::from_secs(30), || async { bob.get_store_sync_response(store_id).await.is_ok_and(|held| held.ended_roots == vec![outer]) }).await;
+    assert!(ended, "the outer share ends");
+    // The inner share's members, and that there may be others.
+    let still = wait_until(Duration::from_secs(30), || async {
+        bob.who_can_open(store_id, fx.leaf).await.is_ok_and(|answer| answer.people.len() == 2 && answer.incomplete)
+    })
+    .await;
+    assert!(still, "{:?}", bob.who_can_open(store_id, fx.leaf).await);
+    assert_eq!(openers(&bob, store_id, fx.inside).await, (Vec::<String>::new(), true));
+
+    b.stop().await.unwrap();
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_change_to_a_share_refused_here_does_not_ask_who_is_in_it_again() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, shared, "Holiday Plans").await.unwrap();
+    // The link's own asking, at its connect, is over.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let asked = env.stub.store_list_calls.load(Ordering::SeqCst);
+    alice.cloud_share_node(store_id, shared, "Again").await.expect_err("shared already");
+    alice.cloud_share_invite(store_id, shared, ALICE.0, MemberRole::Editor).await.expect_err("herself");
+    alice.cloud_share_invite(store_id, fx.private, BOB.0, MemberRole::Editor).await.expect_err("not shared");
+    alice.cloud_share_remove_member(store_id, shared, BOB.0).await.expect_err("not a member");
+    alice.cloud_stop_sharing(store_id, fx.private).await.expect_err("nothing to stop");
+    assert_eq!(env.stub.store_list_calls.load(Ordering::SeqCst), asked);
+
+    // The count does move when a change is made.
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.unwrap();
+    assert!(env.stub.store_list_calls.load(Ordering::SeqCst) > asked);
+
+    a.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_slow_answer_about_who_is_in_a_share_never_replaces_a_later_one() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    let agent = agent_of(&a, &alice, store_id).await;
+    alice.cloud_share_node(store_id, shared, "Holiday Plans").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // One refresh is answered as things are before Bob is invited, and the
+    // answer is slow to arrive.
+    env.stub.hold_next_share_list.store(true, Ordering::SeqCst);
+    let url = format!("http://{}", a.addr());
+    let slow = tokio::spawn(async move { PimbleClient::connect(url).await.unwrap().cloud_people(store_id).await });
+    tokio::time::timeout(Duration::from_secs(10), env.stub.share_list_held.notified()).await.expect("the refresh asks");
+
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.unwrap();
+    let invited = openers(&agent, store_id, fx.inside).await;
+    assert!(invited.0.len() == 2 && !invited.1, "{invited:?}");
+    assert!(!slow.is_finished(), "the earlier refresh is still waiting");
+
+    env.stub.share_list_release.notify_one();
+    let answered = slow.await.unwrap().unwrap();
+    assert!(answered.scopes.iter().any(|scope| scope.root == Some(shared) && scope.people.len() == 2), "it answers what is kept: {answered:?}");
+    assert_eq!(openers(&agent, store_id, fx.inside).await, invited);
+
+    a.stop().await.unwrap();
 }

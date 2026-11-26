@@ -137,7 +137,7 @@ impl Notices {
 
 /// The node and its ancestors, nearest first (a discussion's host stands
 /// for its parent): what says which shares a node is in.
-pub(super) async fn chain_of(handler: &RpcHandler, store_id: StoreId, node: NodeId) -> Vec<NodeId> {
+pub(crate) async fn chain_of(handler: &RpcHandler, store_id: StoreId, node: NodeId) -> Vec<NodeId> {
     let manager = handler.store_manager_handle();
     let manager = manager.read().await;
     let mut chain = vec![node];

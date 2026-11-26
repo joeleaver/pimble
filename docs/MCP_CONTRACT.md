@@ -127,6 +127,35 @@ the LLM as the server's sentence, unchanged ("You can read this, not change it."
 Edits carry client id `agent:<id>` (the agent the key names, docs/AGENTS_CONTRACT.md), so
 notifications and logs say where an edit came from.
 
+### Who can open a note
+
+Decided by Joe, 2026-11-26: an agent that can read a note may see who else can open it,
+"names and ids".
+
+- `list_people` asks **`whoCanOpen { store_id, node_id }`**, which the operator and agents
+  may call; anyone else (a share's member on a server) is refused. An agent needs read
+  access to the node.
+- The answer is the members of the shares the node is in (the node's and its ancestors'
+  shares, ancestors the agent cannot read included, and the whole store's): each person's
+  account id and the name they go by there. No email, no notice key, no share's name.
+- It is read from the kept `people.json` (docs/PRESENCE_CONTRACT.md section 3). Pimble
+  Cloud is not asked, so an agent never spends the person's account session.
+- The list is as this computer last learned it. It is asked again after this computer
+  shares, invites, removes or stops sharing (which waits a few seconds at most for the
+  answer), and otherwise as docs/PRESENCE_CONTRACT.md section 3 says, so a change made
+  elsewhere shows a little later (or once this computer is online).
+- A store's other owners are among those who can open every note in it. A signed-in
+  account that holds nothing of the store leaves the list as it was.
+- In a share still held inside one that ended, the answer names the held share's members
+  and says there may be others.
+- `incomplete` says the note is shared with members this computer does not have (not
+  learned yet, or a share that ended), and the tool says so rather than answering
+  "nobody". A share of the account's own that nobody else is in is kept as such
+  (`people.json`'s `alone`).
+- A failure is answered as a failure. Until 2026-11-26 the tool called `cloudPeople`,
+  which is the operator's alone and stays so: every agent was refused, and the tool
+  reported the refusal as "its store is not shared".
+
 ## Writing: the CRDT path, and nothing else
 
 Every write is an edit of the node's existing document through the one write,

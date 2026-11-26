@@ -411,20 +411,21 @@ impl Pimble {
     #[tool(name = "list_people")]
     pub(super) async fn list_people(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
         let addr = self.resolve(&p.node).await?;
-        let people = match self.api.backend().people(addr.store).await {
-            Ok(people) => people,
-            Err(_) => return Ok("Nobody else can open this note: its store is not shared.".into()),
-        };
-        let mut chain = vec![addr.node];
-        chain.extend(self.api.ancestors(addr).await?.into_iter().map(|a| a.node));
-        let members = people.members_of(&chain);
-        if members.is_empty() {
-            return Ok("Nobody else can open this note: it is in no share.".into());
+        let answer = self.api.backend().who_can_open(addr.store, addr.node).await?;
+        if answer.people.is_empty() {
+            return Ok(if answer.incomplete {
+                "Who can open this note is not known on this computer: it is or was shared, and Pimble does not have the members of that share.".into()
+            } else {
+                "Nobody else can open this note: it is in no share with other members.".into()
+            });
         }
         let mut out = String::from("People who can open it (mention one with its Markdown):\n");
-        for person in members {
+        for person in answer.people {
             let mention = pimble_core::mention::Mention { account: person.user_id.clone(), id: None, name: person.name.clone() };
             out.push_str(&format!("- {}: [{}]({})\n", person.name, mention.words(), mention.href()));
+        }
+        if answer.incomplete {
+            out.push_str("There may be others: this computer does not have the members of every share this note is in.\n");
         }
         Ok(out)
     }

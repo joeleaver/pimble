@@ -20,7 +20,7 @@
 use pimble_host::disk::testfs as tfs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -267,6 +267,15 @@ pub struct Stub {
     pub inner: Mutex<StubInner>,
     /// The members endpoints answer 503 while set: "the service is unreachable".
     pub members_down: AtomicBool,
+    /// `GET /me/shares` takes a minute to answer, as a hung service would.
+    pub shares_stalled: AtomicBool,
+    /// The next `GET /me/shares` takes its answer, says so on
+    /// `share_list_held`, and sends it when `share_list_release` says.
+    pub hold_next_share_list: AtomicBool,
+    pub share_list_held: tokio::sync::Notify,
+    pub share_list_release: tokio::sync::Notify,
+    /// How many times `GET /stores` was asked.
+    pub store_list_calls: AtomicUsize,
     /// `/token` answers 401 "invalid session" while set: the session expired.
     pub refuse_sessions: AtomicBool,
     /// How many times `/token` was asked.
@@ -580,6 +589,7 @@ pub async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap)
 }
 
 pub async fn stub_list_stores(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    state.store_list_calls.fetch_add(1, Ordering::SeqCst);
     let s = state.inner.lock().unwrap();
     let account = s.account_of(&headers);
     let arr: Vec<_> = s
@@ -754,8 +764,21 @@ pub async fn stub_put_me(State(state): State<StubState>, headers: HeaderMap, Jso
 }
 
 pub async fn stub_list_shares(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    if state.shares_stalled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+    let out = shares_of(&state, &headers);
+    if state.hold_next_share_list.swap(false, Ordering::SeqCst) {
+        state.share_list_held.notify_one();
+        state.share_list_release.notified().await;
+    }
+    Json(json!(out))
+}
+
+/// What `GET /me/shares` answers `headers`' account now.
+fn shares_of(state: &StubState, headers: &HeaderMap) -> Vec<serde_json::Value> {
     let s = state.inner.lock().unwrap();
-    let me = s.account_of(&headers).user_id.clone();
+    let me = s.account_of(headers).user_id.clone();
     let mut out = Vec::new();
     for row in s.stores.iter().filter(|row| row.user_id == me) {
         if row.role == "owner" && row.root.is_none() {
@@ -775,7 +798,7 @@ pub async fn stub_list_shares(State(state): State<StubState>, headers: HeaderMap
             out.push(json!({ "store_id": row.store_id, "root": row.root, "name": row.name, "role": row.role, "owned": false, "owner_name": owner, "kind": row.kind, "tier": "hosted", "my_name": chosen, "appears_as": s.name_in(&me, &row.store_id, &row.root) }));
         }
     }
-    Json(json!(out))
+    out
 }
 
 pub async fn stub_put_share_name(
@@ -1115,6 +1138,11 @@ pub async fn spawn_env() -> Env {
             token_role: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
+        shares_stalled: AtomicBool::new(false),
+        hold_next_share_list: AtomicBool::new(false),
+        share_list_held: tokio::sync::Notify::new(),
+        share_list_release: tokio::sync::Notify::new(),
+        store_list_calls: AtomicUsize::new(0),
         refuse_sessions: AtomicBool::new(false),
         token_calls: std::sync::atomic::AtomicUsize::new(0),
         inbox_wake: tokio::sync::Notify::new(),

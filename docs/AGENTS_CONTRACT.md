@@ -46,7 +46,9 @@ Agent {
   search included; `pimble-mcp` holds no rules of its own.
 - **Nothing else is reachable.** An agent never gets the store lifecycle RPCs
   (`createStore`, `openStore`, `closeStore`, `addRemoteStore`, cloud sign-in...): those
-  stay `Service`-only. Its tools are the content tools.
+  stay `Service`-only. Its tools are the content tools. It may ask who can open a
+  note it reads (`whoCanOpen`: names and account ids; docs/MCP_CONTRACT.md "Who can open
+  a note", Joe, 2026-11-26).
 - **Mounts** inside a granted subtree: the source must be granted too, as for a share
   member (anything touching a mount authorizes against the source store). The picker
   says so beside a mount.

@@ -53,6 +53,8 @@ mod kept;
 mod run;
 mod watches;
 
+pub(crate) use run::chain_of;
+
 pub(crate) use detect::{candidates, may_mention, Candidate};
 use kept::{now_ms, Kept, Outgoing};
 

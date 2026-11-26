@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use pimble_core::{
     node_types, BlobId, BlobUrl, DeletedNode, LinkResolution, MountRef, MountState, Node, NodeId, NodeMetadata, Place, Store, StoreAccess, StoreId,
 };
-use pimble_rpc::{PresenceFrame, SearchResultItem, StorePeople};
+use pimble_rpc::{PresenceFrame, SearchResultItem, StorePeople, WhoCanOpenResponse};
 
 use crate::backend::{Backend, ChangeStream, Moved, NodeInit, PresenceStream, StoreCapabilities, SyncedDoc};
 use crate::ApiError;
@@ -412,6 +412,10 @@ impl Backend for Router {
 
     async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
         self.of(store).people(store).await
+    }
+
+    async fn who_can_open(&self, store: StoreId, node: NodeId) -> Result<WhoCanOpenResponse, ApiError> {
+        self.of(store).who_can_open(store, node).await
     }
 
     /// Gated like any structural write; the store's backend says whether it

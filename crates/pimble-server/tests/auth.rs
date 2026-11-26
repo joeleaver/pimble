@@ -555,6 +555,8 @@ async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
     let by_edit = pimble_core::NodeId::new();
     member.apply_edit(store_id, by_edit, "bob-editor", create_edit("By edit", shared)).await.expect("a document created by applyEdit under a parent in scope");
     member.get_node(store_id, by_edit).await.expect("in scope by its parent, before any list names it");
+    let refused = member.who_can_open(store_id, inside).await.expect_err("an agent's or the operator's call").to_string();
+    assert!(refused.contains("only available to this server's own operator"), "{refused}");
     member.delete_node(store_id, by_edit).await.expect("a delete in scope");
     member.undelete_node(store_id, by_edit).await.expect("a tombstone stays in scope, so it can come back");
 

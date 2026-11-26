@@ -14,6 +14,7 @@ use pimble_rpc_macros::pimble_api;
 use crate::account::*;
 use crate::app_links::*;
 use crate::notices::*;
+use crate::openers::*;
 use crate::diagnostics::*;
 use crate::types::*;
 
@@ -492,6 +493,13 @@ pub trait PimbleApi {
     /// or as this device last learned it when it cannot be. `Service`-only.
     #[method(name = "cloudPeople", with_extensions)]
     async fn cloud_people(&self, request: CloudPeopleRequest) -> Result<StorePeople, ErrorObjectOwned>;
+
+    /// Who can open a node: the members of the shares it is in, by account
+    /// id and name, from what this device last learned (Pimble Cloud is not
+    /// asked). For the server's operator and for an AI agent that may read
+    /// the node.
+    #[method(name = "whoCanOpen", with_extensions)]
+    async fn who_can_open(&self, request: WhoCanOpenRequest) -> Result<WhoCanOpenResponse, ErrorObjectOwned>;
 
     /// Add an already-hosted store as a local replica. `Service`-only.
     #[method(name = "cloudAddHostedStore", with_extensions)]

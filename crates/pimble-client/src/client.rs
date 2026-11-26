@@ -1775,6 +1775,11 @@ impl PimbleClient {
         self.client.cloud_people(pimble_rpc::CloudPeopleRequest { store_id }).await.map_err(rpc_error)
     }
 
+    /// Who can open a node: the members of the shares it is in.
+    pub async fn who_can_open(&self, store_id: StoreId, node_id: NodeId) -> Result<pimble_rpc::WhoCanOpenResponse> {
+        self.client.who_can_open(pimble_rpc::WhoCanOpenRequest { store_id, node_id }).await.map_err(rpc_error)
+    }
+
     /// Add an already-hosted store as a local replica.
     pub async fn cloud_add_hosted_store(&self, store_id: StoreId) -> Result<Store> {
         let response = self.client.cloud_add_hosted_store(CloudAddHostedStoreRequest { store_id }).await.map_err(rpc_error)?;

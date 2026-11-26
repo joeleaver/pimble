@@ -8,7 +8,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
-use pimble_rpc::{PresenceFrame, SearchResultItem, StoreChangeKind, StorePeople};
+use pimble_rpc::{PresenceFrame, SearchResultItem, StoreChangeKind, StorePeople, WhoCanOpenResponse};
 
 use crate::ApiError;
 
@@ -217,6 +217,12 @@ pub trait Backend: MaybeSend + MaybeSync {
         Err(ApiError::not_available("Who is in a store's shares is not known here."))
     }
 
+    /// Who can open a node: the members of the shares it is in, by account
+    /// id and name (docs/MCP_CONTRACT.md "Who can open a note").
+    async fn who_can_open(&self, _store: StoreId, _node: NodeId) -> Result<WhoCanOpenResponse, ApiError> {
+        Err(ApiError::not_available("Who can open a note is not known here."))
+    }
+
     /// Make a mount of `source_store`'s `source_node` under `parent`
     /// (docs/history/MOUNTS_CONTRACT.md): the server resolves and merges
     /// it, like any structural call.
@@ -350,6 +356,10 @@ impl<B: Backend + ?Sized> Backend for std::sync::Arc<B> {
 
     async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
         (**self).people(store).await
+    }
+
+    async fn who_can_open(&self, store: StoreId, node: NodeId) -> Result<WhoCanOpenResponse, ApiError> {
+        (**self).who_can_open(store, node).await
     }
 
     async fn create_mount(&self, store: StoreId, parent: NodeId, source_store: StoreId, source_node: NodeId, title: Option<String>) -> Result<(NodeId, MountRef), ApiError> {
