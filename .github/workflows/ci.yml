@@ -105,6 +105,8 @@ jobs:
 
       - name: cargo test the web app and its worker
         working-directory: web
+        # A local run once hung after the tests passed; never sit for 6 hours.
+        timeout-minutes: 10
         run: cargo test --locked --workspace --target wasm32-unknown-unknown
 
   test:
