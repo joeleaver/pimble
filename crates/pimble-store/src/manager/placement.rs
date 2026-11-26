@@ -44,11 +44,20 @@ impl StoreManager {
     /// internal while it holds children. Only what the update changes is
     /// judged: a child an older client put under a theme before this was
     /// enforced keeps its place, and edits of it and of the theme still
-    /// merge. The update is merged into a copy of the document; the
-    /// document is not touched.
+    /// merge.
+    ///
+    /// An update that cannot place anything (`NodeDoc::may_place`: nothing
+    /// it brings lands in the `node` or `children` root, which is every
+    /// keystroke) is let through as it is. Any other is merged into a copy
+    /// of the document, which is judged; the document is not touched.
     pub fn judge_placement(&self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<()> {
         let tree = self.local(store_id)?.tree();
         let held = tree.doc(node_id);
+        if let Some(doc) = held {
+            if !doc.may_place(update)? {
+                return Ok(());
+            }
+        }
         let fields_before = held.and_then(|doc| doc.stored_fields().ok());
         let parent_before = fields_before.as_ref().and_then(|f| f.parent_id);
         let was_internal = fields_before.as_ref().is_some_and(|f| internal_kind(&f.node_type).is_some());

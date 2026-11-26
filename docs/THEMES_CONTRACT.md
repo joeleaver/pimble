@@ -742,7 +742,12 @@ cut or add.
   merging it would leave, judged on a copy of the document before the merge (a `parent_id`
   newly naming an internal node, an id added to an internal node's children, or a node
   made internal while it holds children, listed or only named by a child's `parent_id`).
-  Only what an update changes is judged, so a
+  Only an update that could place something is judged: one with a struct that lands in
+  the `node` or `children` root, or whose landing cannot be told (`NodeDoc::may_place`
+  reads it from the update's struct headers and the document's own structs, without
+  merging). A keystroke is let through as it is: on a 5,000-paragraph note (788 KB) the
+  judgement of a one-character edit went from 10.9 ms to 25 µs. Only what an update
+  changes is judged, so a
   child put under a theme before this keeps its place and its edits. A move by such a
   client sends three updates: the old parent's list, the theme's list and the node's
   own. The last two are refused and the first goes in, since taking an entry out of a

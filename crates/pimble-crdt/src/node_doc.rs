@@ -49,6 +49,7 @@ mod boards;
 mod content;
 mod data;
 mod markdown_edits;
+mod placing;
 mod split;
 mod structure;
 mod transactions;
