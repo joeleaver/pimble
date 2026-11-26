@@ -123,12 +123,14 @@ async fn make_the_gap_with(env: &Env, shared: &mut Shared, reports: bool, words:
     let (store_id, inside) = (shared.fx.store_id, shared.fx.inside);
     env.relay.cut();
     assert!(wait_until(Duration::from_secs(10), || async { !is_synced(&shared.bob, store_id).await }).await, "Bob's link notices the network is gone");
+    // The content flush and its `modified_at` stamp, both inside the vector:
+    // waited for, as the server says it stamped.
+    let mut changes = shared.bob.subscribe_store_changes(store_id).await.unwrap();
     match edit {
         Some(update) => apply(&shared.bob, store_id, inside, "bob-editor", update).await,
         None => seed_content(&shared.bob, store_id, inside, "bob-editor", words).await,
     }
-    // The content flush and its `modified_at` stamp, both inside the vector.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    wait_stamped(&mut changes, &[inside]).await;
     let held = state_vector_of(&shared.bob, store_id, inside).await;
     shared.bob_server.stop().await.unwrap();
 

@@ -57,8 +57,9 @@ async fn text_of(client: &PimbleClient, store_id: StoreId, node: NodeId) -> Stri
 }
 
 /// How long an edit may take to cross: the content flush (750 ms), the
-/// folder's settle (500 ms), with room for a loaded machine.
-const BOUND: Duration = Duration::from_secs(10);
+/// folder's settle (500 ms), with room for a heavily loaded machine: a
+/// generous bound, since a met condition ends the wait at once.
+const BOUND: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn an_edit_through_one_server_reaches_the_other_through_the_folder() {
@@ -76,9 +77,9 @@ async fn an_edit_through_one_server_reaches_the_other_through_the_folder() {
     let (store_id, root) = a.create_store(&path, "Shared").await.unwrap();
     let note = a.create_node(store_id, Some(root), "document", "Note").await.unwrap();
     append(&a, store_id, note, "first words").await;
-    // A's flush, so the folder holds the note before B opens it.
-    assert!(wait_until(BOUND, || async { tfs::exists(&path.join("nodes").join(format!("{note}.yrs"))) }).await);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // A's flush, so the folder holds the note's words before B opens it.
+    let file = path.join("nodes").join(format!("{note}.yrs"));
+    assert!(wait_until(BOUND, || async { tfs::read(&file).is_ok_and(|bytes| NodeDoc::text_of(&bytes).contains("first words")) }).await, "A's flush wrote the note");
     b.open_store(&path).await.expect("B opens the same folder");
     assert!(text_of(&b, store_id, note).await.contains("first words"));
 

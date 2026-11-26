@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pimble_board::*;
 
@@ -34,6 +34,19 @@ fn stretched(rect: Rect) -> (Board, String) {
     let paint = ok(&board, |t| t.paint_layer_for(None));
     ok(&board, |t| t.add_placed_pixels(&paint, &[(SRC.to_string(), rect)], None));
     (board, paint)
+}
+
+/// The CPU time this thread has used: what a render costs, whatever else the
+/// machine is doing (a render is one thread's work; a wall clock also counts
+/// the time the scheduler gave other programs, and a full suite at load
+/// average 90 made a 500 ms bound on it fail at 900 ms, 2026-11-26).
+#[cfg(unix)]
+fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `t` is a valid, writable timespec for the call's duration.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    assert_eq!(rc, 0, "the thread's CPU clock reads");
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }
 
 fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -69,15 +82,30 @@ fn a_county_sized_layer_fitted_reads_coarse_tiles_and_matches_the_full_ones() {
     let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let first = cache.stats();
     let t1 = Instant::now();
+    #[cfg(unix)]
+    let cpu0 = thread_cpu();
     let warm = render(&snap, &pics, &view, w, h, None).unwrap().take();
+    #[cfg(unix)]
+    let warm_cpu = thread_cpu() - cpu0;
     let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let second = cache.stats();
-    eprintln!("fitted county: cold {cold_ms:.0} ms ({} replayed, {} merged), warm {warm_ms:.1} ms; {} MB held", first.replayed, first.merged, cache.memory_bytes() >> 20);
+    eprintln!("fitted county: cold {cold_ms:.0} ms ({} replayed, {} merged), warm {warm_ms:.1} ms ({} tiles read); {} MB held", first.replayed, first.merged, second.hits - first.hits, cache.memory_bytes() >> 20);
     assert_eq!(cold, warm);
     assert!(first.merged > 0, "zoomed out, it reads coarse tiles");
     assert_eq!(second.replayed, first.replayed, "the second step replays nothing");
     assert_eq!(second.merged, first.merged, "and makes no coarse tile again");
-    assert!(warm_ms < 500.0, "a warm fitted step is quick: {warm_ms:.0} ms");
+    assert_eq!(second.loaded, first.loaded, "and reads nothing from disk");
+    // What a warm step does is read the tiles of the view's own level from
+    // memory, about one a tile of the screen: the 8,000 full ones under them
+    // would be thousands.
+    let k = tiles::level_for_scale(view.scale);
+    let side = tiles::tile_rect_at(k, 0, 0).w * view.scale;
+    let on_screen = ((w as f32 / side).ceil() as u64 + 1) * ((h as f32 / side).ceil() as u64 + 1);
+    let read = second.hits - first.hits;
+    assert!(read > 0 && read <= on_screen, "a warm fitted step reads the view's {on_screen} tiles at level {k} at most, not {read}");
+    // And it is quick, by the thread's own clock.
+    #[cfg(unix)]
+    assert!(warm_cpu < Duration::from_millis(500), "a warm fitted step is quick: {warm_cpu:?} of CPU ({warm_ms:.0} ms by the wall)");
     assert!(cache.memory_bytes() <= tiles::DEFAULT_BUDGET, "it kept to its budget");
 
     // The same picture as a full-density render shows: red left, blue

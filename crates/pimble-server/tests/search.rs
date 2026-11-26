@@ -16,9 +16,14 @@ use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 
-/// Real time past the server's per-node content-index debounce (2s), with
-/// margin.
-const PAST_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_500);
+/// How long a test waits for the index to catch up with what it was told.
+/// Indexing runs behind the store's index opening and a 2 s per-node debounce,
+/// so on a loaded machine it arrives late, never not at all (events queue
+/// while the index opens, and a debounce only ever delays): the tests wait for
+/// what they look for, under a deadline far past any delay but a lost edit.
+/// Before 2026-11-26 they slept 2.5 s and searched once, and a full suite at
+/// load average 90 found nothing.
+const INDEX_CATCH_UP: Duration = Duration::from_secs(60);
 
 /// Set up an `RpcHandler` backed by a fresh temporary store. Returns the
 /// handler plus the store/root ids, and the `TempDir` guard (keep it alive
@@ -79,6 +84,30 @@ async fn wait_index_ready(handler: &RpcHandler, store_id: pimble_core::StoreId, 
     false
 }
 
+/// Search until `done` says the answer is the one looked for, or
+/// [`INDEX_CATCH_UP`] has passed; the last answer either way, for the caller
+/// to assert on.
+async fn search_until(
+    handler: &RpcHandler,
+    query: &str,
+    stores: Vec<pimble_core::StoreId>,
+    done: impl Fn(&pimble_rpc::SearchResponse) -> bool,
+) -> pimble_rpc::SearchResponse {
+    let deadline = tokio::time::Instant::now() + INDEX_CATCH_UP;
+    loop {
+        let response = search(handler, query, stores.clone()).await;
+        if done(&response) || tokio::time::Instant::now() >= deadline {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// [`search_until`] some hit comes.
+async fn search_until_found(handler: &RpcHandler, query: &str, stores: Vec<pimble_core::StoreId>) -> pimble_rpc::SearchResponse {
+    search_until(handler, query, stores, |r| !r.results.is_empty()).await
+}
+
 async fn search(handler: &RpcHandler, query: &str, stores: Vec<pimble_core::StoreId>) -> pimble_rpc::SearchResponse {
     handler
         .search(&pimble_server::service_extensions(), SearchRequest {
@@ -92,8 +121,8 @@ async fn search(handler: &RpcHandler, query: &str, stores: Vec<pimble_core::Stor
 }
 
 /// Create a store, create two documents, set distinct content on each; once
-/// the per-node content-index debounce has passed (real time), `search`
-/// finds the one whose text contains the query term.
+/// the per-node content-index debounce has passed and the index has caught
+/// up, `search` finds the one whose text contains the query term.
 #[tokio::test]
 async fn search_finds_the_document_containing_the_query_term() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
@@ -128,9 +157,7 @@ async fn search_finds_the_document_containing_the_query_term() {
     set_text(&handler, store_id, doc_a, "the quick brown fox jumps").await;
     set_text(&handler, store_id, doc_b, "a completely different sentence").await;
 
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-
-    let response = search(&handler, "fox", Vec::new()).await;
+    let response = search_until_found(&handler, "fox", Vec::new()).await;
 
     assert_eq!(
         response.results.len(),
@@ -173,9 +200,7 @@ async fn search_no_longer_finds_a_deleted_node() {
         .node_id;
 
     set_text(&handler, store_id, doc_id, "ephemeral content here").await;
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-
-    let before = search(&handler, "ephemeral", Vec::new()).await;
+    let before = search_until_found(&handler, "ephemeral", Vec::new()).await;
     assert_eq!(before.results.len(), 1, "expected the node to be indexed before delete");
 
     handler
@@ -184,10 +209,8 @@ async fn search_no_longer_finds_a_deleted_node() {
         .unwrap();
 
     // `Remove` is applied immediately (not debounced) but still goes through
-    // the indexer's async channel/task; give it a moment.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let after = search(&handler, "ephemeral", Vec::new()).await;
+    // the indexer's async channel/task: waited for.
+    let after = search_until(&handler, "ephemeral", Vec::new(), |r| r.results.is_empty()).await;
     assert!(
         after.results.is_empty(),
         "expected no hits after delete, got {:?}",
@@ -216,7 +239,11 @@ async fn rebuild_index_reindexes_every_node_from_scratch() {
         .unwrap()
         .node_id;
     set_text(&handler, store_id, doc_id, "durable searchable text").await;
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
+    // Indexed the ordinary way first, so the search after the rebuild finds
+    // what the rebuild left (a later debounced upsert, such as the flush
+    // stamp's, could add it again; `indexed` is what shows the rebuild ran).
+    let indexed = search_until_found(&handler, "durable", vec![store_id]).await;
+    assert_eq!(indexed.results.len(), 1, "indexed before the rebuild: {:?}", indexed.results);
 
     let rebuild_resp = handler
         .rebuild_index(&pimble_server::service_extensions(), RebuildIndexRequest { store_id })
@@ -277,15 +304,16 @@ async fn empty_stores_list_searches_all_open_stores() {
         .node_id;
     set_text(&handler_b, store_b, doc_b, "unrelated other text").await;
 
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-
     // Scoped to store_a explicitly, handler_a's own index (empty `stores`
     // also resolves to exactly its own open stores) finds only doc_a.
-    let response = search(&handler_a, "zephyr", Vec::new()).await;
+    let response = search_until_found(&handler_a, "zephyr", Vec::new()).await;
     assert_eq!(response.results.len(), 1);
     assert_eq!(response.results[0].node_id, doc_a);
 
-    // handler_b's store never indexed "zephyr".
+    // handler_b's store never indexed "zephyr": its own text is indexed
+    // first, so the empty answer below is not merely an index behind.
+    let indexed_b = search_until_found(&handler_b, "unrelated", Vec::new()).await;
+    assert_eq!(indexed_b.results.len(), 1, "store b's own text is indexed: {:?}", indexed_b.results);
     let response_b = search(&handler_b, "zephyr", Vec::new()).await;
     assert!(response_b.results.is_empty());
 }
@@ -316,15 +344,13 @@ async fn reopening_a_store_preserves_its_search_index() {
         .unwrap()
         .node_id;
     set_text(&handler, store_id, doc_id, "persistent indexed content").await;
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-
-    let before = search(&handler, "persistent", vec![store_id]).await;
+    let before = search_until_found(&handler, "persistent", vec![store_id]).await;
     assert_eq!(before.results.len(), 1, "expected the node to be indexed before closing");
 
     handler.close_store(&pimble_server::service_extensions(), CloseStoreRequest { store_id }).await.unwrap();
     handler.open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: store_path }).await.unwrap();
     // The index opens in the background (docs/STARTUP_CONTRACT.md).
-    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(10)).await, "the index opened again");
+    assert!(wait_index_ready(&handler, store_id, INDEX_CATCH_UP).await, "the index opened again");
 
     let after = search(&handler, "persistent", vec![store_id]).await;
     assert_eq!(
@@ -382,8 +408,7 @@ async fn a_board_node_starts_with_its_board_and_its_words_are_found() {
     assert!(held.exists, "the board came with the node");
     assert_eq!(held.texts().len(), 1);
 
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-    let response = search(&handler, "periwinkle", Vec::new()).await;
+    let response = search_until_found(&handler, "periwinkle", Vec::new()).await;
     assert_eq!(response.results.len(), 1, "got {:?}", response.results);
     assert_eq!(response.results[0].node_id, node_id);
     assert_eq!(response.results[0].node_type, pimble_core::node_types::BOARD);
@@ -413,9 +438,8 @@ async fn a_locked_index_is_waited_for_and_never_rebuilt() {
         .unwrap()
         .node_id;
     set_text(&handler, store_id, doc_id, "keepers of the lamp").await;
-    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(10)).await);
-    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
-    assert_eq!(search(&handler, "lamp", vec![store_id]).await.results.len(), 1);
+    assert!(wait_index_ready(&handler, store_id, INDEX_CATCH_UP).await);
+    assert_eq!(search_until_found(&handler, "lamp", vec![store_id]).await.results.len(), 1);
     handler.close_store(&pimble_server::service_extensions(), CloseStoreRequest { store_id }).await.unwrap();
 
     // Another program holds the index (as pimble-mcp's server did after a
@@ -425,16 +449,17 @@ async fn a_locked_index_is_waited_for_and_never_rebuilt() {
     // The handler's own schema (semantic when this build has it).
     let holder = pimble_search::SearchIndex::open(&index_dir, true).unwrap();
 
-    let started = std::time::Instant::now();
+    // The open answers without its index, and before the brief wait for a
+    // lock is over (`Held` is said only once it is): by what it says, not by
+    // a stopwatch a loaded machine stretches.
     let opened = handler.open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: store_path.clone() }).await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1), "the open answers without its index: {:?}", started.elapsed());
-    assert!(opened.store.index.is_indexing(), "{:?}", opened.store.index);
+    assert!(opened.store.index.is_indexing(), "the open answers without its index: {:?}", opened.store.index);
     let answer = search(&handler, "lamp", Vec::new()).await;
     assert_eq!(answer.indexing, vec![store_id], "search says the store is still being indexed");
     assert!(answer.results.is_empty());
 
     // Still held after the quiet wait: said, and not rebuilt over.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + INDEX_CATCH_UP;
     while index_state(&handler, store_id).await != pimble_core::IndexState::Held {
         assert!(tokio::time::Instant::now() < deadline, "the store says its index is held: {:?}", index_state(&handler, store_id).await);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -443,7 +468,7 @@ async fn a_locked_index_is_waited_for_and_never_rebuilt() {
 
     // Let go: it opens, as it was.
     drop(holder);
-    assert!(wait_index_ready(&handler, store_id, Duration::from_secs(5)).await, "opened once let go");
+    assert!(wait_index_ready(&handler, store_id, INDEX_CATCH_UP).await, "opened once let go");
     assert_eq!(std::fs::metadata(index_dir.join("LOCK")).unwrap().ino(), inode, "the same index, not a rebuilt one");
     let found = search(&handler, "lamp", vec![store_id]).await;
     assert_eq!(found.results.len(), 1, "what it held is found");

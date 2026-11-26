@@ -87,8 +87,7 @@ async fn hosted(env: &Env, alice: &PimbleClient, dir: &std::path::Path, name: &s
     env.sign_in(alice, ALICE).await;
     let (store_id, root_id) = alice.create_store(dir.join("a.pimble"), name).await.unwrap();
     let doc = alice.create_node(store_id, Some(root_id), "document", "Canvas").await.unwrap();
-    seed_content(alice, store_id, doc, "seed", "small to start").await;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    seed_and_wait_stamped(alice, store_id, &[(doc, "small to start")]).await;
     alice.cloud_host_store(store_id).await.unwrap();
     wait_all_seeded(env, store_id, &[root_id, doc]).await;
     (store_id, root_id, doc)

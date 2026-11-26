@@ -33,3 +33,9 @@ svgtypes = "0.16"
 # uuid v4 needs a randomness backend in the browser; the native build has one.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 uuid = { workspace = true, features = ["js"] }
+
+# The pyramid test bounds a render by the thread's CPU clock
+# (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`), which a loaded machine does not
+# stretch the way it stretches a wall clock.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

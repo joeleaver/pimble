@@ -5248,6 +5248,7 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "kurbo",
+ "libc",
  "linesweeper",
  "pimble-crdt",
  "svgtypes",

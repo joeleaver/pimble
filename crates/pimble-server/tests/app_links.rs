@@ -37,18 +37,39 @@ async fn a_link_goes_to_the_oldest_window_listening() {
     assert_eq!(heard.activation_token, None);
     assert!(tokio::time::timeout(Duration::from_millis(300), second_links.next()).await.is_err(), "only one window takes it");
 
-    // The first window closes: the next link goes to the second.
+    // The first window closes: once the server has heard it close, the next
+    // link goes to the second. Until then a link may still be queued for the
+    // closing one and go with it (a caller that must know asks with
+    // `confirm`), so this asks until the second window hears one.
     drop(first_links);
     drop(first);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(caller.open_in_app("pimble:settings", None).await.unwrap());
-    let heard = tokio::time::timeout(Duration::from_secs(5), second_links.next()).await.unwrap().unwrap().unwrap();
+    let deadline = tokio::time::Instant::now() + WINDOW_GONE_DEADLINE;
+    let heard = loop {
+        assert!(caller.open_in_app("pimble:settings", None).await.unwrap(), "the second window still listens");
+        if let Ok(heard) = tokio::time::timeout(Duration::from_millis(250), second_links.next()).await {
+            break heard.unwrap().unwrap();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the next link reaches the second window once the first has closed");
+    };
     assert_eq!(heard.url, "pimble:settings");
 
     drop(second_links);
     drop(second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!caller.open_in_app(link, None).await.unwrap(), "every window is gone");
+    until_no_window(&caller, link).await;
+}
+
+/// How long a test waits for the server to hear a window's connection close:
+/// when the socket's close reaches it, which a loaded machine delays.
+const WINDOW_GONE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Ask to open `link` until no window takes it: the server has heard every
+/// window close.
+async fn until_no_window(caller: &PimbleClient, link: &str) {
+    let deadline = tokio::time::Instant::now() + WINDOW_GONE_DEADLINE;
+    while caller.open_in_app(link, None).await.unwrap() {
+        assert!(tokio::time::Instant::now() < deadline, "every window is gone");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The activation token a click gave the program asked to open a link
@@ -154,11 +175,12 @@ async fn a_confirmed_link_no_window_acts_on_is_not_delivered() {
     let heard = tokio::time::timeout(Duration::from_secs(5), links.next()).await.unwrap().unwrap().unwrap();
     window.app_link_taken(heard.ack.unwrap()).await.unwrap();
 
-    // Nobody listening at all answers at once.
+    // Nobody listening at all answers at once: without waiting out the
+    // confirmation's time, which a window listening would have had.
     drop(links);
     drop(window);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    until_no_window(&caller, "pimble:").await;
     let began = std::time::Instant::now();
     assert!(!caller.open_in_app_confirmed("pimble:", None).await.unwrap());
-    assert!(began.elapsed() < Duration::from_secs(1), "no window, no wait");
+    assert!(began.elapsed() < wait, "no window, no wait: {:?}", began.elapsed());
 }

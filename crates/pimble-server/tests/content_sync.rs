@@ -174,18 +174,22 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
         .await
         .unwrap();
 
-    // Give the debounced flush (750ms) time to run, using real time.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
     // Reopen the store directory with a completely fresh StoreManager,
     // bypassing the handler's in-memory state entirely, to prove the edit
-    // actually reached disk rather than just living in the server's cache.
+    // actually reached disk rather than just living in the server's cache:
+    // again until the debounced flush (750 ms) has run, which a loaded
+    // machine delays, under a deadline only a flush that never comes meets.
     let store_path = dir.path().join("test.pimble");
-    let mut fresh_manager = StoreManager::new();
-    fresh_manager.open_local_store(&store_path).await.unwrap();
-    let node = fresh_manager.get_node(store_id, node_id).unwrap();
-
-    let text = NodeDoc::text_of(&node.content);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let text = loop {
+        let mut fresh_manager = StoreManager::new();
+        fresh_manager.open_local_store(&store_path).await.unwrap();
+        let text = NodeDoc::text_of(&fresh_manager.get_node(store_id, node_id).unwrap().content);
+        if text.contains("World") || tokio::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert!(
         text.contains("World"),
         "expected the debounced flush to have persisted the edit, got {:?}",
