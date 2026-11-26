@@ -44,12 +44,12 @@
    opacity below 1 makes a stacking context, so an open list inside it drew
    at 60% and under the lines after it. */
 .pimble-theme-editor__line .pimble-theme-editor__control .rinch-select__input,
-.pimble-theme-editor__line .pimble-theme-editor__control input,
+.pimble-theme-editor__line .pimble-theme-editor__control .pimble-properties__input,
 .pimble-theme-editor__line .pimble-theme-editor__control .rinch-checkbox__box {
     opacity: 0.6;
 }
 .pimble-theme-editor__line--own .pimble-theme-editor__control .rinch-select__input,
-.pimble-theme-editor__line--own .pimble-theme-editor__control input,
+.pimble-theme-editor__line--own .pimble-theme-editor__control .pimble-properties__input,
 .pimble-theme-editor__line--own .pimble-theme-editor__control .rinch-checkbox__box {
     opacity: 1;
 }

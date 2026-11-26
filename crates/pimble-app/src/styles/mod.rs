@@ -185,7 +185,7 @@ mod tests {
     /// dropdown drew the open list at 60% and under the lines after it.
     #[test]
     fn the_theme_editor_dims_fields_never_their_dropdowns() {
-        const FIELDS: [&str; 3] = [".rinch-select__input", "input", ".rinch-checkbox__box"];
+        const FIELDS: [&str; 3] = [".rinch-select__input", ".pimble-properties__input", ".rinch-checkbox__box"];
         let css = AREAS.iter().find(|(file, _)| *file == "theme_editor.css").expect("the theme editor's area").1;
         let rules = without_comments(css).expect("its comments close");
         let mut dimmed = 0;
