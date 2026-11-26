@@ -33,6 +33,7 @@ pub mod creating;
 pub mod pasting;
 pub mod commands;
 pub mod editor;
+pub(crate) mod editor_keys;
 pub mod events;
 pub mod fields;
 pub mod hashtags;
@@ -111,6 +112,7 @@ pub mod plugin_calls;
 pub mod task_lists;
 pub mod tree_drop;
 pub mod tree_keys;
+pub(crate) mod tree_pages;
 pub mod tree_view;
 pub mod zoom;
 

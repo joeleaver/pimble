@@ -1,9 +1,12 @@
 //! The explorer's keyboard (docs/TREE_CONTRACT.md "The keyboard"). rinch's
-//! Tree moves the cursor (the arrows, Home, End, PageUp, PageDown, `*`,
-//! type-ahead) and offers every key here first; this binds Pimble's own:
-//! opening, renaming, making nodes, moving them (Alt+Shift+arrows, judged and
-//! sent exactly as a drop is, by `tree_drop::plan_drop`), deleting, cut and
-//! paste, and handing the keyboard back to the document.
+//! Tree moves the cursor (the arrows, Home, End, `*`, type-ahead) and offers
+//! every key here first; this binds Pimble's own: opening, renaming, making
+//! nodes, moving them (Alt+Shift+arrows, judged and sent exactly as a drop
+//! is, by `tree_drop::plan_drop`), deleting, cut and paste, handing the
+//! keyboard back to the document, and the two the Tree leaves to the app
+//! since rinch #3062 (`tree_pages`): PageUp and PageDown (a page of rows,
+//! the document following the cursor) and Ctrl+A (the cursor row's
+//! siblings).
 
 use pimble_core::Place;
 use rinch::prelude::{untracked, DropZone, TreeDrop, TreeKey, TreeMove, TreeSlot, UseTreeReturn};
@@ -31,6 +34,10 @@ pub(crate) enum Action {
     CopyLink,
     /// Give up the keyboard (or drop a cut first).
     Escape,
+    /// The cursor a page of rows down (or up).
+    Page { down: bool },
+    /// Select every row at the cursor's level under its parent.
+    SelectSiblings,
 }
 
 /// The binding of `key` with these modifiers, or `None` for a key that is
@@ -51,6 +58,9 @@ pub(crate) fn action(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option<Ac
         ("v" | "V", true, shift, false) => Action::Paste { into: shift },
         ("c" | "C", true, false, false) => Action::CopyLink,
         ("Escape", false, false, false) => Action::Escape,
+        ("PageDown", false, false, false) => Action::Page { down: true },
+        ("PageUp", false, false, false) => Action::Page { down: false },
+        ("a" | "A", true, false, false) => Action::SelectSiblings,
         _ => return None,
     })
 }
@@ -209,6 +219,8 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
                 crate::editor::give_keyboard_to(store, store.focused());
             }
         }
+        Action::Page { down } => crate::tree_pages::page(store, tree_state, &cursor, down),
+        Action::SelectSiblings => crate::tree_pages::select_siblings(store, tree_state, &cursor),
     }
     true
 }
@@ -286,16 +298,22 @@ mod tests {
         assert_eq!(action("V", true, true, false), Some(Action::Paste { into: true }));
         assert_eq!(action("c", true, false, false), Some(Action::CopyLink));
         assert_eq!(action("Escape", false, false, false), Some(Action::Escape));
+        assert_eq!(action("PageDown", false, false, false), Some(Action::Page { down: true }));
+        assert_eq!(action("PageUp", false, false, false), Some(Action::Page { down: false }));
+        assert_eq!(action("a", true, false, false), Some(Action::SelectSiblings));
+        assert_eq!(action("A", true, false, false), Some(Action::SelectSiblings));
     }
 
     /// The Tree's own keys, and the ones nobody binds, are not taken here.
     #[test]
     fn the_trees_keys_pass_through() {
-        for key in ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "PageDown", "*", "a"] {
+        for key in ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "*", "a"] {
             assert_eq!(action(key, false, false, false), None, "{key}");
         }
         assert_eq!(action("Tab", false, false, false), None, "Tab is left alone");
         assert_eq!(action("ArrowDown", false, true, false), None, "Shift+arrows are wave 3's");
+        assert_eq!(action("PageDown", false, true, false), None, "Shift+PageDown is nobody's");
+        assert_eq!(action("a", true, true, false), None, "Ctrl+Shift+A is nobody's");
     }
 
     #[test]

@@ -70,6 +70,9 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::mentions::MentionsPlugin { pane }));
                 // Colored text legible in either theme (docs/TEXT_COLOR_CONTRACT.md).
                 handle.add_plugin(std::rc::Rc::new(crate::text_color::TextColorPlugin));
+                // The chords Pimble advertises that rinch no longer binds, and
+                // Tab indenting in lists and tables (crate::editor_keys).
+                crate::editor_keys::install(&handle, pane);
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).

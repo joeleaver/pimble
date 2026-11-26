@@ -25,7 +25,7 @@ pub use rinch_web::{
 };
 
 /// The editor's spellchecker (`spelling.rs`), shared by both backends.
-pub use rinch_editor_view::{SpellcheckPlugin, SPELLCHECK_KEY};
+pub use rinch_editor_view::{SpellcheckPlugin, TabBehavior, SPELLCHECK_KEY};
 
 /// An embed atom's attributes for the editor (`pimble_crdt::markdown::Embed`
 /// says what each one carries).

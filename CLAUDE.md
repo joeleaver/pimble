@@ -277,6 +277,9 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   rinch's input rules less the task list (`markdown_shortcuts.rs`), and no command makes a
   task list (`task_lists.rs` overrides rinch's `toggleTaskList`; rinch #3062 dropped its
   Ctrl+Shift+7).
+- rinch's editor keeps only Chrome's keys (rinch #3062): Pimble binds back what it advertises
+  (`editor_keys.rs`: Ctrl+Shift+B is the toolbar's quote toggle, Tab indents in lists and
+  tables), and the explorer binds PageUp/PageDown and Ctrl+A itself (`tree_pages.rs`).
 - Spellcheck (`spelling.rs`): rinch's, leaving code out; the system checker on the desktop
   (Windows and macOS platform checkers, Linux Hunspell with the bundled `en_US` from
   `assets/dictionaries/` as the fallback), the same `en_US` fetched in the browser. Added
@@ -308,7 +311,7 @@ press (`PRESS_HEARD`): a split button's press focuses the new pane, and its rele
 still over the old one. `open_node` opens in the focused pane,
 `open_node_in` in a named one ("Open in Split View", a link followed from a pane, which
 `AppStore::link_from` carries to `LinkOpen.pane`). There is ONE toolbar, above the panes, for
-the focused pane (`toolbar.rs`: `TARGET` follows `focused_pane`; dimmed while that pane has
+the focused pane (`toolbar/mod.rs`: `TARGET` follows `focused_pane`; dimmed while that pane has
 no document or a read-only one; Joe, 2026-10-08). The keyboard follows the pane focus
 (`editor::give_keyboard_to`: the focused pane's editor when it holds a document, no editor
 when it holds none; rinch `EditorHandle::blur`).
