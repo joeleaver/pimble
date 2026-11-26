@@ -12,6 +12,7 @@
 //! (its own name in each share), so it is this computer's and not the
 //! folder's (docs/STORE_FOLDERS_CONTRACT.md rule 1, decided 2026-11-19).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use pimble_core::{NodeId, StoreId};
@@ -27,6 +28,30 @@ const FILE_NAME: &str = "people.json";
 /// How long a change to a share waits to see itself in what is kept. The
 /// asking goes on after that.
 const CHANGE_WAIT: Duration = Duration::from_secs(3);
+
+/// The order of a server's refreshes, per store. Several can be under way at
+/// once (the link's, a change to a share, `cloudPeople`) and a slow one must
+/// not write its older answer over a later one. The lock is held to number a
+/// refresh and to keep its answer, never while the accounts service is asked.
+#[derive(Default)]
+pub(crate) struct Refreshes(tokio::sync::Mutex<HashMap<StoreId, Order>>);
+
+#[derive(Default)]
+struct Order {
+    /// The number of the last refresh started.
+    started: u64,
+    /// The number of the refresh whose answer is kept.
+    kept: u64,
+}
+
+impl Refreshes {
+    async fn start(&self, store_id: StoreId) -> u64 {
+        let mut orders = self.0.lock().await;
+        let order = orders.entry(store_id).or_default();
+        order.started += 1;
+        order.started
+    }
+}
 
 async fn file_of(handler: &RpcHandler, store_id: StoreId) -> Option<std::path::PathBuf> {
     let manager = handler.store_manager_handle();
@@ -143,15 +168,23 @@ pub(crate) async fn refresh_after_change(handler: &RpcHandler, store_id: StoreId
 
 /// Ask again and, when the answer differs from what is kept, keep it and
 /// tell this server's subscribers (`StoreChangeKind::PeopleChanged`).
-/// Best effort: what is kept stays when the service cannot be asked.
+/// Best effort: what is kept stays when the service cannot be asked, and
+/// when a refresh started after this one has been answered already.
 pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId) -> StorePeople {
+    let number = handler.people_refreshes().start(store_id).await;
+    let Some(account) = handler.keystore().account().await else { return cached(handler, store_id).await };
+    let Some(mut fresh) = fetch(handler.http(), &account, store_id).await else { return cached(handler, store_id).await };
+    fresh.alone = shares_with_nobody_else(handler, &account, store_id, &fresh).await;
+    let mut orders = handler.people_refreshes().0.lock().await;
+    let order = orders.entry(store_id).or_default();
     // `None` when nothing readable is kept: an empty answer is then written
     // too, since "nobody" and "never told" are not the same.
     let on_disk = kept(handler, store_id).await.ok().flatten();
     let held = on_disk.clone().unwrap_or_default();
-    let Some(account) = handler.keystore().account().await else { return held };
-    let Some(mut fresh) = fetch(handler.http(), &account, store_id).await else { return held };
-    fresh.alone = shares_with_nobody_else(handler, &account, store_id, &fresh).await;
+    if number < order.kept {
+        return held;
+    }
+    order.kept = number;
     if on_disk.as_ref() != Some(&fresh) {
         if let Some(path) = file_of(handler, store_id).await {
             match serde_json::to_vec_pretty(&fresh) {
@@ -164,6 +197,7 @@ pub(crate) async fn refresh(handler: &RpcHandler, store_id: StoreId) -> StorePeo
             }
         }
     }
+    drop(orders);
     if fresh != held {
         handler.notify_people_changed(store_id).await;
     }

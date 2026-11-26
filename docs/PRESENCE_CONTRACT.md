@@ -353,6 +353,8 @@ Each wave is checked in the desktop app and in the browser on the local stack
   - after this device asks the accounts service to share a node, invite, remove a member
     or stop a share, whether or not an answer came back. The call waits 3 s at most for
     it, and a deletion that stops a share does not wait.
+- Refreshes of one store can overlap. An answer to one started earlier never replaces
+  the answer to one started later.
 - A refresh keeps nothing when the signed-in account holds nothing of the store. For an
   owner it asks who holds the whole store as well, since `GET /me/shares` leaves out the
   other owners; they are kept as the whole-store scope.

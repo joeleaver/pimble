@@ -1226,6 +1226,9 @@ pub struct RpcHandler {
     /// One lock per store being loaded outside the manager's lock, so two
     /// opens of one store never load it twice (`openStore`).
     loading: Arc<tokio::sync::Mutex<HashMap<StoreId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Which answer about who is in a store's shares is the latest
+    /// (`crate::people`).
+    people_refreshes: Arc<crate::people::Refreshes>,
     /// Whether every `SearchIndex::open` call below should ask for semantic
     /// search. `true` unless `PimbleServer::start`'s model warm-up (see
     /// `warm_embedding_model` there) failed — a failure means the model
@@ -1434,6 +1437,7 @@ impl RpcHandler {
             pending_indexes: Arc::new(Mutex::new(HashMap::new())),
             index_states: Arc::new(Mutex::new(HashMap::new())),
             loading: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            people_refreshes: Arc::default(),
             semantic_available,
             semantic_warmup: None,
             links: Arc::new(RwLock::new(HashMap::new())),
@@ -2141,6 +2145,10 @@ impl RpcHandler {
     }
 
     // ── Cloud / vault links (docs/CRYPTO_CONTRACT.md) ────────────────────
+
+    pub(crate) fn people_refreshes(&self) -> &crate::people::Refreshes {
+        &self.people_refreshes
+    }
 
     /// Shared handle to this server's keystore, for [`crate::vault_link`] to
     /// look up the signed-in account's session (to mint a JWT) and store
