@@ -112,6 +112,9 @@ ban_joined "web/src builds a Router (stores routed to another server)" '\bRouter
 # import (a name followed by `,`, `}` or `;`).
 ban_joined "web/src makes an RPC backend over anything but LocalConnector (the page's one server is its worker)" \
     '\bRpcBackend\b(?!\s*::\s*new\s*\(\s*LocalConnector\b)(?!\s*[,};])' "$src"
+# A type alias is a name followed by `;` too, so it is banned on its own.
+ban_joined "web/src aliases RpcBackend (the page's one server is its worker)" \
+    '\btype\b[^;={}]*=\s*(?:[\w:]*::)?RpcBackend\b' "$src"
 ban_joined "web/src implements a pimble_api Connector other than LocalConnector (the page's one server is its worker)" \
     '\bimpl\b[^{;]*\bConnector\s+for\s+(?!LocalConnector\b)\w+' "$src"
 ban_joined "web/src opens a PimbleClient other than over_message_port (the page's one server is its worker)" \
