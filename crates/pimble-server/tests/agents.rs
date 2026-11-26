@@ -10,7 +10,7 @@ use base64::Engine;
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreAccess, StoreId};
 use pimble_crdt::NodeDoc;
-use pimble_rpc::{AgentGrant, AgentRole, EditOperation};
+use pimble_rpc::{AgentGrant, AgentRole, EditOperation, Opener};
 use pimble_server::{PimbleServer, ServerConfig};
 use tempfile::TempDir;
 
@@ -159,6 +159,68 @@ async fn removing_or_narrowing_an_agent_holds_its_open_connection_to_it() {
             .is_err(),
         "a removed agent's key opens nothing"
     );
+}
+
+/// Write who is who in `store` as this device keeps it
+/// (`<state dir>/people.json`), as a refresh from the accounts service would.
+fn keep_people(f: &Fixture, json: &str) {
+    let dir = f._dir.path().join("stores").join(f.store.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("people.json"), json).unwrap();
+}
+
+/// Put a share's marker on `node`.
+async fn mark_shared(f: &Fixture, node: NodeId) {
+    let marker = serde_json::json!({ "v": 1, "key_id": uuid::Uuid::new_v4(), "url": "https://pimble.app", "name": "Plans" });
+    f.service.edit_node(f.store, node, "test", |doc, now| doc.set_custom(pimble_core::custom_keys::SHARE, &marker, now)).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_agent_learns_who_can_open_a_note_it_reads_and_no_more() {
+    let f = fixture().await;
+    let created = f
+        .service
+        .create_agent("Claude", vec![AgentGrant { store: f.store, node: Some(f.drafts), role: AgentRole::Reader }])
+        .await
+        .unwrap();
+    let agent = connect_agent(&f.server, &created.key).await;
+
+    let alone = agent.who_can_open(f.store, f.drafts).await.expect("a note it reads");
+    assert!(alone.people.is_empty() && !alone.incomplete, "{alone:?}");
+
+    // Shared, and this computer has not been told who is in it.
+    mark_shared(&f, f.project).await;
+    let unknown = agent.who_can_open(f.store, f.drafts).await.unwrap();
+    assert!(unknown.people.is_empty() && unknown.incomplete, "{unknown:?}");
+
+    let scope = |root: NodeId, id: &str, name: &str| {
+        serde_json::json!({ "root": root, "share_name": "Plans", "people": [{ "user_id": id, "name": name, "notice_key": "a-notice-key" }] })
+    };
+    keep_people(&f, &serde_json::json!({ "scopes": [scope(f.project, "u-will", "Will"), scope(f.journal, "u-sam", "Sam")] }).to_string());
+    // The share is above what the agent may read: its members can open the
+    // note all the same. Another share's are not named.
+    let known = agent.who_can_open(f.store, f.drafts).await.unwrap();
+    assert_eq!(known.people, vec![Opener { user_id: "u-will".into(), name: "Will".into() }]);
+    assert!(!known.incomplete, "{known:?}");
+    assert!(!serde_json::to_string(&known).unwrap().contains("a-notice-key"));
+
+    // Only for a note it may read, and `cloudPeople` stays closed.
+    for node in [f.journal, f.project, NodeId::new()] {
+        let refused = agent.who_can_open(f.store, node).await.expect_err("outside its grant").to_string();
+        assert!(refused.contains("no grant for this document"), "{refused}");
+    }
+    assert!(agent.who_can_open(StoreId::new(), f.drafts).await.is_err(), "another store");
+    let closed = agent.cloud_people(f.store).await.expect_err("the operator's alone").to_string();
+    assert!(closed.contains("only available to this server's own operator"), "{closed}");
+
+    // The operator asks too; a node that is not there is an error.
+    assert_eq!(f.service.who_can_open(f.store, f.journal).await.unwrap().people[0].name, "Sam");
+    assert!(f.service.who_can_open(f.store, NodeId::new()).await.is_err());
+
+    // What cannot be read is an error, never "nobody".
+    keep_people(&f, "not json");
+    let failed = agent.who_can_open(f.store, f.drafts).await.expect_err("a broken list").to_string();
+    assert!(failed.contains("could not be read"), "{failed}");
 }
 
 #[tokio::test]

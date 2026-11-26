@@ -39,6 +39,8 @@ mod internal_tests;
 #[cfg(test)]
 mod large_notes_tests;
 #[cfg(test)]
+mod people_tests;
+#[cfg(test)]
 mod presence_tests;
 #[cfg(test)]
 mod text_edit_tests;

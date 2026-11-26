@@ -30,12 +30,23 @@ async fn file_of(handler: &RpcHandler, store_id: StoreId) -> Option<std::path::P
         .or_else(|| manager.get_store_info(store_id).ok().and_then(|store| store.local_path().map(|p| p.join(FILE_NAME))))
 }
 
-/// What this device last learned, empty when it never has.
+/// What this device last learned, empty when it never has or cannot read it.
 pub(crate) async fn cached(handler: &RpcHandler, store_id: StoreId) -> StorePeople {
-    let Some(path) = file_of(handler, store_id).await else { return StorePeople::default() };
+    kept(handler, store_id).await.ok().flatten().unwrap_or_default()
+}
+
+/// What this device last learned: `None` when it never has, an error when
+/// what it kept cannot be read.
+pub(crate) async fn kept(handler: &RpcHandler, store_id: StoreId) -> Result<Option<StorePeople>, String> {
+    let Some(path) = file_of(handler, store_id).await else { return Ok(None) };
+    let failed = |e: &dyn std::fmt::Display| {
+        warn!("People of store {}: could not read {}: {}", store_id, path.display(), e);
+        format!("Who is in this store's shares could not be read on this computer: {e}")
+    };
     match handler.disk().read_to_string(&path).await {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-        Err(_) => StorePeople::default(),
+        Ok(json) => serde_json::from_str(&json).map(Some).map_err(|e| failed(&e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(failed(&e)),
     }
 }
 

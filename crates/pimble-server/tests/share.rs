@@ -219,7 +219,7 @@ fn sorted_uuids(mut ids: Vec<Uuid>) -> Vec<Uuid> {
 #[tokio::test]
 async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     let env = spawn_env().await;
-    let (_a, alice, a_dir) = start_local_server().await;
+    let (a, alice, a_dir) = start_local_server().await;
     let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
     let (store_id, shared) = (fx.store_id, fx.shared);
     alice.cloud_share_node(store_id, shared, "Holiday Plans").await.expect("sharing a folder");
@@ -250,6 +250,19 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     let alice_people = alice.cloud_people(store_id).await.unwrap();
     assert_eq!(alice_people.name_of(&env.user_id(BOB.0), Some(shared)), Some("Bobby"), "{alice_people:?}");
     assert!(!contains_bytes_recursive(b_dir.path(), b"alice@example.com"), "no owner email on the member's disk");
+
+    // An AI agent on Alice's computer learns who can open a note in the
+    // share, by those names (docs/MCP_CONTRACT.md "Who can open a note").
+    let created = alice
+        .create_agent("Claude", vec![pimble_rpc::AgentGrant { store: store_id, node: Some(shared), role: pimble_rpc::AgentRole::Reader }])
+        .await
+        .unwrap();
+    let agent = PimbleClient::connect_with_auth(format!("http://{}", a.addr()), &pimble_core::AuthMethod::Bearer { token: created.key }).await.unwrap();
+    let answer = agent.who_can_open(store_id, fx.inside).await.expect("an agent asks");
+    let mut named: Vec<_> = answer.people.iter().map(|p| (p.user_id.clone(), p.name.clone())).collect();
+    named.sort_by(|x, y| x.1.cmp(&y.1));
+    assert_eq!(named, vec![(env.user_id(ALICE.0), "Alice A.".to_string()), (env.user_id(BOB.0), "Bobby".to_string())]);
+    assert!(!answer.incomplete, "{answer:?}");
 
     // The Share dialog on Bob's side names Alice and shows no email; Alice's
     // own shows Bob's name with his email, for her to manage the share.

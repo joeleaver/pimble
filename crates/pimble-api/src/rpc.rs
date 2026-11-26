@@ -13,7 +13,7 @@ use base64::Engine as _;
 use futures::StreamExt;
 use pimble_client::PimbleClient;
 use pimble_core::{BlobId, BlobUrl, DeletedNode, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
-use pimble_rpc::{EditOperation, PresenceFrame, SearchResultItem, StorePeople};
+use pimble_rpc::{EditOperation, PresenceFrame, SearchResultItem, StorePeople, WhoCanOpenResponse};
 
 use crate::backend::{Backend, ChangeStream, MaybeSend, MaybeSync, Moved, NodeInit, PresenceStream, StoreChange, SyncedDoc};
 use crate::ApiError;
@@ -260,6 +260,11 @@ impl Backend for RpcBackend {
     async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
         let c = self.client().await?;
         c.cloud_people(store).await.map_err(|e| err(&c, e))
+    }
+
+    async fn who_can_open(&self, store: StoreId, node: NodeId) -> Result<WhoCanOpenResponse, ApiError> {
+        let c = self.client().await?;
+        c.who_can_open(store, node).await.map_err(|e| err_at(&c, e, store, node))
     }
 
     async fn create_mount(&self, store: StoreId, parent: NodeId, source_store: StoreId, source_node: NodeId, title: Option<String>) -> Result<(NodeId, MountRef), ApiError> {

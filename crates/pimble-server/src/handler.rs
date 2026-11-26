@@ -46,6 +46,7 @@ mod diagnostics;
 mod hosted;
 mod hosted_plain;
 mod mount_sources;
+mod who_can_open;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -65,7 +66,7 @@ use pimble_rpc::{
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
-    CloudStatusResponse, CloudStopRelayingRequest, PresenceFrame, PresenceWho, PublishPresenceRequest, GetPresenceResponse, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
+    CloudStatusResponse, CloudStopRelayingRequest, PresenceFrame, PresenceWho, PublishPresenceRequest, GetPresenceResponse, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople, WhoCanOpenRequest, WhoCanOpenResponse,
     CreateMountRequest, CreateMountResponse,
     CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse, CloudPersonalSyncRequest, CloudPersonalSyncResponse,
     DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
@@ -4583,6 +4584,10 @@ impl PimbleApiServer for RpcHandler {
         // Asked again now where it can be (a refresh that changes it tells
         // the subscribers too), what was kept where it cannot.
         Ok(crate::people::refresh(self, request.store_id).await)
+    }
+
+    async fn who_can_open(&self, ext: &Extensions, request: WhoCanOpenRequest) -> Result<WhoCanOpenResponse, ErrorObjectOwned> {
+        self.openers(ext, request).await
     }
 
     async fn cloud_add_hosted_store(&self, ext: &Extensions, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned> {
