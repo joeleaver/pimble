@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 
-use pimble_core::diagnostics::{random_hex, report_code, valid_install, Envelope, LogBudget, Scrubber, Severity};
+use pimble_core::diagnostics::{may_send, random_hex, report_code, valid_install, Envelope, LogBudget, Scrubber, Severity};
 use pimble_host::http::{Body, Http, HttpRequest, Method};
 use pimble_host::Disk;
 use serde_json::{json, Value};
@@ -348,20 +348,23 @@ impl Queue {
     /// Send, oldest first, every waiting batch that is `account`'s or no
     /// one's to `url` with `bearer` (that account's session), asking
     /// `go_on` before each: once it says no (diagnostics were turned off),
-    /// nothing more is read or sent. Another account's batches wait for it;
+    /// nothing more is read or sent. Another account's batches wait for it
+    /// (`pimble_core::diagnostics::may_send`, the page's rule too);
     /// a batch whose name says no owner is deleted unsent. A batch taken, or
     /// refused as unreadable or too big (400, 413), is deleted; anything else
     /// stops the send.
     pub async fn send(&self, http: &dyn Http, url: &str, bearer: &str, account: &str, go_on: &dyn Fn() -> bool) -> Sent {
         for path in self.waiting().await {
-            match owner_of(&path) {
-                Owner::NoOne => {}
-                Owner::Account(owner) if owner == account => {}
-                Owner::Account(_) => continue,
+            let owner = match owner_of(&path) {
+                Owner::NoOne => None,
+                Owner::Account(owner) => Some(owner),
                 Owner::Unknown => {
                     let _ = self.disk.remove_file(&path).await;
                     continue;
                 }
+            };
+            if !may_send(owner.as_deref(), Some(account)) {
+                continue;
             }
             if !go_on() {
                 return Sent::Stopped;

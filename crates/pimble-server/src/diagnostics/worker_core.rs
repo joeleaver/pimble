@@ -380,7 +380,8 @@ impl WorkerDiagnostics {
             }
         }
         queue.cap(MAX_QUEUED_BYTES).await;
-        // Signed out (or the session ran out): they wait for the next sign-in.
+        // Signed out (or the session ran out): they wait for the next sign-in
+        // (`may_send` sends nothing as no one; `Queue::send` asks it per batch).
         let Some(account) = account else { return };
         let http = Bounded::new(http, runtime, self.send_timeout);
         queue.send(&http, &records_url(account.url), account.session, account.user_id, &go_on).await;

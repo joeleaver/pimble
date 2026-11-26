@@ -3,15 +3,17 @@
 //! target and at info from the sync targets, `system`, `panic`), scrubbed in
 //! the page, queued in `localStorage` (at most [`MAX_QUEUED_BYTES`]) and sent
 //! every minute to the accounts service's `/api/v1/diagnostics/records`,
-//! which adds the send key; no page carries it. Settings > Diagnostics turns
+//! which adds the send key; no page carries it. Like the worker's, they go
+//! only as the signed-in account (`pimble_core::diagnostics::sendable`):
+//! signed out, nothing is sent and they wait. Settings > Diagnostics turns
 //! it off (`localStorage` `pimble.diagnostics`), and the page keeps the last
 //! [`RECENT_LINES`] log lines for Help > "Send Diagnostics...".
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 
-use pimble_core::diagnostics::{is_info_target, random_hex, timestamp, valid_install, Envelope, LogBudget, SavedChoice, Scrubber, Severity};
+use pimble_core::diagnostics::{is_info_target, random_hex, sendable, timestamp, valid_install, Envelope, LogBudget, SavedChoice, Scrubber, Severity};
 use serde_json::{json, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -225,24 +227,33 @@ async fn post(path: &str, content_type: &str, body: String) -> Result<String, St
     }
 }
 
+/// Send what may go as the signed-in account (`sendable`, the rule the
+/// worker's queue follows too): nothing while no one is signed in, an
+/// account's records only as that account, no one's as whoever is.
 async fn send_waiting() {
-    let batch: Vec<String> = STATE.with(|st| st.borrow().as_ref().filter(|s| s.enabled).map(|s| s.queue.clone()).unwrap_or_default());
+    let batch: Vec<String> = STATE.with(|st| {
+        let st = st.borrow();
+        let Some(st) = st.as_ref().filter(|s| s.enabled) else { return Vec::new() };
+        sendable(&st.queue, st.account.as_deref()).into_iter().cloned().collect()
+    });
     if batch.is_empty() {
         return;
     }
     let sent = post("/api/v1/diagnostics/records", "application/x-ndjson", batch.join("\n")).await;
     // Taken (or refused for good: unreadable, too big): dropped. Anything
-    // else waits for the next minute.
+    // else waits for the next minute. Each line is its own (a session and a
+    // number), so the ones sent are found again whatever was queued or
+    // dropped meanwhile.
     let done = match &sent {
         Ok(_) => true,
         Err(e) => e.starts_with("400") || e.starts_with("413"),
     };
     if done {
+        let gone: HashSet<String> = batch.into_iter().collect();
         STATE.with(|st| {
             if let Some(st) = st.borrow_mut().as_mut() {
-                let n = batch.len().min(st.queue.len());
-                let gone: usize = st.queue.drain(..n).map(|l| l.len()).sum();
-                st.queued_bytes = st.queued_bytes.saturating_sub(gone);
+                st.queue.retain(|line| !gone.contains(line));
+                st.queued_bytes = st.queue.iter().map(String::len).sum();
             }
         });
     }

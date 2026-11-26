@@ -105,6 +105,27 @@ async fn an_off_during_a_pump_sends_nothing_after_it_and_leaves_nothing() {
 }
 
 #[tokio::test]
+async fn nothing_is_sent_while_no_one_is_signed_in() {
+    let disk = Disk::memory();
+    let service = Service::default();
+    let d = WorkerDiagnostics::new("1.0.0", "web");
+    d.attach(&disk, dir()).await;
+    d.configure(&disk, true, None).await;
+    d.record("stores", json!({ "by": "no one" }), "t".into());
+    for _ in 0..3 {
+        d.pump(&disk, &service, &rt(), None).await;
+    }
+    assert!(service.sent().is_empty() && service.bearers().is_empty(), "no request is made while signed out");
+    assert_eq!(waiting(&disk).await, 1, "what was recorded waits on the disk for a sign-in");
+
+    d.pump(&disk, &service, &rt(), Some(alice())).await;
+    let sent = service.sent();
+    let by: Vec<&str> = sent.iter().flat_map(|(_, r)| r).filter_map(|r| r["data"]["by"].as_str()).collect();
+    assert_eq!(by, ["no one"], "sent with the next sign-in");
+    assert_eq!(waiting(&disk).await, 0);
+}
+
+#[tokio::test]
 async fn batches_never_cross_accounts() {
     let disk = Disk::memory();
     let service = Service::default();
