@@ -17,7 +17,7 @@ use pimble_api::{Change, Pimble};
 use pimble_client::PimbleClient;
 use pimble_core::plan::Refusal;
 use pimble_plugin_host::{Approval, Approved};
-use rinch_core::dom::DomDocument;
+use rinch_core::dom::{DomContent, DomTree};
 use rinch_core::events::{dispatch_key_handler, EventHandlerId, KeyEventData};
 
 fn hello_wasm() -> Option<std::path::PathBuf> {

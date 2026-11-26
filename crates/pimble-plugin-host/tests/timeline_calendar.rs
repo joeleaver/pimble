@@ -14,7 +14,7 @@ use pimble_api::Addr;
 use pimble_core::NodeId;
 use pimble_plugin_abi::{NodeAddr, Props};
 use pimble_plugin_host::{Approval, Approved};
-use rinch_core::dom::{DomDocument, NodeId as DomId};
+use rinch_core::dom::{DomContent, DomTree, NodeId as DomId};
 use rinch_core::events::{dispatch_input_event, EventHandlerId};
 use serde_json::json;
 

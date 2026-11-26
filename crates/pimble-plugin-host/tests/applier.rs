@@ -8,7 +8,7 @@ use std::rc::Rc;
 use pimble_plugin_abi::{encode, Event, EventData, Op, GUEST_BODY, GUEST_ROOT};
 use pimble_plugin_host::{Answered, Applier, ApplierOptions, Call, Failure, GuestEngine, Instance, InstanceOptions, Refusal};
 use rinch_core::dom::mock::MockDomDocument;
-use rinch_core::dom::{DomDocument, NodeId};
+use rinch_core::dom::{DomContent, DomDocument, DomFocus, DomTree, NodeId};
 use rinch_core::events::{dispatch_event, dispatch_key_handler, has_click_handler, EventHandlerId, KeyEventData};
 
 fn document() -> (Rc<RefCell<MockDomDocument>>, Rc<RefCell<dyn DomDocument>>, NodeId) {

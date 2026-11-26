@@ -24,7 +24,7 @@ use pimble_plugin_host::wasmtime_engine::load_file;
 use pimble_plugin_host::{ApiSide, ApplierOptions, Approval, Instance, InstanceOptions};
 use pimble_server::{PimbleServer, ServerConfig};
 use rinch_core::dom::mock::MockDomDocument;
-use rinch_core::dom::{DomDocument, NodeId as DomId};
+use rinch_core::dom::{DomContent, DomDocument, DomTree, NodeId as DomId};
 use rinch_core::events::{dispatch_event, dispatch_input_event, set_input_context, EventHandlerId, InputContext};
 
 /// A plugin as `plugins/` builds it (`hello_viewer`, `kanban_viewer`), when it

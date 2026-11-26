@@ -16,7 +16,7 @@ use pimble_core::plan::Refusal;
 use pimble_core::{NodeId, Place, StoreId};
 use pimble_plugin_abi::{HostRequest, HostState, NodeAddr, NodePeople, PresentPerson};
 use pimble_plugin_host::{Approval, Approved};
-use rinch_core::dom::{DomDocument, NodeId as DomId};
+use rinch_core::dom::{DomContent, DomFocus, DomTree, NodeId as DomId};
 use rinch_core::events::{dispatch_event, dispatch_key_handler, set_click_context, ClickContext, EventHandlerId, KeyEventData};
 
 fn children(f: &Fixture, store: StoreId, node: NodeId) -> Vec<String> {

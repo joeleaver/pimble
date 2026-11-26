@@ -16,7 +16,7 @@ use pimble_plugin_sdk::prelude::*;
 use pimble_plugin_sdk::pimble_ui::presence::PersonChip;
 use pimble_plugin_sdk::{Guest, HostLink};
 use rinch_core::dom::mock::MockDomDocument;
-use rinch_core::dom::{DomDocument, NodeId};
+use rinch_core::dom::{DomContent, DomDocument, DomFocus, DomTree, NodeId};
 
 /// Applies a guest's ops to a mock document, as the host applies them to its own.
 struct ApplyToMock {

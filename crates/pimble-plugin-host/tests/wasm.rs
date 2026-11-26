@@ -13,7 +13,7 @@ use pimble_plugin_abi::{encode, Manifest, Op, Props, Provision, SourceShape, Vie
 use pimble_plugin_host::wasmtime_engine::{load_bytes, Plugin, ViewerLookup};
 use pimble_plugin_host::{ApplierOptions, Instance, InstanceOptions};
 use rinch_core::dom::mock::MockDomDocument;
-use rinch_core::dom::{DomDocument, NodeId};
+use rinch_core::dom::{DomDocument, DomTree, NodeId};
 
 fn manifest(abi: u32, viewer: &str) -> Manifest {
     Manifest {
