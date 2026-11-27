@@ -142,7 +142,7 @@ Pimble adds one `mcpServers.pimble-<agent name>` entry and touches nothing else:
 
 | Client | File |
 | --- | --- |
-| Claude | the Claude app's `claude_desktop_config.json` (Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`, macOS `~/Library/Application Support/Claude/`), its Windows package's copy of it (below), and `~/.claude.json` user scope (with `"type": "stdio"`), each only when that Claude is installed: the app when its config folder, its program (Windows `%LOCALAPPDATA%\AnthropicClaude`, macOS `Claude.app` in `/Applications` or `~/Applications`) or its Windows package is there, though it may never have run; `claude` when `~/.claude.json` or `~/.claude/` is |
+| Claude | every `claude_desktop_config.json` an installed Claude app reads (below: the plain one, Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`, macOS `~/Library/Application Support/Claude/`, and the Windows package's private copy), and `~/.claude.json` user scope (with `"type": "stdio"`) when `~/.claude.json` or `~/.claude/` is there |
 | ChatGPT desktop, Codex CLI and IDE extension | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`): a `[mcp_servers.pimble-<name>]` table with `command` and an `env` table, merged with `toml_edit` so the file's comments and layout stay |
 | Cursor | `~/.cursor/mcp.json` |
 
@@ -164,22 +164,60 @@ name): the entries of the old "Claude Desktop" and "Claude Code" choices
 new name. Each Claude file ends with exactly one Pimble entry. The other apps replace only
 an entry of the same name.
 
-**The Claude app as a Windows package** (MSIX: the Microsoft Store, and today's installer)
-does not read `%APPDATA%\Claude`. Windows gives it a private copy of that folder,
-`%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`, which it reads once
-the copy exists, and the plain folder until then; its own "Edit Config" opens the plain
-one (2026-11-26: a tester's "Add to Claude" wrote only the plain file, and Claude never
-started `pimble-mcp`). So when the package folder is there (that name, else any
-`Claude_<publisher id>` folder in `Packages`, the id 13 characters of Crockford base32)
-Pimble writes the plain file, and the private copy too once the app has made one, and
-treats them as one app: the Chat and Code tabs still load one entry. Pimble never makes
-the copy itself: with none the app reads the plain file, which already holds the entry,
-and Windows makes the copy from it when the app first writes there; a copy made by
-Pimble would pin the app to a file its own "Edit Config" never opens.
+**Where each Claude reads its config** (researched 2026-11-27, after a tester's packaged
+Claude never started `pimble-mcp`; `crates/pimble-app/src/agents/locations.rs`). Pimble
+finds every Claude installed and writes the file each one reads:
+
+| Claude | Found by | Reads |
+| --- | --- | --- |
+| The app as a Windows package (MSIX: the Microsoft Store, WinGet, and the installer at claude.ai/download today) | `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc` (else any `Claude_<publisher id>` folder there, the id 13 characters of Crockford base32) | `...\LocalCache\Roaming\Claude\claude_desktop_config.json` once that private folder exists; `%APPDATA%\Claude\claude_desktop_config.json` while it does not |
+| The app from the older installer (Squirrel) | `%LOCALAPPDATA%\AnthropicClaude` | `%APPDATA%\Claude\claude_desktop_config.json` |
+| The macOS app | `Claude.app` in `/Applications` or `~/Applications` | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| A Claude app with no program Pimble knows (Linux builds, or installed elsewhere) | the config folder it made | that folder's `claude_desktop_config.json` |
+| Claude Code (`claude`, and the app's Code tab) | `~/.claude.json` or `~/.claude/` | `~/.claude.json` |
+
+Why the package is different. Windows runs a packaged desktop app with `AppData`
+virtualized: "All newly created files and folders in the user's AppData folder ... are
+written to a private per-user, per-app location", while "Modifications to existing files
+under the user's AppData folder is allowed"; and on opening a file "the OS will open the
+file from the per-user, per-package location first. If that location doesn't exist, then
+the OS will attempt to open the file from the real AppData location"
+([MSIX behind the scenes](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes),
+[flexible virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization)).
+So a packaged Claude that first ran with no `%APPDATA%\Claude` made that folder privately
+under `LocalCache\Roaming` and keeps its config, logs and extensions there, while its
+"Edit Config" opens the plain file, which it does not read once it has a file of its own
+([anthropics/claude-code#25579](https://github.com/anthropics/claude-code/issues/25579),
+[#26073](https://github.com/anthropics/claude-code/issues/26073), open); one that found
+`%APPDATA%\Claude` already there (an earlier install, or the folder made by hand before
+installing, the workaround reported in #26073) keeps using the plain folder. Microsoft
+describes the read fallback per file open, but no source says whether Claude, once it has
+its private folder, still reads a plain file when the private one is missing, and the
+tester's machine (private folder, no file in it, entry only in the plain file) never
+loaded the entry. So Pimble does not rely on the fallback:
+
+- When the package's private `Claude` folder exists, Pimble writes its
+  `claude_desktop_config.json`. When the app has made the folder and no file in it, Pimble
+  makes the file as a copy of the plain file first, so nothing the person set there is
+  lost, then adds the entry. It never makes the private folder itself, or anything else in
+  the package's folder: with no private folder the app reads the plain file.
+- When the package is installed, Pimble also writes the plain file (what "Edit Config"
+  opens, and what the app reads while it has no folder of its own); a plain folder made
+  before the app's first run is the one it then uses.
+- The files of every Claude are one app: "Claude keeps exactly one Pimble agent" holds
+  across all of them, the Chat and Code tabs load one entry, and removing an agent takes it
+  out of every file in this section whether or not its Claude is still installed.
+
+Anthropic's own pages give only the plain paths (macOS and `%APPDATA%\Claude`;
+[Connect to local MCP servers](https://modelcontextprotocol.io/docs/develop/connect-local-servers));
+the package family name `Claude_pzs8sxrjxfjjc` is the one Anthropic's
+[data storage page](https://claude.com/docs/third-party/claude-desktop/data-storage) uses.
 
 **What an "Add" or a removal did is logged** (`pimble_app::agents`, sent with diagnostics
-at `info`, docs/DIAGNOSTICS_CONTRACT.md section 2): each file written or changed by path,
-each failure, the agents replaced by id, and every place looked when nothing was written.
+at `info`, docs/DIAGNOSTICS_CONTRACT.md section 2): the Claudes found (how each is
+installed, where, and the file it reads), each file written, made from the plain file,
+skipped or changed by path with why, each failure, the agents replaced by id, and every
+place looked when nothing was written or taken out.
 Never an agent's name or key.
 
 **Replaced agents are removed.** A key names its agent (`pmbl_agent_<id>_...`,

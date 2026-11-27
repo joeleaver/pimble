@@ -15,6 +15,7 @@
 #![cfg_attr(not(feature = "native"), allow(dead_code))]
 
 pub mod client_config;
+pub mod locations;
 mod picker;
 pub mod setup;
 mod view;
