@@ -327,6 +327,7 @@ fn set_up(store: AppStore) {
     let held = setup::holders(&at);
     let agents: Vec<(Uuid, String)> = untracked(|| ui.agents.get()).into_iter().filter_map(|a| Uuid::parse_str(&a.id).ok().map(|id| (id, a.name))).collect();
     let settled = setup::settle(app, &added, &held, &agents);
+    setup::log_added(&at, app, id, &added, &settled);
     for old in &settled.remove {
         ui.removing.update(|r| {
             r.insert(*old);

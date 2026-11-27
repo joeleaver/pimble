@@ -22,7 +22,8 @@ pub const MAX_INFO: u32 = 2000;
 pub const SAME_MESSAGE: u32 = 3;
 
 /// The targets whose `info` lines are recorded wherever they run: how syncing
-/// and sharing go, and what the app makes of it.
+/// and sharing go, what the app makes of it, and what setting an agent up in
+/// another app wrote.
 pub const INFO_TARGETS: &[&str] = &[
     "pimble_server::vault_link",
     "pimble_server::sync_link",
@@ -33,6 +34,7 @@ pub const INFO_TARGETS: &[&str] = &[
     "pimble_server::local",
     "pimble_server::server",
     "pimble_app::events",
+    "pimble_app::agents",
 ];
 
 /// Whether the `n`th sighting of one message is recorded.
@@ -206,6 +208,7 @@ mod tests {
         assert!(is_info_target("pimble_server::sync_link::reconcile", INFO_TARGETS));
         assert!(!is_info_target("pimble_server::sync_linkage", INFO_TARGETS));
         assert!(!is_info_target("pimble_plugin_host::registry", INFO_TARGETS));
+        assert!(is_info_target("pimble_app::agents::setup", INFO_TARGETS));
     }
 
     #[test]

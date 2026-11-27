@@ -20,3 +20,6 @@ DEBUG pimble_client: connecting to wss://pimble.app/rpc?access_token=eyJhbGciOiJ
 DEBUG pimble_server::auth: request with Authorization: Bearer 3f9a8b7c6d5e4f30a1b2c3d4e5f60718293a4b5c
 DEBUG pimble_cloud: cookie pimble_session=9f8e7d6c5b4a39281706f5e4d3c2b1a0ffeeddcc
 WARN pimble_server::vault_link: Vault link for store 1dacd405-1685-43fc-9730-d302dcc09a15 to this computer's relay face dropped: minting a cloud token from https://pimble.app failed: cloud service at https://pimble.app/api/v1/token answered 502: bad gateway
+INFO pimble_app::agents::setup: Agent 6f2a9311-46ce-4c00-8c1f-27838839763d added to Claude: wrote /home/tester/.config/Claude/claude_desktop_config.json
+WARN pimble_app::agents::setup: Agent 6f2a9311-46ce-4c00-8c1f-27838839763d not added to Claude: Could not make /home/tester/.config/Claude: permission denied
+WARN pimble_app::agents::setup: Agent 6f2a9311-46ce-4c00-8c1f-27838839763d: nothing written for Claude; looked at /home/tester/.config/Claude/claude_desktop_config.json, /home/tester/.claude.json

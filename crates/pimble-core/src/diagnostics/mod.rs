@@ -23,7 +23,9 @@ pub use sending::*;
 /// known not to be sent.
 #[derive(Debug, Clone, Default)]
 pub struct Scrubber {
-    homes: Vec<String>,
+    /// Each form the home folder is written in, and whether it is matched
+    /// ignoring case.
+    homes: Vec<(String, bool)>,
     titles: HashSet<String>,
 }
 
@@ -48,17 +50,31 @@ impl Scrubber {
     pub fn new(home: Option<&str>) -> Self {
         let mut homes = Vec::new();
         if let Some(home) = home.map(|h| h.trim_end_matches(['/', '\\'])).filter(|h| h.len() > 1) {
-            homes.push(home.to_string());
-            // A Windows home is written with either slash.
-            let forward = home.replace('\\', "/");
-            if forward != home {
-                homes.push(forward);
-            }
-            let back = home.replace('/', "\\");
-            if back != home && home.contains(':') {
-                homes.push(back);
+            // A Windows home (`C:\Users\will`, or `\\server\users\will` on a
+            // network) is matched ignoring case, as Windows names files.
+            let windows = home.contains(':') || home.starts_with("\\\\");
+            let mut add = |h: String| {
+                if !homes.iter().any(|(k, _): &(String, bool)| *k == h) {
+                    homes.push((h, windows));
+                }
+            };
+            add(home.to_string());
+            if windows {
+                // Written with either slash, and with every backslash
+                // doubled: a path printed with `{:?}`
+                // ("C:\\Users\\will\\AppData...") kept the home folder
+                // before 2026-11-26.
+                add(home.replace('\\', "/"));
+                let back = home.replace('/', "\\");
+                add(back.replace('\\', "\\\\"));
+                add(back);
+            } else if home.contains('\\') {
+                add(home.replace('\\', "/"));
             }
         }
+        // Longest first, so the doubled form is replaced before the plain
+        // one could match inside it.
+        homes.sort_by_key(|(h, _)| std::cmp::Reverse(h.len()));
         Scrubber { homes, titles: HashSet::new() }
     }
 
@@ -73,26 +89,33 @@ impl Scrubber {
     /// `line` as it may leave this computer.
     pub fn scrub(&self, line: &str) -> String {
         let mut out = line.to_string();
-        for home in &self.homes {
-            out = replace_path_prefix(&out, home);
+        for (home, fold) in &self.homes {
+            out = replace_path_prefix(&out, home, *fold);
         }
         out = scrub_titles(&out, &self.titles);
         scrub_words(&out)
     }
 }
 
-/// Every `home` followed by a separator or the end becomes `~`.
-fn replace_path_prefix(line: &str, home: &str) -> String {
+/// Every `home` followed by a separator or the end becomes `~`; `fold`
+/// matches it ignoring ASCII case (which keeps every byte offset). Windows
+/// ignores case beyond ASCII too, so `C:\Users\Zoë` written `ZOË` stays;
+/// Windows writes a home folder as the account has it, so that line would
+/// have had to change the case itself.
+fn replace_path_prefix(line: &str, home: &str, fold: bool) -> String {
+    let (hay, needle) = if fold { (line.to_ascii_lowercase(), home.to_ascii_lowercase()) } else { (line.to_string(), home.to_string()) };
     let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(at) = rest.find(home) {
-        let after = &rest[at + home.len()..];
+    let mut from = 0;
+    while let Some(found) = hay[from..].find(&needle) {
+        let at = from + found;
+        let end = at + needle.len();
+        let after = &line[end..];
         let boundary = after.is_empty() || after.starts_with(['/', '\\', '"', '\'', ' ', ')', ',']);
-        out.push_str(&rest[..at]);
-        out.push_str(if boundary { "~" } else { home });
-        rest = after;
+        out.push_str(&line[from..at]);
+        out.push_str(if boundary { "~" } else { &line[at..end] });
+        from = end;
     }
-    out.push_str(rest);
+    out.push_str(&line[from..]);
     out
 }
 
@@ -197,6 +220,15 @@ mod tests {
         let w = Scrubber::new(Some(r"C:\Users\Will"));
         assert_eq!(w.scrub(r"Opening store at C:\Users\Will\Documents\Notes.pimble"), r"Opening store at ~\Documents\Notes.pimble");
         assert_eq!(w.scrub("Opening store at C:/Users/Will/Documents/Notes.pimble"), "Opening store at ~/Documents/Notes.pimble");
+        let debug = format!("{:?}", r"C:\Users\Will\AppData\Local\pimble");
+        assert_eq!(w.scrub(&format!("Opening store at {debug}")), r#"Opening store at "~\\AppData\\Local\\pimble""#);
+        assert_eq!(w.scrub(r"at c:\users\will\Notes.pimble"), r"at ~\Notes.pimble", "Windows names files ignoring case");
+        assert_eq!(w.scrub(r"at C:\Users\Willow\x"), r"at C:\Users\Willow\x", "another folder that starts alike stays");
+        let unc = Scrubber::new(Some(r"\\server\users\will"));
+        assert_eq!(unc.scrub(&format!("at {:?}", r"\\server\users\will\x")), r#"at "~\\x""#);
+        assert_eq!(unc.scrub(r"at \\SERVER\users\will\x"), r"at ~\x");
+        let linux = Scrubber::new(Some("/home/Tester"));
+        assert_eq!(linux.scrub("/home/tester/x and /home/Tester/y"), "/home/tester/x and ~/y", "case counts off Windows");
     }
 
     #[test]
