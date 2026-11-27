@@ -1,5 +1,13 @@
 # Next session: start here
 
+**2026-11-27: 0.34.3 cut.**
+- In 0.34.3 (branch `subtitle-pictures`, merged as `081c6b6`, Joe's "merge it"; two review
+  rounds, the second round's two findings fixed with tests in `58520a2` and not reviewed
+  again before Joe said to merge): a Subtitle paragraph style in the toolbar (bylines too), which
+  themes style; a picture alone on a line gets space and no indent (centered in Book,
+  Manuscript, Report, Journal). An older Pimble keeps the mark while typing but does not
+  draw it, and an older version's agent rewrite of that paragraph drops it.
+
 **2026-11-27: 0.34.2 cut.**
 - In 0.34.2: File > New Store (and every other file dialog) no longer aborts the app on
   Linux. The tray (since 0.31.0) pulls in ksni with zbus's `tokio` feature, and zbus then
