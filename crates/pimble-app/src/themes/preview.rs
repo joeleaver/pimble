@@ -102,7 +102,7 @@ pub(crate) fn sample() -> Vec<Block> {
     let para = |text: &str| Block::Paragraph { align: None, subtitle: false, classes: String::new(), inlines: run(text) };
     vec![
         Block::Heading { level: 1, align: None, classes: paragraph_roles::BEFORE_SUBTITLE.to_string(), inlines: run("The Harbor") },
-        Block::Paragraph { align: None, subtitle: true, classes: String::new(), inlines: run("A morning on the water") },
+        Block::Paragraph { align: None, subtitle: true, classes: paragraph_roles::UNDER[0].to_string(), inlines: run("A morning on the water") },
         para("The boats came in after noon, low with the morning's catch. Gulls followed them past the breakwater."),
         para("By evening the quay was quiet again, and the lamps came on one by one along the water."),
         Block::Quote(vec![para("The sea gives and the sea takes.")]),

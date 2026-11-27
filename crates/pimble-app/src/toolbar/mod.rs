@@ -199,7 +199,7 @@ fn watch_toolbar() {
 mod buttons;
 
 use buttons::*;
-pub(crate) use buttons::{insert, inserts, set_plain_paragraph};
+pub(crate) use buttons::{insert, inserts};
 
 /// The Block Quote button's toggle on `pane`'s editor: wrap the selection in
 /// a quote, or lift it out of the one it is in. Ctrl+Shift+B runs this too

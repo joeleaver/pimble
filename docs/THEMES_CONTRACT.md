@@ -873,7 +873,7 @@ they did; Book, Manuscript, Report and Journal center it.
 has no `:has()`, joeleaver/rinch#680) or look back from a subtitle to its heading's chosen
 alignment, so `paragraph_roles` puts classes on blocks as node decorations
 (joeleaver/rinch#3097): `pimble-picture-block`, `pimble-before-subtitle` and
-`pimble-title-<alignment>`. The classes are drawing only and are never stored. The theme
+`pimble-under-h<level>` with `pimble-title-<alignment>`. The classes are drawing only and are never stored. The theme
 preview computes the same classes.
 
 **Elsewhere.** Markdown writes the role as ` {.subtitle}` (docs/MCP_CONTRACT.md). A

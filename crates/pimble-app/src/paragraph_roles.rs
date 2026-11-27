@@ -10,14 +10,14 @@
 //! select for itself, as classes on blocks (node decorations, which are no
 //! part of the document): a paragraph holding only pictures
 //! ([`PICTURE_BLOCK`]), the heading or subtitle a subtitle follows
-//! ([`BEFORE_SUBTITLE`]), and the alignment someone chose for the heading a
-//! subtitle is under ([`title_class`]).
+//! ([`BEFORE_SUBTITLE`]), and for a subtitle under a heading, that heading's
+//! level ([`UNDER`]) and the alignment someone chose for it ([`title_class`]).
 
 use std::rc::Rc;
 
 use pimble_crdt::text_roles::{is_subtitle, ROLE_ATTR, SUBTITLE};
 use rinch_editor_core::state::{EditorState, Transaction};
-use rinch_editor_core::{DataAttrSplit, Decoration, DecorationSet, Node as EditorNode, Plugin, PluginKey, Pos};
+use rinch_editor_core::{AttrValue, Attrs, DataAttrSplit, Decoration, DecorationSet, Node as EditorNode, Plugin, PluginKey, Pos};
 
 use crate::rinch_editor::EditorHandle;
 
@@ -27,6 +27,11 @@ const PLUGIN_KEY: PluginKey = PluginKey("pimble.paragraph_roles");
 pub const PICTURE_BLOCK: &str = "pimble-picture-block";
 /// The class of a heading or subtitle with a subtitle right after it.
 pub const BEFORE_SUBTITLE: &str = "pimble-before-subtitle";
+
+/// The classes of a subtitle under a heading of level 1 to 6, whether it
+/// follows the heading or another subtitle that does.
+pub(crate) const UNDER: [&str; 6] =
+    ["pimble-under-h1", "pimble-under-h2", "pimble-under-h3", "pimble-under-h4", "pimble-under-h5", "pimble-under-h6"];
 
 /// The class of a subtitle under a heading whose alignment someone chose:
 /// the subtitle is aligned the same.
@@ -61,9 +66,9 @@ pub(crate) fn is_picture_block(node: &EditorNode) -> bool {
 /// block the stylesheet needs none on. One string a block, since a block
 /// takes its classes from one decoration. The theme's preview draws the same.
 pub(crate) fn classes(blocks: &[EditorNode]) -> Vec<String> {
-    // The alignment chosen for the heading the current run of subtitles is
-    // under.
-    let mut title: Option<&'static str> = None;
+    // The classes of the heading the current run of subtitles is under: its
+    // level's, and its chosen alignment's.
+    let mut title: [Option<&'static str>; 2] = [None, None];
     blocks
         .iter()
         .enumerate()
@@ -72,11 +77,12 @@ pub(crate) fn classes(blocks: &[EditorNode]) -> Vec<String> {
             let subtitle = is_subtitle(block);
             let mut classes = Vec::new();
             if heading {
-                title = block.attrs().get_str("text_align").and_then(title_class);
+                let level = block.attrs().get_int("level").unwrap_or(1).clamp(1, 6) as usize;
+                title = [Some(UNDER[level - 1]), block.attrs().get_str("text_align").and_then(title_class)];
             } else if subtitle {
-                classes.extend(title);
+                classes.extend(title.into_iter().flatten());
             } else {
-                title = None;
+                title = [None, None];
             }
             if (heading || subtitle) && blocks.get(i + 1).is_some_and(is_subtitle) {
                 classes.push(BEFORE_SUBTITLE);
@@ -157,21 +163,58 @@ impl Plugin for ParagraphRolesPlugin {
 /// Whether every textblock at the selection is a subtitle: the toolbar's
 /// button reads as pressed.
 pub(crate) fn subtitle_active(handle: &EditorHandle) -> bool {
-    handle.current_block_type().as_deref() == Some("paragraph") && handle.block_data_attr(ROLE_ATTR).as_deref() == Some(SUBTITLE)
+    let state = handle.state();
+    let mut found = None;
+    for (from, to) in state.selection.ranges(&state.doc) {
+        state.doc.nodes_between(from.0, to.0, &mut |node, _, _| {
+            if node.is_textblock() {
+                found = Some(found.unwrap_or(true) && is_subtitle(node));
+            }
+            true
+        });
+    }
+    found == Some(true)
 }
 
 /// The toolbar's Subtitle button: makes the blocks at the selection
-/// subtitles (a heading or code block becomes a paragraph first), or, on a
-/// subtitle, ordinary paragraphs again.
+/// subtitles (a heading or code block becomes a paragraph first, keeping its
+/// alignment and indent), or, when they all are, ordinary paragraphs again.
+/// One transaction, so one undo.
 pub(crate) fn toggle_subtitle(handle: &EditorHandle) {
     if subtitle_active(handle) {
         handle.set_block_data_attr(ROLE_ATTR, None);
         return;
     }
-    if handle.current_block_type().as_deref() != Some("paragraph") {
-        crate::toolbar::set_plain_paragraph(handle);
-    }
-    handle.set_block_data_attr(ROLE_ATTR, Some(SUBTITLE));
+    handle.update(|state| {
+        let paragraph = state.schema().node_type("paragraph")?.clone();
+        let ranges = state.selection.ranges(&state.doc);
+        // The textblocks that are no paragraphs, each by a position inside it.
+        let mut others: Vec<(usize, Vec<(&str, AttrValue)>)> = Vec::new();
+        for (from, to) in &ranges {
+            state.doc.nodes_between(from.0, to.0, &mut |node, pos, _| {
+                if node.is_textblock() && node.type_name() != "paragraph" {
+                    let mut kept = Vec::new();
+                    if let Some(align) = node.attrs().get_str("text_align") {
+                        kept.push(("text_align", AttrValue::from(align)));
+                    }
+                    if let Some(indent) = node.attrs().get_int("indent") {
+                        kept.push(("indent", AttrValue::Int(indent)));
+                    }
+                    others.push((pos + 1, kept));
+                }
+                true
+            });
+        }
+        let mut tr = state.tr();
+        // A block keeps its size when its type changes, so the positions hold.
+        for (at, kept) in others {
+            tr.set_block_type(at, at, paragraph.clone(), Attrs::from_iter(kept)).ok()?;
+        }
+        for (from, to) in ranges {
+            tr.set_block_data_attr(from.0, to.0, ROLE_ATTR, Some(SUBTITLE)).ok()?;
+        }
+        tr.doc_changed().then_some(tr)
+    });
 }
 
 #[cfg(test)]

@@ -230,7 +230,7 @@ pub(super) fn heading_level(h: &EditorHandle) -> Option<i64> {
 /// in: the "off" half of a heading or code-block button. The same transaction
 /// step rinch's own block commands use, through the editor's one dispatch
 /// path, so it is recorded and broadcast like any other edit.
-pub(crate) fn set_plain_paragraph(h: &EditorHandle) -> bool {
+pub(super) fn set_plain_paragraph(h: &EditorHandle) -> bool {
     use rinch_editor_core::{AttrValue, Attrs};
     h.update(|state| {
         let paragraph = state.schema().node_type("paragraph")?.clone();

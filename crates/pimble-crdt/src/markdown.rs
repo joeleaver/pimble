@@ -128,7 +128,8 @@ fn check_scope_of(node: &Node) -> Result<()> {
 fn strict(schema: &Schema, md: &str) -> Result<Node> {
     check_scope(md)?;
     // Marked before the parse, which reads `\{.subtitle}` as the plain words.
-    let marked = subtitles::mark(md);
+    let stand_ins = subtitles::StandIns::absent_from(md);
+    let marked = stand_ins.mark(md);
     let doc = doc_from_markdown_strict(schema, &marked).map_err(|e| match e {
         MarkdownError::Unsupported { construct, line, .. } => cannot_hold(
             line,
@@ -148,7 +149,7 @@ fn strict(schema: &Schema, md: &str) -> Result<Node> {
         MarkdownError::Invalid(e) => collab(e),
     })?;
     check_scope_of(&doc)?;
-    let doc = subtitles::read(schema, &doc)?;
+    let doc = stand_ins.read(schema, &doc)?;
     // A mention written without its id is given one as it enters a document
     // (docs/NOTIFICATIONS_CONTRACT.md "Built in wave 0").
     Ok(crate::mentions::with_ids(&with_canvas_attrs(&doc)?, schema))

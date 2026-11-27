@@ -221,7 +221,8 @@ and then that parse.
   the subtitle role is written as its text with ` {.subtitle}` after it
   (`pimble_crdt::markdown::SUBTITLE_MARK`), at the end of a line or a table cell, and read
   back the same way; `\{.subtitle}` is those words, and the mark in code or elsewhere in a
-  line is words too. A rewrite that leaves the mark out takes the role away. A Pimble from
+  line is words too. A table written as HTML has no marks: its paragraphs say
+  `data-role="subtitle"` themselves. A rewrite that leaves the mark out takes the role away. A Pimble from
   before subtitles shows no mark in what it reads, so a paragraph rewritten through its
   MCP server loses the role.
 - **Block quotes and tables** (in since rinch `51cb7c7`, joeleaver/rinch#1229 and #1233):
