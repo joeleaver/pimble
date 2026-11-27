@@ -166,6 +166,27 @@ const HEADINGS: [[Token; 10]; 6] = [
     heading!("h6", "0.9", "semibold", "0.7em", "0.3em"),
 ];
 
+// A subtitle (a paragraph with that role) and a paragraph holding only
+// pictures (docs/THEMES_CONTRACT.md "Subtitles and pictures"). Notes from
+// before themes have neither a subtitle nor a picture rule, so a subtitle's
+// values are its look with no theme setting any, and the picture's spacing
+// is unset.
+const SUBTITLE_AND_PICTURE: [Token; 7] = [
+    token(
+        "subtitle.size",
+        TokenType::Ratio { min: 0.6, max: 2.0 },
+        "1.1",
+    ),
+    token("subtitle.italic", TokenType::Bool, "true"),
+    token("subtitle.color", TokenType::ColorRef, ""),
+    // Unset: under a heading it is aligned as the heading is, elsewhere at
+    // the start.
+    token("subtitle.align", TokenType::Enum(HEADING_ALIGNS), ""),
+    token("subtitle.space_after", length(Unit::Em, 0.0, 4.0), "1em"),
+    token("picture.align", TokenType::Enum(HEADING_ALIGNS), "start"),
+    token("picture.space", length(Unit::Em, 0.0, 4.0), ""),
+];
+
 const BLOCKS: [Token; 13] = [
     token(
         "quote.style",
@@ -215,6 +236,7 @@ pub fn all() -> impl Iterator<Item = &'static Token> {
         .iter()
         .chain(PARAGRAPH.iter())
         .chain(HEADINGS.iter().flatten())
+        .chain(SUBTITLE_AND_PICTURE.iter())
         .chain(BLOCKS.iter())
         .chain(RULE_AND_PALETTE.iter())
 }
@@ -246,7 +268,7 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), keys.len(), "no key twice");
-        assert_eq!(keys.len(), 7 + 4 + 60 + 13 + 8);
+        assert_eq!(keys.len(), 7 + 4 + 60 + 7 + 13 + 8);
         for key in keys {
             assert!(
                 key.bytes().all(|b| b.is_ascii_lowercase()

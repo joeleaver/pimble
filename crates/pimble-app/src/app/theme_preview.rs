@@ -10,6 +10,7 @@
 //! `[data-pm-editor] > p` selectors would see as a parent of its own, so the
 //! preview would indent, space and measure differently from the note.
 
+use pimble_crdt::text_roles::SUBTITLE;
 use rinch::core::dom::IntoNode;
 use rinch::prelude::*;
 
@@ -55,21 +56,31 @@ fn align_style(align: Option<&'static str>) -> String {
 
 fn block(__scope: &mut RenderScope, b: &Block) -> NodeHandle {
     match b {
-        Block::Paragraph { align, inlines } => {
+        Block::Paragraph {
+            align,
+            subtitle,
+            classes,
+            inlines,
+        } => {
             let style = align_style(*align);
-            let el = rsx! { p { style: style } };
+            let classes = classes.clone();
+            let el = match subtitle {
+                true => rsx! { p { class: classes, style: style, "data-role": SUBTITLE } },
+                false => rsx! { p { class: classes, style: style } },
+            };
             let kids = inline_nodes(__scope, inlines);
             fill(el, kids)
         }
-        Block::Heading { level, align, inlines } => {
+        Block::Heading { level, align, classes, inlines } => {
             let style = align_style(*align);
+            let classes = classes.clone();
             let el = match level {
-                1 => rsx! { h1 { style: style } },
-                2 => rsx! { h2 { style: style } },
-                3 => rsx! { h3 { style: style } },
-                4 => rsx! { h4 { style: style } },
-                5 => rsx! { h5 { style: style } },
-                _ => rsx! { h6 { style: style } },
+                1 => rsx! { h1 { class: classes, style: style } },
+                2 => rsx! { h2 { class: classes, style: style } },
+                3 => rsx! { h3 { class: classes, style: style } },
+                4 => rsx! { h4 { class: classes, style: style } },
+                5 => rsx! { h5 { class: classes, style: style } },
+                _ => rsx! { h6 { class: classes, style: style } },
             };
             let kids = inline_nodes(__scope, inlines);
             fill(el, kids)

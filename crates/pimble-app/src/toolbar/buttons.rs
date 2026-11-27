@@ -11,6 +11,7 @@ use crate::editor::editor;
 use crate::panes::PaneId;
 use crate::rinch_editor::EditorHandle;
 use crate::state::AppStore;
+use pimble_crdt::text_roles::ROLE_ATTR;
 
 #[derive(Clone)]
 pub(super) enum Cmd {
@@ -25,6 +26,8 @@ pub(super) enum Cmd {
     Insert(Insert),
     /// A discussion at the caret, drawn in the margin.
     Discuss,
+    /// Makes the paragraph a subtitle, or an ordinary one again.
+    Subtitle,
     /// The Text Color button: it opens its swatches (`render_color_btn`).
     TextColor,
 }
@@ -103,6 +106,7 @@ pub(crate) fn insert(store: AppStore, what: Insert) {
 pub(super) enum ActiveCheck {
     Mark(&'static str),
     Block(&'static str),
+    Subtitle,
     None,
 }
 
@@ -150,6 +154,7 @@ pub(super) fn button_groups() -> Vec<Group> {
                 b(TablerIcon::H1, "Heading 1", Cmd::SetBlock("h1"), ActiveCheck::Block("h1")),
                 b(TablerIcon::H2, "Heading 2", Cmd::SetBlock("h2"), ActiveCheck::Block("h2")),
                 b(TablerIcon::H3, "Heading 3", Cmd::SetBlock("h3"), ActiveCheck::Block("h3")),
+                b(TablerIcon::TextCaption, "Subtitle", Cmd::Subtitle, ActiveCheck::Subtitle),
                 b(TablerIcon::List, "Bullet List", Cmd::SetBlock("ul"), ActiveCheck::Block("ul")),
                 b(TablerIcon::ListNumbers, "Numbered List", Cmd::SetBlock("ol"), ActiveCheck::Block("ol")),
                 b(TablerIcon::Blockquote, "Block Quote (Ctrl+Shift+B)", Cmd::SetBlock("blockquote"), ActiveCheck::Block("blockquote")),
@@ -225,7 +230,7 @@ pub(super) fn heading_level(h: &EditorHandle) -> Option<i64> {
 /// in: the "off" half of a heading or code-block button. The same transaction
 /// step rinch's own block commands use, through the editor's one dispatch
 /// path, so it is recorded and broadcast like any other edit.
-pub(super) fn set_plain_paragraph(h: &EditorHandle) -> bool {
+pub(crate) fn set_plain_paragraph(h: &EditorHandle) -> bool {
     use rinch_editor_core::{AttrValue, Attrs};
     h.update(|state| {
         let paragraph = state.schema().node_type("paragraph")?.clone();
@@ -258,6 +263,7 @@ pub(super) fn check_active_with(h: &EditorHandle, check: &ActiveCheck) -> bool {
             "pre" => h.current_block_type().as_deref() == Some("code_block"),
             _ => false,
         },
+        ActiveCheck::Subtitle => crate::paragraph_roles::subtitle_active(h),
         ActiveCheck::None => false,
     }
 }
@@ -287,6 +293,7 @@ pub(super) fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
             };
             h.command(name);
         }
+        Cmd::Subtitle => crate::paragraph_roles::toggle_subtitle(&h),
         Cmd::SetBlock(tag) => {
             // A block button is a toggle: pressed on a block that already is
             // what it sets, it goes back to a plain paragraph. rinch's
@@ -328,6 +335,9 @@ pub(super) fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
         }
         Cmd::ClearFormatting => {
             h.command("setParagraph");
+            // A subtitle is formatting too, and rinch keeps an app's
+            // attributes on a paragraph that stays one.
+            h.set_block_data_attr(ROLE_ATTR, None);
         }
     }
     bump_toolbar(pane);

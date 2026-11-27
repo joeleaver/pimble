@@ -217,6 +217,13 @@ and then that parse.
   `list_people` says whom a note can mention.
 - Hard breaks (a trailing backslash, or `<br>` where that does not read back) and
   horizontal rules (`---`) map both ways.
+- **Subtitles** (docs/THEMES_CONTRACT.md "Subtitles and pictures"). A paragraph with
+  the subtitle role is written as its text with ` {.subtitle}` after it
+  (`pimble_crdt::markdown::SUBTITLE_MARK`), at the end of a line or a table cell, and read
+  back the same way; `\{.subtitle}` is those words, and the mark in code or elsewhere in a
+  line is words too. A rewrite that leaves the mark out takes the role away. A Pimble from
+  before subtitles shows no mark in what it reads, so a paragraph rewritten through its
+  MCP server loses the role.
 - **Block quotes and tables** (in since rinch `51cb7c7`, joeleaver/rinch#1229 and #1233):
   `>` quotes, and GFM pipe tables for a table with a header row, no merged cells and one
   paragraph per cell; any other table is written as HTML `<table>` (`colspan`/`rowspan`,

@@ -56,6 +56,7 @@ pub mod nav;
 pub mod out_of_step;
 pub mod pane_view;
 pub mod panes;
+pub mod paragraph_roles;
 pub mod persistence;
 pub mod pictures;
 pub mod protocol;

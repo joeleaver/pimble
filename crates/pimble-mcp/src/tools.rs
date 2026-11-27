@@ -70,7 +70,9 @@ comes before the first heading.
 
 Content is Markdown: headings, paragraphs, bold, italic, strikethrough, inline code, links, \
 fenced code, bullet and numbered lists (nested), block quotes, pipe tables, horizontal \
-rules. Underline, highlight, text colour, subscript and superscript are the HTML tags <u>, \
+rules. A subtitle, the line under a title such as a byline, is a paragraph followed by \
+`{.subtitle}` (`by Ann {.subtitle}`): keep it when rewriting that paragraph; `\\{.subtitle}` \
+is those words themselves. Underline, highlight, text colour, subscript and superscript are the HTML tags <u>, \
 <mark>, <span style=\"color:#rrggbb\">, <sub> and <sup>; a table with merged cells or blocks \
 in a cell is an HTML <table>. Pictures are canvases: \
 a picture already in Pimble is written as get_node shows it (![alt](pimble-blob:...#canvas=<id>)), so \

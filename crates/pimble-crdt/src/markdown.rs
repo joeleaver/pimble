@@ -127,7 +127,9 @@ fn check_scope_of(node: &Node) -> Result<()> {
 /// line breaks and tables from, footnotes, unsafe addresses).
 fn strict(schema: &Schema, md: &str) -> Result<Node> {
     check_scope(md)?;
-    let doc = doc_from_markdown_strict(schema, md).map_err(|e| match e {
+    // Marked before the parse, which reads `\{.subtitle}` as the plain words.
+    let marked = subtitles::mark(md);
+    let doc = doc_from_markdown_strict(schema, &marked).map_err(|e| match e {
         MarkdownError::Unsupported { construct, line, .. } => cannot_hold(
             line,
             match construct {
@@ -146,6 +148,7 @@ fn strict(schema: &Schema, md: &str) -> Result<Node> {
         MarkdownError::Invalid(e) => collab(e),
     })?;
     check_scope_of(&doc)?;
+    let doc = subtitles::read(schema, &doc)?;
     // A mention written without its id is given one as it enters a document
     // (docs/NOTIFICATIONS_CONTRACT.md "Built in wave 0").
     Ok(crate::mentions::with_ids(&with_canvas_attrs(&doc)?, schema))
@@ -166,12 +169,10 @@ pub fn parse(schema: &Schema, md: &str) -> Result<Node> {
 /// text colour, sub/superscript, a table with merged cells or blocks in a cell).
 /// A canvas in text is its picture with the canvas's id after the URL,
 /// `![alt](pimble-blob:<store>/<hash>#canvas=<id>)` (docs/CANVAS_CONTRACT.md,
-/// decision 5).
+/// decision 5). A subtitle is its paragraph with [`SUBTITLE_MARK`] after it.
 pub fn render(doc: &Node) -> String {
-    match with_canvas_urls(doc) {
-        Some(doc) => doc_to_markdown(&doc),
-        None => doc_to_markdown(doc),
-    }
+    let canvases = with_canvas_urls(doc);
+    subtitles::write(canvases.as_ref().unwrap_or(doc))
 }
 
 /// The attribute of a picture in text naming its canvas (a board, in storage).
@@ -437,6 +438,7 @@ mod edits;
 mod headings;
 mod judge;
 mod quotes;
+mod subtitles;
 #[cfg(test)]
 mod edits_tests;
 #[cfg(test)]
@@ -449,3 +451,4 @@ pub use judge::MIN_DELETE_QUOTE;
 pub use quotes::{BlockTarget, Narrowing, Occurrence, Quote};
 pub(crate) use edits::{append, cut_sections, steps, write_new};
 pub(crate) use quotes::is_blank;
+pub use subtitles::SUBTITLE_MARK;

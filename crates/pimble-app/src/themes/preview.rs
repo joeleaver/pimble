@@ -7,8 +7,11 @@
 //! `app/theme_preview.rs` can draw it with the elements the editor draws
 //! and `document_theme.css` dresses it exactly as it dresses the note.
 
+use pimble_crdt::text_roles::is_subtitle;
 use rinch_editor_core::tables::{self, Rect};
 use rinch_editor_core::{Mark, Node as EditorNode};
+
+use crate::paragraph_roles;
 
 /// No more top-level blocks than this are shown: a preview is a page, and a
 /// long note would cost a long redraw on every theme the pointer crosses.
@@ -29,8 +32,10 @@ pub(crate) const MAX_PLACED_COLUMNS: usize = 10_000;
 /// One block of a preview, as the editor's schema names it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Block {
-    Paragraph { align: Option<&'static str>, inlines: Vec<Inline> },
-    Heading { level: u8, align: Option<&'static str>, inlines: Vec<Inline> },
+    /// `classes` are the ones the editor puts on the block
+    /// ([`crate::paragraph_roles`]).
+    Paragraph { align: Option<&'static str>, subtitle: bool, classes: String, inlines: Vec<Inline> },
+    Heading { level: u8, align: Option<&'static str>, classes: String, inlines: Vec<Inline> },
     List { ordered: bool, start: i64, items: Vec<Vec<Block>> },
     Quote(Vec<Block>),
     Code(String),
@@ -86,46 +91,60 @@ pub(crate) struct Run {
 
 /// The blocks of an editor document, the first [`MAX_BLOCKS`] of them.
 pub(crate) fn of_doc(doc: &EditorNode) -> Vec<Block> {
-    blocks_of(doc.content().children().iter().take(MAX_BLOCKS), 0)
+    blocks_of(doc.content().children(), MAX_BLOCKS, 0)
 }
 
-/// A heading and two paragraphs, for a node no editor holds (the row menu
-/// on a note that is not open): enough to show a theme's headings, body and
-/// paragraph spacing.
+/// A heading, a subtitle and two paragraphs, for a node no editor holds (the
+/// row menu on a note that is not open): enough to show a theme's headings,
+/// subtitle, body and paragraph spacing.
 pub(crate) fn sample() -> Vec<Block> {
-    let para = |text: &str| Block::Paragraph { align: None, inlines: vec![Inline::Text(Run { text: text.to_string(), ..Run::default() })] };
+    let run = |text: &str| vec![Inline::Text(Run { text: text.to_string(), ..Run::default() })];
+    let para = |text: &str| Block::Paragraph { align: None, subtitle: false, classes: String::new(), inlines: run(text) };
     vec![
-        Block::Heading { level: 1, align: None, inlines: vec![Inline::Text(Run { text: "The Harbor".to_string(), ..Run::default() })] },
+        Block::Heading { level: 1, align: None, classes: paragraph_roles::BEFORE_SUBTITLE.to_string(), inlines: run("The Harbor") },
+        Block::Paragraph { align: None, subtitle: true, classes: String::new(), inlines: run("A morning on the water") },
         para("The boats came in after noon, low with the morning's catch. Gulls followed them past the breakwater."),
         para("By evening the quay was quiet again, and the lamps came on one by one along the water."),
         Block::Quote(vec![para("The sea gives and the sea takes.")]),
     ]
 }
 
-fn blocks_of<'a>(nodes: impl Iterator<Item = &'a EditorNode>, depth: usize) -> Vec<Block> {
+/// The first `limit` of `nodes`, siblings, as blocks. Their classes are read
+/// from all of them, as the editor reads them.
+fn blocks_of(nodes: &[EditorNode], limit: usize, depth: usize) -> Vec<Block> {
     if depth > MAX_NESTING {
         return Vec::new();
     }
-    nodes.filter_map(|node| block_of(node, depth)).collect()
+    let classes = paragraph_roles::classes(nodes);
+    nodes
+        .iter()
+        .zip(classes)
+        .take(limit)
+        .filter_map(|(node, classes)| block_of(node, classes, depth))
+        .collect()
+}
+
+fn all_of(node: &EditorNode, depth: usize) -> Vec<Block> {
+    blocks_of(node.content().children(), usize::MAX, depth)
 }
 
 fn children(node: &EditorNode) -> std::slice::Iter<'_, EditorNode> {
     node.content().children().iter()
 }
 
-fn block_of(node: &EditorNode, depth: usize) -> Option<Block> {
+fn block_of(node: &EditorNode, classes: String, depth: usize) -> Option<Block> {
     let block = match node.type_name() {
-        "paragraph" => Block::Paragraph { align: align_of(node), inlines: inlines_of(node) },
+        "paragraph" => Block::Paragraph { align: align_of(node), subtitle: is_subtitle(node), classes, inlines: inlines_of(node) },
         "heading" => {
             let level = node.attrs().get_int("level").unwrap_or(1).clamp(1, 6) as u8;
-            Block::Heading { level, align: align_of(node), inlines: inlines_of(node) }
+            Block::Heading { level, align: align_of(node), classes, inlines: inlines_of(node) }
         }
         "bullet_list" | "task_list" => Block::List { ordered: false, start: 1, items: items_of(node, depth) },
         "ordered_list" => {
             let start = node.attrs().get_int("start").unwrap_or(1);
             Block::List { ordered: true, start, items: items_of(node, depth) }
         }
-        "blockquote" => Block::Quote(blocks_of(children(node), depth + 1)),
+        "blockquote" => Block::Quote(all_of(node, depth + 1)),
         "code_block" => Block::Code(children(node).filter_map(|n| n.text()).collect()),
         "table" => table_of(node, depth),
         "horizontal_rule" => Block::Rule,
@@ -144,7 +163,7 @@ fn table_of(table: &EditorNode, depth: usize) -> Block {
         .map(|(row, row_rects)| {
             children(row)
                 .zip(row_rects)
-                .map(|(cell, rect)| Cell { header: cell.type_name() == "table_header_cell", blocks: blocks_of(children(cell), depth + 1), rect })
+                .map(|(cell, rect)| Cell { header: cell.type_name() == "table_header_cell", blocks: all_of(cell, depth + 1), rect })
                 .collect()
         })
         .collect();
@@ -152,7 +171,7 @@ fn table_of(table: &EditorNode, depth: usize) -> Block {
 }
 
 fn items_of(list: &EditorNode, depth: usize) -> Vec<Vec<Block>> {
-    children(list).map(|item| blocks_of(children(item), depth + 1)).collect()
+    children(list).map(|item| all_of(item, depth + 1)).collect()
 }
 
 /// A textblock's own alignment, when someone set one. An unset alignment is

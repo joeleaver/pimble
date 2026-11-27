@@ -140,6 +140,8 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
                 "h1.size": 1.6, "h2.size": 1.3, "h3.size": 1.1,
                 "h1.space_before": "1.5em", "h1.space_after": "1em",
                 "h2.space_before": "1.2em", "h2.space_after": "0.8em",
+                "subtitle.size": 1, "subtitle.space_after": "1.5em",
+                "picture.align": "center", "picture.space": "1em",
             }));
             for level in ["h1", "h2", "h3"] {
                 map.insert(format!("{level}.align"), json!("center"));
@@ -158,6 +160,9 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
                 "paragraph.spacing": "indented",
                 "paragraph.indent": "2em",
                 "h1.align": "center",
+                "subtitle.size": 1, "subtitle.italic": false,
+                "subtitle.space_after": "2em",
+                "picture.align": "center", "picture.space": "1em",
             }));
             every_level(&mut map, "size", json!(1));
             every_level(&mut map, "weight", json!("bold"));
@@ -170,6 +175,8 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
                 "body.line_height": 1.55,
                 "code.wrap": false,
                 "tables.style": "grid",
+                "subtitle.size": 1, "subtitle.italic": false,
+                "picture.space": "0.75em",
             }));
             every_level(&mut map, "weight", json!("bold"));
             ("Code", map)
@@ -181,6 +188,8 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
                 "body.line_height": 1.6,
                 "code.size": 1,
                 "quote.style": "bar",
+                "subtitle.size": 1, "subtitle.italic": false,
+                "picture.space": "0.75em",
             }));
             every_level(&mut map, "size", json!(1));
             every_level(&mut map, "weight", json!("bold"));
@@ -201,6 +210,8 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
             "h1.space_before": "1.2em", "h2.space_before": "1.2em",
             "tables.style": "rows",
             "tables.header": "shaded",
+            "subtitle.size": 1.15, "subtitle.italic": false,
+            "picture.align": "center", "picture.space": "1em",
             })),
         ),
         "journal" => (
@@ -213,6 +224,7 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
             "paragraph.spacing": "spaced",
             "paragraph.gap": "0.9em",
             "h1.weight": "semibold", "h2.weight": "semibold",
+            "picture.align": "center", "picture.space": "1em",
             })),
         ),
         "compact" => {
@@ -222,6 +234,8 @@ fn builtin_json(name: &str) -> Option<(&'static str, Map<String, Json>)> {
                 "body.line_height": 1.4,
                 "lists.item_spacing": "0em",
                 "tables.size": 0.95,
+                "subtitle.size": 1, "subtitle.space_after": "0.6em",
+                "picture.space": "0.5em",
             }));
             every_level(&mut map, "space_before", json!("0.5em"));
             every_level(&mut map, "space_after", json!("0.2em"));

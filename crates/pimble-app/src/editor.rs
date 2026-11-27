@@ -62,6 +62,11 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
                 // After the links plugin: a pasted link is claimed there.
                 handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));
+                // Subtitles, and the classes the theme reads on subtitles and
+                // pictures (docs/THEMES_CONTRACT.md).
+                handle.add_plugin(std::rc::Rc::new(
+                    crate::paragraph_roles::ParagraphRolesPlugin,
+                ));
                 // Other people's selections (docs/PRESENCE_CONTRACT.md section 4).
                 handle.add_plugin(std::rc::Rc::new(crate::presence::text::PresencePlugin));
                 // Hashtags colored in the text (docs/HASHTAGS_CONTRACT.md).
