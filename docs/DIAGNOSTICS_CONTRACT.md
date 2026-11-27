@@ -24,7 +24,8 @@ decision; everything below reads from the same records.
 One record per log line at `warn` and `error` from every target, and the `info` lines of the
 targets that tell how syncing and sharing go (`pimble_server::{vault_link, sync_link,
 share, relay_face, relay_tunnel, handler}`, `pimble_server::local`, `pimble_app::events`'s
-sync and connection lines). Plus a few structured events:
+sync and connection lines, `pimble_app::agents`: what setting an agent up in another app wrote,
+by path and agent id, docs/AGENTS_CONTRACT.md section 6). Plus a few structured events:
 
 | `kind` | When | `data` |
 |---|---|---|
@@ -37,7 +38,9 @@ sync and connection lines). Plus a few structured events:
 
 **Scrubbing** happens before a record is written to the queue, never on the server: a
 record that holds something it should not is a leak whether or not anyone reads it.
-- File paths stay, with the home folder written `~` (`~/Dropbox/Personal.pimble`): where a
+- File paths stay, with the home folder written `~` (`~/Dropbox/Personal.pimble`), in
+  every form a line can hold it: either slash on Windows, and every backslash doubled as
+  Rust's `{:?}` prints a path (until 2026-11-26 `C:\\Users\\<name>` got through): where a
   store lives (a Dropbox or OneDrive folder, a network drive) is often the cause.
 - Store names stay (`'Personal'`): they make a record readable. Note titles do not: a log
   line that names a note writes its id, and one that quotes a title is a bug in that line,

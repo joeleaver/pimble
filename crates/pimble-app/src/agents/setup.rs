@@ -9,6 +9,18 @@
 //! Claude is installed, and takes every other Pimble entry out of both:
 //! Claude keeps exactly one Pimble agent, and no tool is loaded twice.
 //!
+//! **The Claude app installed as a Windows package** (MSIX) does not read
+//! `%APPDATA%\Claude`: Windows hands it a private copy of that folder under
+//! `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`
+//! once that copy exists, and the real folder until then (2026-11-26: a
+//! tester's Claude never started Pimble's MCP server). So when the package
+//! is there Pimble writes the same entry to both, and the app sees it either
+//! way.
+//!
+//! What an "Add" or a removal did is logged under `pimble_app::agents`, one
+//! of the targets diagnostics send at `info` (docs/DIAGNOSTICS_CONTRACT.md
+//! section 2): files by path, agents by id, never their names or keys.
+//!
 //! An entry's key names its agent (`pimble_rpc::agent_id_of_key`), which is
 //! how Pimble finds the entries of an agent being removed and the agents an
 //! "Add" replaced.
@@ -26,6 +38,9 @@ use super::ClientApp;
 pub enum ConfigFile {
     /// The Claude app's: its Chat tab, and its Code tab too.
     ClaudeApp,
+    /// The Claude app's when it is installed as a Windows package: its
+    /// private copy of `ClaudeApp`'s folder.
+    ClaudeAppPackaged,
     /// `~/.claude.json`, user scope: `claude` in a terminal, and the Claude
     /// app's Code tab.
     ClaudeCli,
@@ -35,12 +50,12 @@ pub enum ConfigFile {
 }
 
 impl ConfigFile {
-    pub const ALL: [ConfigFile; 4] = [ConfigFile::ClaudeApp, ConfigFile::ClaudeCli, ConfigFile::Codex, ConfigFile::Cursor];
+    pub const ALL: [ConfigFile; 5] = [ConfigFile::ClaudeApp, ConfigFile::ClaudeAppPackaged, ConfigFile::ClaudeCli, ConfigFile::Codex, ConfigFile::Cursor];
 
     /// The files an app's setup writes.
     pub fn of(app: ClientApp) -> &'static [ConfigFile] {
         match app {
-            ClientApp::Claude => &[ConfigFile::ClaudeApp, ConfigFile::ClaudeCli],
+            ClientApp::Claude => &[ConfigFile::ClaudeApp, ConfigFile::ClaudeAppPackaged, ConfigFile::ClaudeCli],
             ClientApp::ChatGpt => &[ConfigFile::Codex],
             ClientApp::Cursor => &[ConfigFile::Cursor],
             ClientApp::Other => &[],
@@ -49,7 +64,7 @@ impl ConfigFile {
 
     pub fn app(self) -> ClientApp {
         match self {
-            ConfigFile::ClaudeApp | ConfigFile::ClaudeCli => ClientApp::Claude,
+            ConfigFile::ClaudeApp | ConfigFile::ClaudeAppPackaged | ConfigFile::ClaudeCli => ClientApp::Claude,
             ConfigFile::Codex => ClientApp::ChatGpt,
             ConfigFile::Cursor => ClientApp::Cursor,
         }
@@ -74,6 +89,42 @@ pub struct Locations {
     pub config: PathBuf,
     /// `CODEX_HOME`, else `~/.codex`.
     pub codex: PathBuf,
+    /// The Claude app's Windows package folder, when it is installed as one
+    /// (`%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc`, found by
+    /// [`claude_package_in`]); never elsewhere.
+    pub claude_package: Option<PathBuf>,
+    /// Where the Claude app's program is when it is installed the ordinary
+    /// way: any of these there means the app is installed, though it may
+    /// never have run and made its config folder.
+    pub claude_programs: Vec<PathBuf>,
+}
+
+/// The Claude app's Windows package family name: its package folder's name,
+/// the same on every computer (the part after `_` is derived from the
+/// publisher).
+pub const CLAUDE_PACKAGE: &str = "Claude_pzs8sxrjxfjjc";
+
+/// The Claude app's package folder in `packages` (`%LOCALAPPDATA%\Packages`):
+/// [`CLAUDE_PACKAGE`], else any folder named `Claude_<publisher>` (ignoring
+/// case), so a package signed anew still counts. The first by name when
+/// several are there.
+pub fn claude_package_in(packages: &std::path::Path) -> Option<PathBuf> {
+    let known = packages.join(CLAUDE_PACKAGE);
+    if known.is_dir() {
+        return Some(known);
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir(packages)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            name.strip_prefix("claude_").is_some_and(|publisher| !publisher.is_empty() && publisher.chars().all(|c| c.is_ascii_alphanumeric()))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    found.sort();
+    found.into_iter().next()
 }
 
 impl Locations {
@@ -84,25 +135,51 @@ impl Locations {
         let config = dirs::config_dir()?;
         // `CODEX_HOME` moves it, as Codex itself honours.
         let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Some(Locations { home, config, codex })
+        let local = dirs::data_local_dir();
+        let (claude_package, claude_programs) = if cfg!(windows) {
+            // The package (Microsoft Store, or the MSIX installer), or the
+            // older installer's per-user folder.
+            let package = local.as_ref().and_then(|l| claude_package_in(&l.join("Packages")));
+            (package, local.iter().map(|l| l.join("AnthropicClaude")).collect())
+        } else if cfg!(target_os = "macos") {
+            (None, vec![PathBuf::from("/Applications/Claude.app"), home.join("Applications").join("Claude.app")])
+        } else {
+            (None, Vec::new())
+        };
+        Some(Locations { home, config, codex, claude_package, claude_programs })
     }
 
-    pub fn path(&self, file: ConfigFile) -> PathBuf {
-        match file {
+    /// Where `file` is, or `None` when this computer has no such file (the
+    /// Windows package's, when the package is not installed).
+    pub fn path(&self, file: ConfigFile) -> Option<PathBuf> {
+        Some(match file {
             ConfigFile::ClaudeApp => self.config.join("Claude").join("claude_desktop_config.json"),
+            ConfigFile::ClaudeAppPackaged => {
+                self.claude_package.as_ref()?.join("LocalCache").join("Roaming").join("Claude").join("claude_desktop_config.json")
+            }
             ConfigFile::ClaudeCli => self.home.join(".claude.json"),
             ConfigFile::Codex => self.codex.join("config.toml"),
             ConfigFile::Cursor => self.home.join(".cursor").join("mcp.json"),
-        }
+        })
     }
 
-    /// Whether the app that reads `file` looks installed: the file, or the
-    /// folder the app keeps it in, is there. Only Claude's two files are
-    /// judged so; for the others, choosing the app is asking for its file.
+    /// The files this computer can have, with where each is.
+    pub fn files(&self) -> impl Iterator<Item = (ConfigFile, PathBuf)> + '_ {
+        ConfigFile::ALL.into_iter().filter_map(|f| self.path(f).map(|p| (f, p)))
+    }
+
+    /// Whether the app that reads `file` looks installed. Only Claude's files
+    /// are judged so; for the others, choosing the app is asking for its
+    /// file. The Claude app is installed when its config folder, its program
+    /// or its Windows package is there; a packaged app also gets the plain
+    /// file, which is the one its "Edit Config" opens and the one it reads
+    /// until it has made its own copy.
     pub fn installed(&self, file: ConfigFile) -> bool {
+        let packaged = self.claude_package.as_ref().is_some_and(|d| d.is_dir());
         match file {
-            ConfigFile::ClaudeApp => self.config.join("Claude").is_dir(),
-            ConfigFile::ClaudeCli => self.path(file).exists() || self.home.join(".claude").is_dir(),
+            ConfigFile::ClaudeApp => self.config.join("Claude").is_dir() || packaged || self.claude_programs.iter().any(|p| p.exists()),
+            ConfigFile::ClaudeAppPackaged => packaged,
+            ConfigFile::ClaudeCli => self.home.join(".claude.json").exists() || self.home.join(".claude").is_dir(),
             ConfigFile::Codex | ConfigFile::Cursor => true,
         }
     }
@@ -132,16 +209,17 @@ impl Added {
 /// the same name is replaced.
 pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Added {
     let mut added = Added::default();
-    let files: Vec<ConfigFile> = ConfigFile::of(app).iter().copied().filter(|f| at.installed(*f)).collect();
+    let files: Vec<(ConfigFile, PathBuf)> =
+        ConfigFile::of(app).iter().filter(|f| at.installed(**f)).filter_map(|f| at.path(*f).map(|p| (*f, p))).collect();
     if files.is_empty() && app == ClientApp::Claude {
         added.failed.push("Pimble found no Claude on this computer".into());
     }
     let one_agent = |_: &str, e: &Entry| e.runs_pimble();
     let same_name = |name: &str, _: &Entry| name == entry.name;
     let drop: &dyn Fn(&str, &Entry) -> bool = if app == ClientApp::Claude { &one_agent } else { &same_name };
-    for file in files {
+    for (file, path) in files {
         let change = Change { drop, add: Some(NewEntry { stdio_type: file.stdio_type(), ..entry }) };
-        match client_config::apply(&at.path(file), file.format(), &change) {
+        match client_config::apply(&path, file.format(), &change) {
             Ok(changed) => {
                 added.written.push(file);
                 for (name, e) in changed.dropped {
@@ -157,6 +235,53 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
     added
 }
 
+/// Log what adding agent `agent` to `app` did: each file written, each that
+/// failed, the agents it replaced and, when it wrote nothing, every place it
+/// looked.
+pub fn log_added(at: &Locations, app: ClientApp, agent: Uuid, added: &Added, settled: &Settled) {
+    for line in added_log(at, app, agent, added, settled) {
+        match line {
+            Logged::Info(l) => tracing::info!("{l}"),
+            Logged::Warn(l) => tracing::warn!("{l}"),
+        }
+    }
+}
+
+/// A line of [`log_added`], at its level.
+#[derive(Debug, PartialEq)]
+pub enum Logged {
+    Info(String),
+    Warn(String),
+}
+
+/// The lines [`log_added`] writes. Paths are written with `display`, never
+/// `{:?}`: a Windows path in its debug form doubles every backslash.
+pub fn added_log(at: &Locations, app: ClientApp, agent: Uuid, added: &Added, settled: &Settled) -> Vec<Logged> {
+    let shown = |f: ConfigFile| at.path(f).map(|p| p.display().to_string()).unwrap_or_else(|| "no Windows package".into());
+    let mut out = Vec::new();
+    for f in &added.written {
+        out.push(Logged::Info(format!("Agent {agent} added to {}: wrote {}", app.name(), shown(*f))));
+    }
+    for e in &added.failed {
+        out.push(Logged::Warn(format!("Agent {agent} not added to {}: {e}", app.name())));
+    }
+    if added.written.is_empty() {
+        let looked: Vec<String> = ConfigFile::of(app).iter().map(|f| shown(*f)).collect();
+        out.push(Logged::Warn(format!("Agent {agent}: nothing written for {}; looked at {}", app.name(), looked.join(", "))));
+    }
+    for id in &settled.remove {
+        out.push(Logged::Info(format!("Agent {agent} replaced agent {id}, removed from Pimble")));
+    }
+    if !settled.kept.is_empty() || !settled.others.is_empty() {
+        out.push(Logged::Info(format!(
+            "Agent {agent}: {} replaced agents kept, {} entries for no agent here taken out",
+            settled.kept.len(),
+            settled.others.len()
+        )));
+    }
+    out
+}
+
 /// What taking an agent out did: the files changed, and a sentence per file
 /// that could not be.
 #[derive(Debug, Default)]
@@ -165,15 +290,22 @@ pub struct Forgotten {
     pub failed: Vec<String>,
 }
 
-/// Take every entry whose key names `agent` out of every file Pimble knows.
+/// Take every entry whose key names `agent` out of every file Pimble knows,
+/// and log what that changed.
 pub fn forget(at: &Locations, agent: Uuid) -> Forgotten {
     let mut out = Forgotten::default();
     let theirs = |_: &str, e: &Entry| e.agent() == Some(agent);
-    for file in ConfigFile::ALL {
-        match client_config::apply(&at.path(file), file.format(), &Change { drop: &theirs, add: None }) {
-            Ok(changed) if changed.written => out.changed.push(file),
+    for (file, path) in at.files() {
+        match client_config::apply(&path, file.format(), &Change { drop: &theirs, add: None }) {
+            Ok(changed) if changed.written => {
+                tracing::info!("Agent {agent} taken out of {}", path.display());
+                out.changed.push(file);
+            }
             Ok(_) => {}
-            Err(e) => out.failed.push(e),
+            Err(e) => {
+                tracing::warn!("Agent {agent} not taken out of {}: {e}", path.display());
+                out.failed.push(e);
+            }
         }
     }
     out
@@ -189,8 +321,8 @@ pub struct Holders {
 
 pub fn holders(at: &Locations) -> Holders {
     let mut out = Holders::default();
-    for file in ConfigFile::ALL {
-        let Ok(entries) = client_config::read_entries(&at.path(file), file.format()) else {
+    for (file, path) in at.files() {
+        let Ok(entries) = client_config::read_entries(&path, file.format()) else {
             out.unreadable = true;
             continue;
         };
@@ -276,13 +408,14 @@ pub fn added_sentence(app: ClientApp, added: &Added, settled: &Settled) -> Strin
     let mut out = Vec::new();
     let wrote = |f| added.written.contains(&f);
     if app == ClientApp::Claude {
-        match (wrote(ConfigFile::ClaudeApp), wrote(ConfigFile::ClaudeCli)) {
+        let claude_app = wrote(ConfigFile::ClaudeApp) || wrote(ConfigFile::ClaudeAppPackaged);
+        match (claude_app, wrote(ConfigFile::ClaudeCli)) {
             (true, true) => out.push("Added to Claude: the Chat and Code tabs of the Claude app, and claude in a terminal.".to_string()),
             (true, false) => out.push("Added to the Claude app, for its Chat and Code tabs.".to_string()),
             (false, true) => out.push("Added to Claude Code, for claude in a terminal.".to_string()),
             (false, false) => {}
         }
-        if wrote(ConfigFile::ClaudeApp) {
+        if claude_app {
             // The Claude app on Windows keeps running in the tray when its
             // window closes, and reads its config only when it starts
             // (2026-11-13: a closed window looked like a restart).

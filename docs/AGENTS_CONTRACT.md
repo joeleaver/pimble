@@ -142,7 +142,7 @@ Pimble adds one `mcpServers.pimble-<agent name>` entry and touches nothing else:
 
 | Client | File |
 | --- | --- |
-| Claude | both of: the Claude app's `claude_desktop_config.json` (Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`, macOS `~/Library/Application Support/Claude/`), and `~/.claude.json` user scope (with `"type": "stdio"`), each only when that Claude is installed (the `Claude` config folder; `~/.claude.json` or `~/.claude/`) |
+| Claude | the Claude app's `claude_desktop_config.json` (Linux `~/.config/Claude/`, Windows `%APPDATA%\Claude\`, macOS `~/Library/Application Support/Claude/`), its Windows package's copy of it (below), and `~/.claude.json` user scope (with `"type": "stdio"`), each only when that Claude is installed: the app when its config folder, its program (Windows `%LOCALAPPDATA%\AnthropicClaude`, macOS `Claude.app` in `/Applications` or `~/Applications`) or its Windows package is there, though it may never have run; `claude` when `~/.claude.json` or `~/.claude/` is |
 | ChatGPT desktop, Codex CLI and IDE extension | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`): a `[mcp_servers.pimble-<name>]` table with `command` and an `env` table, merged with `toml_edit` so the file's comments and layout stay |
 | Cursor | `~/.cursor/mcp.json` |
 
@@ -163,6 +163,20 @@ name): the entries of the old "Claude Desktop" and "Claude Code" choices
 (`pimble-claude-desktop`, `pimble-claude-code`), a hand-made pair, a stale entry under the
 new name. Each Claude file ends with exactly one Pimble entry. The other apps replace only
 an entry of the same name.
+
+**The Claude app as a Windows package** (MSIX: the Microsoft Store, and today's installer)
+does not read `%APPDATA%\Claude`. Windows gives it a private copy of that folder,
+`%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`, which it reads once
+the copy exists, and the plain folder until then; its own "Edit Config" opens the plain
+one (2026-11-26: a tester's "Add to Claude" wrote only the plain file, and Claude never
+started `pimble-mcp`). So when the package folder is there (that name, else any
+`Claude_<publisher>` folder in `Packages`) Pimble writes the same entry to both files and
+treats them as one app: the Chat and Code tabs still load one entry.
+
+**What an "Add" or a removal did is logged** (`pimble_app::agents`, sent with diagnostics
+at `info`, docs/DIAGNOSTICS_CONTRACT.md section 2): each file written or changed by path,
+each failure, the agents replaced by id, and every place looked when nothing was written.
+Never an agent's name or key.
 
 **Replaced agents are removed.** A key names its agent (`pmbl_agent_<id>_...`,
 `pimble_rpc::agent_id_of_key`), so Pimble knows whose entries an "Add" replaced. Each of

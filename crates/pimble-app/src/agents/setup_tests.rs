@@ -3,7 +3,7 @@ use super::*;
 /// A computer with the Claude app and Claude Code installed, nothing set up.
 fn computer() -> (tempfile::TempDir, Locations) {
     let dir = tempfile::tempdir().unwrap();
-    let at = Locations { home: dir.path().join("home"), config: dir.path().join("config"), codex: dir.path().join("home/.codex") };
+    let at = Locations { home: dir.path().join("home"), config: dir.path().join("config"), codex: dir.path().join("home/.codex"), claude_package: None, claude_programs: Vec::new() };
     std::fs::create_dir_all(at.config.join("Claude")).unwrap();
     std::fs::create_dir_all(at.home.join(".claude")).unwrap();
     (dir, at)
@@ -20,13 +20,13 @@ fn entry<'a>(name: &'a str, key: &'a str) -> NewEntry<'a> {
 }
 
 fn servers(at: &Locations, file: ConfigFile) -> serde_json::Map<String, serde_json::Value> {
-    let text = std::fs::read_to_string(at.path(file)).unwrap();
+    let text = std::fs::read_to_string(at.path(file).unwrap()).unwrap();
     let config: serde_json::Value = serde_json::from_str(&text).unwrap();
     config["mcpServers"].as_object().cloned().unwrap_or_default()
 }
 
 fn write(at: &Locations, file: ConfigFile, json: serde_json::Value) {
-    let path = at.path(file);
+    let path = at.path(file).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_string(&json).unwrap()).unwrap();
 }
@@ -54,7 +54,7 @@ fn claude_is_one_entry_written_alike_to_both_files() {
     assert_eq!(cli["pimble-claude"]["type"], "stdio");
     assert!(app["pimble-claude"].get("type").is_none());
     assert_eq!(cli["other"]["command"], "x", "other servers stay");
-    let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeCli)).unwrap();
+    let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeCli).unwrap()).unwrap();
     assert!(text.contains("numStartups"), "the rest of ~/.claude.json stays");
 
     assert_eq!(holders(&at).by_agent.get(&id), Some(&vec![ClientApp::Claude]), "one app, not two");
@@ -63,18 +63,18 @@ fn claude_is_one_entry_written_alike_to_both_files() {
 #[test]
 fn claude_is_written_only_where_it_is_installed() {
     let dir = tempfile::tempdir().unwrap();
-    let at = Locations { home: dir.path().join("home"), config: dir.path().join("config"), codex: dir.path().join("codex") };
+    let at = Locations { home: dir.path().join("home"), config: dir.path().join("config"), codex: dir.path().join("codex"), claude_package: None, claude_programs: Vec::new() };
     let id = Uuid::new_v4();
     let k = key(id);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
     assert!(added.written.is_empty());
     assert_eq!(added.failed.len(), 1, "no Claude here says so");
-    assert!(!at.path(ConfigFile::ClaudeApp).exists() && !at.path(ConfigFile::ClaudeCli).exists());
+    assert!(!at.path(ConfigFile::ClaudeApp).unwrap().exists() && !at.path(ConfigFile::ClaudeCli).unwrap().exists());
 
     std::fs::create_dir_all(at.home.join(".claude")).unwrap();
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
     assert_eq!(added.written, vec![ConfigFile::ClaudeCli]);
-    assert!(!at.path(ConfigFile::ClaudeApp).exists(), "no Claude app, no config made for it");
+    assert!(!at.path(ConfigFile::ClaudeApp).unwrap().exists(), "no Claude app, no config made for it");
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn one_claude_file_failing_removes_nobody() {
     let old = Uuid::new_v4();
     let pair = serde_json::json!({ "mcpServers": { "pimble-claude-desktop": pimble(&key(old)) } });
     write(&at, ConfigFile::ClaudeApp, pair);
-    std::fs::write(at.path(ConfigFile::ClaudeCli), "{ half written").unwrap();
+    std::fs::write(at.path(ConfigFile::ClaudeCli).unwrap(), "{ half written").unwrap();
     let id = Uuid::new_v4();
     let k = key(id);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
@@ -226,7 +226,7 @@ fn one_claude_file_failing_removes_nobody() {
     assert!(held.unreadable);
     let settled = settle(ClientApp::Claude, &added, &held, &[(old, "Claude Desktop".into())]);
     assert!(settled.remove.is_empty(), "it may still be in the file that failed");
-    assert_eq!(std::fs::read_to_string(at.path(ConfigFile::ClaudeCli)).unwrap(), "{ half written", "left alone");
+    assert_eq!(std::fs::read_to_string(at.path(ConfigFile::ClaudeCli).unwrap()).unwrap(), "{ half written", "left alone");
 }
 
 #[test]
@@ -245,13 +245,13 @@ fn other_apps_remove_no_agent_they_replace() {
 fn removing_takes_an_agent_out_of_codex_too() {
     let (_dir, at) = computer();
     std::fs::create_dir_all(&at.codex).unwrap();
-    std::fs::write(at.path(ConfigFile::Codex), "# mine\n[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
+    std::fs::write(at.path(ConfigFile::Codex).unwrap(), "# mine\n[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
     let id = Uuid::new_v4();
     let k = key(id);
     add(&at, ClientApp::ChatGpt, entry("pimble-chatgpt", &k), id);
     assert_eq!(holders(&at).by_agent[&id], vec![ClientApp::ChatGpt]);
     assert_eq!(forget(&at, id).changed, vec![ConfigFile::Codex]);
-    let text = std::fs::read_to_string(at.path(ConfigFile::Codex)).unwrap();
+    let text = std::fs::read_to_string(at.path(ConfigFile::Codex).unwrap()).unwrap();
     assert!(!text.contains("pimble-chatgpt") && text.contains("# mine") && text.contains("[mcp_servers.other]"), "{text}");
 }
 
@@ -283,4 +283,112 @@ fn a_claude_file_that_cannot_be_written_removes_nobody() {
     // enough to remove nobody.
     let settled = settle(ClientApp::Claude, &added, &Holders::default(), &[(old, "Claude Desktop".into())]);
     assert!(settled.remove.is_empty());
+}
+
+/// A Windows computer with the Claude app installed as a package, which has
+/// never made its plain config folder.
+fn packaged_computer() -> (tempfile::TempDir, Locations) {
+    let dir = tempfile::tempdir().unwrap();
+    let packages = dir.path().join("local/Packages");
+    std::fs::create_dir_all(packages.join(CLAUDE_PACKAGE)).unwrap();
+    let at = Locations {
+        home: dir.path().join("home"),
+        config: dir.path().join("roaming"),
+        codex: dir.path().join("home/.codex"),
+        claude_package: claude_package_in(&packages),
+        claude_programs: Vec::new(),
+    };
+    (dir, at)
+}
+
+#[test]
+fn a_packaged_claude_gets_its_own_copy_and_the_plain_one() {
+    let (_dir, at) = packaged_computer();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert!(added.failed.is_empty(), "{:?}", added.failed);
+    assert_eq!(added.written, vec![ConfigFile::ClaudeApp, ConfigFile::ClaudeAppPackaged]);
+    let packaged = at.path(ConfigFile::ClaudeAppPackaged).unwrap();
+    assert!(packaged.ends_with("LocalCache/Roaming/Claude/claude_desktop_config.json"), "{}", packaged.display());
+    assert_eq!(servers(&at, ConfigFile::ClaudeAppPackaged), servers(&at, ConfigFile::ClaudeApp));
+    assert_eq!(holders(&at).by_agent.get(&id), Some(&vec![ClientApp::Claude]), "one app");
+    let sentence = added_sentence(ClientApp::Claude, &added, &Settled::default());
+    assert!(sentence.starts_with("Added to the Claude app"), "{sentence}");
+
+    let gone = forget(&at, id);
+    assert!(gone.failed.is_empty());
+    assert!(servers(&at, ConfigFile::ClaudeAppPackaged).is_empty() && servers(&at, ConfigFile::ClaudeApp).is_empty());
+}
+
+#[test]
+fn the_packaged_copy_loses_the_old_pimble_entries_too() {
+    let (_dir, at) = packaged_computer();
+    let old = Uuid::new_v4();
+    write(&at, ConfigFile::ClaudeAppPackaged, serde_json::json!({ "preferences": { "x": 1 }, "mcpServers": { "pimble-claude-desktop": pimble(&key(old)) } }));
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert_eq!(added.replaced(), [old].into_iter().collect());
+    assert_eq!(servers(&at, ConfigFile::ClaudeAppPackaged).keys().collect::<Vec<_>>(), vec!["pimble-claude"]);
+    let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap();
+    assert!(text.contains("preferences"), "the rest of the app's file stays");
+}
+
+#[test]
+fn a_claude_package_is_found_by_its_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(claude_package_in(dir.path()), None);
+    assert_eq!(claude_package_in(&dir.path().join("missing")), None);
+    for name in ["ClaudeHelper", "Claude_", "Claude_x.y", "Other_pzs8sxrjxfjjc"] {
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+    }
+    assert_eq!(claude_package_in(dir.path()), None, "only Claude_<publisher>");
+    std::fs::create_dir_all(dir.path().join("claude_newpublisher1")).unwrap();
+    assert_eq!(claude_package_in(dir.path()), Some(dir.path().join("claude_newpublisher1")), "a package signed anew");
+    std::fs::create_dir_all(dir.path().join(CLAUDE_PACKAGE)).unwrap();
+    assert_eq!(claude_package_in(dir.path()), Some(dir.path().join(CLAUDE_PACKAGE)), "the known one first");
+}
+
+#[test]
+fn a_claude_app_that_never_ran_is_found_by_its_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("local/AnthropicClaude");
+    let at = Locations {
+        home: dir.path().join("home"),
+        config: dir.path().join("roaming"),
+        codex: dir.path().join("home/.codex"),
+        claude_package: None,
+        claude_programs: vec![program.clone()],
+    };
+    assert!(!at.installed(ConfigFile::ClaudeApp));
+    std::fs::create_dir_all(&program).unwrap();
+    assert!(at.installed(ConfigFile::ClaudeApp));
+    assert!(!at.installed(ConfigFile::ClaudeAppPackaged));
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert_eq!(added.written, vec![ConfigFile::ClaudeApp], "its config folder is made");
+    assert!(at.path(ConfigFile::ClaudeApp).unwrap().exists());
+}
+
+#[test]
+fn what_an_add_did_is_logged_by_path_and_id() {
+    let (_dir, at) = packaged_computer();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("my private name", &k), id);
+    let lines = added_log(&at, ClientApp::Claude, id, &added, &Settled::default());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for (line, file) in lines.iter().zip([ConfigFile::ClaudeApp, ConfigFile::ClaudeAppPackaged]) {
+        let Logged::Info(line) = line else { panic!("{line:?}") };
+        assert!(line.contains(&id.to_string()) && line.contains(&at.path(file).unwrap().display().to_string()), "{line}");
+        assert!(!line.contains("my private name") && !line.contains(&k), "no names, no keys: {line}");
+    }
+
+    let nowhere = Locations { home: at.home.join("x"), config: at.config.join("x"), codex: at.codex.clone(), claude_package: None, claude_programs: Vec::new() };
+    let added = add(&nowhere, ClientApp::Claude, entry("pimble-claude", &k), id);
+    let lines = added_log(&nowhere, ClientApp::Claude, id, &added, &Settled::default());
+    assert!(matches!(&lines[0], Logged::Warn(l) if l.contains("found no Claude")), "{lines:?}");
+    assert!(matches!(lines.last(), Some(Logged::Warn(l)) if l.contains("looked at") && l.contains(".claude.json") && l.contains("no Windows package")), "{lines:?}");
 }
