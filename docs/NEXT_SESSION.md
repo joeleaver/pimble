@@ -1,5 +1,21 @@
 # Next session: start here
 
+**2026-11-27: 0.34.2 cut.**
+- In 0.34.2: File > New Store (and every other file dialog) no longer aborts the app on
+  Linux. The tray (since 0.31.0) pulls in ksni with zbus's `tokio` feature, and zbus then
+  panics on any call made outside a tokio runtime, which rfd's portal dialogs were.
+  rinch #3104 (batch #3106, main `68e23c0a`) runs every rfd call inside one shared tokio
+  runtime kept for the process, with a test that makes the portal call on a private
+  dbus-daemon in both zbus modes. Checked in a release test app: New Store, Open Store,
+  the three imports, Mount Store Here and Save as PNG, and the tray.
+- Moving the pin: `cargo update -p rinch --precise` in `web/` also re-resolved `ahash`'s
+  and `tempfile`'s `getrandom`, which broke the wasm check (E0464, two `getrandom`
+  candidates). Check the web lock's diff holds only rinch source lines after a pin move.
+- rinch follow-ups found on the way (not filed yet): accesskit_unix's thread would hit the
+  same zbus panic (its `tokio` feature fixes it); `rinch-screen-capture` asks for ashpd's
+  `tokio` feature while rfd builds it with `async-std`, so a build with both fails to
+  compile; `crates/rinch/src/tray.rs` is 2,926 lines.
+
 **2026-11-26: 0.34.1 cut.**
 - In 0.34.1:
   - "Add to Claude" works with the Claude app installed as a Windows package (MSIX): it also
