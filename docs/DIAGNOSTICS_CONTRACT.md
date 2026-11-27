@@ -39,8 +39,8 @@ by path and agent id, docs/AGENTS_CONTRACT.md section 6). Plus a few structured 
 **Scrubbing** happens before a record is written to the queue, never on the server: a
 record that holds something it should not is a leak whether or not anyone reads it.
 - File paths stay, with the home folder written `~` (`~/Dropbox/Personal.pimble`), in
-  every form a line can hold it: either slash on Windows, and every backslash doubled as
-  Rust's `{:?}` prints a path (until 2026-11-26 `C:\\Users\\<name>` got through): where a
+  every form a line can hold it: on Windows either slash, any case, a network (`\\server`)
+  home too, and every backslash doubled as Rust's `{:?}` prints a path (until 2026-11-26 `C:\\Users\\<name>` got through): where a
   store lives (a Dropbox or OneDrive folder, a network drive) is often the cause.
 - Store names stay (`'Personal'`): they make a record readable. Note titles do not: a log
   line that names a note writes its id, and one that quotes a title is a bug in that line,

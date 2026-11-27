@@ -170,8 +170,11 @@ does not read `%APPDATA%\Claude`. Windows gives it a private copy of that folder
 the copy exists, and the plain folder until then; its own "Edit Config" opens the plain
 one (2026-11-26: a tester's "Add to Claude" wrote only the plain file, and Claude never
 started `pimble-mcp`). So when the package folder is there (that name, else any
-`Claude_<publisher>` folder in `Packages`) Pimble writes the same entry to both files and
-treats them as one app: the Chat and Code tabs still load one entry.
+`Claude_<publisher id>` folder in `Packages`, the id 13 characters of Crockford base32)
+Pimble writes the same entry to both files and treats them as one app: the Chat and Code
+tabs still load one entry. The private copy, made by Pimble before the app has made it,
+starts as a copy of the plain file, since from then on the app reads only the copy: a
+copy holding Pimble's entry alone would hide the person's other servers and settings.
 
 **What an "Add" or a removal did is logged** (`pimble_app::agents`, sent with diagnostics
 at `info`, docs/DIAGNOSTICS_CONTRACT.md section 2): each file written or changed by path,

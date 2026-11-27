@@ -105,8 +105,8 @@ pub struct Locations {
 pub const CLAUDE_PACKAGE: &str = "Claude_pzs8sxrjxfjjc";
 
 /// The Claude app's package folder in `packages` (`%LOCALAPPDATA%\Packages`):
-/// [`CLAUDE_PACKAGE`], else any folder named `Claude_<publisher>` (ignoring
-/// case), so a package signed anew still counts. The first by name when
+/// [`CLAUDE_PACKAGE`], else any folder named `Claude_<publisher id>`
+/// (ignoring case), so a package signed anew still counts. The first by name when
 /// several are there.
 pub fn claude_package_in(packages: &std::path::Path) -> Option<PathBuf> {
     let known = packages.join(CLAUDE_PACKAGE);
@@ -118,13 +118,19 @@ pub fn claude_package_in(packages: &std::path::Path) -> Option<PathBuf> {
         .flatten()
         .filter(|e| {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-            name.strip_prefix("claude_").is_some_and(|publisher| !publisher.is_empty() && publisher.chars().all(|c| c.is_ascii_alphanumeric()))
+            name.strip_prefix("claude_").is_some_and(is_publisher_id)
         })
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
     found.sort();
     found.into_iter().next()
+}
+
+/// Whether `id` has the shape of a Windows package's publisher id: 13
+/// characters of Crockford base32 (no i, l, o or u).
+fn is_publisher_id(id: &str) -> bool {
+    id.len() == 13 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='z') && !matches!(c, 'i' | 'l' | 'o' | 'u'))
 }
 
 impl Locations {
@@ -218,6 +224,12 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
     let same_name = |name: &str, _: &Entry| name == entry.name;
     let drop: &dyn Fn(&str, &Entry) -> bool = if app == ClientApp::Claude { &one_agent } else { &same_name };
     for (file, path) in files {
+        if file == ConfigFile::ClaudeAppPackaged {
+            if let Err(e) = seed_packaged_copy(at, &path) {
+                added.failed.push(e);
+                continue;
+            }
+        }
         let change = Change { drop, add: Some(NewEntry { stdio_type: file.stdio_type(), ..entry }) };
         match client_config::apply(&path, file.format(), &change) {
             Ok(changed) => {
@@ -233,6 +245,23 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
         }
     }
     added
+}
+
+/// Before the packaged app's own copy of its config is first written, make it
+/// a copy of the plain file: once the copy exists the app reads it instead,
+/// so a copy holding only Pimble's entry would hide every other server and
+/// setting the person has. The plain file is already changed by this "Add"
+/// (it comes first), so the change applied to the copy then rewrites nothing.
+fn seed_packaged_copy(at: &Locations, packaged: &std::path::Path) -> Result<(), String> {
+    let Some(plain) = at.path(ConfigFile::ClaudeApp) else { return Ok(()) };
+    if packaged.exists() || !plain.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&plain).map_err(|e| format!("Could not read {}: {e}", plain.display()))?;
+    if let Some(dir) = packaged.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
+    }
+    std::fs::write(packaged, text).map_err(|e| format!("Could not write {}: {e}", packaged.display()))
 }
 
 /// Log what adding agent `agent` to `app` did: each file written, each that
@@ -257,7 +286,7 @@ pub enum Logged {
 /// The lines [`log_added`] writes. Paths are written with `display`, never
 /// `{:?}`: a Windows path in its debug form doubles every backslash.
 pub fn added_log(at: &Locations, app: ClientApp, agent: Uuid, added: &Added, settled: &Settled) -> Vec<Logged> {
-    let shown = |f: ConfigFile| at.path(f).map(|p| p.display().to_string()).unwrap_or_else(|| "no Windows package".into());
+    let shown = |f: ConfigFile| at.path(f).map(|p| p.display().to_string()).unwrap_or_else(|| format!("{f:?}"));
     let mut out = Vec::new();
     for f in &added.written {
         out.push(Logged::Info(format!("Agent {agent} added to {}: wrote {}", app.name(), shown(*f))));
@@ -266,7 +295,7 @@ pub fn added_log(at: &Locations, app: ClientApp, agent: Uuid, added: &Added, set
         out.push(Logged::Warn(format!("Agent {agent} not added to {}: {e}", app.name())));
     }
     if added.written.is_empty() {
-        let looked: Vec<String> = ConfigFile::of(app).iter().map(|f| shown(*f)).collect();
+        let looked: Vec<String> = ConfigFile::of(app).iter().filter_map(|f| at.path(*f)).map(|p| p.display().to_string()).collect();
         out.push(Logged::Warn(format!("Agent {agent}: nothing written for {}; looked at {}", app.name(), looked.join(", "))));
     }
     for id in &settled.remove {

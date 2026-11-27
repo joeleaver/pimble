@@ -340,12 +340,12 @@ fn a_claude_package_is_found_by_its_prefix() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(claude_package_in(dir.path()), None);
     assert_eq!(claude_package_in(&dir.path().join("missing")), None);
-    for name in ["ClaudeHelper", "Claude_", "Claude_x.y", "Other_pzs8sxrjxfjjc"] {
+    for name in ["ClaudeHelper", "Claude_", "Claude_x.y", "Claude_abcdefghjkmn", "Claude_abcdefghjkmno", "Other_pzs8sxrjxfjjc"] {
         std::fs::create_dir_all(dir.path().join(name)).unwrap();
     }
-    assert_eq!(claude_package_in(dir.path()), None, "only Claude_<publisher>");
-    std::fs::create_dir_all(dir.path().join("claude_newpublisher1")).unwrap();
-    assert_eq!(claude_package_in(dir.path()), Some(dir.path().join("claude_newpublisher1")), "a package signed anew");
+    assert_eq!(claude_package_in(dir.path()), None, "only Claude_<publisher id>: 13 characters, no i, l, o or u");
+    std::fs::create_dir_all(dir.path().join("Claude_abcdefghjkmnp")).unwrap();
+    assert_eq!(claude_package_in(dir.path()), Some(dir.path().join("Claude_abcdefghjkmnp")), "a package signed anew");
     std::fs::create_dir_all(dir.path().join(CLAUDE_PACKAGE)).unwrap();
     assert_eq!(claude_package_in(dir.path()), Some(dir.path().join(CLAUDE_PACKAGE)), "the known one first");
 }
@@ -390,5 +390,21 @@ fn what_an_add_did_is_logged_by_path_and_id() {
     let added = add(&nowhere, ClientApp::Claude, entry("pimble-claude", &k), id);
     let lines = added_log(&nowhere, ClientApp::Claude, id, &added, &Settled::default());
     assert!(matches!(&lines[0], Logged::Warn(l) if l.contains("found no Claude")), "{lines:?}");
-    assert!(matches!(lines.last(), Some(Logged::Warn(l)) if l.contains("looked at") && l.contains(".claude.json") && l.contains("no Windows package")), "{lines:?}");
+    assert!(matches!(lines.last(), Some(Logged::Warn(l)) if l.contains("looked at") && l.contains(".claude.json") && !l.contains("Packaged")), "{lines:?}");
+}
+
+#[test]
+fn a_new_packaged_copy_starts_from_the_plain_file() {
+    let (_dir, at) = packaged_computer();
+    write(&at, ConfigFile::ClaudeApp, serde_json::json!({ "preferences": { "theme": "dark" }, "mcpServers": { "mine": { "command": "x" } } }));
+    assert!(!at.path(ConfigFile::ClaudeAppPackaged).unwrap().exists());
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert!(added.failed.is_empty(), "{:?}", added.failed);
+    let packaged = servers(&at, ConfigFile::ClaudeAppPackaged);
+    assert_eq!(packaged.keys().collect::<Vec<_>>(), vec!["mine", "pimble-claude"], "the person's servers stay in the copy the app will read");
+    let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap();
+    assert!(text.contains("dark"), "and the rest of their settings");
+    assert_eq!(packaged, servers(&at, ConfigFile::ClaudeApp));
 }
