@@ -41,6 +41,7 @@ pub const MODIFIERS: &[&str] = &[
     "rule-space",
     "code-unwrapped",
     "marker-color",
+    "picture-spaced",
 ];
 
 /// The modifier an enum token's word draws with, if it is not the look
@@ -120,6 +121,11 @@ pub fn draw(tokens: &Tokens, dark: bool) -> Drawn {
             }
             (_, Value::Font(family)) => declare(token.key, family.css_stack()),
             (TokenType::Length { unit, .. }, Value::Length(n)) => {
+                // Unset, a picture's paragraph keeps the paragraphs' own
+                // spacing, which no fallback can say.
+                if token.key == "picture.space" {
+                    modifiers.push("picture-spaced");
+                }
                 declare(token.key, format!("{}{}", number_text(*n), unit.suffix()))
             }
             (TokenType::Ratio { .. }, Value::Number(n)) => {
@@ -143,6 +149,9 @@ pub fn draw(tokens: &Tokens, dark: bool) -> Drawn {
             },
             (_, Value::Bool(on)) => match (token.key, on) {
                 ("code.wrap", false) => modifiers.push("code-unwrapped"),
+                (key @ "subtitle.italic", on) => {
+                    declare(key, if *on { "italic" } else { "normal" }.to_string())
+                }
                 (key, true) if key.ends_with(".rule_below") => declare(
                     key,
                     format!("1px solid {}", slot_value(tokens, Slot::Rule, dark)),
@@ -280,7 +289,16 @@ mod tests {
         modifiers.sort();
         assert_eq!(
             modifiers,
-            ["measured", "para-indented", "quote-italic", "rule-ornament"]
+            [
+                "measured",
+                "para-indented",
+                "picture-spaced",
+                "quote-italic",
+                "rule-ornament"
+            ]
         );
+        assert_eq!(get("--pd-subtitle-italic"), None, "italic already");
+        assert_eq!(get("--pd-picture-align"), Some("center"));
+        assert_eq!(get("--pd-picture-space"), Some("1em"));
     }
 }

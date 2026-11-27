@@ -101,6 +101,8 @@ so nothing a theme holds can end a declaration or open a rule. One stylesheet
 | Lists | `marker_color` (optional), `item_spacing` (length) |
 | Tables | `style` (`grid`, `rows`, `minimal`), `header` (`bold`, `shaded`), `font` (optional), `size` (ratio) |
 | Rule | `style` (`line`, `ornament`: a centered short rule, `space`) |
+| Subtitle | `size` (ratio of body), `italic` (bool), `color` (optional), `align` (`start`, `center`; unset, a subtitle under a heading follows the heading), `space_after` (length) |
+| Picture | `align` (`start`, `center`), `space` (length, optional: above and below a picture alone in its paragraph; unset, the paragraphs' own spacing) |
 
 **The palette** (decided, Joe 2026-11-24, decision 7): a fixed set of named color slots,
 each a **pair**, one value for the light scheme and one for the dark:
@@ -827,6 +829,58 @@ cut or add.
   stack, on an encrypted store: New Theme opening the editor, an edit drawing in the
   sample and in a note the theme is applied to (and again after a reload), the store's
   group in the picker, Show Internal, and "Own colors" starting from a slot's pair.
+
+## Subtitles and pictures
+
+Two gaps found on a story read in Book (approved by Joe, 2026-11-26): a byline under a
+title sat at the left with the first paragraph indented, and a picture alone in a
+paragraph took the first-line indent (overflowing the measure) with no space around it.
+
+**A subtitle is a paragraph role, chosen, never guessed.** The paragraph carries
+`data-role="subtitle"` (`pimble_crdt::text_roles`), an app attribute rinch keeps without
+knowing what it means (joeleaver/rinch#3093). The toolbar's "Subtitle" button toggles it,
+and makes a heading or code block a subtitle paragraph first; Clear Formatting takes it
+off. Enter at a subtitle's end starts an ordinary paragraph; Enter inside one leaves two
+(`DataAttrSplit::CopyToText`, which every editor handle sets). It is used for bylines too.
+
+**What it looks like**, all from tokens (section 2.1), never CSS in a theme:
+
+- Directly under a heading, and for a second subtitle under the first, it takes the
+  alignment the heading has (the one a person set, else the theme's), unless the theme's
+  `subtitle.align` or the paragraph's own alignment says otherwise; the heading and a
+  subtitle before another keep 0.2 em between them, and `subtitle.space_after` follows the
+  last.
+- Anywhere else it is a dimmed paragraph with no indent. The paragraph after a subtitle is
+  not indented.
+
+**A picture alone** is a paragraph holding at least one image and nothing but white space
+besides. It has no first-line indent, `picture.space` above and below, `picture.align`
+unless the person aligned it, and the paragraph after it is not indented. A picture inside
+a sentence is drawn as before. Default and Document set no picture token, so they look as
+they did; Book, Manuscript, Report and Journal center it.
+
+| Theme | Subtitle | Picture |
+| --- | --- | --- |
+| Default, Document | 1.1, italic | as before |
+| Book | body size, italic, 1.5 em after | centered, 1 em |
+| Manuscript | body size, upright, 2 em after | centered, 1 em |
+| Code, Markdown | body size, upright | left, 0.75 em |
+| Report | 1.15, upright | centered, 1 em |
+| Journal | 1.1, italic | centered, 1 em |
+| Compact | body size, 0.6 em after | left, 0.5 em |
+
+**Drawing.** The stylesheet cannot tell a picture's paragraph from another (desktop CSS
+has no `:has()`, joeleaver/rinch#680) or look back from a subtitle to its heading's chosen
+alignment, so `paragraph_roles` puts classes on blocks as node decorations
+(joeleaver/rinch#3097): `pimble-picture-block`, `pimble-before-subtitle` and
+`pimble-under-h<level>` with `pimble-title-<alignment>`. The classes are drawing only and are never stored. The theme
+preview computes the same classes.
+
+**Elsewhere.** Markdown writes the role as ` {.subtitle}` (docs/MCP_CONTRACT.md). A
+Pimble from before subtitles keeps the attribute through typing, formatting and merging,
+copies it to both halves of a split, drops it when the block's type is set, does not draw
+it, leaves it out of exported HTML and pasted HTML, and loses it from a paragraph its MCP
+server rewrites.
 
 ## 14. How it is checked
 

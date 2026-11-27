@@ -160,6 +160,84 @@
     color: var(--pd-h6-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
 }
 
+/* ── Subtitles and pictures ─────────────────────────────────────── */
+/* A subtitle is a paragraph with that role (`data-role`, set by the
+   toolbar). `paragraph_roles` puts these classes on blocks:
+   `pimble-picture-block` on a paragraph holding only pictures,
+   `pimble-before-subtitle` on the heading or subtitle a subtitle follows,
+   and `pimble-under-h*` and `pimble-title-*` on a subtitle under a
+   heading. A book indents neither, nor the
+   paragraph after either. An alignment someone chose is inline and wins. */
+.pimble-editor__content-wrap > [data-pm-editor] p[data-role="subtitle"] {
+    font-size: var(--pd-subtitle-size, 1.1em);
+    font-style: var(--pd-subtitle-italic, italic);
+    text-align: var(--pd-subtitle-align, start);
+    text-indent: 0;
+    margin: 0 0 var(--pd-subtitle-space-after, 1em);
+}
+/* Under a heading (and under another subtitle there), aligned as it is. */
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h1[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h1-align, start));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h2[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h2-align, start));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h3[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h3-align, start));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h4[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h4-align, start));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h5[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h5-align, start));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-under-h6[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, var(--pd-h6-align, start));
+}
+/* A heading whose alignment someone chose carries it to its subtitles,
+   unless the theme aligns subtitles itself. After the level's rules, which
+   these overrule. */
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-title-left[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, left);
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-title-center[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, center);
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-title-right[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, right);
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-title-justify[data-role="subtitle"] {
+    text-align: var(--pd-subtitle-align, justify);
+}
+/* What a subtitle follows sits close to it. */
+.pimble-editor__content-wrap > [data-pm-editor] h1.pimble-before-subtitle,
+.pimble-editor__content-wrap > [data-pm-editor] h2.pimble-before-subtitle,
+.pimble-editor__content-wrap > [data-pm-editor] h3.pimble-before-subtitle,
+.pimble-editor__content-wrap > [data-pm-editor] h4.pimble-before-subtitle,
+.pimble-editor__content-wrap > [data-pm-editor] h5.pimble-before-subtitle,
+.pimble-editor__content-wrap > [data-pm-editor] h6.pimble-before-subtitle {
+    margin-bottom: 0.2em;
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-before-subtitle[data-role="subtitle"] {
+    margin-bottom: 0.2em;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="dark"] p[data-role="subtitle"],
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme="light"] p[data-role="subtitle"] {
+    color: var(--pd-subtitle-color, var(--pd-dimmed, var(--rinch-color-dimmed)));
+}
+.pimble-editor__content-wrap > [data-pm-editor] p.pimble-picture-block {
+    text-align: var(--pd-picture-align, start);
+    text-indent: 0;
+}
+.pimble-editor__content-wrap--picture-spaced > [data-pm-editor] p.pimble-picture-block {
+    margin-top: var(--pd-picture-space);
+    margin-bottom: var(--pd-picture-space);
+}
+.pimble-editor__content-wrap--para-indented > [data-pm-editor] p[data-role="subtitle"] + p,
+.pimble-editor__content-wrap--para-indented > [data-pm-editor] p.pimble-picture-block + p {
+    text-indent: 0;
+}
+
 /* ── Quotes ─────────────────────────────────────────────────────── */
 .pimble-editor__content-wrap > [data-pm-editor] blockquote {
     font-family: var(--pd-quote-font, var(--pd-body-font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif));

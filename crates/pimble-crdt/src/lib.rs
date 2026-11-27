@@ -26,6 +26,7 @@ pub mod node_doc;
 pub mod order;
 pub mod rules;
 pub mod store_document;
+pub mod text_roles;
 pub mod tree;
 mod sync_util;
 
