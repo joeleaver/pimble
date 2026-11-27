@@ -41,16 +41,11 @@ impl StandIns {
     }
 
     /// `md` with the role's stand-in in place of each unescaped mark that ends
-    /// a line or a table cell, outside HTML tables.
+    /// a line or a table cell. Which of those are a paragraph's end is for
+    /// [`Self::read`] to see, in the parsed document.
     pub(super) fn mark(self, md: &str) -> String {
-        let mut html = false;
         md.split_inclusive('\n')
             .map(|line| {
-                html |= line.trim_start().starts_with("<table");
-                if html {
-                    html = !line.contains("</table>");
-                    return line.to_string();
-                }
                 let mut out = String::with_capacity(line.len());
                 let mut copied = 0;
                 for (at, found) in line.match_indices(SUBTITLE_MARK) {
@@ -106,24 +101,26 @@ impl StandIns {
     fn prepared(self, schema: &Schema, root: &Node, node: &Node) -> Option<Node> {
         if node.type_name() == "paragraph" {
             let mut children: Vec<Node> = node.content().iter().cloned().collect();
-            let words = children.last().and_then(|last| {
+            // The last run with something to read: blank runs after the words
+            // do not stop them ending the line.
+            let last = children.iter().enumerate().rev().find(|(_, run)| run.text().is_none_or(|text| !text.trim().is_empty()));
+            let words = last.and_then(|(at, run)| {
                 // In inline code the words are code, which is read as written.
-                if last.marks().iter().any(|m| m.type_name() == "code") {
+                if run.marks().iter().any(|m| m.type_name() == "code") {
                     return None;
                 }
-                // Blank space after them does not stop them ending the line.
-                let text = last.text()?;
+                let text = run.text()?;
                 let kept = text.trim_end();
                 let before = kept.strip_suffix(SUBTITLE_MARK)?;
                 let space = &text[kept.len()..];
-                schema.text_with_marks(&format!("{before}{}{space}", self.words), last.marks().to_vec()).ok()
+                Some((at, schema.text_with_marks(&format!("{before}{}{space}", self.words), run.marks().to_vec()).ok()?))
             });
             let subtitle = is_subtitle(node);
             if words.is_none() && !subtitle {
                 return None;
             }
-            if let Some(words) = words {
-                *children.last_mut().expect("the words are its last run") = words;
+            if let Some((at, words)) = words {
+                children[at] = words;
             }
             if subtitle {
                 // A run of its own, with no marks, its space inside it so the

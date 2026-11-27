@@ -1,4 +1,4 @@
-use rinch_editor_core::{Fragment, Node, Schema};
+use rinch_editor_core::{Fragment, Mark, Node, Schema};
 
 use super::SUBTITLE_MARK;
 use crate::content_doc::project;
@@ -136,6 +136,55 @@ fn private_use_characters_stay_themselves() {
     round_trip(
         "```\n\u{E0A0}\n```\n\n\u{10F000} \u{10F001} {.subtitle}",
         &[("\u{E0A0}", false), ("\u{10F000} \u{10F001}", true)],
+    );
+}
+
+/// A line that only looks like the start of an HTML table (in code, or one
+/// closed in capitals) changes nothing after it.
+#[test]
+fn table_tags_in_the_text_do_not_stop_the_marks() {
+    round_trip(
+        "```html\n<table>\n```\n\nby Ann {.subtitle}",
+        &[("<table>", false), ("by Ann", true)],
+    );
+    let doc = read("<TABLE>\n<tr><td>a</td></tr>\n</TABLE>\n\nby Ann {.subtitle}");
+    assert_eq!(
+        blocks(&doc),
+        [("a".to_string(), false), ("by Ann".to_string(), true)]
+    );
+}
+
+/// Blank runs of other marks after the words leave them words.
+#[test]
+fn the_words_before_a_marked_space_stay_words() {
+    let schema = Schema::starter_kit();
+    let words = schema.text("x {.subtitle}").unwrap();
+    let space = schema
+        .text_with_marks(
+            " ",
+            vec![Mark::simple(schema.mark_type("bold").unwrap().clone())],
+        )
+        .unwrap();
+    let paragraph = schema
+        .create_node(
+            "paragraph",
+            Default::default(),
+            Fragment::from_children(vec![words, space]),
+        )
+        .unwrap();
+    let doc = schema
+        .create_node(
+            "doc",
+            Default::default(),
+            Fragment::from_children(vec![paragraph]),
+        )
+        .unwrap();
+    let written = render(&doc);
+    let back = read(&written);
+    assert!(!blocks(&back)[0].1, "{written:?}");
+    assert!(
+        blocks(&back)[0].0.starts_with("x {.subtitle}"),
+        "{written:?}"
     );
 }
 
