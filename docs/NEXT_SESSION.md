@@ -1,5 +1,20 @@
 # Next session: start here
 
+**2026-11-27: 0.34.4 cut.**
+- In 0.34.4 (branch `claude/claude-config-detect-5ccd8f`, merged as `5006e1c`): "Add to
+  Claude" finds every Claude install (`crates/pimble-app/src/agents/locations.rs`) and
+  writes the config file each one reads. The Store/MSIX Claude reads only its private
+  `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\
+  claude_desktop_config.json` when it made that folder itself; 0.34.1 wrote there only
+  if the file already existed, so Will's Claude (6.28899.6, no `%APPDATA%\Claude\logs`)
+  listed no local MCP servers. Pimble now creates that file from the plain one; each Add
+  and removal logs the installs found and files written (docs/AGENTS_CONTRACT.md
+  section 6 has the research and sources). Two review rounds; round 2's fixes
+  (the copy keeps the plain file's permissions) not reviewed again.
+- Will, after updating: Account > AI Agents > Add to Claude, quit Claude from its tray
+  icon, reopen; the agent shows under Settings > Desktop app > Extensions > Manage >
+  "Local MCP servers". If not, read his `pimble_app::agents` diagnostics lines.
+
 **2026-11-27: 0.34.3 cut.**
 - In 0.34.3 (branch `subtitle-pictures`, merged as `081c6b6`, Joe's "merge it"; two review
   rounds, the second round's two findings fixed with tests in `58520a2` and not reviewed
