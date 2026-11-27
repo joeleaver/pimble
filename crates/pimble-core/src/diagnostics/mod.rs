@@ -58,6 +58,13 @@ impl Scrubber {
             if back != home && home.contains(':') {
                 homes.push(back);
             }
+            // And with every backslash doubled: a path printed with `{:?}`
+            // ("C:\\Users\\will\\AppData...") kept the home folder
+            // before 2026-11-26.
+            let doubled = home.replace('/', "\\").replace('\\', "\\\\");
+            if home.contains(':') && !homes.contains(&doubled) {
+                homes.push(doubled);
+            }
         }
         Scrubber { homes, titles: HashSet::new() }
     }
@@ -197,6 +204,8 @@ mod tests {
         let w = Scrubber::new(Some(r"C:\Users\Will"));
         assert_eq!(w.scrub(r"Opening store at C:\Users\Will\Documents\Notes.pimble"), r"Opening store at ~\Documents\Notes.pimble");
         assert_eq!(w.scrub("Opening store at C:/Users/Will/Documents/Notes.pimble"), "Opening store at ~/Documents/Notes.pimble");
+        let debug = format!("{:?}", r"C:\Users\Will\AppData\Local\pimble");
+        assert_eq!(w.scrub(&format!("Opening store at {debug}")), r#"Opening store at "~\\AppData\\Local\\pimble""#);
     }
 
     #[test]
