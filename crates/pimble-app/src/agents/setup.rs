@@ -111,6 +111,7 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
                 // the app to read in place of the plain file.
                 if carried {
                     let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(client_config::backup_path(&path));
                 }
                 added.failed.push(e);
             }
@@ -123,19 +124,14 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
 /// one, when there is a plain one. Whether it made one. A plain file that
 /// does not parse is not copied (the app would then read the broken copy,
 /// and a fix made to the plain file would never reach it): that is a
-/// failure, and nothing is made. The copy is written whole or not at all.
+/// failure, and nothing is made. The copy is written whole or not at all,
+/// with the plain file's permissions (it holds agent keys).
 fn carry_over(at: &Locations, path: &Path) -> Result<bool, String> {
     if path.exists() {
         return Ok(false);
     }
     let Some(plain) = at.path(ConfigFile::ClaudeApp).filter(|p| p.is_file()) else { return Ok(false) };
-    client_config::read_entries(&plain, ConfigFile::ClaudeApp.format()).map_err(|e| format!("{e}, so {} was not made from it", path.display()))?;
-    let text = std::fs::read(&plain).map_err(|e| format!("Could not read {}: {e}", plain.display()))?;
-    let tmp = path.with_extension("pimble-tmp");
-    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).map(|_| true).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("Could not copy {} to {}: {e}", plain.display(), path.display())
-    })
+    client_config::copy_settings(&plain, path).map(|_| true).map_err(|e| format!("{e}; {} was not made from it", path.display()))
 }
 
 /// Log what adding agent `agent` to `app` did: the Claudes found, each file

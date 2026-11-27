@@ -271,6 +271,18 @@ fn write_replacing(path: &Path, text: &str, permissions: Option<&std::fs::Permis
     std::fs::rename(&tmp, path).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
+/// Make `to` a copy of the JSON settings file `from`, with its permissions,
+/// written whole or not at all. A `from` that is not a JSON settings object
+/// is not copied: the sentence says why.
+pub fn copy_settings(from: &Path, to: &Path) -> Result<(), String> {
+    let Some(text) = read(from)? else { return Err(format!("{} is gone", from.display())) };
+    if !parse_json(from, &text)?.is_object() {
+        return Err(format!("{} is not a settings object, so it was left alone", from.display()));
+    }
+    let permissions = std::fs::metadata(from).ok().map(|m| m.permissions());
+    write_replacing(to, &text, permissions.as_ref())
+}
+
 /// Where the file at `path` is kept as it was before Pimble's last change.
 pub fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

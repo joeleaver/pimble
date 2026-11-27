@@ -519,7 +519,38 @@ fn a_broken_plain_file_is_not_copied_into_the_package() {
         let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
         assert_eq!(added.failed.len(), 2, "{broken}: the plain file and the copy both fail: {:?}", added.failed);
         assert!(!private.exists(), "{broken}: no copy left for the app to read in place of the plain file");
+        let left: Vec<_> = std::fs::read_dir(private.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "{broken}: nothing else left in the package's folder: {left:?}");
         assert!(added.carried.is_empty());
         assert_eq!(std::fs::read_to_string(at.path(ConfigFile::ClaudeApp).unwrap()).unwrap(), broken, "the plain file is left alone");
     }
+}
+
+#[test]
+fn a_plain_file_that_is_not_settings_is_never_copied() {
+    // The check itself, apart from the clean-up after a failed change.
+    let dir = tempfile::tempdir().unwrap();
+    let (from, to) = (dir.path().join("plain.json"), dir.path().join("private/copy.json"));
+    for broken in ["{ \"a\": 1, }", "[1, 2]"] {
+        std::fs::write(&from, broken).unwrap();
+        assert!(client_config::copy_settings(&from, &to).is_err(), "{broken}");
+        assert!(!to.exists(), "{broken}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_packaged_copy_keeps_the_plain_files_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, at) = packaged_computer();
+    std::fs::remove_file(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap();
+    write(&at, ConfigFile::ClaudeApp, serde_json::json!({ "preferences": {} }));
+    let plain = at.path(ConfigFile::ClaudeApp).unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+    assert_eq!(added.carried, vec![ConfigFile::ClaudeAppPackaged]);
+    let mode = std::fs::metadata(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "it holds an agent key");
 }
