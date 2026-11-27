@@ -1,5 +1,24 @@
 # Next session: start here
 
+**2026-11-26: 0.34.1 cut.**
+- In 0.34.1:
+  - "Add to Claude" works with the Claude app installed as a Windows package (MSIX): it also
+    writes the package's private config copy (`%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\
+    Roaming\Claude`) once Claude has made it, finds the package by its publisher-id shape, and
+    counts Claude installed by its program or package even before its first run. Found from
+    Will's diagnostics: his machine had never started `pimble-mcp` (docs/AGENTS_CONTRACT.md
+    section 6);
+  - agent setup logs what it wrote or failed to write (`pimble_app::agents`, sent at `info`);
+  - the diagnostics scrubber takes out a Windows home printed with `{:?}` (doubled
+    backslashes: Will's user name reached the server), in any case, and network homes.
+- Not verified on a real Windows machine: ask Will to press "Add to Claude" again in 0.34.1,
+  quit Claude from the tray and reopen it; an `mcp` system record from his install
+  (`tools/diagnostics.sh stats`, then `export --kind system`) means it connected.
+- Seen in Will's records, not looked into: every start says something on 127.0.0.1:7462 did
+  not answer as a Pimble server, writes under `AppData\Local\pimble\stores\...` fail with
+  "Access is denied", and his app warns that DESKTOP-52CDFF9 runs 0.32.0 (perhaps a leftover
+  process on his own machine).
+
 **2026-11-26 (master local_198b8f9e, transcript 3e8511e5): 0.34.0 cut.**
 - In 0.34.0:
   - who can open a note: the `whoCanOpen` RPC (names and account ids only) and people refreshes
