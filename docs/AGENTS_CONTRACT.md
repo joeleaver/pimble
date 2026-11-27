@@ -186,7 +186,8 @@ the OS will attempt to open the file from the real AppData location"
 [flexible virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization)).
 So a packaged Claude that first ran with no `%APPDATA%\Claude` made that folder privately
 under `LocalCache\Roaming` and keeps its config, logs and extensions there, while its
-"Edit Config" opens the plain file, which it does not read once it has a file of its own
+"Edit Config" (Settings > Developer in older versions) opened the plain file, which it does
+not read once it has a file of its own
 ([anthropics/claude-code#25579](https://github.com/anthropics/claude-code/issues/25579),
 [#26073](https://github.com/anthropics/claude-code/issues/26073), open); one that found
 `%APPDATA%\Claude` already there (an earlier install, or the folder made by hand before
@@ -199,8 +200,12 @@ loaded the entry. So Pimble does not rely on the fallback:
 - When the package's private `Claude` folder exists, Pimble writes its
   `claude_desktop_config.json`. When the app has made the folder and no file in it, Pimble
   makes the file as a copy of the plain file first, so nothing the person set there is
-  lost, then adds the entry. It never makes the private folder itself, or anything else in
-  the package's folder: with no private folder the app reads the plain file.
+  lost, then adds the entry (a plain file that does not parse is not copied, and a copy the
+  entry could not be added to is taken away again: the app is never left reading a broken
+  copy). From then on the app reads the private file: a later hand edit of the plain file
+  does not reach it, and Pimble keeps only its own entry alike in both. It never makes the
+  private folder itself, or anything else in the package's folder: with no private folder
+  the app reads the plain file.
 - When the package is installed, Pimble also writes the plain file (what "Edit Config"
   opens, and what the app reads while it has no folder of its own); a plain folder made
   before the app's first run is the one it then uses.
@@ -208,7 +213,14 @@ loaded the entry. So Pimble does not rely on the fallback:
   across all of them, the Chat and Code tabs load one entry, and removing an agent takes it
   out of every file in this section whether or not its Claude is still installed.
 
-Anthropic's own pages give only the plain paths (macOS and `%APPDATA%\Claude`;
+Current Claude versions (6.x) have no Settings > Developer page and no "Edit Config"; local
+servers are listed under Settings > Desktop app > Extensions ("Manage"), "Local MCP
+servers" ([Getting started with local MCP servers](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop),
+2026-10-23, which describes only desktop extensions). A hand-configured server is still the
+`mcpServers` of `claude_desktop_config.json`, which the app now shares with its own settings
+(`preferences`), so Pimble merges into it and never replaces it (third-party, checked
+2026-11-23: [corsair.dev](https://corsair.dev/blog/claude-desktop-mcp)); no current source
+names another file. Anthropic's own pages give only the plain paths (macOS and `%APPDATA%\Claude`;
 [Connect to local MCP servers](https://modelcontextprotocol.io/docs/develop/connect-local-servers));
 the package family name `Claude_pzs8sxrjxfjjc` is the one Anthropic's
 [data storage page](https://claude.com/docs/third-party/claude-desktop/data-storage) uses.

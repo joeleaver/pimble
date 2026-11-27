@@ -504,3 +504,22 @@ fn both_claude_apps_and_claude_code_each_get_the_one_entry_and_lose_it_together(
     let again = forgotten_log(&at, id, &forget(&at, id));
     assert!(matches!(again.last(), Some(Logged::Info(l)) if l.contains("was in none of")), "{again:?}");
 }
+
+#[test]
+fn a_broken_plain_file_is_not_copied_into_the_package() {
+    let (_dir, at) = packaged_computer();
+    let private = at.path(ConfigFile::ClaudeAppPackaged).unwrap();
+    std::fs::remove_file(&private).unwrap();
+    let id = Uuid::new_v4();
+    let k = key(id);
+    let plain = at.path(ConfigFile::ClaudeApp).unwrap();
+    std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+    for broken in ["{ \"mcpServers\": {}, }", "[1, 2]"] {
+        std::fs::write(at.path(ConfigFile::ClaudeApp).unwrap(), broken).unwrap();
+        let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
+        assert_eq!(added.failed.len(), 2, "{broken}: the plain file and the copy both fail: {:?}", added.failed);
+        assert!(!private.exists(), "{broken}: no copy left for the app to read in place of the plain file");
+        assert!(added.carried.is_empty());
+        assert_eq!(std::fs::read_to_string(at.path(ConfigFile::ClaudeApp).unwrap()).unwrap(), broken, "the plain file is left alone");
+    }
+}

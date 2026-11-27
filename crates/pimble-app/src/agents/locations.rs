@@ -19,8 +19,11 @@
 //!   making the file when the app has not (a tester's Claude, 2026-11-27, had
 //!   the folder and no file, and never read the plain one Pimble wrote), from
 //!   the plain file's content so nothing the person set there is lost; and
-//!   it always writes the plain file too, which the app's own "Edit Config"
-//!   opens and which it reads while it has no folder of its own.
+//!   it always writes the plain file too, which the app reads while it has
+//!   no folder of its own (and which older versions' "Edit Config" opened).
+//!   Once Pimble has made the private file, the app reads that and no longer
+//!   the plain one: a hand edit of the plain file stops reaching it, and only
+//!   Pimble's own entry is kept alike in both.
 //! - The Claude app from the **older installer** (Squirrel, program in
 //!   `%LOCALAPPDATA%\AnthropicClaude`), not virtualized: `%APPDATA%\Claude`.
 //! - The **macOS** app (`Claude.app`): `~/Library/Application Support/Claude`.
@@ -256,7 +259,7 @@ impl Locations {
         let packaged = installs.iter().any(|i| i.kind == InstallKind::Packaged);
         match file {
             ConfigFile::ClaudeApp if read_by(file) => Target::Write("a Claude app installed here reads it"),
-            ConfigFile::ClaudeApp if packaged => Target::Write("the packaged Claude's Edit Config opens it"),
+            ConfigFile::ClaudeApp if packaged => Target::Write("the packaged Claude reads it while it has no private config folder"),
             ConfigFile::ClaudeApp => Target::Skip("no Claude app is installed here"),
             ConfigFile::ClaudeAppPackaged if read_by(file) => Target::Write("the packaged Claude made its config folder here, and reads it first"),
             ConfigFile::ClaudeAppPackaged if packaged => Target::Skip("the packaged Claude has made no private config folder, so it reads the plain file"),
