@@ -14,8 +14,10 @@
 //! `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`
 //! once that copy exists, and the real folder until then (2026-11-26: a
 //! tester's Claude never started Pimble's MCP server). So when the package
-//! is there Pimble writes the same entry to both, and the app sees it either
-//! way.
+//! is there Pimble writes the plain file, and the copy too when the app has
+//! made one; Pimble never makes the copy, which would hide the plain file
+//! from the app. Windows makes it from the plain file when the app first
+//! writes there, so the entry is in it either way.
 //!
 //! What an "Add" or a removal did is logged under `pimble_app::agents`, one
 //! of the targets diagnostics send at `info` (docs/DIAGNOSTICS_CONTRACT.md
@@ -177,14 +179,16 @@ impl Locations {
     /// Whether the app that reads `file` looks installed. Only Claude's files
     /// are judged so; for the others, choosing the app is asking for its
     /// file. The Claude app is installed when its config folder, its program
-    /// or its Windows package is there; a packaged app also gets the plain
-    /// file, which is the one its "Edit Config" opens and the one it reads
-    /// until it has made its own copy.
+    /// or its Windows package is there. A packaged app always gets the plain
+    /// file (the one it reads until it has made its own copy, and the one its
+    /// "Edit Config" opens), and its own copy only once that copy exists.
     pub fn installed(&self, file: ConfigFile) -> bool {
         let packaged = self.claude_package.as_ref().is_some_and(|d| d.is_dir());
         match file {
             ConfigFile::ClaudeApp => self.config.join("Claude").is_dir() || packaged || self.claude_programs.iter().any(|p| p.exists()),
-            ConfigFile::ClaudeAppPackaged => packaged,
+            // Only a copy the app has made: without one it reads the plain
+            // file, and a copy made here would hide that file from it.
+            ConfigFile::ClaudeAppPackaged => self.path(file).is_some_and(|p| p.is_file()),
             ConfigFile::ClaudeCli => self.home.join(".claude.json").exists() || self.home.join(".claude").is_dir(),
             ConfigFile::Codex | ConfigFile::Cursor => true,
         }
@@ -224,12 +228,6 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
     let same_name = |name: &str, _: &Entry| name == entry.name;
     let drop: &dyn Fn(&str, &Entry) -> bool = if app == ClientApp::Claude { &one_agent } else { &same_name };
     for (file, path) in files {
-        if file == ConfigFile::ClaudeAppPackaged {
-            if let Err(e) = seed_packaged_copy(at, &path) {
-                added.failed.push(e);
-                continue;
-            }
-        }
         let change = Change { drop, add: Some(NewEntry { stdio_type: file.stdio_type(), ..entry }) };
         match client_config::apply(&path, file.format(), &change) {
             Ok(changed) => {
@@ -245,23 +243,6 @@ pub fn add(at: &Locations, app: ClientApp, entry: NewEntry, agent: Uuid) -> Adde
         }
     }
     added
-}
-
-/// Before the packaged app's own copy of its config is first written, make it
-/// a copy of the plain file: once the copy exists the app reads it instead,
-/// so a copy holding only Pimble's entry would hide every other server and
-/// setting the person has. The plain file is already changed by this "Add"
-/// (it comes first), so the change applied to the copy then rewrites nothing.
-fn seed_packaged_copy(at: &Locations, packaged: &std::path::Path) -> Result<(), String> {
-    let Some(plain) = at.path(ConfigFile::ClaudeApp) else { return Ok(()) };
-    if packaged.exists() || !plain.is_file() {
-        return Ok(());
-    }
-    let text = std::fs::read_to_string(&plain).map_err(|e| format!("Could not read {}: {e}", plain.display()))?;
-    if let Some(dir) = packaged.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
-    }
-    std::fs::write(packaged, text).map_err(|e| format!("Could not write {}: {e}", packaged.display()))
 }
 
 /// Log what adding agent `agent` to `app` did: each file written, each that

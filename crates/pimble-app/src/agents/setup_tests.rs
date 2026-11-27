@@ -286,7 +286,7 @@ fn a_claude_file_that_cannot_be_written_removes_nobody() {
 }
 
 /// A Windows computer with the Claude app installed as a package, which has
-/// never made its plain config folder.
+/// made its own copy of its config (`{}`), and never its plain config folder.
 fn packaged_computer() -> (tempfile::TempDir, Locations) {
     let dir = tempfile::tempdir().unwrap();
     let packages = dir.path().join("local/Packages");
@@ -298,6 +298,7 @@ fn packaged_computer() -> (tempfile::TempDir, Locations) {
         claude_package: claude_package_in(&packages),
         claude_programs: Vec::new(),
     };
+    write(&at, ConfigFile::ClaudeAppPackaged, serde_json::json!({}));
     (dir, at)
 }
 
@@ -394,17 +395,17 @@ fn what_an_add_did_is_logged_by_path_and_id() {
 }
 
 #[test]
-fn a_new_packaged_copy_starts_from_the_plain_file() {
+fn a_packaged_claude_without_its_own_copy_gets_only_the_plain_file() {
     let (_dir, at) = packaged_computer();
-    write(&at, ConfigFile::ClaudeApp, serde_json::json!({ "preferences": { "theme": "dark" }, "mcpServers": { "mine": { "command": "x" } } }));
-    assert!(!at.path(ConfigFile::ClaudeAppPackaged).unwrap().exists());
+    std::fs::remove_file(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap();
+    write(&at, ConfigFile::ClaudeApp, serde_json::json!({ "mcpServers": { "mine": { "command": "x" } } }));
     let id = Uuid::new_v4();
     let k = key(id);
     let added = add(&at, ClientApp::Claude, entry("pimble-claude", &k), id);
     assert!(added.failed.is_empty(), "{:?}", added.failed);
-    let packaged = servers(&at, ConfigFile::ClaudeAppPackaged);
-    assert_eq!(packaged.keys().collect::<Vec<_>>(), vec!["mine", "pimble-claude"], "the person's servers stay in the copy the app will read");
-    let text = std::fs::read_to_string(at.path(ConfigFile::ClaudeAppPackaged).unwrap()).unwrap();
-    assert!(text.contains("dark"), "and the rest of their settings");
-    assert_eq!(packaged, servers(&at, ConfigFile::ClaudeApp));
+    assert_eq!(added.written, vec![ConfigFile::ClaudeApp], "the app reads the plain file until it makes its copy");
+    assert!(!at.path(ConfigFile::ClaudeAppPackaged).unwrap().exists(), "a copy made here would hide the plain file from the app");
+    assert_eq!(servers(&at, ConfigFile::ClaudeApp).keys().collect::<Vec<_>>(), vec!["mine", "pimble-claude"]);
+    let sentence = added_sentence(ClientApp::Claude, &added, &Settled::default());
+    assert!(sentence.starts_with("Added to the Claude app"), "{sentence}");
 }

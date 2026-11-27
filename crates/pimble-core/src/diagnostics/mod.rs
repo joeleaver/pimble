@@ -98,7 +98,10 @@ impl Scrubber {
 }
 
 /// Every `home` followed by a separator or the end becomes `~`; `fold`
-/// matches it ignoring ASCII case (which keeps every byte offset).
+/// matches it ignoring ASCII case (which keeps every byte offset). Windows
+/// ignores case beyond ASCII too, so `C:\Users\Zoë` written `ZOË` stays;
+/// Windows writes a home folder as the account has it, so that line would
+/// have had to change the case itself.
 fn replace_path_prefix(line: &str, home: &str, fold: bool) -> String {
     let (hay, needle) = if fold { (line.to_ascii_lowercase(), home.to_ascii_lowercase()) } else { (line.to_string(), home.to_string()) };
     let mut out = String::with_capacity(line.len());

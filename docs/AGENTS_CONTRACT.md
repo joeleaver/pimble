@@ -171,10 +171,11 @@ the copy exists, and the plain folder until then; its own "Edit Config" opens th
 one (2026-11-26: a tester's "Add to Claude" wrote only the plain file, and Claude never
 started `pimble-mcp`). So when the package folder is there (that name, else any
 `Claude_<publisher id>` folder in `Packages`, the id 13 characters of Crockford base32)
-Pimble writes the same entry to both files and treats them as one app: the Chat and Code
-tabs still load one entry. The private copy, made by Pimble before the app has made it,
-starts as a copy of the plain file, since from then on the app reads only the copy: a
-copy holding Pimble's entry alone would hide the person's other servers and settings.
+Pimble writes the plain file, and the private copy too once the app has made one, and
+treats them as one app: the Chat and Code tabs still load one entry. Pimble never makes
+the copy itself: with none the app reads the plain file, which already holds the entry,
+and Windows makes the copy from it when the app first writes there; a copy made by
+Pimble would pin the app to a file its own "Edit Config" never opens.
 
 **What an "Add" or a removal did is logged** (`pimble_app::agents`, sent with diagnostics
 at `info`, docs/DIAGNOSTICS_CONTRACT.md section 2): each file written or changed by path,
